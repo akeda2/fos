@@ -22,16 +22,23 @@ const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
 
 pub fn reset() -> ! {
-    restart(false)
+    restart(false, true)
+}
+
+/// Resets after a crash: the stop is not marked clean, so the next boot counts it as unclean.
+pub fn crash_reset() -> ! {
+    restart(false, false)
 }
 
 /// Powers off (see the header); if nothing works the CPU sleeps for good.
 pub fn off() -> ! {
-    restart(true)
+    restart(true, true)
 }
 
-fn restart(halt: bool) -> ! {
-    crate::slots::mark_clean_stop();
+fn restart(halt: bool, clean: bool) -> ! {
+    if clean {
+        crate::slots::mark_clean_stop();
+    }
     if crate::gic::bases().0 == 0xff84_1000 {
         crate::paging::map_device(PM_BASE, 0x1000);
         unsafe {

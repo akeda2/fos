@@ -350,3 +350,22 @@ playback with a real signal, `duplex`, hardware timestamps (genet has none).
 
 `opus-bench` runs on the Pi too (same libopus archive): 100 stereo 20 ms frames at complexity 10, 96 kbit/s: encode 565 us average
 (2.8 % of a core), decode 137 us. That is every general-purpose tape; `memtest`, `fpcheck`, `cpu64-*` and `longmode-rs` are x86-only.
+
+## Debug file, crash record and watchdog (2026-10-23, verified on the Pi)
+
+`kernel/src/crash.rs` is the Pi's `debug.rs`/`config.rs` half: the `debug` file (`reboot-on-crash`, `reboot-delay N`,
+`crash-on-boot`, `watchdog [N]`, `kernel-update`), `debug` status, the crash-loop guard (the loader's crash count) and the
+watchdog. Differences from x86:
+
+- **The crash record is a file**, `crash` on the boot volume, printed and deleted by the next boot. A RAM page was tried first and
+  the Pi's firmware clears RAM across a reset. The handler skips the write if the fault hit inside `block::read/write`
+  (`crash::disk_busy`), so it cannot damage the file system, and puts the SD driver in poll-only mode (`sdhci::force_polling`),
+  because inside the timer interrupt nothing can wake a `wfi`.
+- **The watchdog has two halves**: the 100 Hz tick checks the foreground's `crash::pet()` (shell loop, `block::*`, `netfs`, tape
+  `should_abort`; ten minutes while a tape runs) and records the interrupted ELR; behind it the BCM2711 PM watchdog (15 s, fed by
+  the tick once a second) resets a hang with interrupts masked, without a record.
+- The unclean-boot streak (three in a row keeps the watchdog off) is cleared after five minutes of uptime, as on x86.
+
+Verified: `debug crash` and `debug hang` with `reboot-on-crash` + `watchdog 10`: the record appears at the next boot, the Pi
+resets, and the streak guard and its clearing work. Not verified: the hardware-only half (a hang with interrupts masked) and
+`crash-on-boot` as a crash loop.

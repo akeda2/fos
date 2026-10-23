@@ -34,6 +34,8 @@ pub fn run() -> ! {
     start_script(false);
     crate::print(format_args!("\nType `help` for the commands.\nfos> "));
     loop {
+        crate::crash::pet();
+        crate::crash::housekeeping();
         crate::usb_kbd::poll();
         match crate::arch::aarch64::pl011::read_byte().or_else(crate::usb_kbd::pop) {
             Some(byte) => {

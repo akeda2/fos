@@ -219,6 +219,7 @@ pub fn run(entry: u64, arguments: &str) -> Result<(), &'static str> {
     let stack = memory::allocate_contiguous(STACK_BYTES / memory::FRAME, None).ok_or("no memory for the tape's stack")?;
     let api = make_api(info, arguments);
     cpu::fp_enable();
+    crate::crash::set_tape_running(true);
     unsafe {
         // x21 is callee-saved, so the tape preserves it: it keeps our stack pointer across the call.
         core::arch::asm!(
@@ -233,6 +234,7 @@ pub fn run(entry: u64, arguments: &str) -> Result<(), &'static str> {
             clobber_abi("C"),
         );
     }
+    crate::crash::set_tape_running(false);
     crate::framebuffer::gfx_close();
     close_extra_screens();
     crate::gpio::tape_ended();
@@ -430,6 +432,7 @@ extern "C" fn api_read_key() -> u32 {
 
 /// Escape stops a tape; any other key typed meanwhile is dropped (`should_abort` and `read_key` share one input).
 extern "C" fn api_should_abort() -> u32 {
+    crate::crash::pet();
     if crate::tasks::in_service() {
         return u32::from(crate::tasks::service_should_abort());
     }

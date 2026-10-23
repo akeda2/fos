@@ -87,6 +87,8 @@ pub fn get(index: usize) -> Option<Disk> {
 
 /// Reads whole sectors (`buffer.len()` a multiple of 512) from `lba`.
 pub fn read(disk: usize, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
+    #[cfg(target_arch = "aarch64")]
+    let _busy = crate::crash::disk_busy();
     let info = get(disk).ok_or(Error::NoSuchDisk)?;
     if buffer.len() % 512 != 0 || lba + (buffer.len() / 512) as u64 > info.sectors {
         return Err(Error::OutOfRange);
@@ -116,6 +118,8 @@ pub fn read(disk: usize, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
 
 /// Writes whole sectors to `lba`.
 pub fn write(disk: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
+    #[cfg(target_arch = "aarch64")]
+    let _busy = crate::crash::disk_busy();
     let info = get(disk).ok_or(Error::NoSuchDisk)?;
     if buffer.len() % 512 != 0 || lba + (buffer.len() / 512) as u64 > info.sectors {
         return Err(Error::OutOfRange);

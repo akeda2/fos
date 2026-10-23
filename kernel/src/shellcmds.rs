@@ -137,7 +137,8 @@ fn debug(rest: &str) {
             }
             #[cfg(target_arch = "aarch64")]
             {
-                crate::println!("kernel-update {}", crate::netservice::kernel_update_enabled());
+                let debug = crate::crash::debug();
+                crate::println!("reboot-on-crash {}, reboot-delay {} s, kernel-update {}, crash-on-boot {}, watchdog {:?}", debug.reboot_on_crash, debug.reboot_delay_seconds, debug.kernel_update, debug.crash_on_boot, debug.watchdog_seconds);
                 crate::slots::show();
             }
         }
@@ -246,6 +247,8 @@ fn sleep(rest: &str) {
     while timer::ticks() < end {
         #[cfg(target_arch = "x86_64")]
         crate::debug::pet();
+        #[cfg(target_arch = "aarch64")]
+        crate::crash::pet();
         crate::cpu::sleep();
     }
     crate::println!("Slept {seconds} s.");

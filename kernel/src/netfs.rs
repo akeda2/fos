@@ -866,7 +866,9 @@ mod imp {
         escape
     }
 
-    pub fn pet() {}
+    pub fn pet() {
+        crate::crash::pet();
+    }
 
     /// One 4 MiB transfer buffer, allocated on first use and kept.
     pub fn staging() -> Option<&'static mut [u8]> {

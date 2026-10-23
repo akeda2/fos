@@ -132,8 +132,18 @@ extern "C" fn exception_report(index: u64) -> ! {
     crate::println!("EXCEPTION: {kind} from {origin}, running at EL{}.", current_el());
     crate::println!("  ESR {esr:#010x}: class {class:#04x} ({}), ISS {:#x}", class_name(class), esr & 0x1ff_ffff);
     crate::println!("  ELR {elr:#018x} (the faulting instruction)   FAR {far:#018x} (the faulting address, if the class has one)");
-    crate::println!("Parking the CPU.");
-    loop {
-        unsafe { asm!("wfe") };
+    crate::crash::fatal(index, esr, elr, far, false)
+}
+
+/// The ELR of the exception level the kernel runs at: the instruction an interrupt (or fault) just interrupted.
+pub fn elr() -> u64 {
+    let elr: u64;
+    unsafe {
+        if current_el() == 2 {
+            asm!("mrs {}, elr_el2", out(reg) elr, options(nomem, nostack));
+        } else {
+            asm!("mrs {}, elr_el1", out(reg) elr, options(nomem, nostack));
+        }
     }
+    elr
 }

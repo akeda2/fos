@@ -98,6 +98,7 @@ pub fn dispatch() {
         IRQ_TICKS.fetch_add(1, Ordering::Relaxed);
         let reload = RELOAD.load(Ordering::Relaxed);
         unsafe { core::arch::asm!("msr cntp_tval_el0, {}", in(reg) reload, options(nomem, nostack)) };
+        crate::crash::tick();
     }
     let handler = HANDLERS.get(intid as usize).map_or(0, |h| h.load(Ordering::Acquire));
     if handler != 0 {

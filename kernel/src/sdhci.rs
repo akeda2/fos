@@ -30,6 +30,12 @@ const PI4_INTID: u32 = 32 + 126;
 const SPIN_MICROS: u64 = 50;
 
 static INTERRUPTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Set by the crash handler, which may run inside the timer interrupt: nothing can wake a `wfi` there, so waits only poll.
+static POLL_ONLY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn force_polling() {
+    POLL_ONLY.store(true, core::sync::atomic::Ordering::Relaxed);
+}
 static WAKE_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 const SDMA: usize = 0x00;
@@ -185,7 +191,7 @@ impl Controller {
 
     fn wait_status(&self, bit: u32) -> Result<(), Error> {
         let start = timer::micros();
-        let wakes = WAKE_BASE.load(core::sync::atomic::Ordering::Relaxed) == self.base;
+        let wakes = WAKE_BASE.load(core::sync::atomic::Ordering::Relaxed) == self.base && !POLL_ONLY.load(core::sync::atomic::Ordering::Relaxed);
         loop {
             let status = self.read(INT_STATUS);
             if status & INT_ERROR != 0 {

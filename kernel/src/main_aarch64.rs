@@ -12,6 +12,7 @@ mod hda;
 mod block;
 mod font_data;
 mod clock;
+mod crash;
 mod fatvol;
 mod formatshell;
 mod fosfs;
@@ -170,6 +171,7 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
                 (info.acpi_rsdp & !0xfff, 16384),
             ],
         );
+        crash::set_boot_crash_count(info.crash_count);
         arch::aarch64::early::mark(5);
         let stats = memory::stats();
         println!("Physical memory: {} MiB managed, {} MiB free.", stats.frames * memory::FRAME / (1024 * 1024), stats.free * memory::FRAME / (1024 * 1024));
@@ -211,6 +213,7 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
             );
         }
         storage::init(info);
+        crash::init();
         genet::init();
         if gic::bases().0 == PI4_GIC_DISTRIBUTOR {
             mailbox::second_screen();
@@ -240,7 +243,12 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
     let no_msi = shell::apply_settings();
     xhci::enable_interrupts_all(no_msi);
     cpu::interrupts_enable();
+    if crash::debug().crash_on_boot {
+        println!("debug: crash-on-boot is set; faulting now.");
+        unsafe { core::arch::asm!("udf #0") };
+    }
     slots::confirm_boot();
+    crash::confirm();
     shell::run()
 }
 
