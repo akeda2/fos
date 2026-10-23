@@ -397,3 +397,11 @@ another disk: new GPT, the ESP sector for sector (on the Pi it holds the firmwar
 `BOOTAA64.EFI`), the running kernel as slot 0 with fresh metadata, and a FOSFS volume with every file. No BIOS code on aarch64.
 Verified: the command is registered, and it refuses the boot disk. Not verified: an actual copy (needs a USB disk or second SD in the
 Pi; USB boot is not enabled in the Pi's EEPROM yet, so a copy on USB can only be checked by reading it back or booting it from SD later).
+
+## USB-MIDI on the Pi
+
+`usb_midi.rs` is shared with x86 (xHCI only, also behind a hub). The Pi's `usb_kbd.rs` now attaches MIDI like
+`usb_hid.rs` does (audio first, then MIDI on the same configuration), releases it with the port and routes its
+events. The `midi` command (`midi`, `midi monitor`, `midi send [#N] HEX..`) moved from `term.rs` to the shared
+`midishell.rs`. Verified: both kernels build, the Pi shows "no USB MIDI device" and refuses a send. Not verified: a
+real MIDI device (none attached yet).

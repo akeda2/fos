@@ -51,6 +51,8 @@ mod slots;
 mod sdhci;
 mod usb_hub;
 mod usb_audio;
+mod usb_midi;
+mod midishell;
 mod usb_kbd;
 mod usb_pointer;
 mod usbshell;

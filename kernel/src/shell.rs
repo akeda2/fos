@@ -74,6 +74,7 @@ static COMMANDS: &[Command] = &[
     Command::new("i2s", "i2s probe|capture [SECONDS]|audio on|off", "the Maltex I2S audio HAT: clock edge counts, a level meter, or offer it as an audio device.", |_, rest| crate::i2s_pi::command(rest)),
     Command::new("bootcode", "bootcode [update] [diskN] [confirm]", "shows or replaces the UEFI loader (loader.efi on disk1).", |_, rest| crate::bootcode::command(rest.split_whitespace())),
     Command::new("i2c", "i2c [status|speed KHZ|scan|read ADDR [N]|write ADDR BYTE...|get ADDR REG [N]]", "the header's I2C bus (GPIO2/3): scan, read and write devices.", |_, rest| crate::i2c::command(rest)),
+    Command::new("midi", "midi [monitor|send [#N] HEX HEX [HEX]]", "USB-MIDI devices: lists them, shows what they send, sends a message.", |_, rest| crate::midishell::command(&mut rest.split_whitespace())),
     Command::new("install", "install diskN [LABEL] [bare] [force]", "copies this system onto another disk (then: install diskN confirm).", |_, rest| crate::install::command(rest.split_whitespace())),
     Command::new("recv", "recv ...", "receives a file over the serial port.", |_, rest| recv_serial(rest)),
     Command::new("peek", "peek ADDR [N]", "reads memory (hex; bring-up).", |_, rest| peek(rest)),

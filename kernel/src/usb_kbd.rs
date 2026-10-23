@@ -153,6 +153,7 @@ pub fn release_port(controller: &mut Controller, port: u8, route: Option<u32>) {
             *freed = keyboard.buffer;
         }
     }
+    crate::usb_midi::release(controller, port, route);
     match route {
         Some(route) => controller.release_route_slots(port, route),
         None => controller.release_port_slots(port),
@@ -203,11 +204,23 @@ pub fn probe_device(controller_index: usize, controller: &mut Controller, mut de
                 }
             });
         }
-        // A USB audio class device (an interface or a headset): PCM streams through isochronous endpoints.
-        if crate::usb_audio::is_audio(&configuration[..total]) {
-            let description = crate::usb_audio::parse(&configuration[..total]);
-            crate::usb_audio::report(&description, &device.path(), vendor, product, xhci::speed_name(device.speed));
-            if crate::usb_audio::attach(controller, device, description, configuration[5]) {
+        // Audio goes first: attaching it selects the configuration, which would reset the bulk endpoints MIDI configured.
+        let midi = crate::usb_midi::find_endpoints(&configuration[..total]);
+        let audio = crate::usb_audio::is_audio(&configuration[..total]);
+        if midi.is_some() || audio {
+            let mut attached = false;
+            if audio {
+                let description = crate::usb_audio::parse(&configuration[..total]);
+                crate::usb_audio::report(&description, &device.path(), vendor, product, xhci::speed_name(device.speed));
+                attached = crate::usb_audio::attach(controller, device, description, configuration[5]);
+            }
+            if let Some(endpoints) = midi {
+                if !attached {
+                    controller.set_configuration(&device, configuration[5])?;
+                }
+                attached |= crate::usb_midi::attach(controller, device, &endpoints, vendor, product);
+            }
+            if attached {
                 return Ok(true);
             }
             controller.release_slot(device.slot);
@@ -276,7 +289,7 @@ fn find_boot_keyboard(descriptors: &[u8]) -> Option<(u8, u8, u16, u8)> {
 
 /// Handles an event nobody was waiting for: a keyboard's report completing (called by xhci.rs's wait loops and `poll`).
 pub fn background_event(controller: &mut Controller, event: &Trb) {
-    if !event.is_transfer() || crate::usb_serial::background_event(controller, event) {
+    if !event.is_transfer() || crate::usb_midi::background_event(controller, event) || crate::usb_serial::background_event(controller, event) {
         return;
     }
     let keyboards = unsafe { &mut *core::ptr::addr_of_mut!(KEYBOARDS) };

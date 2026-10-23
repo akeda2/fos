@@ -58,6 +58,7 @@ mod usb_pointer;
 mod usbshell;
 mod usb_hub;
 mod usb_midi;
+mod midishell;
 mod usb_serial;
 mod usb_serial_pl2303;
 mod usb_serial_ti;

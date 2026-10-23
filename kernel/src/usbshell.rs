@@ -88,6 +88,7 @@ mod imp {
     pub fn after_rescan() {}
 
     pub fn describe_more() {
+        crate::usb_midi::describe_devices(|arguments| crate::println!("{}", arguments));
         crate::usb_serial::describe();
     }
 
