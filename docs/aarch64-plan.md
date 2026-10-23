@@ -369,3 +369,10 @@ watchdog. Differences from x86:
 Verified: `debug crash` and `debug hang` with `reboot-on-crash` + `watchdog 10`: the record appears at the next boot, the Pi
 resets, and the streak guard and its clearing work. Not verified: the hardware-only half (a hang with interrupts masked) and
 `crash-on-boot` as a crash loop.
+
+## bootcode on the Pi (2026-10-23, verified on the Pi)
+
+`bootcode` (`kernel/src/bootcode.rs`) is shared with x86; on aarch64 only the UEFI-loader half exists. It replaces
+`\EFI\BOOT\BOOTAA64.EFI` from `loader.efi` on the boot volume (`make loader-aarch64`, then
+`foscopy.py FILE :disk1/loader.efi`), checking PE machine 0xAA64 and the loader banner, writing `BOOTAA64.NEW` beside it and
+switching with one directory-sector write. Verified: show, update + confirm, readback identical, reboot on the new loader.

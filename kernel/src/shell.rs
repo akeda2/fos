@@ -72,6 +72,7 @@ static COMMANDS: &[Command] = &[
     }),
     Command::new("cpufreq", "cpufreq [MHZ|min|max]", "the ARM clock, SoC temperature and throttle flags; sets the clock.", |_, rest| crate::pipower::command(rest)).alias(&["temp"]),
     Command::new("i2s", "i2s probe|capture [SECONDS]|audio on|off", "the Maltex I2S audio HAT: clock edge counts, a level meter, or offer it as an audio device.", |_, rest| crate::i2s_pi::command(rest)),
+    Command::new("bootcode", "bootcode [update] [diskN] [confirm]", "shows or replaces the UEFI loader (loader.efi on disk1).", |_, rest| crate::bootcode::command(rest.split_whitespace())),
     Command::new("recv", "recv ...", "receives a file over the serial port.", |_, rest| recv_serial(rest)),
     Command::new("peek", "peek ADDR [N]", "reads memory (hex; bring-up).", |_, rest| peek(rest)),
     Command::new("poke", "poke ADDR VALUE", "writes memory (hex; bring-up).", |_, rest| poke(rest)),
@@ -80,6 +81,9 @@ static COMMANDS: &[Command] = &[
 fn execute(line: &str) {
     if line.split_whitespace().next() != Some("format") {
         crate::formatshell::cancel();
+    }
+    if line.split_whitespace().next() != Some("bootcode") {
+        crate::bootcode::cancel();
     }
     if line.is_empty() || fosfor_shell::execute(&mut KernelHost, &[COMMANDS, crate::shellcmds::COMMANDS, fosfor_shell::files::COMMANDS], line) {
         return;

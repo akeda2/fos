@@ -10,6 +10,7 @@ mod ehci;
 #[path = "hda_none.rs"]
 mod hda;
 mod block;
+mod bootcode;
 mod font_data;
 mod clock;
 mod crash;

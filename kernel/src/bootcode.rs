@@ -10,6 +10,8 @@
 //!    build/cargo-target/x86_64-unknown-uefi/release/fosfor-loader.efi) on the boot volume, e.g. `foscopy.py FILE :disk1/stage2.bin`;
 //! 2. `bootcode update` announces what it would write; `bootcode update confirm` as the very next command does it.
 //!
+//! (On aarch64 only the loader exists: `\EFI\BOOT\BOOTAA64.EFI`, an AArch64 PE image; the BIOS half is skipped.)
+//!
 //! The UEFI loader is `\EFI\BOOT\BOOTX64.EFI` on the disk's EFI System Partition (FAT32), the one file UEFI firmware boots from,
 //! so it is replaced as carefully as a boot sector: the new file is checked (a PE image for x86-64, an EFI application, carrying the
 //! loader's banner), written beside the old one as `BOOTX64.NEW` and read back, and only then does one directory-sector write
@@ -33,8 +35,41 @@ const CODE_BYTES: usize = 446;
 
 /// The GPT type GUID of an EFI System Partition, in on-disk byte order.
 const ESP_GUID: [u8; 16] = fatvol::ESP_GUID;
+#[cfg(target_arch = "x86_64")]
 const LOADER_PATH: &str = "\\EFI\\BOOT\\BOOTX64.EFI";
+#[cfg(target_arch = "aarch64")]
+const LOADER_PATH: &str = "\\EFI\\BOOT\\BOOTAA64.EFI";
+#[cfg(target_arch = "x86_64")]
+const LOADER_FILE: &str = "BOOTX64.EFI";
+#[cfg(target_arch = "aarch64")]
+const LOADER_FILE: &str = "BOOTAA64.EFI";
+/// The staging copy's name, and both names as the ESP directory stores them (8.3, lower case).
+#[cfg(target_arch = "x86_64")]
+const LOADER_NEW_FILE: &str = "BOOTX64.NEW";
+#[cfg(target_arch = "aarch64")]
+const LOADER_NEW_FILE: &str = "BOOTAA64.NEW";
+#[cfg(target_arch = "x86_64")]
+const NAME_EFI: &[u8] = b"bootx64.efi";
+#[cfg(target_arch = "aarch64")]
+const NAME_EFI: &[u8] = b"bootaa64.efi";
+#[cfg(target_arch = "x86_64")]
+const NAME_NEW: &[u8] = b"bootx64.new";
+#[cfg(target_arch = "aarch64")]
+const NAME_NEW: &[u8] = b"bootaa64.new";
+/// The PE machine type the loader must carry.
+#[cfg(target_arch = "x86_64")]
+const MACHINE: u16 = 0x8664;
+#[cfg(target_arch = "aarch64")]
+const MACHINE: u16 = 0xaa64;
 /// The largest loader accepted (the real one is a few hundred KiB).
+#[cfg(target_arch = "x86_64")]
+fn pet() {
+    crate::debug::pet();
+}
+#[cfg(target_arch = "aarch64")]
+fn pet() {
+    crate::crash::pet();
+}
 const LOADER_MAX_BYTES: usize = 2 << 20;
 const LOADER_BANNER: &[u8] = b"Fosfor OS loader";
 
@@ -77,6 +112,9 @@ fn fingerprint(bytes: &[u8]) -> u32 {
 /// Reads the BIOS files from the boot volume into the static buffers and checks them. `Ok(None)` when neither is there (an
 /// update of the UEFI loader alone); an error when one is missing or either is not what it should be. Returns stage two's length.
 fn load_bios_files() -> Result<Option<usize>, &'static str> {
+    if cfg!(target_arch = "aarch64") {
+        return Ok(None); // a Pi has no BIOS boot code
+    }
     let volume = storage::boot_volume().ok_or("the boot volume is not mounted, so there are no files to take")?;
     let stage1 = unsafe { &mut *core::ptr::addr_of_mut!(STAGE1_NEW) };
     let stage2 = unsafe { &mut *core::ptr::addr_of_mut!(STAGE2_NEW) };
@@ -132,8 +170,8 @@ fn check_loader(bytes: &[u8]) -> Result<(), &'static str> {
     if le32(pe) != Some(0x0000_4550) {
         return Err("loader.efi has no PE signature");
     }
-    if le16(pe + 4) != Some(0x8664) {
-        return Err("loader.efi is not an x86-64 image");
+    if le16(pe + 4) != Some(MACHINE) {
+        return Err("loader.efi is not an image for this CPU");
     }
     let optional = pe + 24;
     if le16(optional) != Some(0x020b) {
@@ -193,7 +231,7 @@ fn installed_loader(fs: &mut fatvol::Fs, name: &[u8]) -> Result<Option<(u64, u32
         }
         hash = fingerprint_step(hash, &buffer[..count]);
         offset += count as u64;
-        crate::debug::pet();
+        pet();
     }
     Ok(Some((file.size, hash)))
 }
@@ -245,9 +283,13 @@ pub fn command(mut words: core::str::SplitWhitespace) {
         Err(error) => return crate::println!("bootcode: cannot read disk{} ({error:?}).", disk + 1),
     };
     if !update {
-        crate::println!("disk{}: {} MiB. BIOS boot code: stage one {}, stage two at LBA {} (fingerprint {:08x}).", disk + 1, info.sectors / 2048,
-            if has_code { "present in the MBR" } else { "absent (UEFI-only disk)" }, BIOS_STAGE2_LBA, installed);
-        let loader_now = open_loader_directory(disk).and_then(|mut fs| installed_loader(&mut fs, b"bootx64.efi"));
+        if cfg!(target_arch = "aarch64") {
+            crate::println!("disk{}: {} MiB.", disk + 1, info.sectors / 2048);
+        } else {
+            crate::println!("disk{}: {} MiB. BIOS boot code: stage one {}, stage two at LBA {} (fingerprint {:08x}).", disk + 1, info.sectors / 2048,
+                if has_code { "present in the MBR" } else { "absent (UEFI-only disk)" }, BIOS_STAGE2_LBA, installed);
+        }
+        let loader_now = open_loader_directory(disk).and_then(|mut fs| installed_loader(&mut fs, NAME_EFI));
         match &loader_now {
             Ok(Some((size, hash))) => crate::println!("UEFI loader: {LOADER_PATH}, {size} bytes (fingerprint {hash:08x})."),
             Ok(None) => crate::println!("UEFI loader: the EFI System Partition has no {LOADER_PATH}."),
@@ -259,6 +301,7 @@ pub fn command(mut words: core::str::SplitWhitespace) {
                 let same = fingerprint(new) == installed;
                 crate::println!("The boot volume has stage1.bin and stage2.bin ({length} bytes); stage two there is {}.", if same { "identical to the installed one" } else { "different from the installed one" });
             }
+            Ok(None) if cfg!(target_arch = "aarch64") => {}
             Ok(None) => crate::println!("The boot volume has no stage1.bin/stage2.bin (BIOS boot code) to install."),
             Err(reason) => crate::println!("Files for a BIOS boot code update: {reason}."),
         }
@@ -282,6 +325,9 @@ pub fn command(mut words: core::str::SplitWhitespace) {
         Err(reason) => return crate::println!("bootcode: {reason}."),
     };
     if bios.is_none() && loader.is_none() {
+        if cfg!(target_arch = "aarch64") {
+            return crate::println!("bootcode: put loader.efi (the UEFI loader, fosfor-loader.efi from build/cargo-target/aarch64-unknown-uefi/release) on the boot volume first.");
+        }
         return crate::println!("bootcode: put stage1.bin and stage2.bin (BIOS boot code) and/or loader.efi (the UEFI loader) on the boot volume first.");
     }
     if loader.is_some() {
@@ -328,7 +374,7 @@ fn write_bios(disk: usize) {
     if let Err(error) = block::write(disk, BIOS_STAGE2_LBA, stage2) {
         return crate::println!("bootcode: writing stage two failed ({error:?}); the MBR is untouched.");
     }
-    crate::debug::pet();
+    pet();
     let check = unsafe { &mut *core::ptr::addr_of_mut!(STAGE2_NOW) };
     if block::read(disk, BIOS_STAGE2_LBA, check).is_err() || check[..] != stage2[..] {
         return crate::println!("bootcode: stage two read back different; the MBR is untouched. Write the stick again if the disk no longer boots.");
@@ -359,11 +405,11 @@ fn write_loader(disk: usize, address: u64, length: usize) {
         Err(reason) => return crate::println!("bootcode: {reason}; the UEFI loader is untouched."),
     };
     // An earlier update may have been cut after its switch (two names, one chain) or before it (a stale, complete copy).
-    let _ = fs.forget_alias(b"bootx64.new", b"bootx64.efi");
-    let _ = fs.remove(b"bootx64.new");
-    let has_old = matches!(fs.find(b"bootx64.efi"), Ok(Some(_)));
-    let name: &[u8] = if has_old { b"bootx64.new" } else { b"bootx64.efi" };
-    crate::println!("Writing the UEFI loader ({length} bytes) as {}...", if has_old { "BOOTX64.NEW beside the old one" } else { "BOOTX64.EFI (there was none)" });
+    let _ = fs.forget_alias(NAME_NEW, NAME_EFI);
+    let _ = fs.remove(NAME_NEW);
+    let has_old = matches!(fs.find(NAME_EFI), Ok(Some(_)));
+    let name: &[u8] = if has_old { NAME_NEW } else { NAME_EFI };
+    crate::println!("Writing the UEFI loader ({length} bytes) as {}...", if has_old { "the staging copy beside the old one" } else { "the loader (there was none)" });
     let stream = match fs.create(name, length as u64) {
         Ok(stream) => stream,
         Err(error) => return crate::println!("bootcode: no room for the new loader on the EFI System Partition ({error:?}); the old one is untouched."),
@@ -373,25 +419,25 @@ fn write_loader(disk: usize, address: u64, length: usize) {
         if let Err(error) = fs.write(&stream, offset as u64, chunk, (offset + chunk.len()) as u64) {
             return crate::println!("bootcode: writing the new loader failed ({error:?}); the old one is untouched.");
         }
-        crate::debug::pet();
+        pet();
     }
     if let Err(error) = fs.finish(&stream, name, length as u64) {
         return crate::println!("bootcode: finishing the new loader failed ({error:?}); the old one is untouched.");
     }
     match installed_loader(&mut fs, name) {
         Ok(Some((size, hash))) if size == length as u64 && hash == fingerprint(bytes) => {}
-        _ => return crate::println!("bootcode: the new loader read back different; the old one is untouched (a stray BOOTX64.NEW stays; the next update removes it)."),
+        _ => return crate::println!("bootcode: the new loader read back different; the old one is untouched (a stray {LOADER_NEW_FILE} stays; the next update removes it)."),
     }
     if has_old {
-        crate::println!("Switching BOOTX64.EFI to the new file (one directory-sector write)...");
-        if let Err(error) = fs.replace(b"bootx64.efi", b"bootx64.new") {
+        crate::println!("Switching {LOADER_FILE} to the new file (one directory-sector write)...");
+        if let Err(error) = fs.replace(NAME_EFI, NAME_NEW) {
             return crate::println!("bootcode: the switch failed ({error:?}); check `bootcode` before rebooting.");
         }
     }
-    match installed_loader(&mut fs, b"bootx64.efi") {
+    match installed_loader(&mut fs, NAME_EFI) {
         Ok(Some((size, hash))) if size == length as u64 && hash == fingerprint(bytes) => {
             crate::println!("Done: the loader reads back identical. The new loader runs at the next UEFI boot (`reboot`).");
         }
-        _ => crate::println!("bootcode: BOOTX64.EFI does not read back as the new loader; check `bootcode` before rebooting."),
+        _ => crate::println!("bootcode: {LOADER_FILE} does not read back as the new loader; check `bootcode` before rebooting."),
     }
 }
