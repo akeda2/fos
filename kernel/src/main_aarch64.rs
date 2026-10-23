@@ -37,6 +37,7 @@ mod tapesync;
 mod gpio;
 mod gpio_remote;
 mod gpio_shell;
+mod i2c;
 mod shellhost;
 mod storage;
 mod tape_aarch64;

@@ -376,3 +376,15 @@ resets, and the streak guard and its clearing work. Not verified: the hardware-o
 `\EFI\BOOT\BOOTAA64.EFI` from `loader.efi` on the boot volume (`make loader-aarch64`, then
 `foscopy.py FILE :disk1/loader.efi`), checking PE machine 0xAA64 and the loader banner, writing `BOOTAA64.NEW` beside it and
 switching with one directory-sector write. Verified: show, update + confirm, readback identical, reboot on the new loader.
+
+## I2C on the Pi (2026-10-23, verified on the Pi without a device)
+
+`kernel/src/i2c.rs`: BSC1 (GPIO2 SDA / GPIO3 SCL, alt0) as a master, shell `i2c [status|speed KHZ|scan|read|write|get]`. The
+divider comes from the firmware's core clock (mailbox id 4, 500 MHz). Waits spin 30 us, then `wfi` with the BSC interrupt (GIC SPI 117)
+armed, as the SD driver does. No repeated START yet (`get` is write, STOP, read). Verified with an empty bus: a scan takes 26/13/3/1 ms
+at 50/100/400/1000 kHz (nine clocks per probe, so the clock and divider are right) and one interrupt per probe. A NACK can raise
+DONE before ERR, and the next transfer needs TA to fall first; both bit at 400 kHz. Not verified: a real device, clock stretching,
+transfers over 16 bytes (FIFO refill), the tape ABI (not added yet).
+
+Target: the DFRobot ~4.5" DSI panel (chips seen: ICN6211 DSI-to-RGB bridge, GD32V MCU, AEP7510, AJ2004). The ICN6211 is set up over
+I2C (usually 0x2c; Linux `chipone-icn6211.c`), but the Pi's DSI1 controller also needs a driver.
