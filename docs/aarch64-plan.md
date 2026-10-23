@@ -347,3 +347,6 @@ the tiny freestanding headers in `crates/opus-codec/libc-a64/` (math maps to `__
 code the linker drops). `duplex` has an aarch64 `duplex_switch` (x19-x30, d8-d15). Verified: `send proto=rtp codec=opus src=tone=440`
 encodes at about 335 us per 20 ms frame (686 us worst) and announces via SAP. Not verified: receiving it elsewhere, I2S input and
 playback with a real signal, `duplex`, hardware timestamps (genet has none).
+
+`opus-bench` runs on the Pi too (same libopus archive): 100 stereo 20 ms frames at complexity 10, 96 kbit/s: encode 565 us average
+(2.8 % of a core), decode 137 us. That is every general-purpose tape; `memtest`, `fpcheck`, `cpu64-*` and `longmode-rs` are x86-only.

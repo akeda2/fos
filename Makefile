@@ -196,7 +196,7 @@ kernel-aarch64:
 	cd kernel && cargo +nightly-2026-09-13 build --release --target aarch64-unknown-none-softfloat -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem
 
 # Tapes for aarch64 (M2 of the plan): the portable ones, built for the built-in hard-float aarch64-unknown-none target.
-A64_TAPES := hello gfxcheck calc ed netcheck clock gonio ptp play record recorder ltas kaffe fterm telnet net-chat ip-chat bridge nettest router audio-net
+A64_TAPES := hello gfxcheck calc ed netcheck clock gonio ptp play record recorder ltas kaffe fterm telnet net-chat ip-chat bridge nettest router audio-net opus-bench
 A64_TAPE_DIR := $(CARGO_TARGET_DIR)/aarch64-unknown-none/release
 A64_TAPE_STAMPED := build/fosfor-aarch64/tapes
 
