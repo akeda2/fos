@@ -424,6 +424,8 @@ fn next_key() -> Option<u16> {
 }
 
 extern "C" fn api_read_key() -> u32 {
+    // A tape that polls keys with `read_key` (gonio, clock) never calls `should_abort`: it still counts as progress.
+    crate::crash::pet();
     if crate::tasks::in_service() {
         return crate::tasks::service_read_key();
     }
@@ -455,6 +457,7 @@ extern "C" fn api_set_input_mode(_mode: u32) {}
 /// A tape found nothing to do. Alone, the CPU sleeps until the next interrupt. With two tapes each gets a pass before the CPU
 /// sleeps, and the other tape runs now.
 extern "C" fn api_wait_for_event() {
+    crate::crash::pet();
     if crate::tasks::in_service() {
         return crate::tasks::service_wait();
     }
