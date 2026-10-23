@@ -1055,6 +1055,7 @@ fn execute(command: &str) {
             _ => {}
         },
         "midi" => crate::midishell::command(&mut words),
+        "touch" => crate::usb_pointer::command(&mut words),
         "cpufreq" | "temp" => power_command(None),
         "power" => match words.next() {
             Some("hwp") => hwp_command(words.next()),

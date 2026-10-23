@@ -198,6 +198,8 @@ fn make_api(info: &BootInfo, arguments: &str) -> TapeApi {
         gpio_function: crate::gpio::api_gpio_function,
         i2c_speed: crate::i2c::api_i2c_speed,
         i2c_transfer: crate::i2c::api_i2c_transfer,
+        touch_info: crate::usb_pointer::api_touch_info,
+        touch_read: crate::usb_pointer::api_touch_read,
     }
 }
 

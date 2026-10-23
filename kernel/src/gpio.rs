@@ -291,6 +291,15 @@ pub fn set_function(pin: usize, function: u8, level: bool) -> Result<(), Error> 
     Ok(())
 }
 
+/// The kernel's own use of a pin the shell and tapes may not touch (the display connector's I2C on GPIO44/45).
+pub fn set_function_kernel(pin: usize, function: u8) -> bool {
+    if !available() || pin >= PINS || function > 7 {
+        return false;
+    }
+    set_code(pin, FUNC_TO_CODE[usize::from(function)]);
+    true
+}
+
 pub fn set_pull(pin: usize, pull: u8) -> Result<(), Error> {
     check(pin)?;
     if pull > PULL_DOWN {

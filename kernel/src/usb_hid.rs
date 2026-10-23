@@ -64,6 +64,7 @@ pub fn release_port(controller: &mut Controller, port: u8, route: Option<u32>) {
         }
     }
     crate::usb_midi::release(controller, port, route);
+    crate::usb_pointer::release(controller, port, route);
     // The slots go first: the controller must stop writing reports before their buffer is handed back.
     match route {
         Some(route) => controller.release_route_slots(port, route),
@@ -260,7 +261,9 @@ pub fn probe_device(controller_index: usize, controller: &mut Controller, mut de
             }
             crate::usb_serial::Outcome::Unclaimed => {}
         }
-        crate::usb_pointer::describe(controller, &device, &configuration[..total], vendor, product);
+        if crate::usb_pointer::claim(controller, &device, &configuration[..total], vendor, product) {
+            return Ok(true);
+        }
         controller.release_slot(device.slot);
         crate::println!("USB: port {port}: {vendor:04x}:{product:04x} (device class {:#04x}, {}): nothing here uses it.", descriptor[4], xhci::speed_name(device.speed));
         return Ok(false);
@@ -331,7 +334,7 @@ pub fn background_event(controller: &mut Controller, event: &Trb) {
     if !event.is_transfer() {
         return;
     }
-    if crate::usb_midi::background_event(controller, event) || crate::usb_serial::background_event(controller, event) {
+    if crate::usb_midi::background_event(controller, event) || crate::usb_pointer::background_event(controller, event) || crate::usb_serial::background_event(controller, event) {
         return;
     }
     let keyboards = unsafe { &mut *core::ptr::addr_of_mut!(KEYBOARDS) };

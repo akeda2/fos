@@ -17,18 +17,23 @@
 //! sensors) accept that; one that needs a repeated START does not work until the BSC's chained-transfer trick is tried.
 //! A scan probes with a one-byte read, as `i2cdetect -r` does; a write probe would change a device's register pointer.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use crate::timer;
 
-const BASE: u64 = 0xfe80_4000;
 const PI4_GIC_DISTRIBUTOR: u64 = 0xff84_1000;
 /// BSC1's GIC interrupt: VideoCore interrupt 21 (shared by the BSC units) is SPI 96 + 21.
 const INTID: u32 = 32 + 117;
-const SDA: usize = 2;
-const SCL: usize = 3;
-/// GPIO alt0 in `gpio::set_function` numbering (0 in, 1 out, 2.. alt0..).
-const ALT0: u8 = 2;
+/// The two buses: the 40-pin header's (BSC1, GPIO2/3 alt0) and the one on the DSI/CSI camera-display connectors, where
+/// a display's touch controller sits (BSC0, GPIO44/45 alt1; the same pins carry the connectors' EEPROM and camera I2C).
+const HEADER: u8 = 0;
+const DSI: u8 = 1;
+const BASES: [u64; 2] = [0xfe80_4000, 0xfe20_5000];
+const PINS: [(usize, usize); 2] = [(2, 3), (44, 45)];
+/// `gpio::set_function` numbering: 0 in, 1 out, 2.. alt0..; the header bus is alt0, the connector bus alt1.
+const FUNCTIONS: [u8; 2] = [2, 3];
+static BUS: AtomicU8 = AtomicU8::new(HEADER);
+static MAPPED: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
 /// Clock id 4 of the mailbox clock tags: the VideoCore core clock, the BSC's input.
 const CORE_CLOCK: u32 = 4;
 
@@ -94,11 +99,11 @@ static SPEED_HZ: AtomicU32 = AtomicU32::new(100_000);
 static INTERRUPTS: AtomicU64 = AtomicU64::new(0);
 
 fn read(offset: u64) -> u32 {
-    unsafe { ((BASE + offset) as *const u32).read_volatile() }
+    unsafe { ((BASES[usize::from(BUS.load(Ordering::Relaxed))] + offset) as *const u32).read_volatile() }
 }
 
 fn write(offset: u64, value: u32) {
-    unsafe { ((BASE + offset) as *mut u32).write_volatile(value) }
+    unsafe { ((BASES[usize::from(BUS.load(Ordering::Relaxed))] + offset) as *mut u32).write_volatile(value) }
 }
 
 /// IRQ context: drop the interrupt enables so the level line falls; the foreground reads the status itself.
@@ -131,19 +136,27 @@ fn start() -> Result<(), Error> {
     if !available() {
         return Err(Error::NoBus);
     }
-    if STARTED.swap(true, Ordering::AcqRel) {
-        return Ok(());
+    let bus = usize::from(BUS.load(Ordering::Relaxed));
+    if !STARTED.swap(true, Ordering::AcqRel) {
+        crate::gic::register(INTID, true, interrupt);
     }
-    crate::paging::map_device(BASE, 0x1000);
-    crate::gic::register(INTID, true, interrupt);
-    write(C, C_EN | C_CLEAR);
+    if !MAPPED[bus].swap(true, Ordering::AcqRel) {
+        crate::paging::map_device(BASES[bus], 0x1000);
+        write(C, C_EN | C_CLEAR);
+    }
     Ok(())
 }
 
 fn pins() -> Result<(), Error> {
-    for pin in [SDA, SCL] {
-        if crate::gpio::function(pin) != Some(ALT0) {
-            crate::gpio::set_function(pin, ALT0, false).map_err(|_| Error::Pins)?;
+    let bus = usize::from(BUS.load(Ordering::Relaxed));
+    let (sda, scl) = PINS[bus];
+    for pin in [sda, scl] {
+        if crate::gpio::function(pin) != Some(FUNCTIONS[bus]) {
+            // Only the header's pins are the tapes' to deny; the connector's are the kernel's own.
+            let done = if bus == usize::from(HEADER) { crate::gpio::set_function(pin, FUNCTIONS[bus], false).is_ok() } else { crate::gpio::set_function_kernel(pin, FUNCTIONS[bus]) };
+            if !done {
+                return Err(Error::Pins);
+            }
         }
     }
     Ok(())
@@ -262,6 +275,25 @@ fn transfer(address: u8, mut io: Io) -> Result<(), Error> {
     result
 }
 
+/// Runs `f` on the display connector's bus at `hz`, then puts the selected bus and speed back (the foreground owns the
+/// controller, so nothing else touches the registers meanwhile).
+fn on_dsi<T>(hz: u32, f: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+    let (bus, speed) = (BUS.swap(DSI, Ordering::Relaxed), SPEED_HZ.swap(hz, Ordering::Relaxed));
+    let result = f();
+    BUS.store(bus, Ordering::Relaxed);
+    SPEED_HZ.store(speed, Ordering::Relaxed);
+    result
+}
+
+/// A read from the display connector's bus (where a DSI display's touch chip is), whatever bus the shell has selected.
+pub fn read_dsi(address: u8, data: &mut [u8], hz: u32) -> Result<(), Error> {
+    on_dsi(hz, || read_bytes(address, data))
+}
+
+pub fn write_read_dsi(address: u8, request: &[u8], data: &mut [u8], hz: u32) -> Result<(), Error> {
+    on_dsi(hz, || write_read(address, request, data))
+}
+
 /// Writes `data` to the 7-bit device `address`.
 pub fn write_bytes(address: u8, data: &[u8]) -> Result<(), Error> {
     transfer(address, Io::Write(data))
@@ -324,11 +356,12 @@ pub extern "C" fn api_i2c_transfer(address: u32, out: *const u8, out_len: u32, i
 /// A tape ends: the bus goes back to 100 kHz.
 pub fn tape_ended() {
     SPEED_HZ.store(100_000, Ordering::Relaxed);
+    BUS.store(HEADER, Ordering::Relaxed);
 }
 
 // ---- the shell command ------------------------------------------------------------------------------------------------
 
-const USAGE: &str = "i2c [status|speed KHZ|scan|read ADDR [N]|write ADDR BYTE...|get ADDR REG [N]]  (hex ADDR, REG, BYTE)";
+const USAGE: &str = "i2c [status|bus header|dsi|speed KHZ|scan|read ADDR [N]|write ADDR BYTE...|get ADDR REG [N]]  (hex ADDR, REG, BYTE)";
 
 fn hex(word: Option<&str>) -> Option<u8> {
     u8::from_str_radix(word?.trim_start_matches("0x"), 16).ok()
@@ -362,11 +395,16 @@ pub fn command(rest: &str) {
                 return crate::println!("i2c: {}.", Error::NoBus.text());
             }
             match divider() {
-                Some((clock, div, actual)) => crate::println!("I2C1 (SDA GPIO{SDA}, SCL GPIO{SCL}): core clock {} MHz / {div} = {} kHz (asked {}), {} interrupts.",
-                    clock / 1_000_000, actual / 1000, speed() / 1000, interrupt_count()),
+                Some((clock, div, actual)) => crate::println!("I2C{} (SDA GPIO{}, SCL GPIO{}): core clock {} MHz / {div} = {} kHz (asked {}), {} interrupts.",
+                    1 - BUS.load(Ordering::Relaxed), PINS[usize::from(BUS.load(Ordering::Relaxed))].0, PINS[usize::from(BUS.load(Ordering::Relaxed))].1, clock / 1_000_000, actual / 1000, speed() / 1000, interrupt_count()),
                 None => crate::println!("i2c: the firmware does not answer for the core clock."),
             }
         }
+        "bus" => match words.next() {
+            Some("header") => BUS.store(HEADER, Ordering::Relaxed),
+            Some("dsi") => BUS.store(DSI, Ordering::Relaxed),
+            _ => crate::println!("i2c bus: header (GPIO2/3) or dsi (the display connector, GPIO44/45)."),
+        },
         "speed" => match words.next().and_then(|word| word.parse::<u32>().ok()) {
             Some(khz) => report(set_speed(khz.saturating_mul(1000))),
             None => crate::println!("{USAGE}"),

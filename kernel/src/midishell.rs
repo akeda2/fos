@@ -61,6 +61,11 @@ pub fn command<'a>(words: &mut impl Iterator<Item = &'a str>) {
     }
 }
 
+/// One pass over the USB controllers' event rings (what a blocking monitor loop calls).
+pub fn poll_usb() {
+    imp::poll();
+}
+
 #[cfg(target_arch = "x86_64")]
 mod imp {
     pub fn poll() {

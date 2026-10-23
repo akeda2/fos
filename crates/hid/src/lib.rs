@@ -106,6 +106,10 @@ pub fn parse_pointer(descriptor: &[u8]) -> Option<Pointer> {
     let mut local = Local::default();
     let mut application = (0u16, 0u16);
     let mut nesting = 0u32;
+    // A finger collection inside the application starts a contact; with those, a repeated field inside one is ignored
+    // (an ELAN panel declares X and Y twice per finger).
+    let mut grouped = false;
+    let mut fresh = false;
 
     let mut at = 0;
     while at < descriptor.len() {
@@ -165,6 +169,10 @@ pub fn parse_pointer(descriptor: &[u8]) -> Option<Pointer> {
                 if nesting == 0 {
                     application = (global.page, if local.count > 0 { local.usages[0] } else { 0 });
                 }
+                if nesting >= 1 {
+                    grouped = true;
+                    fresh = true;
+                }
                 nesting += 1;
                 local = Local::default();
             }
@@ -200,7 +208,7 @@ pub fn parse_pointer(descriptor: &[u8]) -> Option<Pointer> {
                         for index in 0..global.count {
                             let usage = usage_at(&local, index);
                             let field = Field { offset: position, size: global.size as u8, min: global.min, max: global.max, signed: global.min < 0, relative };
-                            place(report, global.page, usage, field);
+                            place(report, global.page, usage, field, grouped, &mut fresh);
                             position = position.saturating_add(global.size as u16);
                         }
                     }
@@ -258,7 +266,7 @@ enum Slot {
 
 /// Files one field into the pointer's contact list. A new contact starts when a field that already exists in
 /// the current contact appears again (the finger collection repeats).
-fn place(report: &mut Pointer, page: u16, usage: u16, field: Field) {
+fn place(report: &mut Pointer, page: u16, usage: u16, field: Field, grouped: bool, fresh: &mut bool) {
     let (slot, from_button) = match (page, usage) {
         (PAGE_GENERIC_DESKTOP, USAGE_X) => (Slot::X, false),
         (PAGE_GENERIC_DESKTOP, USAGE_Y) => (Slot::Y, false),
@@ -275,6 +283,16 @@ fn place(report: &mut Pointer, page: u16, usage: u16, field: Field) {
         report.contact_count = 1;
     }
     let mut index = report.contact_count - 1;
+    if *fresh && !from_button {
+        *fresh = false;
+        let c = &report.contacts[index];
+        if (c.x.is_some() || c.y.is_some() || c.id.is_some()) && report.contact_count < MAX_CONTACTS {
+            report.contact_count += 1;
+            index += 1;
+        }
+    } else if grouped && get(&report.contacts[index], slot).is_some() {
+        return;
+    }
     if get(&report.contacts[index], slot).is_some() {
         // Button 1 only stands in for a tip switch; it never starts a new contact.
         if from_button || report.contact_count >= MAX_CONTACTS {
@@ -412,6 +430,27 @@ mod tests {
         0x09, 0x31, 0x81, 0x02, 0x75, 0x02, 0x81, 0x03, 0xc0, //
         0x05, 0x0d, 0x09, 0x54, 0x25, 0x7f, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02, 0xc0,
     ];
+
+    // ELAN style: X and Y are declared with count 2 inside each finger collection; the finger collection, not the repeated
+    // field, starts a contact. Per finger: tip(1) pad(7) x(16) x2(16) y(16) y2(16) = 9 bytes.
+    const ELAN_TOUCH: &[u8] = &[
+        0x05, 0x0d, 0x09, 0x04, 0xa1, 0x01, 0x85, 0x01, //
+        0x09, 0x22, 0xa1, 0x02, 0x09, 0x42, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x01, 0x81, 0x02, 0x75, 0x07, 0x81, 0x03, //
+        0x05, 0x01, 0x09, 0x30, 0x26, 0xf0, 0x0c, 0x75, 0x10, 0x95, 0x02, 0x81, 0x02, 0x26, 0x50, 0x07, 0x09, 0x31, 0x81, 0x02, 0xc0, //
+        0x05, 0x0d, 0x09, 0x22, 0xa1, 0x02, 0x09, 0x42, 0x75, 0x01, 0x95, 0x01, 0x25, 0x01, 0x81, 0x02, 0x75, 0x07, 0x81, 0x03, //
+        0x05, 0x01, 0x09, 0x30, 0x26, 0xf0, 0x0c, 0x75, 0x10, 0x95, 0x02, 0x81, 0x02, 0x26, 0x50, 0x07, 0x09, 0x31, 0x81, 0x02, 0xc0, 0xc0,
+    ];
+
+    #[test]
+    fn repeated_fields_stay_in_one_contact() {
+        let pointer = parse_pointer(ELAN_TOUCH).unwrap();
+        assert_eq!(pointer.contact_count, 2);
+        assert_eq!(pointer.contacts[0].x.unwrap().offset, 8);
+        assert_eq!(pointer.contacts[0].y.unwrap().offset, 40);
+        assert_eq!(pointer.contacts[0].y.unwrap().max, 1872);
+        assert_eq!(pointer.contacts[1].tip.unwrap().offset, 72);
+        assert_eq!(pointer.contacts[1].y.unwrap().max, 1872);
+    }
 
     #[test]
     fn multi_touch() {

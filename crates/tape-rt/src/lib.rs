@@ -751,6 +751,36 @@ pub fn i2c_transfer(address: u8, out: &[u8], input: &mut [u8]) -> Result<(), i32
     }
 }
 
+/// One finger event from a USB touch panel, in the panel's own coordinates (`touch_extent` gives their range).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TouchEvent {
+    pub panel: u32,
+    pub id: i32,
+    pub x: i32,
+    pub y: i32,
+    pub down: bool,
+    /// The tape screen it sits on; -1 when unknown.
+    pub screen: i32,
+}
+
+fn touch_table() -> Option<&'static TapeApi> {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, touch_read) + core::mem::size_of::<usize>();
+    (table.version >= 24 && table.size as usize >= end).then_some(table)
+}
+
+/// The largest X and Y of touch panel `panel` (0-based); `None` without such a panel or on a kernel older than version 24.
+pub fn touch_extent(panel: u32) -> Option<(i32, i32)> {
+    let packed = (touch_table()?.touch_info)(panel);
+    (packed != 0).then_some(((packed >> 32) as i32, packed as u32 as i32))
+}
+
+/// The next finger event, if any.
+pub fn touch_event() -> Option<TouchEvent> {
+    let mut out = [0i32; 6];
+    ((touch_table()?.touch_read)(out.as_mut_ptr()) == 1).then(|| TouchEvent { panel: out[0] as u32, id: out[1], x: out[2], y: out[3], down: out[4] != 0, screen: out[5] })
+}
+
 /// `gfx_info` for screen number `screen` (0-based). Screen 0 works on kernels from version 17, others need 20. From 20 on,
 /// even screen 0 goes through the numbered calls: `run A | B` splits the console into two screens, 0 and 1.
 pub fn gfx_info_on(screen: u32) -> Option<(u32, u32)> {

@@ -22,7 +22,8 @@ core::arch::global_asm!(
     .global _start
     _start:
         msr daifset, #0xf              // debug, SError, IRQ, FIQ masked
-        adr x1, __stack_top
+        adrp x1, __stack_top           // adr only reaches 1 MiB, the image is bigger
+        add x1, x1, :lo12:__stack_top
         mov sp, x1
         mov x29, xzr
         bl kmain                       // x0 still holds the BootInfo pointer

@@ -626,6 +626,8 @@ pub fn build_api(info: &BootInfo, arguments: &str) -> TapeApi {
         gpio_function: crate::gpio::api_gpio_function,
         i2c_speed: api_i2c_speed,
         i2c_transfer: api_i2c_transfer,
+        touch_info: crate::usb_pointer::api_touch_info,
+        touch_read: crate::usb_pointer::api_touch_read,
     }
 }
 

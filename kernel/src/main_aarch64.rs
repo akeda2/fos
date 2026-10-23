@@ -38,6 +38,7 @@ mod gpio;
 mod gpio_remote;
 mod gpio_shell;
 mod i2c;
+mod dsitouch;
 mod install;
 mod shellhost;
 mod storage;
@@ -245,6 +246,9 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
     }
     tape_aarch64::set_boot_info(info);
     println!("USB: {} keyboard(s) found.", usb_kbd::init());
+    if dsitouch::init() {
+        println!("DSI touch: FT5406-style controller at 0x38 on the display connector's I2C bus (`touch`).");
+    }
     let no_msi = shell::apply_settings();
     xhci::enable_interrupts_all(no_msi);
     cpu::interrupts_enable();

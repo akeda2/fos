@@ -405,3 +405,22 @@ Pi; USB boot is not enabled in the Pi's EEPROM yet, so a copy on USB can only be
 events. The `midi` command (`midi`, `midi monitor`, `midi send [#N] HEX..`) moved from `term.rs` to the shared
 `midishell.rs`. Verified: both kernels build, the Pi shows "no USB MIDI device" and refuses a send. Not verified: a
 real MIDI device (none attached yet).
+
+## Touch screens, USB and DSI (2026-10-23)
+
+Shell `touch` lists the panels, `touch monitor` prints finger events (down/moved, up) until Escape; tapes read them with ABI 24
+`touch_info` / `touch_read` (`tape_rt::touch_event`, `touch_extent`); `kaffe` presses its buttons with them. One event queue
+(`kernel/src/usb_pointer.rs`), two sources:
+
+- **USB touch screens** (both kernels, xHCI): a HID digitizer's report descriptor is parsed by `crates/hid` (`parse_pointer`,
+  `Pointer::decode`), its interrupt-IN endpoint kept queued like a keyboard's. Checked with an ELAN 04f3:249f (10 contacts,
+  3312 x 1872) on the Pi's hub; that panel declares X and Y twice per finger, so a contact starts at the finger collection, not at
+  a repeated field. Coordinates are the panel's own; `touch_read` reports the tape screen a panel sits on, -1 for a USB panel
+  (any monitor), so a tape takes it as covering its screen.
+- **The DSI display's chip** (Pi only, `kernel/src/dsitouch.rs`): an FT5406-style controller at 0x38 on the display connector's
+  I2C bus, BSC0 on GPIO44/45 alt1 (`i2c bus dsi` selects it in the shell; `i2c scan` there shows 0x38, and 0x45 for the
+  panel's own controller, as on the official 7" screen). No interrupt line is used: the chip is read (400 kHz, at most every 8 ms)
+  whenever something asks for an event. 800 x 480 on the DFRobot 4.5"; it is tape screen 0. The tape i2c calls stay on the header bus.
+
+Verified on the Pi: both panels' events in `touch monitor`, `kaffe` buttons on the USB panel. Not verified: two fingers, `kaffe` on
+the DSI screen, an x86 USB touch screen.

@@ -89,6 +89,7 @@ mod imp {
 
     pub fn describe_more() {
         crate::usb_midi::describe_devices(|arguments| crate::println!("{}", arguments));
+        crate::usb_pointer::describe_devices(|arguments| crate::println!("{}", arguments));
         crate::usb_serial::describe();
     }
 

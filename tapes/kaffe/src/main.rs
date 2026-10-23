@@ -1,8 +1,8 @@
 //! `kaffe`: a graphic "coffee is ready" board, the fos version of radiokannan's touch page. A big red clock, a
 //! "Kaffet klart!" button that stamps the time the coffee was made and a "Rensa" button that clears the stamp. The stamp is
 //! kept in `kaffe.cfg` (`last=YYYY-MM-DDTHH:MM`), so it survives leaving the tape and a reboot, like the page's localStorage.
-//! Keys: Enter or Space = Kaffet klart!, c, Delete or Backspace = Rensa, Escape quits. The buttons are plain rectangles
-//! (`Layout::button_at`), so a touch or mouse press maps onto them with one call once the kernel reports pointer events.
+//! Keys: Enter or Space = Kaffet klart!, c, Delete or Backspace = Rensa, Escape quits; a USB touch screen presses the buttons. The buttons are plain rectangles
+//! (`Layout::button_at`); a touch is scaled from the panel's range to the screen and looked up there.
 #![no_std]
 #![no_main]
 
@@ -269,6 +269,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     println!("kaffe: Enter or Space = Kaffet klart!, c = Rensa, Escape quits.");
     let mut decoder = KeyDecoder::new();
     let mut pressed: Option<(Button, u64)> = None;
+    let mut finger_down: Option<i32> = None;
     let mut last_second = u8::MAX;
     loop {
         let mut action = None;
@@ -279,6 +280,21 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         });
         if !keep_going {
             break;
+        }
+        // A touch panel is taken to cover the whole screen: a finger going down on a button presses it.
+        while let Some(touch) = tape_rt::touch_event() {
+            if touch.screen >= 0 && touch.screen != screen_number as i32 {
+                continue; // a panel on another screen
+            }
+            if let (true, Some((max_x, max_y))) = (touch.down, tape_rt::touch_extent(touch.panel)) {
+                if finger_down != Some(touch.id) {
+                    let (x, y) = (touch.x * layout.width / max_x.max(1), touch.y * layout.height / max_y.max(1));
+                    action = action.or(layout.button_at(x, y));
+                }
+                finger_down = Some(touch.id);
+            } else if finger_down == Some(touch.id) {
+                finger_down = None;
+            }
         }
         if let Some(sync) = sync.as_mut() {
             if syncing {
