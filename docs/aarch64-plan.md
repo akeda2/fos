@@ -424,3 +424,7 @@ Shell `touch` lists the panels, `touch monitor` prints finger events (down/moved
 
 Verified on the Pi: both panels' events in `touch monitor`, `kaffe` buttons on the USB panel. Not verified: two fingers, `kaffe` on
 the DSI screen, an x86 USB touch screen.
+
+Rotation (2026-10-23): a single tape takes `rotate=r|l|flip` (`run kaffe screen=0 rotate=l`; `f` and `180` also mean flip),
+and touch follows the rotation of the screen it belongs to (`usb_pointer::upright`; the shell `touch monitor` stays raw).
+Checked on the Pi's DSI screen with `kaffe`; an x86 run and a USB panel on a rotated HDMI screen are untested.

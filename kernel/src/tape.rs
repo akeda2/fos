@@ -960,7 +960,19 @@ pub fn run_named(arguments: &str) {
             }
             match load_staged(name) {
                 Ok(()) => {
-                    if let Err(reason) = run(rest.trim()) {
+                    // `rotate=r|l`: turn the screen the tape draws on for this run, as the `rotate` setting does.
+                    let (mut text, mut arguments) = ([0u8; 256], rest.trim());
+                    let turn = crate::tasks::own_rotation(arguments);
+                    if turn.is_some() {
+                        let Some(stripped) = crate::tasks::with_screen(&mut text, arguments, 0, false) else {
+                            return crate::println!("run: the arguments of a tape take at most 240 bytes.");
+                        };
+                        arguments = stripped;
+                        crate::framebuffer::rotate_run(0, turn);
+                    }
+                    let outcome = run(arguments);
+                    crate::framebuffer::rotate_reset();
+                    if let Err(reason) = outcome {
                         crate::println!("run: {reason}.");
                     }
                 }

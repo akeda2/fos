@@ -317,6 +317,11 @@ pub fn rotate_option(first: &str, second: &str) -> Option<crate::framebuffer::Ro
     first.split_ascii_whitespace().chain(second.split_ascii_whitespace()).find_map(|word| word.strip_prefix("rotate=")).and_then(crate::framebuffer::Rotate::parse)
 }
 
+/// The `rotate=` of a single tape's arguments (`run NAME rotate=l`).
+pub fn own_rotation(arguments: &str) -> Option<crate::framebuffer::Rotate> {
+    rotate_option(arguments, "")
+}
+
 /// The `screen=N` of a `run A | B` pair: the physical screen the pair shares (either tape may name it).
 pub fn group_screen(first: &str, second: &str) -> Option<usize> {
     first.split_ascii_whitespace().chain(second.split_ascii_whitespace()).find_map(|word| word.strip_prefix("screen=")?.parse().ok())

@@ -278,10 +278,30 @@ pub fn range(index: usize) -> Option<(i32, i32)> {
     Some(extent(&panel.pointer))
 }
 
+/// How the monitor a panel sits on is turned (`framebuffer::Rotate`; tapes draw upright on the logical screen). Only panels
+/// whose screen is known follow a rotation.
+fn turn_of(panel: u8) -> Option<crate::framebuffer::Rotate> {
+    usize::try_from(screen_of(panel)).ok().filter(|&screen| screen <= 1).and_then(crate::framebuffer::rotation)
+}
+
+/// A panel's coordinates seen from the logical (rotated) screen: right = clockwise, the logical top-left corner is at the
+/// framebuffer's top right; left = anti-clockwise, at its bottom left (the extent's X and Y swap for both); flip = 180 degrees.
+fn upright(turn: Option<crate::framebuffer::Rotate>, (max_x, max_y): (i32, i32), (x, y): (i32, i32)) -> ((i32, i32), (i32, i32)) {
+    match turn {
+        None => ((max_x, max_y), (x, y)),
+        Some(crate::framebuffer::Rotate::Right) => ((max_y, max_x), (y, max_x - x)),
+        Some(crate::framebuffer::Rotate::Left) => ((max_y, max_x), (max_y - y, x)),
+        Some(crate::framebuffer::Rotate::Flip) => ((max_x, max_y), (max_x - x, max_y - y)),
+    }
+}
+
 /// Tape ABI 24 `touch_info`.
 pub extern "C" fn api_touch_info(panel: u32) -> u64 {
     match range(panel as usize) {
-        Some((x, y)) => ((x as u64) << 32) | y as u64,
+        Some(extent) => {
+            let ((x, y), _) = upright(u8::try_from(panel).ok().and_then(turn_of), extent, (0, 0));
+            ((x as u64) << 32) | y as u64
+        }
         None => 0,
     }
 }
@@ -298,7 +318,9 @@ pub extern "C" fn api_touch_read(out: *mut i32) -> i32 {
     crate::midishell::poll_usb();
     match take() {
         Some(event) => {
-            unsafe { out.copy_from_nonoverlapping([i32::from(event.panel), i32::from(event.id), event.x, event.y, i32::from(event.down), screen_of(event.panel)].as_ptr(), 6) };
+            let extent = range(usize::from(event.panel)).unwrap_or((1, 1));
+            let (_, (x, y)) = upright(turn_of(event.panel), extent, (event.x, event.y));
+            unsafe { out.copy_from_nonoverlapping([i32::from(event.panel), i32::from(event.id), x, y, i32::from(event.down), screen_of(event.panel)].as_ptr(), 6) };
             1
         }
         None => 0,

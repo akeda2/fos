@@ -240,7 +240,20 @@ pub(crate) fn run_tape(rest: &str) {
     if run_groups(rest) {
         return;
     }
-    match crate::tape_aarch64::load(name).and_then(|entry| crate::tape_aarch64::run(entry, arguments)) {
+    // `rotate=r|l` turns the screen the tape draws on for this run (the `rotate` setting's way, for one tape).
+    let (mut text, mut arguments) = ([0u8; 256], arguments);
+    let turn = crate::tasks::own_rotation(arguments);
+    if turn.is_some() {
+        let phys = crate::tasks::group_screen(arguments, "").unwrap_or(0).min(1);
+        let Some(stripped) = crate::tasks::with_screen(&mut text, arguments, phys, false) else {
+            return crate::println!("run: the arguments of a tape take at most 240 bytes.");
+        };
+        arguments = stripped;
+        crate::framebuffer::rotate_run(phys, turn);
+    }
+    let outcome = crate::tape_aarch64::load(name).and_then(|entry| crate::tape_aarch64::run(entry, arguments));
+    crate::framebuffer::rotate_reset();
+    match outcome {
         Ok(()) => crate::println!("Tape returned; back at the fos shell."),
         Err(reason) => crate::println!("run: {name}: {reason}."),
     }
@@ -273,7 +286,7 @@ pub fn apply_settings() -> bool {
                 crate::framebuffer::rotate_default(usize::from(key == "rotate1"), mode);
                 crate::println!("settings: {key} {word} (tapes' pixel screens; the text console stays upright).");
             } else {
-                crate::println!("settings: `{}` ignored ({key} r|l|off).", line.trim());
+                crate::println!("settings: `{}` ignored ({key} r|l|flip|off).", line.trim());
             }
         }
         if let Some(key @ ("foreground" | "background")) = first {
