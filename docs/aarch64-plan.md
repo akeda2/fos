@@ -338,4 +338,4 @@ has the stubs it needs, and the tape ABI `serial_*` calls number the adapters fr
 `peer_info`, `hostname`, `nic_active` (one NIC, so a service's pinned NIC or 0) and `disk_format_exfat` are real now. `fterm`
 (serial list, term net to rack1), `net-chat` (both ways, discovery), `ip-chat` (DHCP, UDP both ways) and `telnet` (DHCP, TCP to a host
 listener) are in `A64_TAPES` and ran on the Pi. Not verified: data through the PL2303 cable. Still stubs: the NIC extras genet lacks
-(PTP stamps, multicast filter, VLAN filter, TX offload, counters). Still to port: `bridge`, `nettest`, `router`, `audio-net`.
+(PTP stamps, multicast filter, VLAN filter, TX offload, counters). `nettest`, `bridge` and `router` build and start (in `A64_TAPES`): bridge and router refuse to run with one NIC (the Pi has only genet; no USB Ethernet driver), so their forwarding is untested on the Pi. `nettest serve=1` on the Pi answered a master on rack1 (round trip 133 us) and a 50 Mbit/s soak both ways ran with 0% loss up and 2.7% down (Pi sending; not investigated). Still to port: `audio-net`.
