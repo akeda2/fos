@@ -330,3 +330,12 @@ duplex run at 48000 frames/s with no underruns. Only hardware with a signal show
 (GPIO13 is the lock indicator, not read yet), and that playback is *heard* (jumper 8-9 hardwires the card's output to its
 input; remove it or use 7-8 so GPIO26 chooses). The position is polled (no interrupts), so a reader or writer must call in at
 least every 170 ms. Open: IRQ-driven position, GPIO13 lock status in `audio`, `audio-net` on the Pi with the HAT.
+
+## USB serial, `fterm` and the network tapes (2026-10-23, verified on the Pi)
+
+The shared `usb_serial` layer (PL2303, TI) runs on the Pi: xHCI enumeration in `usb_kbd.rs` offers each device to it, `ehci_none.rs`
+has the stubs it needs, and the tape ABI `serial_*` calls number the adapters from 1 (no 16550 UARTs; the PL011 is the console).
+`peer_info`, `hostname`, `nic_active` (one NIC, so a service's pinned NIC or 0) and `disk_format_exfat` are real now. `fterm`
+(serial list, term net to rack1), `net-chat` (both ways, discovery), `ip-chat` (DHCP, UDP both ways) and `telnet` (DHCP, TCP to a host
+listener) are in `A64_TAPES` and ran on the Pi. Not verified: data through the PL2303 cable. Still stubs: the NIC extras genet lacks
+(PTP stamps, multicast filter, VLAN filter, TX offload, counters). Still to port: `bridge`, `nettest`, `router`, `audio-net`.

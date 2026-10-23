@@ -52,7 +52,6 @@ stubs! {
     api_nic_vlan_filter(usize, u32, u32) -> u32 = 0;
     api_nic_tx_offload(usize, u32) -> u32 = 0;
     api_nic_counters(usize, *mut u64, usize) -> usize = 0;
-    api_disk_format_exfat(usize, *const u8, usize) -> i32 = -1;
 }
 
 fn region(slot: usize) -> Option<u64> {
@@ -299,6 +298,17 @@ extern "C" fn api_hostname(index: usize, out: *mut u8, capacity: usize) -> usize
 /// The Pi has one interface (genet), so `nic use` has nothing to steer; a service pinned to a NIC still reports it.
 extern "C" fn api_nic_active() -> u32 {
     crate::tasks::current_nic().unwrap_or(0) as u32
+}
+extern "C" fn api_disk_format_exfat(number: usize, label: *const u8, length: usize) -> i32 {
+    use crate::fatvol::FormatError;
+    let label = unsafe { core::slice::from_raw_parts(label, length) };
+    match number.checked_sub(1).map_or(Err(FormatError::NoSuchDisk), |disk| crate::fatvol::format_exfat(disk, label)) {
+        Ok(_) => 0,
+        Err(FormatError::NoSuchDisk) => FORMAT_NO_DISK,
+        Err(FormatError::BootDisk) => FORMAT_BOOT_DISK,
+        Err(FormatError::BadLabel) => FORMAT_BAD_LABEL,
+        Err(FormatError::Failed) => FORMAT_FAILED,
+    }
 }
 extern "C" fn api_gfx_info() -> u64 {
     crate::framebuffer::gfx_info().map_or(0, |(width, height)| u64::from(width) << 32 | u64::from(height))
