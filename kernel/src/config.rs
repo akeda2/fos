@@ -9,7 +9,7 @@
 //!   `keymap us|sv` picks the keyboard layout (US by default; sv is Swedish/Finnish);
 //!   `foreground gray|green|amber|black|#rrggbb` and `background black|blue|gray|#rrggbb` set the pixel console's colours (not in
 //!   BIOS text mode, which stays grey on black; the Pi kernel reads them too);
-//!   `rotate r|l|flip|off` turns what tapes draw clockwise or anti-clockwise for a monitor mounted in portrait (the text console
+//!   `rotate [all|0|1] r|l|flip|off` turns what tapes draw clockwise or anti-clockwise for a monitor mounted in portrait (the text console
 //!   stays upright; `run A | B rotate=r` does it for one run);
 //! * `debug`: `reboot-on-crash`, `reboot-delay N`, `crash-on-boot`; `watchdog [N]` arms the
 //!   software watchdog and `kernel-update` enables KUP (both in `debug.rs`/`term.rs`);
@@ -143,7 +143,11 @@ pub fn load() {
                     }
                 }
                 Some("rotate") => {
-                    let word = line.split_whitespace().nth(1).unwrap_or("");
+                    let mut words = line.split_whitespace().skip(1);
+                    let mut word = words.next().unwrap_or("");
+                    if matches!(word, "all" | "0" | "1") {
+                        word = words.next().unwrap_or(""); // one screen here; a screen number is for the Pi's two
+                    }
                     let mode = crate::framebuffer::Rotate::parse(word);
                     if mode.is_some() || matches!(word, "off" | "none") {
                         crate::framebuffer::rotate_default(0, mode);

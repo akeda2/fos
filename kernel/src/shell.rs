@@ -280,13 +280,22 @@ pub fn apply_settings() -> bool {
             crate::gpio::apply_setting(line);
         }
         if let Some(key @ ("rotate" | "rotate1")) = first {
-            let word = words.next().unwrap_or("");
+            let mut word = words.next().unwrap_or("");
+            // `rotate [all|0|1] MODE`: which physical screens (`rotate1` is the same as `rotate 1`).
+            let mut screens: &[usize] = if key == "rotate1" { &[1] } else { &[0] };
+            let all = key == "rotate" && matches!(word, "all" | "0" | "1");
+            if all {
+                screens = match word { "all" => &[0, 1], "1" => &[1], _ => &[0] };
+                word = words.next().unwrap_or("");
+            }
             let mode = crate::framebuffer::Rotate::parse(word);
             if mode.is_some() || matches!(word, "off" | "none") {
-                crate::framebuffer::rotate_default(usize::from(key == "rotate1"), mode);
-                crate::println!("settings: {key} {word} (tapes' pixel screens; the text console stays upright).");
+                for &screen in screens {
+                    crate::framebuffer::rotate_default(screen, mode);
+                }
+                crate::println!("settings: {key} {screens:?} {word} (tapes' pixel screens; the text console stays upright).");
             } else {
-                crate::println!("settings: `{}` ignored ({key} r|l|flip|off).", line.trim());
+                crate::println!("settings: `{}` ignored ({key} [all|0|1] r|l|flip|off).", line.trim());
             }
         }
         if let Some(key @ ("foreground" | "background")) = first {
