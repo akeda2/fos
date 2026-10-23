@@ -272,7 +272,9 @@ fn update_link(genet: &mut Genet) -> bool {
     let promiscuous = if genet.promiscuous { CMD_PROMISC } else { 0 };
     let enabled = read(UMAC_CMD) & (CMD_TX_EN | CMD_RX_EN);
     write(UMAC_CMD, code << CMD_SPEED_SHIFT | promiscuous | enabled);
-    update(EXT_RGMII_OOB_CTRL, OOB_DISABLE, RGMII_LINK | RGMII_MODE_EN | ID_MODE_DIS);
+    // ID_MODE_DIS stays clear: the MAC delays TXC itself (the PHY's transmit delay is off). With it set about 1 frame in 100 of 1000
+    // bytes was lost on the wire (bit errors, a CRC failure at the receiver), found with nettest; 0 of 20000 lost without it.
+    update(EXT_RGMII_OOB_CTRL, OOB_DISABLE | ID_MODE_DIS, RGMII_LINK | RGMII_MODE_EN);
     true
 }
 
