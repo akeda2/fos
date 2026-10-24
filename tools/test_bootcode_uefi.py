@@ -149,7 +149,7 @@ def main():
         struct.pack_into("<H", other_machine, struct.unpack_from("<I", loader, 0x3c)[0] + 4, 0x14c)   # the PE machine field: i386
         for label, bad, expect in (
             ("a file that is not a PE image", b"this is not a loader", "MZ signature"),
-            ("an image for another machine", other_machine, "x86-64"),
+            ("an image for another machine", other_machine, "this CPU"),
             ("a loader without the banner", loader.replace(b"Fosfor OS loader", b"Some other loader"), "banner"),
         ):
             image = build(tmp, "bad", bytes(bad))

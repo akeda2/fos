@@ -79,7 +79,6 @@ pub fn claim(controller: &mut Controller, device: &xhci::Device, configuration: 
                             if touch.is_some_and(|pointer| attach(controller, device, configuration, number, pointer, vendor, product)) {
                                 return true;
                             }
-                            report(vendor, product, number, descriptor);
                         }
                         Err(error) => crate::println!("USB HID {vendor:04x}:{product:04x} interface {number}: report descriptor not readable ({error:?})."),
                     }
