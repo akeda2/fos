@@ -87,6 +87,12 @@ pub fn probe_all() -> usize {
     added
 }
 
+/// Root ports (bit = port number) whose device was enumerated and found unused (a Bluetooth controller, say). A rescan leaves
+/// them alone until the port reports a change: resetting and re-addressing such a device on every `usb rescan` made some of
+/// them stop answering (ports 7 and 8 of the laptop1 xHCI timed out three times each).
+const IDLE_CONTROLLERS: usize = 4;
+static mut IDLE_PORTS: [u64; IDLE_CONTROLLERS] = [0; IDLE_CONTROLLERS];
+
 fn probe_all_once() -> usize {
     let mut added = 0;
     for index in 0..xhci::count() {
@@ -108,6 +114,12 @@ fn probe_all_once() -> usize {
                     controller.pci.bus, controller.pci.device, controller.pci.function);
             }
             if controller.port_status(port) & 1 == 0 {
+                if index < IDLE_CONTROLLERS {
+                    unsafe { (*core::ptr::addr_of_mut!(IDLE_PORTS))[index] &= !(1 << port) };
+                }
+                continue;
+            }
+            if index < IDLE_CONTROLLERS && unsafe { (*core::ptr::addr_of!(IDLE_PORTS))[index] } & (1 << port) != 0 && !controller.port_connect_changed(port) {
                 continue;
             }
             // Real controllers sometimes fail the first transfer after a reset; try again from
@@ -266,6 +278,9 @@ pub fn probe_device(controller_index: usize, controller: &mut Controller, mut de
         }
         controller.release_slot(device.slot);
         crate::println!("USB: port {port}: {vendor:04x}:{product:04x} (device class {:#04x}, {}): nothing here uses it.", descriptor[4], xhci::speed_name(device.speed));
+        if device.route == 0 && controller_index < IDLE_CONTROLLERS && device.port < 64 {
+            unsafe { (*core::ptr::addr_of_mut!(IDLE_PORTS))[controller_index] |= 1 << device.port };
+        }
         return Ok(false);
     };
 
@@ -332,6 +347,15 @@ fn find_boot_keyboard(descriptors: &[u8]) -> Option<(u8, u8, u16, u8)> {
 /// Handles an event nobody was waiting for: a keyboard's report completing.
 pub fn background_event(controller: &mut Controller, event: &Trb) {
     if !event.is_transfer() {
+        return;
+    }
+    // An unplugged device's endpoints report errors, and every handler below answers one with Reset Endpoint commands (each
+    // timing out, since the controller already dropped the slot) and a re-armed transfer, which fails again: the command
+    // ring was aborted over and over and the disks behind the same controller stalled. Root port empty: drop the event and
+    // do not re-arm. (A device behind a hub is covered by its root port too; `usb rescan` cleans up the registrations.)
+    if !matches!(event.completion(), xhci::COMPLETION_SUCCESS | xhci::COMPLETION_SHORT)
+        && controller.slot_location(event.slot_number()).is_some_and(|(port, _)| port != 0 && controller.port_status(port) & 1 == 0)
+    {
         return;
     }
     if crate::usb_midi::background_event(controller, event) || crate::usb_pointer::background_event(controller, event) || crate::usb_serial::background_event(controller, event) {
