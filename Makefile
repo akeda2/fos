@@ -12,9 +12,17 @@ export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 .DEFAULT_GOAL := image
 .PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug test-usb-pointer test-xhci-abort test-idle-cpu test-net-chat test-telnet test-release-loops test-nettest-lab test-nettest-remote test-audio-bench test-bootcode-uefi test-console-utf8 test-keymap test-console-colors test-hostnames test-config-fat test-fterm test-fterm-net test-fterm-ui test-serial-shell test-midi test-services
 
-all: image tapes
+# `all` builds both machines' images: the x86 image and the Raspberry Pi 4 SD card image. What is missing is said up front.
+ifneq ($(filter all image-pi4 image-aarch64,$(MAKECMDGOALS)),)
+ifneq ($(shell python3 tools/check_build_tools.py >&2; echo $$?),0)
+$(error build prerequisites missing, see the list above)
+endif
+endif
+
+all: image tapes image-pi4
 
 help:
+	@echo "make all          both images: the x86 one and the Raspberry Pi 4 SD card image (checks the tools first)"
 	@echo "make image        build $(BUILD)/fosfor/fosfor.img (UEFI loader + kernel + every tape)"
 	@echo "make run          build it and boot it in QEMU + OVMF with the serial console on the terminal"
 	@echo "make test         host unit tests (abi, crates, tape libraries), then the boot test (loader, kernel, framebuffer)"

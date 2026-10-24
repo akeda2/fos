@@ -132,6 +132,7 @@ Python 3 (stdlib only for tools), `qemu-system-x86_64` with OVMF
 
 ```sh
 make image            # build/fosfor/fosfor.img: loader + kernel + every tape (default goal)
+make all              # both images (x86 and build/fosfor-aarch64/fosfor-pi4.img); tools/check_build_tools.py names what is missing first
 make run              # boot it in QEMU + OVMF, serial on the terminal
 make test             # host unit tests (abi, crates, the tape libraries via `cargo test --lib`) and the boot/framebuffer test
 make test-NAME        # one end-to-end test; `make help`, or the .PHONY list in the Makefile
