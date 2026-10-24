@@ -20,11 +20,12 @@
 //! arrived, whichever device is behind them.
 
 use crate::{hda, usb_audio as usb};
+#[cfg(not(target_arch = "aarch64"))]
+pub use crate::usb_audio::PcmRing;
 #[cfg(target_arch = "aarch64")]
 use crate::i2s_pi as i2s;
 #[cfg(not(target_arch = "aarch64"))]
 use crate::i2s_none as i2s;
-pub use crate::usb_audio::PcmRing;
 use fosfor_abi::tape::{AudioDevice, AudioInfo, AudioStats, AUDIO_KIND_HDA, AUDIO_KIND_I2S, AUDIO_KIND_USB, AUDIO_NO_DEVICE};
 
 #[derive(Clone, Copy, PartialEq, Eq)]

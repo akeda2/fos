@@ -21,10 +21,6 @@ fn lufs(energy: f64) -> f64 {
     if energy <= 0.0 { -200.0 } else { OFFSET + 10.0 * ln64(energy) / core::f64::consts::LN_10 }
 }
 
-fn energy_of(lufs: f64) -> f64 {
-    pow10_64((lufs - OFFSET) / 10.0)
-}
-
 #[derive(Clone, Copy)]
 struct Biquad {
     b: [f64; 3],

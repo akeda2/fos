@@ -71,10 +71,7 @@ mod imp {
         term::flush_output();
         timer::busy_wait_ms(200);
         crate::debug::mark_clean_stop();
-        crate::power::reset(crate::power::runtime_services());
-        loop {
-            core::hint::spin_loop();
-        }
+        crate::power::reset(crate::power::runtime_services())
     }
 
     pub struct Dropped(usize);

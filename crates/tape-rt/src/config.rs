@@ -88,15 +88,13 @@ pub fn compose(
         used += word.len() + 1;
     }
     let mut default_name = [0u8; MAX_NAME];
-    let mut default_length = 0;
     let name = match chosen {
         Some(name) => name,
         None => {
             let mut text = crate::Line::<MAX_NAME>::new();
             let _ = write!(text, "{tape}.cfg");
             default_name[..text.length].copy_from_slice(text.as_str().as_bytes());
-            default_length = text.length;
-            core::str::from_utf8(&default_name[..default_length]).unwrap_or("")
+            core::str::from_utf8(&default_name[..text.length]).unwrap_or("")
         }
     };
     if name.len() > MAX_NAME {

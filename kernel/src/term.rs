@@ -12,7 +12,7 @@
 
 use crate::nic::Nic;
 use crate::termsession::Frame;
-use crate::{pci, power, timer};
+use crate::{power, timer};
 
 pub(crate) use crate::netfs::*;
 const TAG_KUP_REQUEST: u8 = 0x3a;
@@ -795,7 +795,7 @@ pub fn local_input(byte: u8) {
     feed(byte);
 }
 
-pub use crate::netdump::{describe_frame, Line, Mac};
+pub use crate::netdump::Mac;
 
 /// `start`: runs the `start` file again, as the boot does. A start file that itself says `start` would never end, so inside a run it is refused.
 fn prompt() {

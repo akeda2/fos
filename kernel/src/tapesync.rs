@@ -16,8 +16,8 @@
 
 use crate::fosfs::Volume;
 use crate::netdump::Mac;
-use crate::netfs::{self, NETFS_BUSY, NETFS_DISK_ERROR, NETFS_NO_SYNC, TAG_GET_ERROR, TAG_SYNC_REQUEST};
-use crate::{println, timer};
+use crate::netfs::{NETFS_BUSY, NETFS_DISK_ERROR, NETFS_NO_SYNC, TAG_GET_ERROR, TAG_SYNC_REQUEST};
+use crate::timer;
 use tape_sync::{Action, Entry, MANIFEST_MAX, MAX_TAPES, NAME_LEN, NONCE_LEN, Stamp};
 
 use crate::netfs::KEY_FILE;

@@ -3,7 +3,7 @@
 //! optional reboot of v1's debug mode; the legible report is the part that must exist
 //! from the first fault on.)
 
-use crate::{cpu, paging, println};
+use crate::{cpu, paging};
 
 /// The register state at the moment of an interrupt, as `isr_common` builds it.
 #[repr(C)]

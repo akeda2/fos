@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use fosfor_abi::tape::*;
 use fosfor_abi::{elf, BootInfo};
 
-use crate::{cpu, memory, paging, storage, timer};
+use crate::{cpu, memory, paging, timer};
 
 const HUGE: u64 = 2 * 1024 * 1024;
 const REGION_BYTES: u64 = 4 * 1024 * 1024;
@@ -867,7 +867,7 @@ pub fn run_many(tapes: &[(u64, &str)]) -> Result<(), &'static str> {
             let words = frame as *mut u64;
             words.write(*entry);
             words.add(1).write(api_at);
-            words.add(11).write(fos_task_start as usize as u64);
+            words.add(11).write(fos_task_start as *const () as u64);
         }
         state.sp[index] = frame;
         state.done[index] = false;
