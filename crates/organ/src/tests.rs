@@ -181,3 +181,68 @@ fn works_at_other_sample_rates() {
     let peak = out[4410..].iter().map(|f| f[0].abs()).fold(0.0, f32::max);
     assert!(peak > 0.03 && peak < 0.1, "peak {peak}");
 }
+
+#[test]
+fn mod_wheel_picks_the_leslie_zone() {
+    let mut organ = Organ::new(RATE);
+    for (value, wanted) in [(0, Leslie::Stop), (42, Leslie::Stop), (43, Leslie::Slow), (84, Leslie::Slow), (85, Leslie::Fast), (127, Leslie::Fast), (10, Leslie::Stop)] {
+        assert!(organ.midi(&[0xb3, 1, value]));
+        assert_eq!(organ.leslie(), wanted, "mod wheel {value}");
+    }
+}
+
+fn tail_energy(reverb: f32) -> f32 {
+    let mut organ = Organ::new(RATE);
+    only(&mut organ, [0, 0, 8, 0, 0, 0, 0, 0, 0]);
+    organ.set_reverb(reverb);
+    organ.note_on(60);
+    render(&mut organ, 9600);
+    organ.note_off(60);
+    render(&mut organ, 4800); // the key's own release dies away
+    let tail = render(&mut organ, 24000);
+    tail.iter().map(|f| f[0] * f[0] + f[1] * f[1]).sum::<f32>()
+}
+
+#[test]
+fn reverb_rings_on_after_the_key_is_released_and_off_means_silence() {
+    assert!(tail_energy(0.0) < 1e-9);
+    let wet = tail_energy(0.5);
+    assert!(wet > 0.01, "tail energy {wet}");
+    assert!(tail_energy(1.0) > wet);
+}
+
+#[test]
+fn reverb_stays_in_range_and_dry_level_is_kept_when_off() {
+    let mut organ = Organ::new(RATE);
+    organ.set_reverb(1.0);
+    for note in [48, 52, 55, 60, 64, 67] {
+        organ.note_on(note);
+    }
+    let frames = render(&mut organ, 48000);
+    assert!(frames.iter().all(|f| f[0].abs() <= 1.0 && f[1].abs() <= 1.0 && f[0].is_finite()));
+    organ.set_reverb(0.0);
+    assert_eq!(organ.reverb(), 0.0);
+}
+
+#[test]
+fn reverb_works_at_every_supported_rate() {
+    for rate in [8000, 44100, 96000, 192000] {
+        let mut organ = Organ::new(rate);
+        organ.set_reverb(0.5);
+        organ.note_on(60);
+        let mut out = vec![[0.0; 2]; 4096];
+        organ.render(&mut out);
+        assert!(out.iter().all(|f| f[0].is_finite() && f[0].abs() <= 1.0), "rate {rate}");
+    }
+}
+
+#[test]
+fn key_click_is_audible_without_drive() {
+    let mut organ = Organ::new(RATE);
+    organ.set_drawbars([0; DRAWBARS]);
+    organ.set_click(1.0);
+    organ.note_on(60);
+    let burst = render(&mut organ, 96);
+    let peak = burst.iter().map(|f| f[0].abs()).fold(0.0, f32::max);
+    assert!(peak > 0.1, "click peak {peak}");
+}

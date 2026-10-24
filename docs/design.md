@@ -1290,8 +1290,10 @@ Only real hardware shows a float interface's behaviour and Opus's CPU cost on ol
 ABI 25 gives tapes USB-MIDI: `midi_read` returns one received message (device, cable, length, up to 3 bytes) and
 `midi_send` writes one to a device (`tape_rt::midi_event`, `midi_send`). `crates/organ` is a `no_std` Hammond-style engine
 with host tests: 91 tone wheels (one sine per semitone from C1), nine drawbars at 3 dB per step, 2nd/3rd-harmonic percussion,
-key click, a scanner vibrato/chorus (modulated delay), a drive stage and a Leslie (800 Hz crossover, horn and drum with speed
-inertia, Doppler delay). `tapes/organ` is the hard-float front end: touch panel and typed keys (a terminal sends no key
+key click, a scanner vibrato/chorus (modulated delay), a drive stage, a Leslie (800 Hz crossover, horn and drum with speed
+inertia, Doppler delay) and a Freeverb-style stereo reverb after it (`reverb.rs`,
+one level slider; lengths scale with the sample rate). The mod wheel (CC 1)
+picks the Leslie in three zones (0-42 Stop, 43-84 Slow, 85-127 Fast). `tapes/organ` is the hard-float front end: touch panel and typed keys (a terminal sends no key
 release, so typed notes ring 0.3 s), MIDI keyboard, 61 keys (MIDI 36-96). It keeps a short audio queue (`latency=`, default 40 ms)
 and sends the picture in 32-row bands, topping the queue up between bands, because a full-screen framebuffer write takes longer
 than the audio queue holds. `make test-organ` checks the picture and that a typed key sounds at the right pitch in a USB-audio

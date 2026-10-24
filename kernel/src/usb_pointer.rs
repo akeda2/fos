@@ -120,13 +120,19 @@ fn attach(controller: &mut Controller, device: &Device, configuration: &[u8], in
         return false;
     };
     let Some(buffer) = memory::allocate_contiguous(1, Some(1 << 32)) else { return false };
-    let started = controller.set_configuration(device, configuration[5]).and_then(|()| {
-        let _ = controller.control_transfer(device, 0x21, 0x0a, 0, u16::from(interface), &mut []); // SET_IDLE(0); may stall
-        controller.configure_interrupt_in(device, endpoint, max_packet, interval)
-    });
-    let Ok(dci) = started else {
+    if let Err(error) = controller.set_configuration(device, configuration[5]) {
+        crate::println!("USB touch {vendor:04x}:{product:04x}: SET_CONFIGURATION failed ({error:?}).");
         memory::free(buffer, 1);
         return false;
+    }
+    let _ = controller.control_transfer(device, 0x21, 0x0a, 0, u16::from(interface), &mut []); // SET_IDLE(0); may stall
+    let dci = match controller.configure_interrupt_in(device, endpoint, max_packet, interval) {
+        Ok(dci) => dci,
+        Err(error) => {
+            crate::println!("USB touch {vendor:04x}:{product:04x}: endpoint {endpoint:#04x} ({max_packet} bytes, interval {interval}) not configured ({error:?}).");
+            memory::free(buffer, 1);
+            return false;
+        }
     };
     // One transfer as long as the whole report (a panel with 10 contacts sends more than one packet), ended early by a short packet.
     let length = u32::from(pointer.report_bytes).clamp(u32::from(max_packet.max(8)), 4096);

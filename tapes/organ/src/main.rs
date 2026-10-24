@@ -16,16 +16,19 @@ use organ_tape::{GLYPH_H, GLYPH_W, Hit, Layout, Rect, drag, label, lit, note_for
 use tape_rt::{AudioInfo, Key, KeyDecoder, Line, TapeApi, println};
 
 tape_rt::tape_help!(
-    br#"organ [device=N] [outdev=N] [screen=N] [rate=HZ] [latency=MS]
+    br#"organ [device=N] [outdev=N] [screen=N] [rate=HZ] [latency=MS] [out=N]
 A drawbar organ in the Hammond B-3 mould. The screen has nine drawbars (drag
 them up and down), six presets, percussion (2nd/3rd harmonic, fast/slow,
 soft/normal), scanner vibrato V1-V3 and chorus C1-C3, a Leslie (Off, Stop,
 Slow, Fast: the rotors speed up and slow down like the real ones), overdrive,
-volume, key click, and a 61-key keyboard that a finger plays. A USB-MIDI
-keyboard plays it too (note on/off; controller 123 stops all notes). The sound
+volume, key click, reverb, and a 61-key keyboard that a finger plays. A
+USB-MIDI keyboard plays it too (note on/off; controller 123 stops all notes;
+the mod wheel sets the Leslie: low Stop, middle Slow, high Fast). The sound
 is stereo, 32-bit float inside, whatever the audio device takes (24 bit, 48 kHz
 USB audio, say). latency=MS is how much audio is kept queued (10-200, default
-40): lower is quicker to respond, higher survives a slow screen.
+40): lower is quicker to respond, higher survives a slow screen. out=N picks
+the output pair on a multichannel card: N is the left channel (out=9 plays on
+outputs 9 and 10; default 1). The other channels stay silent.
 Keys: z s x d c v g b h n j m , and q 2 w 3 e r 5 t 6 y 7 u i play notes
 (each rings 0.3 s, a terminal sends no key release); Left/Right move them an
 octave; Tab flips the Leslie between Slow and Fast; Escape quits.
@@ -35,6 +38,8 @@ octave; Tab flips the Leslie between Slow and Fast; Escape quits.
 const MAX_WIDTH: u32 = 1920;
 const MAX_HEIGHT: u32 = 1080;
 const CHUNK: usize = 256;
+// Room for a 32-channel device with 4-byte slots.
+const MAX_FRAME_BYTES: usize = 128;
 const SCOPE_LEN: usize = 1024;
 const BAND_ROWS: u32 = 32;
 /// How long a typed key sounds.
@@ -51,7 +56,7 @@ const BLACK_BAR: u32 = 0x1a1a1a;
 
 static mut ORGAN: Option<Organ> = None;
 static mut FRAMES: [[f32; 2]; CHUNK] = [[0.0; 2]; CHUNK];
-static mut PACKED: [u8; CHUNK * 8 * 4] = [0; CHUNK * 8 * 4];
+static mut PACKED: [u8; CHUNK * MAX_FRAME_BYTES] = [0; CHUNK * MAX_FRAME_BYTES];
 static mut SCOPE: [f32; SCOPE_LEN] = [0.0; SCOPE_LEN];
 static mut SCOPE_AT: usize = 0;
 
@@ -62,6 +67,7 @@ fn organ() -> &'static mut Organ {
 /// The playback side: how the device wants its frames, and how many to keep queued.
 struct Audio {
     channels: usize,
+    first: usize,
     format: Format,
     capacity: u32,
     target: usize,
@@ -85,11 +91,14 @@ fn pump(api: &TapeApi, audio: &mut Audio) -> bool {
     let mut peak = audio.peak * 0.98;
     for (n, frame) in rendered.iter().enumerate() {
         for channel in 0..audio.channels {
-            let value = match channel {
-                0 if audio.channels == 1 => 0.5 * (frame[0] + frame[1]),
-                0 => frame[0],
-                1 => frame[1],
-                _ => 0.0,
+            let value = if audio.channels == 1 {
+                0.5 * (frame[0] + frame[1])
+            } else if channel == audio.first {
+                frame[0]
+            } else if channel == audio.first + 1 {
+                frame[1]
+            } else {
+                0.0
             };
             let at = n * frame_bytes + channel * slot;
             audio.format.write(value, &mut packed[at..at + slot]);
@@ -264,12 +273,18 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     (api.audio_info)(&mut info);
     let format = Format::new(info.playback_slot_bytes as usize, info.playback_bits as usize, tape_rt::audio_float_of(api).1);
     let channels = info.playback_channels as usize;
-    if !format.valid() || channels == 0 || channels * format.slot > 32 {
+    if !format.valid() || channels == 0 || channels * format.slot > MAX_FRAME_BYTES {
         (api.audio_stop)();
         return println!("organ: cannot write this device's sample format ({} byte slots, {} channels).", format.slot, channels);
     }
-    let mut audio = Audio { channels, format, capacity: info.playback_space, target: (rate * latency_ms / 1000) as usize, peak: 0.0 };
+    let first = tape_rt::arg_value(start.arguments, "out").and_then(|value| value.parse::<usize>().ok()).map_or(0, |n| n.max(1) - 1);
+    if channels > 1 && first + 2 > channels {
+        (api.audio_stop)();
+        return println!("organ: out={} needs outputs {} and {}, the device has {}.", first + 1, first + 1, first + 2, channels);
+    }
+    let mut audio = Audio { channels, first, format, capacity: info.playback_space, target: (rate * latency_ms / 1000) as usize, peak: 0.0 };
     unsafe { *core::ptr::addr_of_mut!(ORGAN) = Some(Organ::new(rate)) };
+    organ().set_reverb(0.25);
 
     let layout = Layout::new(start.width as i32, start.height as i32);
     let Some(mut screen) = Screen::new(api, layout.width as u32, layout.height as u32).map(|screen| screen.on(start.screen)) else {
@@ -280,7 +295,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         (api.audio_stop)();
         return println!("organ: cannot take the screen.");
     }
-    println!("organ: {} Hz, {} channel(s) of {}-bit {}, {} ms queued. Escape quits.", rate, channels, info.playback_bits, if format.float { "float" } else { "integer" }, latency_ms);
+    println!("organ: {} Hz, {} channel(s) of {}-bit {}, outputs {}-{}, {} ms queued. Escape quits.", rate, channels, info.playback_bits, if format.float { "float" } else { "integer" }, first + 1, first + 2, latency_ms);
     // Fill the queue before the first picture: the first draw is the slowest.
     while pump(api, &mut audio) {}
 

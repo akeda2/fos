@@ -9,10 +9,13 @@
 //! however many keys are down: the keys only add to per-wheel gains, which are smoothed over a few milliseconds so a key does
 //! not click by accident; the deliberate key click is added separately.
 //!
-//! Chain: wheels -> drawbar mix (+ percussion, + key click) -> scanner vibrato/chorus -> overdrive -> Leslie (stereo) -> volume.
+//! Chain: wheels -> drawbar mix (+ percussion, + key click) -> scanner vibrato/chorus -> overdrive -> Leslie (stereo) -> reverb -> volume.
 #![cfg_attr(not(test), no_std)]
 
 use dsp::math;
+
+mod reverb;
+pub use reverb::Reverb;
 
 pub const FIRST_KEY: u8 = 36;
 pub const KEYS: usize = 61;
@@ -137,6 +140,7 @@ pub struct Organ {
     drive: f32,
     volume: f32,
     click: f32,
+    reverb: Reverb,
     dirty: bool,
     held: [bool; KEYS],
     held_count: usize,
@@ -181,7 +185,8 @@ impl Organ {
             leslie: Leslie::Off,
             drive: 0.0,
             volume: 0.7,
-            click: 0.3,
+            click: 0.5,
+            reverb: Reverb::new(),
             dirty: true,
             held: [false; KEYS],
             held_count: 0,
@@ -222,6 +227,7 @@ impl Organ {
         self.click_decay = math::exp64(-1.0 / (0.0015 * rate as f64)) as f32;
         self.vibrato_step = (6.1 / rate as f64 * 4294967296.0) as u32;
         self.split = 1.0 - math::exp64(-2.0 * core::f64::consts::PI * 800.0 / rate as f64) as f32;
+        self.reverb.set_sample_rate(rate);
         self.set_percussion_decay();
     }
 
@@ -308,6 +314,15 @@ impl Organ {
         self.volume
     }
 
+    /// Reverb level 0..=1 (after the Leslie; 0 is off).
+    pub fn set_reverb(&mut self, level: f32) {
+        self.reverb.set_mix(level);
+    }
+
+    pub fn reverb(&self) -> f32 {
+        self.reverb.mix()
+    }
+
     /// Key click level 0..=1.
     pub fn set_click(&mut self, click: f32) {
         self.click = click.clamp(0.0, 1.0);
@@ -357,7 +372,7 @@ impl Organ {
     }
 
     /// Feeds one MIDI channel message (1-3 bytes; every channel is the same keyboard): note on/off, and "all notes off"
-    /// (controllers 120 and 123). Returns whether it was one of those.
+    /// (controllers 120 and 123) and the mod wheel (controller 1: the Leslie, three zones). Returns whether it was one of those.
     pub fn midi(&mut self, message: &[u8]) -> bool {
         let [status, data1, data2] = match *message {
             [status, data1, data2] => [status, data1, data2],
@@ -368,6 +383,12 @@ impl Organ {
             0x90 if data2 > 0 => self.note_on(data1),
             0x90 | 0x80 => self.note_off(data1),
             0xb0 if data1 == 123 || data1 == 120 => self.all_notes_off(),
+            // The mod wheel drives the Leslie in three zones: Stop, Slow, Fast.
+            0xb0 if data1 == 1 => self.set_leslie(match data2 {
+                0..=42 => Leslie::Stop,
+                43..=84 => Leslie::Slow,
+                _ => Leslie::Fast,
+            }),
             _ => return false,
         }
         true
@@ -461,7 +482,7 @@ impl Organ {
             // Key click: differentiated noise, so it is all treble, under a very short envelope.
             self.noise = self.noise.wrapping_mul(1664525).wrapping_add(1013904223);
             let noise = (self.noise >> 8) as f32 * (2.0 / 16777216.0) - 1.0;
-            sample += (noise - self.last_noise) * 0.075 * self.click_env * self.click;
+            sample += (noise - self.last_noise) * 0.2 * self.click_env * self.click;
             self.last_noise = noise;
             self.click_env *= self.click_decay;
 
@@ -489,6 +510,7 @@ impl Organ {
                 let (drum_left, drum_right) = Self::rotor(&mut self.drum, low, drum_target, drum_follow, self.sample_rate, 3.0 * swing, 0.35, &self.sine);
                 (horn_left + drum_left, horn_right + drum_right)
             };
+            let (left, right) = self.reverb.process(left, right);
             frame[0] = (left * self.volume).clamp(-1.0, 1.0);
             frame[1] = (right * self.volume).clamp(-1.0, 1.0);
         }

@@ -9,7 +9,7 @@ pub const GLYPH_W: i32 = gfx::GLYPH_WIDTH as i32;
 pub const GLYPH_H: i32 = gfx::GLYPH_HEIGHT as i32;
 const MAX_WIDGETS: usize = 48;
 pub const WHITE_KEYS: i32 = 36;
-pub const SLIDERS: [&str; 3] = ["Drive", "Volume", "Click"];
+pub const SLIDERS: [&str; 4] = ["Drive", "Volume", "Click", "Reverb"];
 const PERCUSSION: [(&str, Percussion); 3] = [("Off", Percussion::Off), ("2nd", Percussion::Second), ("3rd", Percussion::Third)];
 const SCANNERS: [Scanner; 7] = [Scanner::Off, Scanner::V1, Scanner::V2, Scanner::V3, Scanner::C1, Scanner::C2, Scanner::C3];
 const LESLIES: [(&str, Leslie); 4] = [("Off", Leslie::Off), ("Stop", Leslie::Stop), ("Slow", Leslie::Slow), ("Fast", Leslie::Fast)];
@@ -148,7 +148,7 @@ impl Layout {
         let scanners: [Hit; 7] = core::array::from_fn(|index| Hit::Scanner(index as u8));
         buttons(&mut layout, "Scanner", &scanners);
         buttons(&mut layout, "Leslie", &[Hit::Leslie(0), Hit::Leslie(1), Hit::Leslie(2), Hit::Leslie(3)]);
-        for slider in 0..3u8 {
+        for slider in 0..SLIDERS.len() as u8 {
             buttons(&mut layout, SLIDERS[slider as usize], &[Hit::Slider(slider)]);
         }
         layout
@@ -224,7 +224,8 @@ pub fn drag(layout: &Layout, organ: &mut Organ, hit: Hit, x: i32, y: i32) {
             match index {
                 0 => organ.set_drive(value),
                 1 => organ.set_volume(value),
-                _ => organ.set_click(value),
+                2 => organ.set_click(value),
+                _ => organ.set_reverb(value),
             }
         }
         _ => {}
@@ -236,7 +237,8 @@ pub fn slider_value(organ: &Organ, index: u8) -> f32 {
     match index {
         0 => organ.drive(),
         1 => organ.volume(),
-        _ => organ.click(),
+        2 => organ.click(),
+        _ => organ.reverb(),
     }
 }
 
