@@ -5,9 +5,11 @@
 //! bands with the audio topped up in between, because a full-screen framebuffer write takes longer than the queue holds.
 #![cfg_attr(not(test), no_std)]
 
+mod keys;
 mod output;
 mod touch;
 
+pub use keys::{FIRST_KEY, KEYS, Keyboard, Rect, WHITE_KEYS, note_for_char};
 pub use output::{CHUNK, MAX_FRAME_BYTES, Output, SCOPE_LEN, pack};
 pub use touch::{TouchTarget, Touches, TypedKeys};
 

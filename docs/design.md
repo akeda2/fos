@@ -1301,7 +1301,36 @@ than the audio queue holds. `make test-organ` checks the picture and that a type
 recording; MIDI input, touch mapping, underruns and the Leslie/loudness balance need real hardware.
 
 Reusable parts: `crates/fx` holds the effects (`Rotary` (the Leslie), `Reverb`, `Ensemble` (a three-voice string-machine
-chorus), `Phaser`, `overdrive`, `Delay`, `Sine`); `crates/organ` re-exports `Leslie` and `Reverb` from it. `crates/instrument-rt`
+chorus), `Phaser`, `Spring` (a two-spring reverb with dispersive allpass chains), `overdrive`, `Delay`, `Sine`); `crates/organ` re-exports `Leslie` and `Reverb` from it. `crates/instrument-rt`
 is the tape glue: `Output` (audio device, `rate=`/`latency=`/`out=`, queue pump, scope), `Touches` + `TouchTarget` (finger grabs),
-`TypedKeys`, `poll_midi` and `blit_banded`. The next instrument (a divide-down string machine) is meant to need only its own
-oscillators, UI and wiring.
+`TypedKeys`, `poll_midi`, `blit_banded` (`Output::start_duplex` + `pump_duplex` also capture and pass the input through) and the 61-key `Keyboard` (geometry, hit test, drawing) with `note_for_char`; the
+strings tape uses the shared keyboard, the organ still has its own copy (moving it over is left for later). A new instrument needs
+only its own oscillators, UI and wiring.
+
+### String machine (crates/strings, tapes/strings)
+
+A Solina-style divide-down machine. Twelve counters run at the frequencies of the top octave (C8-B8, 32-bit phase steps) and every
+lower note is the same counter shifted right by its octave number: a sawtooth phase-locked to its octaves, as the original's
+top-octave chip made it (a test checks 220/440 Hz wrap counts). Each key has a strings envelope (attack 10 ms-1 s, release 50 ms-3 s,
+both sliders), a brass envelope (60/120 ms) and a piano envelope (2 ms attack, 3 s decay while held, 0.25 s after release); the
+keys feed seven buses (strings 16'/8'/4', brass 8'/4', piano 8'/4'), the 4' registers fading out over the top octave against aliasing.
+Six sections pick buses and filter them (two-pole low-pass, 0.5-6 kHz): Violin (8'+4', bright), Viola (8'), Cello (16'+8'), Bass
+(16'), Brass, Piano; each has a level fader. The sum goes through `fx::Ensemble` (mono to stereo), `fx::Phaser`, `fx::Reverb`.
+The mod wheel (CC1) sweeps the phaser speed (0.25-6 Hz) and/or the ensemble depth, as the Phaser/Ens/Both switch says; CC64 is
+the sustain pedal (the on-screen Pedal button and Tab do the same); CC123 stops all notes. The screen hides the keyboard while
+`midi_devices() > 0`, as the organ does. `make test-strings` checks the picture and a typed key's pitch in a USB-audio recording;
+the sound, touch, MIDI, pedal and mod wheel need real hardware.
+
+### Tape echo (crates/tape-echo, tapes/tape-echo)
+
+An RE-201-style effect box: audio in, tape loop, spring reverb, audio out, on one capture+playback device (`Output::start_duplex`;
+each captured frame becomes exactly one played frame, so the input-to-output delay is the queue `latency=` keeps). `TapeEcho` is a
+mono loop of 65536 samples with one record head and three playback heads at 1:2:3 times the head-1 delay (0.35-0.05 s, the repeat
+rate is log-scale; the motor is a 120 ms one-pole with a slew limit so a speed change glides the pitch and never reverses the
+tape). Feedback is normalised by the selected heads, so Intensity is the loop gain whatever the heads; each trip loses lows (90 Hz)
+and highs (5.5 kHz) and is soft-saturated. Wow/flutter modulate the speed (up to about 0.3%); Freeze (30 ms smoothing) cuts the input,
+holds the loop at gain 1 and bypasses losses and wow. Bass/treble shelve the echoes, Spread pans the heads. `fx::Spring` is the
+reverb. `TapTempo` averages up to four taps (gaps over 2 s restart, under 80 ms are bounces) and `fit_delay` folds the interval into the
+tape's range. MIDI: controllers 20-31 are the twelve sliders, 64 Freeze (held), 65 Tap, 102-104 the heads. Other instruments can
+use `TapeEcho` alone, or just `Spring`. `make test-tape-echo` uses QEMU's HD Audio duplex codec (silence in) and checks start, picture, keys
+and a clean stop; latency, feedback, the sound, touch and MIDI need real hardware.

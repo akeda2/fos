@@ -100,3 +100,21 @@ fn pack_mixes_down_for_a_mono_device_and_writes_integers() {
     pack(&[[0.5, -0.5]], 2, 0, int, &mut out);
     assert!((int.read(&out[..3]) - 0.5).abs() < 1e-6 && (int.read(&out[3..]) + 0.5).abs() < 1e-6);
 }
+
+#[test]
+fn every_key_is_found_at_its_own_centre_and_typed_keys_map() {
+    for (w, h) in [(640, 480), (1280, 1024), (1920, 1080)] {
+        let keyboard = Keyboard::new(w, h * 7 / 10, h * 3 / 10 - 8, 8);
+        for note in FIRST_KEY..FIRST_KEY + KEYS as u8 {
+            let rect = keyboard.key_rect(note);
+            let black = matches!((note - FIRST_KEY) % 12, 1 | 3 | 6 | 8 | 10);
+            let y = if black { rect.y + rect.h / 2 } else { rect.y + rect.h - 3 };
+            assert_eq!(keyboard.hit(rect.x + rect.w / 2, y), Some(note), "{w}x{h} note {note}");
+        }
+        assert_eq!(keyboard.hit(0, 0), None);
+    }
+    assert_eq!(note_for_char(b'z', 48), Some(48));
+    assert_eq!(note_for_char(b'Q', 48), Some(60));
+    assert_eq!(note_for_char(b'z', 97), None);
+    assert_eq!(note_for_char(b'!', 48), None);
+}

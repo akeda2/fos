@@ -32,6 +32,14 @@ pub fn pack(frames: &[[f32; 2]], channels: usize, first: usize, format: Format, 
     }
 }
 
+/// The capture side of a duplex `Output`: the input pair and the device's sample layout.
+struct Capture {
+    channels: usize,
+    first: usize,
+    format: Format,
+    bytes: [u8; CHUNK * MAX_FRAME_BYTES],
+}
+
 pub struct Output {
     api: &'static TapeApi,
     pub rate: u32,
@@ -42,6 +50,9 @@ pub struct Output {
     pub latency_ms: u32,
     /// A slowly falling peak of what was played, 0..=1.
     pub peak: f32,
+    /// The same for what was captured (a duplex `Output` only).
+    pub input_peak: f32,
+    capture: Option<Capture>,
     capacity: u32,
     target: usize,
     scope: [f32; SCOPE_LEN],
@@ -54,17 +65,31 @@ impl Output {
     /// Starts the playback device. Takes `rate=HZ` (default 48000 if offered, else the first rate offered), `latency=MS`
     /// (10-200, default 40) and `out=N` (the left channel of the output pair, 1-based, default 1) from `arguments`.
     pub fn start(api: &'static TapeApi, arguments: &str) -> Result<Output, Line<128>> {
+        Self::open(api, arguments, false)
+    }
+
+    /// Like `start`, and the device also captures: `in=N` is the left channel of the input pair (1-based, default 1; a
+    /// mono input feeds both sides). Use `pump_duplex` to run the signal through.
+    pub fn start_duplex(api: &'static TapeApi, arguments: &str) -> Result<Output, Line<128>> {
+        Self::open(api, arguments, true)
+    }
+
+    fn open(api: &'static TapeApi, arguments: &str, duplex: bool) -> Result<Output, Line<128>> {
         let mut info = AudioInfo::default();
         let mut error = Line::<128>::new();
         if (api.audio_info)(&mut info) == 0 || info.playback_channels == 0 {
             let _ = core::fmt::Write::write_str(&mut error, "no audio output (USB audio or HD Audio with a playback side)");
             return Err(error);
         }
+        if duplex && info.capture_channels == 0 {
+            let _ = core::fmt::Write::write_str(&mut error, "no audio input (the device has no capture side)");
+            return Err(error);
+        }
         let wanted = tape_rt::arg_value(arguments, "rate").and_then(|value| value.parse::<u32>().ok());
         let offered = &info.rates[..(info.rate_count as usize).min(8)];
         let rate = wanted.or_else(|| offered.contains(&48000).then_some(48000)).or_else(|| offered.first().copied()).unwrap_or(48000);
         let latency_ms = tape_rt::arg_value(arguments, "latency").and_then(|value| value.parse::<u32>().ok()).unwrap_or(40).clamp(10, 200);
-        if (api.audio_start)(rate, 0, 1) != 0 {
+        if (api.audio_start)(rate, u32::from(duplex), 1) != 0 {
             let _ = core::fmt::Write::write_fmt(&mut error, format_args!("the audio device does not start at {rate} Hz"));
             return Err(error);
         }
@@ -82,6 +107,26 @@ impl Output {
             let _ = core::fmt::Write::write_fmt(&mut error, format_args!("out={} needs outputs {} and {}, the device has {}", first + 1, first + 1, first + 2, channels));
             return Err(error);
         }
+        let capture = if duplex {
+            let format = Format::new(info.capture_slot_bytes as usize, info.capture_bits as usize, tape_rt::audio_float_of(api).0);
+            let channels = info.capture_channels as usize;
+            let first = tape_rt::arg_value(arguments, "in").and_then(|value| value.parse::<usize>().ok()).map_or(0, |n| n.max(1) - 1);
+            let problem = if !format.valid() || channels * format.slot > MAX_FRAME_BYTES {
+                Some(format_args!("cannot read this device's input format ({} byte slots, {} channels)", format.slot, channels))
+            } else if channels > 1 && first + 2 > channels {
+                Some(format_args!("in={} needs inputs {} and {}, the device has {}", first + 1, first + 1, first + 2, channels))
+            } else {
+                None
+            };
+            if let Some(problem) = problem {
+                (api.audio_stop)();
+                let _ = core::fmt::Write::write_fmt(&mut error, problem);
+                return Err(error);
+            }
+            Some(Capture { channels, first, format, bytes: [0; CHUNK * MAX_FRAME_BYTES] })
+        } else {
+            None
+        };
         Ok(Output {
             api,
             rate,
@@ -90,6 +135,8 @@ impl Output {
             format,
             latency_ms,
             peak: 0.0,
+            input_peak: 0.0,
+            capture,
             capacity: info.playback_space,
             target: (rate * latency_ms / 1000) as usize,
             scope: [0.0; SCOPE_LEN],
@@ -111,8 +158,20 @@ impl Output {
             return false;
         }
         let frames = (self.target - queued).min(CHUNK);
+        render(&mut self.frames[..frames]);
+        self.finish_rendered(frames);
+        true
+    }
+
+    fn finish(&mut self, frames: usize, process: &mut impl FnMut(&mut [[f32; 2]])) {
+        process(&mut self.frames[..frames]);
+        self.finish_rendered(frames);
+    }
+
+    /// Meters, scopes and queues the first `frames` of `self.frames`.
+    fn finish_rendered(&mut self, frames: usize) {
+        let frame_bytes = self.channels * self.format.slot;
         let rendered = &mut self.frames[..frames];
-        render(rendered);
         let mut peak = self.peak * 0.98;
         for frame in rendered.iter() {
             peak = peak.max(frame[0].abs()).max(frame[1].abs());
@@ -122,6 +181,46 @@ impl Output {
         self.peak = peak;
         pack(rendered, self.channels, self.first, self.format, &mut self.packed);
         (self.api.audio_write)(self.packed.as_ptr(), frames * frame_bytes);
+    }
+
+    /// One duplex step: takes the captured frames that are waiting (as many as the playback queue has room for), hands them to
+    /// `process` as stereo frames to be changed in place, and queues the result. Every captured frame becomes exactly one
+    /// played frame, so the input-to-output delay is the queue the tape primed with (`prime`) plus the device's own buffers,
+    /// and it stays put because the one device clocks both sides. If the loop stalled and a backlog grew past the latency,
+    /// the oldest frames are dropped (a glitch) instead of keeping the delay for good. True when it wrote something.
+    pub fn pump_duplex(&mut self, mut process: impl FnMut(&mut [[f32; 2]])) -> bool {
+        let Some(capture) = self.capture.as_mut() else { return false };
+        let mut info = AudioInfo::default();
+        (self.api.audio_info)(&mut info);
+        self.capacity = self.capacity.max(info.playback_space);
+        let in_bytes = capture.channels * capture.format.slot;
+        let out_bytes = self.channels * self.format.slot;
+        let room = info.playback_space as usize / out_bytes;
+        let mut waiting = info.capture_available as usize / in_bytes;
+        while waiting > self.target + CHUNK {
+            let drop = (waiting - self.target).min(CHUNK);
+            (self.api.audio_read)(capture.bytes.as_mut_ptr(), drop * in_bytes);
+            waiting -= drop;
+        }
+        let frames = waiting.min(room).min(CHUNK);
+        if frames == 0 {
+            return false;
+        }
+        let got = (self.api.audio_read)(capture.bytes.as_mut_ptr(), frames * in_bytes) / in_bytes;
+        if got == 0 {
+            return false;
+        }
+        let slot = capture.format.slot;
+        let mut input_peak = self.input_peak * 0.98;
+        for (n, frame) in self.frames[..got].iter_mut().enumerate() {
+            let at = n * in_bytes;
+            let left = capture.format.read(&capture.bytes[at + capture.first * slot..]);
+            let right = if capture.channels == 1 { left } else { capture.format.read(&capture.bytes[at + (capture.first + 1) * slot..]) };
+            input_peak = input_peak.max(left.abs()).max(right.abs());
+            *frame = [left, right];
+        }
+        self.input_peak = input_peak;
+        self.finish(got, &mut process);
         true
     }
 

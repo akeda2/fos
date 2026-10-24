@@ -133,9 +133,9 @@ LOADER_EFI := $(CARGO_TARGET_DIR)/x86_64-unknown-uefi/release/fosfor-loader.efi
 KERNEL_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel
 IMAGE := $(OUT)/fosfor.img
 # tapes: one crate each under tapes/ (shared libraries live in crates/), each built to build/cargo-target/x86_64-fos-tape/release/NAME.
-TAPES := hello calc memtest nettest bridge router ip-chat telnet net-chat ed record recorder play audio-net ptp fterm fpcheck gfxcheck ltas gonio clock kaffe organ
+TAPES := hello calc memtest nettest bridge router ip-chat telnet net-chat ed record recorder play audio-net ptp fterm fpcheck gfxcheck ltas gonio clock kaffe organ strings tape-echo
 # Hard-float tapes (target x86_64-fos-tape-fp, SSE2/AVX2; the kernel enables SSE before they start) build into their own directory.
-FP_TAPES := fpcheck ltas gonio clock kaffe audio-net organ
+FP_TAPES := fpcheck ltas gonio clock kaffe audio-net organ strings tape-echo
 tape_dir = x86_64-fos-tape$(if $(filter $(1),$(FP_TAPES)),-fp)
 TAPE_BINS := $(foreach tape,$(TAPES),$(CARGO_TARGET_DIR)/$(call tape_dir,$(tape))/release/$(tape))
 # The image and deployments use the stamped copies (tools/stamp_tape.py: the `.fos_build` section `tapesync` compares).
@@ -159,7 +159,7 @@ OPUS_A64_CFLAGS := --target=aarch64-unknown-none-elf -isystem crates/opus-codec/
 TAPE_LINK := -C link-arg=-T../tape.ld -C relocation-model=pic -C link-arg=-pie -C link-arg=--no-dynamic-linker -C link-arg=-znorelro
 
 
-.PHONY: opus-lib-aarch64 image-pi4 tapes-aarch64 loader-aarch64 kernel-aarch64 image-aarch64 test-aarch64-boot test-aarch64-faults test-aarch64-kup test-kup-serial opus-lib tape-opus-bench loader kernel image run test test-faults test-keyboard test-usb-boot test-config test-tapes test-nettest test-debug-mode test-msi test-router test-nettapes test-hub test-disks test-stick-guids test-format test-ed test-diag test-fp test-gfx test-ltas test-gonio test-clock test-kaffe test-organ test-split test-usb-audio test-hda test-audio-net test-services test-ptp test-ptp-l2 test-ptp-e1000e test-peers test-ptp-both test-ptp-ntp test-audio-ptp test-audio-ptp-raw test-audio-ptp-avtp test-audio-serve test-record test-recorder test-recorder-fat test-fat-shell test-format-exfat test-recorder-format test-grow test-install test-lineedit test-scripts test-nic test-netfs test-tapesync test-gpio test-rtl8139
+.PHONY: opus-lib-aarch64 image-pi4 tapes-aarch64 loader-aarch64 kernel-aarch64 image-aarch64 test-aarch64-boot test-aarch64-faults test-aarch64-kup test-kup-serial opus-lib tape-opus-bench loader kernel image run test test-faults test-keyboard test-usb-boot test-config test-tapes test-nettest test-debug-mode test-msi test-router test-nettapes test-hub test-disks test-stick-guids test-format test-ed test-diag test-fp test-gfx test-ltas test-gonio test-clock test-kaffe test-organ test-strings test-tape-echo test-split test-usb-audio test-hda test-audio-net test-services test-ptp test-ptp-l2 test-ptp-e1000e test-peers test-ptp-both test-ptp-ntp test-audio-ptp test-audio-ptp-raw test-audio-ptp-avtp test-audio-serve test-record test-recorder test-recorder-fat test-fat-shell test-format-exfat test-recorder-format test-grow test-install test-lineedit test-scripts test-nic test-netfs test-tapesync test-gpio test-rtl8139
 
 # The loader: a PE/COFF UEFI application (x86_64-unknown-uefi), built with the same
 # pinned nightly and -Z build-std as everything else here.
@@ -204,7 +204,7 @@ kernel-aarch64:
 	cd kernel && cargo +nightly-2026-09-13 build --release --target aarch64-unknown-none-softfloat -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem
 
 # Tapes for aarch64 (M2 of the plan): the portable ones, built for the built-in hard-float aarch64-unknown-none target.
-A64_TAPES := hello gfxcheck calc ed netcheck clock gonio ptp play record recorder ltas kaffe organ fterm telnet net-chat ip-chat bridge nettest router audio-net opus-bench i2cscan
+A64_TAPES := hello gfxcheck calc ed netcheck clock gonio ptp play record recorder ltas kaffe organ strings tape-echo fterm telnet net-chat ip-chat bridge nettest router audio-net opus-bench i2cscan
 A64_TAPE_DIR := $(CARGO_TARGET_DIR)/aarch64-unknown-none/release
 A64_TAPE_STAMPED := build/fosfor-aarch64/tapes
 
@@ -263,10 +263,12 @@ test: image
 	cargo +nightly-2026-09-13 test --manifest-path crates/noise/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/fx/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/organ/Cargo.toml
+	cargo +nightly-2026-09-13 test --manifest-path crates/strings/Cargo.toml
+	cargo +nightly-2026-09-13 test --manifest-path crates/tape-echo/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/instrument-rt/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-screen/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/tape-rt/Cargo.toml
-	for tape in router nettest ed ip-chat telnet ptp fterm organ; do cargo +nightly-2026-09-13 test --lib --manifest-path tapes/$$tape/Cargo.toml || exit 1; done
+	for tape in router nettest ed ip-chat telnet ptp fterm organ strings tape-echo; do cargo +nightly-2026-09-13 test --lib --manifest-path tapes/$$tape/Cargo.toml || exit 1; done
 	python3 tools/test_boot.py
 
 # Deliberate-fault kernels (one Cargo feature each): checks the exception reports,
@@ -332,6 +334,12 @@ test-kaffe: image
 
 test-organ: image
 	python3 tools/test_organ.py
+
+test-strings: image
+	python3 tools/test_strings.py
+
+test-tape-echo: image
+	python3 tools/test_tape_echo.py
 
 # run A | B: two graphic tapes share one screen, side by side or stacked (split=v).
 test-split: image

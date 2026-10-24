@@ -133,3 +133,73 @@ fn effects_work_at_every_rate() {
         }
     }
 }
+
+#[test]
+fn spring_off_is_a_bypass_and_an_impulse_rings_then_fades() {
+    let mut spring = Spring::new(RATE);
+    assert_eq!(spring.process(0.3, -0.2), (0.3, -0.2));
+    spring.set_mix(1.0);
+    spring.set_decay(0.5);
+    let mut left = Vec::new();
+    for n in 0..RATE as usize * 4 {
+        let (l, r) = spring.process(if n == 0 { 1.0 } else { 0.0 }, 0.0);
+        assert!(l.is_finite() && r.is_finite());
+        left.push(l);
+    }
+    let early = rms(&left[1000..12000]);
+    let late = rms(&left[RATE as usize * 3..]);
+    assert!(early > 0.002 && late < 0.2 * early, "{early} {late}");
+    // The first echo comes after one trip of the spring (29 ms), not at once.
+    assert!(rms(&left[1..600]) < 0.05 * early.max(1e-6) + 1e-3);
+}
+
+#[test]
+fn a_longer_decay_rings_longer() {
+    let tail = |decay: f32| {
+        let mut spring = Spring::new(RATE);
+        spring.set_mix(1.0);
+        spring.set_decay(decay);
+        let mut out = Vec::new();
+        for n in 0..RATE as usize * 2 {
+            out.push(spring.process(if n == 0 { 1.0 } else { 0.0 }, 0.0).0);
+        }
+        rms(&out[RATE as usize * 3 / 2..])
+    };
+    assert!(tail(1.0) > 3.0 * tail(0.0));
+}
+
+#[test]
+fn the_spring_is_dispersive_low_frequencies_arrive_later() {
+    // The energy centroid of a windowed tone burst after the allpass chain, minus before it.
+    let delay = |hz: f32| {
+        let mut chain = spring::Dispersion::new(-0.65);
+        let (mut before, mut after, mut weight) = (0.0f64, 0.0f64, 0.0f64);
+        for n in 0..8192usize {
+            let x = if n < 2048 {
+                let window = 0.5 - 0.5 * math::cos(2.0 * core::f32::consts::PI * n as f32 / 2048.0);
+                window * math::sin(2.0 * core::f32::consts::PI * hz * n as f32 / RATE as f32)
+            } else {
+                0.0
+            };
+            let y = chain.process(x);
+            before += (x * x) as f64 * n as f64;
+            after += (y * y) as f64 * n as f64;
+            weight += (x * x) as f64;
+        }
+        ((after - before) / weight) as f32
+    };
+    let (low, high) = (delay(400.0), delay(4000.0));
+    assert!(low > high + 50.0, "{low} {high}");
+}
+
+#[test]
+fn a_loud_input_at_full_decay_stays_bounded() {
+    let mut spring = Spring::new(RATE);
+    spring.set_mix(1.0);
+    spring.set_decay(1.0);
+    for n in 0..RATE as usize * 5 {
+        let x = 1.0 * math::sin(2.0 * core::f32::consts::PI * 300.0 * n as f32 / RATE as f32);
+        let (l, r) = spring.process(x, x);
+        assert!(l.abs() < 10.0 && r.abs() < 10.0, "{n}");
+    }
+}

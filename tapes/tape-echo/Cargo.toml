@@ -1,0 +1,26 @@
+[package]
+name = "tape-echo-tape"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "tape_echo_tape"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tape-echo"
+path = "src/main.rs"
+
+[dependencies]
+audio-screen = { path = "../../crates/audio-screen" }
+gfx = { path = "../../crates/gfx" }
+instrument-rt = { path = "../../crates/instrument-rt" }
+tape-echo = { path = "../../crates/tape-echo" }
+tape-rt = { path = "../../crates/tape-rt" }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = 2
+strip = "symbols"

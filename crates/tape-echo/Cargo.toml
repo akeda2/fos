@@ -1,0 +1,12 @@
+[package]
+name = "tape-echo"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "tape_echo"
+path = "src/lib.rs"
+
+[dependencies]
+dsp = { path = "../dsp" }
+fx = { path = "../fx" }
