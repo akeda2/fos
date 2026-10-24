@@ -6,14 +6,14 @@
 #![no_std]
 #![no_main]
 
-use audio_sample::Format;
 use audio_screen::{Screen, poll_keys};
 use core::fmt::Write;
 use gfx::Canvas;
 use gfx::theme::theme;
+use instrument_rt::{Output, TouchTarget, Touches, TypedKeys, blit_banded, poll_midi};
 use organ::{DRAWBARS, FIRST_KEY, FOOTAGES, KEYS, Leslie, Organ};
 use organ_tape::{GLYPH_H, GLYPH_W, Hit, Layout, Rect, drag, label, lit, note_for_char, press, slider_value};
-use tape_rt::{AudioInfo, Key, KeyDecoder, Line, TapeApi, println};
+use tape_rt::{Key, KeyDecoder, Line, TapeApi, println};
 
 tape_rt::tape_help!(
     br#"organ [device=N] [outdev=N] [screen=N] [rate=HZ] [latency=MS] [out=N]
@@ -23,7 +23,8 @@ soft/normal), scanner vibrato V1-V3 and chorus C1-C3, a Leslie (Off, Stop,
 Slow, Fast: the rotors speed up and slow down like the real ones), overdrive,
 volume, key click, reverb, and a 61-key keyboard that a finger plays. A
 USB-MIDI keyboard plays it too (note on/off; controller 123 stops all notes;
-the mod wheel sets the Leslie: low Stop, middle Slow, high Fast). The sound
+the mod wheel sets the Leslie: low Stop, middle Slow, high Fast); while one
+is connected the on-screen keyboard is hidden. The sound
 is stereo, 32-bit float inside, whatever the audio device takes (24 bit, 48 kHz
 USB audio, say). latency=MS is how much audio is kept queued (10-200, default
 40): lower is quicker to respond, higher survives a slow screen. out=N picks
@@ -37,11 +38,6 @@ octave; Tab flips the Leslie between Slow and Fast; Escape quits.
 
 const MAX_WIDTH: u32 = 1920;
 const MAX_HEIGHT: u32 = 1080;
-const CHUNK: usize = 256;
-// Room for a 32-channel device with 4-byte slots.
-const MAX_FRAME_BYTES: usize = 128;
-const SCOPE_LEN: usize = 1024;
-const BAND_ROWS: u32 = 32;
 /// How long a typed key sounds.
 const TYPED_US: u64 = 300_000;
 const BACKGROUND: u32 = 0x15110d;
@@ -53,66 +49,6 @@ const INK: u32 = 0xe8dcc0;
 const BROWN: u32 = 0x7a3f1c;
 const WHITE_BAR: u32 = 0xf0ead8;
 const BLACK_BAR: u32 = 0x1a1a1a;
-
-static mut ORGAN: Option<Organ> = None;
-static mut FRAMES: [[f32; 2]; CHUNK] = [[0.0; 2]; CHUNK];
-static mut PACKED: [u8; CHUNK * MAX_FRAME_BYTES] = [0; CHUNK * MAX_FRAME_BYTES];
-static mut SCOPE: [f32; SCOPE_LEN] = [0.0; SCOPE_LEN];
-static mut SCOPE_AT: usize = 0;
-
-fn organ() -> &'static mut Organ {
-    unsafe { (*core::ptr::addr_of_mut!(ORGAN)).as_mut().expect("the organ is made before the loop") }
-}
-
-/// The playback side: how the device wants its frames, and how many to keep queued.
-struct Audio {
-    channels: usize,
-    first: usize,
-    format: Format,
-    capacity: u32,
-    target: usize,
-    peak: f32,
-}
-
-/// Tops the device's queue up to `target` frames with freshly rendered sound. True when it wrote something.
-fn pump(api: &TapeApi, audio: &mut Audio) -> bool {
-    let mut info = AudioInfo::default();
-    (api.audio_info)(&mut info);
-    audio.capacity = audio.capacity.max(info.playback_space);
-    let slot = audio.format.slot;
-    let frame_bytes = audio.channels * slot;
-    let queued = (audio.capacity - info.playback_space) as usize / frame_bytes;
-    if queued >= audio.target {
-        return false;
-    }
-    let frames = (audio.target - queued).min(CHUNK);
-    let (rendered, packed, scope) = unsafe { (&mut (&mut *core::ptr::addr_of_mut!(FRAMES))[..frames], &mut *core::ptr::addr_of_mut!(PACKED), &mut *core::ptr::addr_of_mut!(SCOPE)) };
-    organ().render(rendered);
-    let mut peak = audio.peak * 0.98;
-    for (n, frame) in rendered.iter().enumerate() {
-        for channel in 0..audio.channels {
-            let value = if audio.channels == 1 {
-                0.5 * (frame[0] + frame[1])
-            } else if channel == audio.first {
-                frame[0]
-            } else if channel == audio.first + 1 {
-                frame[1]
-            } else {
-                0.0
-            };
-            let at = n * frame_bytes + channel * slot;
-            audio.format.write(value, &mut packed[at..at + slot]);
-        }
-        peak = peak.max(frame[0].abs()).max(frame[1].abs());
-        unsafe {
-            scope[SCOPE_AT] = frame[0];
-            SCOPE_AT = (SCOPE_AT + 1) % SCOPE_LEN;
-        }
-    }
-    audio.peak = peak;
-    (api.audio_write)(packed.as_ptr(), frames * frame_bytes);
-    true
-}
 
 fn center(canvas: &mut Canvas, rect: Rect, text: &str, scale: i32, rgb: u32) {
     let width = gfx::text_width(text) as i32 * scale;
@@ -127,7 +63,8 @@ fn bar_colour(index: usize) -> u32 {
     }
 }
 
-fn draw_header(canvas: &mut Canvas, layout: &Layout, organ: &Organ, rate: u32, midi_messages: u32, peak: f32) {
+fn draw_header(canvas: &mut Canvas, layout: &Layout, organ: &Organ, output: &Output, midi_messages: u32) {
+    let (rate, peak) = (output.rate, output.peak);
     let header = layout.header;
     canvas.fill_rect(header.x, header.y, header.w as u32, header.h as u32, PANEL);
     canvas.rect(header.x, header.y, header.w as u32, header.h as u32, WOOD_LIGHT);
@@ -136,20 +73,7 @@ fn draw_header(canvas: &mut Canvas, layout: &Layout, organ: &Organ, rate: u32, m
 
     // The sound itself: the last samples, started at a rising zero crossing so a steady note stands still.
     let scope = Rect { x: header.x + header.w * 28 / 100, y: header.y + 3, w: header.w * 36 / 100, h: header.h - 6 };
-    canvas.fill_rect(scope.x, scope.y, scope.w as u32, scope.h as u32, 0x0b0907);
-    let samples = unsafe { &*core::ptr::addr_of!(SCOPE) };
-    let newest = unsafe { SCOPE_AT };
-    let at = |n: usize| samples[(newest + n) % SCOPE_LEN];
-    let start = (0..SCOPE_LEN / 2).find(|&n| at(n) <= 0.0 && at(n + 1) > 0.0).unwrap_or(0);
-    let points = (SCOPE_LEN / 2).min(scope.w as usize);
-    let mid = scope.y + scope.h / 2;
-    let point = |n: usize| (scope.x + (n as i32 * scope.w) / points as i32, mid - (at(start + n * (SCOPE_LEN / 2) / points) * (scope.h as f32 * 0.45)) as i32);
-    let mut last = point(0);
-    for n in 1..points {
-        let next = point(n);
-        canvas.line(last.0, last.1, next.0, next.1, 0x4ade80);
-        last = next;
-    }
+    output.draw_scope(canvas, scope.x, scope.y, scope.w, scope.h, 0x0b0907, 0x4ade80);
 
     let mut status = Line::<64>::new();
     let _ = write!(status, "{rate} Hz  MIDI {midi_messages}  keys {}", organ.held_count());
@@ -250,6 +174,44 @@ fn draw_keyboard(canvas: &mut Canvas, layout: &Layout, organ: &Organ) {
     }
 }
 
+/// The organ as a touch target: drawbars, switches, sliders and the keyboard.
+struct OrganTouch<'a> {
+    layout: &'a Layout,
+    organ: &'a mut Organ,
+}
+
+impl TouchTarget for OrganTouch<'_> {
+    type Grab = Hit;
+
+    fn down(&mut self, x: i32, y: i32) -> Option<Hit> {
+        let hit = self.layout.hit(x, y)?;
+        press(self.layout, self.organ, hit, x, y);
+        Some(hit)
+    }
+
+    fn moved(&mut self, grab: Hit, x: i32, y: i32) -> Hit {
+        let Hit::Key(old) = grab else {
+            drag(self.layout, self.organ, grab, x, y);
+            return grab;
+        };
+        // Sliding along the keyboard plays the keys on the way.
+        if let Some(Hit::Key(new)) = self.layout.hit(x, y).filter(|h| matches!(h, Hit::Key(_))) {
+            if new != old {
+                self.organ.note_off(old);
+                self.organ.note_on(new);
+                return Hit::Key(new);
+            }
+        }
+        grab
+    }
+
+    fn up(&mut self, grab: Hit) {
+        if let Hit::Key(note) = grab {
+            self.organ.note_off(note);
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn tape_main(api: &'static TapeApi) {
     let start = match audio_screen::startup(api, MAX_WIDTH, MAX_HEIGHT) {
@@ -259,144 +221,84 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             return println!("organ: {reason}.");
         }
     };
-    let mut info = AudioInfo::default();
-    if (api.audio_info)(&mut info) == 0 || info.playback_channels == 0 {
-        return println!("organ: no audio output (USB audio or HD Audio with a playback side).");
-    }
-    let wanted = tape_rt::arg_value(start.arguments, "rate").and_then(|value| value.parse::<u32>().ok());
-    let offered = &info.rates[..(info.rate_count as usize).min(8)];
-    let rate = wanted.or_else(|| offered.contains(&48000).then_some(48000)).or_else(|| offered.first().copied()).unwrap_or(48000);
-    let latency_ms = tape_rt::arg_value(start.arguments, "latency").and_then(|value| value.parse::<u32>().ok()).unwrap_or(40).clamp(10, 200);
-    if (api.audio_start)(rate, 0, 1) != 0 {
-        return println!("organ: the audio device does not start at {rate} Hz.");
-    }
-    (api.audio_info)(&mut info);
-    let format = Format::new(info.playback_slot_bytes as usize, info.playback_bits as usize, tape_rt::audio_float_of(api).1);
-    let channels = info.playback_channels as usize;
-    if !format.valid() || channels == 0 || channels * format.slot > MAX_FRAME_BYTES {
-        (api.audio_stop)();
-        return println!("organ: cannot write this device's sample format ({} byte slots, {} channels).", format.slot, channels);
-    }
-    let first = tape_rt::arg_value(start.arguments, "out").and_then(|value| value.parse::<usize>().ok()).map_or(0, |n| n.max(1) - 1);
-    if channels > 1 && first + 2 > channels {
-        (api.audio_stop)();
-        return println!("organ: out={} needs outputs {} and {}, the device has {}.", first + 1, first + 1, first + 2, channels);
-    }
-    let mut audio = Audio { channels, first, format, capacity: info.playback_space, target: (rate * latency_ms / 1000) as usize, peak: 0.0 };
-    unsafe { *core::ptr::addr_of_mut!(ORGAN) = Some(Organ::new(rate)) };
-    organ().set_reverb(0.25);
+    let mut output = match Output::start(api, start.arguments) {
+        Ok(output) => output,
+        Err(reason) => return println!("organ: {}.", reason.as_str()),
+    };
+    let mut organ = Organ::new(output.rate);
+    organ.set_reverb(0.25);
 
-    let layout = Layout::new(start.width as i32, start.height as i32);
+    let mut keys_shown = tape_rt::midi_devices() == 0;
+    let mut layout = Layout::new(start.width as i32, start.height as i32, keys_shown);
     let Some(mut screen) = Screen::new(api, layout.width as u32, layout.height as u32).map(|screen| screen.on(start.screen)) else {
-        (api.audio_stop)();
+        output.stop();
         return println!("organ: out of memory.");
     };
     if !screen.open() {
-        (api.audio_stop)();
+        output.stop();
         return println!("organ: cannot take the screen.");
     }
-    println!("organ: {} Hz, {} channel(s) of {}-bit {}, outputs {}-{}, {} ms queued. Escape quits.", rate, channels, info.playback_bits, if format.float { "float" } else { "integer" }, first + 1, first + 2, latency_ms);
-    // Fill the queue before the first picture: the first draw is the slowest.
-    while pump(api, &mut audio) {}
+    println!(
+        "organ: {} Hz, {} channel(s) of {}-bit {}, outputs {}-{}, {} ms queued. Escape quits.",
+        output.rate,
+        output.channels,
+        output.format.bits,
+        if output.format.float { "float" } else { "integer" },
+        output.first + 1,
+        output.first + 2,
+        output.latency_ms
+    );
+    output.prime(|frames| organ.render(frames));
 
     let mut decoder = KeyDecoder::new();
-    let mut grabs: [Option<(i32, Hit)>; 8] = [None; 8];
-    let mut typed: [Option<(u8, u64)>; 8] = [None; 8];
+    let mut touches = Touches::new(layout.width, layout.height, start.screen);
+    let mut typed = TypedKeys::new(TYPED_US);
     let mut typed_base = 48u8;
     let mut midi_messages = 0u32;
     let mut next_animation = 0u64;
+    let mut next_check = 0u64;
     loop {
         let mut changed = false;
-        let keep_going = poll_keys(api, &mut decoder, |key| {
-            let now = tape_rt::micros();
-            match key {
-                Key::Char(c) => {
-                    if let Some(note) = note_for_char(c, typed_base) {
-                        organ().note_on(note);
-                        let slot = typed.iter().position(|t| t.is_some_and(|(n, _)| n == note)).or_else(|| typed.iter().position(|t| t.is_none()));
-                        if let Some(slot) = slot {
-                            typed[slot] = Some((note, now + TYPED_US));
-                        }
-                        changed = true;
-                    }
-                }
-                Key::Left => typed_base = typed_base.saturating_sub(12).max(FIRST_KEY),
-                Key::Right => typed_base = (typed_base + 12).min(FIRST_KEY + 36),
-                Key::Tab => {
-                    organ().set_leslie(if organ().leslie() == Leslie::Fast { Leslie::Slow } else { Leslie::Fast });
+        let keep_going = poll_keys(api, &mut decoder, |key| match key {
+            Key::Char(c) => {
+                if let Some(note) = note_for_char(c, typed_base) {
+                    organ.note_on(note);
+                    typed.press(note, tape_rt::micros());
                     changed = true;
                 }
-                _ => {}
             }
+            Key::Left => typed_base = typed_base.saturating_sub(12).max(FIRST_KEY),
+            Key::Right => typed_base = (typed_base + 12).min(FIRST_KEY + 36),
+            Key::Tab => {
+                organ.set_leslie(if organ.leslie() == Leslie::Fast { Leslie::Slow } else { Leslie::Fast });
+                changed = true;
+            }
+            _ => {}
         });
         if !keep_going {
             break;
         }
         let now = tape_rt::micros();
-        for slot in typed.iter_mut() {
-            if let Some((note, until)) = *slot {
-                if now >= until {
-                    organ().note_off(note);
-                    *slot = None;
-                    changed = true;
-                }
+        changed |= typed.expire(now, |note| organ.note_off(note));
+        changed |= touches.poll(&mut OrganTouch { layout: &layout, organ: &mut organ });
+        if now >= next_check {
+            // A MIDI keyboard makes the on-screen one redundant; it comes back when the last device is unplugged.
+            next_check = now + 500_000;
+            let want_keys = tape_rt::midi_devices() == 0;
+            if want_keys != keys_shown {
+                keys_shown = want_keys;
+                layout = Layout::new(start.width as i32, start.height as i32, keys_shown);
+                changed = true;
             }
         }
+        let accepted = poll_midi(|message| organ.midi(message));
+        midi_messages += accepted;
+        changed |= accepted > 0;
 
-        while let Some(touch) = tape_rt::touch_event() {
-            if touch.screen >= 0 && touch.screen != start.screen as i32 {
-                continue; // a panel on another screen
-            }
-            let Some((max_x, max_y)) = tape_rt::touch_extent(touch.panel) else { continue };
-            let (x, y) = (touch.x * layout.width / max_x.max(1), touch.y * layout.height / max_y.max(1));
-            let held = grabs.iter().position(|g| g.is_some_and(|(id, _)| id == touch.id));
+        output.pump(|frames| organ.render(frames));
+        if (organ.held_count() > 0 || output.peak > 0.002) && now >= next_animation {
+            next_animation = now + 60_000;
             changed = true;
-            match (touch.down, held) {
-                (true, None) => {
-                    if let (Some(hit), Some(free)) = (layout.hit(x, y), grabs.iter().position(|g| g.is_none())) {
-                        press(&layout, organ(), hit, x, y);
-                        grabs[free] = Some((touch.id, hit));
-                    }
-                }
-                (true, Some(slot)) => {
-                    let Some((id, hit)) = grabs[slot] else { continue };
-                    if let Hit::Key(old) = hit {
-                        // Sliding along the keyboard plays the keys on the way.
-                        if let Some(Hit::Key(new)) = layout.hit(x, y).filter(|h| matches!(h, Hit::Key(_))) {
-                            if new != old {
-                                organ().note_off(old);
-                                organ().note_on(new);
-                                grabs[slot] = Some((id, Hit::Key(new)));
-                            }
-                        }
-                    } else {
-                        drag(&layout, organ(), hit, x, y);
-                    }
-                }
-                (false, Some(slot)) => {
-                    if let Some((_, Hit::Key(note))) = grabs[slot] {
-                        organ().note_off(note);
-                    }
-                    grabs[slot] = None;
-                }
-                (false, None) => {}
-            }
-        }
-
-        for _ in 0..64 {
-            let Some(message) = tape_rt::midi_event() else { break };
-            if organ().midi(&message.data[..message.len]) {
-                midi_messages += 1;
-                changed = true;
-            }
-        }
-
-        pump(api, &mut audio);
-        if organ().held_count() > 0 || audio.peak > 0.002 {
-            if now >= next_animation {
-                next_animation = now + 60_000;
-                changed = true;
-            }
         }
         if changed {
             screen.mark_dirty();
@@ -405,25 +307,21 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             {
                 let mut canvas = screen.frame();
                 canvas.clear(BACKGROUND);
-                draw_header(&mut canvas, &layout, organ(), rate, midi_messages, audio.peak);
-                draw_drawbars(&mut canvas, &layout, organ());
-                draw_switches(&mut canvas, &layout, organ());
-                draw_keyboard(&mut canvas, &layout, organ());
+                draw_header(&mut canvas, &layout, &organ, &output, midi_messages);
+                draw_drawbars(&mut canvas, &layout, &organ);
+                draw_switches(&mut canvas, &layout, &organ);
+                if layout.keys_shown {
+                    draw_keyboard(&mut canvas, &layout, &organ);
+                }
             }
-            let width = screen.width;
-            let mut row = 0;
-            while row < screen.height {
-                let rows = BAND_ROWS.min(screen.height - row);
-                let pixels = &screen.pixels()[(row * width) as usize..((row + rows) * width) as usize];
-                tape_rt::gfx_blit_on(screen.index, 0, row, width, rows, pixels, width);
-                pump(api, &mut audio);
-                row += rows;
-            }
+            blit_banded(&screen, || {
+                output.pump(|frames| organ.render(frames));
+            });
         }
         tape_rt::idle();
     }
-    organ().all_notes_off();
-    (api.audio_stop)();
+    organ.all_notes_off();
+    output.stop();
     screen.close();
     println!("organ: stopped.");
 }

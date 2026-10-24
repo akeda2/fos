@@ -381,7 +381,9 @@ pub fn command<'a>(words: &mut impl Iterator<Item = &'a str>) {
 
 fn report(vendor: u16, product: u16, interface: u8, descriptor: &[u8]) {
     crate::println!("USB HID {vendor:04x}:{product:04x} interface {interface}: report descriptor, {} bytes:", descriptor.len());
-    for row in descriptor.chunks(24) {
+    // A multi-touch panel's descriptor repeats one contact block ten times: the start is enough, and a long dump
+    // overflows a term net session so the lines after it are lost.
+    for row in descriptor[..descriptor.len().min(96)].chunks(24) {
         let mut line = crate::netdump::Line::new();
         for byte in row {
             let _ = write!(line, " {byte:02x}");

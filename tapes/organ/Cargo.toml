@@ -12,9 +12,9 @@ name = "organ"
 path = "src/main.rs"
 
 [dependencies]
-audio-sample = { path = "../../crates/audio-sample" }
 audio-screen = { path = "../../crates/audio-screen" }
 gfx = { path = "../../crates/gfx" }
+instrument-rt = { path = "../../crates/instrument-rt" }
 organ = { path = "../../crates/organ" }
 tape-rt = { path = "../../crates/tape-rt" }
 

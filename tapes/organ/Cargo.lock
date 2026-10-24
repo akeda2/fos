@@ -37,10 +37,27 @@ name = "fosfor-abi"
 version = "0.1.0"
 
 [[package]]
+name = "fx"
+version = "0.1.0"
+dependencies = [
+ "dsp",
+]
+
+[[package]]
 name = "gfx"
 version = "0.1.0"
 dependencies = [
  "dsp",
+]
+
+[[package]]
+name = "instrument-rt"
+version = "0.1.0"
+dependencies = [
+ "audio-sample",
+ "audio-screen",
+ "gfx",
+ "tape-rt",
 ]
 
 [[package]]
@@ -56,15 +73,16 @@ name = "organ"
 version = "0.1.0"
 dependencies = [
  "dsp",
+ "fx",
 ]
 
 [[package]]
 name = "organ-tape"
 version = "0.1.0"
 dependencies = [
- "audio-sample",
  "audio-screen",
  "gfx",
+ "instrument-rt",
  "organ",
  "tape-rt",
 ]

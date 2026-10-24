@@ -14,8 +14,9 @@
 
 use dsp::math;
 
-mod reverb;
-pub use reverb::Reverb;
+use fx::{Delay, Rotary, overdrive};
+pub use fx::RotaryMode as Leslie;
+pub use fx::Reverb;
 
 pub const FIRST_KEY: u8 = 36;
 pub const KEYS: usize = 61;
@@ -55,16 +56,6 @@ impl Scanner {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Leslie {
-    /// No rotary speaker: the same mono signal on both channels.
-    Off,
-    /// Rotors spun down (they take a while, as the real ones do).
-    Stop,
-    Slow,
-    Fast,
-}
-
 /// Drawbar registrations (16' .. 1') worth having a button for.
 pub const PRESETS: [(&str, [u8; DRAWBARS]); 6] = [
     ("Full", [8, 8, 8, 8, 8, 8, 8, 8, 8]),
@@ -89,45 +80,6 @@ fn wheel_for(key: u8, interval: i32) -> usize {
     wheel.max(0) as usize
 }
 
-/// A delay line read with linear interpolation.
-struct Delay<const N: usize> {
-    buffer: [f32; N],
-    write: usize,
-}
-
-impl<const N: usize> Delay<N> {
-    const fn new() -> Self {
-        Delay { buffer: [0.0; N], write: 0 }
-    }
-
-    fn push(&mut self, value: f32) {
-        self.buffer[self.write] = value;
-        self.write = (self.write + 1) % N;
-    }
-
-    /// The sample `delay` samples ago (1.0 is the one pushed last), 1 <= delay < N - 1.
-    fn read(&self, delay: f32) -> f32 {
-        let whole = delay as usize;
-        let fraction = delay - whole as f32;
-        let newer = self.buffer[(self.write + N - whole) % N];
-        let older = self.buffer[(self.write + N - whole - 1) % N];
-        newer + (older - newer) * fraction
-    }
-}
-
-/// One Leslie rotor (horn or drum): its speed follows the target slowly; it modulates level and delay (Doppler) per ear.
-struct Rotor {
-    phase: u32,
-    speed: f32,
-    delay: Delay<64>,
-}
-
-impl Rotor {
-    const fn new() -> Self {
-        Rotor { phase: 0, speed: 0.0, delay: Delay::new() }
-    }
-}
-
 pub struct Organ {
     sine: [f32; TABLE + 1],
     sample_rate: f32,
@@ -136,7 +88,6 @@ pub struct Organ {
     percussion_fast: bool,
     percussion_soft: bool,
     scanner: Scanner,
-    leslie: Leslie,
     drive: f32,
     volume: f32,
     click: f32,
@@ -161,10 +112,7 @@ pub struct Organ {
     vibrato_delay: Delay<256>,
     vibrato_phase: u32,
     vibrato_step: u32,
-    horn: Rotor,
-    drum: Rotor,
-    split: f32,
-    low: f32,
+    rotary: Rotary,
 }
 
 impl Organ {
@@ -182,7 +130,6 @@ impl Organ {
             percussion_fast: true,
             percussion_soft: false,
             scanner: Scanner::Off,
-            leslie: Leslie::Off,
             drive: 0.0,
             volume: 0.7,
             click: 0.5,
@@ -206,10 +153,7 @@ impl Organ {
             vibrato_delay: Delay::new(),
             vibrato_phase: 0,
             vibrato_step: 0,
-            horn: Rotor::new(),
-            drum: Rotor::new(),
-            split: 0.0,
-            low: 0.0,
+            rotary: Rotary::new(sample_rate),
         };
         organ.set_sample_rate(sample_rate);
         organ
@@ -226,7 +170,7 @@ impl Organ {
         self.smoothing = 1.0 - math::exp64(-1.0 / (0.003 * rate as f64)) as f32;
         self.click_decay = math::exp64(-1.0 / (0.0015 * rate as f64)) as f32;
         self.vibrato_step = (6.1 / rate as f64 * 4294967296.0) as u32;
-        self.split = 1.0 - math::exp64(-2.0 * core::f64::consts::PI * 800.0 / rate as f64) as f32;
+        self.rotary.set_sample_rate(sample_rate);
         self.reverb.set_sample_rate(rate);
         self.set_percussion_decay();
     }
@@ -289,11 +233,11 @@ impl Organ {
     }
 
     pub fn leslie(&self) -> Leslie {
-        self.leslie
+        self.rotary.mode()
     }
 
     pub fn set_leslie(&mut self, leslie: Leslie) {
-        self.leslie = leslie;
+        self.rotary.set_mode(leslie);
     }
 
     /// Overdrive amount 0..=1 (0 is clean).
@@ -419,22 +363,6 @@ impl Organ {
         self.dirty = false;
     }
 
-    /// One Leslie rotor's two ear signals: level follows the rotor's facing, the delay swings by `swing` samples (Doppler).
-    #[allow(clippy::too_many_arguments)]
-    fn rotor(rotor: &mut Rotor, input: f32, target: f32, follow: f32, rate: f32, swing: f32, depth: f32, sine: &[f32; TABLE + 1]) -> (f32, f32) {
-        rotor.speed += (target - rotor.speed) * follow;
-        rotor.phase = rotor.phase.wrapping_add((rotor.speed * (4294967296.0 / rate)) as u32);
-        let table = |phase: u32| {
-            let index = (phase >> 22) as usize;
-            let fraction = (phase & 0x003f_ffff) as f32 * (1.0 / 4194304.0);
-            sine[index] + (sine[index + 1] - sine[index]) * fraction
-        };
-        rotor.delay.push(input);
-        let delayed = rotor.delay.read(swing + 1.0 + swing * table(rotor.phase));
-        let facing = table(rotor.phase.wrapping_add(1 << 30));
-        (delayed * 0.7 * (1.0 + depth * facing), delayed * 0.7 * (1.0 - depth * facing))
-    }
-
     /// Renders `frames.len()` stereo frames (left, right), each within -1..=1.
     pub fn render(&mut self, frames: &mut [[f32; 2]]) {
         if self.dirty {
@@ -448,16 +376,6 @@ impl Organ {
             Scanner::V2 | Scanner::C2 => (2.5 * scale, self.scanner == Scanner::C2),
             Scanner::V3 | Scanner::C3 => (4.0 * scale, self.scanner == Scanner::C3),
         };
-        let (horn_target, drum_target) = match self.leslie {
-            Leslie::Off | Leslie::Stop => (0.0, 0.0),
-            Leslie::Slow => (0.8, 0.66),
-            Leslie::Fast => (6.7, 5.7),
-        };
-        // Time constants of the rotors' inertia: the horn is light, the drum heavy.
-        let horn_follow = 1.0 / (0.7 * self.sample_rate);
-        let drum_follow = 1.0 / (3.0 * self.sample_rate);
-        let swing = scale;
-        let drive_gain = 1.0 + self.drive * 7.0;
         for frame in frames.iter_mut() {
             let mut main = 0.0;
             let mut percussion = 0.0;
@@ -497,19 +415,10 @@ impl Organ {
             }
 
             if self.drive > 0.0 {
-                let x = sample * drive_gain;
-                sample = x / (1.0 + x.abs()) * (1.0 + self.drive);
+                sample = overdrive(sample, self.drive);
             }
 
-            let (left, right) = if self.leslie == Leslie::Off {
-                (sample, sample)
-            } else {
-                self.low += (sample - self.low) * self.split;
-                let (low, high) = (self.low, sample - self.low);
-                let (horn_left, horn_right) = Self::rotor(&mut self.horn, high, horn_target, horn_follow, self.sample_rate, 6.0 * swing, 0.6, &self.sine);
-                let (drum_left, drum_right) = Self::rotor(&mut self.drum, low, drum_target, drum_follow, self.sample_rate, 3.0 * swing, 0.35, &self.sine);
-                (horn_left + drum_left, horn_right + drum_right)
-            };
+            let (left, right) = self.rotary.process(sample);
             let (left, right) = self.reverb.process(left, right);
             frame[0] = (left * self.volume).clamp(-1.0, 1.0);
             frame[1] = (right * self.volume).clamp(-1.0, 1.0);

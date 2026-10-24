@@ -802,6 +802,13 @@ pub fn midi_event() -> Option<MidiMessage> {
     ((midi_table()?.midi_read)(out.as_mut_ptr()) == 1).then(|| MidiMessage { device: out[0] as u32, cable: out[1], len: (out[2] as usize).min(3), data: [out[3], out[4], out[5]] })
 }
 
+/// How many USB-MIDI devices are connected now; 0 on a kernel older than version 26 (which cannot tell).
+pub fn midi_devices() -> u32 {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, midi_devices) + core::mem::size_of::<usize>();
+    if table.version >= 26 && table.size as usize >= end { (table.midi_devices)() } else { 0 }
+}
+
 /// Sends a 1-3 byte MIDI message to USB-MIDI device `device`; `false` on any failure (including an old kernel).
 pub fn midi_send(device: u32, message: &[u8]) -> bool {
     midi_table().is_some_and(|table| (table.midi_send)(device, message.as_ptr(), message.len() as u32) == 0)

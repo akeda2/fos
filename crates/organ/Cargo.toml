@@ -9,3 +9,4 @@ path = "src/lib.rs"
 
 [dependencies]
 dsp = { path = "../dsp" }
+fx = { path = "../fx" }

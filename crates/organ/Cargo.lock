@@ -14,8 +14,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fx"
+version = "0.1.0"
+dependencies = [
+ "dsp",
+]
+
+[[package]]
 name = "organ"
 version = "0.1.0"
 dependencies = [
  "dsp",
+ "fx",
 ]

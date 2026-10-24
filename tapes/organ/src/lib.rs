@@ -63,6 +63,8 @@ pub struct Layout {
     pub drawbar_panel: Rect,
     pub switch_panel: Rect,
     pub keyboard: Rect,
+    /// False when a MIDI keyboard is connected: the on-screen keys are not drawn or touchable and the panels use the room.
+    pub keys_shown: bool,
     /// The drawbar travel: position 0 (pushed in) at `track_top`, position 8 at `track_bottom`.
     pub track_top: i32,
     pub track_bottom: i32,
@@ -84,14 +86,14 @@ fn white_index(note: u8) -> (i32, bool) {
 }
 
 impl Layout {
-    pub fn new(width: i32, height: i32) -> Self {
+    pub fn new(width: i32, height: i32, keys_shown: bool) -> Self {
         let scale = (height / 540).max(1);
         let margin = (height / 60).max(3);
         let header_h = (height / 10).max(GLYPH_H * scale + 2 * margin);
-        let keyboard_h = height * 30 / 100;
+        let keyboard_h = if keys_shown { height * 30 / 100 } else { 0 };
         let keys_w = (width - 2 * margin) / WHITE_KEYS * WHITE_KEYS;
         let white_w = keys_w / WHITE_KEYS;
-        let keyboard = Rect { x: (width - keys_w) / 2, y: height - margin - keyboard_h, w: keys_w, h: keyboard_h };
+        let keyboard = Rect { x: (width - keys_w) / 2, y: if keys_shown { height - margin - keyboard_h } else { height }, w: keys_w, h: keyboard_h };
         let header = Rect { x: margin, y: margin, w: width - 2 * margin, h: header_h };
         let panel_y = header.y + header.h + margin;
         let panel_h = keyboard.y - margin - panel_y;
@@ -109,6 +111,7 @@ impl Layout {
             drawbar_panel,
             switch_panel,
             keyboard,
+            keys_shown,
             track_top: panel_y + label_h + margin,
             track_bottom: panel_y + panel_h - 2 * label_h - margin,
             white_w,
@@ -288,7 +291,7 @@ mod tests {
     #[test]
     fn every_key_is_found_at_its_own_centre() {
         for (w, h) in SIZES {
-            let layout = Layout::new(w, h);
+            let layout = Layout::new(w, h, true);
             for note in FIRST_KEY..FIRST_KEY + KEYS as u8 {
                 let rect = layout.key_rect(note);
                 let (_, black) = white_index(note);
@@ -299,9 +302,19 @@ mod tests {
     }
 
     #[test]
+    fn hidden_keyboard_gives_its_room_to_the_panels() {
+        let (shown, hidden) = (Layout::new(1280, 1024, true), Layout::new(1280, 1024, false));
+        assert!(hidden.drawbar_panel.h > shown.drawbar_panel.h && hidden.switch_panel.h > shown.switch_panel.h);
+        assert!(hidden.drawbar_panel.y + hidden.drawbar_panel.h <= 1024);
+        let key = shown.key_rect(60);
+        assert_eq!(shown.hit(key.x + key.w / 2, key.y + key.h - 2), Some(Hit::Key(60)));
+        assert!((0..1024).step_by(8).all(|y| (0..1280).step_by(8).all(|x| !matches!(hidden.hit(x, y), Some(Hit::Key(_))))));
+    }
+
+    #[test]
     fn keyboard_has_36_white_keys_and_stays_on_screen() {
         for (w, h) in SIZES {
-            let layout = Layout::new(w, h);
+            let layout = Layout::new(w, h, true);
             assert_eq!((FIRST_KEY..FIRST_KEY + KEYS as u8).filter(|&n| !white_index(n).1).count() as i32, WHITE_KEYS);
             let last = layout.key_rect(96);
             assert!(layout.keyboard.x >= 0 && last.x + last.w <= w && layout.keyboard.y + layout.keyboard.h <= h);
@@ -311,7 +324,7 @@ mod tests {
     #[test]
     fn controls_do_not_overlap_and_fit() {
         for (w, h) in SIZES {
-            let layout = Layout::new(w, h);
+            let layout = Layout::new(w, h, true);
             let widgets = layout.widgets();
             for (i, a) in widgets.iter().enumerate() {
                 assert!(a.rect.x >= 0 && a.rect.y >= 0 && a.rect.x + a.rect.w <= w && a.rect.y + a.rect.h <= layout.keyboard.y, "{w}x{h} {:?}", a.hit);
@@ -326,7 +339,7 @@ mod tests {
 
     #[test]
     fn dragging_a_drawbar_sets_its_position() {
-        let layout = Layout::new(1280, 1024);
+        let layout = Layout::new(1280, 1024, true);
         let mut organ = Organ::new(48000);
         let column = layout.widget_rect(Hit::Drawbar(2)).unwrap();
         let hit = layout.hit(column.x + 5, layout.knob_y(5)).unwrap();
@@ -342,7 +355,7 @@ mod tests {
 
     #[test]
     fn switches_and_sliders_act() {
-        let layout = Layout::new(1280, 1024);
+        let layout = Layout::new(1280, 1024, true);
         let mut organ = Organ::new(48000);
         press(&layout, &mut organ, Hit::Preset(1), 0, 0);
         assert!(lit(&organ, Hit::Preset(1)) && !lit(&organ, Hit::Preset(0)));

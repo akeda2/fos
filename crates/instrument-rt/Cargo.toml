@@ -1,0 +1,14 @@
+[package]
+name = "instrument-rt"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "instrument_rt"
+path = "src/lib.rs"
+
+[dependencies]
+audio-sample = { path = "../audio-sample" }
+audio-screen = { path = "../audio-screen" }
+gfx = { path = "../gfx" }
+tape-rt = { path = "../tape-rt" }

@@ -261,7 +261,9 @@ test: image
 	cargo +nightly-2026-09-13 test --manifest-path crates/dsp/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/ltas/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/noise/Cargo.toml
+	cargo +nightly-2026-09-13 test --manifest-path crates/fx/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/organ/Cargo.toml
+	cargo +nightly-2026-09-13 test --manifest-path crates/instrument-rt/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-screen/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/tape-rt/Cargo.toml
 	for tape in router nettest ed ip-chat telnet ptp fterm organ; do cargo +nightly-2026-09-13 test --lib --manifest-path tapes/$$tape/Cargo.toml || exit 1; done

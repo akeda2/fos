@@ -1285,10 +1285,11 @@ SDP (no RFC name exists), AVTP AAF format 0x01. L16/L24 remain the standards-bas
 (`audio-sample`, `audio-wire` round trips) and `make test-audio-net` (run h: float RTP, F32 SDP, 350 Hz tone).
 Only real hardware shows a float interface's behaviour and Opus's CPU cost on old machines.
 
-### Drawbar organ and tape MIDI (ABI 25, crates/organ, tapes/organ)
+### Drawbar organ and tape MIDI (ABI 25-26, crates/organ, crates/fx, crates/instrument-rt, tapes/organ)
 
 ABI 25 gives tapes USB-MIDI: `midi_read` returns one received message (device, cable, length, up to 3 bytes) and
-`midi_send` writes one to a device (`tape_rt::midi_event`, `midi_send`). `crates/organ` is a `no_std` Hammond-style engine
+`midi_send` writes one to a device (`tape_rt::midi_event`, `midi_send`); ABI 26 `midi_devices` counts the connected ones
+(`tape_rt::midi_devices`): the organ hides its on-screen keyboard while one is connected and gives the room to the panels. `crates/organ` is a `no_std` Hammond-style engine
 with host tests: 91 tone wheels (one sine per semitone from C1), nine drawbars at 3 dB per step, 2nd/3rd-harmonic percussion,
 key click, a scanner vibrato/chorus (modulated delay), a drive stage, a Leslie (800 Hz crossover, horn and drum with speed
 inertia, Doppler delay) and a Freeverb-style stereo reverb after it (`reverb.rs`,
@@ -1298,3 +1299,9 @@ release, so typed notes ring 0.3 s), MIDI keyboard, 61 keys (MIDI 36-96). It kee
 and sends the picture in 32-row bands, topping the queue up between bands, because a full-screen framebuffer write takes longer
 than the audio queue holds. `make test-organ` checks the picture and that a typed key sounds at the right pitch in a USB-audio
 recording; MIDI input, touch mapping, underruns and the Leslie/loudness balance need real hardware.
+
+Reusable parts: `crates/fx` holds the effects (`Rotary` (the Leslie), `Reverb`, `Ensemble` (a three-voice string-machine
+chorus), `Phaser`, `overdrive`, `Delay`, `Sine`); `crates/organ` re-exports `Leslie` and `Reverb` from it. `crates/instrument-rt`
+is the tape glue: `Output` (audio device, `rate=`/`latency=`/`out=`, queue pump, scope), `Touches` + `TouchTarget` (finger grabs),
+`TypedKeys`, `poll_midi` and `blit_banded`. The next instrument (a divide-down string machine) is meant to need only its own
+oscillators, UI and wiring.

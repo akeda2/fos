@@ -313,6 +313,12 @@ pub extern "C" fn api_midi_read(out: *mut u8) -> i32 {
     }
 }
 
+/// Tape ABI 26 `midi_devices`.
+pub extern "C" fn api_midi_devices() -> u32 {
+    crate::midishell::poll_usb();
+    count() as u32
+}
+
 /// Tape ABI 25 `midi_send`.
 pub extern "C" fn api_midi_send(device: u32, message: *const u8, len: u32) -> i32 {
     if message.is_null() || len == 0 || len > 3 {

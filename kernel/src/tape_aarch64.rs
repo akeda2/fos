@@ -202,6 +202,7 @@ fn make_api(info: &BootInfo, arguments: &str) -> TapeApi {
         touch_read: crate::usb_pointer::api_touch_read,
         midi_read: crate::usb_midi::api_midi_read,
         midi_send: crate::usb_midi::api_midi_send,
+        midi_devices: crate::usb_midi::api_midi_devices,
     }
 }
 
