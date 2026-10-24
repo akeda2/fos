@@ -298,3 +298,31 @@ pub fn describe_devices(print: impl Fn(core::fmt::Arguments)) {
         print(format_args!("MIDI: {dropped} event(s) dropped (nobody was reading)"));
     }
 }
+
+/// Tape ABI 25 `midi_read`: `out` points at six bytes (device, cable, count, three data bytes).
+pub extern "C" fn api_midi_read(out: *mut u8) -> i32 {
+    // The USB event rings are only drained when something polls; a tape's loop does not, so do it here.
+    crate::midishell::poll_usb();
+    match take() {
+        Some((device, cable, bytes, count)) => {
+            let packet = [device as u8, cable, count as u8, bytes[0], bytes[1], bytes[2]];
+            unsafe { out.copy_from_nonoverlapping(packet.as_ptr(), 6) };
+            1
+        }
+        None => 0,
+    }
+}
+
+/// Tape ABI 25 `midi_send`.
+pub extern "C" fn api_midi_send(device: u32, message: *const u8, len: u32) -> i32 {
+    if message.is_null() || len == 0 || len > 3 {
+        return -1;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(message, len as usize) };
+    match send(device as usize, bytes) {
+        Ok(()) => 0,
+        Err("no such MIDI device") => -2,
+        Err("the transfer failed") | Err("the controller is gone") => -3,
+        Err(_) => -1,
+    }
+}

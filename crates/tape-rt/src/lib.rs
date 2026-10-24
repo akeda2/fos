@@ -781,6 +781,32 @@ pub fn touch_event() -> Option<TouchEvent> {
     ((touch_table()?.touch_read)(out.as_mut_ptr()) == 1).then(|| TouchEvent { panel: out[0] as u32, id: out[1], x: out[2], y: out[3], down: out[4] != 0, screen: out[5] })
 }
 
+/// One received MIDI message: `data[..len]` is the message, status byte first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MidiMessage {
+    pub device: u32,
+    pub cable: u8,
+    pub len: usize,
+    pub data: [u8; 3],
+}
+
+fn midi_table() -> Option<&'static TapeApi> {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, midi_send) + core::mem::size_of::<usize>();
+    (table.version >= 25 && table.size as usize >= end).then_some(table)
+}
+
+/// The next message from any USB-MIDI device; `None` when there is none or the kernel is older than version 25.
+pub fn midi_event() -> Option<MidiMessage> {
+    let mut out = [0u8; 6];
+    ((midi_table()?.midi_read)(out.as_mut_ptr()) == 1).then(|| MidiMessage { device: out[0] as u32, cable: out[1], len: (out[2] as usize).min(3), data: [out[3], out[4], out[5]] })
+}
+
+/// Sends a 1-3 byte MIDI message to USB-MIDI device `device`; `false` on any failure (including an old kernel).
+pub fn midi_send(device: u32, message: &[u8]) -> bool {
+    midi_table().is_some_and(|table| (table.midi_send)(device, message.as_ptr(), message.len() as u32) == 0)
+}
+
 /// `gfx_info` for screen number `screen` (0-based). Screen 0 works on kernels from version 17, others need 20. From 20 on,
 /// even screen 0 goes through the numbered calls: `run A | B` splits the console into two screens, 0 and 1.
 pub fn gfx_info_on(screen: u32) -> Option<(u32, u32)> {

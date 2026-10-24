@@ -628,6 +628,8 @@ pub fn build_api(info: &BootInfo, arguments: &str) -> TapeApi {
         i2c_transfer: api_i2c_transfer,
         touch_info: crate::usb_pointer::api_touch_info,
         touch_read: crate::usb_pointer::api_touch_read,
+        midi_read: crate::usb_midi::api_midi_read,
+        midi_send: crate::usb_midi::api_midi_send,
     }
 }
 

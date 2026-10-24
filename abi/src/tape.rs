@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`. Version 20 added `gfx_screens` and the `gfx_*_on` calls (a screen number). Version 21 added `audio_float`. Version 22 added the `gpio_*` calls. Version 23 added `i2c_speed` and `i2c_transfer`. Version 24 added `touch_info` and `touch_read`.
-pub const TAPE_API_VERSION: u32 = 24;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`. Version 20 added `gfx_screens` and the `gfx_*_on` calls (a screen number). Version 21 added `audio_float`. Version 22 added the `gpio_*` calls. Version 23 added `i2c_speed` and `i2c_transfer`. Version 24 added `touch_info` and `touch_read`. Version 25 added `midi_read` and `midi_send`.
+pub const TAPE_API_VERSION: u32 = 25;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -339,6 +339,15 @@ pub struct TapeApi {
     /// a USB touch screen could be on any monitor; the Pi's DSI display is screen 0). Returns 1 for an event, 0 for none.
     /// Events nobody reads are dropped; the queue is shared with the shell's `touch monitor`.
     pub touch_read: extern "C" fn(*mut i32) -> i32,
+    /// `midi_read(out)` (version 25): takes the next message received from any USB-MIDI device and writes six bytes to `out`:
+    /// device number (0-based, as `midi` lists them), USB cable, how many of the three data bytes are valid (1-3), then the
+    /// three data bytes (one complete MIDI message). Returns 1 for a message, 0 for none. Polls the USB event rings itself.
+    /// The queue is shared with the shell's `midi monitor`; messages nobody reads are dropped when it overflows.
+    pub midi_read: extern "C" fn(*mut u8) -> i32,
+    /// `midi_send(device, message, len)` (version 25): sends one channel or system message of 1-3 bytes (no SysEx) on cable 0
+    /// of USB-MIDI device `device`. 0 on success; -1 bad message (empty, longer than 3, wrong length for its status byte),
+    /// -2 no such device, -3 the transfer failed.
+    pub midi_send: extern "C" fn(u32, *const u8, u32) -> i32,
 }
 
 /// `audio_float` bits: the capture stream / the playback stream carries IEEE 754 single-precision samples.
