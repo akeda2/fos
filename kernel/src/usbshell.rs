@@ -13,7 +13,12 @@ pub fn command(rest: &str) {
             crate::println!("{} new device(s) (keyboards or disks).", imp::rescan());
             imp::after_rescan();
         }
-        Some(_) => crate::println!("Usage: usb [rescan]"),
+        Some("debug") => {
+            let on = rest.split_whitespace().nth(1) != Some("off");
+            xhci::set_debug(on);
+            crate::println!("USB debug listing {} (port events, PORTSC, touch endpoint state).", if on { "on" } else { "off" });
+        }
+        Some(_) => crate::println!("Usage: usb [rescan|debug [off]]"),
     }
 }
 
@@ -32,8 +37,16 @@ pub fn describe_xhci(print: &impl Fn(core::fmt::Arguments)) {
             let status = controller.port_status(port);
             if status & 1 != 0 {
                 let speed = ((status >> 10) & 0xf) as u8;
-                print(format_args!("  port {port}: device connected ({}){}", xhci::speed_name(speed), if controller.slot_in_use_for_port(port) { ", in use" } else { "" }));
+                let in_use = if controller.slot_in_use_for_port(port) { ", in use" } else { "" };
+                if xhci::debug() {
+                    print(format_args!("  port {port}: device connected ({}), PORTSC {status:#x}{in_use}", xhci::speed_name(speed)));
+                } else {
+                    print(format_args!("  port {port}: device connected ({}){in_use}", xhci::speed_name(speed)));
+                }
             }
+        }
+        if xhci::debug() {
+            xhci::port_event_summary(index, print);
         }
         usb_hub::describe(index, controller, print);
     }

@@ -93,6 +93,75 @@ pub fn probe_all() -> usize {
 const IDLE_CONTROLLERS: usize = 4;
 static mut IDLE_PORTS: [u64; IDLE_CONTROLLERS] = [0; IDLE_CONTROLLERS];
 
+/// Root ports (bit = port number) whose last enumeration failed all three attempts: `auto_reattach` tries them again.
+static mut FAILED_PORTS: [u64; IDLE_CONTROLLERS] = [0; IDLE_CONTROLLERS];
+
+fn mark_failed(index: usize, port: u8, failed: bool) {
+    if index < IDLE_CONTROLLERS {
+        let bits = unsafe { &mut (*core::ptr::addr_of_mut!(FAILED_PORTS))[index] };
+        if failed { *bits |= 1 << port } else { *bits &= !(1 << port) }
+    }
+}
+
+fn any_failed() -> bool {
+    unsafe { (*core::ptr::addr_of!(FAILED_PORTS)).iter().any(|&bits| bits != 0) }
+}
+
+/// How often `auto_reattach` looks at the ports (timer ticks, 100 per second).
+const AUTO_CHECK_TICKS: u64 = 100;
+/// A port that fails to enumerate is tried again after this long, up to `AUTO_RETRIES` times in a row: a panel that is not
+/// ready for a while after power-up (rack1's touch screen) then turns up without a `usb rescan`.
+const AUTO_RETRY_TICKS: u64 = 1000;
+const AUTO_RETRIES: u8 = 6;
+static mut AUTO_NEXT: u64 = 0;
+static mut AUTO_RETRY_AT: u64 = 0;
+static mut AUTO_RETRIES_LEFT: u8 = AUTO_RETRIES;
+static mut AUTO_BUSY: bool = false;
+
+/// Hot-plug without `usb rescan`, run from `poll` about once a second. A root port whose device went away or came back
+/// (rack1's touch panel drops off the bus now and then: PORTSC shows it disconnected, the connect-change bit set) has its
+/// old slot released, and a connected port that nobody uses is enumerated. It is the pass `usb rescan` makes, so it can
+/// take a while (a foreground tape stalls meanwhile), but it only runs when a port needs it.
+fn auto_reattach() {
+    let now = crate::timer::ticks();
+    unsafe {
+        if AUTO_BUSY || now < AUTO_NEXT {
+            return;
+        }
+        AUTO_NEXT = now + AUTO_CHECK_TICKS;
+    }
+    let mut needed = false;
+    for index in 0..xhci::count() {
+        let Some(controller) = xhci::controller(index) else { continue };
+        for port in 1..=controller.ports {
+            let status = controller.port_status(port);
+            if status & 1 == 0 {
+                unsafe { AUTO_RETRIES_LEFT = AUTO_RETRIES }; // something was unplugged: a fresh start for the retries
+            }
+            if controller.slot_in_use_for_port(port) {
+                needed |= status & 1 == 0 || controller.port_connect_changed(port);
+            } else if status & 1 != 0 && !(index < IDLE_CONTROLLERS && unsafe { (*core::ptr::addr_of!(IDLE_PORTS))[index] } & (1 << port) != 0) {
+                needed |= unsafe { AUTO_RETRIES_LEFT > 0 && now >= AUTO_RETRY_AT };
+            }
+        }
+    }
+    if !needed {
+        return;
+    }
+    unsafe { AUTO_BUSY = true };
+    crate::println!("USB: a port changed or has no driver yet; looking at the ports again (what `usb rescan` does).");
+    probe_all();
+    unsafe {
+        AUTO_BUSY = false;
+        if any_failed() {
+            AUTO_RETRIES_LEFT = AUTO_RETRIES_LEFT.saturating_sub(1);
+            AUTO_RETRY_AT = crate::timer::ticks() + AUTO_RETRY_TICKS;
+        } else {
+            AUTO_RETRIES_LEFT = AUTO_RETRIES;
+        }
+    }
+}
+
 fn probe_all_once() -> usize {
     let mut added = 0;
     for index in 0..xhci::count() {
@@ -117,6 +186,7 @@ fn probe_all_once() -> usize {
                 if index < IDLE_CONTROLLERS {
                     unsafe { (*core::ptr::addr_of_mut!(IDLE_PORTS))[index] &= !(1 << port) };
                 }
+                mark_failed(index, port, false);
                 continue;
             }
             if index < IDLE_CONTROLLERS && unsafe { (*core::ptr::addr_of!(IDLE_PORTS))[index] } & (1 << port) != 0 && !controller.port_connect_changed(port) {
@@ -127,12 +197,13 @@ fn probe_all_once() -> usize {
             for attempt in 1..=3 {
                 unsafe { STEP = "open the port (reset, enable slot, address device)" };
                 match probe_port(index, controller, port) {
-                    Ok(true) => {
-                        added += 1;
+                    Ok(found) => {
+                        mark_failed(index, port, false);
+                        added += usize::from(found);
                         break;
                     }
-                    Ok(false) => break,
                     Err(error) => {
+                        mark_failed(index, port, attempt == 3);
                         crate::println!(
                             "USB: xHCI {:02x}:{:02x}.{} port {port}, attempt {attempt}/3 failed at \"{}\": {error:?} (PORTSC {:#x}, USBSTS {:#x}).",
                             controller.pci.bus, controller.pci.device, controller.pci.function,
@@ -400,12 +471,14 @@ fn decode(keyboard: &mut Keyboard, report: &[u8; 8]) {
 /// Drains every controller's event ring and polls every EHCI keyboard queue (call
 /// from the main loop).
 pub fn poll() {
+    xhci::note_foreground_poll();
     for index in 0..xhci::count() {
         let Some(controller) = xhci::controller(index) else { continue };
         while let Some(event) = controller.next_event() {
             background_event(controller, &event);
         }
     }
+    auto_reattach();
     let keyboards = unsafe { &mut *core::ptr::addr_of_mut!(KEYBOARDS) };
     for keyboard in keyboards.iter_mut().flatten() {
         if let Source::Ehci { controller, index } = keyboard.source {

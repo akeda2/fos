@@ -231,7 +231,7 @@ pub fn drag(layout: &Layout, machine: &mut Strings, hit: Hit, x: i32, y: i32) {
 mod tests {
     use super::*;
 
-    const SIZES: [(i32, i32); 3] = [(640, 480), (1280, 1024), (3312, 1872)];
+    const SIZES: [(i32, i32); 4] = [(640, 480), (1366, 768), (1280, 1024), (3312, 1872)];
 
     #[test]
     fn every_widget_is_on_screen_and_none_overlap() {

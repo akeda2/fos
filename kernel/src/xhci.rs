@@ -76,6 +76,7 @@ const TRB_SET_TR_DEQUEUE: u32 = 16;
 const TRB_STOP_ENDPOINT: u32 = 15;
 const TRB_NOOP_COMMAND: u32 = 23;
 const TRB_TRANSFER_EVENT: u32 = 32;
+const TRB_PORT_STATUS_EVENT: u32 = 34;
 const TRB_COMMAND_COMPLETION: u32 = 33;
 const TRB_CYCLE: u32 = 1;
 const TRB_TOGGLE_CYCLE: u32 = 2;
@@ -344,6 +345,62 @@ static mut SOFT: [SoftQueue; MAX_CONTROLLERS] = [const {
     SoftQueue { items: [Trb { parameter: 0, status: 0, control: 0 }; SOFT_CAPACITY], head: core::sync::atomic::AtomicUsize::new(0), tail: core::sync::atomic::AtomicUsize::new(0), dropped: core::sync::atomic::AtomicU64::new(0) }
 }; MAX_CONTROLLERS];
 
+/// The last port status changes the controller reported (a device that drops off the bus shows up here), newest last.
+const PORT_LOG: usize = 12;
+static mut PORT_EVENTS: [(u64, u8, u32, u32, u32); PORT_LOG] = [(0, 0, 0, 0, 0); PORT_LOG];
+/// When a touch panel's last report arrived (set by usb_pointer), so a port event can say how long the panel had been quiet.
+pub static LAST_TOUCH_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// `usb debug` turns the extra diagnostics (PORTSC, port-event log, touch endpoint state) on in listings; they are off by default.
+static DEBUG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub fn set_debug(on: bool) {
+    DEBUG.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+pub fn debug() -> bool {
+    DEBUG.load(core::sync::atomic::Ordering::Relaxed)
+}
+static PORT_EVENT_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// PORTSC of `port` for a controller whose USBSTS is at `usbsts` (a read does not clear anything: the change bits are RW1C).
+fn portsc_at(usbsts: usize, port: u8) -> u32 {
+    if port == 0 { return 0 }
+    read32(usbsts - 4 + OP_PORTS + (usize::from(port) - 1) * 0x10)
+}
+
+static POLL_LAST_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static POLL_MAX_GAP_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Called by the foreground each time it drains the event rings: remembers when, and the longest silence between two calls,
+/// so `usb` can say whether a slow tape (it reads touch and MIDI only when its loop comes round) starved the controller's
+/// event handling around a port change.
+pub fn note_foreground_poll() {
+    use core::sync::atomic::Ordering;
+    let now = timer::micros();
+    let last = POLL_LAST_US.swap(now, Ordering::Relaxed);
+    if last != 0 {
+        POLL_MAX_GAP_US.fetch_max(now.saturating_sub(last), Ordering::Relaxed);
+    }
+}
+
+fn note_port_event(trb: &Trb, usbsts: usize) {
+    use core::sync::atomic::Ordering;
+    let count = PORT_EVENT_COUNT.load(Ordering::Relaxed);
+    unsafe { (*core::ptr::addr_of_mut!(PORT_EVENTS))[count % PORT_LOG] = (timer::ticks(), (trb.parameter >> 24) as u8, portsc_at(usbsts, (trb.parameter >> 24) as u8), timer::micros().saturating_sub(POLL_LAST_US.load(Ordering::Relaxed)) as u32, timer::micros().saturating_sub(LAST_TOUCH_US.load(Ordering::Relaxed)).min(u64::from(u32::MAX)) as u32) };
+    PORT_EVENT_COUNT.store(count + 1, Ordering::Release);
+}
+
+/// For `usb`: how many port status changes were seen, the latest ones (tick, port) and the events the soft queue dropped.
+pub fn port_event_summary(index: usize, print: &impl Fn(core::fmt::Arguments)) {
+    use core::sync::atomic::Ordering;
+    let count = PORT_EVENT_COUNT.load(Ordering::Acquire);
+    let dropped = unsafe { (*core::ptr::addr_of!(SOFT))[index].dropped.load(Ordering::Relaxed) };
+    print(format_args!("  {count} port status change(s) since boot, {dropped} event(s) dropped by the soft queue, now at tick {}", timer::ticks()));
+    print(format_args!("  foreground event handling: longest silence {} us since the last `usb`", POLL_MAX_GAP_US.swap(0, Ordering::Relaxed)));
+    for n in count.saturating_sub(PORT_LOG)..count {
+        let (tick, port, portsc, silent, quiet) = unsafe { (*core::ptr::addr_of!(PORT_EVENTS))[n % PORT_LOG] };
+        print(format_args!("    tick {tick}: port {port}, PORTSC {portsc:#x} then, foreground silent {silent} us, last touch report {quiet} us before"));
+    }
+}
+
 fn soft_push(index: usize, trb: Trb) {
     use core::sync::atomic::Ordering;
     let queue = unsafe { &mut (*core::ptr::addr_of_mut!(SOFT))[index] };
@@ -399,6 +456,9 @@ fn drain(index: usize) {
         consumed = true;
         if crate::usb_audio::irq_event(index, &trb) {
             continue;
+        }
+        if trb.kind() == TRB_PORT_STATUS_EVENT {
+            note_port_event(&trb, state.usbsts);
         }
         soft_push(index, trb);
     }
@@ -844,6 +904,17 @@ impl Controller {
 
     fn context_endpoint(&self, context: u64, dci: u32) -> u64 {
         context + self.context_bytes * (1 + u64::from(dci))
+    }
+
+    /// Diagnostics: an endpoint's state in the controller's output context (0 disabled, 1 running, 2 halted, 3 stopped, 4 error),
+    /// the dequeue pointer it has reached and the address where the next TRB would be queued.
+    pub fn endpoint_debug(&self, slot: u8, dci: u32) -> (u32, u64, u64) {
+        let context = (self.slots[usize::from(slot)].output + self.context_bytes * u64::from(dci)) as *const u32; // no control context here
+        unsafe {
+            let state = context.read_volatile() & 7;
+            let dequeue = u64::from(context.add(2).read_volatile()) | (u64::from(context.add(3).read_volatile()) << 32);
+            (state, dequeue & !0xf, self.slots[usize::from(slot)].rings[dci as usize].enqueue_address())
+        }
     }
 
     /// Resets a root port by hand (`usb try`): a hot reset (PR), or for a SuperSpeed port a warm reset (WPR), which also

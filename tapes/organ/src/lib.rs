@@ -286,7 +286,7 @@ pub fn note_for_char(c: u8, base: u8) -> Option<u8> {
 mod tests {
     use super::*;
 
-    const SIZES: [(i32, i32); 4] = [(640, 480), (800, 600), (1280, 1024), (1920, 1080)];
+    const SIZES: [(i32, i32); 5] = [(640, 480), (1366, 768), (800, 600), (1280, 1024), (1920, 1080)];
 
     #[test]
     fn every_key_is_found_at_its_own_centre() {

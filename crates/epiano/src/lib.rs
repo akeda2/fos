@@ -424,7 +424,8 @@ impl EPiano {
         // Brightness: the voice's resonant low-pass opens to 6-70 times the pitch (higher the harder the hit and the
         // brighter the tone), rings at a Q of 0.9-3.5 by the hit, and closes to 3-13 times the pitch in 0.25-1.15 s.
         let top = (hz * (6.0 + 64.0 * hits * (0.3 + 0.7 * self.bell))).min(0.4 * rate).min(16000.0);
-        let bottom = (hz * (3.0 + 10.0 * self.bell)).clamp(600.0, top);
+        // Not `clamp`: a soft low note's `top` is below 600 Hz, and then the filter simply stays at `top`.
+        let bottom = (hz * (3.0 + 10.0 * self.bell)).max(600.0).min(top);
         // The pickup reaches less on high notes: their tines swing less, and their harmonics would alias.
         let reach = REACH / 0.32 * self.bark / (0.85 + hz / 1500.0);
         let voice = &mut self.voices[index];

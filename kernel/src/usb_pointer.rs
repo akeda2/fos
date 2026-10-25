@@ -36,6 +36,9 @@ struct Panel {
     down: [Option<hid::Touch>; hid::MAX_CONTACTS],
     reports: u64,
     events: u64,
+    /// Reports that ended in an error, and the last completion code (a stalled or failing panel).
+    errors: u64,
+    last_code: u8,
 }
 
 /// A finger went down, moved or lifted (`down` false), at the panel's own coordinates.
@@ -150,6 +153,8 @@ fn attach(controller: &mut Controller, device: &Device, configuration: &[u8], in
         down: [None; hid::MAX_CONTACTS],
         reports: 0,
         events: 0,
+        errors: 0,
+        last_code: 0,
     });
     controller.queue_interrupt_in(device.slot, dci, buffer, length);
     let (x, y) = extent(&pointer);
@@ -191,6 +196,7 @@ pub fn background_event(controller: &mut Controller, event: &Trb) -> bool {
             let mut touches = [hid::Touch::default(); hid::MAX_CONTACTS];
             let count = panel.pointer.decode(report, &mut touches);
             panel.reports += 1;
+            xhci::LAST_TOUCH_US.store(crate::timer::micros(), core::sync::atomic::Ordering::Relaxed);
             for touch in touches[..count].iter().copied() {
                 let known = panel.down.iter().position(|entry| entry.is_some_and(|known| known.id == touch.id));
                 let changed = match (known, touch.down) {
@@ -214,7 +220,11 @@ pub fn background_event(controller: &mut Controller, event: &Trb) -> bool {
                 }
             }
         }
-        _ => controller.reset_stalled_endpoint(panel.device.slot, panel.dci),
+        code => {
+            panel.errors += 1;
+            panel.last_code = code;
+            controller.reset_stalled_endpoint(panel.device.slot, panel.dci)
+        }
     }
     controller.queue_interrupt_in(panel.device.slot, panel.dci, panel.buffer, panel.length);
     true
@@ -335,7 +345,14 @@ pub extern "C" fn api_touch_read(out: *mut i32) -> i32 {
 pub fn describe_devices(print: impl Fn(core::fmt::Arguments)) {
     for (number, panel) in unsafe { (*core::ptr::addr_of!(PANELS)).iter().enumerate().filter_map(|(number, entry)| Some((number, entry.as_ref()?))) } {
         let (x, y) = extent(&panel.pointer);
-        print(format_args!("Touch {}: {:04x}:{:04x} on port {}, {x} x {y}, {} report(s), {} event(s)", number + 1, panel.vendor, panel.product, panel.device.path(), panel.reports, panel.events));
+        print(format_args!("Touch {}: {:04x}:{:04x} on port {}, {x} x {y}, {} report(s), {} event(s), {} error(s) (last code {})", number + 1, panel.vendor, panel.product, panel.device.path(), panel.reports, panel.events, panel.errors, panel.last_code));
+        for index in 0..xhci::count() {
+            let Some(controller) = xhci::controller(index) else { continue };
+            if xhci::debug() && (controller.pci.bus, controller.pci.device, controller.pci.function) == (panel.bus, panel.device_number, panel.function) {
+                let (state, dequeue, enqueue) = controller.endpoint_debug(panel.device.slot, panel.dci);
+                print(format_args!("  endpoint state {state}, dequeue {dequeue:#x}, next TRB {enqueue:#x}"));
+            }
+        }
     }
     #[cfg(target_arch = "aarch64")]
     if dsi_present() {

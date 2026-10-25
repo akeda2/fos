@@ -419,3 +419,21 @@ fn soft_lifts_the_velocity_floor() {
     assert!(level(0.8, 80) < 1.5 * level(0.0, 1) && level(0.8, 80) < 0.05 * level(0.0, 80));
     assert!((level(0.8, 127) - level(0.0, 127)).abs() < 0.01 * level(0.0, 127));
 }
+
+#[test]
+fn the_softest_hit_on_every_key_plays() {
+    // A soft low note's filter ceiling is below 600 Hz: `clamp(600, top)` used to panic (min > max) with Soft raised.
+    for model in Model::ALL {
+        for soft in [0.0, 0.5, 1.0] {
+            let mut piano = bare();
+            piano.set_model(model);
+            piano.set_soft(soft);
+            for note in 21..=108 {
+                for velocity in [1, 40, 80, 127] {
+                    piano.note_on(note, velocity);
+                }
+            }
+            assert!(render(&mut piano, 480).iter().all(|f| f[0].is_finite() && f[1].is_finite()), "{model:?} soft {soft}");
+        }
+    }
+}

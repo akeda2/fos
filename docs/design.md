@@ -1391,3 +1391,18 @@ each audio top-up and again between the bands of every screen blit (`blit_banded
 has no velocity, so a finger strikes harder the lower it lands on a key. The engine holds a whole `TapeEcho` (about 320 KB), so host tests
 run with `RUST_MIN_STACK=33554432`; the tape keeps it on its 1 MiB stack. `make test-epiano` records a typed note from a QEMU USB sound
 card and checks its pitch and the picture; the tone, the real latency (underruns at 10 ms), MIDI and touch need real hardware.
+
+### USB auto-reattach and the touch-panel drop (rack1, 2026-10)
+
+`usb_hid::auto_reattach` (called from `poll`, at most once a second) runs the `usb rescan` pass by itself when an in-use xHCI port lost its
+device (CCS=0 or connect-change set) or a connected port has no driver yet; failed ports are retried every 10 s, up to 6 times. A running
+tape stalls briefly while the port is enumerated. It also picks up devices that fail at boot (rack1's ELAN 04f3:249f touch panel and the UFX).
+
+Observed on rack1: the panel physically disconnected (PORTSC `0x202a0`: CCS=0, CSC, link RxDetect, no reset from us) once per run, within
+seconds, with epiano at `latency=10` and touch input; never with organ, strings, or epiano at 20/40 ms. It is not CPU load (the foreground
+was polling, no soft-queue drops, epiano renders 10 ms in about 1 ms). Later runs with auto-reattach and continuous dragging did not
+reproduce it; the root cause (power, USB link power management, panel firmware) is unknown.
+
+The diagnostics stay in the kernel but are off by default: `usb debug` adds PORTSC per port, the 12-entry port-event log (tick, port, PORTSC,
+foreground silence, age of the last touch report) and the touch endpoint state to `usb` and `touch`; `usb debug off` hides them again.
+`touch` always shows its error counters.
