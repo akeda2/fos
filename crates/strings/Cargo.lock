@@ -26,4 +26,13 @@ version = "0.1.0"
 dependencies = [
  "dsp",
  "fx",
+ "tape-echo",
+]
+
+[[package]]
+name = "tape-echo"
+version = "0.1.0"
+dependencies = [
+ "dsp",
+ "fx",
 ]

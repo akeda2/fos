@@ -263,12 +263,12 @@ test: image
 	cargo +nightly-2026-09-13 test --manifest-path crates/noise/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/fx/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/organ/Cargo.toml
-	cargo +nightly-2026-09-13 test --manifest-path crates/strings/Cargo.toml
+	RUST_MIN_STACK=33554432 cargo +nightly-2026-09-13 test --manifest-path crates/strings/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/tape-echo/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/instrument-rt/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-screen/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/tape-rt/Cargo.toml
-	for tape in router nettest ed ip-chat telnet ptp fterm organ strings tape-echo; do cargo +nightly-2026-09-13 test --lib --manifest-path tapes/$$tape/Cargo.toml || exit 1; done
+	for tape in router nettest ed ip-chat telnet ptp fterm organ strings tape-echo; do RUST_MIN_STACK=33554432 cargo +nightly-2026-09-13 test --lib --manifest-path tapes/$$tape/Cargo.toml || exit 1; done
 	python3 tools/test_boot.py
 
 # Deliberate-fault kernels (one Cargo feature each): checks the exception reports,

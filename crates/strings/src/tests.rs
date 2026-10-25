@@ -32,6 +32,7 @@ fn dry(section: usize) -> Strings {
     machine.set_ensemble(0.0);
     machine.set_phaser(0.0);
     machine.set_reverb(0.0);
+    machine.echo_mut().set_echo_level(0.0);
     machine.set_attack(0.0);
     machine.set_release(0.0);
     machine
@@ -216,4 +217,21 @@ fn a_moderate_chord_does_not_clip() {
     let out = render(&mut machine, RATE as usize * 2);
     let peak = out.iter().fold(0.0f32, |peak, f| peak.max(f[0].abs()).max(f[1].abs()));
     assert!(peak > 0.05 && peak < 0.95, "{peak}");
+}
+
+#[test]
+fn the_tape_echo_repeats_a_note_after_it_ends() {
+    let tail = |echo_level: f32| {
+        let mut machine = dry(1);
+        machine.echo_mut().set_echo_level(echo_level);
+        machine.echo_mut().set_repeat_rate(1.0);
+        machine.note_on(60);
+        render(&mut machine, RATE as usize / 2);
+        machine.note_off(60);
+        // With no release, only the echoes (and their feedback) can still be sounding 0.25 s after the key.
+        render(&mut machine, RATE as usize / 4);
+        rms(&render(&mut machine, RATE as usize / 4))
+    };
+    assert!(tail(0.0) < 1e-4);
+    assert!(tail(1.0) > 10.0 * tail(0.0).max(1e-5));
 }

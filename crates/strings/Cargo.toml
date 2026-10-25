@@ -10,3 +10,4 @@ path = "src/lib.rs"
 [dependencies]
 dsp = { path = "../dsp" }
 fx = { path = "../fx" }
+tape-echo = { path = "../tape-echo" }

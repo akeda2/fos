@@ -10,12 +10,13 @@
 //! sections (Violin, Viola, Cello, Bass, Brass, Piano) are different mixes of them through different low-pass filters, each
 //! with its own level slider.
 //!
-//! Chain: keys -> section buses -> section filters and levels -> ensemble chorus -> phaser -> reverb -> volume. The mod wheel
+//! Chain: keys -> section buses -> section filters and levels -> ensemble chorus -> phaser -> tape echo -> reverb -> volume. The mod wheel
 //! (controller 1) steers the phaser speed, the ensemble depth or both (`ModTarget`); controller 64 is the sustain pedal.
 #![cfg_attr(not(test), no_std)]
 
 use dsp::math;
 use fx::{Ensemble, Phaser, Reverb};
+use tape_echo::TapeEcho;
 
 pub const FIRST_KEY: u8 = 36;
 pub const KEYS: usize = 61;
@@ -66,6 +67,7 @@ pub struct Strings {
     low: [[f32; 2]; SECTIONS],
     ensemble: Ensemble,
     phaser: Phaser,
+    echo: TapeEcho,
     reverb: Reverb,
     volume: f32,
     mod_wheel: f32,
@@ -108,6 +110,7 @@ impl Strings {
             low: [[0.0; 2]; SECTIONS],
             ensemble: Ensemble::new(sample_rate),
             phaser: Phaser::new(sample_rate),
+            echo: TapeEcho::new(sample_rate),
             reverb: Reverb::new(),
             volume: 0.7,
             mod_wheel: 0.35,
@@ -119,6 +122,10 @@ impl Strings {
         };
         strings.set_sample_rate(sample_rate);
         strings.set_reverb(0.25);
+        // A tape echo behind the phaser takes the dryness off; its own spring stays off (the machine has its reverb).
+        strings.echo.set_echo_level(0.35);
+        strings.echo.set_intensity(0.35);
+        strings.echo.set_reverb(0.0);
         strings
     }
 
@@ -142,6 +149,7 @@ impl Strings {
         self.ensemble.set_sample_rate(sample_rate);
         self.phaser.set_sample_rate(sample_rate);
         self.reverb.set_sample_rate(rate);
+        self.echo.set_sample_rate(sample_rate);
         self.update_times();
         self.update_effects();
     }
@@ -285,6 +293,15 @@ impl Strings {
         self.phaser_mix
     }
 
+    /// The tape echo between the phaser and the reverb (its dry level stays 1; the spring stays off).
+    pub fn echo(&self) -> &TapeEcho {
+        &self.echo
+    }
+
+    pub fn echo_mut(&mut self) -> &mut TapeEcho {
+        &mut self.echo
+    }
+
     pub fn set_reverb(&mut self, mix: f32) {
         self.reverb.set_mix(mix);
     }
@@ -381,6 +398,7 @@ impl Strings {
             }
             let (left, right) = self.ensemble.process(mono * HEADROOM);
             let (left, right) = self.phaser.process(left, right);
+            let (left, right) = self.echo.process(left, right);
             let (left, right) = self.reverb.process(left, right);
             frame[0] = (left * self.volume).clamp(-1.0, 1.0);
             frame[1] = (right * self.volume).clamp(-1.0, 1.0);

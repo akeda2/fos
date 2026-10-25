@@ -7,7 +7,7 @@ use strings::{ModTarget, SECTIONS, Strings};
 
 pub const GLYPH_H: i32 = gfx::GLYPH_HEIGHT as i32;
 const MAX_WIDGETS: usize = 24;
-pub const SLIDERS: [&str; 7] = ["Attack", "Release", "Ensemble", "Phaser", "Reverb", "Volume", "Mod"];
+pub const SLIDERS: [&str; 10] = ["Attack", "Release", "Ensemble", "Phaser", "Reverb", "Volume", "Mod", "Echo", "Repeat", "Feedback"];
 pub const TARGETS: [(&str, ModTarget); 3] = [("Phaser", ModTarget::Phaser), ("Ens", ModTarget::Ensemble), ("Both", ModTarget::Both)];
 
 /// Something a finger can be on.
@@ -15,7 +15,7 @@ pub const TARGETS: [(&str, ModTarget); 3] = [("Phaser", ModTarget::Phaser), ("En
 pub enum Hit {
     /// A section fader (index into `SECTION_NAMES`).
     Fader(u8),
-    /// 0 attack, 1 release, 2 ensemble, 3 phaser, 4 reverb, 5 volume, 6 mod wheel.
+    /// 0 attack, 1 release, 2 ensemble, 3 phaser, 4 reverb, 5 volume, 6 mod wheel, 7 echo level, 8 echo repeat rate, 9 echo feedback.
     Slider(u8),
     /// What the mod wheel steers.
     Target(u8),
@@ -81,7 +81,7 @@ impl Layout {
             let rect = Rect { x: fader_panel.x + margin / 2 + index as i32 * column, y: layout.track_top - margin, w: column, h: layout.track_bottom - layout.track_top + margin * 2 };
             layout.add(rect, Hit::Fader(index as u8));
         }
-        // Seven sliders, then a row of three switches and the pedal, sharing the control panel's height.
+        // The sliders, then a row of three switches and the pedal, sharing the control panel's height.
         let rows = SLIDERS.len() as i32 + 1;
         let row_h = (control_panel.h - margin) / rows;
         for index in 0..SLIDERS.len() {
@@ -147,7 +147,10 @@ pub fn slider_value(machine: &Strings, index: u8) -> f32 {
         3 => machine.phaser(),
         4 => machine.reverb(),
         5 => machine.volume(),
-        _ => machine.mod_wheel(),
+        6 => machine.mod_wheel(),
+        7 => machine.echo().echo_level(),
+        8 => machine.echo().repeat_rate(),
+        _ => machine.echo().intensity(),
     }
 }
 
@@ -159,7 +162,10 @@ fn set_slider(machine: &mut Strings, index: u8, value: f32) {
         3 => machine.set_phaser(value),
         4 => machine.set_reverb(value),
         5 => machine.set_volume(value),
-        _ => machine.set_mod_wheel(value),
+        6 => machine.set_mod_wheel(value),
+        7 => machine.echo_mut().set_echo_level(value),
+        8 => machine.echo_mut().set_repeat_rate(value),
+        _ => machine.echo_mut().set_intensity(value),
     }
 }
 

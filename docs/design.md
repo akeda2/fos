@@ -1315,7 +1315,7 @@ top-octave chip made it (a test checks 220/440 Hz wrap counts). Each key has a s
 both sliders), a brass envelope (60/120 ms) and a piano envelope (2 ms attack, 3 s decay while held, 0.25 s after release); the
 keys feed seven buses (strings 16'/8'/4', brass 8'/4', piano 8'/4'), the 4' registers fading out over the top octave against aliasing.
 Six sections pick buses and filter them (two-pole low-pass, 0.5-6 kHz): Violin (8'+4', bright), Viola (8'), Cello (16'+8'), Bass
-(16'), Brass, Piano; each has a level fader. The sum goes through `fx::Ensemble` (mono to stereo), `fx::Phaser`, `fx::Reverb`.
+(16'), Brass, Piano; each has a level fader. The sum goes through `fx::Ensemble` (mono to stereo), `fx::Phaser`, a `tape_echo::TapeEcho` (Echo level, Repeat rate and Feedback sliders; its spring stays off, the machine's own reverb follows) and `fx::Reverb`. `TapeEcho` is about 320 KB, so host tests of `crates/strings` and `tapes/strings` run with `RUST_MIN_STACK=33554432` (the Makefile sets it).
 The mod wheel (CC1) sweeps the phaser speed (0.25-6 Hz) and/or the ensemble depth, as the Phaser/Ens/Both switch says; CC64 is
 the sustain pedal (the on-screen Pedal button and Tab do the same); CC123 stops all notes. The screen hides the keyboard while
 `midi_devices() > 0`, as the organ does. `make test-strings` checks the picture and a typed key's pitch in a USB-audio recording;
