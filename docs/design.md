@@ -1338,6 +1338,27 @@ tape's range. MIDI: controllers 20-31 are the twelve sliders, 64 Freeze (held), 
 use `TapeEcho` alone, or just `Spring`. `make test-tape-echo` uses QEMU's HD Audio duplex codec (silence in) and checks start, picture, keys
 and a clean stop; latency, feedback, the sound, touch and MIDI need real hardware.
 
+### Phono equaliser (crates/phono, tapes/phono)
+
+A record-playback equaliser for a flat (unequalised) input: `Phono` runs per-channel biquads in f64 state over f32 audio. A curve is
+`H(s) = (1 + s t2) / ((1 + s t1)(1 + s t3))` (bass shelf t1, treble cut t3, 0 = absent; a missing shelf gets a 10 Hz pole so the gain
+stays finite); `crates/riaa/src/curves.rs` has 21 entries from the Graumann 1958 table (microgroove: RIAA, IEC with its 7950 us
+high-pass, Columbia LP, NAB, NAB 1942, AES, London, Teldec, RCA LP, RCA 45; 78 rpm: IEC, CCIR, Decca, Columbia, RCA, Euro, Blumlein
+300, flat-500, American 6 and 8; and Flat). A plain bilinear transform was up to 3 dB off at 16 kHz, so the lead-lag and low-pass
+sections keep the analogue pole and match the gain at DC and Nyquist (lead-lag) or at 0.35 x rate (low-pass): under 0.15 dB to 16 kHz
+at 48 kHz. Gain is 0 dB at 1 kHz over the curve and rumble filter, then the trim. Signal order: polarity, mono (L+R halved, one
+chain), curve, rumble (Butterworth high-pass, 10-100 Hz), bass boost (RBJ peaking, +0-12 dB at 60-150 Hz, Q 0.3-3, outside the 1 kHz
+normalisation so its dB is exact at its centre), trim (-24 to +12 dB). The boost can clip the output (curve bass up to +20 dB plus
+up to +12 dB): watch the output meter and use trim.
+
+`tapes/phono` is one tape in two modes. The default shows the live response (green) over the analogue curve, a button per curve,
+five sliders, Mono / Invert L / Invert R and Save. `phono service` has no screen, prints one line and runs until Escape, so it fits
+the `start` file; the kernel does not allow audio tapes as `&N` services (audio teardown is not owner-aware), so it is a headless
+foreground tape. Settings are `key=value` words (`curve= mono= polarity= rumble= bass= bassfreq= bassq= trim=`) from `phono.cfg` or
+`@FILE`, then the command line; Save (or key `w`) writes the current settings to that config file, which is the default `service`
+reads. `make test-phono` uses QEMU's HD Audio duplex codec and checks the screen mode, keys, Save, a service run reading the saved file
+and a bad curve name; the sound itself needs real hardware. Record-to-file and speed correction are not done.
+
 ### Electric piano (crates/epiano, tapes/epiano)
 
 A Rhodes-style piano meant for playing live. Each of 20 voices is four decaying phasors (`Mode`): the fundamental, 2f, and the

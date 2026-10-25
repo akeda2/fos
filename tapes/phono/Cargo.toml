@@ -1,0 +1,27 @@
+[package]
+name = "phono-tape"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "phono_tape"
+path = "src/lib.rs"
+
+[[bin]]
+name = "phono"
+path = "src/main.rs"
+
+[dependencies]
+audio-screen = { path = "../../crates/audio-screen" }
+dsp = { path = "../../crates/dsp" }
+gfx = { path = "../../crates/gfx" }
+instrument-rt = { path = "../../crates/instrument-rt" }
+phono = { path = "../../crates/phono" }
+tape-rt = { path = "../../crates/tape-rt" }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = 2
+strip = "symbols"
