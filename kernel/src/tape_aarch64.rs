@@ -203,6 +203,7 @@ fn make_api(info: &BootInfo, arguments: &str) -> TapeApi {
         midi_read: crate::usb_midi::api_midi_read,
         midi_send: crate::usb_midi::api_midi_send,
         midi_devices: crate::usb_midi::api_midi_devices,
+        nic_owned: api_nic_owned,
     }
 }
 
@@ -550,6 +551,10 @@ extern "C" fn api_nic_count() -> usize {
     usize::from(crate::genet::present())
 }
 
+extern "C" fn api_nic_owned(index: usize) -> u32 {
+    u32::from(index == 0 && crate::genet::present() && crate::tasks::may_use(0))
+}
+
 extern "C" fn api_nic_mac(index: usize, out: *mut u8) -> u32 {
     match crate::genet::mac().filter(|_| index == 0) {
         Some(mac) => {
@@ -561,7 +566,7 @@ extern "C" fn api_nic_mac(index: usize, out: *mut u8) -> u32 {
 }
 
 extern "C" fn api_nic_send(index: usize, frame: *const u8, length: usize) -> u32 {
-    u32::from(index == 0 && length <= 1518 && crate::genet::send(unsafe { core::slice::from_raw_parts(frame, length) }))
+    u32::from(index == 0 && crate::tasks::may_use(0) && length <= 1518 && crate::genet::send(unsafe { core::slice::from_raw_parts(frame, length) }))
 }
 
 extern "C" fn api_nic_receive(index: usize, buffer: *mut u8, capacity: usize) -> usize {
@@ -580,7 +585,7 @@ extern "C" fn api_nic_receive(index: usize, buffer: *mut u8, capacity: usize) ->
 }
 
 extern "C" fn api_nic_set_promiscuous(index: usize, on: u32) -> u32 {
-    u32::from(index == 0 && crate::genet::set_promiscuous(on != 0))
+    u32::from(index == 0 && crate::tasks::may_use(0) && crate::genet::set_promiscuous(on != 0))
 }
 
 extern "C" fn api_nic_set_multicast(index: usize, on: u32) -> u32 {

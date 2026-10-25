@@ -159,12 +159,14 @@ fn parse_ports(
     let arguments = strip_leading_bridge_word(arguments);
     let arguments = &arguments[skip_spaces(arguments, 0)..];
     if arguments.is_empty() {
-        if nic_count > MAX_PORTS {
-            return None;
-        }
-        let count = nic_count;
-        for (index, port) in ports.iter_mut().take(count).enumerate() {
-            *port = index as u32;
+        // No list: every NIC this bridge may drive (a service gets its own `&N,M` NICs, not the whole machine's).
+        let mut count = 0;
+        for index in (0..nic_count as u32).filter(|&index| tape_rt::nic_usable(index)) {
+            if count == MAX_PORTS {
+                return None;
+            }
+            ports[count] = index;
+            count += 1;
         }
         return (count >= 2).then_some(count);
     }
@@ -280,6 +282,11 @@ pub extern "C" fn tape_main(api: &'static tape_rt::TapeApi) {
         );
         return;
     };
+
+    if ports[..port_count].iter().any(|&port| !tape_rt::nic_usable(port)) {
+        print_bytes(putc, b"Bridge: a selected NIC is reserved by a service (`ps`); it cannot use it.\n");
+        return;
+    }
 
     let max_frame_len = usize::try_from(nic_max_frame_len())
         .unwrap_or(MAX_FRAME_LEN)

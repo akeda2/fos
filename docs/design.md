@@ -1248,6 +1248,11 @@ service, and the foreground tape gets none from it. A second service on an owned
 NIC is refused. Tape-end cleanup (multicast, VLAN, offload, timestamps) skips
 service NICs; `nic_release` clears them when the service ends.
 
+**Tapes cannot touch NICs they have not reserved.** The tape calls that send or change a card (`nic_send`, `nic_set_promiscuous`,
+`nic_multicast_join`, VLAN, offload, timestamps) fail on a NIC the running tape may not use: a service may use only its own NICs,
+the foreground only those no service owns (`tasks::may_use`). ABI 27 `nic_owned(index)` (`tape_rt::nic_usable`) lets a tape ask first:
+`bridge` without a port list bridges only the usable NICs, and `bridge`/`router` refuse a configuration that names a reserved one.
+
 **Audio devices are owned too.** `run NAME device=N outdev=M &0` (or `nic=N` instead of `&N`) makes the kernel claim audio
 devices N (input, and output unless `outdev=`) and M (output) for the service before it starts; `ps` shows them (`audio N out M`). The
 device choice (`audio device`, `audio output`, the tape calls `audio_use_device`/`audio_use_output`) is kept per context

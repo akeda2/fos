@@ -2585,6 +2585,11 @@ pub extern "C" fn tape_main(api: &'static tape_rt::TapeApi) {
         print_bytes(putc, b"Router configuration error: a DHCP NIC is not present.\n");
         return;
     }
+    let reserved = parsed.interfaces[..parsed.interface_count].iter().flatten().map(|config| config.nic).chain(parsed.dhcp_uplinks[..parsed.dhcp_uplink_count].iter().flatten().copied()).find(|&nic| !tape_rt::nic_usable(nic));
+    if reserved.is_some() {
+        print_bytes(putc, b"Router configuration error: a NIC is reserved by a service (`ps`); the router may only use its own.\n");
+        return;
+    }
     let max_frame_len = min(nic_max_frame_len() as usize, MAX_FRAME_LEN);
     if max_frame_len < 60 {
         print_bytes(putc, b"Router cannot start: NIC frame limit is too small.\n");

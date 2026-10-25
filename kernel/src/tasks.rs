@@ -97,6 +97,13 @@ pub fn current_nic() -> Option<usize> {
     (current != 0).then(|| services()[current - 1].nics).filter(|&nics| nics != 0).map(|nics| nics.trailing_zeros() as usize)
 }
 
+/// Whether the running tape (a service, or the foreground) may drive NIC `index`: a service only its own NICs, the foreground
+/// only those no service owns. The calls that send or change a card check this, so a tape cannot touch hardware it has not
+/// reserved.
+pub fn may_use(index: usize) -> bool {
+    if in_service() { current_owns(index) } else { !service_owns(index) }
+}
+
 /// Whether the service that is running now owns NIC `index`.
 pub fn current_owns(index: usize) -> bool {
     let current = unsafe { CURRENT };

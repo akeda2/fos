@@ -809,6 +809,14 @@ pub fn midi_devices() -> u32 {
     if table.version >= 26 && table.size as usize >= end { (table.midi_devices)() } else { 0 }
 }
 
+/// Whether this tape may drive NIC `nic` (0-based): it exists and no other service reserved it, or, in a service, it is one of
+/// its own. True for every present NIC on a kernel older than version 27 (which reserves nothing).
+pub fn nic_usable(nic: u32) -> bool {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, nic_owned) + core::mem::size_of::<usize>();
+    if table.version >= 27 && table.size as usize >= end { (table.nic_owned)(nic as usize) != 0 } else { (nic as usize) < (table.nic_count)() }
+}
+
 /// Sends a 1-3 byte MIDI message to USB-MIDI device `device`; `false` on any failure (including an old kernel).
 pub fn midi_send(device: u32, message: &[u8]) -> bool {
     midi_table().is_some_and(|table| (table.midi_send)(device, message.as_ptr(), message.len() as u32) == 0)

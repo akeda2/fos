@@ -339,18 +339,33 @@ extern "C" fn api_wall_clock_set(time: *const fosfor_abi::tape::WallClock) -> u3
     u32::from(crate::clock::set(&time).is_ok())
 }
 extern "C" fn api_nic_ts_enable(index: usize) -> u32 {
+    if !crate::tasks::may_use(index) {
+        return 0;
+    }
     u32::from(term::nic_ts_enable(index))
 }
 extern "C" fn api_nic_ts_clock(index: usize) -> u64 {
+    if !crate::tasks::may_use(index) {
+        return 0;
+    }
     term::nic_ts_clock(index)
 }
 extern "C" fn api_nic_ts_adjust(index: usize, ppb: i32) -> u32 {
+    if !crate::tasks::may_use(index) {
+        return 0;
+    }
     u32::from(term::nic_ts_adjust(index, ppb))
 }
 extern "C" fn api_nic_ts_step(index: usize, delta: i64) -> u32 {
+    if !crate::tasks::may_use(index) {
+        return 0;
+    }
     u32::from(term::nic_ts_step(index, delta))
 }
 extern "C" fn api_nic_multicast_join(index: usize, mac: *const u8, on: u32) -> u32 {
+    if !crate::tasks::may_use(index) {
+        return 0;
+    }
     if mac.is_null() {
         return 0;
     }
@@ -359,9 +374,15 @@ extern "C" fn api_nic_multicast_join(index: usize, mac: *const u8, on: u32) -> u
     u32::from(term::nic_multicast_join(index, address, on != 0))
 }
 extern "C" fn api_nic_vlan_filter(index: usize, vid: u32, on: u32) -> u32 {
+    if !crate::tasks::may_use(index) {
+        return 0;
+    }
     u16::try_from(vid).is_ok_and(|vid| term::nic_vlan_filter(index, vid, on != 0)) as u32
 }
 extern "C" fn api_nic_counters(index: usize, out: *mut u64, count: usize) -> usize {
+    if !crate::tasks::may_use(index) {
+        return 0;
+    }
     if out.is_null() {
         return 0;
     }
@@ -396,15 +417,27 @@ extern "C" fn api_fp_level() -> u32 {
     unsafe { FP_LEVEL }
 }
 extern "C" fn api_nic_tx_offload(index: usize, on: u32) -> u32 {
+    if !crate::tasks::may_use(index) {
+        return 0;
+    }
     u32::from(term::nic_tx_offload(index, on != 0))
 }
 extern "C" fn api_nic_ts_all(index: usize, on: u32) -> u32 {
+    if !crate::tasks::may_use(index) {
+        return 0;
+    }
     u32::from(term::nic_ts_all(index, on != 0))
 }
 extern "C" fn api_nic_ts_rx(index: usize) -> u64 {
+    if !crate::tasks::may_use(index) {
+        return 0;
+    }
     term::last_rx_stamp(index)
 }
 extern "C" fn api_nic_send_stamped(index: usize, frame: *const u8, length: usize, stamp: *mut u64) -> u32 {
+    if !crate::tasks::may_use(index) {
+        return 0;
+    }
     if length > 1518 {
         return 0;
     }
@@ -452,13 +485,23 @@ extern "C" fn api_serial_break(number: usize, on: u32) {
 extern "C" fn api_audio_set_capture_ring(bytes: u64) {
     crate::usb_audio::set_capture_ring(bytes); // the capture ring belongs to whichever device starts next
 }
+/// Tape ABI 27 `nic_owned`: 1 when the running tape may drive NIC `index` (see `tasks::may_use`).
+extern "C" fn api_nic_owned(index: usize) -> u32 {
+    u32::from(index < term::nic_count() && crate::tasks::may_use(index))
+}
 extern "C" fn api_nic_count() -> usize {
     term::nic_count()
 }
 extern "C" fn api_nic_set_promiscuous(index: usize, on: u32) -> u32 {
+    if !crate::tasks::may_use(index) {
+        return 0;
+    }
     u32::from(term::nic_set_promiscuous(index, on != 0))
 }
 extern "C" fn api_nic_set_multicast(index: usize, on: u32) -> u32 {
+    if !crate::tasks::may_use(index) {
+        return 0;
+    }
     u32::from(term::nic_set_multicast(index, on != 0))
 }
 extern "C" fn api_nic_mac(index: usize, out: *mut u8) -> u32 {
@@ -470,6 +513,9 @@ extern "C" fn api_nic_mac(index: usize, out: *mut u8) -> u32 {
     1
 }
 extern "C" fn api_nic_send(index: usize, frame: *const u8, length: usize) -> u32 {
+    if !crate::tasks::may_use(index) {
+        return 0;
+    }
     if length > 1518 {
         return 0;
     }
@@ -631,6 +677,7 @@ pub fn build_api(info: &BootInfo, arguments: &str) -> TapeApi {
         midi_read: crate::usb_midi::api_midi_read,
         midi_send: crate::usb_midi::api_midi_send,
         midi_devices: crate::usb_midi::api_midi_devices,
+        nic_owned: api_nic_owned,
     }
 }
 
