@@ -10,12 +10,15 @@
 //! sections (Violin, Viola, Cello, Bass, Brass, Piano) are different mixes of them through different low-pass filters, each
 //! with its own level slider.
 //!
-//! Chain: keys -> section buses -> section filters and levels -> ensemble chorus -> phaser -> tape echo -> reverb -> volume. The mod wheel
-//! (controller 1) steers the phaser speed, the ensemble depth or both (`ModTarget`); controller 64 is the sustain pedal.
+//! Chain: keys -> section buses -> section filters and levels -> (wah) -> ensemble chorus -> phaser -> tape echo -> reverb -> volume.
+//! The wah is `fx::Wah`, the electric piano's vowel filter, on the sum: off until switched on (`set_wah`), then resting at
+//! Vowel, sharpened by Q, opening as high as Range, worked by an expression pedal (controller 11) and opened by the
+//! sound's own level as much as Env says (an envelope filter: a chord swells into "a"). The mod wheel (controller 1)
+//! steers the phaser speed, the ensemble depth, both, or the wah (`ModTarget`); controller 64 is the sustain pedal.
 #![cfg_attr(not(test), no_std)]
 
 use dsp::math;
-use fx::{Ensemble, Phaser, Reverb};
+use fx::{Ensemble, Phaser, Reverb, Wah, WahShape};
 use tape_echo::TapeEcho;
 
 pub const FIRST_KEY: u8 = 36;
@@ -34,11 +37,21 @@ pub enum ModTarget {
     Phaser,
     Ensemble,
     Both,
+    /// The mod wheel works the wah like a pedal (controller 11).
+    Wah,
 }
 
 impl ModTarget {
     pub fn name(self) -> &'static str {
-        ["Phaser", "Ensemble", "Both"][self as usize]
+        ["Phaser", "Ensemble", "Both", "Wah"][self as usize]
+    }
+
+    fn phaser(self) -> bool {
+        self == ModTarget::Phaser || self == ModTarget::Both
+    }
+
+    fn ensemble(self) -> bool {
+        self == ModTarget::Ensemble || self == ModTarget::Both
     }
 }
 
@@ -76,6 +89,17 @@ pub struct Strings {
     phaser_mix: f32,
     phaser_speed: f32,
     ensemble_depth: f32,
+    wah_on: bool,
+    wah: Wah,
+    vowel: f32,
+    q: f32,
+    range: f32,
+    env: f32,
+    pedal_wah: f32,
+    /// The envelope follower: the sum's level, rising in 10 ms and falling in 200 ms.
+    level_follow: f32,
+    follow_attack: f32,
+    follow_release: f32,
 }
 
 fn time_constant(seconds: f32, rate: f32) -> f32 {
@@ -119,6 +143,16 @@ impl Strings {
             phaser_mix: 0.0,
             phaser_speed: 0.4,
             ensemble_depth: 0.7,
+            wah_on: false,
+            wah: Wah::ZERO,
+            vowel: 0.3,
+            q: 0.5,
+            range: 0.3,
+            env: 0.5,
+            pedal_wah: 0.0,
+            level_follow: 0.0,
+            follow_attack: 0.0,
+            follow_release: 0.0,
         };
         strings.set_sample_rate(sample_rate);
         strings.set_reverb(0.25);
@@ -143,6 +177,8 @@ impl Strings {
         self.brass_attack = time_constant(0.06, rate);
         self.brass_release = time_constant(0.12, rate);
         self.piano_attack = time_constant(0.002, rate);
+        self.follow_attack = time_constant(0.01, rate);
+        self.follow_release = time_constant(0.2, rate);
         // The piano's amplitude falls by 60 dB in 3 s while held and in 0.25 s after release.
         self.piano_decay = math::exp64(-6.9078 / (3.0 * rate as f64)) as f32;
         self.piano_release = math::exp64(-6.9078 / (0.25 * rate as f64)) as f32;
@@ -161,8 +197,8 @@ impl Strings {
 
     fn update_effects(&mut self) {
         let wheel = self.mod_wheel;
-        self.phaser_speed = if self.mod_target != ModTarget::Ensemble { 0.25 * math::pow10(1.3802 * wheel) } else { 0.4 };
-        self.ensemble_depth = if self.mod_target != ModTarget::Phaser { 0.4 + 0.6 * wheel } else { 0.8 };
+        self.phaser_speed = if self.mod_target.phaser() { 0.25 * math::pow10(1.3802 * wheel) } else { 0.4 };
+        self.ensemble_depth = if self.mod_target.ensemble() { 0.4 + 0.6 * wheel } else { 0.8 };
         self.phaser.set_speed(self.phaser_speed);
         self.phaser.set_depth(0.8);
         self.phaser.set_feedback(0.5);
@@ -225,7 +261,8 @@ impl Strings {
         self.pedal
     }
 
-    /// Handles one MIDI message: note on/off, controller 1 (mod wheel), 64 (sustain), 120 and 123 (all notes off).
+    /// Handles one MIDI message: note on/off, controller 1 (mod wheel), 11 (expression: the wah pedal), 64 (sustain), 120
+    /// and 123 (all notes off).
     /// Returns whether it was one of those.
     pub fn midi(&mut self, message: &[u8]) -> bool {
         let [status, data1, data2] = match *message {
@@ -238,6 +275,7 @@ impl Strings {
             0x90 | 0x80 => self.note_off(data1),
             0xb0 => match data1 {
                 1 => self.set_mod_wheel(data2 as f32 / 127.0),
+                11 => self.set_wah_pedal(data2 as f32 / 127.0),
                 64 => self.set_sustain(data2 >= 64),
                 120 | 123 => self.all_notes_off(),
                 _ => return false,
@@ -318,7 +356,61 @@ impl Strings {
         self.volume
     }
 
-    /// The mod wheel, 0..=1: phaser speed 0.25-6 Hz and/or ensemble depth 0.4-1, as `mod_target` says.
+    /// The wah on the sum (`fx::Wah`), off by default.
+    pub fn set_wah(&mut self, on: bool) {
+        self.wah_on = on;
+    }
+
+    pub fn wah_on(&self) -> bool {
+        self.wah_on
+    }
+
+    /// Where the wah rests, 0..=1: a dark "u" to the top of the Range.
+    pub fn set_vowel(&mut self, vowel: f32) {
+        self.vowel = vowel.clamp(0.0, 1.0);
+    }
+
+    pub fn vowel(&self) -> f32 {
+        self.vowel
+    }
+
+    /// The wah's sharpness, 0..=1 (Q 1.5 to 12; sharper keeps less of the unfiltered sound).
+    pub fn set_q(&mut self, q: f32) {
+        self.q = q.clamp(0.0, 1.0);
+    }
+
+    pub fn q(&self) -> f32 {
+        self.q
+    }
+
+    /// How high the wah opens, 0..=1: its first formant at full openness, 600 Hz to 2.4 kHz.
+    pub fn set_range(&mut self, range: f32) {
+        self.range = range.clamp(0.0, 1.0);
+    }
+
+    pub fn range(&self) -> f32 {
+        self.range
+    }
+
+    /// How far the sound's own level opens the wah, 0..=1 (0: only the pedal moves it).
+    pub fn set_env(&mut self, env: f32) {
+        self.env = env.clamp(0.0, 1.0);
+    }
+
+    pub fn env(&self) -> f32 {
+        self.env
+    }
+
+    /// The wah pedal (controller 11), 0..=1; the mod wheel does the same with the Wah target, the further counts.
+    pub fn set_wah_pedal(&mut self, pedal: f32) {
+        self.pedal_wah = pedal.clamp(0.0, 1.0);
+    }
+
+    pub fn wah_pedal(&self) -> f32 {
+        self.pedal_wah
+    }
+
+    /// The mod wheel, 0..=1: phaser speed 0.25-6 Hz and/or ensemble depth 0.4-1, or the wah, as `mod_target` says.
     pub fn set_mod_wheel(&mut self, wheel: f32) {
         self.mod_wheel = wheel.clamp(0.0, 1.0);
         self.update_effects();
@@ -349,6 +441,9 @@ impl Strings {
 
     /// Renders `frames.len()` stereo frames (left, right), each within -1..=1.
     pub fn render(&mut self, frames: &mut [[f32; 2]]) {
+        let wheel = if self.mod_target == ModTarget::Wah { self.mod_wheel } else { 0.0 };
+        let shape = WahShape::new(self.vowel, self.pedal_wah.max(wheel), self.q, self.range, self.rate);
+        let lift_room = 1.2 - shape.base();
         for frame in frames.iter_mut() {
             for pc in 0..12 {
                 self.counter[pc] = self.counter[pc].wrapping_add(self.step[pc] as u64);
@@ -396,7 +491,17 @@ impl Strings {
                 *second += (*first - *second) * self.pole[section];
                 mono += *second * self.level[section];
             }
-            let (left, right) = self.ensemble.process(mono * HEADROOM);
+            let mut mono = mono * HEADROOM;
+            if self.wah_on {
+                // The follower is near 0.04 for one key of one full section: that opens it two thirds of the way, a big
+                // chord or more sections a little further.
+                let level = mono.abs();
+                let pole = if level > self.level_follow { self.follow_attack } else { self.follow_release };
+                self.level_follow += (level - self.level_follow) * pole;
+                let lift = self.env * lift_room * self.level_follow / (self.level_follow + 0.02);
+                mono = self.wah.tick(mono, lift, 1.0, &shape);
+            }
+            let (left, right) = self.ensemble.process(mono);
             let (left, right) = self.phaser.process(left, right);
             let (left, right) = self.echo.process(left, right);
             let (left, right) = self.reverb.process(left, right);

@@ -21,10 +21,15 @@ A divide-down string machine in the Solina mould. Six sections, each with a
 fader on the screen: Violin, Viola, Cello, Bass, Brass (a slow swell) and
 Piano (it decays while held). Attack and Release shape the strings; Ensemble
 is the three-voice chorus, Phaser a six-stage phaser, Reverb a room. Echo,
-Repeat and Feedback are a tape echo (crates/tape-echo) before the reverb. A
-USB-MIDI keyboard plays it (note on/off, sustain pedal, controller 123 stops
-all notes); the mod wheel sweeps the phaser speed and/or the ensemble depth,
-as the Phaser / Ens / Both buttons say. Pedal on the screen holds notes like
+Repeat and Feedback are a tape echo (crates/tape-echo) before the reverb.
+The Wah button puts the electric piano's vowel filter on the sum, before the
+chorus: Vowel sets where it rests, Q how sharp it is, Range how high it
+opens (low a sung "a", high a squeal), Env how far the sound's own level
+opens it (a chord swells into "a"), the Wah slider is the pedal. A USB-MIDI
+keyboard plays it (note on/off, sustain pedal, controller 123 stops all
+notes, an expression pedal, CC 11, works the wah); the mod wheel sweeps the
+phaser speed and/or the ensemble depth, or works the wah, as the Phaser /
+Ens / Both / Wah buttons say. Pedal on the screen holds notes like
 the sustain pedal. While a MIDI keyboard is connected the on-screen keyboard
 is hidden. The sound is stereo, 32-bit float inside, whatever the audio device
 takes. latency=MS is how much audio is kept queued (10-200, default 40).

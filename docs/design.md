@@ -1304,7 +1304,7 @@ Reusable parts: `crates/fx` holds the effects (`Rotary` (the Leslie), `Reverb`, 
 chorus), `Phaser`, `Spring` (a two-spring reverb with dispersive allpass chains), `overdrive`, `Delay`, `Sine`); `crates/organ` re-exports `Leslie` and `Reverb` from it. `crates/instrument-rt`
 is the tape glue: `Output` (audio device, `rate=`/`latency=`/`out=`, queue pump, scope), `Touches` + `TouchTarget` (finger grabs),
 `TypedKeys`, `poll_midi`, `blit_banded` (`Output::start_duplex` + `pump_duplex` also capture and pass the input through) and the 61-key `Keyboard` (geometry, hit test, drawing) with `note_for_char`; the
-strings tape uses the shared keyboard, the organ still has its own copy (moving it over is left for later). A new instrument needs
+strings and epiano tapes use the shared keyboard, the organ still has its own copy (moving it over is left for later). A new instrument needs
 only its own oscillators, UI and wiring.
 
 ### String machine (crates/strings, tapes/strings)
@@ -1316,7 +1316,10 @@ both sliders), a brass envelope (60/120 ms) and a piano envelope (2 ms attack, 3
 keys feed seven buses (strings 16'/8'/4', brass 8'/4', piano 8'/4'), the 4' registers fading out over the top octave against aliasing.
 Six sections pick buses and filter them (two-pole low-pass, 0.5-6 kHz): Violin (8'+4', bright), Viola (8'), Cello (16'+8'), Bass
 (16'), Brass, Piano; each has a level fader. The sum goes through `fx::Ensemble` (mono to stereo), `fx::Phaser`, a `tape_echo::TapeEcho` (Echo level, Repeat rate and Feedback sliders; its spring stays off, the machine's own reverb follows) and `fx::Reverb`. `TapeEcho` is about 320 KB, so host tests of `crates/strings` and `tapes/strings` run with `RUST_MIN_STACK=33554432` (the Makefile sets it).
-The mod wheel (CC1) sweeps the phaser speed (0.25-6 Hz) and/or the ensemble depth, as the Phaser/Ens/Both switch says; CC64 is
+The Wah button puts the electric piano's vowel filter (`fx::Wah`, below) on the mono sum, before the ensemble: Vowel, Q and Range as
+there, an expression pedal (CC11), the Wah slider or the mod wheel's Wah target to work it, and Env, an envelope follower (the sum's level, 10 ms up,
+200 ms down, one key of one section about 0.04, opening it by level/(level+0.02)), so a chord swells into "a" with the strings'
+attack. The mod wheel (CC1) sweeps the phaser speed (0.25-6 Hz) and/or the ensemble depth, or the wah, as the Phaser/Ens/Both/Wah switch says; CC64 is
 the sustain pedal (the on-screen Pedal button and Tab do the same); CC123 stops all notes. The screen hides the keyboard while
 `midi_devices() > 0`, as the organ does. `make test-strings` checks the picture and a typed key's pitch in a USB-audio recording;
 the sound, touch, MIDI, pedal and mod wheel need real hardware.
@@ -1334,3 +1337,57 @@ reverb. `TapTempo` averages up to four taps (gaps over 2 s restart, under 80 ms 
 tape's range. MIDI: controllers 20-31 are the twelve sliders, 64 Freeze (held), 65 Tap, 102-104 the heads. Other instruments can
 use `TapeEcho` alone, or just `Spring`. `make test-tape-echo` uses QEMU's HD Audio duplex codec (silence in) and checks start, picture, keys
 and a clean stop; latency, feedback, the sound, touch and MIDI need real hardware.
+
+### Electric piano (crates/epiano, tapes/epiano)
+
+A Rhodes-style piano meant for playing live. Each of 20 voices is four decaying phasors (`Mode`): the fundamental, 2f, and the
+tine's bell and ting at 6.267 and 17.55 times the fundamental (cantilever-beam ratios). A hit's velocity first goes through the Soft floor (velocities up to 0-100 play the softest note, the rest is stretched to the full range, for keyboards that send high velocities for light playing; the header shows the last velocity; the engine alone spans about 35 dB from velocity 10 to 127), then through `v^(0.6..2.2)` (the Touch slider; 1.32 by default); the bell
+amplitude follows its square, so hard playing is bright and soft playing is mellow (Bell sets the overall amount, the bell fades near
+Nyquist). Higher notes decay faster, Decay sets the base (0.8-7.8 s at middle C), the bell dies in about half a second. A burst of
+low-passed noise is the hammer thump. After a key-up a damper takes the note down in 70 ms unless the pedal holds it. Each tine has its
+own pickup (`Pickup`), as on a Rhodes, so a note's bark rises and dies with that note and chords stay clean. The tine swings across a
+small magnet and coil, resting 0.4 field widths off its middle; the flux is bell-shaped, 1/(1 + (q - 0.4)^2) for a swing q in field
+widths (up to 2 at full Bark and velocity 127). A small swing sees the slope, a clean copy; a hard one passes the whole bell twice a cycle
+and makes lopsided pulses. The tine's tuned tone passes as it is, plus 0.6 of what the curve adds (the fundamental sags on a hard hit) and
+1.6 times its derivative, high-passed at 1.5 times the pitch first (the coil reads the change of flux, raising harmonic n n-fold, up to
+about the fifth, a low-pass at five times the pitch standing for the coil's inductance). A soft note keeps a second and a third harmonic
+("plong"); a hard one spreads to the ninth (harmonics 4-9 at 0.03 against 1.0 of the fundamental, velocity 50 against 127, full Bark).
+The first pickup on the sum of all notes (a cubic term) made chords clip and sounded like a distorted "dunn"; a second, 1/(1 - q) per
+tine, gave dynamics but its harmonics fell off geometrically, so a low note had nothing above about 330 Hz and any formant there
+was idle ("dunn" to "dinn"). The tonebar is added after the pickup, which does not see it. A hard hit also adds the hammer's "b", a
+15 ms burst of noise band-passed at 1.8 kHz (velocity cubed, deeper with Bark). After each pickup comes the vowel filter
+(`Voicing::Vowel`, the Vowel button): a low-pass from 1.4 kHz ("u") to 4.4 kHz ("a") and two formant band-passes at fixed frequencies,
+300 to 750 Hz and 870 to 1250 Hz (Q about 3 and 4, standing out by 0.8-3 times with the hit). The Vowel slider sets where it rests;
+a hard hit opens it towards "a" by Glide and it closes to a little below the rest in 0.1-0.5 s, "baouw"; a soft hit barely moves it. The first try had fixed formant frequencies (F1 at most 750 Hz), a peak at most 12 dB up and the whole unfiltered
+sound beside it, and the "a" never came through on real hardware. So it became a wah: Q (1.5 to 12; above 0.3 on the slider the
+unfiltered sound is turned down, to a tenth at full Q, and the peaks up) and Range (where the first formant is at full openness,
+600 Hz to 2.4 kHz, 850 by default; the second at 1.6 times that). F1 rises from 300 Hz as `open (0.4 + 0.6 open)`, slowly at first
+as a pedal's sweep sounds even. Controller 11 (an expression pedal), the on-screen Wah slider or the mod wheel with the Wah target (not part of All) opens
+every ringing note's filter from the Vowel setting to past the top of the Range, so the filter settings are read once a render
+call and shared by the voices; a hit's own opening is added on top. The filter is `fx::Wah` (`crates/fx/src/wah.rs`: one
+`WahShape` a block, one `Wah` state per voice), shared with the string machine.
+With the Vowel button off (`Voicing::Sweep`) each note gets the earlier pitch-relative sweep instead (below) and the sum a mid hump at
+1 kHz (a band-pass added, up to 0.9 with Bark). A soft limiter that tops out at 0.95 keeps the sum off the clamp. Then come a tube stage (bias plus
+`fx::overdrive`, treble loss with drive), `fx::Ensemble` as chorus, a tremolo auto-pan, `fx::Phaser`, `TapeEcho` and the volume. The pitch
+wheel is `TapeEcho::set_speed_bend`: up to +-1 octave of tape speed (the delay scales by 10^(-0.30103 bend)), through the motor's glide, so
+the repeats swoop; the knob's own delay is kept. The mod wheel adds tremolo depth, echo feedback (up to 0.95) and bark, selected by the
+Trem / Echo fb / Bark / All buttons. The tone constants are untuned and want listening on real hardware.
+
+The first version (`Model::Bar`) sounded like a xylophone: the bell was too strong and rang too long. `Model` therefore selects how a tine is
+made, switchable at run time (buttons, or MIDI program change 0-5) so the candidates can be compared by ear: `Bar` (above), `Tine` (nearly
+pure fundamental, a quiet 0.2 s bell, little thump; the pickup supplies the harmonics), `Fm` (DX7 "E.Piano" style: one carrier at the pitch
+modulated by itself with an index that falls over about a second, plus a 14x operator that is gone in 0.15 s; velocity raises both
+indices), `Hybrid` (`Tine` plus a small FM voice) and `Metal` (`Hybrid` with an inharmonic 5.43x operator, 0.3 s click and a stronger
+bell). Every model but `Bar` also has a tonebar (a second sine off the pitch by the Detune slider, 0.05-4 Hz at middle C: a slow shimmer), (with `Voicing::Sweep`) a per-voice resonant low-pass after the pickup that follows the hit: it opens to 6-70 times the pitch (higher the harder
+the hit and the higher Bell), rings at a Q of 0.9-3.5 (velocity squared) and closes to 3-13 times the pitch in 0.25-1.15 s, a growl
+sweeping down through the harmonics, the "ow" of a Rhodes (the highs of a tine die first) and almost no hammer thump (the
+low-passed noise is what sounded wooden). `Chime` is a pure tine with its overtones (6.27x and 17.55x) lifted by whole octaves to at least 2.5 and 5 kHz and left to ring for
+0.4-1.2 s (low notes' 6.27x is only 800 Hz, a marimba tock; the same lift sets `Tine`'s and `Metal`'s bell and `Metal`'s FM ratio) and has no
+per-voice low-pass. An earlier pickup (a cubic term on the sum of all notes) made a chord at Bark above half clip and sounded like a distorted "dunn" rather than a bark. A model applies to notes struck after the switch. Which one is closest to a Rhodes is
+decided on real hardware.
+
+Latency is the point: the queue defaults to 10 ms (`Output::start_with_latency`; `latency=` still overrides), MIDI is polled right before
+each audio top-up and again between the bands of every screen blit (`blit_banded`), so a note-on is never held up by a frame. A touch screen
+has no velocity, so a finger strikes harder the lower it lands on a key. The engine holds a whole `TapeEcho` (about 320 KB), so host tests
+run with `RUST_MIN_STACK=33554432`; the tape keeps it on its 1 MiB stack. `make test-epiano` records a typed note from a QEMU USB sound
+card and checks its pitch and the picture; the tone, the real latency (underruns at 10 ms), MIDI and touch need real hardware.

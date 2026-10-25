@@ -6,20 +6,25 @@ use instrument_rt::{Keyboard, Rect};
 use strings::{ModTarget, SECTIONS, Strings};
 
 pub const GLYPH_H: i32 = gfx::GLYPH_HEIGHT as i32;
-const MAX_WIDGETS: usize = 24;
-pub const SLIDERS: [&str; 10] = ["Attack", "Release", "Ensemble", "Phaser", "Reverb", "Volume", "Mod", "Echo", "Repeat", "Feedback"];
-pub const TARGETS: [(&str, ModTarget); 3] = [("Phaser", ModTarget::Phaser), ("Ens", ModTarget::Ensemble), ("Both", ModTarget::Both)];
+const MAX_WIDGETS: usize = 32;
+pub const SLIDERS: [&str; 15] =
+    ["Attack", "Release", "Ensemble", "Phaser", "Reverb", "Volume", "Mod", "Echo", "Repeat", "Feedback", "Vowel", "Q", "Range", "Env", "Wah"];
+pub const TARGETS: [(&str, ModTarget); 4] =
+    [("Phaser", ModTarget::Phaser), ("Ens", ModTarget::Ensemble), ("Both", ModTarget::Both), ("Wah", ModTarget::Wah)];
 
 /// Something a finger can be on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
     /// A section fader (index into `SECTION_NAMES`).
     Fader(u8),
-    /// 0 attack, 1 release, 2 ensemble, 3 phaser, 4 reverb, 5 volume, 6 mod wheel, 7 echo level, 8 echo repeat rate, 9 echo feedback.
+    /// 0 attack, 1 release, 2 ensemble, 3 phaser, 4 reverb, 5 volume, 6 mod wheel, 7 echo level, 8 echo repeat rate, 9 echo feedback,
+    /// 10 wah vowel, 11 wah Q, 12 wah range, 13 wah envelope, 14 wah pedal.
     Slider(u8),
     /// What the mod wheel steers.
     Target(u8),
     Sustain,
+    /// The wah on or off.
+    Wah,
     /// A key, by MIDI note.
     Key(u8),
 }
@@ -81,8 +86,9 @@ impl Layout {
             let rect = Rect { x: fader_panel.x + margin / 2 + index as i32 * column, y: layout.track_top - margin, w: column, h: layout.track_bottom - layout.track_top + margin * 2 };
             layout.add(rect, Hit::Fader(index as u8));
         }
-        // The sliders, then a row of three switches and the pedal, sharing the control panel's height.
-        let rows = SLIDERS.len() as i32 + 1;
+        // The sliders, then a row of the mod wheel's four targets and a row with the pedal and the wah switch, sharing the
+        // control panel's height.
+        let rows = SLIDERS.len() as i32 + 2;
         let row_h = (control_panel.h - margin) / rows;
         for index in 0..SLIDERS.len() {
             let y = control_panel.y + margin / 2 + index as i32 * row_h;
@@ -90,8 +96,11 @@ impl Layout {
         }
         let y = control_panel.y + margin / 2 + SLIDERS.len() as i32 * row_h + margin / 2;
         let button_w = (control_panel.w - 2 * margin) / 4;
-        for index in 0..TARGETS.len() + 1 {
-            let hit = if index < TARGETS.len() { Hit::Target(index as u8) } else { Hit::Sustain };
+        for index in 0..TARGETS.len() {
+            layout.add(Rect { x: control_panel.x + margin + index as i32 * button_w, y, w: button_w - margin / 2, h: row_h - margin }, Hit::Target(index as u8));
+        }
+        let (y, button_w) = (y + row_h, (control_panel.w - 2 * margin) / 2);
+        for (index, hit) in [Hit::Sustain, Hit::Wah].into_iter().enumerate() {
             layout.add(Rect { x: control_panel.x + margin + index as i32 * button_w, y, w: button_w - margin / 2, h: row_h - margin }, hit);
         }
         layout
@@ -150,7 +159,12 @@ pub fn slider_value(machine: &Strings, index: u8) -> f32 {
         6 => machine.mod_wheel(),
         7 => machine.echo().echo_level(),
         8 => machine.echo().repeat_rate(),
-        _ => machine.echo().intensity(),
+        9 => machine.echo().intensity(),
+        10 => machine.vowel(),
+        11 => machine.q(),
+        12 => machine.range(),
+        13 => machine.env(),
+        _ => machine.wah_pedal(),
     }
 }
 
@@ -165,7 +179,12 @@ fn set_slider(machine: &mut Strings, index: u8, value: f32) {
         6 => machine.set_mod_wheel(value),
         7 => machine.echo_mut().set_echo_level(value),
         8 => machine.echo_mut().set_repeat_rate(value),
-        _ => machine.echo_mut().set_intensity(value),
+        9 => machine.echo_mut().set_intensity(value),
+        10 => machine.set_vowel(value),
+        11 => machine.set_q(value),
+        12 => machine.set_range(value),
+        13 => machine.set_env(value),
+        _ => machine.set_wah_pedal(value),
     }
 }
 
@@ -174,6 +193,7 @@ pub fn lit(machine: &Strings, hit: Hit) -> bool {
     match hit {
         Hit::Target(index) => machine.mod_target() == TARGETS[index as usize].1,
         Hit::Sustain => machine.sustain(),
+        Hit::Wah => machine.wah_on(),
         _ => false,
     }
 }
@@ -182,6 +202,7 @@ pub fn label(hit: Hit) -> &'static str {
     match hit {
         Hit::Target(index) => TARGETS[index as usize].0,
         Hit::Sustain => "Pedal",
+        Hit::Wah => "Wah",
         _ => "",
     }
 }
@@ -192,6 +213,7 @@ pub fn press(layout: &Layout, machine: &mut Strings, hit: Hit, x: i32, y: i32) {
         Hit::Key(note) => machine.note_on(note),
         Hit::Target(index) => machine.set_mod_target(TARGETS[index as usize].1),
         Hit::Sustain => machine.set_sustain(!machine.sustain()),
+        Hit::Wah => machine.set_wah(!machine.wah_on()),
         _ => drag(layout, machine, hit, x, y),
     }
 }
@@ -266,5 +288,9 @@ mod tests {
         assert!(lit(&machine, Hit::Sustain));
         press(&layout, &mut machine, Hit::Sustain, 0, 0);
         assert!(!lit(&machine, Hit::Sustain));
+        let wah = layout.widget_rect(Hit::Wah).unwrap();
+        assert_eq!(layout.hit(wah.x + 2, wah.y + 2), Some(Hit::Wah));
+        press(&layout, &mut machine, Hit::Wah, 0, 0);
+        assert!(lit(&machine, Hit::Wah));
     }
 }

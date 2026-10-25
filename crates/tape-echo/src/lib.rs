@@ -65,6 +65,9 @@ pub struct TapeEcho {
     /// Head 1's delay now and the one the knob asks for, samples.
     delay_now: f32,
     delay_target: f32,
+    /// Head 1's delay the repeat knob asks for before the speed bend, samples.
+    knob_delay: f32,
+    bend: f32,
     motor_coef: f32,
     freeze_coef: f32,
     /// 0 when running, 1 when frozen, moving between them over `FREEZE_TIME`.
@@ -113,6 +116,8 @@ impl TapeEcho {
             frozen: false,
             delay_now: 0.0,
             delay_target: 0.0,
+            knob_delay: 0.0,
+            bend: 0.0,
             motor_coef: 0.0,
             freeze_coef: 0.0,
             freeze: 0.0,
@@ -164,7 +169,25 @@ impl TapeEcho {
         self.repeat = rate.clamp(0.0, 1.0);
         let (fast, slow) = self.delay_range();
         let seconds = slow * math::pow10(-math::log10(slow / fast) * self.repeat);
-        self.delay_target = seconds * self.rate;
+        self.knob_delay = seconds * self.rate;
+        self.retarget();
+    }
+
+    /// Speed bend, -1..=1: the tape runs up to an octave faster (+1, shorter delay, higher pitch) or slower (-1), on top of
+    /// the repeat knob. The motor glides to it, so a pitch-bend wheel bends the repeats like a hand on the reel.
+    pub fn set_speed_bend(&mut self, bend: f32) {
+        self.bend = bend.clamp(-1.0, 1.0);
+        self.retarget();
+    }
+
+    pub fn speed_bend(&self) -> f32 {
+        self.bend
+    }
+
+    fn retarget(&mut self) {
+        let slowest = self.delay_range().1 * self.rate * 2.0;
+        let longest = (CAP as f32 - 64.0) / RATIO[2];
+        self.delay_target = (self.knob_delay * math::pow10(-0.30103 * self.bend)).clamp(FASTEST * self.rate * 0.5, longest.min(slowest));
     }
 
     pub fn repeat_rate(&self) -> f32 {
@@ -180,7 +203,7 @@ impl TapeEcho {
 
     /// Head 1's delay at the speed the knob asks for, seconds.
     pub fn delay(&self) -> f32 {
-        self.delay_target / self.rate
+        self.knob_delay / self.rate
     }
 
     /// `seconds` halved or doubled until it fits `delay_range`: a tap at 100 bpm (600 ms) becomes 300 ms.

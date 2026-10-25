@@ -174,6 +174,67 @@ fn the_mod_wheel_steers_what_the_switch_says() {
     machine.set_mod_target(ModTarget::Both);
     machine.midi(&[0xb0, 1, 127]);
     assert!(machine.phaser_speed() > 5.0 && machine.ensemble_depth() > 0.95);
+    machine.set_mod_target(ModTarget::Wah);
+    assert!(machine.phaser_speed() == 0.4 && machine.ensemble_depth() == 0.8);
+}
+
+/// How open C3 sounds through the wah: harmonics 6-7 (785-915 Hz, an "a") over 2-3 (260-390 Hz, a "u").
+fn openness(frames: &[[f32; 2]]) -> f32 {
+    let band = |range: core::ops::RangeInclusive<u32>| range.map(|n| component(frames, 130.81 * n as f32)).sum::<f32>();
+    band(6..=7) / band(2..=3)
+}
+
+fn wah(env: f32) -> Strings {
+    let mut machine = dry(0);
+    machine.set_wah(true);
+    machine.set_vowel(0.0);
+    machine.set_env(env);
+    machine.note_on(48);
+    render(&mut machine, 4800);
+    machine
+}
+
+#[test]
+fn the_pedal_and_the_wheel_open_the_wah_and_off_is_off() {
+    let mut machine = wah(0.0);
+    let closed = openness(&render(&mut machine, 9600));
+    assert!(machine.midi(&[0xb0, 11, 110]));
+    render(&mut machine, 480);
+    let pedal = openness(&render(&mut machine, 9600));
+    machine.midi(&[0xb0, 11, 0]);
+    machine.set_mod_target(ModTarget::Wah);
+    machine.set_mod_wheel(110.0 / 127.0);
+    render(&mut machine, 480);
+    let wheel = openness(&render(&mut machine, 9600));
+    machine.set_wah(false);
+    render(&mut machine, 480);
+    let off = openness(&render(&mut machine, 9600));
+    assert!(pedal > 1.8 * closed && (wheel - pedal).abs() < 0.1 * pedal && off < 0.7 * pedal, "{closed} {pedal} {wheel} {off}");
+}
+
+#[test]
+fn the_envelope_opens_the_wah_as_the_sound_swells() {
+    let mut machine = wah(0.0);
+    let still = openness(&render(&mut machine, 9600));
+    let mut machine = wah(1.0);
+    let opened = openness(&render(&mut machine, 9600));
+    assert!(opened > 1.5 * still, "{still} {opened}");
+}
+
+#[test]
+fn a_chord_through_a_sharp_wah_stays_in_range() {
+    let mut machine = Strings::new(RATE);
+    machine.set_wah(true);
+    machine.set_q(1.0);
+    machine.set_range(1.0);
+    machine.set_volume(1.0);
+    machine.midi(&[0xb0, 11, 70]);
+    for note in [36, 48, 55, 60, 64, 67, 72, 84] {
+        machine.note_on(note);
+    }
+    let out = render(&mut machine, RATE as usize);
+    assert!(out.iter().all(|f| f[0].is_finite() && f[0].abs() < 1.0), "{}", out.iter().fold(0.0f32, |p, f| p.max(f[0].abs())));
+    assert!(rms(&out) > 0.01);
 }
 
 #[test]

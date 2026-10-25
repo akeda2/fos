@@ -65,16 +65,21 @@ impl Output {
     /// Starts the playback device. Takes `rate=HZ` (default 48000 if offered, else the first rate offered), `latency=MS`
     /// (10-200, default 40) and `out=N` (the left channel of the output pair, 1-based, default 1) from `arguments`.
     pub fn start(api: &'static TapeApi, arguments: &str) -> Result<Output, Line<128>> {
-        Self::open(api, arguments, false)
+        Self::open(api, arguments, false, 40)
+    }
+
+    /// Like `start`, with another default latency (still overridden by `latency=`): for instruments played live.
+    pub fn start_with_latency(api: &'static TapeApi, arguments: &str, default_ms: u32) -> Result<Output, Line<128>> {
+        Self::open(api, arguments, false, default_ms)
     }
 
     /// Like `start`, and the device also captures: `in=N` is the left channel of the input pair (1-based, default 1; a
     /// mono input feeds both sides). Use `pump_duplex` to run the signal through.
     pub fn start_duplex(api: &'static TapeApi, arguments: &str) -> Result<Output, Line<128>> {
-        Self::open(api, arguments, true)
+        Self::open(api, arguments, true, 40)
     }
 
-    fn open(api: &'static TapeApi, arguments: &str, duplex: bool) -> Result<Output, Line<128>> {
+    fn open(api: &'static TapeApi, arguments: &str, duplex: bool, default_ms: u32) -> Result<Output, Line<128>> {
         let mut info = AudioInfo::default();
         let mut error = Line::<128>::new();
         if (api.audio_info)(&mut info) == 0 || info.playback_channels == 0 {
@@ -88,7 +93,7 @@ impl Output {
         let wanted = tape_rt::arg_value(arguments, "rate").and_then(|value| value.parse::<u32>().ok());
         let offered = &info.rates[..(info.rate_count as usize).min(8)];
         let rate = wanted.or_else(|| offered.contains(&48000).then_some(48000)).or_else(|| offered.first().copied()).unwrap_or(48000);
-        let latency_ms = tape_rt::arg_value(arguments, "latency").and_then(|value| value.parse::<u32>().ok()).unwrap_or(40).clamp(10, 200);
+        let latency_ms = tape_rt::arg_value(arguments, "latency").and_then(|value| value.parse::<u32>().ok()).unwrap_or(default_ms).clamp(10, 200);
         if (api.audio_start)(rate, u32::from(duplex), 1) != 0 {
             let _ = core::fmt::Write::write_fmt(&mut error, format_args!("the audio device does not start at {rate} Hz"));
             return Err(error);

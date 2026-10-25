@@ -92,6 +92,21 @@ fn the_repeat_rate_glides_the_pitch() {
 }
 
 #[test]
+fn the_speed_bend_moves_the_delay_both_ways_and_keeps_the_knob() {
+    let mut echo = quiet(RATE);
+    echo.set_delay(0.2);
+    let knob = echo.delay();
+    echo.set_speed_bend(1.0);
+    run(&mut echo, RATE as usize * 2, |_| 0.0);
+    assert!((echo.delay_now / RATE as f32 - 0.1).abs() < 0.002, "{}", echo.delay_now);
+    echo.set_speed_bend(-1.0);
+    run(&mut echo, RATE as usize * 2, |_| 0.0);
+    assert!((echo.delay_now / RATE as f32 - 0.4).abs() < 0.004, "{}", echo.delay_now);
+    echo.set_speed_bend(0.0);
+    assert!((echo.delay() - knob).abs() < 1e-6);
+}
+
+#[test]
 fn freeze_holds_the_loop_while_a_normal_loop_dies() {
     let hold = |frozen: bool| {
         let mut echo = quiet(RATE);

@@ -1,0 +1,13 @@
+[package]
+name = "epiano"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "epiano"
+path = "src/lib.rs"
+
+[dependencies]
+dsp = { path = "../dsp" }
+fx = { path = "../fx" }
+tape-echo = { path = "../tape-echo" }

@@ -1,5 +1,5 @@
 //! Audio effects for the instrument tapes, `no_std`, allocation-free and hard-float (`dsp::math` for the few elementary
-//! functions): a rotary speaker, a stereo reverb, a spring reverb, a three-voice ensemble chorus, a phaser and an overdrive. Each effect is a
+//! functions): a rotary speaker, a stereo reverb, a spring reverb, a three-voice ensemble chorus, a phaser, a vowel filter / wah and an overdrive. Each effect is a
 //! plain struct that owns its delay lines, is made for a sample rate, and is fed one frame at a time, so an instrument can put
 //! them in whatever order it likes (the organ: ... overdrive -> rotary -> reverb; a string machine: ensemble -> phaser ->
 //! reverb). Settings are 0..=1 unless a name says otherwise, and every effect with a mix of 0 is a bypass that costs nothing.
@@ -12,12 +12,14 @@ mod phaser;
 mod reverb;
 mod rotary;
 mod spring;
+mod wah;
 
 pub use ensemble::Ensemble;
 pub use phaser::Phaser;
 pub use reverb::Reverb;
 pub use rotary::{Rotary, RotaryMode};
 pub use spring::Spring;
+pub use wah::{Svf, Wah, WahShape, fast_g};
 
 const TABLE: usize = 1024;
 
