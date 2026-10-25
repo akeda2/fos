@@ -1431,12 +1431,6 @@ fn stop_stream(host: &mut Host, mut stream: Stream) {
 }
 
 /// Stops the streams of every unit.
-pub fn stop_all() {
-    for unit in 0..UNITS {
-        stop(unit);
-    }
-}
-
 pub fn stop(unit: usize) {
     let Some(device) = audio(unit) else { return };
     // 1. Tell `irq_event` and `ehci_event` to stop touching the streams (their events are swallowed from now on).

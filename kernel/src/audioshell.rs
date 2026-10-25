@@ -58,7 +58,7 @@ pub fn command(rest: &str) {
             }
         }
         Some("stop") => {
-            ua::stop();
+            ua::stop_mine();
             ua::status();
         }
         Some("start") => {
@@ -133,7 +133,7 @@ pub fn command(rest: &str) {
                 imp::flush();
             }
             ua::status();
-            ua::stop();
+            ua::stop_mine();
         }
         Some("duplex") => {
             // Capture and playback at once (the playback side gets silence, the capture side is discarded):
@@ -154,7 +154,7 @@ pub fn command(rest: &str) {
                 }
             }
             ua::status();
-            ua::stop();
+            ua::stop_mine();
         }
         Some("tone") => {
             let frequency = words.next().and_then(|word| word.parse::<u32>().ok()).unwrap_or(440).clamp(20, 20_000);
@@ -199,7 +199,7 @@ pub fn command(rest: &str) {
                 ua::write(&chunk[..frames * frame_bytes]);
             }
             ua::status();
-            ua::stop();
+            ua::stop_mine();
         }
         Some(_) => crate::println!("Usage: audio | audio device N|auto | audio modes | audio use capture|playback N|auto | audio start RATE [capture|playback|both] | audio stop | audio capture SECONDS [RATE] | audio tone [HZ] [SECONDS] [RATE] | audio duplex [SECONDS] [RATE]"),
     }

@@ -470,7 +470,7 @@ pub fn service_poll() {
 
 /// A service's `nic_receive`: only on its own NIC.
 pub fn service_receive(index: usize, out: &mut [u8]) -> usize {
-    if crate::tasks::current_nic() != Some(index) {
+    if !crate::tasks::current_owns(index) {
         return 0;
     }
     if index < MAX_NICS && unsafe { FRAME_TAIL[index] != FRAME_HEAD[index] } {

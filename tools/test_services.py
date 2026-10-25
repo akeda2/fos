@@ -89,6 +89,27 @@ def main():
             slave_mark = slave.send("run ptp ip=10.7.0.2/24 secs=6")
             slave.wait_for("Tape returned", 30, slave_mark)
             check("ptp: master" not in slave.text()[slave_mark:], "the slave hears no master after the service ended")
+            # Several NICs: a second guest has two and a service owns both.
+            two = Guest(tmp, "two", "52:54:00:12:36:03", extra=["-netdev", "user,id=net1", "-device", "e1000,netdev=net1,mac=52:54:00:12:36:04"])
+            try:
+                two.wait_for("M3 complete")
+                two.wait_for("fos> ")
+                mark = two.send("run ptp master ip=10.7.0.9/24 &1,2")
+                two.wait_for("Service ptp started on NIC 1,2", 30, mark)
+                two.wait_for("fos> ", 10, mark)
+                mark = two.send("ps")
+                two.wait_for("NIC 1,2", 10, mark)
+                check(True, "a service can own several NICs (`&1,2`), `ps` lists them")
+                mark = two.send("run ptp master ip=10.7.0.8/24 &2")
+                two.wait_for("a service already owns NIC 2", 10, mark)
+                check(True, "a second service cannot take one of its NICs")
+                mark = two.send("run ptp master ip=10.7.0.8/24 &3")
+                two.wait_for("no NIC 3", 10, mark)
+                check(True, "a NIC that does not exist is refused")
+                mark = two.send("kill 1")
+                two.wait_for("Service ptp ended.", 20, mark)
+            finally:
+                two.stop()
             print("PASS: services")
         finally:
             master.stop()

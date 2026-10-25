@@ -911,7 +911,7 @@ fn run_shared(first: &str, second: &str) -> bool {
     crate::framebuffer::split_set(0, Some(crate::tasks::split_mode(first, second)));
     crate::framebuffer::rotate_run(0, crate::tasks::rotate_option(first, second));
     set_staged_length(length);
-    crate::tasks::start(two, two_args, None);
+    crate::tasks::start(two, two_args, 0);
     match load_from_file(one) {
         Ok(length) => {
             set_staged_length(length);
@@ -958,8 +958,8 @@ pub fn run_named(arguments: &str) {
                 }
             }
             set_staged_length(length);
-            if let Some(Ok(nic)) = service {
-                return crate::tasks::start(name, rest.trim(), nic);
+            if let Some(Ok(nics)) = service {
+                return crate::tasks::start(name, rest.trim(), nics);
             }
             match load_staged(name) {
                 Ok(()) => {

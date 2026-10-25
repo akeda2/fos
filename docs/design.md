@@ -1235,22 +1235,31 @@ tells what a given switch and NIC do. The pure part has host tests (`cargo test`
 
 ### Services: quiet tapes in the background (kernel/src/tasks.rs)
 
-`run NAME ARGS &N` starts a tape as a *service* that owns NIC N (1-based) and
+`run NAME ARGS &N` starts a tape as a *service* that owns NIC N (1-based; `&1,2` or `nic=1,2` for several, as a router or bridge needs; a bit mask per service) and
 runs next to the shell or a foreground tape. `ps` (or `tasks`) lists services, `kill N`, `kill NAME` (every service running that tape) or `kill all`
 Scheduling is cooperative: a context switch (`fos_ctx_switch`, callee-
 saved registers only) happens at tape-call boundaries (`should_abort`, `read_key`,
 `micros`, `wait_for_event`, 200 us slices) and in the shell loop, never inside a
 kernel routine, so no locks are needed. Each service has its own 4 MiB tape
-region and 1 MiB stack; at most 2.
+region (allocated on first use) and 1 MiB stack; at most 8 (`MAX_SERVICES`, memory is the real limit).
 
 NIC ownership replaces frame filtering: frames of a service's NIC go only to the
 service, and the foreground tape gets none from it. A second service on an owned
 NIC is refused. Tape-end cleanup (multicast, VLAN, offload, timestamps) skips
 service NICs; `nic_release` clears them when the service ends.
 
-Limits: services must be quiet (console output is shared), must not be audio
-tapes (audio, UART and gfx teardown are not owner-aware), and keys/Escape go to
-the foreground only. KUP and NETFS work while a service runs. Test:
+**Audio devices are owned too.** `run NAME device=N outdev=M &0` (or `nic=N` instead of `&N`) makes the kernel claim audio
+devices N (input, and output unless `outdev=`) and M (output) for the service before it starts; `ps` shows them (`audio N out M`). The
+device choice (`audio device`, `audio output`, the tape calls `audio_use_device`/`audio_use_output`) is kept per context
+(`audio.rs` `Choice`: the foreground, then one per service), `stop_for_tape` and the shell's `audio stop` stop only the
+running context's devices, and a service that ends (or is killed) stops its streams and gives the devices back. A claimed device
+is refused ("owned by service N", `AUDIO_BUSY` for tape calls) to the shell, the foreground tape and other services, and the
+automatic choice skips it. Screens and touch are not owned yet (`gfx_close` at foreground end, touch goes to the foreground).
+Test: `make test-audio-services` (two HD Audio controllers; the shell can answer seconds late there, so the test repeats
+commands that are safe to repeat). A service that computes for long without a tape call delays the shell and other services.
+
+Limits: services must be quiet (console output is shared), must not use the screen or UART (gfx and UART teardown are not
+owner-aware), and keys/Escape go to the foreground only. KUP and NETFS work while a service runs. Test:
 `make test-services` (ptp master service, slave locks on, foreground tapes,
 `kill`). Only real hardware shows Sync jitter next to a busy foreground tape.
 

@@ -114,7 +114,7 @@ fn tape_part(part: &str) -> (&str, &str) {
 }
 
 /// `run A | B screen=P &N`: two background tapes share physical screen P (default 0); A owns NIC N, B none.
-fn start_pair(rest: &str, nic: Option<usize>) -> bool {
+fn start_pair(rest: &str, nics: u64) -> bool {
     let Some((first, second)) = rest.split_once(" | ") else { return false };
     let ((one, one_args), (two, two_args)) = (tape_part(first), tape_part(second));
     let phys = crate::tasks::group_screen(one_args, two_args).unwrap_or(0);
@@ -132,8 +132,8 @@ fn start_pair(rest: &str, nic: Option<usize>) -> bool {
         return true;
     };
     crate::framebuffer::split_set_service(phys, mode);
-    crate::tasks::start(one, one_args, nic);
-    crate::tasks::start(two, two_args, None);
+    crate::tasks::start(one, one_args, nics);
+    crate::tasks::start(two, two_args, 0);
     true
 }
 
@@ -223,7 +223,7 @@ fn run_groups(rest: &str) -> bool {
 
 /// `run NAME [ARGS]`: loads a tape from the boot volume and runs it until it returns or Escape stops it.
 pub(crate) fn run_tape(rest: &str) {
-    // `run NAME ARGS &N`: a background tape (service) that owns NIC N.
+    // `run NAME ARGS &N`: a background tape (service) that owns NICs N (`&1,2` for several).
     let (rest, service) = crate::tasks::split_suffix(rest);
     if service == Some(Err(())) {
         return crate::tasks::usage();
@@ -237,11 +237,11 @@ pub(crate) fn run_tape(rest: &str) {
     if matches!(arguments, "help" | "-h" | "--help" | "?") && fosfor_shell::Host::tape_help(&mut KernelHost, name) {
         return;
     }
-    if let Some(Ok(nic)) = service {
-        if rest.contains(" | ") && start_pair(rest, nic) {
+    if let Some(Ok(nics)) = service {
+        if rest.contains(" | ") && start_pair(rest, nics) {
             return;
         }
-        return crate::tasks::start(name, arguments, nic);
+        return crate::tasks::start(name, arguments, nics);
     }
     if run_groups(rest) {
         return;

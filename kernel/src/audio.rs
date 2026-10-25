@@ -26,7 +26,7 @@ pub use crate::usb_audio::PcmRing;
 use crate::i2s_pi as i2s;
 #[cfg(not(target_arch = "aarch64"))]
 use crate::i2s_none as i2s;
-use fosfor_abi::tape::{AudioDevice, AudioInfo, AudioStats, AUDIO_KIND_HDA, AUDIO_KIND_I2S, AUDIO_KIND_USB, AUDIO_NO_DEVICE};
+use fosfor_abi::tape::{AudioDevice, AudioInfo, AudioStats, AUDIO_KIND_HDA, AUDIO_KIND_I2S, AUDIO_KIND_USB, AUDIO_BUSY, AUDIO_NO_DEVICE};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
@@ -36,16 +36,43 @@ pub enum Backend {
     I2s,
 }
 
-/// The device the user picked; `None` is automatic.
-static mut CHOSEN: Option<Backend> = None;
-/// While a tape has chosen a device (`audio_use_device`), what the operator had chosen before, to put back when the tape ends.
-/// `None` = no tape has chosen anything.
-static mut OPERATOR_CHOICE: Option<Option<Backend>> = None;
+/// The device choices of one context: 0 is the shell or foreground tape (the operator's `audio device`), `n` is service
+/// `n - 1`. A service's explicit choice is also its claim: nothing else may pick that device while it runs.
+#[derive(Clone, Copy)]
+struct Choice {
+    /// The device picked; `None` is automatic.
+    chosen: Option<Backend>,
+    /// While a tape has chosen a device (`audio_use_device`), what was chosen before, to put back when the tape ends.
+    /// `None` = the tape has chosen nothing.
+    saved_chosen: Option<Option<Backend>>,
+    /// A separate playback device (`audio output`); `None` = playback follows the active device.
+    output: Option<Backend>,
+    /// What was chosen as the output before a tape did (`audio_use_output`).
+    saved_output: Option<Option<Backend>>,
+}
 
-/// A separate playback device (`audio output`); `None` = playback follows the active device.
-static mut OUTPUT: Option<Backend> = None;
-/// What the operator had chosen as the output before a tape did (`audio_use_output`).
-static mut OPERATOR_OUTPUT: Option<Option<Backend>> = None;
+impl Choice {
+    const NONE: Choice = Choice { chosen: None, saved_chosen: None, output: None, saved_output: None };
+}
+
+static mut CHOICES: [Choice; 1 + crate::tasks::MAX_SERVICES] = [Choice::NONE; 1 + crate::tasks::MAX_SERVICES];
+
+const CLAIMED: &str = "that audio device belongs to a service";
+
+fn choices() -> &'static mut [Choice; 1 + crate::tasks::MAX_SERVICES] {
+    unsafe { &mut *core::ptr::addr_of_mut!(CHOICES) }
+}
+
+/// The choices of the running context.
+fn mine() -> &'static mut Choice {
+    &mut choices()[crate::tasks::context()]
+}
+
+/// The service (1-based context number) that claimed `backend`, other than the running context.
+fn claimed_by_other(backend: Backend) -> Option<usize> {
+    let me = crate::tasks::context();
+    (1..choices().len()).find(|&context| context != me && crate::tasks::context_live(context) && (choices()[context].chosen == Some(backend) || choices()[context].output == Some(backend)))
+}
 
 fn available(backend: Backend) -> bool {
     match backend {
@@ -80,15 +107,16 @@ fn devices() -> ([Backend; usb::UNITS + hda::MAX_CONTROLLERS + 1], usize) {
 }
 
 fn automatic() -> Option<Backend> {
-    if let Some(unit) = (0..usb::UNITS).find(|&unit| usb::present(unit)) {
+    let free = |backend: Backend| claimed_by_other(backend).is_none();
+    if let Some(unit) = (0..usb::UNITS).find(|&unit| usb::present(unit) && free(Backend::Usb(unit))) {
         return Some(Backend::Usb(unit));
     }
-    (0..hda::count()).filter(|&index| hda::present(index)).max_by_key(|&index| (hda::rank(index), usize::MAX - index)).map(Backend::Hda).or(i2s::present().then_some(Backend::I2s))
+    (0..hda::count()).filter(|&index| hda::present(index) && free(Backend::Hda(index))).max_by_key(|&index| (hda::rank(index), usize::MAX - index)).map(Backend::Hda).or((i2s::present() && free(Backend::I2s)).then_some(Backend::I2s))
 }
 
 /// The device the next call goes to.
 fn active() -> Option<Backend> {
-    match unsafe { *core::ptr::addr_of!(CHOSEN) } {
+    match mine().chosen {
         Some(backend) if available(backend) => Some(backend),
         _ => automatic(),
     }
@@ -96,7 +124,7 @@ fn active() -> Option<Backend> {
 
 /// The device playback goes to: the separate output when one is chosen and present, else the active device.
 fn output() -> Option<Backend> {
-    match unsafe { *core::ptr::addr_of!(OUTPUT) } {
+    match mine().output {
         Some(backend) if available(backend) => Some(backend),
         _ => active(),
     }
@@ -122,22 +150,26 @@ fn backend_number(number: Option<usize>) -> Result<Option<Backend>, &'static str
 /// `audio output N|same`: playback goes to device N (1-based, as `audio` lists them); `same` follows the input device.
 pub fn choose_output(number: Option<usize>) -> Result<(), &'static str> {
     let backend = backend_number(number)?;
-    stop();
-    unsafe { *core::ptr::addr_of_mut!(OUTPUT) = backend };
+    if backend.is_some_and(|backend| claimed_by_other(backend).is_some()) {
+        return Err(CLAIMED);
+    }
+    stop_mine();
+    mine().output = backend;
     Ok(())
 }
 
 /// The tape call `audio_use_output`: like `audio output N|same` (0 = same), undone when the tape ends.
 pub fn use_output_for_tape(number: u32) -> i32 {
-    let before = unsafe { *core::ptr::addr_of!(OUTPUT) };
+    let before = mine().output;
     match choose_output(if number == 0 { None } else { Some(number as usize) }) {
         Ok(()) => {
-            let saved = unsafe { &mut *core::ptr::addr_of_mut!(OPERATOR_OUTPUT) };
+            let saved = &mut mine().saved_output;
             if saved.is_none() {
                 *saved = Some(before);
             }
             0
         }
+        Err(CLAIMED) => AUDIO_BUSY,
         Err(_) => AUDIO_NO_DEVICE,
     }
 }
@@ -145,8 +177,11 @@ pub fn use_output_for_tape(number: u32) -> i32 {
 /// `audio device N|auto`: picks the device (1-based, as `audio` lists them). Anything running is stopped first.
 pub fn choose(number: Option<usize>) -> Result<(), &'static str> {
     let backend = backend_number(number)?;
-    stop();
-    unsafe { *core::ptr::addr_of_mut!(CHOSEN) = backend };
+    if backend.is_some_and(|backend| claimed_by_other(backend).is_some()) {
+        return Err(CLAIMED);
+    }
+    stop_mine();
+    mine().chosen = backend;
     Ok(())
 }
 
@@ -182,16 +217,17 @@ pub fn device_info(number: usize) -> Option<AudioDevice> {
 /// The tape call `audio_use_device`: like `audio device N|auto`, but remembered as the tape's own choice, so
 /// `stop_for_tape` can put the operator's back. 0 for automatic.
 pub fn use_device_for_tape(number: u32) -> i32 {
-    let before = unsafe { *core::ptr::addr_of!(CHOSEN) };
+    let before = mine().chosen;
     match choose(if number == 0 { None } else { Some(number as usize) }) {
         Ok(()) => {
             // Only the first choice of a tape records what to restore: a second call must not turn the tape's own pick into "the operator's".
-            let saved = unsafe { &mut *core::ptr::addr_of_mut!(OPERATOR_CHOICE) };
+            let saved = &mut mine().saved_chosen;
             if saved.is_none() {
                 *saved = Some(before);
             }
             0
         }
+        Err(CLAIMED) => AUDIO_BUSY,
         Err(_) => AUDIO_NO_DEVICE,
     }
 }
@@ -206,7 +242,7 @@ pub fn start(rate: u32, capture: bool, playback: bool) -> Result<(), &'static st
     }
     if playback {
         if let Err(reason) = start_on(output(), rate, false, true) {
-            stop();
+            stop_mine();
             return Err(reason);
         }
     }
@@ -222,12 +258,23 @@ fn start_on(backend: Option<Backend>, rate: u32, capture: bool, playback: bool) 
     }
 }
 
-/// Stops every running stream on every device.
-pub fn stop() {
-    usb::stop_all();
-    i2s::stop();
-    for index in 0..hda::count() {
-        hda::stop(index);
+fn stop_backend(backend: Backend) {
+    match backend {
+        Backend::Usb(unit) => usb::stop(unit),
+        Backend::Hda(index) => hda::stop(index),
+        Backend::I2s => i2s::stop(),
+    }
+}
+
+/// Stops the streams on the devices the running context uses (its input and its output), and nobody else's: a service's
+/// stream goes on when the foreground tape ends.
+pub fn stop_mine() {
+    let input = active();
+    if let Some(backend) = input {
+        stop_backend(backend);
+    }
+    if let Some(backend) = output().filter(|&backend| Some(backend) != input) {
+        stop_backend(backend);
     }
 }
 
@@ -456,12 +503,49 @@ pub fn select_for_tape(capture: bool, mode: u32) -> i32 {
 /// A tape that returns (or was aborted) must not leave a stream running, or its big capture ring allocated.
 pub fn stop_for_tape() {
     usb::set_capture_ring(0);
-    stop();
+    stop_mine();
     // A device the tape picked is not the operator's choice: put the operator's back.
-    if let Some(before) = unsafe { (*core::ptr::addr_of_mut!(OPERATOR_CHOICE)).take() } {
-        unsafe { *core::ptr::addr_of_mut!(CHOSEN) = before };
+    if let Some(before) = mine().saved_chosen.take() {
+        mine().chosen = before;
     }
-    if let Some(before) = unsafe { (*core::ptr::addr_of_mut!(OPERATOR_OUTPUT)).take() } {
-        unsafe { *core::ptr::addr_of_mut!(OUTPUT) = before };
+    if let Some(before) = mine().saved_output.take() {
+        mine().output = before;
     }
+}
+
+/// `run NAME device=N outdev=M`: service context `context` claims its devices (1-based, as `audio` lists them) before it
+/// starts. Refuses a device that does not exist or that another service holds.
+pub fn claim(context: usize, input: Option<usize>, output: Option<usize>) -> Result<(), &'static str> {
+    let input = backend_number(input)?;
+    let output = backend_number(output)?;
+    for backend in [input, output].into_iter().flatten() {
+        if let Some(owner) = claimed_by_other(backend) {
+            crate::println!("run: audio device {} is owned by service {}.", number_of(backend), owner);
+            return Err(CLAIMED);
+        }
+    }
+    choices()[context] = Choice { chosen: input, output, ..Choice::NONE };
+    Ok(())
+}
+
+/// The service ended (still running as that context): stop its streams and drop its claims.
+pub fn release_service() {
+    stop_mine();
+    *mine() = Choice::NONE;
+}
+
+/// A service that never started gives its claims back.
+pub fn unclaim(context: usize) {
+    choices()[context] = Choice::NONE;
+}
+
+fn number_of(backend: Backend) -> usize {
+    let (list, count) = devices();
+    list[..count].iter().position(|&other| other == backend).map_or(0, |index| index + 1)
+}
+
+/// What service `context` holds, for `ps`: the numbers of its input and output devices (0 = automatic / follows input).
+pub fn claims_of(context: usize) -> (usize, usize) {
+    let choice = &choices()[context];
+    (choice.chosen.map_or(0, number_of), choice.output.map_or(0, number_of))
 }

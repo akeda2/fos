@@ -9,7 +9,7 @@
 //! the shell's idle loop, never inside a kernel routine, so the kernel needs no locks. Because a tape treats every
 //! call as clobbering the SSE/AVX registers, switching there needs to save only the callee-saved integer registers.
 //!
-//! A service owns one NIC (`&N`, 1-based; `&0` owns none): the frames of that NIC are queued for it alone (the foreground tape's
+//! A service owns NICs (`&N` or `&N,M,...`, 1-based; `&0` owns none): the frames of those NICs are queued for it alone (the foreground tape's
 //! `nic_receive` on that NIC returns nothing) and the card's multicast, VLAN, offload and stamp state is its own to
 //! set and to clear when it ends. Console output is not redirected: a service should be quiet. Keys and `Escape` go
 //! to the foreground tape only; `kill N` stops a service.
@@ -19,9 +19,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::service_host as host;
 use crate::{memory, timer};
 
-pub const MAX_SERVICES: usize = 2;
-/// `Service::nic` of a service that owns no NIC (`&0`).
-const NO_NIC: usize = usize::MAX;
+pub const MAX_SERVICES: usize = 8;
+/// NICs are a bit mask in `Service::nics` (bit i = NIC i + 1), so at most 64.
 const STACK_BYTES: u64 = 1024 * 1024;
 /// How long a context may run before a tape call hands the CPU on (a tape that idles hands it on at once).
 const SLICE_US: u64 = 200;
@@ -42,14 +41,14 @@ struct Service {
     name_length: usize,
     rsp: u64,
     stack: u64,
-    nic: usize,
+    nics: u64,
     abort: bool,
     /// Gave up the CPU in `wait_for_event`: nothing to do before the next interrupt.
     idle: bool,
 }
 
 impl Service {
-    const EMPTY: Service = Service { state: State::Free, name: [0; 16], name_length: 0, rsp: 0, stack: 0, nic: 0, abort: false, idle: false };
+    const EMPTY: Service = Service { state: State::Free, name: [0; 16], name_length: 0, rsp: 0, stack: 0, nics: 0, abort: false, idle: false };
 
     fn name(&self) -> &str {
         core::str::from_utf8(&self.name[..self.name_length]).unwrap_or("?")
@@ -72,20 +71,36 @@ pub fn count() -> usize {
     LIVE.load(Ordering::Relaxed)
 }
 
+/// Which context runs: 0 is the shell or foreground tape, `n` is service `n - 1`.
+pub fn context() -> usize {
+    unsafe { CURRENT }
+}
+
+/// Whether context `context` (1-based service number) is a running service.
+pub fn context_live(context: usize) -> bool {
+    context != 0 && services().get(context - 1).is_some_and(|service| service.state == State::Live)
+}
+
 pub fn in_service() -> bool {
     unsafe { CURRENT != 0 }
 }
 
 /// True when a running service owns NIC `index` (0-based).
 pub fn service_owns(index: usize) -> bool {
-    count() != 0 && index != NO_NIC && services().iter().any(|service| service.state == State::Live && service.nic == index)
+    count() != 0 && index < 64 && services().iter().any(|service| service.state == State::Live && service.nics >> index & 1 != 0)
 }
 
-/// The NIC of the service that is running now.
+/// The first NIC of the service that is running now (what `nic_active` reports).
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 pub fn current_nic() -> Option<usize> {
     let current = unsafe { CURRENT };
-    (current != 0).then(|| services()[current - 1].nic).filter(|&nic| nic != NO_NIC)
+    (current != 0).then(|| services()[current - 1].nics).filter(|&nics| nics != 0).map(|nics| nics.trailing_zeros() as usize)
+}
+
+/// Whether the service that is running now owns NIC `index`.
+pub fn current_owns(index: usize) -> bool {
+    let current = unsafe { CURRENT };
+    current != 0 && index < 64 && services()[current - 1].nics >> index & 1 != 0
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -272,9 +287,10 @@ pub fn service_wait() {
 pub extern "C" fn task_exit() -> ! {
     let id = unsafe { CURRENT };
     let service = &mut services()[id - 1];
-    if service.nic != NO_NIC {
-        host::nic_release(service.nic);
+    for nic in (0..64).filter(|&nic| service.nics >> nic & 1 != 0) {
+        host::nic_release(nic);
     }
+    crate::audio::release_service();
     crate::println!("Service {} ended.", service.name());
     service.state = State::Dead;
     LIVE.fetch_sub(1, Ordering::Relaxed);
@@ -292,17 +308,27 @@ pub extern "C" fn task_exit() -> ! {
     unreachable!("a finished service was resumed");
 }
 
-/// Splits a trailing `&N` off the arguments of `run`: `None` when there is none, `Err` when N is not a number,
-/// `Ok(None)` for `&0` (no NIC), `Ok(Some(index))` with the 0-based NIC otherwise.
-pub fn split_suffix(arguments: &str) -> (&str, Option<Result<Option<usize>, ()>>) {
+/// Splits a trailing `&N` or `&N,M,...` off the arguments of `run`: `None` when there is none, `Err` when it is not a list of
+/// numbers, `Ok(mask)` otherwise (bit i = 0-based NIC i; `&0` is an empty mask).
+pub fn split_suffix(arguments: &str) -> (&str, Option<Result<u64, ()>>) {
     let arguments = arguments.trim();
     match arguments.rsplit_once(char::is_whitespace) {
-        Some((before, last)) if last.starts_with('&') => {
-            let nic = last[1..].parse::<usize>().map(|n| n.checked_sub(1)).map_err(|_| ());
-            (before.trim(), Some(nic))
-        }
+        Some((before, last)) if last.starts_with('&') => (before.trim(), Some(nic_list(&last[1..]))),
         _ => (arguments, None),
     }
+}
+
+/// "1,3" as a NIC mask (1-based numbers; 0 means none and stands alone).
+fn nic_list(list: &str) -> Result<u64, ()> {
+    let mut mask = 0u64;
+    for number in list.split(',') {
+        match number.parse::<usize>().map_err(|_| ())? {
+            0 => {}
+            n if n <= 64 => mask |= 1 << (n - 1),
+            _ => return Err(()),
+        }
+    }
+    Ok(mask)
 }
 
 /// `split=v` (stacked) in either tape's arguments of `run A | B`; side by side otherwise or for `split=h`.
@@ -358,20 +384,22 @@ pub fn with_screen<'a>(buffer: &'a mut [u8; 256], arguments: &str, screen: usize
 }
 
 pub fn usage() {
-    crate::println!("run: `&N` names the NIC the background tape owns (N from 1 to {}; `&0` for none).", host::nic_count());
+    crate::println!("run: `&N` or `&N,M` names the NICs the background tape owns (from 1 to {}; `&0` for none).", host::nic_count());
 }
 
-/// `run NAME ARGS &N`: tape `name` becomes a service owning NIC `nic` (0-based; `None` for no NIC). The kernel's
+/// `run NAME ARGS &N`: tape `name` becomes a service owning the NICs in the mask `nics` (bit i = 0-based NIC i; 0 for none). The kernel's
 /// `host::load` has the file ready (x86: the staging buffer; aarch64: it reads it).
-pub fn start(name: &str, arguments: &str, nic: Option<usize>) {
+pub fn start(name: &str, arguments: &str, nics: u64) {
     if in_service() {
         return crate::println!("run: a service cannot start another.");
     }
-    let nic = nic.unwrap_or(NO_NIC);
-    if nic != NO_NIC && nic >= host::nic_count() {
+    let word = |key: &str| arguments.split_ascii_whitespace().find_map(|word| word.strip_prefix(key)?.parse::<usize>().ok());
+    // `nic=N,M` is `&N,M`.
+    let nics = if nics == 0 { arguments.split_ascii_whitespace().find_map(|word| nic_list(word.strip_prefix("nic=")?).ok()).unwrap_or(0) } else { nics };
+    if let Some(nic) = (0..64).find(|&nic| nics >> nic & 1 != 0 && nic >= host::nic_count()) {
         return crate::println!("run: no NIC {} (this machine has {}).", nic + 1, host::nic_count());
     }
-    if service_owns(nic) {
+    if let Some(nic) = (0..64).find(|&nic| nics >> nic & 1 != 0 && service_owns(nic)) {
         return crate::println!("run: a service already owns NIC {}.", nic + 1);
     }
     if arguments.len() > ARGS_BYTES {
@@ -380,7 +408,10 @@ pub fn start(name: &str, arguments: &str, nic: Option<usize>) {
     let Some(slot) = services().iter().position(|service| service.state == State::Free) else {
         return crate::println!("run: {MAX_SERVICES} services are running already (`ps`, `kill N`).");
     };
-    let Some(entry) = host::load(slot + 1, name) else { return };
+    if crate::audio::claim(slot + 1, word("device="), word("outdev=")).is_err() {
+        return;
+    }
+    let Some(entry) = host::load(slot + 1, name) else { return crate::audio::unclaim(slot + 1) };
     let Some(stack) = memory::allocate_contiguous(STACK_BYTES / memory::FRAME, None) else {
         return crate::println!("run: no memory for the service's stack.");
     };
@@ -401,19 +432,62 @@ pub fn start(name: &str, arguments: &str, nic: Option<usize>) {
     service.name_length = take;
     service.rsp = sp;
     service.stack = stack;
-    service.nic = nic;
+    service.nics = nics;
     service.state = State::Live;
     LIVE.fetch_add(1, Ordering::Relaxed);
-    if nic != NO_NIC {
+    for nic in (0..64).filter(|&nic| nics >> nic & 1 != 0) {
         host::nic_claim(nic);
     }
     host::services_begin();
-    if nic == NO_NIC {
-        crate::println!("Service {name} started: `ps` lists services, `kill {}` stops this one.", slot + 1);
-    } else {
-        crate::println!("Service {name} started on NIC {}: `ps` lists services, `kill {}` stops this one.", nic + 1, slot + 1);
-    }
+    let mut owned = [0u8; 24];
+    let owned = nic_text(&mut owned, nics);
+    crate::println!("Service {name} started{owned}: `ps` lists services, `kill {}` stops this one.", slot + 1);
     yield_now(); // let it start and print its first lines
+}
+
+/// " on NIC 1,2" for the NICs in a mask (empty for none).
+fn nic_text(buffer: &mut [u8; 24], nics: u64) -> &str {
+    use core::fmt::Write;
+    struct Out<'b>(&'b mut [u8], usize);
+    impl Write for Out<'_> {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            let end = self.1 + text.len();
+            self.0.get_mut(self.1..end).ok_or(core::fmt::Error)?.copy_from_slice(text.as_bytes());
+            self.1 = end;
+            Ok(())
+        }
+    }
+    let mut out = Out(&mut buffer[..], 0);
+    let mut first = true;
+    for nic in (0..64).filter(|&nic| nics >> nic & 1 != 0) {
+        write!(out, "{}{}", if first { " on NIC " } else { "," }, nic + 1).ok();
+        first = false;
+    }
+    let length = out.1;
+    core::str::from_utf8(&buffer[..length]).unwrap_or("")
+}
+
+/// "  audio N out M" for the devices a service holds (nothing when it holds none).
+fn claim_text(buffer: &mut [u8; 24], input: usize, output: usize) -> &str {
+    use core::fmt::Write;
+    struct Out<'b>(&'b mut [u8], usize);
+    impl Write for Out<'_> {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            let end = self.1 + text.len();
+            self.0.get_mut(self.1..end).ok_or(core::fmt::Error)?.copy_from_slice(text.as_bytes());
+            self.1 = end;
+            Ok(())
+        }
+    }
+    let mut out = Out(&mut buffer[..], 0);
+    if input != 0 {
+        write!(out, "  audio {input}").ok();
+    }
+    if output != 0 {
+        write!(out, "  out {output}").ok();
+    }
+    let length = out.1;
+    core::str::from_utf8(&buffer[..length]).unwrap_or("")
 }
 
 /// `tasks`
@@ -423,11 +497,12 @@ pub fn list() {
     }
     for (index, service) in services().iter().enumerate().filter(|(_, service)| service.state == State::Live) {
         let state = if service.abort { "stopping" } else if service.idle { "idle" } else { "running" };
-        if service.nic == NO_NIC {
-            crate::println!("{}  {:<16} no NIC  {state}", index + 1, service.name());
-        } else {
-            crate::println!("{}  {:<16} NIC {}  {state}", index + 1, service.name(), service.nic + 1);
-        }
+        let (input, output) = crate::audio::claims_of(index + 1);
+        let mut audio = [0u8; 24];
+        let audio = claim_text(&mut audio, input, output);
+        let mut owned = [0u8; 24];
+        let owned = nic_text(&mut owned, service.nics);
+        crate::println!("{}  {:<16} {}  {state}{audio}", index + 1, service.name(), owned.strip_prefix(" on ").unwrap_or("no NIC"));
     }
 }
 
