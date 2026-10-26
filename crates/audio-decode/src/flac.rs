@@ -12,6 +12,7 @@
 //! The decoder is large (two channels of `MAX_BLOCK` samples): keep it in a `static`, build it with `Decoder::new` and
 //! call `open`.
 
+use crate::tags::Tags;
 use crate::{Decode, Error, Source};
 
 /// The longest block, in samples per channel. Streams from encoders that stay inside the FLAC "subset" use at most 4608
@@ -34,6 +35,7 @@ pub struct Decoder<S: Source> {
     pub bits_per_sample: u32,
     /// 0 when the encoder did not know (a stream).
     pub total_samples: u64,
+    pub tags: Tags,
     /// The decoded block: `samples[channel][..n]`, left/right already restored. Valid after `next_block` returned `n`.
     pub samples: [[i32; MAX_BLOCK]; 2],
 }
@@ -53,6 +55,7 @@ impl<S: Source> Decoder<S> {
             channels: 0,
             bits_per_sample: 0,
             total_samples: 0,
+            tags: Tags::new(),
             samples: [[0; MAX_BLOCK]; 2],
         }
     }
@@ -67,6 +70,7 @@ impl<S: Source> Decoder<S> {
         self.end = 0;
         self.next_offset = 0;
         self.bits = 0;
+        self.tags.clear();
         let mut signature = [0u8; 4];
         for byte in &mut signature {
             *byte = self.byte()?;
@@ -93,6 +97,8 @@ impl<S: Source> Decoder<S> {
                 self.total_samples = ((self.read_bits(4)? as u64) << 32) | self.read_bits(32)? as u64;
                 self.skip(16 + (length - 34))?; // the MD5 signature and anything after
                 have_streaminfo = true;
+            } else if kind == 4 {
+                self.vorbis_comments(length)?;
             } else {
                 self.skip(length)?;
             }
@@ -114,6 +120,44 @@ impl<S: Source> Decoder<S> {
         }
         self.data_start = self.next_offset - (self.end - self.position) as u64;
         Ok(())
+    }
+
+    /// Reads a VORBIS_COMMENT block (little-endian lengths, `NAME=value` strings) for the tags; a malformed one is skipped.
+    fn vorbis_comments(&mut self, length: u64) -> Result<(), Error> {
+        let mut left = length;
+        let word = |decoder: &mut Self, left: &mut u64| -> Result<Option<u32>, Error> {
+            if *left < 4 {
+                return Ok(None);
+            }
+            let mut value = 0u32;
+            for shift in [0, 8, 16, 24] {
+                value |= (decoder.byte()? as u32) << shift;
+            }
+            *left -= 4;
+            Ok(Some(value))
+        };
+        let Some(vendor) = word(self, &mut left)? else { return self.skip(left) };
+        if vendor as u64 > left {
+            return self.skip(left);
+        }
+        self.skip(vendor as u64)?;
+        left -= vendor as u64;
+        let Some(count) = word(self, &mut left)? else { return self.skip(left) };
+        for _ in 0..count {
+            let Some(size) = word(self, &mut left)? else { break };
+            if size as u64 > left {
+                break;
+            }
+            let mut comment = [0u8; 160];
+            let keep = (size as usize).min(comment.len());
+            for slot in &mut comment[..keep] {
+                *slot = self.byte()?;
+            }
+            self.skip(size as u64 - keep as u64)?;
+            left -= size as u64;
+            self.tags.set_vorbis(&comment[..keep]);
+        }
+        self.skip(left)
     }
 
     /// Back to the first frame.
@@ -463,5 +507,9 @@ impl<S: Source> Decode for Decoder<S> {
 
     fn total_samples(&self) -> u64 {
         self.total_samples
+    }
+
+    fn tags(&self) -> &Tags {
+        &self.tags
     }
 }

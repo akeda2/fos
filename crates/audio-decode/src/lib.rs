@@ -8,6 +8,7 @@
 pub mod flac;
 pub mod mp3;
 pub mod resample;
+pub mod tags;
 
 /// What the player needs from any decoder: blocks of audio, converted to stereo `f32` on request.
 pub trait Decode {
@@ -22,6 +23,8 @@ pub trait Decode {
     fn bits_per_sample(&self) -> u32;
     /// 0 when unknown.
     fn total_samples(&self) -> u64;
+    /// Title, artist and album found in the file's metadata (empty when there are none); valid after `open`.
+    fn tags(&self) -> &tags::Tags;
 }
 
 /// Random-access bytes of one file.

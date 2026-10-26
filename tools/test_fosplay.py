@@ -47,7 +47,8 @@ def main():
         for name, rate, channels, options in [("p1.flac", 48000, 2, ["-sample_fmt", "s16"]), ("p2.mp3", 44100, 2, ["-b:a", "192k"])]:
             path = Path(tmp) / name
             subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"sine=frequency={TONE_HZ}:sample_rate={rate}:duration=3",
-                            "-ac", str(channels), *options, str(path)], check=True)
+                            "-ac", str(channels), *options, "-metadata", f"title=Song {name[1]}", "-metadata", "artist=Bj\u00f6rk Quartet",
+                            str(path)], check=True)
             files[name] = path.read_bytes()
         guest = Guest(tmp, "fosplay", MAC, files=files)
         try:
@@ -76,6 +77,7 @@ def main():
                 guest.pump(2)
             guest.pump(3)
             text = guest.text()
+            check("Song 1 - Bj\u00f6rk Quartet" in text and "Song 2 - Bj\u00f6rk Quartet" in text, "titles and artists come from the Vorbis and ID3 tags", text[-800:])
             check("[1/2] p1.flac" in text and "[2/2] p2.mp3" in text, "the playlist names both tracks", text[-800:])
             check("2 track(s)" in text, "the playlist ends with a summary of 2 tracks", text[-800:])
         finally:

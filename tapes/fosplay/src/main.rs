@@ -605,6 +605,15 @@ fn play_track(session: &mut Session, path: &str, index: usize, total: usize) -> 
         decoder.channels(), decoder.total_samples() / rate as u64, if out_rate == rate { "" } else { " (resampled)" },
         if float { "float " } else { "" }, info.playback_bits
     );
+    let tags = decoder.tags();
+    if !tags.title.is_empty() {
+        println!(
+            "fosplay: {position}{}{}{}{}{}",
+            tags.title.as_str(),
+            if tags.artist.is_empty() { "" } else { " - " }, tags.artist.as_str(),
+            if tags.album.is_empty() { "" } else { " - " }, tags.album.as_str()
+        );
+    }
     session.tracks += 1;
     let mut output = session.output.take().unwrap();
     output.command = None;

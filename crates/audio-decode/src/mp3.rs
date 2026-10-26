@@ -4,6 +4,7 @@
 //! of the encoder delay is not done.
 use nanomp3_core::{DecodeError, Decoder as Core, MAX_SAMPLES_PER_FRAME};
 
+use crate::tags::Tags;
 use crate::{Decode, Error, Source};
 
 const INPUT: usize = 16384;
@@ -27,6 +28,7 @@ pub struct Decoder<S: Source> {
     pub channels: u32,
     /// Estimated from the file size and the first frame's bitrate (exact for constant bitrate).
     pub total_samples: u64,
+    pub tags: Tags,
 }
 
 impl<S: Source> Decoder<S> {
@@ -45,6 +47,7 @@ impl<S: Source> Decoder<S> {
             sample_rate: 0,
             channels: 0,
             total_samples: 0,
+            tags: Tags::new(),
         }
     }
 
@@ -112,6 +115,7 @@ impl<S: Source> Decoder<S> {
     /// Finds the first audio frame (skipping tags) to learn the rate and channels, and estimates the length.
     pub fn open(&mut self) -> Result<(), Error> {
         self.restart();
+        self.read_tags();
         let size = self.source.size();
         match self.frame()? {
             Some(_) => self.pending = true,
@@ -125,6 +129,90 @@ impl<S: Source> Decoder<S> {
             _ => 0,
         };
         self.total_samples = if bitrate > 0 { size * 8 / (bitrate as u64 * 1000) * self.sample_rate as u64 } else { 0 };
+        Ok(())
+    }
+
+    /// Title, artist and album from an ID3v2 tag at the start, else from an ID3v1 tag in the last 128 bytes. Best effort:
+    /// a tag that cannot be read leaves the fields empty and never stops the file from playing.
+    fn read_tags(&mut self) {
+        self.tags.clear();
+        let _ = self.id3v2();
+        if self.tags.is_empty() {
+            let _ = self.id3v1();
+        }
+    }
+
+    fn id3v2(&mut self) -> Result<(), Error> {
+        let mut head = [0u8; 10];
+        if self.source.read_at(0, &mut head)? < 10 || &head[..3] != b"ID3" {
+            return Ok(());
+        }
+        let version = head[3];
+        let synchsafe = |b: &[u8]| b.iter().fold(0u64, |n, &x| (n << 7) | (x & 0x7F) as u64);
+        let end = 10 + synchsafe(&head[6..10]);
+        // Frame header: 6 bytes (id 3, size 3) in v2.2, else 10 (id 4, size 4, flags 2).
+        let (id_len, header) = if version == 2 { (3, 6) } else { (4, 10) };
+        let mut at = 10u64;
+        if head[5] & 0x40 != 0 && version >= 3 {
+            // An extended header: its size (synchsafe in v2.4, plain in v2.3, not counting these four bytes).
+            let mut size = [0u8; 4];
+            self.source.read_at(at, &mut size)?;
+            at += if version == 4 { synchsafe(&size) } else { u32::from_be_bytes(size) as u64 + 4 };
+        }
+        while at + header as u64 <= end {
+            let mut frame = [0u8; 10];
+            if self.source.read_at(at, &mut frame[..header])? < header || frame[0] == 0 {
+                break;
+            }
+            let size = match (version, &frame[id_len..header]) {
+                (2, b) => u32::from_be_bytes([0, b[0], b[1], b[2]]) as u64,
+                (4, b) => synchsafe(&b[..4]),
+                (_, b) => u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as u64,
+            };
+            let body = at + header as u64;
+            let field = match &frame[..id_len] {
+                b"TIT2" | b"TT2" => Some(0),
+                b"TPE1" | b"TP1" => Some(1),
+                b"TALB" | b"TAL" => Some(2),
+                _ => None,
+            };
+            if let (Some(which), true) = (field, size > 1) {
+                let mut data = [0u8; 200];
+                let keep = ((size - 1) as usize).min(data.len());
+                let mut encoding = [0u8; 1];
+                self.source.read_at(body, &mut encoding)?;
+                let got = self.source.read_at(body + 1, &mut data[..keep])?;
+                let data = &data[..got];
+                let text = match which {
+                    0 => &mut self.tags.title,
+                    1 => &mut self.tags.artist,
+                    _ => &mut self.tags.album,
+                };
+                match encoding[0] {
+                    0 => text.set_latin1(data),
+                    1 => text.set_utf16(data, false),
+                    2 => text.set_utf16(data, true),
+                    _ => text.set_utf8(data.split(|&b| b == 0).next().unwrap_or(&[])),
+                }
+            }
+            at = body + size;
+        }
+        Ok(())
+    }
+
+    /// ID3v1: "TAG", then 30 bytes each of title, artist and album, padded with NULs or spaces.
+    fn id3v1(&mut self) -> Result<(), Error> {
+        let size = self.source.size();
+        if size < 128 {
+            return Ok(());
+        }
+        let mut tag = [0u8; 128];
+        if self.source.read_at(size - 128, &mut tag)? < 128 || &tag[..3] != b"TAG" {
+            return Ok(());
+        }
+        for (text, range) in [(&mut self.tags.title, 3..33), (&mut self.tags.artist, 33..63), (&mut self.tags.album, 63..93)] {
+            text.set_latin1(&tag[range]);
+        }
         Ok(())
     }
 
@@ -173,5 +261,9 @@ impl<S: Source> Decode for Decoder<S> {
 
     fn total_samples(&self) -> u64 {
         self.total_samples
+    }
+
+    fn tags(&self) -> &Tags {
+        &self.tags
     }
 }
