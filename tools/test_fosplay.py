@@ -43,6 +43,12 @@ def main():
             path = Path(tmp) / name
             make_audio(path, rate, channels, options)
             files[name] = path.read_bytes()
+        # A playlist of two short files (FLAC then MP3, different rates), played back to back.
+        for name, rate, channels, options in [("p1.flac", 48000, 2, ["-sample_fmt", "s16"]), ("p2.mp3", 44100, 2, ["-b:a", "192k"])]:
+            path = Path(tmp) / name
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"sine=frequency={TONE_HZ}:sample_rate={rate}:duration=3",
+                            "-ac", str(channels), *options, str(path)], check=True)
+            files[name] = path.read_bytes()
         guest = Guest(tmp, "fosplay", MAC, files=files)
         try:
             guest.wait_for("M3 complete")
@@ -59,6 +65,19 @@ def main():
                     guest.pump(2)
                 check("record" not in ask(guest, "ps", "fos> "), f"the {name} recording finishes", guest.text()[-600:])
                 guest.pump(8)
+            # The playlist: both tracks play, the second named [2/2], and the summary counts them.
+            guest.send("run record device=loop0 list 9 &0")
+            guest.pump(2)
+            guest.send("run fosplay device=loop0 play p1.flac p2.mp3 &0")
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                if "record" not in ask(guest, "ps", "fos> "):
+                    break
+                guest.pump(2)
+            guest.pump(3)
+            text = guest.text()
+            check("[1/2] p1.flac" in text and "[2/2] p2.mp3" in text, "the playlist names both tracks", text[-800:])
+            check("2 track(s)" in text, "the playlist ends with a summary of 2 tracks", text[-800:])
         finally:
             guest.stop()
         out = fosfs_files(Path(tmp) / "fosplay.img")
@@ -72,6 +91,11 @@ def main():
             middle = len(loud) and len(samples) // 2
             measured = tone_frequency(samples, got, samples[middle - got // 8:middle + got // 8])
             check(abs(measured - TONE_HZ) < 20, f"{name}: recorded tone is {measured:.0f} Hz (wanted {TONE_HZ})", "")
+        blob = out.get("list.wav")
+        check(blob is not None, "list.wav was written", str(sorted(out)))
+        samples, got = float_wav(blob)
+        loud = [i for i, x in enumerate(samples) if abs(x) > 0.05]
+        check(len(loud) > 5 * got // 2, f"the playlist recording holds both tracks ({len(loud)} loud samples)", "")
     print("PASS: fosplay")
 
 

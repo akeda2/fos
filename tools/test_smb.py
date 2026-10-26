@@ -13,7 +13,10 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_audio_net import Guest  # noqa: E402
 from test_boot import check  # noqa: E402
+from test_loopback import ask, float_wav  # noqa: E402
+from test_record import fosfs_files  # noqa: E402
 from test_usb_audio import boot_with_commands  # noqa: E402
 
 HOST = os.environ.get("FOS_SMB_HOST", "192.168.0.94")
@@ -52,7 +55,35 @@ def main():
         size, digest = expected
         check(f"read {size} bytes" in output and f"fnv1a {digest:08x}" in output,
               f"size {size} and checksum {digest:08x} match smbclient's copy", output[-1800:])
+    play_directory(directory)
     print("PASS: smb")
+
+
+def play_directory(directory):
+    """`fosplay play HOST SHARE DIR` streams the directory's tracks into loop0 (the NIC is a second, user-mode one) while
+    `record` captures the first seconds: the playlist is found, sorted and numbered, and what is recorded is sound."""
+    with tempfile.TemporaryDirectory() as tmp:
+        guest = Guest(tmp, "smbplay", "52:54:00:12:36:03", extra=["-netdev", "user,id=n1", "-device", "e1000,netdev=n1"])
+        try:
+            guest.wait_for("M3 complete")
+            guest.wait_for("fos> ")
+            ask(guest, "nic use 2", "Using NIC 2")
+            guest.send("run record device=loop0 smb 8 &0")
+            guest.pump(2)
+            guest.send(f"run fosplay device=loop0 play {HOST} {SHARE} {directory} &2")
+            guest.wait_for("Service record ended", 60)
+            guest.pump(1)
+            text = guest.text()
+            check("[1/" in text and "FLAC" in text, "the directory playlist starts its first track", text[-1200:])
+            guest.send("kill 2")
+            guest.pump(1)
+        finally:
+            guest.stop()
+        blob = fosfs_files(Path(tmp) / "smbplay.img").get("smb.wav")
+        check(blob is not None, "smb.wav was written", guest.text()[-800:])
+        samples, rate = float_wav(blob)
+        loud = [x for x in samples if abs(x) > 0.02]
+        check(len(loud) > rate, f"the streamed music was recorded ({len(loud)} loud samples)", guest.text()[-800:])
 
 
 if __name__ == "__main__":

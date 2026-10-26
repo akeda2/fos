@@ -15,7 +15,7 @@ use smb::{Client, Error, Handle, Transport};
 use tape_ip::net;
 use tape_ip::tcp::Socket;
 use tape_net::{Ipv4Address, MacAddress};
-use tape_rt::{AudioInfo, AudioStats, TapeApi, println};
+use tape_rt::{AudioInfo, AudioStats, KEY_ABORT, KEY_BASE, KEY_NONE, TapeApi, println};
 
 const SMB_PORT: u16 = 445;
 /// How long the server may stay silent before a request counts as lost.
@@ -105,13 +105,13 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     }
     let mut words = arguments.split_whitespace();
     let command = words.next().unwrap_or("");
-    let rest: [&str; 3] = core::array::from_fn(|_| words.next().unwrap_or(""));
-    if command == "play" && !rest[0].is_empty() && rest[1].is_empty() {
-        return play_local(api, rest[0]);
+    if command == "play" {
+        return play_command(api, words);
     }
+    let rest: [&str; 3] = core::array::from_fn(|_| words.next().unwrap_or(""));
     let [host, share, path] = rest;
     let Some(address) = net::parse_ip(host) else { return usage() };
-    if share.is_empty() || !matches!(command, "ls" | "cat" | "play") || (command != "ls" && path.is_empty()) {
+    if share.is_empty() || !matches!(command, "ls" | "cat") || (command == "cat" && path.is_empty()) {
         return usage();
     }
     #[allow(static_mut_refs)]
@@ -119,20 +119,15 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let Some(()) = open(api, client, address, host, share) else { return };
     match command {
         "ls" => list(client, path),
-        "cat" => cat(api, client, path),
-        _ => {
-            let Some(file) = open_remote(client, path) else { return };
-            media_source(path).handle = Some(file);
-            play(api, path);
-            let _ = client.close(&file);
-        }
+        _ => cat(api, client, path),
     }
     client.transport().socket.close(api);
 }
 
 fn usage() {
     println!("usage: fosplay ls HOST SHARE [DIR] | cat HOST SHARE FILE");
-    println!("       fosplay [device=N|loopN] play FILE | play HOST SHARE FILE");
+    println!("       fosplay [device=N|loopN] [rate=HZ] play HOST SHARE [FILE|DIR]");
+    println!("       fosplay [device=N|loopN] [rate=HZ] play NAME...");
 }
 
 type Player = Client<Link, { 64 * 1024 + 1024 }>;
@@ -220,17 +215,30 @@ fn cat(api: &TapeApi, client: &mut Player, path: &str) {
 }
 
 /// Sends the stereo frames it is given to the audio device in its own format, blocking while the ring is full.
-struct Output<'a> {
-    api: &'a TapeApi,
+/// What the listener asked for with a key, or how a track ended.
+#[derive(Clone, Copy, PartialEq)]
+enum Outcome {
+    Done,
+    Next,
+    Previous,
+    Stop,
+    Failed,
+}
+
+/// The device end of playback: converts frames to the device's format and writes them, watching the keys between
+/// writes (`n` next, `p` previous, space pause, Esc or `q` stop).
+struct Output {
+    api: &'static TapeApi,
     format: audio_sample::Format,
     channels: usize,
     slot: usize,
     staging: [u8; 8192],
     staged: usize,
-    aborted: bool,
+    paused: bool,
+    command: Option<Outcome>,
 }
 
-impl Output<'_> {
+impl Output {
     fn frame(&mut self, frame: [f32; 2]) {
         if self.staged + self.channels * self.slot > self.staging.len() {
             self.flush();
@@ -242,19 +250,242 @@ impl Output<'_> {
         }
     }
 
+    /// Reads the keys; while paused it waits here, so nothing is decoded or written.
+    fn poll(&mut self) {
+        loop {
+            let key = (self.api.read_key)();
+            let command = match key {
+                KEY_NONE if self.paused => {
+                    tape_rt::idle();
+                    continue;
+                }
+                KEY_NONE => return,
+                KEY_ABORT => Some(Outcome::Stop),
+                _ => match (key - KEY_BASE) as u8 {
+                    b'n' => Some(Outcome::Next),
+                    b'p' => Some(Outcome::Previous),
+                    b'q' => Some(Outcome::Stop),
+                    b' ' => {
+                        self.paused = !self.paused;
+                        if self.paused {
+                            println!("fosplay: paused (space resumes).");
+                        }
+                        None
+                    }
+                    _ => None,
+                },
+            };
+            if command.is_some() {
+                self.command = command;
+                return;
+            }
+        }
+    }
+
     fn flush(&mut self) {
         let mut sent = 0;
-        while sent < self.staged && !self.aborted {
+        while sent < self.staged && self.command.is_none() {
             let accepted = (self.api.audio_write)(self.staging[sent..self.staged].as_ptr(), self.staged - sent);
             sent += accepted;
-            if (self.api.should_abort)() != 0 {
-                self.aborted = true;
-            } else if accepted == 0 {
+            self.poll();
+            if accepted == 0 && self.command.is_none() {
                 tape_rt::idle();
             }
         }
         self.staged = 0;
     }
+}
+
+/// `[3/12] ` before a track's name when there is more than one.
+struct Position(usize, usize);
+
+impl core::fmt::Display for Position {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        if self.1 > 1 { write!(f, "[{}/{}] ", self.0, self.1) } else { Ok(()) }
+    }
+}
+
+/// The names of the tracks, `dir/name` for a share, as given for FOSFS files.
+struct Playlist {
+    names: [u8; 24576],
+    used: usize,
+    items: [(u16, u8); 192],
+    count: usize,
+}
+
+static mut PLAYLIST: Playlist = Playlist { names: [0; 24576], used: 0, items: [(0, 0); 192], count: 0 };
+
+impl Playlist {
+    fn add(&mut self, directory: &str, name: &str) -> bool {
+        let separator = !directory.is_empty() && !directory.ends_with(['/', '\\']);
+        let length = directory.len() + separator as usize + name.len();
+        if self.count == self.items.len() || self.used + length > self.names.len() || length > 255 {
+            return false;
+        }
+        let at = self.used;
+        self.names[at..at + directory.len()].copy_from_slice(directory.as_bytes());
+        let mut end = at + directory.len();
+        if separator {
+            self.names[end] = b'/';
+            end += 1;
+        }
+        self.names[end..end + name.len()].copy_from_slice(name.as_bytes());
+        self.items[self.count] = (at as u16, length as u8);
+        self.count += 1;
+        self.used += length;
+        true
+    }
+
+    fn get(&self, index: usize) -> &str {
+        let (at, length) = self.items[index];
+        core::str::from_utf8(&self.names[at as usize..at as usize + length as usize]).unwrap_or("?")
+    }
+
+    /// By name, byte order: files numbered `01_...` play in order.
+    fn sort(&mut self) {
+        for i in 1..self.count {
+            let mut j = i;
+            while j > 0 && self.get(j - 1).as_bytes() > self.get(j).as_bytes() {
+                self.items.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+    }
+}
+
+fn has_extension(path: &str, extension: &str) -> bool {
+    let (path, extension) = (path.as_bytes(), extension.as_bytes());
+    path.len() > extension.len() && path[path.len() - extension.len()..].eq_ignore_ascii_case(extension)
+}
+
+fn is_audio(path: &str) -> bool {
+    has_extension(path, ".flac") || has_extension(path, ".mp3")
+}
+
+/// `fosplay play HOST SHARE [FILE|DIR]` (a directory plays its .flac and .mp3 files in name order) or
+/// `fosplay play NAME...` (FOSFS files).
+fn play_command<'a>(api: &'static TapeApi, mut words: impl Iterator<Item = &'a str>) {
+    let first = words.next().unwrap_or("");
+    if first.is_empty() {
+        return usage();
+    }
+    #[allow(static_mut_refs)]
+    let list = unsafe { &mut *core::ptr::addr_of_mut!(PLAYLIST) };
+    let Some(address) = net::parse_ip(first) else {
+        for name in core::iter::once(first).chain(words) {
+            if !list.add("", name) {
+                return println!("fosplay: too many files.");
+            }
+        }
+        return run(api, None);
+    };
+    let (share, path) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
+    if share.is_empty() {
+        return usage();
+    }
+    #[allow(static_mut_refs)]
+    let client = unsafe { &mut *core::ptr::addr_of_mut!(CLIENT) };
+    let Some(()) = open(api, client, address, first, share) else { return };
+    if is_audio(path) {
+        list.add("", path);
+    } else {
+        let result = client.list(path, |entry| {
+            if entry.is_dir() {
+                return;
+            }
+            let mut name = [0u8; 120];
+            let length = entry.name_utf8(&mut name);
+            let name = core::str::from_utf8(&name[..length]).unwrap_or("");
+            if is_audio(name) && !name.starts_with('.') && !list.add(path, name) {
+                println!("fosplay: the playlist is full; the rest is left out.");
+            }
+        });
+        if let Err(error) = result {
+            println!("fosplay: {path}: {}.", error.describe());
+        }
+        list.sort();
+    }
+    if list.count == 0 {
+        println!("fosplay: no .flac or .mp3 files found.");
+    } else {
+        run(api, Some(client));
+    }
+    client.transport().socket.close(api);
+}
+
+/// The device across tracks: it stays open while the next track wants the same output rate, so an album at one rate
+/// plays without restarting it.
+struct Session {
+    api: &'static TapeApi,
+    output: Option<Output>,
+    /// What the first choice of rate was when the device was started (a track asks for the same, it keeps running).
+    wanted: u32,
+    out_rate: u32,
+    /// Ring space when it holds nothing.
+    empty: usize,
+    started: u64,
+    tracks: u32,
+}
+
+impl Session {
+    /// Waits for the queued audio to play out (when `drain`), reports, and stops the device.
+    fn close(&mut self, drain: bool, report: bool) {
+        let Some(mut output) = self.output.take() else { return };
+        let mut info = AudioInfo::default();
+        if drain && output.command.is_none() {
+            output.flush();
+            let mut waited = 0;
+            while output.command.is_none() && waited < 120_000 {
+                (self.api.audio_info)(&mut info);
+                if info.playback_space as usize >= self.empty {
+                    break;
+                }
+                output.poll();
+                tape_rt::idle();
+                waited += 1;
+            }
+        }
+        let mut stats = AudioStats::default();
+        (self.api.audio_stats)(&mut stats);
+        (self.api.audio_stop)();
+        let seconds = (tape_rt::micros() - self.started) / 1_000_000;
+        if report {
+            println!("fosplay: {} track(s), {seconds} s, {} packets, {} underrun(s).", self.tracks, stats.playback_packets, stats.playback_underruns);
+        }
+    }
+}
+
+fn run(api: &'static TapeApi, mut client: Option<&mut Player>) {
+    #[allow(static_mut_refs)]
+    let list = unsafe { &*core::ptr::addr_of!(PLAYLIST) };
+    let mut session = Session { api, output: None, wanted: 0, out_rate: 0, empty: 0, started: 0, tracks: 0 };
+    let total = list.count;
+    let mut index = 0;
+    let mut stopped = false;
+    while index < total {
+        let path = list.get(index);
+        let outcome = match client.as_deref_mut() {
+            Some(client) => match open_remote(client, path) {
+                Some(file) => {
+                    media_source(path).handle = Some(file);
+                    let outcome = play_track(&mut session, path, index, total);
+                    let _ = client.close(&file);
+                    outcome
+                }
+                None => Outcome::Failed,
+            },
+            None => play_local(&mut session, path, index, total),
+        };
+        match outcome {
+            Outcome::Done | Outcome::Next | Outcome::Failed => index += 1,
+            Outcome::Previous => index = index.saturating_sub(1),
+            Outcome::Stop => {
+                stopped = true;
+                break;
+            }
+        }
+    }
+    session.close(!stopped, true);
 }
 
 fn open_remote(client: &mut Player, path: &str) -> Option<Handle> {
@@ -268,12 +499,14 @@ fn open_remote(client: &mut Player, path: &str) -> Option<Handle> {
 }
 
 /// A FOSFS file, read into memory whole (the tape ABI has no partial reads), then decoded from there.
-fn play_local(api: &'static TapeApi, name: &str) {
+fn play_local(session: &mut Session, name: &str, index: usize, total: usize) -> Outcome {
+    let api = session.api;
     let mut capacity = 4 << 20;
     let (buffer, length) = loop {
         let buffer = (api.alloc)(capacity);
         if buffer == 0 {
-            return println!("fosplay: not enough memory.");
+            println!("fosplay: not enough memory.");
+            return Outcome::Failed;
         }
         let result = (api.fs_read)(name.as_ptr(), name.len(), buffer as *mut u8, capacity);
         if result == tape_rt::FS_TOO_BIG && capacity < (256 << 20) {
@@ -283,27 +516,32 @@ fn play_local(api: &'static TapeApi, name: &str) {
         }
         if result < 0 {
             (api.free)(buffer, capacity);
-            return println!("fosplay: cannot read {name} (code {result}).");
+            println!("fosplay: cannot read {name} (code {result}).");
+            return Outcome::Failed;
         }
         break (buffer, result as usize);
     };
     let source = media_source(name);
     source.handle = None;
     source.memory = unsafe { core::slice::from_raw_parts(buffer as *const u8, length) };
-    play(api, name);
+    let outcome = play_track(session, name, index, total);
     source.memory = &[];
     (api.free)(buffer, capacity);
+    outcome
 }
 
 /// Plays the file behind the source `media_source(path)` was given.
-fn play(api: &'static TapeApi, path: &str) {
+fn play_track(session: &mut Session, path: &str, index: usize, total: usize) -> Outcome {
+    let api = session.api;
     let mut info = AudioInfo::default();
     if (api.audio_info)(&mut info) == 0 || info.playback_channels == 0 {
-        return println!("fosplay: no audio device with outputs (USB audio, HD Audio or a loopN).");
+        println!("fosplay: no audio device with outputs (USB audio, HD Audio or a loopN).");
+        return Outcome::Stop;
     }
     let decoder = decoder_for(path);
     if let Err(error) = decoder.open() {
-        return println!("fosplay: {path}: {}.", error.describe());
+        println!("fosplay: {path}: {}.", error.describe());
+        return Outcome::Failed;
     }
     let rate = decoder.sample_rate();
     let offered = &info.rates[..info.rate_count as usize];
@@ -327,41 +565,54 @@ fn play(api: &'static TapeApi, path: &str) {
     }
     offered.iter().for_each(|&r| want(r));
     let float = tape_rt::audio_float().1;
-    let depth = if decoder.bits_per_sample() == 0 { "MP3" } else { "FLAC" };
-    let mut out_rate = 0;
-    let mut status = -1;
-    for &candidate in &candidates[..wanted] {
-        status = (api.audio_start)(candidate, 0, 1);
-        if status == 0 {
-            out_rate = candidate;
-            break;
+    if session.output.is_some() && session.wanted != candidates[0] {
+        session.close(true, false);
+    }
+    if session.output.is_none() {
+        let mut status = -1;
+        for &candidate in &candidates[..wanted] {
+            status = (api.audio_start)(candidate, 0, 1);
+            if status == 0 {
+                session.out_rate = candidate;
+                break;
+            }
         }
+        if status != 0 {
+            println!("fosplay: cannot start playback (code {status}); the device offers {offered:?}.");
+            return Outcome::Stop;
+        }
+        session.wanted = candidates[0];
+        (api.audio_info)(&mut info);
+        session.empty = (info.playback_space as usize).saturating_sub(64).min((1 << 20) - 64);
+        session.started = tape_rt::micros();
+        session.tracks = 0;
+        session.output = Some(Output {
+            api,
+            format: audio_sample::Format::new(info.playback_slot_bytes as usize, info.playback_bits as usize, float),
+            channels: info.playback_channels as usize,
+            slot: info.playback_slot_bytes as usize,
+            staging: [0; 8192],
+            staged: 0,
+            paused: false,
+            command: None,
+        });
     }
-    if status != 0 {
-        return println!("fosplay: cannot start playback (code {status}); the device offers {offered:?}.");
-    }
+    let out_rate = session.out_rate;
+    let depth = if decoder.bits_per_sample() == 0 { "MP3" } else { "FLAC" };
+    let position = Position(index + 1, total);
     println!(
-        "fosplay: {path}: {depth}, {rate} Hz, {} channel(s), {} s; to {out_rate} Hz{}, {}{}-bit.",
+        "fosplay: {position}{path}: {depth}, {rate} Hz, {} channel(s), {} s; to {out_rate} Hz{}, {}{}-bit.",
         decoder.channels(), decoder.total_samples() / rate as u64, if out_rate == rate { "" } else { " (resampled)" },
         if float { "float " } else { "" }, info.playback_bits
     );
-    (api.audio_info)(&mut info);
-    let empty = (info.playback_space as usize).saturating_sub(64).min((1 << 20) - 64);
-    let mut output = Output {
-        api,
-        format: audio_sample::Format::new(info.playback_slot_bytes as usize, info.playback_bits as usize, float),
-        channels: info.playback_channels as usize,
-        slot: info.playback_slot_bytes as usize,
-        staging: [0; 8192],
-        staged: 0,
-        aborted: false,
-    };
+    session.tracks += 1;
+    let mut output = session.output.take().unwrap();
+    output.command = None;
     #[allow(static_mut_refs)]
     let resampler = unsafe { &mut *core::ptr::addr_of_mut!(RESAMPLER) };
     resampler.configure(rate, out_rate);
     let mut pcm = [0f32; 2 * 512];
     let mut failure = None;
-    let started = tape_rt::micros();
     'blocks: loop {
         let count = match decoder.next_block() {
             Ok(Some(count)) => count,
@@ -382,34 +633,33 @@ fn play(api: &'static TapeApi, path: &str) {
                     resampler.push([frame[0], frame[1]], &mut |sample| output.frame(sample));
                 }
             }
-            if output.aborted {
+            if output.command.is_some() {
                 break 'blocks;
             }
             at += step;
         }
     }
-    if !output.aborted {
-        if out_rate != rate && failure.is_none() {
-            resampler.finish(&mut |sample| output.frame(sample));
-        }
-        output.flush();
-        let mut waited = 0;
-        loop {
-            (api.audio_info)(&mut info);
-            if info.playback_space as usize >= empty || (api.should_abort)() != 0 || waited > 120_000 {
-                break;
-            }
-            tape_rt::idle();
-            waited += 1;
-        }
+    if output.command.is_none() && failure.is_none() && out_rate != rate {
+        resampler.finish(&mut |sample| output.frame(sample));
     }
-    let mut stats = AudioStats::default();
-    (api.audio_stats)(&mut stats);
-    (api.audio_stop)();
-    let seconds = (tape_rt::micros() - started) / 1_000_000;
-    match failure {
-        Some(why) => println!("fosplay: stopped after {seconds} s: {why}."),
-        None => println!("fosplay: {} after {seconds} s, {} packets, {} underrun(s).", if output.aborted { "stopped" } else { "finished" }, stats.playback_packets, stats.playback_underruns),
+    if output.command.is_none() {
+        output.flush();
+    }
+    let command = output.command;
+    session.output = Some(output);
+    if let Some(why) = failure {
+        println!("fosplay: stopped: {why}.");
+        return Outcome::Failed;
+    }
+    match command {
+        // Next and previous cut the queued audio at once: stopping the device empties its ring.
+        Some(outcome) => {
+            if outcome != Outcome::Stop {
+                session.close(false, false);
+            }
+            outcome
+        }
+        None => Outcome::Done,
     }
 }
 
@@ -417,8 +667,11 @@ tape_rt::tape_help!(br#"fosplay: play audio from an SMB share (guest access).
 
   tape run fosplay ls HOST SHARE [DIR]
   tape run fosplay cat HOST SHARE FILE
-  tape run fosplay [device=N|loopN] [rate=HZ] play HOST SHARE FILE
-  tape run fosplay [device=N|loopN] [rate=HZ] play NAME        (a FOSFS file)
+  tape run fosplay [device=N|loopN] [rate=HZ] play HOST SHARE [FILE|DIR]
+  tape run fosplay [device=N|loopN] [rate=HZ] play NAME...     (FOSFS files)
+
+  A directory plays its .flac and .mp3 files in name order. Keys: n next,
+  p previous, space pause, Esc or q stop.
 
   HOST is an IPv4 address; the address comes from DHCP on the NIC chosen
   with `nic use N`. FLAC (mono or stereo, up to 24 bits) and MP3 (any MPEG
