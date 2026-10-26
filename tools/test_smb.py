@@ -70,6 +70,7 @@ def main():
         check(f"read {size} bytes" in output and f"fnv1a {digest:08x}" in output,
               f"size {size} and checksum {digest:08x} match smbclient's copy", output[-1800:])
     play_directory(directory)
+    browse_directory(directory)
     print("PASS: smb")
 
 
@@ -98,6 +99,32 @@ def play_directory(directory):
         samples, rate = float_wav(blob)
         loud = [x for x in samples if abs(x) > 0.02]
         check(len(loud) > rate, f"the streamed music was recorded ({len(loud)} loud samples)", guest.text()[-800:])
+
+
+def browse_directory(directory):
+    """`fosplay browse //HOST/SHARE/DIR` lists the directory on the touch screen; `a` (QEMU has no touch input) plays the
+    directory's audio files, q returns to the list and q leaves the tape."""
+    with tempfile.TemporaryDirectory() as tmp:
+        guest = Guest(tmp, "smbbrowse", "52:54:00:12:36:04", extra=["-netdev", "user,id=n1", "-device", "e1000,netdev=n1"])
+        try:
+            guest.wait_for("M3 complete")
+            guest.wait_for("fos> ")
+            ask(guest, "nic use 2", "Using NIC 2")
+            mark = guest.send(f"run fosplay device=loop0 browse //{HOST}/{SHARE}/{directory}")
+            guest.pump(5)
+            for byte in (b"a",):
+                guest.process.stdin.write(byte)
+                guest.process.stdin.flush()
+                guest.pump(1)
+            guest.wait_for("[1/", 60, since=mark)
+            check("FLAC" in guest.text()[mark:], "play all plays the directory's tracks", guest.text()[-1200:])
+            for byte in (b"q", b"q"):
+                guest.process.stdin.write(byte)
+                guest.process.stdin.flush()
+                guest.pump(1)
+            guest.wait_for("Tape returned", 30, since=mark)
+        finally:
+            guest.stop()
 
 
 if __name__ == "__main__":

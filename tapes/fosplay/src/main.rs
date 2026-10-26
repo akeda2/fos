@@ -19,7 +19,7 @@ use smb::{Client, Error, Handle, Transport};
 use tape_ip::net;
 use tape_ip::tcp::Socket;
 use tape_net::{ArpCache, Ipv4Address, MacAddress};
-use tape_rt::{AudioInfo, AudioStats, KEY_ABORT, KEY_BASE, KEY_NONE, TapeApi, println};
+use tape_rt::{AudioInfo, AudioStats, KEY_ABORT, KEY_BASE, KEY_NONE, Line, TapeApi, println};
 
 const SMB_PORT: u16 = 445;
 /// How long the server may stay silent before a request counts as lost.
@@ -174,6 +174,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     if command == "play" {
         return play_command(api, words);
     }
+    if command == "browse" {
+        return browse_command(api, words);
+    }
     let rest: [&str; 3] = core::array::from_fn(|_| words.next().unwrap_or(""));
     let [host, share, path] = rest;
     if host.is_empty() || share.is_empty() || !matches!(command, "ls" | "cat") || (command == "cat" && path.is_empty()) {
@@ -221,6 +224,7 @@ fn usage() {
     println!("usage: fosplay ls HOST SHARE [DIR] | cat HOST SHARE FILE");
     println!("       fosplay [device=N|loopN] [OPTIONS] play //HOST/SHARE[/FILE|DIR]");
     println!("       fosplay [device=N|loopN] [OPTIONS] play NAME...");
+    println!("       fosplay [device=N|loopN] [OPTIONS] browse [//HOST/SHARE[/DIR]]");
 }
 
 type Player = Client<Link, { 64 * 1024 + 1024 }>;
@@ -454,7 +458,7 @@ impl Output {
                 effects.surround.center = !effects.surround.center;
                 self.retune();
             }
-            Action::Upmix => {}
+            Action::Upmix | Action::Open(_) | Action::Parent | Action::PlayAll | Action::Quit => {}
         }
     }
 
@@ -570,9 +574,20 @@ struct Playlist {
     count: usize,
 }
 
-static mut PLAYLIST: Playlist = Playlist { names: [0; 24576], used: 0, items: [(0, 0); 192], count: 0 };
+static mut PLAYLIST: Playlist = Playlist::new();
+/// What the browser shows: the current folder's sub-folders (names end in `/`) and audio files.
+static mut ENTRIES: Playlist = Playlist::new();
 
 impl Playlist {
+    const fn new() -> Self {
+        Playlist { names: [0; 24576], used: 0, items: [(0, 0); 192], count: 0 }
+    }
+
+    fn clear(&mut self) {
+        self.used = 0;
+        self.count = 0;
+    }
+
     fn add(&mut self, directory: &str, name: &str) -> bool {
         let separator = !directory.is_empty() && !directory.ends_with(['/', '\\']);
         let length = directory.len() + separator as usize + name.len();
@@ -600,9 +615,14 @@ impl Playlist {
 
     /// By name, byte order: files numbered `01_...` play in order.
     fn sort(&mut self) {
+        self.sort_by(|a, b| a.as_bytes() < b.as_bytes());
+    }
+
+    /// Insertion sort (stable); `before(a, b)` says `a` goes ahead of `b`.
+    fn sort_by(&mut self, before: impl Fn(&str, &str) -> bool) {
         for i in 1..self.count {
             let mut j = i;
-            while j > 0 && self.get(j - 1).as_bytes() > self.get(j).as_bytes() {
+            while j > 0 && before(self.get(j), self.get(j - 1)) {
                 self.items.swap(j - 1, j);
                 j -= 1;
             }
@@ -628,20 +648,13 @@ fn play_command<'a>(api: &'static TapeApi, mut words: impl Iterator<Item = &'a s
     }
     #[allow(static_mut_refs)]
     let list = unsafe { &mut *core::ptr::addr_of_mut!(PLAYLIST) };
-    // `//HOST/SHARE[/PATH]` or `HOST SHARE [PATH]` with a dotted-quad HOST name an SMB share; anything else is FOSFS files.
-    let (first, share, path) = if let Some(unc) = first.strip_prefix("//") {
-        let (host, rest) = unc.split_once('/').unwrap_or((unc, ""));
-        let (share, path) = rest.split_once('/').unwrap_or((rest, ""));
-        (host, share, path.trim_end_matches('/'))
-    } else if net::parse_ip(first).is_some() {
-        (first, words.next().unwrap_or(""), words.next().unwrap_or(""))
-    } else {
+    let Some((first, share, path)) = parse_share(first, &mut words) else {
         for name in core::iter::once(first).chain(words) {
             if !list.add("", name) {
                 return println!("fosplay: too many files.");
             }
         }
-        return run(api, None);
+        return run(api, None, 0);
     };
     if first.is_empty() || share.is_empty() {
         return usage();
@@ -671,9 +684,22 @@ fn play_command<'a>(api: &'static TapeApi, mut words: impl Iterator<Item = &'a s
     if list.count == 0 {
         println!("fosplay: no .flac, .mp3, .wav or .opus files found.");
     } else {
-        run(api, Some(client));
+        run(api, Some(client), 0);
     }
     client.transport().socket.close(api);
+}
+
+/// `//HOST/SHARE[/PATH]` or `HOST SHARE [PATH]` with a dotted-quad HOST name an SMB share; anything else is FOSFS.
+fn parse_share<'a>(first: &'a str, words: &mut impl Iterator<Item = &'a str>) -> Option<(&'a str, &'a str, &'a str)> {
+    if let Some(unc) = first.strip_prefix("//") {
+        let (host, rest) = unc.split_once('/').unwrap_or((unc, ""));
+        let (share, path) = rest.split_once('/').unwrap_or((rest, ""));
+        Some((host, share, path.trim_end_matches('/')))
+    } else if net::parse_ip(first).is_some() {
+        Some((first, words.next().unwrap_or(""), words.next().unwrap_or("")))
+    } else {
+        None
+    }
 }
 
 /// The device across tracks: it stays open while the next track wants the same output rate, so an album at one rate
@@ -718,16 +744,21 @@ impl Session {
     }
 }
 
-fn run(api: &'static TapeApi, mut client: Option<&mut Player>) {
+/// Plays the playlist from entry `start`. Takes the touch screen unless the browser already holds it.
+fn run(api: &'static TapeApi, mut client: Option<&mut Player>, start: usize) {
     #[allow(static_mut_refs)]
     let list = unsafe { &*core::ptr::addr_of!(PLAYLIST) };
     let mut session = Session { api, output: None, wanted: 0, out_rate: 0, empty: 0, started: 0, tracks: 0 };
     let total = list.count;
-    let mut index = 0;
+    let mut index = start;
     let mut stopped = false;
     #[allow(static_mut_refs)]
+    let own_ui = unsafe { (*core::ptr::addr_of!(UI)).is_none() };
+    #[allow(static_mut_refs)]
     unsafe {
-        *core::ptr::addr_of_mut!(UI) = if GFX { Ui::open(api, UI_SCREEN) } else { None };
+        if own_ui {
+            *core::ptr::addr_of_mut!(UI) = if GFX { Ui::open(api, UI_SCREEN) } else { None };
+        }
     }
     while index < total {
         let path = list.get(index);
@@ -755,8 +786,245 @@ fn run(api: &'static TapeApi, mut client: Option<&mut Player>) {
     }
     session.close(!stopped, true);
     #[allow(static_mut_refs)]
-    if let Some(ui) = unsafe { (*core::ptr::addr_of_mut!(UI)).take() } {
-        ui.close();
+    if own_ui {
+        if let Some(ui) = unsafe { (*core::ptr::addr_of_mut!(UI)).take() } {
+            ui.close();
+        }
+    }
+}
+
+/// `fosplay browse //HOST/SHARE[/DIR]` (or `HOST SHARE [DIR]`) or `fosplay browse [VOLUME]` for FOSFS and `diskN` files:
+/// the touch screen lists folders and audio files; a tap on a folder enters it, on a file plays the folder from there.
+fn browse_command<'a>(api: &'static TapeApi, mut words: impl Iterator<Item = &'a str>) {
+    if !unsafe { GFX } {
+        return println!("fosplay: browse needs the touch screen (gfx=off is set).");
+    }
+    let first = words.next().unwrap_or("");
+    let target = parse_share(first, &mut words);
+    #[allow(static_mut_refs)]
+    let client = unsafe { &mut *core::ptr::addr_of_mut!(CLIENT) };
+    if let Some((host, share, _)) = target {
+        if host.is_empty() || share.is_empty() || open(api, client, host, share).is_none() {
+            return;
+        }
+    }
+    match Ui::open(api, unsafe { UI_SCREEN }) {
+        Some(ui) => unsafe { *core::ptr::addr_of_mut!(UI) = Some(ui) },
+        None => println!("fosplay: browse needs a pixel screen."),
+    }
+    #[allow(static_mut_refs)]
+    if unsafe { (*core::ptr::addr_of!(UI)).is_some() } {
+        let remote = target.is_some();
+        browse(api, remote.then_some(&mut *client), target.map_or(first, |(_, _, path)| path), target.map(|(host, share, _)| (host, share)));
+        #[allow(static_mut_refs)]
+        if let Some(ui) = unsafe { (*core::ptr::addr_of_mut!(UI)).take() } {
+            ui.close();
+        }
+    }
+    if target.is_some() {
+        client.transport().socket.close(api);
+    }
+}
+
+fn ui() -> Option<&'static mut Ui> {
+    #[allow(static_mut_refs)]
+    unsafe { (*core::ptr::addr_of_mut!(UI)).as_mut() }
+}
+
+/// Case-blind name order with folders first and `../` before everything.
+fn browse_order(a: &str, b: &str) -> bool {
+    let key = |name: &str| (name != "../", !name.ends_with('/'));
+    match key(a).cmp(&key(b)) {
+        core::cmp::Ordering::Equal => a.bytes().map(|byte| byte.to_ascii_lowercase()).cmp(b.bytes().map(|byte| byte.to_ascii_lowercase())) == core::cmp::Ordering::Less,
+        order => order == core::cmp::Ordering::Less,
+    }
+}
+
+/// Fills `ENTRIES` with what `path` holds; an error is shown on the screen and leaves the list empty.
+fn load_entries(api: &TapeApi, client: Option<&mut Player>, path: &str) {
+    #[allow(static_mut_refs)]
+    let entries = unsafe { &mut *core::ptr::addr_of_mut!(ENTRIES) };
+    entries.clear();
+    let mut full = false;
+    let mut add = |entries: &mut Playlist, name: &str, folder: bool| {
+        if name.starts_with('.') || (!folder && !is_audio(name)) {
+            return;
+        }
+        let mut label = Line::<132>::new();
+        let _ = write!(label, "{name}{}", if folder { "/" } else { "" });
+        full |= !entries.add("", label.as_str());
+    };
+    use core::fmt::Write;
+    match client {
+        Some(client) => {
+            if !path.is_empty() {
+                entries.add("", "../");
+            }
+            if let Err(error) = client.list(path, |entry| {
+                let mut name = [0u8; 120];
+                let length = entry.name_utf8(&mut name);
+                add(entries, core::str::from_utf8(&name[..length]).unwrap_or(""), entry.is_dir());
+            }) {
+                show_message(format_args!("{path}: {}", error.describe()));
+            }
+        }
+        None => {
+            for index in 0.. {
+                match tape_rt::list_file(api, path, index) {
+                    Ok(Some(info)) => {
+                        let name = core::str::from_utf8(&info.name[..info.name_length as usize]).unwrap_or("");
+                        add(entries, name, info.flags & tape_rt::FILE_DIRECTORY != 0);
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        show_message(format_args!("cannot list {}", if path.is_empty() { "the boot volume" } else { path }));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    entries.sort_by(browse_order);
+    if full {
+        show_message(format_args!("the folder has more entries than fit; the rest is left out"));
+    }
+}
+
+/// Puts the audio files of `ENTRIES` (in `path`) in the playlist and returns the index of `first` in it (0 when absent).
+fn playlist_from_entries(path: &str, first: &str) -> usize {
+    #[allow(static_mut_refs)]
+    let (list, entries) = unsafe { (&mut *core::ptr::addr_of_mut!(PLAYLIST), &*core::ptr::addr_of!(ENTRIES)) };
+    list.clear();
+    let mut start = 0;
+    for index in 0..entries.count {
+        let name = entries.get(index);
+        if !name.ends_with('/') && list.add(path, name) && name == first {
+            start = list.count - 1;
+        }
+    }
+    start
+}
+
+/// The folder above `path` (`a/b` -> `a`, `a` -> the share's root).
+fn parent_of(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+fn browse(api: &'static TapeApi, mut client: Option<&mut Player>, start: &str, share: Option<(&str, &str)>) {
+    use core::fmt::Write;
+    let mut path = Line::<200>::new();
+    let _ = write!(path, "{}", start.trim_matches('/'));
+    let mut reload = true;
+    let mut refresh = true;
+    if let Some(ui) = ui() {
+        ui.set_browse(true);
+    }
+    loop {
+        let Some(ui) = ui() else { return };
+        if reload {
+            ui.view.message.clear();
+            load_entries(api, client.as_deref_mut(), path.as_str());
+            ui.reset_list();
+            reload = false;
+            refresh = true;
+        }
+        #[allow(static_mut_refs)]
+        let entries = unsafe { &*core::ptr::addr_of!(ENTRIES) };
+        if refresh {
+            refresh = false;
+            ui.view.count = entries.count;
+            ui.view.title.clear();
+            match share {
+                Some((host, name)) => {
+                    let _ = write!(ui.view.title, "//{host}/{name}/{}", path.as_str());
+                }
+                None => {
+                    let _ = write!(ui.view.title, "{}", if path.is_empty() { "FOSFS" } else { path.as_str() });
+                }
+            }
+            ui.view.detail.clear();
+            let _ = write!(ui.view.detail, "{} entries", entries.count);
+        }
+        let mut action = ui.next_action();
+        if action.is_none() {
+            let key = (api.read_key)();
+            action = match key {
+                KEY_NONE => None,
+                KEY_ABORT => Some(Action::Quit),
+                _ => match (key - KEY_BASE) as u8 {
+                    b'q' => Some(Action::Quit),
+                    b'j' => {
+                        ui.cursor_by(1);
+                        None
+                    }
+                    b'k' => {
+                        ui.cursor_by(-1);
+                        None
+                    }
+                    b'\r' | b'\n' => (ui.view.cursor < entries.count).then_some(Action::Open(ui.view.cursor)),
+                    0x08 | 0x7f => Some(Action::Parent),
+                    b'a' => Some(Action::PlayAll),
+                    _ => None,
+                },
+            };
+        }
+        let Some(action) = action else {
+            if ui.due() {
+                ui.draw(|index| match entries.get(index) {
+                    "../" => ".. (up)",
+                    name => name,
+                });
+            } else {
+                tape_rt::idle();
+            }
+            continue;
+        };
+        let mut chosen = Line::<132>::new();
+        let mut play_from = None;
+        match action {
+            Action::Quit => return,
+            Action::Parent => {
+                if client.is_some() && !path.is_empty() {
+                    let parent = parent_of(path.as_str());
+                    let mut up = Line::<200>::new();
+                    let _ = write!(up, "{parent}");
+                    path = up;
+                    reload = true;
+                }
+            }
+            Action::PlayAll => play_from = Some(""),
+            Action::Open(index) if index < entries.count => {
+                let _ = write!(chosen, "{}", entries.get(index));
+                if chosen.as_str() == "../" {
+                    let mut up = Line::<200>::new();
+                    let _ = write!(up, "{}", parent_of(path.as_str()));
+                    path = up;
+                    reload = true;
+                } else if let Some(folder) = chosen.as_str().strip_suffix('/') {
+                    let mut down = Line::<200>::new();
+                    let _ = write!(down, "{}{}{folder}", path.as_str(), if path.is_empty() || client.is_none() { "" } else { "/" });
+                    path = down;
+                    reload = true;
+                } else {
+                    play_from = Some(chosen.as_str());
+                }
+            }
+            _ => {}
+        }
+        if let Some(first) = play_from {
+            let start = playlist_from_entries(path.as_str(), first);
+            #[allow(static_mut_refs)]
+            if unsafe { (*core::ptr::addr_of!(PLAYLIST)).count } == 0 {
+                show_message(format_args!("no audio files here"));
+                continue;
+            }
+            ui.set_browse(false);
+            run(api, client.as_deref_mut(), start);
+            if let Some(ui) = self::ui() {
+                ui.set_browse(true);
+            }
+            refresh = true;
+        }
     }
 }
 
@@ -1014,6 +1282,7 @@ tape_rt::tape_help!(br#"fosplay: play audio from an SMB share (guest access).
   tape run fosplay [device=N|loopN] [OPTIONS] play //HOST/SHARE[/FILE|DIR]
   tape run fosplay [device=N|loopN] [OPTIONS] play IP SHARE [FILE|DIR]
   tape run fosplay [device=N|loopN] [OPTIONS] play NAME...     (FOSFS files)
+  tape run fosplay [device=N|loopN] [OPTIONS] browse [//HOST/SHARE[/DIR]]
 
   A directory plays its .flac, .mp3, .wav and .opus files in name order.
   Keys: n next, p previous, space pause, f / b jump 10 s forward / back,
@@ -1022,6 +1291,11 @@ tape_rt::tape_help!(br#"fosplay: play audio from an SMB share (guest access).
   (touch to seek), transport buttons, the playlist (touch to jump), a level
   meter, volume, bass boost and the 5.1 upmix switches. gfx=off hides it,
   screen=N picks the screen.
+  browse shows the folders and audio files of a share (or, without one, of
+  FOSFS; `browse diskN` a FAT volume) on that screen: touch a folder to open
+  it, a file to play its folder from there, Play all, Up, Quit. Keys: j k
+  move, Enter opens, Backspace up, a play all, q quits. Stop returns to the
+  list.
 
   HOST is an IPv4 address or a name (asked of the DNS server DHCP names, else
   the gateway); our address comes from DHCP on the NIC chosen with

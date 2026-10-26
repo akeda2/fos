@@ -1,5 +1,5 @@
 //! fosplay's touch screen: title, a progress bar that seeks, transport buttons, the playlist, a level meter, the volume and
-//! the output effects. `Ui` draws what `View` says and turns finger events into `Action`s; `Output` (main.rs) carries them out,
+//! the output effects; or, in browse mode, a folder list with Up, Play all and Quit. `Ui` draws what `View` says and turns finger events into `Action`s; `Output` (main.rs) carries them out,
 //! so the picture never decides anything about the sound.
 
 use audio_screen::Screen;
@@ -23,6 +23,7 @@ const BAR: u32 = 0x1c6a8a;
 const GREEN: u32 = 0x3ccf6a;
 const AMBER: u32 = 0xffc83d;
 const RED: u32 = 0xff4d4d;
+const FOLDER: u32 = 0x7fc8ff;
 /// The volume slider spans this many dB below full scale; its first hundredth is silence.
 pub const VOLUME_RANGE_DB: f32 = 50.0;
 /// The bass slider's top, as `bass=`.
@@ -63,6 +64,11 @@ pub enum Action {
     Width(f32),
     Upmix,
     Center,
+    /// Browse mode: open entry `n` of the list (a folder to enter, a file to play).
+    Open(usize),
+    Parent,
+    PlayAll,
+    Quit,
 }
 
 /// What the screen shows; `Output` and `play_track` keep it current.
@@ -84,6 +90,10 @@ pub struct View {
     pub upmix_ok: bool,
     pub center: bool,
     pub message: Line<96>,
+    /// Browse mode: the list is a folder's entries (names ending in `/` are folders), the progress bar and sliders are hidden.
+    pub browse: bool,
+    /// The entry the keys act on; `usize::MAX` until a key moves it.
+    pub cursor: usize,
 }
 
 impl View {
@@ -105,6 +115,8 @@ impl View {
             upmix_ok: false,
             center: true,
             message: Line::new(),
+            browse: false,
+            cursor: usize::MAX,
         }
     }
 }
@@ -122,6 +134,8 @@ pub struct Layout {
     margin: i32,
     pub header: Rect,
     pub meter: Rect,
+    /// The whole right column (the browser's help text goes here).
+    pub side: Rect,
     pub rows: usize,
     widgets: [Widget; MAX_WIDGETS],
     count: usize,
@@ -143,6 +157,7 @@ impl Layout {
             margin,
             header: Rect { x: margin, y: margin, w: width - 2 * margin, h: header_h },
             meter: Rect::ZERO,
+            side: Rect::ZERO,
             rows: 0,
             widgets: [Widget { rect: Rect::ZERO, hit: Hit::Stop }; MAX_WIDGETS],
             count: 0,
@@ -172,6 +187,7 @@ impl Layout {
         let right_w = width - right_x - margin;
         // Five equal cells down the right: the meter, three sliders, the two switches side by side.
         let cell_h = (body_h - 4 * gap) / 5;
+        layout.side = Rect { x: right_x, y, w: right_w, h: body_h };
         layout.meter = Rect { x: right_x, y, w: right_w, h: cell_h };
         let mut cell_y = y + cell_h + gap;
         for hit in [Hit::Volume, Hit::Bass, Hit::Width] {
@@ -245,6 +261,7 @@ struct Target<'a> {
     actions: &'a mut Actions,
     seek: &'a mut Option<u32>,
     scroll_by: &'a mut i32,
+    browsing: bool,
 }
 
 impl Target<'_> {
@@ -265,6 +282,23 @@ impl TouchTarget for Target<'_> {
 
     fn down(&mut self, x: i32, y: i32) -> Option<Hit> {
         let hit = self.layout.hit(x, y)?;
+        if self.browsing {
+            match hit {
+                Hit::Previous => self.actions.push(Action::Parent),
+                Hit::PlayPause => self.actions.push(Action::PlayAll),
+                Hit::Stop => self.actions.push(Action::Quit),
+                Hit::PageUp => *self.scroll_by -= self.layout.rows as i32,
+                Hit::PageDown => *self.scroll_by += self.layout.rows as i32,
+                Hit::Row(row) => {
+                    let index = self.scroll + row as usize;
+                    if index < self.count {
+                        self.actions.push(Action::Open(index));
+                    }
+                }
+                _ => return None,
+            }
+            return Some(hit);
+        }
         match hit {
             Hit::Previous => self.actions.push(Action::Previous),
             Hit::Back => self.actions.push(Action::Back),
@@ -314,6 +348,8 @@ pub struct Ui {
     next_animation: u64,
     /// The index the list was last scrolled to follow.
     followed: usize,
+    /// Where the browser's list was when the player took the screen.
+    saved_scroll: usize,
 }
 
 impl Ui {
@@ -335,6 +371,7 @@ impl Ui {
             actions: Actions { queue: [None; 8] },
             next_animation: 0,
             followed: usize::MAX,
+            saved_scroll: 0,
         })
     }
 
@@ -352,6 +389,7 @@ impl Ui {
             actions: &mut self.actions,
             seek: &mut self.seek,
             scroll_by: &mut scroll_by,
+            browsing: self.view.browse,
         });
         if scroll_by != 0 {
             let moved = self.scroll as i32 + scroll_by;
@@ -363,6 +401,57 @@ impl Ui {
             self.screen.mark_dirty();
         }
         self.actions.pop()
+    }
+
+    /// Switches between the browser and the player; the track's text, clock and the list position start afresh.
+    pub fn set_browse(&mut self, browse: bool) {
+        if browse != self.view.browse {
+            if browse {
+                self.scroll = self.saved_scroll;
+            } else {
+                self.saved_scroll = self.scroll;
+            }
+        }
+        let view = &mut self.view;
+        view.browse = browse;
+        view.title.clear();
+        view.detail.clear();
+        view.format.clear();
+        view.message.clear();
+        view.index = 0;
+        view.count = 0;
+        view.seconds = 0.0;
+        view.total = 0.0;
+        view.paused = false;
+        view.cursor = usize::MAX;
+        if !browse {
+            self.scroll = 0;
+        }
+        self.followed = usize::MAX;
+        self.screen.mark_dirty();
+    }
+
+    /// A new list is on show (a folder was entered): from the top, no entry chosen.
+    pub fn reset_list(&mut self) {
+        self.scroll = 0;
+        self.view.cursor = usize::MAX;
+        self.followed = self.view.index;
+        self.screen.mark_dirty();
+    }
+
+    /// Moves the chosen entry by `delta` (keys), scrolling to keep it in sight.
+    pub fn cursor_by(&mut self, delta: i32) {
+        let last = self.view.count.saturating_sub(1) as i32;
+        let from = if self.view.cursor == usize::MAX { if delta > 0 { -1 } else { last + 1 } } else { self.view.cursor as i32 };
+        let cursor = (from + delta).clamp(0, last) as usize;
+        self.view.cursor = cursor;
+        let rows = self.layout.rows;
+        if cursor < self.scroll {
+            self.scroll = cursor;
+        } else if cursor >= self.scroll + rows {
+            self.scroll = cursor + 1 - rows;
+        }
+        self.screen.mark_dirty();
     }
 
     /// True when a frame should be drawn now: something changed, or the meter and clock are due.
@@ -378,7 +467,7 @@ impl Ui {
 
     /// Draws the picture and sends it. `name(i)` is entry `i` of the playlist.
     pub fn draw<'n>(&mut self, name: impl Fn(usize) -> &'n str) {
-        if self.followed != self.view.index {
+        if !self.view.browse && self.followed != self.view.index {
             self.followed = self.view.index;
             let rows = self.layout.rows;
             self.scroll = clamp_scroll(self.view.index.saturating_sub(rows / 3), rows, self.view.count);
@@ -389,11 +478,15 @@ impl Ui {
             let mut canvas = self.screen.frame();
             canvas.clear(BACKGROUND);
             draw_header(&mut canvas, layout, view);
-            draw_progress(&mut canvas, layout, view, seek);
             draw_buttons(&mut canvas, layout, view);
             draw_list(&mut canvas, layout, view, scroll, name);
-            draw_meter(&mut canvas, layout, view);
-            draw_controls(&mut canvas, layout, view);
+            if view.browse {
+                draw_help(&mut canvas, layout);
+            } else {
+                draw_progress(&mut canvas, layout, view, seek);
+                draw_meter(&mut canvas, layout, view);
+                draw_controls(&mut canvas, layout, view);
+            }
         }
         blit_banded(&self.screen, || {});
     }
@@ -423,6 +516,9 @@ fn draw_header(canvas: &mut Canvas, layout: &Layout, view: &View) {
         let _ = write!(line, "{}", view.format.as_str());
     }
     canvas.text_scaled(rect.x, rect.y + 2 * text, line.as_str(), scale as u32, DIM);
+    if view.browse {
+        return;
+    }
     let mut position = Line::<48>::new();
     if view.count > 1 {
         let _ = write!(position, "{}/{}  ", view.index + 1, view.count);
@@ -447,6 +543,7 @@ fn draw_progress(canvas: &mut Canvas, layout: &Layout, view: &View, seek: Option
 }
 
 fn draw_buttons(canvas: &mut Canvas, layout: &Layout, view: &View) {
+    let browse_labels = [(Hit::Previous, "Parent"), (Hit::Back, ""), (Hit::PlayPause, "Play all"), (Hit::Forward, ""), (Hit::Next, ""), (Hit::Stop, "Quit")];
     let labels = [
         (Hit::Previous, "|<"),
         (Hit::Back, "-10s"),
@@ -455,9 +552,9 @@ fn draw_buttons(canvas: &mut Canvas, layout: &Layout, view: &View) {
         (Hit::Next, ">|"),
         (Hit::Stop, "Stop"),
     ];
-    for (hit, label) in labels {
+    for (hit, label) in if view.browse { browse_labels } else { labels } {
         let rect = layout.rect(hit);
-        let lit = hit == Hit::PlayPause && view.paused;
+        let lit = hit == Hit::PlayPause && view.paused && !view.browse;
         canvas.fill_rect(rect.x, rect.y, rect.w as u32, rect.h as u32, if lit { ACTIVE } else { BUTTON_OFF });
         canvas.rect(rect.x, rect.y, rect.w as u32, rect.h as u32, EDGE);
         center(canvas, rect, label, layout.scale, if lit { 0x000000 } else { INK });
@@ -471,18 +568,34 @@ fn draw_list<'n>(canvas: &mut Canvas, layout: &Layout, view: &View, scroll: usiz
         if index >= view.count {
             break;
         }
-        let current = index == view.index;
+        let current = if view.browse { index == view.cursor } else { index == view.index };
         canvas.fill_rect(rect.x, rect.y, rect.w as u32, rect.h as u32, if current { ACTIVE } else { BUTTON_OFF });
         let mut line = Line::<96>::new();
-        let _ = write!(line, "{:>2} {}", index + 1, name(index));
+        let label = name(index);
+        if view.browse {
+            let _ = write!(line, "{label}");
+        } else {
+            let _ = write!(line, "{:>2} {label}", index + 1);
+        }
+        let folder = view.browse && label.ends_with('/');
+        let ink = if current { 0x000000 } else if folder { FOLDER } else { INK };
         let y = rect.y + (rect.h - GLYPH_H * layout.scale) / 2;
-        canvas.text_scaled(rect.x + layout.margin, y, line.as_str(), layout.scale as u32, if current { 0x000000 } else { INK });
+        canvas.text_scaled(rect.x + layout.margin, y, line.as_str(), layout.scale as u32, ink);
     }
     for (hit, label) in [(Hit::PageUp, "Up"), (Hit::PageDown, "Down")] {
         let rect = layout.rect(hit);
         canvas.fill_rect(rect.x, rect.y, rect.w as u32, rect.h as u32, BUTTON_OFF);
         canvas.rect(rect.x, rect.y, rect.w as u32, rect.h as u32, EDGE);
         center(canvas, rect, label, layout.scale, INK);
+    }
+}
+
+fn draw_help(canvas: &mut Canvas, layout: &Layout) {
+    let rect = layout.side;
+    let lines = ["Tap a folder to open it", "Tap a file to play from it", "Play all: this folder", "Parent: the folder above", "Quit: leave fosplay", "", "Keys: j k move, Enter opens", "a plays all, Backspace is up", "q quits"];
+    let step = GLYPH_H * layout.scale * 3 / 2;
+    for (index, line) in lines.iter().enumerate() {
+        canvas.text_scaled(rect.x + layout.margin, rect.y + layout.margin + index as i32 * step, line, layout.scale as u32, DIM);
     }
 }
 

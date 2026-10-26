@@ -1518,5 +1518,13 @@ reads. `make test-loopback` plays a WAV through `loop0` and records it with `rec
   runs far ahead of the ear, and the position shown is the decoded time minus what is queued in the ring. `gfx=off` hides it,
   `screen=N` picks the screen. QEMU has no touchscreen the kernel accepts, so `make test-fosplay` checks the picture (a
   screendump) and the keys; fingers need the real panel.
+- **The file browser** (`fosplay browse [//HOST/SHARE[/DIR]]`, `browse_command` in main.rs, browse mode of `ui.rs`): the same
+  screen shows a folder's entries (folders first, `../` on a share below its root, only audio files; `ENTRIES`, listed by
+  `client.list` or `tape_rt::list_file`, which has no folders on FOSFS) with Parent, Play all and Quit on the transport row.
+  A tap on a folder enters it, on a file fills the playlist with the folder's files and plays from that one through the
+  ordinary `run`, which leaves the screen to the browser; Stop or the end of the list returns to the folder (list position
+  kept), Quit or Esc leaves. Keys stand in for fingers (`j` `k` Enter Backspace `a` `q`) and are what QEMU tests drive
+  (`browse_test`, `test_smb.py`); the panel's touch handling of the browser needs real hardware. A folder holds at most 192
+  entries (the playlist's limit); while a track plays the browser is not reachable (Stop first).
 
 Only hardware shows: USB underruns, Pi 4 CPU load, track-boundary gaps over a network, real packet loss.

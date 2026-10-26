@@ -105,6 +105,7 @@ def main():
     jump_test()
     bass_test()
     ui_test()
+    browse_test()
     print("PASS: fosplay")
 
 
@@ -187,6 +188,52 @@ def screenshot(monitor_path, tmp, name):
         time.sleep(0.1)
     time.sleep(0.3)
     return read_ppm(shot)
+
+
+def browse_test():
+    """`fosplay browse` on FOSFS (QEMU has no touch input, so the keys stand in for fingers): the list shows the audio files
+    only, j moves the chosen row (amber), Enter plays the folder from that file, q ends the track and brings the list back
+    (nothing chosen, so no amber), q again leaves the tape."""
+    amber = (255, 179, 71)
+    with tempfile.TemporaryDirectory() as tmp:
+        files = {"notes.txt": b"not audio\n"}
+        for name in ("a1.flac", "a2.flac"):
+            path = Path(tmp) / name
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=500:sample_rate=48000:duration=60", "-ac", "2",
+                            "-sample_fmt", "s16", str(path)], check=True)
+            files[name] = path.read_bytes()
+        monitor_path = Path(tmp) / "monitor"
+        guest = Guest(tmp, "browse", MAC, extra=("-monitor", f"unix:{monitor_path},server,nowait"), files=files)
+        try:
+            guest.wait_for("M3 complete")
+            guest.wait_for("fos> ")
+            mark = guest.send("run fosplay device=loop0 browse")
+            guest.pump(3)
+
+            def count():
+                width, height, pixel = screenshot(monitor_path, tmp, "browse.ppm")
+                return sum(1 for y in range(0, height, 2) for x in range(0, width, 2) if pixel(x, y) == amber)
+
+            def key(byte):
+                guest.process.stdin.write(byte)
+                guest.process.stdin.flush()
+                guest.pump(1)
+
+            check(count() < 20, "the list opens with nothing chosen", "")
+            for _ in range(3):
+                key(b"j")
+            chosen = count()
+            check(chosen > 300, f"j chooses a row, and stops at the last audio file ({chosen} amber samples)", "")
+            key(b"\r")
+            guest.wait_for("[2/2] a2.flac", 30, since=mark)
+            key(b"q")
+            guest.pump(1)
+            check(count() < 20, "q at a track returns to the list", "")
+            check("Tape returned" not in guest.text()[mark:], "the tape is still running in the list", "")
+            key(b"q")
+            guest.wait_for("Tape returned", 30, since=mark)
+        finally:
+            guest.stop()
 
 
 def ui_test():
