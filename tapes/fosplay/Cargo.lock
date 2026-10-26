@@ -39,6 +39,7 @@ dependencies = [
  "audio-decode",
  "audio-sample",
  "opus-codec",
+ "outfx",
  "smb",
  "tape-ip",
  "tape-net",
@@ -56,6 +57,20 @@ name = "opus-codec"
 version = "0.1.0"
 dependencies = [
  "tape-rt",
+]
+
+[[package]]
+name = "outfx"
+version = "0.1.0"
+dependencies = [
+ "phono",
+]
+
+[[package]]
+name = "phono"
+version = "0.1.0"
+dependencies = [
+ "dsp",
 ]
 
 [[package]]

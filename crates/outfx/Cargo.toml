@@ -1,0 +1,12 @@
+[package]
+name = "outfx"
+version = "0.1.0"
+edition = "2024"
+description = "Output effects for players (bass boost now, upmix next): stereo frames in, frames out, no tape ABI"
+
+[lib]
+name = "outfx"
+path = "src/lib.rs"
+
+[dependencies]
+phono = { path = "../phono" }

@@ -273,6 +273,7 @@ test: image
 	cargo +nightly-2026-09-13 test --manifest-path crates/noise/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/fx/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/phono/Cargo.toml
+	cargo +nightly-2026-09-13 test --manifest-path crates/outfx/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/organ/Cargo.toml
 	RUST_MIN_STACK=33554432 cargo +nightly-2026-09-13 test --manifest-path crates/strings/Cargo.toml
 	RUST_MIN_STACK=33554432 cargo +nightly-2026-09-13 test --manifest-path crates/epiano/Cargo.toml

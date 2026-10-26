@@ -14,6 +14,7 @@ tape-rt = { path = "../../crates/tape-rt" }
 smb = { path = "../../crates/smb" }
 audio-decode = { path = "../../crates/audio-decode" }
 audio-sample = { path = "../../crates/audio-sample" }
+outfx = { path = "../../crates/outfx" }
 opus-codec = { path = "../../crates/opus-codec" }
 
 [profile.release]

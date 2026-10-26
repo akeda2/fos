@@ -10,6 +10,7 @@
 #![no_std]
 #![no_main]
 
+use outfx::{Bass, Options};
 use audio_decode::{Decode, Source, SourceError, flac, mp3, opus, resample::Resampler, wav};
 use smb::{Client, Error, Handle, Transport};
 use tape_ip::net;
@@ -68,6 +69,8 @@ static mut WAV: wav::Decoder<MediaSource> = wav::Decoder::new(MediaSource { hand
 
 /// Output rate forced with `rate=N`; 0 means the file's own rate when the device offers it.
 static mut FORCED_RATE: u32 = 0;
+/// The output effects asked for (`bass=DB`...).
+static mut EFFECTS: Options = Options::OFF;
 static mut RESAMPLER: Resampler = Resampler::new();
 
 /// libopus for the Ogg Opus reader in `audio-decode`.
@@ -147,11 +150,11 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         Err(reason) => return println!("fosplay: {reason}."),
     };
     let mut arguments = arguments;
-    if let Some(rest) = arguments.strip_prefix("rate=") {
-        let (number, after) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-        match number.parse::<u32>() {
-            Ok(rate) if (8000..=384_000).contains(&rate) => unsafe { FORCED_RATE = rate },
-            _ => return println!("fosplay: rate= needs a sample rate such as 48000."),
+    // Options come before the command: rate=HZ bass=DB bassfreq=HZ bassq=Q.
+    while let Some((word, after)) = arguments.split_once(char::is_whitespace).or(Some((arguments, ""))) {
+        let Some((key, value)) = word.split_once('=') else { break };
+        if let Err(reason) = set_option(key, value) {
+            return println!("fosplay: {reason}.");
         }
         arguments = after.trim_start();
     }
@@ -175,10 +178,29 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     client.transport().socket.close(api);
 }
 
+/// One `key=value` option; the error says what was wrong.
+fn set_option(key: &str, value: &str) -> Result<(), &'static str> {
+    #[allow(static_mut_refs)]
+    unsafe {
+        match key {
+            "rate" => match value.parse::<u32>() {
+                Ok(rate) if (8000..=384_000).contains(&rate) => FORCED_RATE = rate,
+                _ => return Err("rate= needs a sample rate such as 48000"),
+            },
+            _ => {
+                if !EFFECTS.set(key, value, tape_rt::parse_f32)? {
+                    return Err("unknown option (see `fosplay help`)");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn usage() {
     println!("usage: fosplay ls HOST SHARE [DIR] | cat HOST SHARE FILE");
-    println!("       fosplay [device=N|loopN] [rate=HZ] play //HOST/SHARE[/FILE|DIR]");
-    println!("       fosplay [device=N|loopN] [rate=HZ] play NAME...");
+    println!("       fosplay [device=N|loopN] [OPTIONS] play //HOST/SHARE[/FILE|DIR]");
+    println!("       fosplay [device=N|loopN] [OPTIONS] play NAME...");
 }
 
 type Player = Client<Link, { 64 * 1024 + 1024 }>;
@@ -301,10 +323,15 @@ struct Output {
     staged: usize,
     paused: bool,
     command: Option<Outcome>,
+    /// The bass boost, when asked for.
+    bass: Option<Bass>,
 }
 
 impl Output {
-    fn frame(&mut self, frame: [f32; 2]) {
+    fn frame(&mut self, mut frame: [f32; 2]) {
+        if let Some(bass) = self.bass.as_mut() {
+            frame = bass.process(frame);
+        }
         if self.staged + self.channels * self.slot > self.staging.len() {
             self.flush();
         }
@@ -668,6 +695,7 @@ fn play_track(session: &mut Session, path: &str, index: usize, total: usize) -> 
             staged: 0,
             paused: false,
             command: None,
+            bass: Bass::new(session.out_rate, unsafe { EFFECTS }.bass),
         });
     }
     let out_rate = session.out_rate;
@@ -767,20 +795,26 @@ tape_rt::tape_help!(br#"fosplay: play audio from an SMB share (guest access).
 
   tape run fosplay ls HOST SHARE [DIR]
   tape run fosplay cat HOST SHARE FILE
-  tape run fosplay [device=N|loopN] [rate=HZ] play //HOST/SHARE[/FILE|DIR]
-  tape run fosplay [device=N|loopN] [rate=HZ] play IP SHARE [FILE|DIR]
-  tape run fosplay [device=N|loopN] [rate=HZ] play NAME...     (FOSFS files)
+  tape run fosplay [device=N|loopN] [OPTIONS] play //HOST/SHARE[/FILE|DIR]
+  tape run fosplay [device=N|loopN] [OPTIONS] play IP SHARE [FILE|DIR]
+  tape run fosplay [device=N|loopN] [OPTIONS] play NAME...     (FOSFS files)
 
-  A directory plays its .flac, .mp3, .wav and .opus files in name order. Keys: n next,
-  p previous, space pause,
-  f / b jump 10 s forward / back, Esc or q stop.
+  A directory plays its .flac, .mp3, .wav and .opus files in name order.
+  Keys: n next, p previous, space pause, f / b jump 10 s forward / back,
+  Esc or q stop.
 
   HOST is an IPv4 address or a name (asked of the DNS server DHCP names, else
   the gateway); our address comes from DHCP on the NIC chosen with
   `nic use N`. FLAC (mono or stereo, up to 24 bits), MP3 (any MPEG
   layer; no gapless trim), WAV (PCM 8-32 bit, float32) and Ogg Opus (.opus);
-  the extension
-  chooses. A rate the
-  device does not offer is resampled (windowed sinc); rate=HZ forces
-  the output rate. Escape stops.
+  the extension chooses. A rate the device does not offer is resampled
+  (windowed sinc).
+
+  OPTIONS (before the command):
+    rate=HZ       force the output rate
+    bass=DB       bass boost 0-12 dB (peaking filter, as in the phono tape);
+                  the level drops by the same DB so a full-scale note cannot
+                  clip
+    bassfreq=HZ   its centre, 60-150 (default 100)
+    bassq=Q       its width, 0.3 broad - 3 narrow (default 0.7)
 "#);

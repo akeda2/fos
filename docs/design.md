@@ -1500,4 +1500,10 @@ reads. `make test-loopback` plays a WAV through `loop0` and records it with `rec
   the byte the bitrate predicts (exact for CBR, an estimate for VBR) and resynchronises. A jump drops the staged audio but
   not what the device already holds (a few ms to a fraction of a second). Host test in `make test-flac`.
 
+- **Output effects** (`crates/outfx`, no tape ABI, meant to be reused by an effects tape): `Options` parses `bass=DB`
+  `bassfreq=HZ` `bassq=Q` (any tape spells them alike) and `Bass` is the phono tape's peaking filter (`phono::Phono` on its
+  flat curve) with the level lowered by the boost, so 0 dB at the centre and the rest `DB` quieter: no clipping. fosplay
+  applies it per frame after the resampler. `make test-fosplay` checks 100 Hz comes out 9 dB above 1 kHz with `bass=9`.
+  Planned next: a 2 to 5.1 upmix (matrix centre, delayed decorrelated surrounds, LFE), SMPTE order, centre optional.
+
 Only hardware shows: USB underruns, Pi 4 CPU load, track-boundary gaps over a network, real packet loss.

@@ -103,6 +103,7 @@ def main():
         loud = [i for i, x in enumerate(samples) if abs(x) > 0.05]
         check(len(loud) > 5 * got // 2, f"the playlist recording holds both tracks ({len(loud)} loud samples)", "")
     jump_test()
+    bass_test()
     print("PASS: fosplay")
 
 
@@ -134,6 +135,43 @@ def jump_test():
             guest.send("kill 1")
         finally:
             guest.stop()
+
+
+def bass_test():
+    """`bass=9`: the boost peaks at 100 Hz and the level drops by 9 dB, so 100 Hz comes out 9 dB above 1 kHz (the two files
+    have the same level)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        files = {}
+        for name, hz in (("b100.flac", 100), ("b1k.flac", 1000)):
+            path = Path(tmp) / name
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"sine=frequency={hz}:sample_rate=48000:duration=12",
+                            "-af", "volume=0.5", "-ac", "2", "-sample_fmt", "s16", str(path)], check=True)
+            files[name] = path.read_bytes()
+        guest = Guest(tmp, "bass", MAC, files=files)
+        try:
+            guest.wait_for("M3 complete")
+            guest.wait_for("fos> ")
+            for name in files:
+                take = "bass-" + name.split(".")[0]
+                guest.send(f"run record device=loop0 {take} 4 &0")
+                guest.pump(2)
+                guest.send(f"run fosplay device=loop0 bass=9 play {name} &0")
+                deadline = time.monotonic() + 60
+                while time.monotonic() < deadline:
+                    if "record" not in ask(guest, "ps", "fos> "):
+                        break
+        finally:
+            guest.stop()
+        out = fosfs_files(Path(tmp) / "bass.img")
+        level = {}
+        for name in files:
+            blob = out.get("bass-" + name.split(".")[0] + ".wav")
+            check(blob is not None, f"{name}: the bass take was written", str(sorted(out)))
+            samples, got = float_wav(blob)
+            middle = samples[len(samples) // 2 - got // 2:len(samples) // 2 + got // 2]
+            level[name] = (sum(x * x for x in middle) / len(middle)) ** 0.5
+        ratio = level["b100.flac"] / level["b1k.flac"]
+        check(2.2 < ratio < 3.4, f"bass=9 makes 100 Hz {20 * __import__('math').log10(ratio):.1f} dB above 1 kHz (wanted 9)", str(level))
 
 
 if __name__ == "__main__":
