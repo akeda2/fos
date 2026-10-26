@@ -64,6 +64,10 @@ impl Source for MediaSource {
 static mut FLAC: flac::Decoder<MediaSource> = flac::Decoder::new(MediaSource { handle: None, memory: &[] });
 static mut MP3: mp3::Decoder<MediaSource> = mp3::Decoder::new(MediaSource { handle: None, memory: &[] });
 
+/// Output rate forced with `rate=N`; 0 means the file's own rate when the device offers it.
+static mut FORCED_RATE: u32 = 0;
+static mut RESAMPLER: Resampler = Resampler::new();
+
 fn is_mp3(path: &str) -> bool {
     path.len() > 4 && path.as_bytes()[path.len() - 4..].eq_ignore_ascii_case(b".mp3")
 }
@@ -90,6 +94,15 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         Ok(rest) => rest,
         Err(reason) => return println!("fosplay: {reason}."),
     };
+    let mut arguments = arguments;
+    if let Some(rest) = arguments.strip_prefix("rate=") {
+        let (number, after) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        match number.parse::<u32>() {
+            Ok(rate) if (8000..=384_000).contains(&rate) => unsafe { FORCED_RATE = rate },
+            _ => return println!("fosplay: rate= needs a sample rate such as 48000."),
+        }
+        arguments = after.trim_start();
+    }
     let mut words = arguments.split_whitespace();
     let command = words.next().unwrap_or("");
     let rest: [&str; 3] = core::array::from_fn(|_| words.next().unwrap_or(""));
@@ -294,18 +307,44 @@ fn play(api: &'static TapeApi, path: &str) {
     }
     let rate = decoder.sample_rate();
     let offered = &info.rates[..info.rate_count as usize];
-    let out_rate = if offered.is_empty() || offered.contains(&rate) { rate } else if offered.contains(&48000) { 48000 } else { offered[0] };
+    let forced = unsafe { FORCED_RATE };
+    // The file's own rate when the device has it, else 48 kHz, else whatever it offers; `rate=N` goes first. A rate the
+    // device lists but then refuses falls through to the next candidate (the file is resampled to it).
+    let mut candidates = [0u32; 18];
+    let mut wanted = 0;
+    let mut want = |rate: u32| {
+        if rate != 0 && wanted < candidates.len() && !candidates[..wanted].contains(&rate) {
+            candidates[wanted] = rate;
+            wanted += 1;
+        }
+    };
+    want(forced);
+    if forced == 0 && (offered.is_empty() || offered.contains(&rate)) {
+        want(rate);
+    }
+    if offered.contains(&48000) {
+        want(48000);
+    }
+    offered.iter().for_each(|&r| want(r));
     let float = tape_rt::audio_float().1;
     let depth = if decoder.bits_per_sample() == 0 { "MP3" } else { "FLAC" };
+    let mut out_rate = 0;
+    let mut status = -1;
+    for &candidate in &candidates[..wanted] {
+        status = (api.audio_start)(candidate, 0, 1);
+        if status == 0 {
+            out_rate = candidate;
+            break;
+        }
+    }
+    if status != 0 {
+        return println!("fosplay: cannot start playback (code {status}); the device offers {offered:?}.");
+    }
     println!(
         "fosplay: {path}: {depth}, {rate} Hz, {} channel(s), {} s; to {out_rate} Hz{}, {}{}-bit.",
         decoder.channels(), decoder.total_samples() / rate as u64, if out_rate == rate { "" } else { " (resampled)" },
         if float { "float " } else { "" }, info.playback_bits
     );
-    let status = (api.audio_start)(out_rate, 0, 1);
-    if status != 0 {
-        return println!("fosplay: cannot start playback at {out_rate} Hz (code {status}); the device offers {offered:?}.");
-    }
     (api.audio_info)(&mut info);
     let empty = (info.playback_space as usize).saturating_sub(64).min((1 << 20) - 64);
     let mut output = Output {
@@ -317,7 +356,9 @@ fn play(api: &'static TapeApi, path: &str) {
         staged: 0,
         aborted: false,
     };
-    let mut resampler = Resampler::new(rate, out_rate);
+    #[allow(static_mut_refs)]
+    let resampler = unsafe { &mut *core::ptr::addr_of_mut!(RESAMPLER) };
+    resampler.configure(rate, out_rate);
     let mut pcm = [0f32; 2 * 512];
     let mut failure = None;
     let started = tape_rt::micros();
@@ -348,6 +389,9 @@ fn play(api: &'static TapeApi, path: &str) {
         }
     }
     if !output.aborted {
+        if out_rate != rate && failure.is_none() {
+            resampler.finish(&mut |sample| output.frame(sample));
+        }
         output.flush();
         let mut waited = 0;
         loop {
@@ -373,11 +417,12 @@ tape_rt::tape_help!(br#"fosplay: play audio from an SMB share (guest access).
 
   tape run fosplay ls HOST SHARE [DIR]
   tape run fosplay cat HOST SHARE FILE
-  tape run fosplay [device=N|loopN] play HOST SHARE FILE
-  tape run fosplay [device=N|loopN] play NAME        (a FOSFS file)
+  tape run fosplay [device=N|loopN] [rate=HZ] play HOST SHARE FILE
+  tape run fosplay [device=N|loopN] [rate=HZ] play NAME        (a FOSFS file)
 
   HOST is an IPv4 address; the address comes from DHCP on the NIC chosen
   with `nic use N`. FLAC (mono or stereo, up to 24 bits) and MP3 (any MPEG
   layer, by the .mp3 extension; no gapless trim). A rate the
-  device does not offer is resampled. Escape stops.
+  device does not offer is resampled (windowed sinc); rate=HZ forces
+  the output rate. Escape stops.
 "#);

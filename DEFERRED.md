@@ -519,3 +519,12 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
 - **Touchscreen** (Pi). The panel may be USB (the official 7" DSI panel's touch is I2C behind the firmware instead; DFRobot ~4.5" DSI: ICN6211 bridge, see docs/aarch64-plan.md "I2C on the Pi"). If USB, so it goes through `usb_hid` as a pointer device. To test 2026-10-22: which HID report
   descriptor it sends (single or multi-touch, absolute coordinates, range). Then a pointer/touch event call for tapes (append-only
   ABI) and hit-testing in the console and `gfx_*` tapes. Nordic-only keyboards still hold for any on-screen keys.
+
+## Planned: aliasing in the instruments (user, 2026-10-26)
+
+- **Check the instruments for aliasing** (`organ`, `strings`, `epiano`, `phono`, and the nonlinear stages in `crates/fx`: drive/overdrive,
+  wah, rotary). None has an anti-alias filter: `strings` fades its 4' on the top keys and `epiano` fades partials near Nyquist, `organ` has
+  no handling (check how it builds its tones). Nonlinear stages create harmonics above Nyquist that fold back down. Test: a high-note
+  sweep with drive on, through `ltas` or an FFT on the host; aliases show as inharmonic lines. Fix if needed: 2x/4x oversampling around
+  the nonlinearity with a half-band filter (the Kaiser-windowed sinc of `crates/audio-decode/src/resample.rs` is a starting point), in
+  `crates/dsp` or `crates/fx`.

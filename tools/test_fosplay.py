@@ -22,7 +22,10 @@ TONE_HZ = 1000
 
 # (file name, sample rate, channels, ffmpeg output options)
 CASES = [("t48.flac", 48000, 2, ["-sample_fmt", "s16"]), ("t44.flac", 44100, 2, ["-sample_fmt", "s16"]),
-         ("m44.mp3", 44100, 2, ["-b:a", "192k"]), ("m22.mp3", 22050, 1, ["-b:a", "64k"])]
+         ("m44.mp3", 44100, 2, ["-b:a", "192k"]), ("m22.mp3", 22050, 1, ["-b:a", "64k"]),
+         ("r44.flac", 48000, 2, ["-sample_fmt", "s16"])]
+# Files played with an output rate asked for (rate=44100: the loopback may refuse it; fosplay then falls back and resamples).
+PLAY_OPTIONS = {"r44.flac": "rate=44100 "}
 
 
 def make_audio(path, rate, channels, options):
@@ -48,7 +51,7 @@ def main():
                 take = name.split(".")[0]
                 guest.send(f"run record device=loop0 {take} 4 &0")
                 guest.pump(2)
-                guest.send(f"run fosplay device=loop0 play {name} &0")
+                guest.send(f"run fosplay device=loop0 {PLAY_OPTIONS.get(name, "")}play {name} &0")
                 deadline = time.monotonic() + 90
                 while time.monotonic() < deadline:
                     if "record" not in ask(guest, "ps", "fos> "):
