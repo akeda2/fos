@@ -10,7 +10,7 @@
 #![no_std]
 #![no_main]
 
-use outfx::{Bass, Options};
+use outfx::{Bass, Options, Upmix};
 use audio_decode::{Decode, Source, SourceError, flac, mp3, opus, resample::Resampler, wav};
 use smb::{Client, Error, Handle, Transport};
 use tape_ip::net;
@@ -71,6 +71,8 @@ static mut WAV: wav::Decoder<MediaSource> = wav::Decoder::new(MediaSource { hand
 static mut FORCED_RATE: u32 = 0;
 /// The output effects asked for (`bass=DB`...).
 static mut EFFECTS: Options = Options::OFF;
+/// The 2 to 5.1 upmix (a 64 KiB delay line, so it lives here); `Output::upmix` says whether it is in use.
+static mut UPMIX: Upmix = Upmix::new();
 static mut RESAMPLER: Resampler = Resampler::new();
 
 /// libopus for the Ogg Opus reader in `audio-decode`.
@@ -325,6 +327,8 @@ struct Output {
     command: Option<Outcome>,
     /// The bass boost, when asked for.
     bass: Option<Bass>,
+    /// `UPMIX` feeds the first six channels (L R C LFE Ls Rs); the device has at least six.
+    upmix: bool,
 }
 
 impl Output {
@@ -335,10 +339,30 @@ impl Output {
         if self.staged + self.channels * self.slot > self.staging.len() {
             self.flush();
         }
+        let wide = if self.upmix {
+            #[allow(static_mut_refs)]
+            Some(unsafe { (*core::ptr::addr_of_mut!(UPMIX)).process(frame) })
+        } else {
+            None
+        };
         for channel in 0..self.channels {
-            let value = if channel < 2 { frame[channel].clamp(-1.0, 1.0) } else { 0.0 };
-            self.format.write(value, &mut self.staging[self.staged..self.staged + self.slot]);
+            let value = match wide {
+                Some(six) => if channel < 6 { six[channel] } else { 0.0 },
+                None => if channel < 2 { frame[channel] } else { 0.0 },
+            };
+            self.format.write(value.clamp(-1.0, 1.0), &mut self.staging[self.staged..self.staged + self.slot]);
             self.staged += self.slot;
+        }
+    }
+
+    /// Clears the effects' history (after a seek).
+    fn reset_effects(&mut self) {
+        if let Some(bass) = self.bass.as_mut() {
+            bass.reset();
+        }
+        if self.upmix {
+            #[allow(static_mut_refs)]
+            unsafe { (*core::ptr::addr_of_mut!(UPMIX)).reset() };
         }
     }
 
@@ -686,6 +710,16 @@ fn play_track(session: &mut Session, path: &str, index: usize, total: usize) -> 
         session.empty = (info.playback_space as usize).saturating_sub(64).min((1 << 20) - 64);
         session.started = tape_rt::micros();
         session.tracks = 0;
+        let effects = unsafe { EFFECTS };
+        let upmix = effects.upmix && info.playback_channels >= 6;
+        if effects.upmix && !upmix {
+            println!("fosplay: upmix needs 6 playback channels; the device has {} (`audio modes`, `audio use playback N`): stereo.", info.playback_channels);
+        }
+        if upmix {
+            #[allow(static_mut_refs)]
+            unsafe { (*core::ptr::addr_of_mut!(UPMIX)).configure(session.out_rate, effects.surround) };
+            println!("fosplay: upmix to 5.1 on {} channels (L R C LFE Ls Rs{}).", info.playback_channels, if effects.surround.center { "" } else { ", no centre" });
+        }
         session.output = Some(Output {
             api,
             format: audio_sample::Format::new(info.playback_slot_bytes as usize, info.playback_bits as usize, float),
@@ -696,6 +730,7 @@ fn play_track(session: &mut Session, path: &str, index: usize, total: usize) -> 
             paused: false,
             command: None,
             bass: Bass::new(session.out_rate, unsafe { EFFECTS }.bass),
+            upmix,
         });
     }
     let out_rate = session.out_rate;
@@ -751,6 +786,7 @@ fn play_track(session: &mut Session, path: &str, index: usize, total: usize) -> 
                         // What is queued is from before the jump: drop what is staged, keep the device running.
                         output.staged = 0;
                         resampler.reset();
+                        output.reset_effects();
                         println!("fosplay: at {}:{:02} of {}:{:02}.", start / rate as u64 / 60, start / rate as u64 % 60,
                                  decoder.total_samples() / rate as u64 / 60, decoder.total_samples() / rate as u64 % 60);
                         continue 'blocks;
@@ -817,4 +853,9 @@ tape_rt::tape_help!(br#"fosplay: play audio from an SMB share (guest access).
                   clip
     bassfreq=HZ   its centre, 60-150 (default 100)
     bassq=Q       its width, 0.3 broad - 3 narrow (default 0.7)
+    upmix=on      stereo to 5.1 on the device's first six channels, order
+                  L R C LFE Ls Rs (pick a 6-channel mode: `audio use playback N`)
+    center=off    leave the centre silent, fronts untouched (default on)
+    width=0..1    surround level (0.7), lfe=HZ crossover 40-200 (100),
+    delay=MS      surround delay 0-40 (15)
 "#);

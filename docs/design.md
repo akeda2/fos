@@ -1504,6 +1504,10 @@ reads. `make test-loopback` plays a WAV through `loop0` and records it with `rec
   `bassfreq=HZ` `bassq=Q` (any tape spells them alike) and `Bass` is the phono tape's peaking filter (`phono::Phono` on its
   flat curve) with the level lowered by the boost, so 0 dB at the centre and the rest `DB` quieter: no clipping. fosplay
   applies it per frame after the resampler. `make test-fosplay` checks 100 Hz comes out 9 dB above 1 kHz with `bass=9`.
-  Planned next: a 2 to 5.1 upmix (matrix centre, delayed decorrelated surrounds, LFE), SMPTE order, centre optional.
+  `upmix=on` turns stereo into 5.1 in SMPTE order (L R C LFE Ls Rs) on a device with 6+ playback channels (else it says so and
+  plays stereo; pick a 6-channel mode with `audio use playback N`). mid = (L+R)/2 feeds the centre (`center=off` skips it and
+  leaves the fronts alone) and the LFE (Linkwitz-Riley 4th order low-pass, `lfe=HZ`); side = L-R, low-passed at 7 kHz, goes
+  to Ls and, inverted and 1.3 ms later, to Rs, delayed `delay=MS` and scaled by `width=0..1`. Host unit tests cover it; QEMU
+  has no 6-channel device, so channel order and the sound need the UFX.
 
 Only hardware shows: USB underruns, Pi 4 CPU load, track-boundary gaps over a network, real packet loss.

@@ -5,18 +5,26 @@
 //! effects spells them the same way.
 #![cfg_attr(not(test), no_std)]
 
-use phono::{BassBoost, Phono, curves};
+pub mod upmix;
+
+pub use phono::BassBoost;
+pub use upmix::{Upmix, UpmixSettings};
+use phono::{Phono, curves};
 
 /// Settings of the output effects; `Options::OFF` changes nothing.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Options {
     pub bass: BassBoost,
+    /// 2 to 5.1 (`upmix=on`).
+    pub upmix: bool,
+    pub surround: UpmixSettings,
 }
 
 impl Options {
-    pub const OFF: Options = Options { bass: BassBoost::OFF };
+    pub const OFF: Options = Options { bass: BassBoost::OFF, upmix: false, surround: UpmixSettings::DEFAULT };
 
-    /// Takes one `key=value` word: `bass=DB` (0-12), `bassfreq=HZ` (60-150), `bassq=Q` (0.3-3). `Ok(false)` when the key is not
+    /// Takes one `key=value` word: `bass=DB` (0-12), `bassfreq=HZ` (60-150), `bassq=Q` (0.3-3), `upmix=on|off`, `center=on|off`,
+    /// `width=0..1`, `lfe=HZ` (40-200), `delay=MS` (0-40). `Ok(false)` when the key is not
     /// one of ours (the caller may know it), `Err` says what was wrong with the value.
     pub fn set(&mut self, key: &str, value: &str, parse: impl Fn(&str) -> Option<f32>) -> Result<bool, &'static str> {
         let number = |min: f32, max: f32| parse(value).filter(|v| *v >= min && *v <= max);
@@ -24,13 +32,26 @@ impl Options {
             "bass" => self.bass.gain_db = number(0.0, 12.0).ok_or("bass= needs a boost in dB, 0 to 12")?,
             "bassfreq" => self.bass.hz = number(60.0, 150.0).ok_or("bassfreq= needs a frequency, 60 to 150 Hz")?,
             "bassq" => self.bass.q = number(0.3, 3.0).ok_or("bassq= needs a width, 0.3 to 3")?,
+            "upmix" => self.upmix = switch(value).ok_or("upmix= needs on or off")?,
+            "center" => self.surround.center = switch(value).ok_or("center= needs on or off")?,
+            "width" => self.surround.width = number(0.0, 1.0).ok_or("width= needs the surround level, 0 to 1")?,
+            "lfe" => self.surround.lfe_hz = number(40.0, 200.0).ok_or("lfe= needs a crossover frequency, 40 to 200 Hz")?,
+            "delay" => self.surround.delay_ms = number(0.0, 40.0).ok_or("delay= needs the surround delay in ms, 0 to 40")?,
             _ => return Ok(false),
         }
         Ok(true)
     }
 
     pub fn is_off(&self) -> bool {
-        self.bass.gain_db <= 0.0
+        self.bass.gain_db <= 0.0 && !self.upmix
+    }
+}
+
+fn switch(text: &str) -> Option<bool> {
+    match text {
+        "on" | "yes" | "1" => Some(true),
+        "off" | "no" | "0" => Some(false),
+        _ => None,
     }
 }
 

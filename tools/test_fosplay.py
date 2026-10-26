@@ -160,6 +160,9 @@ def bass_test():
                 while time.monotonic() < deadline:
                     if "record" not in ask(guest, "ps", "fos> "):
                         break
+            # loop0 has two channels: the upmix must say so and play stereo, not fail.
+            mark = guest.send("run fosplay device=loop0 upmix=on play b1k.flac &0")
+            guest.wait_for("upmix needs 6 playback channels; the device has 2", 30, since=mark)
         finally:
             guest.stop()
         out = fosfs_files(Path(tmp) / "bass.img")

@@ -10,3 +10,4 @@ path = "src/lib.rs"
 
 [dependencies]
 phono = { path = "../phono" }
+dsp = { path = "../dsp" }
