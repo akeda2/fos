@@ -1478,7 +1478,7 @@ reads. `make test-loopback` plays a WAV through `loop0` and records it with `rec
 
 ## Media player: `fosplay` (tapes/fosplay, crates/smb, crates/audio-decode, crates/tape-ip)
 
-`fosplay` plays FLAC and MP3 from a guest SMB share or from FOSFS files, hard-float, x86 and Pi 4.
+`fosplay` plays FLAC, MP3 and WAV (PCM 8-32 bit and float, LIST/INFO tags, exact seek) from a guest SMB share or from FOSFS files, hard-float, x86 and Pi 4.
 
 - **TCP** (`crates/tape-ip/src/tcp.rs`, `tape_net::Socket`): active open with an MSS option, in-order receive only, a
   retransmit timer and `reopen`; `make test-tcp`.

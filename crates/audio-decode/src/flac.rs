@@ -631,4 +631,8 @@ impl<S: Source> Decode for Decoder<S> {
     fn seek(&mut self, sample: u64) -> Result<u64, Error> {
         Decoder::seek(self, sample)
     }
+
+    fn format_name(&self) -> &'static str {
+        "FLAC"
+    }
 }

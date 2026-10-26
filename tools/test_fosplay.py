@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""fosplay plays a FLAC or MP3 file from FOSFS into loop0 while `record device=loop0` captures it; the recording holds
+"""fosplay plays a FLAC, MP3 or WAV file from FOSFS into loop0 while `record device=loop0` captures it; the recording holds
 the tone at the right pitch, for FLAC at 48 and 44.1 kHz and MP3 at 44.1 kHz stereo and 22.05 kHz mono. Needs ffmpeg on the host (SKIP without). No audio
 hardware or network needed. Run with `make test-fosplay`."""
 
@@ -23,7 +23,8 @@ TONE_HZ = 1000
 # (file name, sample rate, channels, ffmpeg output options)
 CASES = [("t48.flac", 48000, 2, ["-sample_fmt", "s16"]), ("t44.flac", 44100, 2, ["-sample_fmt", "s16"]),
          ("m44.mp3", 44100, 2, ["-b:a", "192k"]), ("m22.mp3", 22050, 1, ["-b:a", "64k"]),
-         ("r44.flac", 48000, 2, ["-sample_fmt", "s16"])]
+         ("r44.flac", 48000, 2, ["-sample_fmt", "s16"]),
+         ("w44.wav", 44100, 2, ["-c:a", "pcm_s24le"]), ("w8.wav", 22050, 1, ["-c:a", "pcm_u8"])]
 # Files played with an output rate asked for (rate=44100: the loopback may refuse it; fosplay then falls back and resamples).
 PLAY_OPTIONS = {"r44.flac": "rate=44100 "}
 
@@ -55,7 +56,7 @@ def main():
             guest.wait_for("M3 complete")
             guest.wait_for("fos> ")
             for name, rate, _, _ in CASES:
-                take = name.split(".")[0]
+                take = "rec-" + name.split(".")[0]
                 guest.send(f"run record device=loop0 {take} 4 &0")
                 guest.pump(2)
                 guest.send(f"run fosplay device=loop0 {PLAY_OPTIONS.get(name, "")}play {name} &0")
@@ -84,7 +85,7 @@ def main():
             guest.stop()
         out = fosfs_files(Path(tmp) / "fosplay.img")
         for name, rate, _, _ in CASES:
-            take = name.split(".")[0]
+            take = "rec-" + name.split(".")[0]
             blob = out.get(f"{take}.wav")
             check(blob is not None, f"{take}.wav was written", str(sorted(out)) + guest.text()[-900:])
             samples, got = float_wav(blob)

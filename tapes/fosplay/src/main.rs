@@ -10,7 +10,7 @@
 #![no_std]
 #![no_main]
 
-use audio_decode::{Decode, Source, SourceError, flac, mp3, resample::Resampler};
+use audio_decode::{Decode, Source, SourceError, flac, mp3, resample::Resampler, wav};
 use smb::{Client, Error, Handle, Transport};
 use tape_ip::net;
 use tape_ip::tcp::Socket;
@@ -63,27 +63,50 @@ impl Source for MediaSource {
 
 static mut FLAC: flac::Decoder<MediaSource> = flac::Decoder::new(MediaSource { handle: None, memory: &[] });
 static mut MP3: mp3::Decoder<MediaSource> = mp3::Decoder::new(MediaSource { handle: None, memory: &[] });
+static mut WAV: wav::Decoder<MediaSource> = wav::Decoder::new(MediaSource { handle: None, memory: &[] });
 
 /// Output rate forced with `rate=N`; 0 means the file's own rate when the device offers it.
 static mut FORCED_RATE: u32 = 0;
 static mut RESAMPLER: Resampler = Resampler::new();
 
-fn is_mp3(path: &str) -> bool {
-    path.len() > 4 && path.as_bytes()[path.len() - 4..].eq_ignore_ascii_case(b".mp3")
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Flac,
+    Mp3,
+    Wav,
+}
+
+/// The decoder for a file name, by its extension (FLAC when it has none we know).
+fn kind_of(path: &str) -> Kind {
+    if has_extension(path, ".mp3") {
+        Kind::Mp3
+    } else if has_extension(path, ".wav") {
+        Kind::Wav
+    } else {
+        Kind::Flac
+    }
 }
 
 /// The source of the decoder that handles `path` (chosen by its extension).
 fn media_source(path: &str) -> &'static mut MediaSource {
     #[allow(static_mut_refs)]
     unsafe {
-        if is_mp3(path) { (*core::ptr::addr_of_mut!(MP3)).source() } else { (*core::ptr::addr_of_mut!(FLAC)).source() }
+        match kind_of(path) {
+            Kind::Mp3 => (*core::ptr::addr_of_mut!(MP3)).source(),
+            Kind::Wav => (*core::ptr::addr_of_mut!(WAV)).source(),
+            Kind::Flac => (*core::ptr::addr_of_mut!(FLAC)).source(),
+        }
     }
 }
 
 fn decoder_for(path: &str) -> &'static mut dyn Decode {
     #[allow(static_mut_refs)]
     unsafe {
-        if is_mp3(path) { &mut *core::ptr::addr_of_mut!(MP3) } else { &mut *core::ptr::addr_of_mut!(FLAC) }
+        match kind_of(path) {
+            Kind::Mp3 => &mut *core::ptr::addr_of_mut!(MP3),
+            Kind::Wav => &mut *core::ptr::addr_of_mut!(WAV),
+            Kind::Flac => &mut *core::ptr::addr_of_mut!(FLAC),
+        }
     }
 }
 
@@ -374,10 +397,10 @@ fn has_extension(path: &str, extension: &str) -> bool {
 }
 
 fn is_audio(path: &str) -> bool {
-    has_extension(path, ".flac") || has_extension(path, ".mp3")
+    has_extension(path, ".flac") || has_extension(path, ".mp3") || has_extension(path, ".wav")
 }
 
-/// `fosplay play HOST SHARE [FILE|DIR]` (a directory plays its .flac and .mp3 files in name order) or
+/// `fosplay play HOST SHARE [FILE|DIR]` (a directory plays its .flac, .mp3 and .wav files in name order) or
 /// `fosplay play NAME...` (FOSFS files).
 fn play_command<'a>(api: &'static TapeApi, mut words: impl Iterator<Item = &'a str>) {
     let first = words.next().unwrap_or("");
@@ -427,7 +450,7 @@ fn play_command<'a>(api: &'static TapeApi, mut words: impl Iterator<Item = &'a s
         list.sort();
     }
     if list.count == 0 {
-        println!("fosplay: no .flac or .mp3 files found.");
+        println!("fosplay: no .flac, .mp3 or .wav files found.");
     } else {
         run(api, Some(client));
     }
@@ -619,7 +642,7 @@ fn play_track(session: &mut Session, path: &str, index: usize, total: usize) -> 
         });
     }
     let out_rate = session.out_rate;
-    let depth = if decoder.bits_per_sample() == 0 { "MP3" } else { "FLAC" };
+    let depth = decoder.format_name();
     let position = Position(index + 1, total);
     println!(
         "fosplay: {position}{path}: {depth}, {rate} Hz, {} channel(s), {} s; to {out_rate} Hz{}, {}{}-bit.",
@@ -719,14 +742,15 @@ tape_rt::tape_help!(br#"fosplay: play audio from an SMB share (guest access).
   tape run fosplay [device=N|loopN] [rate=HZ] play IP SHARE [FILE|DIR]
   tape run fosplay [device=N|loopN] [rate=HZ] play NAME...     (FOSFS files)
 
-  A directory plays its .flac and .mp3 files in name order. Keys: n next,
+  A directory plays its .flac, .mp3 and .wav files in name order. Keys: n next,
   p previous, space pause,
   f / b jump 10 s forward / back, Esc or q stop.
 
   HOST is an IPv4 address or a name (asked of the DNS server DHCP names, else
   the gateway); our address comes from DHCP on the NIC chosen with
-  `nic use N`. FLAC (mono or stereo, up to 24 bits) and MP3 (any MPEG
-  layer, by the .mp3 extension; no gapless trim). A rate the
+  `nic use N`. FLAC (mono or stereo, up to 24 bits), MP3 (any MPEG
+  layer; no gapless trim) and WAV (PCM 8-32 bit, float32); the extension
+  chooses. A rate the
   device does not offer is resampled (windowed sinc); rate=HZ forces
   the output rate. Escape stops.
 "#);

@@ -1,7 +1,7 @@
 //! Streaming decoders for the media player. A decoder reads its file through a `Source` (a local FOSFS file, an SMB file,
 //! a byte slice in the tests) in small pieces and produces blocks of samples; nothing here allocates or needs `std`.
 //!
-//! Today: FLAC (`flac`), written from the format specification in plain Rust: no C library, no floating point except the
+//! Today: WAV (`wav`), FLAC (`flac`), written from the format specification in plain Rust: no C library, no floating point except the
 //! final scaling to `f32`; and MP3 (`mp3`), through the `nanomp3-core` crate. Both implement `Decode`.
 #![cfg_attr(not(test), no_std)]
 
@@ -9,6 +9,7 @@ pub mod flac;
 pub mod mp3;
 pub mod resample;
 pub mod tags;
+pub mod wav;
 
 /// What the player needs from any decoder: blocks of audio, converted to stereo `f32` on request.
 pub trait Decode {
@@ -30,6 +31,8 @@ pub trait Decode {
     /// Moves to the block holding `sample` (per channel) and returns that block's first sample; exact for FLAC, an
     /// estimate from the bitrate for MP3.
     fn seek(&mut self, sample: u64) -> Result<u64, Error>;
+    /// "FLAC", "MP3", "WAV"...
+    fn format_name(&self) -> &'static str;
 }
 
 /// Random-access bytes of one file.
