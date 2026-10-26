@@ -1475,3 +1475,24 @@ There is no clock: with no capture end running the playing end discards (like an
 (64 KiB, about 85 ms) lets a writer through only as fast as the reader drains it. A source with a clock of its own (a
 capture, a synth paced by `playback_space`) sets the pace; a file player such as `play` runs as fast as the listener
 reads. `make test-loopback` plays a WAV through `loop0` and records it with `record`.
+
+## Media player: `fosplay` (tapes/fosplay, crates/smb, crates/audio-decode, crates/tape-ip)
+
+`fosplay` plays FLAC and MP3 from a guest SMB share or from FOSFS files, hard-float, x86 and Pi 4.
+
+- **TCP** (`crates/tape-ip/src/tcp.rs`, `tape_net::Socket`): active open with an MSS option, in-order receive only, a
+  retransmit timer and `reopen`; `make test-tcp`.
+- **SMB** (`crates/smb`): an SMB 2.1 client with anonymous (guest) NTLM, `ls`, and reads capped at 64 KiB per request;
+  paths use `/`. Live test with `FOS_SMB_HOST` set; `make test-smb` (SKIPs when port 445 is unreachable).
+- **Decoders** (`crates/audio-decode`): the `Decode` trait over a `Source` (`open`, `next_block`, `to_f32_stereo`,
+  `sample_rate`, `total_samples`). FLAC is our own (bit-exact with ffmpeg, `make test-flac`); MP3 is `nanomp3-core`
+  (no gapless trim; length estimated from the first frame). The opt-in `wide` feature (SIMD) gained only 10-15 % and is off.
+- **Resampler** (`resample.rs`): windowed sinc, Kaiser beta 9, 16 zero crossings, cutoff 0.97 of the slower Nyquist
+  (anti-alias when going down). Used only when the device lacks the file's rate.
+- **Output rate**: candidates are `rate=HZ` if given, else the file's rate when the device offers it, then 48000, then the
+  other offered rates; a refused rate falls through and the file is resampled.
+- **Playlists**: `play HOST SHARE [FILE|DIR]` (a directory plays its `.flac`/`.mp3`, sorted, dot-names skipped) or
+  `play NAME...`. The device stays open across tracks with the same first-choice rate. Keys: `n` next, `p` previous, space
+  pause, `q`/Escape stop. `make test-fosplay` (loop0 + `record`).
+
+Only hardware shows: USB underruns, Pi 4 CPU load, track-boundary gaps over a network, real packet loss.
