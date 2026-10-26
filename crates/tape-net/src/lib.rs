@@ -1742,7 +1742,20 @@ impl<'a> TcpSegment<'a> {
         source: Ipv4Address,
         destination: Ipv4Address,
     ) -> Result<usize> {
-        let length = Self::MIN_HEADER_LEN + self.data.len();
+        self.encode_with_mss(output, source, destination, None)
+    }
+
+    /// `encode`, with a maximum-segment-size option after the fixed header when `mss` is given (for SYN segments).
+    /// Without it a peer assumes 536 bytes per segment.
+    pub fn encode_with_mss(
+        &self,
+        output: &mut [u8],
+        source: Ipv4Address,
+        destination: Ipv4Address,
+        mss: Option<u16>,
+    ) -> Result<usize> {
+        let header = Self::MIN_HEADER_LEN + if mss.is_some() { 4 } else { 0 };
+        let length = header + self.data.len();
         if length > u16::MAX as usize || output.len() < length {
             return Err(Error::BufferTooSmall);
         }
@@ -1751,11 +1764,15 @@ impl<'a> TcpSegment<'a> {
         output[2..4].copy_from_slice(&self.destination_port.to_be_bytes());
         output[4..8].copy_from_slice(&self.sequence.to_be_bytes());
         output[8..12].copy_from_slice(&self.acknowledgment.to_be_bytes());
-        output[12] = 5 << 4;
+        output[12] = ((header / 4) as u8) << 4;
         output[13] = self.flags as u8;
         output[14..16].copy_from_slice(&self.window.to_be_bytes());
         output[18..20].copy_from_slice(&self.urgent.to_be_bytes());
-        output[20..length].copy_from_slice(self.data);
+        if let Some(mss) = mss {
+            output[20..22].copy_from_slice(&[2, 4]);
+            output[22..24].copy_from_slice(&mss.to_be_bytes());
+        }
+        output[header..length].copy_from_slice(self.data);
         let checksum = pseudo_checksum(source, destination, 6, &output[..length]);
         output[16..18].copy_from_slice(&checksum.to_be_bytes());
         Ok(length)
@@ -1861,6 +1878,37 @@ impl<const RX: usize> TcpConnection<RX> {
         );
         connection.state = TcpState::Closed;
         connection
+    }
+
+    /// Makes this an unconnected active-open connection again (`state` is `Closed`, ready for `start_connect`) without
+    /// building a second connection value: the buffers are large, so a tape keeps one in a static and reuses it.
+    pub fn reopen(
+        &mut self,
+        local_ip: Ipv4Address,
+        local_port: u16,
+        remote_ip: Ipv4Address,
+        remote_port: u16,
+        initial_sequence: u32,
+        retransmit_ticks: u32,
+    ) {
+        self.local_ip = local_ip;
+        self.remote_ip = remote_ip;
+        self.local_port = local_port;
+        self.remote_port = remote_port;
+        self.state = TcpState::Closed;
+        self.send_next = initial_sequence;
+        self.receive_next = 0;
+        self.pending_seq = 0;
+        self.pending_end = 0;
+        self.pending_flags = 0;
+        self.pending_payload_len = 0;
+        self.pending = false;
+        self.deadline = None;
+        self.retransmit_ticks = retransmit_ticks;
+        self.receive_len = 0;
+        self.stream_una = initial_sequence;
+        self.peer_window = 0xffff;
+        self.stream_active = false;
     }
 
     pub fn state(&self) -> TcpState {
@@ -2129,6 +2177,8 @@ impl<const RX: usize> TcpConnection<RX> {
         data: &[u8],
         output: &mut [u8],
     ) -> Result<usize> {
+        // A SYN says how much one segment may carry: what fits the receive buffer, at most an Ethernet frame's worth.
+        let mss = (flags & TCP_SYN != 0).then(|| RX.min(1460) as u16);
         TcpSegment {
             source_port: self.local_port,
             destination_port: self.remote_port,
@@ -2140,7 +2190,7 @@ impl<const RX: usize> TcpConnection<RX> {
             urgent: 0,
             data,
         }
-        .encode(output, self.local_ip, self.remote_ip)
+        .encode_with_mss(output, self.local_ip, self.remote_ip, mss)
     }
 
     fn remember_pending(&mut self, sequence: u32, end: u32, flags: u16, payload: &[u8], now: u32) {
@@ -2662,6 +2712,31 @@ mod tests {
         client.on_segment(&fin_ack, 121, &mut out).unwrap();
         assert_eq!(client.state(), TcpState::Closed);
         let _ = syn_len;
+    }
+
+    #[test]
+    fn tcp_syn_offers_a_segment_size_and_reopen_starts_over() {
+        let mut client = TcpConnection::<512>::active(IP_A, 1000, IP_B, 2000, 10, 5);
+        let mut out = [0u8; 64];
+        let length = client.start_connect(0, &mut out).unwrap();
+        // 20 byte header + 4 byte MSS option; the data offset says so and the option is "kind 2, length 4, 512".
+        assert_eq!(length, 24);
+        assert_eq!(out[12] >> 4, 6);
+        assert_eq!(&out[20..24], &[2, 4, 0x02, 0x00]);
+        let syn = TcpSegment::parse(&out[..length], IP_A, IP_B, true).unwrap();
+        assert!(syn.data.is_empty());
+        // A big receive buffer still offers at most what an Ethernet frame carries.
+        let mut big = TcpConnection::<16384>::active(IP_A, 1000, IP_B, 2000, 10, 5);
+        let mut frame = [0u8; 64];
+        big.start_connect(0, &mut frame).unwrap();
+        assert_eq!(&frame[22..24], &1460u16.to_be_bytes());
+
+        client.reopen(IP_A, 1001, IP_B, 2001, 77, 9);
+        assert_eq!(client.state(), TcpState::Closed);
+        assert_eq!(client.retransmission_deadline(), None);
+        let length = client.start_connect(0, &mut out).unwrap();
+        let again = TcpSegment::parse(&out[..length], IP_A, IP_B, true).unwrap();
+        assert_eq!((again.source_port, again.destination_port, again.sequence), (1001, 2001, 77));
     }
 
     #[test]

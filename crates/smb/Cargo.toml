@@ -1,0 +1,14 @@
+[package]
+name = "smb"
+version = "0.1.0"
+edition = "2024"
+description = "A small read-only SMB 2.1 client (anonymous/guest, no signing) over any byte stream, for tapes"
+license = "MIT"
+
+[lib]
+name = "smb"
+path = "src/lib.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"

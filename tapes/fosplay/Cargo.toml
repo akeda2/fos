@@ -1,0 +1,23 @@
+[package]
+name = "fosplay-tape"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "fosplay"
+path = "src/main.rs"
+
+[dependencies]
+tape-net = { path = "../../crates/tape-net" }
+tape-ip = { path = "../../crates/tape-ip" }
+tape-rt = { path = "../../crates/tape-rt" }
+smb = { path = "../../crates/smb" }
+audio-decode = { path = "../../crates/audio-decode" }
+audio-sample = { path = "../../crates/audio-sample" }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "z"
+strip = "symbols"

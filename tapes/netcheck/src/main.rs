@@ -6,10 +6,13 @@
 #![no_main]
 
 use tape_ip::net::{self, NetConfig};
+use tape_ip::tcp::Socket;
 use tape_net::{ArpCache, EthernetFrame, IcmpEcho, Ipv4Address, Ipv4Packet, ETHERTYPE_IPV4, MacAddress};
 use tape_rt::{TapeApi, println};
 
 const COUNT: u16 = 4;
+/// The receive window of the `tcp=` test: also what a file-reading tape would use.
+static mut SOCKET: Socket<16384> = Socket::new();
 const IDENTIFIER: u16 = 0xf05b;
 
 #[unsafe(no_mangle)]
@@ -29,7 +32,11 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     };
     println!("netcheck: lease: address {:?}, mask {:?}, gateway {:?}.", config.ip, config.netmask, config.gateway);
     let arguments = core::str::from_utf8(tape_rt::args()).unwrap_or("").trim();
-    let target = if arguments.is_empty() { config.gateway } else { net::parse_ip(arguments).unwrap_or(config.gateway) };
+    let mut words = arguments.split_whitespace();
+    let host = words.next().unwrap_or("");
+    let tcp_port = words.next().and_then(|word| word.strip_prefix("tcp=")).and_then(|port| port.parse::<u16>().ok());
+    let tcp_bytes = words.next().and_then(|word| word.parse::<u32>().ok()).unwrap_or(1 << 20);
+    let target = if host.is_empty() { config.gateway } else { net::parse_ip(host).unwrap_or(config.gateway) };
     if target == Ipv4Address([0; 4]) {
         println!("netcheck: no gateway and no host given (tape run netcheck A.B.C.D).");
         return;
@@ -39,6 +46,10 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         println!("netcheck: ARP for {target:?} got no answer.");
         return;
     };
+    if let Some(port) = tcp_port {
+        tcp_test(api, &config, target, port, tcp_bytes);
+        return;
+    }
     println!("netcheck: {target:?} is at {target_mac:?}; pinging.");
     let mut replies = 0;
     for sequence in 1..=COUNT {
@@ -110,3 +121,78 @@ tape_rt::tape_help!(br#"netcheck: DHCP, ARP and ping through the first NIC.
   Gets a lease, resolves the gateway (or the given host) and sends four
   ICMP echo requests, one a second. Escape stops.
 "#);
+
+/// `netcheck HOST tcp=PORT [BYTES]`: sends "GET BYTES\n" to a TCP server, which answers with BYTES bytes where byte i is
+/// `i % 251`; checks every one and prints the throughput. Proves the shared TCP client (`tape_ip::tcp`) end to end.
+fn tcp_test(api: &TapeApi, config: &NetConfig, target: Ipv4Address, port: u16, total: u32) {
+    #[allow(static_mut_refs)]
+    let socket = unsafe { &mut *core::ptr::addr_of_mut!(SOCKET) };
+    println!("netcheck: TCP to {target:?}:{port}, asking for {total} bytes.");
+    if let Err(why) = socket.connect(api, 0, config, target, port, 3_000_000) {
+        println!("netcheck: tcp: {why}.");
+        return;
+    }
+    let mut request = [0u8; 24];
+    let mut length = 0;
+    for byte in b"GET " {
+        request[length] = *byte;
+        length += 1;
+    }
+    let mut digits = [0u8; 10];
+    let mut count = 0;
+    let mut value = total;
+    loop {
+        digits[count] = b'0' + (value % 10) as u8;
+        count += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    while count > 0 {
+        count -= 1;
+        request[length] = digits[count];
+        length += 1;
+    }
+    request[length] = b'\n';
+    length += 1;
+    let started = tape_rt::micros();
+    if let Err(why) = socket.send(api, &request[..length], 2_000_000) {
+        println!("netcheck: tcp: {why}.");
+        return;
+    }
+    let mut buffer = [0u8; 4096];
+    let mut received: u32 = 0;
+    let mut bad: u32 = 0;
+    while received < total {
+        if (api.should_abort)() != 0 {
+            break;
+        }
+        let want = buffer.len().min((total - received) as usize);
+        match socket.recv(api, &mut buffer[..want], 3_000_000) {
+            Ok(0) => {
+                println!("netcheck: tcp: closed after {received} bytes.");
+                break;
+            }
+            Ok(count) => {
+                for (offset, byte) in buffer[..count].iter().enumerate() {
+                    if *byte != ((received as usize + offset) % 251) as u8 {
+                        bad += 1;
+                    }
+                }
+                received += count as u32;
+            }
+            Err(why) => {
+                println!("netcheck: tcp: {why} after {received} bytes.");
+                break;
+            }
+        }
+    }
+    let micros = (tape_rt::micros() - started).max(1);
+    socket.close(api);
+    let kbit = received as u64 * 8 * 1000 / micros;
+    println!("netcheck: tcp: {received} bytes in {} ms, {kbit} kbit/s, {bad} wrong.", micros / 1000);
+    if received == total && bad == 0 {
+        println!("netcheck: tcp: OK.");
+    }
+}

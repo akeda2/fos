@@ -7,5 +7,6 @@
 pub mod dns;
 pub mod igmp;
 pub mod net;
+pub mod tcp;
 pub mod ntp;
 pub mod wallclock;

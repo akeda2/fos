@@ -1,0 +1,14 @@
+[package]
+name = "audio-decode"
+version = "0.1.0"
+edition = "2024"
+description = "Streaming audio file decoders for the media player (FLAC so far), reading through a Source"
+license = "MIT"
+
+[lib]
+name = "audio_decode"
+path = "src/lib.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = 3
