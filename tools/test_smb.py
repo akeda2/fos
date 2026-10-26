@@ -71,6 +71,8 @@ def main():
               f"size {size} and checksum {digest:08x} match smbclient's copy", output[-1800:])
     play_directory(directory)
     browse_directory(directory)
+    if directory:
+        browse_back(directory)
     print("PASS: smb")
 
 
@@ -125,6 +127,42 @@ def browse_directory(directory):
             guest.wait_for("Tape returned", 30, since=mark)
             guest.wait_for("fos> ", 10, since=mark)
             check("fosplay.cfg" in ask(guest, "ls", "fos> "), "the share is remembered in fosplay.cfg", guest.text()[-600:])
+        finally:
+            guest.stop()
+
+
+def browse_back(directory):
+    """Backspace in the browser goes up a folder with the cursor on the folder just left (amber row), so going in and out
+    of folders does not start at the top every time."""
+    from test_boot import monitor, read_ppm
+    amber = (255, 179, 71)
+    with tempfile.TemporaryDirectory() as tmp:
+        monitor_path = Path(tmp) / "monitor"
+        guest = Guest(tmp, "smbback", "52:54:00:12:36:04", extra=["-netdev", "user,id=n1", "-device", "e1000,netdev=n1",
+                                                                  "-monitor", f"unix:{monitor_path},server,nowait"])
+        try:
+            guest.wait_for("M3 complete")
+            guest.wait_for("fos> ")
+            ask(guest, "nic use 2", "Using NIC 2")
+            mark = guest.send(f"run fosplay device=loop0 browse //{HOST}/{SHARE}/{directory}")
+            guest.pump(5)
+
+            def lit():
+                import time
+                shot = Path(tmp) / "back.ppm"
+                monitor(str(monitor_path), f"screendump {shot}")
+                time.sleep(1)
+                width, height, pixel = read_ppm(shot)
+                return sum(1 for y in range(0, height, 2) for x in range(0, width, 2) if pixel(x, y) == amber)
+
+            check(lit() < 20, "the folder opens with no row chosen", "")
+            guest.process.stdin.write(b"\x7f")
+            guest.process.stdin.flush()
+            guest.pump(4)
+            check(lit() > 300, "Backspace goes up with the cursor on the folder just left", "")
+            guest.process.stdin.write(b"q")
+            guest.process.stdin.flush()
+            guest.wait_for("Tape returned", 30, since=mark)
         finally:
             guest.stop()
 

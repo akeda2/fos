@@ -492,6 +492,15 @@ impl Ui {
         self.screen.mark_dirty();
     }
 
+    /// Chooses entry `index` of the browser's list and scrolls it to about a third of the way down (coming back out of a
+    /// folder, the folder we left is where the finger was).
+    pub fn select(&mut self, index: usize) {
+        let rows = self.layouts[slot(Page::Browse)].rows;
+        self.view.cursor = index;
+        self.scroll[slot(Page::Browse)] = clamp_scroll(index.saturating_sub(rows / 3), rows, self.view.entries);
+        self.screen.mark_dirty();
+    }
+
     /// Moves the chosen entry of the browser by `delta` (keys), scrolling to keep it in sight.
     pub fn cursor_by(&mut self, delta: i32) {
         let last = self.view.entries.saturating_sub(1) as i32;

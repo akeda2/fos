@@ -72,6 +72,8 @@ static mut WAV: wav::Decoder<MediaSource> = wav::Decoder::new(MediaSource { hand
 
 /// Output rate forced with `rate=N`; 0 means the file's own rate when the device offers it.
 static mut FORCED_RATE: u32 = 0;
+// The device= choice: audio_stop hands the operator's device back, so a restart must pick it again.
+static mut DEVICE: Option<u32> = None;
 /// The output effects asked for (`bass=DB`...).
 static mut EFFECTS: Options = Options::OFF;
 /// The 2 to 5.1 upmix (a 64 KiB delay line, so it lives here); `Output::upmix` says whether it is in use.
@@ -162,9 +164,19 @@ fn decoder_for(path: &str) -> &'static mut dyn Decode {
     }
 }
 
+fn reselect_device(api: &TapeApi) {
+    if let Some(number) = unsafe { DEVICE } {
+        (api.audio_use_device)(number);
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn tape_main(api: &'static TapeApi) {
     tape_rt::init(api);
+    if let Some(rest) = core::str::from_utf8(tape_rt::args()).unwrap_or("").trim_start().strip_prefix("device=") {
+        let word = rest.split_whitespace().next().unwrap_or("");
+        unsafe { DEVICE = tape_rt::audio_device_number(api, word).ok() };
+    }
     let arguments = match tape_rt::take_audio_device_arg(api, core::str::from_utf8(tape_rt::args()).unwrap_or("")) {
         Ok(rest) => rest,
         Err(reason) => return println!("fosplay: {reason}."),
@@ -529,7 +541,7 @@ fn page_changed(api: &TapeApi, ui: &mut Ui) {
         LAST = page;
     }
     if page == Page::Browse && !browser().loaded {
-        browser_load(api, ui);
+        browser_load(api, ui, "");
     }
 }
 
@@ -596,7 +608,8 @@ fn set_browser(share: Option<(&str, &str)>, path: &str) {
 }
 
 /// Fills `ENTRIES` with the browser's folder and tells the screen.
-fn browser_load(api: &TapeApi, ui: &mut Ui) {
+/// `select` is the entry (a folder, `NAME/`) to put the cursor on, when coming back out of it.
+fn browser_load(api: &TapeApi, ui: &mut Ui, select: &str) {
     use core::fmt::Write;
     let browser = browser();
     ui.view.message.clear();
@@ -611,6 +624,11 @@ fn browser_load(api: &TapeApi, ui: &mut Ui) {
         let _ = write!(ui.view.folder, "{}", if browser.path.is_empty() { "FOSFS" } else { browser.path.as_str() });
     }
     ui.reset_list();
+    #[allow(static_mut_refs)]
+    let entries = unsafe { &*core::ptr::addr_of!(ENTRIES) };
+    if let Some(found) = (0..entries.count).find(|&index| !select.is_empty() && entries.get(index).strip_suffix('/') == Some(select)) {
+        ui.select(found);
+    }
     browser.loaded = true;
     if unsafe { DIRTY } && browser.remote {
         save_settings(api);
@@ -655,8 +673,13 @@ fn browser_action(api: &TapeApi, action: Action) -> bool {
     let mut name = Line::<64>::new();
     let _ = write!(host, "{}", browser.host.as_str());
     let _ = write!(name, "{}", browser.share.as_str());
+    // Going up: the folder we leave is where the cursor lands.
+    let mut left = Line::<132>::new();
+    if matches!(action, Action::Parent) || matches!(action, Action::Open(_)) && next.as_str() == parent_of(browser.path.as_str()) {
+        let _ = write!(left, "{}", browser.path.as_str().rsplit('/').next().unwrap_or(""));
+    }
     set_browser(remote.then(|| (host.as_str(), name.as_str())), next.as_str());
-    browser_load(api, ui);
+    browser_load(api, ui, left.as_str());
     false
 }
 
@@ -1370,6 +1393,7 @@ fn play_track(session: &mut Session, path: &str, index: usize, total: usize) -> 
     if session.output.is_none() {
         let mut status = -1;
         for &candidate in &candidates[..wanted] {
+            reselect_device(api);
             status = (api.audio_start)(candidate, 0, 1);
             if status == 0 {
                 session.out_rate = candidate;
@@ -1489,6 +1513,14 @@ fn play_track(session: &mut Session, path: &str, index: usize, total: usize) -> 
                     Ok(start) => {
                         // What is queued is from before the jump: drop what is staged, keep the device running.
                         output.staged = 0;
+                        // The ring holds seconds of the old position; stopping the device empties it.
+                        (api.audio_stop)();
+                        reselect_device(api);
+                        let status = (api.audio_start)(out_rate, 0, 1);
+                        if status != 0 {
+                            failure = Some("cannot restart playback after the seek");
+                            break 'blocks;
+                        }
                         resampler.reset();
                         output.reset_effects();
                         output.decoded = start as f32 / rate as f32;
