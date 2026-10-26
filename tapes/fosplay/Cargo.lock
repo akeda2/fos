@@ -38,6 +38,7 @@ version = "0.1.0"
 dependencies = [
  "audio-decode",
  "audio-sample",
+ "opus-codec",
  "smb",
  "tape-ip",
  "tape-net",
@@ -49,6 +50,13 @@ name = "nanomp3-core"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63fa2238e662d3d3c1a71168b3278f23422cf9bf76f6943ee6b1c2581d74eb5c"
+
+[[package]]
+name = "opus-codec"
+version = "0.1.0"
+dependencies = [
+ "tape-rt",
+]
 
 [[package]]
 name = "smb"

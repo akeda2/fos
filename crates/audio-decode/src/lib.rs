@@ -2,11 +2,12 @@
 //! a byte slice in the tests) in small pieces and produces blocks of samples; nothing here allocates or needs `std`.
 //!
 //! Today: WAV (`wav`), FLAC (`flac`), written from the format specification in plain Rust: no C library, no floating point except the
-//! final scaling to `f32`; and MP3 (`mp3`), through the `nanomp3-core` crate. Both implement `Decode`.
+//! final scaling to `f32`; MP3 (`mp3`), through the `nanomp3-core` crate, and Ogg Opus (`opus`: the Ogg side only, the codec is the tape's). All implement `Decode`.
 #![cfg_attr(not(test), no_std)]
 
 pub mod flac;
 pub mod mp3;
+pub mod opus;
 pub mod resample;
 pub mod tags;
 pub mod wav;

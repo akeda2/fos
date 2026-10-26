@@ -10,7 +10,7 @@
 #![no_std]
 #![no_main]
 
-use audio_decode::{Decode, Source, SourceError, flac, mp3, resample::Resampler, wav};
+use audio_decode::{Decode, Source, SourceError, flac, mp3, opus, resample::Resampler, wav};
 use smb::{Client, Error, Handle, Transport};
 use tape_ip::net;
 use tape_ip::tcp::Socket;
@@ -63,17 +63,42 @@ impl Source for MediaSource {
 
 static mut FLAC: flac::Decoder<MediaSource> = flac::Decoder::new(MediaSource { handle: None, memory: &[] });
 static mut MP3: mp3::Decoder<MediaSource> = mp3::Decoder::new(MediaSource { handle: None, memory: &[] });
+static mut OPUS: opus::Decoder<MediaSource, OpusCodec> = opus::Decoder::new(MediaSource { handle: None, memory: &[] }, OpusCodec { codec: None });
 static mut WAV: wav::Decoder<MediaSource> = wav::Decoder::new(MediaSource { handle: None, memory: &[] });
 
 /// Output rate forced with `rate=N`; 0 means the file's own rate when the device offers it.
 static mut FORCED_RATE: u32 = 0;
 static mut RESAMPLER: Resampler = Resampler::new();
 
+/// libopus for the Ogg Opus reader in `audio-decode`.
+struct OpusCodec {
+    codec: Option<opus_codec::Decoder>,
+}
+
+impl opus::PacketDecoder for OpusCodec {
+    fn start(&mut self, channels: u32) -> bool {
+        self.codec = None;
+        self.codec = opus_codec::Decoder::new(48_000, channels as i32).ok();
+        self.codec.is_some()
+    }
+
+    fn decode(&mut self, packet: &[u8], out: &mut [f32], max_frames: usize) -> Option<usize> {
+        self.codec.as_mut()?.decode_float(packet, out, max_frames).ok()
+    }
+
+    fn reset(&mut self) {
+        if let Some(codec) = self.codec.as_mut() {
+            codec.reset();
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Flac,
     Mp3,
     Wav,
+    Opus,
 }
 
 /// The decoder for a file name, by its extension (FLAC when it has none we know).
@@ -82,6 +107,8 @@ fn kind_of(path: &str) -> Kind {
         Kind::Mp3
     } else if has_extension(path, ".wav") {
         Kind::Wav
+    } else if has_extension(path, ".opus") {
+        Kind::Opus
     } else {
         Kind::Flac
     }
@@ -94,6 +121,7 @@ fn media_source(path: &str) -> &'static mut MediaSource {
         match kind_of(path) {
             Kind::Mp3 => (*core::ptr::addr_of_mut!(MP3)).source(),
             Kind::Wav => (*core::ptr::addr_of_mut!(WAV)).source(),
+            Kind::Opus => (*core::ptr::addr_of_mut!(OPUS)).source(),
             Kind::Flac => (*core::ptr::addr_of_mut!(FLAC)).source(),
         }
     }
@@ -105,6 +133,7 @@ fn decoder_for(path: &str) -> &'static mut dyn Decode {
         match kind_of(path) {
             Kind::Mp3 => &mut *core::ptr::addr_of_mut!(MP3),
             Kind::Wav => &mut *core::ptr::addr_of_mut!(WAV),
+            Kind::Opus => &mut *core::ptr::addr_of_mut!(OPUS),
             Kind::Flac => &mut *core::ptr::addr_of_mut!(FLAC),
         }
     }
@@ -397,10 +426,10 @@ fn has_extension(path: &str, extension: &str) -> bool {
 }
 
 fn is_audio(path: &str) -> bool {
-    has_extension(path, ".flac") || has_extension(path, ".mp3") || has_extension(path, ".wav")
+    has_extension(path, ".flac") || has_extension(path, ".mp3") || has_extension(path, ".wav") || has_extension(path, ".opus")
 }
 
-/// `fosplay play HOST SHARE [FILE|DIR]` (a directory plays its .flac, .mp3 and .wav files in name order) or
+/// `fosplay play HOST SHARE [FILE|DIR]` (a directory plays its .flac, .mp3, .wav and .opus files in name order) or
 /// `fosplay play NAME...` (FOSFS files).
 fn play_command<'a>(api: &'static TapeApi, mut words: impl Iterator<Item = &'a str>) {
     let first = words.next().unwrap_or("");
@@ -450,7 +479,7 @@ fn play_command<'a>(api: &'static TapeApi, mut words: impl Iterator<Item = &'a s
         list.sort();
     }
     if list.count == 0 {
-        println!("fosplay: no .flac, .mp3 or .wav files found.");
+        println!("fosplay: no .flac, .mp3, .wav or .opus files found.");
     } else {
         run(api, Some(client));
     }
@@ -742,14 +771,15 @@ tape_rt::tape_help!(br#"fosplay: play audio from an SMB share (guest access).
   tape run fosplay [device=N|loopN] [rate=HZ] play IP SHARE [FILE|DIR]
   tape run fosplay [device=N|loopN] [rate=HZ] play NAME...     (FOSFS files)
 
-  A directory plays its .flac, .mp3 and .wav files in name order. Keys: n next,
+  A directory plays its .flac, .mp3, .wav and .opus files in name order. Keys: n next,
   p previous, space pause,
   f / b jump 10 s forward / back, Esc or q stop.
 
   HOST is an IPv4 address or a name (asked of the DNS server DHCP names, else
   the gateway); our address comes from DHCP on the NIC chosen with
   `nic use N`. FLAC (mono or stereo, up to 24 bits), MP3 (any MPEG
-  layer; no gapless trim) and WAV (PCM 8-32 bit, float32); the extension
+  layer; no gapless trim), WAV (PCM 8-32 bit, float32) and Ogg Opus (.opus);
+  the extension
   chooses. A rate the
   device does not offer is resampled (windowed sinc); rate=HZ forces
   the output rate. Escape stops.

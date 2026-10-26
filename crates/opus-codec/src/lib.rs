@@ -11,6 +11,8 @@ use tape_rt::api;
 unsafe extern "C" {
     fn opus_decoder_get_size(channels: i32) -> i32;
     fn opus_decoder_init(state: *mut c_void, sample_rate: i32, channels: i32) -> i32;
+    /// Variadic in C; every call here passes no argument after the request.
+    fn opus_decoder_ctl(state: *mut c_void, request: i32) -> i32;
     fn opus_decode(state: *mut c_void, data: *const u8, len: i32, pcm: *mut i16, frame_size: i32, decode_fec: i32) -> i32;
     fn opus_decode_float(state: *mut c_void, data: *const u8, len: i32, pcm: *mut f32, frame_size: i32, decode_fec: i32) -> i32;
     fn opus_encode_float(state: *mut c_void, pcm: *const f32, frame_size: i32, data: *mut u8, max_data_bytes: i32) -> i32;
@@ -23,6 +25,7 @@ unsafe extern "C" {
 
 const OPUS_APPLICATION_AUDIO: i32 = 2049;
 const OPUS_APPLICATION_RESTRICTED_LOWDELAY: i32 = 2051;
+const OPUS_RESET_STATE: i32 = 4028;
 const OPUS_SET_COMPLEXITY_REQUEST: i32 = 4010;
 const OPUS_SET_BITRATE_REQUEST: i32 = 4002;
 
@@ -122,6 +125,11 @@ impl Decoder {
 }
 
 impl Decoder {
+    /// Forgets the signal history, as for a stream that starts afresh (before decoding from a seek).
+    pub fn reset(&mut self) {
+        unsafe { opus_decoder_ctl(self.state, OPUS_RESET_STATE) };
+    }
+
     /// Like `decode`, into interleaved 32-bit float (full scale 1.0): no integer step, so a float device gets the
     /// decoder's own output.
     pub fn decode_float(&mut self, packet: &[u8], pcm: &mut [f32], frame_size: usize) -> Result<usize> {
