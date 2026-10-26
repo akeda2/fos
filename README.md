@@ -90,6 +90,25 @@ Between machines, `tapesync [HOST] [apply]` pulls newer tapes from one peer, or 
 `debug` files on the machine's disk (see `AGENTS.md`) turn on reboot-on-crash, the watchdog and
 the network kernel update.
 
+### Administering several machines: `fosadm`
+
+`tools/fosadm.py` does discovery, status, kernel and tape deploys in one tool (Python, standard library only). It
+checks for raw-socket rights and explains the one-time `setcap` step if they are missing.
+
+```sh
+tools/fosadm.py hosts                       # discover; stale peers are forgotten first (--keep to disable)
+tools/fosadm.py status [HOST...]            # kernel slot and tape sizes against the build
+tools/fosadm.py deploy [HOST...] --dry-run  # the plan; without --dry-run it asks, then acts (-y skips the question)
+tools/fosadm.py run HOST "uptime"           # also: put FILE HOST, shell HOST, bootcode HOST [--update]
+make release                                # build/release/{x86_64,aarch64}/ + manifest.json, for --from
+```
+
+`deploy` handles each CPU separately (x86 and the Pi), stops a running tape with ESC if the shell does not answer,
+pushes the kernel with KUP and reports if the host fell back to the old one, then copies only the tapes whose size differs
+(`--add-missing` also installs absent ones). `--from DIR` uses a release folder instead of the build tree. An optional
+`hosts.toml` (`./` or `~/.config/fosadm/`) holds `iface` and per-host `note`, `skip` and `restart` (see `fosadm.py`);
+`make test-fosadm` runs its unit tests. Not yet covered: an end-to-end QEMU test.
+
 ## Where things are
 
 | Path | What |

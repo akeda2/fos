@@ -1441,3 +1441,15 @@ reproduce it; the root cause (power, USB link power management, panel firmware) 
 The diagnostics stay in the kernel but are off by default: `usb debug` adds PORTSC per port, the 12-entry port-event log (tick, port, PORTSC,
 foreground silence, age of the last touch report) and the touch endpoint state to `usb` and `touch`; `usb debug off` hides them again.
 `touch` always shows its error counters.
+
+### Host administration: `fosadm` (tools/fosadm.py)
+
+One tool wraps the existing wire code (`send_tape`, `term_net`, `foscopy`, `send_kernel_update`) for people who run
+fos machines. Machines are grouped by host name (`skylake3` is NIC 3 of `skylake`); discovery forgets stale peers first
+because peer numbers go stale. The CPU of each host is read from `about`, and kernel and tapes are taken per CPU from the
+build tree or from a `make release` folder (`x86_64/`, `aarch64/`, each `kernel` + `tapes/`). "Changed" means the size
+differs, since stored tapes are staged images whose bytes differ from the build; the kernel is compared by the booted
+slot's size in sectors (`debug slots`). A deploy shows its plan first, pushes the kernel by KUP, waits for the reboot and
+reports a fallback (the old kernel running) without touching tapes, then copies changed tapes and checks sizes.
+`bootcode --update` needs the host name typed back and sends `confirm` in the same session. Verified on real hardware:
+x86 (rack) and Pi 4 (bjuv) deploys; not covered by a QEMU end-to-end test yet.
