@@ -4,13 +4,13 @@
 //! `crates/smb` over the shared TCP client (`tape_ip::tcp`), on the interface chosen with `nic use N` and an address from
 //! DHCP. HOST is an IPv4 address.
 //!
-//! The player is hard-float: decoding is integer (`audio_decode::flac`), the conversion to the device's format and the
+//! The player is hard-float: FLAC decoding is integer (`audio_decode::flac`), MP3 is float (`audio_decode::mp3`), the conversion to the device's format and the
 //! resampling to a rate the device offers (cubic, `audio_decode::resample`) are `f32`. Nothing is printed between the first
 //! and the last sample: a console line costs ~10 ms on real hardware.
 #![no_std]
 #![no_main]
 
-use audio_decode::{Source, SourceError, flac::Decoder, resample::Resampler};
+use audio_decode::{Decode, Source, SourceError, flac, mp3, resample::Resampler};
 use smb::{Client, Error, Handle, Transport};
 use tape_ip::net;
 use tape_ip::tcp::Socket;
@@ -61,7 +61,27 @@ impl Source for MediaSource {
     }
 }
 
-static mut DECODER: Decoder<MediaSource> = Decoder::new(MediaSource { handle: None, memory: &[] });
+static mut FLAC: flac::Decoder<MediaSource> = flac::Decoder::new(MediaSource { handle: None, memory: &[] });
+static mut MP3: mp3::Decoder<MediaSource> = mp3::Decoder::new(MediaSource { handle: None, memory: &[] });
+
+fn is_mp3(path: &str) -> bool {
+    path.len() > 4 && path.as_bytes()[path.len() - 4..].eq_ignore_ascii_case(b".mp3")
+}
+
+/// The source of the decoder that handles `path` (chosen by its extension).
+fn media_source(path: &str) -> &'static mut MediaSource {
+    #[allow(static_mut_refs)]
+    unsafe {
+        if is_mp3(path) { (*core::ptr::addr_of_mut!(MP3)).source() } else { (*core::ptr::addr_of_mut!(FLAC)).source() }
+    }
+}
+
+fn decoder_for(path: &str) -> &'static mut dyn Decode {
+    #[allow(static_mut_refs)]
+    unsafe {
+        if is_mp3(path) { &mut *core::ptr::addr_of_mut!(MP3) } else { &mut *core::ptr::addr_of_mut!(FLAC) }
+    }
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn tape_main(api: &'static TapeApi) {
@@ -89,9 +109,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         "cat" => cat(api, client, path),
         _ => {
             let Some(file) = open_remote(client, path) else { return };
-            #[allow(static_mut_refs)]
-            let decoder = unsafe { &mut *core::ptr::addr_of_mut!(DECODER) };
-            decoder.source().handle = Some(file);
+            media_source(path).handle = Some(file);
             play(api, path);
             let _ = client.close(&file);
         }
@@ -256,33 +274,32 @@ fn play_local(api: &'static TapeApi, name: &str) {
         }
         break (buffer, result as usize);
     };
-    #[allow(static_mut_refs)]
-    let decoder = unsafe { &mut *core::ptr::addr_of_mut!(DECODER) };
-    decoder.source().handle = None;
-    decoder.source().memory = unsafe { core::slice::from_raw_parts(buffer as *const u8, length) };
+    let source = media_source(name);
+    source.handle = None;
+    source.memory = unsafe { core::slice::from_raw_parts(buffer as *const u8, length) };
     play(api, name);
-    decoder.source().memory = &[];
+    source.memory = &[];
     (api.free)(buffer, capacity);
 }
 
-/// Plays the file behind the static `DECODER`'s source.
+/// Plays the file behind the source `media_source(path)` was given.
 fn play(api: &'static TapeApi, path: &str) {
     let mut info = AudioInfo::default();
     if (api.audio_info)(&mut info) == 0 || info.playback_channels == 0 {
         return println!("fosplay: no audio device with outputs (USB audio, HD Audio or a loopN).");
     }
-    #[allow(static_mut_refs)]
-    let decoder = unsafe { &mut *core::ptr::addr_of_mut!(DECODER) };
+    let decoder = decoder_for(path);
     if let Err(error) = decoder.open() {
         return println!("fosplay: {path}: {}.", error.describe());
     }
-    let rate = decoder.sample_rate;
+    let rate = decoder.sample_rate();
     let offered = &info.rates[..info.rate_count as usize];
     let out_rate = if offered.is_empty() || offered.contains(&rate) { rate } else if offered.contains(&48000) { 48000 } else { offered[0] };
     let float = tape_rt::audio_float().1;
+    let depth = if decoder.bits_per_sample() == 0 { "MP3" } else { "FLAC" };
     println!(
-        "fosplay: {path}: {rate} Hz, {} channel(s), {} bits, {} s; to {out_rate} Hz{}, {}{}-bit.",
-        decoder.channels, decoder.bits_per_sample, decoder.total_samples / rate as u64, if out_rate == rate { "" } else { " (resampled)" },
+        "fosplay: {path}: {depth}, {rate} Hz, {} channel(s), {} s; to {out_rate} Hz{}, {}{}-bit.",
+        decoder.channels(), decoder.total_samples() / rate as u64, if out_rate == rate { "" } else { " (resampled)" },
         if float { "float " } else { "" }, info.playback_bits
     );
     let status = (api.audio_start)(out_rate, 0, 1);
@@ -356,10 +373,11 @@ tape_rt::tape_help!(br#"fosplay: play audio from an SMB share (guest access).
 
   tape run fosplay ls HOST SHARE [DIR]
   tape run fosplay cat HOST SHARE FILE
-  tape run fosplay [device=N|loopN] play HOST SHARE FILE.flac
-  tape run fosplay [device=N|loopN] play NAME.flac        (a FOSFS file)
+  tape run fosplay [device=N|loopN] play HOST SHARE FILE
+  tape run fosplay [device=N|loopN] play NAME        (a FOSFS file)
 
   HOST is an IPv4 address; the address comes from DHCP on the NIC chosen
-  with `nic use N`. FLAC, mono or stereo, up to 24 bits. A rate the
+  with `nic use N`. FLAC (mono or stereo, up to 24 bits) and MP3 (any MPEG
+  layer, by the .mp3 extension; no gapless trim). A rate the
   device does not offer is resampled. Escape stops.
 "#);

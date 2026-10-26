@@ -2,11 +2,27 @@
 //! a byte slice in the tests) in small pieces and produces blocks of samples; nothing here allocates or needs `std`.
 //!
 //! Today: FLAC (`flac`), written from the format specification in plain Rust: no C library, no floating point except the
-//! final scaling to `f32`.
+//! final scaling to `f32`; and MP3 (`mp3`), through the `nanomp3-core` crate. Both implement `Decode`.
 #![cfg_attr(not(test), no_std)]
 
 pub mod flac;
+pub mod mp3;
 pub mod resample;
+
+/// What the player needs from any decoder: blocks of audio, converted to stereo `f32` on request.
+pub trait Decode {
+    fn open(&mut self) -> Result<(), Error>;
+    /// Decodes the next block and returns its length in samples per channel; `None` at the end.
+    fn next_block(&mut self) -> Result<Option<usize>, Error>;
+    /// `count` samples from `start` of the current block as interleaved stereo `f32` in [-1, 1] (mono is duplicated).
+    fn to_f32_stereo(&self, start: usize, count: usize, out: &mut [f32]);
+    fn sample_rate(&self) -> u32;
+    fn channels(&self) -> u32;
+    /// 0 for a lossy format.
+    fn bits_per_sample(&self) -> u32;
+    /// 0 when unknown.
+    fn total_samples(&self) -> u64;
+}
 
 /// Random-access bytes of one file.
 pub trait Source {

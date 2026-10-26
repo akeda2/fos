@@ -12,7 +12,7 @@
 //! The decoder is large (two channels of `MAX_BLOCK` samples): keep it in a `static`, build it with `Decoder::new` and
 //! call `open`.
 
-use crate::{Error, Source};
+use crate::{Decode, Error, Source};
 
 /// The longest block, in samples per channel. Streams from encoders that stay inside the FLAC "subset" use at most 4608
 /// (up to 48 kHz) or 16384.
@@ -433,5 +433,35 @@ impl<S: Source> Decoder<S> {
 
     fn align(&mut self) {
         self.bits -= self.bits % 8;
+    }
+}
+
+impl<S: Source> Decode for Decoder<S> {
+    fn open(&mut self) -> Result<(), Error> {
+        Decoder::open(self)
+    }
+
+    fn next_block(&mut self) -> Result<Option<usize>, Error> {
+        Decoder::next_block(self)
+    }
+
+    fn to_f32_stereo(&self, start: usize, count: usize, out: &mut [f32]) {
+        Decoder::to_f32_stereo(self, start, count, out)
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn channels(&self) -> u32 {
+        self.channels
+    }
+
+    fn bits_per_sample(&self) -> u32 {
+        self.bits_per_sample
+    }
+
+    fn total_samples(&self) -> u64 {
+        self.total_samples
     }
 }

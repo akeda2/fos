@@ -12,3 +12,10 @@ path = "src/lib.rs"
 [profile.release]
 panic = "abort"
 opt-level = 3
+
+[dependencies]
+nanomp3-core = { version = "0.2.0", default-features = false, features = ["layer12"] }
+
+[features]
+# Explicit SIMD in the MP3 decoder (the `wide` crate); off by default, see docs/design.md.
+wide = ["nanomp3-core/wide"]
