@@ -14,17 +14,21 @@ const MAX_WIDTH: u32 = 1920;
 const MAX_HEIGHT: u32 = 1080;
 const MAX_ROWS: usize = 32;
 const MAX_WIDGETS: usize = MAX_ROWS + 16;
-const BACKGROUND: u32 = 0x0c1014;
-const EDGE: u32 = 0x4a5a68;
+const BACKGROUND: u32 = 0x101010;
+const EDGE: u32 = 0x5c5c5c;
 const ACTIVE: u32 = 0xffb347;
-const BUTTON_OFF: u32 = 0x2a343e;
-const INK: u32 = 0xe4ecf0;
-const DIM: u32 = 0x7d8791;
-const BAR: u32 = 0x1c6a8a;
+const BUTTON_OFF: u32 = 0x2e2e2e;
+const INK: u32 = 0xf0f0f0;
+const DIM: u32 = 0x8c8c8c;
+/// The fill of sliders and the progress bar; the screen this runs on shows blues badly, so the theme is red, orange, green.
+const BAR: u32 = 0xb8531a;
+/// A slider that does nothing in this layout.
+const BAR_OFF: u32 = 0x4a3a30;
+const STOP: u32 = 0x9c2a2a;
 const GREEN: u32 = 0x3ccf6a;
 const AMBER: u32 = 0xffc83d;
 const RED: u32 = 0xff4d4d;
-const FOLDER: u32 = 0x7fc8ff;
+const FOLDER: u32 = 0x8fe07a;
 /// The volume slider spans this many dB below full scale; its first hundredth is silence.
 pub const VOLUME_RANGE_DB: f32 = 50.0;
 /// The bass slider's top, as `bass=`.
@@ -32,6 +36,8 @@ pub const BASS_MAX_DB: f32 = 12.0;
 /// The ends of the crossover and delay sliders.
 pub const LFE_RANGE: (f32, f32) = (40.0, 200.0);
 pub const DELAY_RANGE: (f32, f32) = (0.0, 40.0);
+pub const BASS_HZ_RANGE: (f32, f32) = (60.0, 150.0);
+pub const BASS_Q_RANGE: (f32, f32) = (0.3, 3.0);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Page {
@@ -54,6 +60,9 @@ pub enum Hit {
     PageDown,
     Volume,
     Bass,
+    BassHz,
+    BassQ,
+    BassMgmt,
     Width,
     Lfe,
     Delay,
@@ -83,6 +92,9 @@ pub enum Action {
     Jump(usize),
     Volume(f32),
     Bass(f32),
+    BassHz(f32),
+    BassQ(f32),
+    BassMgmt,
     Width(f32),
     Lfe(f32),
     Delay(f32),
@@ -111,6 +123,13 @@ pub struct View {
     pub level: [f32; 2],
     pub volume: f32,
     pub bass_db: f32,
+    pub bass_hz: f32,
+    pub bass_q: f32,
+    /// High-pass the fronts at the crossover, the LFE carries their bass.
+    pub bass_mgmt: bool,
+    /// The layout has an LFE channel / surround channels.
+    pub has_lfe: bool,
+    pub has_surround: bool,
     pub width: f32,
     pub lfe_hz: f32,
     pub delay_ms: f32,
@@ -145,6 +164,11 @@ impl View {
             level: [0.0; 2],
             volume: 1.0,
             bass_db: 0.0,
+            bass_hz: 100.0,
+            bass_q: 0.7,
+            bass_mgmt: false,
+            has_lfe: true,
+            has_surround: true,
             width: 0.7,
             lfe_hz: 100.0,
             delay_ms: 15.0,
@@ -220,11 +244,15 @@ impl Layout {
         let body_h = height - y - margin;
         if page == Page::Settings {
             let column = (width - 3 * margin) / 2;
-            let cell_h = (body_h - 3 * gap) / 4;
-            for (index, (left, right)) in [(Hit::Bass, Hit::Volume), (Hit::Width, Hit::Upmix), (Hit::Lfe, Hit::Center), (Hit::Delay, Hit::Layout)].into_iter().enumerate() {
+            let cell_h = (body_h - 5 * gap) / 6;
+            let rows = [(Hit::Bass, Some(Hit::Volume)), (Hit::BassHz, Some(Hit::Upmix)), (Hit::BassQ, Some(Hit::Layout)), (Hit::Width, Some(Hit::Center)),
+                        (Hit::Lfe, Some(Hit::BassMgmt)), (Hit::Delay, None)];
+            for (index, (left, right)) in rows.into_iter().enumerate() {
                 let cell_y = y + index as i32 * (cell_h + gap);
                 layout.add(Rect { x: margin, y: cell_y, w: column, h: cell_h }, left);
-                layout.add(Rect { x: 2 * margin + column, y: cell_y, w: column, h: cell_h }, right);
+                if let Some(right) = right {
+                    layout.add(Rect { x: 2 * margin + column, y: cell_y, w: column, h: cell_h }, right);
+                }
             }
             return layout;
         }
@@ -328,6 +356,8 @@ impl Target<'_> {
         match hit {
             Hit::Volume => self.actions.push(Action::Volume(value)),
             Hit::Bass => self.actions.push(Action::Bass(value * BASS_MAX_DB)),
+            Hit::BassHz => self.actions.push(Action::BassHz(between(BASS_HZ_RANGE))),
+            Hit::BassQ => self.actions.push(Action::BassQ(between(BASS_Q_RANGE))),
             Hit::Width => self.actions.push(Action::Width(value)),
             Hit::Lfe => self.actions.push(Action::Lfe(between(LFE_RANGE))),
             Hit::Delay => self.actions.push(Action::Delay(between(DELAY_RANGE))),
@@ -351,6 +381,7 @@ impl TouchTarget for Target<'_> {
             Hit::Stop => self.actions.push(Action::Stop),
             Hit::Upmix => self.actions.push(Action::Upmix),
             Hit::Center => self.actions.push(Action::Center),
+            Hit::BassMgmt => self.actions.push(Action::BassMgmt),
             Hit::Layout => self.actions.push(Action::Layout),
             Hit::Parent => self.actions.push(Action::Parent),
             Hit::PlayAll => self.actions.push(Action::PlayAll),
@@ -368,7 +399,7 @@ impl TouchTarget for Target<'_> {
                     self.actions.push(if self.page == Page::Browse { Action::Open(index) } else { Action::Jump(index) });
                 }
             }
-            Hit::Progress | Hit::Volume | Hit::Bass | Hit::Width | Hit::Lfe | Hit::Delay => self.slide(hit, x),
+            Hit::Progress | Hit::Volume | Hit::Bass | Hit::BassHz | Hit::BassQ | Hit::Width | Hit::Lfe | Hit::Delay => self.slide(hit, x),
         }
         Some(hit)
     }
@@ -628,8 +659,13 @@ fn draw_progress(canvas: &mut Canvas, layout: &Layout, view: &View, seek: Option
 }
 
 fn button(canvas: &mut Canvas, layout: &Layout, hit: Hit, label: &str, lit: bool, enabled: bool) {
+    button_off(canvas, layout, hit, label, lit, enabled, BUTTON_OFF);
+}
+
+/// A button whose resting colour is `off` (the Stop button is red while there is something to stop).
+fn button_off(canvas: &mut Canvas, layout: &Layout, hit: Hit, label: &str, lit: bool, enabled: bool, off: u32) {
     let rect = layout.rect(hit);
-    canvas.fill_rect(rect.x, rect.y, rect.w as u32, rect.h as u32, if lit { ACTIVE } else { BUTTON_OFF });
+    canvas.fill_rect(rect.x, rect.y, rect.w as u32, rect.h as u32, if lit { ACTIVE } else { off });
     canvas.rect(rect.x, rect.y, rect.w as u32, rect.h as u32, EDGE);
     center(canvas, rect, label, layout.scale, if lit { 0x000000 } else if enabled { INK } else { DIM });
 }
@@ -644,7 +680,7 @@ fn draw_transport(canvas: &mut Canvas, layout: &Layout, view: &View) {
         (Hit::Stop, "Stop"),
     ];
     for (hit, label) in labels {
-        button(canvas, layout, hit, label, hit == Hit::PlayPause && view.paused, true);
+        button_off(canvas, layout, hit, label, hit == Hit::PlayPause && view.paused, true, if hit == Hit::Stop { STOP } else { BUTTON_OFF });
     }
 }
 
@@ -694,7 +730,7 @@ fn draw_meter(canvas: &mut Canvas, layout: &Layout, view: &View) {
 fn slider(canvas: &mut Canvas, layout: &Layout, hit: Hit, value: f32, label: &str, enabled: bool) {
     let rect = layout.rect(hit);
     canvas.fill_rect(rect.x, rect.y, rect.w as u32, rect.h as u32, BUTTON_OFF);
-    canvas.fill_rect(rect.x, rect.y, (rect.w as f32 * value.clamp(0.0, 1.0)) as u32, rect.h as u32, BAR);
+    canvas.fill_rect(rect.x, rect.y, (rect.w as f32 * value.clamp(0.0, 1.0)) as u32, rect.h as u32, if enabled { BAR } else { BAR_OFF });
     canvas.rect(rect.x, rect.y, rect.w as u32, rect.h as u32, EDGE);
     center(canvas, rect, label, layout.scale, if enabled { INK } else { DIM });
 }
@@ -712,23 +748,32 @@ fn volume_text(view: &View) -> Line<48> {
 fn draw_settings(canvas: &mut Canvas, layout: &Layout, view: &View) {
     let mut text = Line::<48>::new();
     let ok = view.upmix_ok;
+    let surround = ok && view.has_surround;
+    let boosted = view.bass_db > 0.0;
     let _ = write!(text, "Bass boost: {} dB", (view.bass_db + 0.5) as i32);
     slider(canvas, layout, Hit::Bass, view.bass_db / BASS_MAX_DB, text.as_str(), true);
     text.clear();
+    let _ = write!(text, "Bass centre: {} Hz", (view.bass_hz + 0.5) as i32);
+    slider(canvas, layout, Hit::BassHz, (view.bass_hz - BASS_HZ_RANGE.0) / (BASS_HZ_RANGE.1 - BASS_HZ_RANGE.0), text.as_str(), boosted);
+    text.clear();
+    let _ = write!(text, "Bass width Q: {}.{}", view.bass_q as i32, ((view.bass_q * 10.0 + 0.5) as i32) % 10);
+    slider(canvas, layout, Hit::BassQ, (view.bass_q - BASS_Q_RANGE.0) / (BASS_Q_RANGE.1 - BASS_Q_RANGE.0), text.as_str(), boosted);
+    text.clear();
     let _ = write!(text, "Surround: {}%", (view.width * 100.0 + 0.5) as i32);
-    slider(canvas, layout, Hit::Width, view.width, text.as_str(), ok);
+    slider(canvas, layout, Hit::Width, view.width, text.as_str(), surround);
     text.clear();
     let _ = write!(text, "Sub crossover: {} Hz", (view.lfe_hz + 0.5) as i32);
-    slider(canvas, layout, Hit::Lfe, (view.lfe_hz - LFE_RANGE.0) / (LFE_RANGE.1 - LFE_RANGE.0), text.as_str(), ok);
+    slider(canvas, layout, Hit::Lfe, (view.lfe_hz - LFE_RANGE.0) / (LFE_RANGE.1 - LFE_RANGE.0), text.as_str(), ok && view.has_lfe);
     text.clear();
     let _ = write!(text, "Surround delay: {} ms", (view.delay_ms + 0.5) as i32);
-    slider(canvas, layout, Hit::Delay, (view.delay_ms - DELAY_RANGE.0) / (DELAY_RANGE.1 - DELAY_RANGE.0), text.as_str(), ok);
+    slider(canvas, layout, Hit::Delay, (view.delay_ms - DELAY_RANGE.0) / (DELAY_RANGE.1 - DELAY_RANGE.0), text.as_str(), surround);
     slider(canvas, layout, Hit::Volume, view.volume, volume_text(view).as_str(), true);
     text.clear();
     let _ = write!(text, "Upmix {}", if view.upmix { "on" } else if ok { "off" } else { "(too few outputs)" });
     button(canvas, layout, Hit::Upmix, text.as_str(), view.upmix, ok);
-    button(canvas, layout, Hit::Center, "Centre", view.center && view.has_center, ok && view.has_center);
     text.clear();
     let _ = write!(text, "Layout: {}", view.layout);
     button(canvas, layout, Hit::Layout, text.as_str(), false, true);
+    button(canvas, layout, Hit::Center, "Centre", view.center && view.has_center, ok && view.has_center);
+    button(canvas, layout, Hit::BassMgmt, "Fronts to sub", view.bass_mgmt && view.has_lfe, ok && view.has_lfe);
 }

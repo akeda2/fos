@@ -1,6 +1,6 @@
 //! Stereo to 5.1 by matrix, the way a passive surround decoder does it; no analysis of the music, so it is cheap and
 //! predictable. Output order is SMPTE (and USB audio): L R C LFE Ls Rs. A `Layout` leaves out what a smaller speaker
-//! set lacks: 4.1 is L R LFE Ls Rs (no centre, fronts untouched), 4.0 is quad, L R Ls Rs.
+//! set lacks: 4.1 is L R LFE Ls Rs (no centre, fronts untouched), 4.0 is quad, L R Ls Rs, 2.1 is L R LFE.
 //!
 //! * **Centre**: the mid signal (L+R)/2, and half of it is taken out of the fronts, so a voice panned to the middle moves
 //!   to the centre speaker while the energy stays about the same (`C` is scaled so that mono content keeps its power).
@@ -11,7 +11,9 @@
 //!   opposite polarity to Ls and Rs, with 1.3 ms more delay on Rs so the two are not identical. Below a few hundred Hz the
 //!   two largely cancel when folded together, as with the matrix decoders this is modelled on.
 //! * **LFE**: (L+R)/2 low-passed at `lfe` Hz with a Linkwitz-Riley 24 dB per octave filter. The fronts stay full range,
-//!   so nothing is lost on a system whose sub is fed otherwise.
+//!   so nothing is lost on a system whose sub is fed otherwise. With `bass_mgmt` the fronts and the centre are high-passed
+//!   at the same frequency with the matching Linkwitz-Riley filter, so the bass they lose is the bass the LFE carries (the
+//!   two add up flat) and small speakers are not asked for it. The surrounds are left alone.
 use dsp::math::sin_cos64;
 
 /// The longest delay line: 40 ms plus the 1.3 ms offset at 384 kHz.
@@ -30,18 +32,21 @@ pub enum Layout {
     Surround51,
     /// L R LFE Ls Rs: no centre speaker.
     Quad41,
+    /// L R LFE: stereo with a sub.
+    Stereo21,
     /// L R Ls Rs: quad, no centre and no sub.
     Quad40,
 }
 
 impl Layout {
-    pub const ALL: [Layout; 3] = [Layout::Surround51, Layout::Quad41, Layout::Quad40];
+    pub const ALL: [Layout; 4] = [Layout::Surround51, Layout::Quad41, Layout::Quad40, Layout::Stereo21];
 
     pub fn channels(self) -> usize {
         match self {
             Layout::Surround51 => 6,
             Layout::Quad41 => 5,
             Layout::Quad40 => 4,
+            Layout::Stereo21 => 3,
         }
     }
 
@@ -49,11 +54,22 @@ impl Layout {
         self == Layout::Surround51
     }
 
+    /// There is an LFE channel to carry what bass management takes out of the fronts.
+    pub fn has_lfe(self) -> bool {
+        matches!(self, Layout::Surround51 | Layout::Quad41 | Layout::Stereo21)
+    }
+
+    /// There are surround channels (so width and delay mean something).
+    pub fn has_surround(self) -> bool {
+        self != Layout::Stereo21
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Layout::Surround51 => "5.1",
             Layout::Quad41 => "4.1",
             Layout::Quad40 => "4.0",
+            Layout::Stereo21 => "2.1",
         }
     }
 
@@ -61,7 +77,7 @@ impl Layout {
         Layout::ALL.into_iter().find(|layout| layout.name() == text)
     }
 
-    /// The first of 5.1, 4.1, 4.0 that fits `channels` device outputs, `None` below four.
+    /// The first of 5.1, 4.1, 4.0, 2.1 that fits `channels` device outputs, `None` below three.
     pub fn fitting(channels: usize) -> Option<Layout> {
         Layout::ALL.into_iter().find(|layout| layout.channels() <= channels)
     }
@@ -71,6 +87,7 @@ impl Layout {
             Layout::Surround51 => six,
             Layout::Quad41 => [six[0], six[1], six[3], six[4], six[5], 0.0],
             Layout::Quad40 => [six[0], six[1], six[4], six[5], 0.0, 0.0],
+            Layout::Stereo21 => [six[0], six[1], six[3], 0.0, 0.0, 0.0],
         }
     }
 }
@@ -86,27 +103,38 @@ pub struct UpmixSettings {
     /// Feed the centre channel.
     pub center: bool,
     pub layout: Layout,
+    /// High-pass the fronts and the centre at `lfe_hz` (they hand their bass to the LFE); needs a layout with an LFE.
+    pub bass_mgmt: bool,
 }
 
 impl UpmixSettings {
-    pub const DEFAULT: UpmixSettings = UpmixSettings { width: 0.7, lfe_hz: 100.0, delay_ms: 15.0, center: true, layout: Layout::Surround51 };
+    pub const DEFAULT: UpmixSettings = UpmixSettings { width: 0.7, lfe_hz: 100.0, delay_ms: 15.0, center: true, layout: Layout::Surround51, bass_mgmt: false };
 }
 
 #[derive(Clone, Copy)]
-struct LowPass {
+struct Biquad {
     b: [f64; 3],
     a: [f64; 2],
     z: [f64; 2],
 }
 
-impl LowPass {
+impl Biquad {
     /// RBJ low-pass; Q 0.7071 is a Butterworth section.
-    fn new(hz: f64, rate: f64, q: f64) -> LowPass {
+    fn new(hz: f64, rate: f64, q: f64) -> Biquad {
         let (sin, cos) = sin_cos64(core::f64::consts::TAU * hz.min(0.45 * rate) / rate);
         let alpha = sin / (2.0 * q);
         let a0 = 1.0 + alpha;
         let b = (1.0 - cos) / 2.0 / a0;
-        LowPass { b: [b, 2.0 * b, b], a: [-2.0 * cos / a0, (1.0 - alpha) / a0], z: [0.0; 2] }
+        Biquad { b: [b, 2.0 * b, b], a: [-2.0 * cos / a0, (1.0 - alpha) / a0], z: [0.0; 2] }
+    }
+
+    /// RBJ high-pass, same Q convention.
+    fn high(hz: f64, rate: f64, q: f64) -> Biquad {
+        let (sin, cos) = sin_cos64(core::f64::consts::TAU * hz.min(0.45 * rate) / rate);
+        let alpha = sin / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        let b = (1.0 + cos) / 2.0 / a0;
+        Biquad { b: [b, -2.0 * b, b], a: [-2.0 * cos / a0, (1.0 - alpha) / a0], z: [0.0; 2] }
     }
 
     #[inline]
@@ -120,8 +148,10 @@ impl LowPass {
 
 pub struct Upmix {
     settings: UpmixSettings,
-    side: LowPass,
-    lfe: [LowPass; 2],
+    side: Biquad,
+    lfe: [Biquad; 2],
+    /// Two cascaded sections each for L, R and C when bass management is on.
+    high: [[Biquad; 2]; 3],
     delay: [f32; DELAY_CAPACITY],
     write: usize,
     ls_taps: usize,
@@ -129,11 +159,11 @@ pub struct Upmix {
 }
 
 impl Upmix {
-    const IDLE: LowPass = LowPass { b: [0.0; 3], a: [0.0; 2], z: [0.0; 2] };
+    const IDLE: Biquad = Biquad { b: [0.0; 3], a: [0.0; 2], z: [0.0; 2] };
 
     /// A silent upmix for a `static`; `configure` before use (it holds a 64 KiB delay line, so it is not built by value).
     pub const fn new() -> Upmix {
-        Upmix { settings: UpmixSettings::DEFAULT, side: Self::IDLE, lfe: [Self::IDLE; 2], delay: [0.0; DELAY_CAPACITY], write: 0, ls_taps: 0, rs_taps: 0 }
+        Upmix { settings: UpmixSettings::DEFAULT, side: Self::IDLE, lfe: [Self::IDLE; 2], high: [[Self::IDLE; 2]; 3], delay: [0.0; DELAY_CAPACITY], write: 0, ls_taps: 0, rs_taps: 0 }
     }
 
     /// Sets the stream's rate and the settings and clears all history.
@@ -148,11 +178,16 @@ impl Upmix {
         let rate = rate as f64;
         let taps = |ms: f32| ((ms as f64 * rate / 1000.0) as usize).min(DELAY_CAPACITY - 1);
         let q = core::f64::consts::FRAC_1_SQRT_2;
-        let lfe = LowPass::new(settings.lfe_hz.clamp(40.0, 200.0) as f64, rate, q);
+        let lfe = Biquad::new(settings.lfe_hz.clamp(40.0, 200.0) as f64, rate, q);
         let delay_ms = settings.delay_ms.clamp(0.0, 40.0);
         self.settings = settings;
-        self.side = LowPass::new(SURROUND_CUTOFF_HZ, rate, q);
+        self.side = Biquad::new(SURROUND_CUTOFF_HZ, rate, q);
         self.lfe = [lfe, lfe];
+        // Keep the state of the running filters; only the coefficients change.
+        let high = Biquad::high(settings.lfe_hz.clamp(40.0, 200.0) as f64, rate, q);
+        for section in self.high.iter_mut().flatten() {
+            *section = Biquad { z: section.z, ..high };
+        }
         self.ls_taps = taps(delay_ms);
         self.rs_taps = taps(delay_ms + RS_EXTRA_MS);
     }
@@ -169,12 +204,18 @@ impl Upmix {
         self.write = (self.write + 1) % DELAY_CAPACITY;
         let first = self.lfe[0].process(mid as f64);
         let lfe = self.lfe[1].process(first) as f32;
-        let six = if self.settings.center && self.settings.layout.has_center() {
+        let mut six = if self.settings.center && self.settings.layout.has_center() {
             let taken = CENTER_TAKEN_FROM_FRONTS * mid;
             [left - taken, right - taken, CENTER_GAIN * mid, lfe, ls, rs]
         } else {
             [left, right, 0.0, lfe, ls, rs]
         };
+        if self.settings.bass_mgmt && self.settings.layout.has_lfe() {
+            for (channel, sections) in [0, 1, 2].into_iter().zip(self.high.iter_mut()) {
+                let first = sections[0].process(six[channel] as f64);
+                six[channel] = sections[1].process(first) as f32;
+            }
+        }
         self.settings.layout.pick(six)
     }
 
@@ -183,6 +224,9 @@ impl Upmix {
         self.side.z = [0.0; 2];
         for lfe in self.lfe.iter_mut() {
             lfe.z = [0.0; 2];
+        }
+        for section in self.high.iter_mut().flatten() {
+            section.z = [0.0; 2];
         }
         self.delay.fill(0.0);
     }
@@ -252,7 +296,29 @@ mod tests {
         // No centre: the fronts keep the signal whole, and the sub is the third channel.
         assert!((rms(&mono, 0) - 0.707).abs() < 0.01 && rms(&mono, 2) > 0.3 && rms(&mono, 3) < 0.001);
         assert_eq!(Layout::fitting(5), Some(Layout::Quad41));
-        assert_eq!(Layout::fitting(3), None);
+        assert_eq!(Layout::fitting(3), Some(Layout::Stereo21));
+        assert_eq!(Layout::fitting(2), None);
+    }
+
+    #[test]
+    fn stereo_with_a_sub_has_three_channels_and_bass_management_splits_at_the_crossover() {
+        assert_eq!((Layout::Stereo21.channels(), Layout::fitting(3), Layout::parse("2.1")), (3, Some(Layout::Stereo21), Some(Layout::Stereo21)));
+        let managed = UpmixSettings { layout: Layout::Stereo21, bass_mgmt: true, ..UpmixSettings::DEFAULT };
+        let low = run(managed, tone(40.0), tone(40.0), 48000);
+        let high = run(managed, tone(1000.0), tone(1000.0), 48000);
+        // The fronts lose the bass to the sub; the treble stays in the fronts.
+        assert!(rms(&low, 0) < 0.1 * 0.707 && rms(&low, 2) > 0.5 * 0.707, "{} {}", rms(&low, 0), rms(&low, 2));
+        assert!((rms(&high, 0) - 0.707).abs() < 0.02 && rms(&high, 2) < 0.002);
+        // The pair is an LR4 split: front plus sub, summed as signals, has the input's level at the crossover.
+        let at = run(managed, tone(100.0), tone(100.0), 48000);
+        let summed: Vec<[f32; 6]> = at.iter().map(|f| [f[0] + f[2], 0.0, 0.0, 0.0, 0.0, 0.0]).collect();
+        assert!((rms(&summed, 0) - 0.707).abs() < 0.03, "{}", rms(&summed, 0));
+        // Off, the fronts stay whole.
+        let whole = run(UpmixSettings { bass_mgmt: false, ..managed }, tone(40.0), tone(40.0), 48000);
+        assert!((rms(&whole, 0) - 0.707).abs() < 0.01);
+        // No LFE in quad: bass management does nothing there.
+        let quad = run(UpmixSettings { layout: Layout::Quad40, bass_mgmt: true, ..UpmixSettings::DEFAULT }, tone(40.0), tone(40.0), 48000);
+        assert!((rms(&quad, 0) - 0.707).abs() < 0.01);
     }
 
     #[test]

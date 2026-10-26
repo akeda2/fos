@@ -441,8 +441,11 @@ fn effects() -> &'static mut Options {
 fn change_setting(action: Action, device_channels: usize) {
     let effects = effects();
     match action {
-        Action::Volume(slider) => unsafe { VOLUME = slider },
+        Action::Volume(slider) => unsafe { VOLUME = slider.clamp(0.0, 1.0) },
         Action::Bass(db) => effects.bass.gain_db = db.clamp(0.0, ui::BASS_MAX_DB),
+        Action::BassHz(hz) => effects.bass.hz = hz.clamp(ui::BASS_HZ_RANGE.0, ui::BASS_HZ_RANGE.1),
+        Action::BassQ(q) => effects.bass.q = q.clamp(ui::BASS_Q_RANGE.0, ui::BASS_Q_RANGE.1),
+        Action::BassMgmt => effects.surround.bass_mgmt = !effects.surround.bass_mgmt,
         Action::Width(width) => effects.surround.width = width.clamp(0.0, 1.0),
         Action::Lfe(hz) => effects.surround.lfe_hz = hz.clamp(ui::LFE_RANGE.0, ui::LFE_RANGE.1),
         Action::Delay(ms) => effects.surround.delay_ms = ms.clamp(ui::DELAY_RANGE.0, ui::DELAY_RANGE.1),
@@ -453,6 +456,8 @@ fn change_setting(action: Action, device_channels: usize) {
             let all = Layout::ALL;
             let at = all.iter().position(|layout| *layout == effects.surround.layout).unwrap_or(0);
             if let Some(next) = (1..=all.len()).map(|step| all[(at + step) % all.len()]).find(|layout| layout.channels() <= device_channels) {
+                // Bass management is what a stereo pair with a sub is for; the other layouts start without it.
+                effects.surround.bass_mgmt = next == Layout::Stereo21;
                 effects.surround.layout = next;
             }
         }
@@ -467,6 +472,11 @@ fn show_settings(view: &mut ui::View, device_channels: usize) {
     let layout = effects.surround.layout;
     view.volume = unsafe { VOLUME };
     view.bass_db = effects.bass.gain_db;
+    view.bass_hz = effects.bass.hz;
+    view.bass_q = effects.bass.q;
+    view.bass_mgmt = effects.surround.bass_mgmt;
+    view.has_lfe = layout.has_lfe();
+    view.has_surround = layout.has_surround();
     view.width = effects.surround.width;
     view.lfe_hz = effects.surround.lfe_hz;
     view.delay_ms = effects.surround.delay_ms;
@@ -532,6 +542,7 @@ fn save_settings(api: &TapeApi) {
     let _ = write!(body, "volume={:.2}\nbass={:.1}\nbassfreq={:.0}\nbassq={:.2}\n", unsafe { VOLUME }, effects.bass.gain_db, effects.bass.hz, effects.bass.q);
     let _ = write!(body, "upmix={}\ncenter={}\nwidth={:.2}\nlfe={:.0}\ndelay={:.0}\nlayout={}\n", if effects.upmix { "on" } else { "off" }, if effects.surround.center { "on" } else { "off" },
                    effects.surround.width, effects.surround.lfe_hz, effects.surround.delay_ms, effects.surround.layout.name());
+    let _ = write!(body, "bassmgmt={}\n", if effects.surround.bass_mgmt { "on" } else { "off" });
     #[allow(static_mut_refs)]
     let share = unsafe { SAVED_SHARE.as_str() };
     if !share.is_empty() {
@@ -725,6 +736,7 @@ impl Output {
             }
             _ => {
                 change_setting(action, self.channels);
+                self.gain = volume_gain(unsafe { VOLUME });
                 self.sync_effects();
             }
         }
@@ -1376,7 +1388,7 @@ fn play_track(session: &mut Session, path: &str, index: usize, total: usize) -> 
         let effects = unsafe { EFFECTS };
         let upmix = effects.upmix && fit_layout(info.playback_channels as usize);
         if effects.upmix && !upmix {
-            println!("fosplay: upmix needs 4 playback channels; the device has {} (`audio modes`, `audio use playback N`): stereo.", info.playback_channels);
+            println!("fosplay: upmix needs 3 playback channels; the device has {} (`audio modes`, `audio use playback N`): stereo.", info.playback_channels);
         }
         let effects = unsafe { EFFECTS };
         if upmix {
@@ -1565,7 +1577,8 @@ tape_rt::tape_help!(br#"fosplay: play audio from an SMB share (guest access).
     upmix=on      stereo to surround on the device's first channels (pick a
                   multichannel mode: `audio use playback N`)
     layout=5.1    L R C LFE Ls Rs; 4.1: L R LFE Ls Rs (no centre); 4.0: L R Ls
-                  Rs (quad)
+                  Rs (quad); 2.1: L R LFE (turns bassmgmt on)
+    bassmgmt=on   high-pass the fronts and centre at lfe=, the LFE gets their bass
     center=off    leave the centre silent, fronts untouched (default on)
     width=0..1    surround level (0.7), lfe=HZ crossover 40-200 (100),
     delay=MS      surround delay 0-40 (15)

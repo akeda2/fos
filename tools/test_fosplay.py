@@ -165,7 +165,7 @@ def bass_test():
                         break
             # loop0 has two channels: the upmix must say so and play stereo, not fail.
             mark = guest.send("run fosplay device=loop0 gfx=off upmix=on play b1k.flac &0")
-            guest.wait_for("upmix needs 4 playback channels; the device has 2", 30, since=mark)
+            guest.wait_for("upmix needs 3 playback channels; the device has 2", 30, since=mark)
         finally:
             guest.stop()
         out = fosfs_files(Path(tmp) / "bass.img")
@@ -245,7 +245,7 @@ def browse_test():
 
 def config_test():
     """fosplay.cfg is read at start: `upmix=on` from the file (not the command line) reaches the player, which on the two-channel
-    loop0 says it needs four channels for the saved layout."""
+    loop0 says it needs three channels for the saved layout."""
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "c.flac"
         subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=500:sample_rate=48000:duration=5", "-ac", "2",
@@ -256,7 +256,7 @@ def config_test():
             guest.wait_for("M3 complete")
             guest.wait_for("fos> ")
             mark = guest.send("run fosplay device=loop0 gfx=off play c.flac &0")
-            guest.wait_for("upmix needs 4 playback channels; the device has 2", 30, since=mark)
+            guest.wait_for("upmix needs 3 playback channels; the device has 2", 30, since=mark)
             check(True, "fosplay.cfg settings are applied", "")
         finally:
             guest.stop()
@@ -288,7 +288,7 @@ def ui_test():
                 return sum(1 for y in range(0, height, 2) for x in range(0, width, 2) if pixel(x, y) == amber)
 
             playing = count(pixel)
-            check(pixel(width - 2, height - 2) == (12, 16, 20), "the picture has the panel's dark background", str(pixel(width - 2, height - 2)))
+            check(pixel(width - 2, height - 2) == (16, 16, 16), "the picture has the panel's dark background", str(pixel(width - 2, height - 2)))
             check(playing > 300, f"the current playlist row is highlighted ({playing} amber samples)", "")
             guest.process.stdin.write(b" ")
             guest.process.stdin.flush()

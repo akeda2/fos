@@ -1516,7 +1516,7 @@ reads. `make test-loopback` plays a WAV through `loop0` and records it with `rec
   below its root, only audio files; `ENTRIES`, listed by `client.list` or `tape_rt::list_file`, which has no folders on FOSFS)
   full width, with Parent, Play all, Player, Settings and Quit; a tap on a folder enters it, on a file fills the playlist with
   the folder's files and plays from that one. It is reachable while a track plays (the list is read synchronously; the ring
-  holds seconds). *Settings*: sliders for bass boost, surround width, LFE crossover and delay, volume, and Upmix, Centre and
+  holds seconds). *Settings*: sliders for bass boost (dB, centre frequency, Q), surround width, LFE crossover and delay, volume, and Upmix, Centre and
   Layout switches; Done returns to the page it was opened from. `Ui` only draws and turns fingers into `Action`s;
   `Output::apply` (main.rs) carries them out, so the keys keep working and the sound never depends on the picture. The screen
   is serviced from `Output::poll`, which runs between every audio write and while paused, so it needs no thread; the position
@@ -1524,7 +1524,9 @@ reads. `make test-loopback` plays a WAV through `loop0` and records it with `rec
   touchscreen the kernel accepts, so `make test-fosplay` checks the pictures (screendumps) and the keys (`j` `k` Enter
   Backspace `a` `s` `q` in the idle browser); fingers need the real panel.
 - **Upmix layouts** (`outfx::Layout`): `5.1` is L R C LFE Ls Rs, `4.1` L R LFE Ls Rs (no centre, fronts untouched), `4.0` L R Ls
-  Rs (quad). The Layout button (or `layout=`) cycles through those the device has outputs for; a saved layout too wide for the
+  Rs (quad), `2.1` L R LFE (a 3-channel mode). `bassmgmt=on` (the "Fronts to sub" switch; on by default when the Layout button
+  picks 2.1, off for the others, saved in the config) high-passes the fronts and the centre at `lfe=` with an LR4 pair that sums
+  flat with the LFE's low-pass; the surrounds are left alone. Without it the crossover only shapes the LFE and the fronts stay full range. The theme is red/orange/green on neutral greys (the panel in use renders blues badly). The Layout button (or `layout=`) cycles through those the device has outputs for; a saved layout too wide for the
   device is replaced by the widest that fits, none fitting plays stereo. Only unit tests and real hardware show the channel
   order on a 4-channel interface.
 - **Saved settings** (`fosplay.cfg` on FOSFS, `key=value` lines): volume, bass, upmix, centre, width, lfe, delay, layout and
