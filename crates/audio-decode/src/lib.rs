@@ -25,6 +25,11 @@ pub trait Decode {
     fn total_samples(&self) -> u64;
     /// Title, artist and album found in the file's metadata (empty when there are none); valid after `open`.
     fn tags(&self) -> &tags::Tags;
+    /// Samples per channel before the block `next_block` returns next.
+    fn position(&self) -> u64;
+    /// Moves to the block holding `sample` (per channel) and returns that block's first sample; exact for FLAC, an
+    /// estimate from the bitrate for MP3.
+    fn seek(&mut self, sample: u64) -> Result<u64, Error>;
 }
 
 /// Random-access bytes of one file.

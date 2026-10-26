@@ -98,7 +98,38 @@ def main():
         samples, got = float_wav(blob)
         loud = [i for i, x in enumerate(samples) if abs(x) > 0.05]
         check(len(loud) > 5 * got // 2, f"the playlist recording holds both tracks ({len(loud)} loud samples)", "")
+    jump_test()
     print("PASS: fosplay")
+
+
+def jump_test():
+    """`f` and `b` while a track plays (the tape runs in the foreground, so the keys reach it). The loopback has no clock, so
+    a 40 s track plays in about a second; `f` is therefore pressed every 100 ms from the moment the command is typed, and
+    the test only asks that the position is reported and that the jumps left part of the track unplayed."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "seek.flac"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=500:sample_rate=48000:duration=40", "-ac", "2",
+                        "-sample_fmt", "s16", str(path)], check=True)
+        guest = Guest(tmp, "jump", MAC, files={"seek.flac": path.read_bytes()})
+        try:
+            guest.wait_for("M3 complete")
+            guest.wait_for("fos> ")
+            guest.send("run record device=loop0 jump 30 &0")
+            guest.pump(2)
+            mark = guest.send("run fosplay device=loop0 play seek.flac")
+            end = time.monotonic() + 4
+            while time.monotonic() < end and "Tape returned" not in guest.text()[mark:]:
+                guest.process.stdin.write(b"f")
+                guest.process.stdin.flush()
+                guest.pump(0.1)
+            guest.wait_for("Tape returned", 30, since=mark)
+            text = guest.text()[mark:]
+            check("fosplay: at 0:" in text and " of 0:40." in text, "f jumps and reports the position", text[-800:])
+            packets = int(text.split("track(s), ")[1].split(" packets")[0].split()[-1])
+            check(packets < 40 * 48000, f"the jumps skipped part of the track ({packets} of {40 * 48000} frames played)", text[-800:])
+            guest.send("kill 1")
+        finally:
+            guest.stop()
 
 
 if __name__ == "__main__":

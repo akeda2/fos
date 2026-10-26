@@ -36,9 +36,19 @@ pub struct Decoder<S: Source> {
     /// 0 when the encoder did not know (a stream).
     pub total_samples: u64,
     pub tags: Tags,
+    /// Samples per channel up to the end of the last block `next_block` handed out.
+    decoded: u64,
+    block_len: usize,
+    /// `seek` decoded the block it stopped at; the next `next_block` returns it.
+    pending: bool,
+    /// SEEKTABLE points (first sample of a frame, its offset from the first frame), thinned to fit.
+    table: [(u64, u64); SEEK_POINTS],
+    table_len: usize,
     /// The decoded block: `samples[channel][..n]`, left/right already restored. Valid after `next_block` returned `n`.
     pub samples: [[i32; MAX_BLOCK]; 2],
 }
+
+const SEEK_POINTS: usize = 128;
 
 impl<S: Source> Decoder<S> {
     pub const fn new(source: S) -> Self {
@@ -56,6 +66,11 @@ impl<S: Source> Decoder<S> {
             bits_per_sample: 0,
             total_samples: 0,
             tags: Tags::new(),
+            decoded: 0,
+            block_len: 0,
+            pending: false,
+            table: [(0, 0); SEEK_POINTS],
+            table_len: 0,
             samples: [[0; MAX_BLOCK]; 2],
         }
     }
@@ -71,6 +86,9 @@ impl<S: Source> Decoder<S> {
         self.next_offset = 0;
         self.bits = 0;
         self.tags.clear();
+        self.decoded = 0;
+        self.pending = false;
+        self.table_len = 0;
         let mut signature = [0u8; 4];
         for byte in &mut signature {
             *byte = self.byte()?;
@@ -97,6 +115,8 @@ impl<S: Source> Decoder<S> {
                 self.total_samples = ((self.read_bits(4)? as u64) << 32) | self.read_bits(32)? as u64;
                 self.skip(16 + (length - 34))?; // the MD5 signature and anything after
                 have_streaminfo = true;
+            } else if kind == 3 {
+                self.seek_table(length)?;
             } else if kind == 4 {
                 self.vorbis_comments(length)?;
             } else {
@@ -160,8 +180,76 @@ impl<S: Source> Decoder<S> {
         self.skip(left)
     }
 
+    /// Reads a SEEKTABLE block: 18-byte points (sample, offset, frame size), placeholders (sample all ones) skipped.
+    fn seek_table(&mut self, length: u64) -> Result<(), Error> {
+        let points = (length / 18) as usize;
+        let stride = points.div_ceil(SEEK_POINTS).max(1);
+        for index in 0..points {
+            let sample = ((self.read_bits(32)? as u64) << 32) | self.read_bits(32)? as u64;
+            let offset = ((self.read_bits(32)? as u64) << 32) | self.read_bits(32)? as u64;
+            self.read_bits(16)?;
+            if sample != u64::MAX && index % stride == 0 && self.table_len < SEEK_POINTS {
+                self.table[self.table_len] = (sample, offset);
+                self.table_len += 1;
+            }
+        }
+        self.skip(length - 18 * points as u64)
+    }
+
+    /// Positions the stream so `next_block` returns the block that holds sample `target` (counted per channel) and
+    /// returns that block's first sample. Starts from the nearest SEEKTABLE point or, going forward, from where the
+    /// stream is, then decodes up to the block (a frame's length is only known by decoding it).
+    pub fn seek(&mut self, target: u64) -> Result<u64, Error> {
+        let target = if self.total_samples > 0 { target.min(self.total_samples.saturating_sub(1)) } else { target };
+        let here = self.decoded - if self.pending { self.block_len as u64 } else { 0 };
+        if self.pending && target >= here && target < self.decoded {
+            return Ok(here);
+        }
+        if target < here {
+            let mut start = (0u64, 0u64);
+            for &(sample, offset) in &self.table[..self.table_len] {
+                if sample <= target && sample >= start.0 {
+                    start = (sample, offset);
+                }
+            }
+            self.position = 0;
+            self.end = 0;
+            self.bits = 0;
+            self.next_offset = self.data_start + start.1;
+            self.decoded = start.0;
+        } else if target > self.decoded {
+            // Going forward: a table point beyond where the stream is saves decoding the frames in between.
+            let mut best = (self.decoded, None);
+            for &(sample, offset) in &self.table[..self.table_len] {
+                if sample <= target && sample > best.0 {
+                    best = (sample, Some(offset));
+                }
+            }
+            if let (sample, Some(offset)) = best {
+                self.position = 0;
+                self.end = 0;
+                self.bits = 0;
+                self.next_offset = self.data_start + offset;
+                self.decoded = sample;
+            }
+        }
+        self.pending = false;
+        loop {
+            match self.next_block()? {
+                Some(block) if self.decoded > target => {
+                    self.pending = true;
+                    return Ok(self.decoded - block as u64);
+                }
+                Some(_) => {}
+                None => return Ok(self.decoded),
+            }
+        }
+    }
+
     /// Back to the first frame.
     pub fn rewind(&mut self) {
+        self.decoded = 0;
+        self.pending = false;
         self.position = 0;
         self.end = 0;
         self.bits = 0;
@@ -170,6 +258,29 @@ impl<S: Source> Decoder<S> {
 
     /// Decodes the next frame into `samples`; returns its length in samples per channel, `None` at the end of the file.
     pub fn next_block(&mut self) -> Result<Option<usize>, Error> {
+        if self.pending {
+            self.pending = false;
+            return Ok(Some(self.block_len));
+        }
+        let block = self.frame()?;
+        if let Some(count) = block {
+            self.block_len = count;
+            self.decoded += count as u64;
+        }
+        Ok(block)
+    }
+
+    /// Byte offset of the next frame from the first one (for building a SEEKTABLE in tests).
+    pub fn frame_offset(&self) -> u64 {
+        self.next_offset - (self.end - self.position) as u64 - self.data_start
+    }
+
+    /// Samples per channel before the block `next_block` returns next (the playing position, to block granularity).
+    pub fn position(&self) -> u64 {
+        self.decoded - if self.pending { self.block_len as u64 } else { 0 }
+    }
+
+    fn frame(&mut self) -> Result<Option<usize>, Error> {
         if self.bits == 0 && self.position == self.end && !self.refill()? {
             return Ok(None);
         }
@@ -511,5 +622,13 @@ impl<S: Source> Decode for Decoder<S> {
 
     fn tags(&self) -> &Tags {
         &self.tags
+    }
+
+    fn position(&self) -> u64 {
+        Decoder::position(self)
+    }
+
+    fn seek(&mut self, sample: u64) -> Result<u64, Error> {
+        Decoder::seek(self, sample)
     }
 }

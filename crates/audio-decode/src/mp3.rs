@@ -29,6 +29,10 @@ pub struct Decoder<S: Source> {
     /// Estimated from the file size and the first frame's bitrate (exact for constant bitrate).
     pub total_samples: u64,
     pub tags: Tags,
+    /// Samples per channel handed out so far (after a seek: the estimated start).
+    decoded: u64,
+    /// Where the audio starts (after an ID3v2 tag).
+    data_start: u64,
 }
 
 impl<S: Source> Decoder<S> {
@@ -48,6 +52,8 @@ impl<S: Source> Decoder<S> {
             channels: 0,
             total_samples: 0,
             tags: Tags::new(),
+            decoded: 0,
+            data_start: 0,
         }
     }
 
@@ -63,6 +69,7 @@ impl<S: Source> Decoder<S> {
         self.at_end = false;
         self.pending = false;
         self.block = 0;
+        self.decoded = 0;
     }
 
     fn refill(&mut self) -> Result<(), Error> {
@@ -99,6 +106,7 @@ impl<S: Source> Decoder<S> {
                     self.sample_rate = info.sample_rate;
                     self.channels = info.channels.num() as u32;
                     self.block = info.samples_produced;
+                    self.decoded += info.samples_produced as u64;
                     return Ok(Some(info.samples_produced));
                 }
                 Ok(_) | Err(DecodeError::ReservoirUnavailable(_)) | Err(DecodeError::Corrupt(_)) => {}
@@ -136,6 +144,7 @@ impl<S: Source> Decoder<S> {
     /// a tag that cannot be read leaves the fields empty and never stops the file from playing.
     fn read_tags(&mut self) {
         self.tags.clear();
+        self.data_start = 0;
         let _ = self.id3v2();
         if self.tags.is_empty() {
             let _ = self.id3v1();
@@ -150,6 +159,7 @@ impl<S: Source> Decoder<S> {
         let version = head[3];
         let synchsafe = |b: &[u8]| b.iter().fold(0u64, |n, &x| (n << 7) | (x & 0x7F) as u64);
         let end = 10 + synchsafe(&head[6..10]);
+        self.data_start = end;
         // Frame header: 6 bytes (id 3, size 3) in v2.2, else 10 (id 4, size 4, flags 2).
         let (id_len, header) = if version == 2 { (3, 6) } else { (4, 10) };
         let mut at = 10u64;
@@ -216,6 +226,27 @@ impl<S: Source> Decoder<S> {
         Ok(())
     }
 
+    /// Samples per channel before the block `next_block` returns next.
+    pub fn position(&self) -> u64 {
+        self.decoded - if self.pending { self.block as u64 } else { 0 }
+    }
+
+    /// Jumps to the byte that the bitrate says holds `target`: exact for constant bitrate, an estimate for VBR. The
+    /// decoder resynchronises on the next frame; the first frames may be dropped while its bit reservoir refills.
+    pub fn seek(&mut self, target: u64) -> Result<u64, Error> {
+        let size = self.source.size();
+        let target = if self.total_samples > 0 { target.min(self.total_samples.saturating_sub(1)) } else { 0 };
+        let byte = if self.total_samples > 0 { (size as u128 * target as u128 / self.total_samples as u128) as u64 } else { 0 };
+        self.core = Core::new();
+        self.position = 0;
+        self.end = 0;
+        self.at_end = false;
+        self.pending = false;
+        self.next_offset = byte.max(self.data_start).min(size);
+        self.decoded = target;
+        Ok(target)
+    }
+
     pub fn rewind(&mut self) {
         let _ = self.open();
     }
@@ -265,5 +296,13 @@ impl<S: Source> Decode for Decoder<S> {
 
     fn tags(&self) -> &Tags {
         &self.tags
+    }
+
+    fn position(&self) -> u64 {
+        Decoder::position(self)
+    }
+
+    fn seek(&mut self, sample: u64) -> Result<u64, Error> {
+        Decoder::seek(self, sample)
     }
 }

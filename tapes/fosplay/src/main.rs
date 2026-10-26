@@ -215,6 +215,9 @@ fn cat(api: &TapeApi, client: &mut Player, path: &str) {
 }
 
 /// Sends the stereo frames it is given to the audio device in its own format, blocking while the ring is full.
+/// How far `f` and `b` jump.
+const SKIP_SECONDS: i32 = 10;
+
 /// What the listener asked for with a key, or how a track ended.
 #[derive(Clone, Copy, PartialEq)]
 enum Outcome {
@@ -223,6 +226,8 @@ enum Outcome {
     Previous,
     Stop,
     Failed,
+    /// Jump by this many seconds (handled inside the track, never returned from it).
+    Skip(i32),
 }
 
 /// The device end of playback: converts frames to the device's format and writes them, watching the keys between
@@ -265,6 +270,8 @@ impl Output {
                     b'n' => Some(Outcome::Next),
                     b'p' => Some(Outcome::Previous),
                     b'q' => Some(Outcome::Stop),
+                    b'f' => Some(Outcome::Skip(SKIP_SECONDS)),
+                    b'b' => Some(Outcome::Skip(-SKIP_SECONDS)),
                     b' ' => {
                         self.paused = !self.paused;
                         if self.paused {
@@ -477,7 +484,7 @@ fn run(api: &'static TapeApi, mut client: Option<&mut Player>) {
             None => play_local(&mut session, path, index, total),
         };
         match outcome {
-            Outcome::Done | Outcome::Next | Outcome::Failed => index += 1,
+            Outcome::Done | Outcome::Next | Outcome::Failed | Outcome::Skip(_) => index += 1,
             Outcome::Previous => index = index.saturating_sub(1),
             Outcome::Stop => {
                 stopped = true;
@@ -642,6 +649,24 @@ fn play_track(session: &mut Session, path: &str, index: usize, total: usize) -> 
                     resampler.push([frame[0], frame[1]], &mut |sample| output.frame(sample));
                 }
             }
+            if let Some(Outcome::Skip(seconds)) = output.command {
+                output.command = None;
+                let target = (decoder.position() as i64 + seconds as i64 * rate as i64).max(0) as u64;
+                match decoder.seek(target) {
+                    Ok(start) => {
+                        // What is queued is from before the jump: drop what is staged, keep the device running.
+                        output.staged = 0;
+                        resampler.reset();
+                        println!("fosplay: at {}:{:02} of {}:{:02}.", start / rate as u64 / 60, start / rate as u64 % 60,
+                                 decoder.total_samples() / rate as u64 / 60, decoder.total_samples() / rate as u64 % 60);
+                        continue 'blocks;
+                    }
+                    Err(error) => {
+                        failure = Some(error.describe());
+                        break 'blocks;
+                    }
+                }
+            }
             if output.command.is_some() {
                 break 'blocks;
             }
@@ -661,6 +686,7 @@ fn play_track(session: &mut Session, path: &str, index: usize, total: usize) -> 
         return Outcome::Failed;
     }
     match command {
+        None | Some(Outcome::Skip(_)) => Outcome::Done,
         // Next and previous cut the queued audio at once: stopping the device empties its ring.
         Some(outcome) => {
             if outcome != Outcome::Stop {
@@ -668,7 +694,6 @@ fn play_track(session: &mut Session, path: &str, index: usize, total: usize) -> 
             }
             outcome
         }
-        None => Outcome::Done,
     }
 }
 
@@ -680,7 +705,8 @@ tape_rt::tape_help!(br#"fosplay: play audio from an SMB share (guest access).
   tape run fosplay [device=N|loopN] [rate=HZ] play NAME...     (FOSFS files)
 
   A directory plays its .flac and .mp3 files in name order. Keys: n next,
-  p previous, space pause, Esc or q stop.
+  p previous, space pause,
+  f / b jump 10 s forward / back, Esc or q stop.
 
   HOST is an IPv4 address; the address comes from DHCP on the NIC chosen
   with `nic use N`. FLAC (mono or stereo, up to 24 bits) and MP3 (any MPEG

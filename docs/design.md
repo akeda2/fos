@@ -1493,6 +1493,11 @@ reads. `make test-loopback` plays a WAV through `loop0` and records it with `rec
   other offered rates; a refused rate falls through and the file is resampled.
 - **Playlists**: `play HOST SHARE [FILE|DIR]` (a directory plays its `.flac`/`.mp3`, sorted, dot-names skipped) or
   `play NAME...`. The device stays open across tracks with the same first-choice rate. Keys: `n` next, `p` previous, space
-  pause, `q`/Escape stop. `make test-fosplay` (loop0 + `record`).
+  pause, `f`/`b` jump 10 s forward/back, `q`/Escape stop. `make test-fosplay` (loop0 + `record`).
+- **Tags and seeking**: `Decode::tags()` gives title/artist/album (Vorbis comments; ID3v2.2-2.4 with an ID3v1 fallback) and
+  the tape prints them per track. `Decode::seek(sample)` lands on a block start: FLAC starts from the nearest SEEKTABLE
+  point (or the current position when going forward), then decodes up to the block, so it is exact to a block; MP3 jumps to
+  the byte the bitrate predicts (exact for CBR, an estimate for VBR) and resynchronises. A jump drops the staged audio but
+  not what the device already holds (a few ms to a fraction of a second). Host test in `make test-flac`.
 
 Only hardware shows: USB underruns, Pi 4 CPU load, track-boundary gaps over a network, real packet loss.

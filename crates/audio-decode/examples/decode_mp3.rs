@@ -1,4 +1,5 @@
-//! `cargo run --release --example decode_mp3 -- IN.mp3 OUT.raw`: decodes to interleaved stereo f32 little-endian.
+//! `cargo run --release --example decode_mp3 -- IN.mp3 OUT.raw`: decodes to interleaved stereo f32 little-endian;
+//! a third argument seeks to that sample first and prints where it landed.
 use audio_decode::{Decode, mp3::Decoder};
 use std::io::Write;
 
@@ -8,6 +9,9 @@ fn main() {
     let mut decoder = Box::new(Decoder::new(&data[..]));
     decoder.open().unwrap();
     eprintln!("{} Hz, {} channels, about {} samples", decoder.sample_rate(), decoder.channels(), decoder.total_samples());
+    if let Some(target) = args.get(3) {
+        eprintln!("seek: {target} -> {}", decoder.seek(target.parse().unwrap()).unwrap());
+    }
     let mut out = std::io::BufWriter::new(std::fs::File::create(&args[2]).unwrap());
     let mut pcm = vec![0f32; 2 * 1152];
     let mut frames = 0;
