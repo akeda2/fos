@@ -90,6 +90,12 @@ Between machines, `tapesync [HOST] [apply]` pulls newer tapes from one peer, or 
 `debug` files on the machine's disk (see `AGENTS.md`) turn on reboot-on-crash, the watchdog and
 the network kernel update.
 
+### Audio between tapes: loopback devices
+
+`loop0`..`loop3` are virtual audio devices in the kernel (stereo 32-bit float, 48 kHz). A source tape plays into one
+(`outdev=loop0`) and another tape captures from it (`device=loop0`); `audio device loop0` works in the shell. See
+`docs/design.md` "Audio loopback" and `make test-loopback`.
+
 ### Administering several machines: `fosadm`
 
 `tools/fosadm.py` does discovery, status, kernel and tape deploys in one tool (Python, standard library only). It

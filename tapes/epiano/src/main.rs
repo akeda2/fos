@@ -14,7 +14,8 @@ use epiano_tape::{GLYPH_H, Hit, Layout, SLIDERS, drag, label, lit, press, slider
 use tape_rt::{Key, KeyDecoder, Line, TapeApi, println};
 
 tape_rt::tape_help!(
-    br#"epiano [device=N] [outdev=N] [screen=N] [rate=HZ] [latency=MS] [out=N]
+    br#"epiano [device=N|loopN] [outdev=N|loopN]
+[screen=N] [rate=HZ] [latency=MS] [out=N]
 A Rhodes-style electric piano for playing live. Each note is a struck tine
 (fundamental plus a bell and a ting that a hard hit brings out) with a hammer
 thump, through its own pickup (Bark: a hard hit barks, a soft one stays

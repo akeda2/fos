@@ -1,5 +1,6 @@
 mod arch;
 mod audio;
+mod loopback;
 mod audioshell;
 mod ahci;
 mod block;

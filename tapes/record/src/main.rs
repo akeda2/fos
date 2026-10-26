@@ -1,4 +1,4 @@
-//! `record [device=N] NAME [SECONDS] [RATE]`: records from the audio device's inputs (USB audio or HD Audio) into a WAV file,
+//! `record [device=N|loopN] NAME [SECONDS] [RATE]`: records from the audio device's inputs (USB audio or HD Audio) into a WAV file,
 //! straight to disk.
 //!
 //! ```text
@@ -61,7 +61,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         Err(reason) => return println!("record: {reason}."),
     };
     let Some((name, seconds, rate, tone)) = parse_args(arguments) else {
-        return println!("Usage: tape run record [device=N] NAME [SECONDS] [RATE] [tone=HZ]   (NAME.wav is written; SECONDS 0 = until Escape)");
+        return println!("Usage: tape run record [device=N|loopN] NAME [SECONDS] [RATE] [tone=HZ]   (NAME.wav is written; SECONDS 0 = until Escape)");
     };
     let mut info = AudioInfo::default();
     if tone.is_none() {
@@ -213,7 +213,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
 
 tape_rt::tape_help!(br#"record: record the audio inputs into a WAV file on disk.
 
-  tape run record [device=N] NAME [SECONDS] [RATE] [tone=HZ]
+  tape run record [device=N|loopN] NAME [SECONDS] [RATE] [tone=HZ]
 
   tape run record take1 10        10 seconds at 48000 Hz into take1.wav
   tape run record take1 0 96000   until Escape, at 96000 Hz

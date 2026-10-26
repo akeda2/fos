@@ -400,7 +400,7 @@ pub fn start(name: &str, arguments: &str, nics: u64) {
     if in_service() {
         return crate::println!("run: a service cannot start another.");
     }
-    let word = |key: &str| arguments.split_ascii_whitespace().find_map(|word| word.strip_prefix(key)?.parse::<usize>().ok());
+    let word = |key: &str| arguments.split_ascii_whitespace().find_map(|word| crate::audio::parse_device(word.strip_prefix(key)?));
     // `nic=N,M` is `&N,M`.
     let nics = if nics == 0 { arguments.split_ascii_whitespace().find_map(|word| nic_list(word.strip_prefix("nic=")?).ok()).unwrap_or(0) } else { nics };
     if let Some(nic) = (0..64).find(|&nic| nics >> nic & 1 != 0 && nic >= host::nic_count()) {

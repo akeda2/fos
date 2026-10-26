@@ -16,7 +16,8 @@ use strings_tape::{GLYPH_H, Hit, Layout, SLIDERS, drag, label, lit, press, slide
 use tape_rt::{Key, KeyDecoder, Line, TapeApi, println};
 
 tape_rt::tape_help!(
-    br#"strings [device=N] [outdev=N] [screen=N] [rate=HZ] [latency=MS] [out=N]
+    br#"strings [device=N|loopN] [outdev=N|loopN]
+[screen=N] [rate=HZ] [latency=MS] [out=N]
 A divide-down string machine in the Solina mould. Six sections, each with a
 fader on the screen: Violin, Viola, Cello, Bass, Brass (a slow swell) and
 Piano (it decays while held). Attack and Release shape the strings; Ensemble

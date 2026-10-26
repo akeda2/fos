@@ -469,12 +469,14 @@ impl PeerInfo {
 pub const AUDIO_KIND_USB: u32 = 1;
 pub const AUDIO_KIND_HDA: u32 = 2;
 pub const AUDIO_KIND_I2S: u32 = 3;
+/// A virtual loopback device (`id` is its index: `loop0` is 0). Stereo 32-bit float at 48000 Hz.
+pub const AUDIO_KIND_LOOP: u32 = 4;
 
 /// What `audio_devices` reports for one device. A new struct (not more fields in `AudioInfo`), per the rule at the top of this file.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct AudioDevice {
-    /// `AUDIO_KIND_USB`, `AUDIO_KIND_HDA` or `AUDIO_KIND_I2S` (the Pi's I2S audio HAT; the other fields are 0).
+    /// `AUDIO_KIND_USB`, `AUDIO_KIND_HDA`, `AUDIO_KIND_I2S` (the Pi's I2S audio HAT; the other fields are 0) or `AUDIO_KIND_LOOP`.
     pub kind: u32,
     /// 1 if this is the device the `audio_*` calls currently use.
     pub active: u32,

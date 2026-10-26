@@ -1453,3 +1453,25 @@ slot's size in sectors (`debug slots`). A deploy shows its plan first, pushes th
 reports a fallback (the old kernel running) without touching tapes, then copies changed tapes and checks sizes.
 `bootcode --update` needs the host name typed back and sends `confirm` in the same session. Verified on real hardware:
 x86 (rack) and Pi 4 (bjuv) deploys; not covered by a QEMU end-to-end test yet.
+
+## Audio loopback
+
+`loop0`..`loop3` (`kernel/src/loopback.rs`) are virtual audio devices that are always present, listed by `audio` after the
+real devices (so their numbers never move) and never chosen automatically. One tape plays into a loopback and another
+captures from it; no ABI call is new (`AUDIO_KIND_LOOP` is a new `AudioDevice.kind`).
+
+```
+run phono device=1 outdev=loop0 &1        # source: hardware in, loop0 out
+run ltas device=loop0 outdev=1            # sink: loop0 in, hardware out
+```
+
+`device=` and `outdev=` (tapes), `audio device` and `audio output` (shell) take a number or `loopN`
+(`tape_rt::audio_device_number`). The format is fixed: stereo, 32-bit float, 48 kHz (`audio_float` says float). Each end,
+capture and playback, has one holder (foreground or service) at a time; a second one gets `AUDIO_BUSY`, but the other end
+is free, so a service can own the playing end while another tape owns the capturing end. A `device=loopN` without `outdev=`
+makes the output follow the input, i.e. a self-loop; give `outdev=` to play to hardware.
+
+There is no clock: with no capture end running the playing end discards (like an unplugged output), and with one the FIFO
+(64 KiB, about 85 ms) lets a writer through only as fast as the reader drains it. A source with a clock of its own (a
+capture, a synth paced by `playback_space`) sets the pace; a file player such as `play` runs as fast as the listener
+reads. `make test-loopback` plays a WAV through `loop0` and records it with `record`.

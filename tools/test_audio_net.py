@@ -41,7 +41,7 @@ def fosfs_add(image, files):
     else:
         raise SystemExit("FAIL: no FOSFS volume in the image")
     for name, text in files.items():
-        body = text.encode()
+        body = text if isinstance(text, bytes) else text.encode()
         end, slot = 9, None
         for sector in range(1, 9):
             for number in range(8):

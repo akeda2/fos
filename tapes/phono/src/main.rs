@@ -16,7 +16,8 @@ use tape_rt::{Key, KeyDecoder, Line, TapeApi, println};
 
 tape_rt::tape_help!(
     br#"phono [service] [@FILE] [curve=ID] [mono=on|off] [polarity=P] [rumble=HZ]
-[bass=DB] [bassfreq=HZ] [bassq=Q] [trim=DB] [device=N] [outdev=N] [screen=N]
+[bass=DB] [bassfreq=HZ] [bassq=Q] [trim=DB]
+[device=N|loopN] [outdev=N|loopN] [screen=N]
 [rate=HZ] [latency=MS] [in=N] [out=N]
 A phono equaliser: a flat cartridge or preamp signal on the audio input comes
 out equalised. Without `service` the touch screen shows the response curve,
@@ -198,7 +199,7 @@ fn startup(api: &'static TapeApi) -> Result<&'static str, &'static str> {
     tape_rt::init(api);
     let arguments = tape_rt::take_audio_device_arg(api, core::str::from_utf8(tape_rt::args()).unwrap_or(""))?;
     if let Some(number) = tape_rt::arg_value(arguments, "outdev") {
-        let number = number.parse::<u32>().map_err(|_| "outdev=N needs a number (`audio` lists the devices)")?;
+        let number = tape_rt::audio_device_number(api, number).map_err(|_| "outdev= needs a number (`audio` lists the devices) or loopN")?;
         tape_rt::use_audio_output(api, number)?;
     }
     if tape_rt::fp_level() == 0 {

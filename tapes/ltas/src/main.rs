@@ -17,7 +17,7 @@ use tape_rt::{FP_AVX2, Key, KeyDecoder, Line, TapeApi, alloc_zeroed, arg_value a
 use view::{Layout, Scale};
 
 tape_rt::tape_help!(
-    br#"ltas [device=N] [outdev=M] [rate=48000] [chan=1] [n=8192]
+    br#"ltas [device=N|loopN] [outdev=M|loopN] [rate=48000] [chan=1] [n=8192]
      [res=1/3|1/6|1/12|fft] [weight=z|a|c] [save=N]
      [style=smooth|bars]
      [win=hann|rect|hamming|blackman-harris|flat-top]

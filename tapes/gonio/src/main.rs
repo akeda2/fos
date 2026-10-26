@@ -24,7 +24,7 @@ use noise::PairSine;
 use tape_rt::{Key, KeyDecoder, Line, TapeApi, alloc_bytes, arg_value as value, parse_f32, println};
 
 tape_rt::tape_help!(
-    br#"gonio [@NAME] [device=N] [chan=A,B] [rate=48000] [scale=nordic|dbfs]
+    br#"gonio [@NAME] [device=N|loopN] [chan=A,B] [rate=48000] [scale=nordic|dbfs]
       [style=dots|lines] [law=log|linear] [range=DB] [gain=DB] [tau=SECONDS]
       [target=-23|-24|-14] [ebu=9|18] [theme=dark|classic|light]
       [src=input|test] [phase=DEG] [tone=HZ] [level=-18] [right=DB]

@@ -26,7 +26,7 @@ pub fn startup(api: &'static TapeApi, max_width: u32, max_height: u32) -> Result
     tape_rt::init(api);
     let arguments = tape_rt::take_audio_device_arg(api, core::str::from_utf8(tape_rt::args()).unwrap_or("")).map_err(|reason| reason)?;
     if let Some(number) = tape_rt::arg_value(arguments, "outdev") {
-        let number = number.parse::<u32>().map_err(|_| "outdev=N needs a number (`audio` lists the devices)")?;
+        let number = tape_rt::audio_device_number(api, number).map_err(|_| "outdev= needs a number (`audio` lists the devices) or loopN")?;
         tape_rt::use_audio_output(api, number)?;
     }
     if tape_rt::fp_level() == 0 {

@@ -16,7 +16,8 @@ use organ_tape::{GLYPH_H, GLYPH_W, Hit, Layout, Rect, drag, label, lit, note_for
 use tape_rt::{Key, KeyDecoder, Line, TapeApi, println};
 
 tape_rt::tape_help!(
-    br#"organ [device=N] [outdev=N] [screen=N] [rate=HZ] [latency=MS] [out=N]
+    br#"organ [device=N|loopN] [outdev=N|loopN]
+[screen=N] [rate=HZ] [latency=MS] [out=N]
 A drawbar organ in the Hammond B-3 mould. The screen has nine drawbars (drag
 them up and down), six presets, percussion (2nd/3rd harmonic, fast/slow,
 soft/normal), scanner vibrato V1-V3 and chorus C1-C3, a Leslie (Off, Stop,

@@ -164,10 +164,10 @@ def both_devices():
         usb_wav, hda_wav = Path(tmp) / "usb.wav", Path(tmp) / "hda.wav"
         extra = ["-device", "qemu-xhci,id=xhci", "-audiodev", f"wav,id=usbsnd,path={usb_wav}", "-device", "usb-audio,audiodev=usbsnd",
                  "-audiodev", f"wav,id=hdasnd,path={hda_wav}", "-device", "intel-hda", "-device", "hda-duplex,audiodev=hdasnd"]
-        text = boot_with_commands(extra, ["usb rescan", "audio", "audio device 3", "audio device 2", "audio tone 880 3", "audio device auto", "audio"])
+        text = boot_with_commands(extra, ["usb rescan", "audio", "audio device 9", "audio device 2", "audio tone 880 3", "audio device auto", "audio"])
         listing = text.split("fos> audio")[1].split("fos> ")[0]
         check("Audio devices" in listing and "*1: USB audio" in listing and " 2: HD Audio 00:" in listing, "`audio` lists USB audio and HD Audio, USB audio being the automatic choice", listing)
-        check("no such device" in text.split("audio device 3")[1].split("fos> ")[0], "a device number that does not exist is refused", text[-800:])
+        check("no such device" in text.split("audio device 9")[1].split("fos> ")[0], "a device number that does not exist is refused", text[-800:])
         picked = text.split("fos> audio device 2")[1].split("fos> ")[0]
         check(" 1: USB audio" in picked and "*2: HD Audio" in picked, "`audio device 2` selects the HD Audio device", picked)
         check("playback: 48000 Hz" in text.split("audio tone 880 3")[1].split("fos> ")[0], "playback on the picked device runs", text[-800:])

@@ -1,4 +1,4 @@
-//! `recorder [device=N]`: a field recorder for the audio interface (USB audio or HD Audio).
+//! `recorder [device=N|loopN]`: a field recorder for the audio interface (USB audio or HD Audio).
 //!
 //! ```text
 //! tape run recorder                          meters and a pre-roll buffer at once; R starts a take
@@ -634,7 +634,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         Err(reason) => return println!("recorder: {reason}."),
     };
     let Some(options) = parse(arguments) else {
-        return println!("Usage: tape run recorder [device=N] [NAME] [pre=SECONDS] [rate=HZ] [auto] [thresh=DB] [sound=MS] [silence=MS] [tone=HZ [gate=ON,OFF]]");
+        return println!("Usage: tape run recorder [device=N|loopN] [NAME] [pre=SECONDS] [rate=HZ] [auto] [thresh=DB] [sound=MS] [silence=MS] [tone=HZ [gate=ON,OFF]]");
     };
     let mut info = AudioInfo::default();
     if options.tone.is_none() {
@@ -1093,7 +1093,7 @@ fn show(row: usize, text: &str) {
 
 tape_rt::tape_help!(br#"recorder: field recorder with meters and a pre-roll buffer.
 
-  tape run recorder [device=N] [name=NAME] [pre=SECONDS] [auto]
+  tape run recorder [device=N|loopN] [name=NAME] [pre=SECONDS] [auto]
                     [rate=HZ] [thresh=DB] [sound=MS] [silence=MS]
                     [tone=HZ] [gate=ON,OFF] [diskN/NAME|@LABEL/NAME]
 

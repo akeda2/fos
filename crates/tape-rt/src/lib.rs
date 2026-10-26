@@ -109,7 +109,9 @@ pub struct AudioDeviceName(pub AudioDevice);
 impl core::fmt::Display for AudioDeviceName {
     fn fmt(&self, out: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let device = &self.0;
-        if device.kind == AUDIO_KIND_I2S {
+        if device.kind == AUDIO_KIND_LOOP {
+            write!(out, "Loopback {} (virtual)", device.id)
+        } else if device.kind == AUDIO_KIND_I2S {
             write!(out, "I2S audio HAT")
         } else if device.kind == AUDIO_KIND_HDA {
             let location = device.pci_location;
@@ -120,17 +122,36 @@ impl core::fmt::Display for AudioDeviceName {
     }
 }
 
-/// Every audio tape accepts a leading `device=N` (the number `audio` lists; 0 = automatic): it picks the audio device for
+/// An audio device named on a command line: its number as `audio` lists it, or `loopN` for a loopback device (found by
+/// kind and index, since the loopbacks are numbered after the real devices).
+pub fn audio_device_number(api: &TapeApi, text: &str) -> Result<u32, &'static str> {
+    if let Some(index) = text.strip_prefix("loop") {
+        let index: u16 = index.parse().map_err(|_| "loopN needs a loopback number (loop0..)")?;
+        if has_audio_device_calls(api) {
+            for number in 1..=(api.audio_devices)(0, core::ptr::null_mut()) {
+                let mut device = AudioDevice::default();
+                (api.audio_devices)(number, &mut device);
+                if device.kind == AUDIO_KIND_LOOP && device.id == index {
+                    return Ok(number);
+                }
+            }
+        }
+        return Err("there is no such loopback device (`audio` lists them)");
+    }
+    text.parse::<u32>().map_err(|_| "a device is a number (`audio` lists them; 0 = automatic) or loopN")
+}
+
+/// Every audio tape accepts a leading `device=N` or `device=loopN` (the number `audio` lists; 0 = automatic): it picks the audio device for
 /// this run, and is removed from the arguments. Returns what is left, or why the device cannot be chosen. The choice is
 /// undone by the kernel when the tape ends, so the operator's own `audio device N` is never overridden.
 pub fn take_audio_device_arg<'a>(api: &TapeApi, arguments: &'a str) -> Result<&'a str, &'static str> {
     let trimmed = arguments.trim_start();
     let Some(rest) = trimmed.strip_prefix("device=") else { return Ok(arguments) };
     let (number, after) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-    let Ok(number) = number.parse::<u32>() else { return Err("device=N needs a number (`audio` lists the devices; 0 = automatic)") };
     if !has_audio_device_calls(api) {
         return Err("this kernel cannot choose an audio device (tape API 3 needed)");
     }
+    let number = audio_device_number(api, number).map_err(|_| "device= needs a number (`audio` lists the devices; 0 = automatic) or loopN")?;
     if (api.audio_use_device)(number) != 0 {
         return Err("there is no such audio device (`audio` lists them)");
     }

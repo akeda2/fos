@@ -34,9 +34,9 @@ pub fn command(rest: &str) {
         Some("device") => {
             let number = match words.next() {
                 Some("auto") | None => None,
-                Some(word) => match word.parse::<usize>() {
+                Some(word) => match ua::parse_device(word).ok_or(()) {
                     Ok(number) => Some(number),
-                    Err(_) => return crate::println!("Usage: audio device N|auto   (`audio` lists the devices)"),
+                    Err(_) => return crate::println!("Usage: audio device N|loopN|auto   (`audio` lists the devices)"),
                 },
             };
             match ua::choose(number) {
@@ -47,9 +47,9 @@ pub fn command(rest: &str) {
         Some("output") => {
             let number = match words.next() {
                 Some("same") | Some("auto") | None => None,
-                Some(word) => match word.parse::<usize>() {
+                Some(word) => match ua::parse_device(word).ok_or(()) {
                     Ok(number) => Some(number),
-                    Err(_) => return crate::println!("Usage: audio output N|same   (`audio` lists the devices)"),
+                    Err(_) => return crate::println!("Usage: audio output N|loopN|same   (`audio` lists the devices)"),
                 },
             };
             match ua::choose_output(number) {
@@ -201,7 +201,7 @@ pub fn command(rest: &str) {
             ua::status();
             ua::stop_mine();
         }
-        Some(_) => crate::println!("Usage: audio | audio device N|auto | audio modes | audio use capture|playback N|auto | audio start RATE [capture|playback|both] | audio stop | audio capture SECONDS [RATE] | audio tone [HZ] [SECONDS] [RATE] | audio duplex [SECONDS] [RATE]"),
+        Some(_) => crate::println!("Usage: audio | audio device N|loopN|auto | audio modes | audio use capture|playback N|auto | audio start RATE [capture|playback|both] | audio stop | audio capture SECONDS [RATE] | audio tone [HZ] [SECONDS] [RATE] | audio duplex [SECONDS] [RATE]"),
     }
 }
 

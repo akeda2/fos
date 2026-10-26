@@ -14,7 +14,8 @@ use tape_echo::{HEAD1, HEAD2, HEAD3, TapTempo, TapeEcho};
 use tape_rt::{Key, KeyDecoder, Line, TapeApi, println};
 
 tape_rt::tape_help!(
-    br#"tape-echo [device=N] [outdev=N] [screen=N] [rate=HZ] [latency=MS] [in=N]
+    br#"tape-echo [device=N|loopN] [outdev=N|loopN]
+[screen=N] [rate=HZ] [latency=MS] [in=N]
 [out=N]
 A tape echo in the Roland RE-201 style, as an effect box: whatever comes in on
 the audio device goes through a tape loop and a spring reverb and out again.

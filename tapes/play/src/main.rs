@@ -92,7 +92,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         Err(reason) => return println!("play: {reason}."),
     };
     if name.is_empty() {
-        return println!("Usage: tape run play [device=N] NAME.wav");
+        return println!("Usage: tape run play [device=N|loopN] NAME.wav");
     }
     let mut info = AudioInfo::default();
     if (api.audio_info)(&mut info) == 0 {
@@ -140,6 +140,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         (api.free)(buffer, capacity);
         return println!("play: cannot start playback at {} Hz (code {status}); the device offers {:?}.", wav.rate, &info.rates[..info.rate_count as usize]);
     }
+    // Free space of the still empty ring: "drained" below means back at this (a loopback's ring is smaller than a card's).
+    (api.audio_info)(&mut info);
+    let empty = (info.playback_space as usize).saturating_sub(64).min((1 << 20) - 64);
     let data = &file[wav.data..wav.data + frames * in_frame];
     let mut staging = [0u8; 8192];
     let out_frame = out_channels * out_slot;
@@ -200,7 +203,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         let mut waited = 0;
         loop {
             (api.audio_info)(&mut info);
-            if info.playback_space as usize >= (1 << 20) - 64 || (api.should_abort)() != 0 || waited > 120_000 {
+            if info.playback_space as usize >= empty || (api.should_abort)() != 0 || waited > 120_000 {
                 break;
             }
             tape_rt::idle();
@@ -224,7 +227,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
 
 tape_rt::tape_help!(br#"play: play a WAV file on the audio outputs.
 
-  tape run play [device=N] NAME.wav
+  tape run play [device=N|loopN] NAME.wav
 
   8, 16, 24 and 32 bit PCM and 32 bit float; the file's rate must be one the device offers.
   Escape stops.
