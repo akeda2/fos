@@ -2,7 +2,7 @@
 //! `fosplay cat HOST SHARE FILE` reads a file to the end and reports its size, speed and a checksum (FNV-1a 32), and
 //! `fosplay [device=N|loopN] play HOST SHARE FILE` decodes a FLAC file while it streams in and plays it. All of them use
 //! `crates/smb` over the shared TCP client (`tape_ip::tcp`), on the interface chosen with `nic use N` and an address from
-//! DHCP. HOST is an IPv4 address.
+//! DHCP. HOST is an IPv4 address or a host name.
 //!
 //! The player is hard-float: FLAC decoding is integer (`audio_decode::flac`), MP3 is float (`audio_decode::mp3`), the conversion to the device's format and the
 //! resampling to a rate the device offers (cubic, `audio_decode::resample`) are `f32`. Nothing is printed between the first
@@ -14,7 +14,7 @@ use audio_decode::{Decode, Source, SourceError, flac, mp3, resample::Resampler};
 use smb::{Client, Error, Handle, Transport};
 use tape_ip::net;
 use tape_ip::tcp::Socket;
-use tape_net::{Ipv4Address, MacAddress};
+use tape_net::{ArpCache, Ipv4Address, MacAddress};
 use tape_rt::{AudioInfo, AudioStats, KEY_ABORT, KEY_BASE, KEY_NONE, TapeApi, println};
 
 const SMB_PORT: u16 = 445;
@@ -110,13 +110,12 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     }
     let rest: [&str; 3] = core::array::from_fn(|_| words.next().unwrap_or(""));
     let [host, share, path] = rest;
-    let Some(address) = net::parse_ip(host) else { return usage() };
-    if share.is_empty() || !matches!(command, "ls" | "cat") || (command == "cat" && path.is_empty()) {
+    if host.is_empty() || share.is_empty() || !matches!(command, "ls" | "cat") || (command == "cat" && path.is_empty()) {
         return usage();
     }
     #[allow(static_mut_refs)]
     let client = unsafe { &mut *core::ptr::addr_of_mut!(CLIENT) };
-    let Some(()) = open(api, client, address, host, share) else { return };
+    let Some(()) = open(api, client, host, share) else { return };
     match command {
         "ls" => list(client, path),
         _ => cat(api, client, path),
@@ -126,14 +125,15 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
 
 fn usage() {
     println!("usage: fosplay ls HOST SHARE [DIR] | cat HOST SHARE FILE");
-    println!("       fosplay [device=N|loopN] [rate=HZ] play HOST SHARE [FILE|DIR]");
+    println!("       fosplay [device=N|loopN] [rate=HZ] play //HOST/SHARE[/FILE|DIR]");
     println!("       fosplay [device=N|loopN] [rate=HZ] play NAME...");
 }
 
 type Player = Client<Link, { 64 * 1024 + 1024 }>;
 
-/// Address by DHCP, TCP to port 445, SMB negotiate, guest session, tree connect.
-fn open(api: &'static TapeApi, client: &mut Player, address: Ipv4Address, host: &str, share: &str) -> Option<()> {
+/// Address by DHCP, the host's address (a dotted quad or a name asked of the DHCP-named DNS server, else the gateway), TCP
+/// to port 445, SMB negotiate, guest session, tree connect.
+fn open(api: &'static TapeApi, client: &mut Player, host: &str, share: &str) -> Option<()> {
     let nic = tape_rt::active_nic();
     if nic >= (api.nic_count)() as usize {
         println!("fosplay: no network interface.");
@@ -141,11 +141,19 @@ fn open(api: &'static TapeApi, client: &mut Player, address: Ipv4Address, host: 
     }
     let mut mac = [0u8; 6];
     (api.nic_mac)(nic, mac.as_mut_ptr());
-    let Some(config) = net::dhcp(api, nic, MacAddress(mac)) else {
+    let Some((config, _, dns_server)) = net::dhcp_with_servers(api, nic, MacAddress(mac)) else {
         println!("fosplay: no DHCP lease on NIC {nic}.");
         return None;
     };
-    println!("fosplay: {:?} -> {host}:{SMB_PORT}", config.ip);
+    let server = dns_server.unwrap_or(config.gateway);
+    let address = match tape_ip::dns::lookup(api, nic, &config, &mut ArpCache::<8>::new(), server, tape_net::dns::PORT, host) {
+        Ok(address) => address,
+        Err(why) => {
+            println!("fosplay: {host}: {why}.");
+            return None;
+        }
+    };
+    println!("fosplay: {:?} -> {host} ({address:?}):{SMB_PORT}", config.ip);
     let link = client.transport();
     link.api = Some(api);
     if let Err(why) = link.socket.connect(api, nic, &config, address, SMB_PORT, 3_000_000) {
@@ -378,7 +386,14 @@ fn play_command<'a>(api: &'static TapeApi, mut words: impl Iterator<Item = &'a s
     }
     #[allow(static_mut_refs)]
     let list = unsafe { &mut *core::ptr::addr_of_mut!(PLAYLIST) };
-    let Some(address) = net::parse_ip(first) else {
+    // `//HOST/SHARE[/PATH]` or `HOST SHARE [PATH]` with a dotted-quad HOST name an SMB share; anything else is FOSFS files.
+    let (first, share, path) = if let Some(unc) = first.strip_prefix("//") {
+        let (host, rest) = unc.split_once('/').unwrap_or((unc, ""));
+        let (share, path) = rest.split_once('/').unwrap_or((rest, ""));
+        (host, share, path.trim_end_matches('/'))
+    } else if net::parse_ip(first).is_some() {
+        (first, words.next().unwrap_or(""), words.next().unwrap_or(""))
+    } else {
         for name in core::iter::once(first).chain(words) {
             if !list.add("", name) {
                 return println!("fosplay: too many files.");
@@ -386,13 +401,12 @@ fn play_command<'a>(api: &'static TapeApi, mut words: impl Iterator<Item = &'a s
         }
         return run(api, None);
     };
-    let (share, path) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
-    if share.is_empty() {
+    if first.is_empty() || share.is_empty() {
         return usage();
     }
     #[allow(static_mut_refs)]
     let client = unsafe { &mut *core::ptr::addr_of_mut!(CLIENT) };
-    let Some(()) = open(api, client, address, first, share) else { return };
+    let Some(()) = open(api, client, first, share) else { return };
     if is_audio(path) {
         list.add("", path);
     } else {
@@ -701,15 +715,17 @@ tape_rt::tape_help!(br#"fosplay: play audio from an SMB share (guest access).
 
   tape run fosplay ls HOST SHARE [DIR]
   tape run fosplay cat HOST SHARE FILE
-  tape run fosplay [device=N|loopN] [rate=HZ] play HOST SHARE [FILE|DIR]
+  tape run fosplay [device=N|loopN] [rate=HZ] play //HOST/SHARE[/FILE|DIR]
+  tape run fosplay [device=N|loopN] [rate=HZ] play IP SHARE [FILE|DIR]
   tape run fosplay [device=N|loopN] [rate=HZ] play NAME...     (FOSFS files)
 
   A directory plays its .flac and .mp3 files in name order. Keys: n next,
   p previous, space pause,
   f / b jump 10 s forward / back, Esc or q stop.
 
-  HOST is an IPv4 address; the address comes from DHCP on the NIC chosen
-  with `nic use N`. FLAC (mono or stereo, up to 24 bits) and MP3 (any MPEG
+  HOST is an IPv4 address or a name (asked of the DNS server DHCP names, else
+  the gateway); our address comes from DHCP on the NIC chosen with
+  `nic use N`. FLAC (mono or stereo, up to 24 bits) and MP3 (any MPEG
   layer, by the .mp3 extension; no gapless trim). A rate the
   device does not offer is resampled (windowed sinc); rate=HZ forces
   the output rate. Escape stops.

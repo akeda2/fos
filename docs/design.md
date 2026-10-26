@@ -1491,7 +1491,7 @@ reads. `make test-loopback` plays a WAV through `loop0` and records it with `rec
   (anti-alias when going down). Used only when the device lacks the file's rate.
 - **Output rate**: candidates are `rate=HZ` if given, else the file's rate when the device offers it, then 48000, then the
   other offered rates; a refused rate falls through and the file is resampled.
-- **Playlists**: `play HOST SHARE [FILE|DIR]` (a directory plays its `.flac`/`.mp3`, sorted, dot-names skipped) or
+- **Playlists**: `play //HOST/SHARE[/FILE|DIR]` (a directory plays its `.flac`/`.mp3`, sorted, dot-names skipped) or
   `play NAME...`. The device stays open across tracks with the same first-choice rate. Keys: `n` next, `p` previous, space
   pause, `f`/`b` jump 10 s forward/back, `q`/Escape stop. `make test-fosplay` (loop0 + `record`).
 - **Tags and seeking**: `Decode::tags()` gives title/artist/album (Vorbis comments; ID3v2.2-2.4 with an ID3v1 fallback) and

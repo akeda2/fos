@@ -45,9 +45,23 @@ def main():
             data = local.read_bytes()
             expected = (len(data), fnv1a(data))
     directory = FILE.rsplit("/", 1)[0] if "/" in FILE else ""
-    output = boot_with_commands(["-netdev", "user,id=n0", "-device", "e1000,netdev=n0"],
-                                [f"run fosplay ls {HOST} {SHARE} {directory}", f"run fosplay cat {HOST} {SHARE} {FILE}"])
+    # The host's name, when this machine resolves it to the same address: QEMU's DNS relays to ours.
+    name = os.environ.get("FOS_SMB_NAME", "")
+    if not name:
+        try:
+            name = socket.gethostbyaddr(HOST)[0]
+            name = name if socket.gethostbyname(name) == HOST else ""
+        except OSError:
+            name = ""
+    commands = [f"run fosplay ls {HOST} {SHARE} {directory}", f"run fosplay cat {HOST} {SHARE} {FILE}"]
+    if name:
+        commands.append(f"run fosplay ls {name} {SHARE} {directory}")
+    output = boot_with_commands(["-netdev", "user,id=n0", "-device", "e1000,netdev=n0"], commands)
     print(output[-1800:])
+    if name:
+        octets = ", ".join(HOST.split("."))
+        check(f"-> {name} (Ipv4Address([{octets}]))" in output and output.count("entries.") >= 2,
+              f"the host name {name} resolves through DNS and lists the directory", output[-1200:])
     name = FILE.rsplit("/", 1)[-1]
     check(name in output and "entries." in output, "ls lists the directory and shows the file", output[-1800:])
     check("fosplay: cat OK." in output, "cat reads the whole file", output[-1800:])
@@ -70,7 +84,7 @@ def play_directory(directory):
             ask(guest, "nic use 2", "Using NIC 2")
             guest.send("run record device=loop0 smb 8 &0")
             guest.pump(2)
-            guest.send(f"run fosplay device=loop0 play {HOST} {SHARE} {directory} &2")
+            guest.send(f"run fosplay device=loop0 play //{HOST}/{SHARE}/{directory} &2")
             guest.wait_for("Service record ended", 60)
             guest.pump(1)
             text = guest.text()
