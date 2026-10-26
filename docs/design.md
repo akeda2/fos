@@ -1509,5 +1509,14 @@ reads. `make test-loopback` plays a WAV through `loop0` and records it with `rec
   leaves the fronts alone) and the LFE (Linkwitz-Riley 4th order low-pass, `lfe=HZ`); side = L-R, low-passed at 7 kHz, goes
   to Ls and, inverted and 1.3 ms later, to Rs, delayed `delay=MS` and scaled by `width=0..1`. Host unit tests cover it; QEMU
   has no 6-channel device, so channel order and the sound need the UFX.
+- **The touch screen** (`tapes/fosplay/src/ui.rs`): with a pixel screen fosplay shows a panel (like phono's, drawn by `gfx`,
+  fingers through `instrument_rt::Touches`): title, artist and format, a progress bar (a finger seeks when it lifts), prev / -10 s /
+  pause / +10 s / next / stop, the playlist (touch a row to jump, Up/Down page), a stereo level meter and sliders for volume, bass
+  boost and surround width plus 5.1 and Centre switches (dim without 6 outputs). `Ui` only draws and turns fingers into `Action`s;
+  `Output::apply` (main.rs) carries them out, so the keys keep working and the sound never depends on the picture. The screen
+  is serviced from `Output::poll`, which runs between every audio write and while paused, so it needs no thread; the decoder
+  runs far ahead of the ear, and the position shown is the decoded time minus what is queued in the ring. `gfx=off` hides it,
+  `screen=N` picks the screen. QEMU has no touchscreen the kernel accepts, so `make test-fosplay` checks the picture (a
+  screendump) and the keys; fingers need the real panel.
 
 Only hardware shows: USB underruns, Pi 4 CPU load, track-boundary gaps over a network, real packet loss.

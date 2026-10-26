@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_audio_net import Guest, tone_frequency  # noqa: E402
-from test_boot import check  # noqa: E402
+from test_boot import check, monitor, read_ppm  # noqa: E402
 from test_loopback import ask, float_wav  # noqa: E402
 from test_record import fosfs_files  # noqa: E402
 
@@ -61,7 +61,7 @@ def main():
                 take = "rec-" + name.split(".")[0]
                 guest.send(f"run record device=loop0 {take} 4 &0")
                 guest.pump(2)
-                guest.send(f"run fosplay device=loop0 {PLAY_OPTIONS.get(name, "")}play {name} &0")
+                guest.send(f"run fosplay device=loop0 gfx=off {PLAY_OPTIONS.get(name, "")}play {name} &0")
                 deadline = time.monotonic() + 90
                 while time.monotonic() < deadline:
                     if "record" not in ask(guest, "ps", "fos> "):
@@ -72,7 +72,7 @@ def main():
             # The playlist: both tracks play, the second named [2/2], and the summary counts them.
             guest.send("run record device=loop0 list 9 &0")
             guest.pump(2)
-            guest.send("run fosplay device=loop0 play p1.flac p2.mp3 &0")
+            guest.send("run fosplay device=loop0 gfx=off play p1.flac p2.mp3 &0")
             deadline = time.monotonic() + 90
             while time.monotonic() < deadline:
                 if "record" not in ask(guest, "ps", "fos> "):
@@ -104,6 +104,7 @@ def main():
         check(len(loud) > 5 * got // 2, f"the playlist recording holds both tracks ({len(loud)} loud samples)", "")
     jump_test()
     bass_test()
+    ui_test()
     print("PASS: fosplay")
 
 
@@ -121,7 +122,7 @@ def jump_test():
             guest.wait_for("fos> ")
             guest.send("run record device=loop0 jump 30 &0")
             guest.pump(2)
-            mark = guest.send("run fosplay device=loop0 play seek.flac")
+            mark = guest.send("run fosplay device=loop0 gfx=off play seek.flac")
             end = time.monotonic() + 4
             while time.monotonic() < end and "Tape returned" not in guest.text()[mark:]:
                 guest.process.stdin.write(b"f")
@@ -155,13 +156,13 @@ def bass_test():
                 take = "bass-" + name.split(".")[0]
                 guest.send(f"run record device=loop0 {take} 4 &0")
                 guest.pump(2)
-                guest.send(f"run fosplay device=loop0 bass=9 play {name} &0")
+                guest.send(f"run fosplay device=loop0 gfx=off bass=9 play {name} &0")
                 deadline = time.monotonic() + 60
                 while time.monotonic() < deadline:
                     if "record" not in ask(guest, "ps", "fos> "):
                         break
             # loop0 has two channels: the upmix must say so and play stereo, not fail.
-            mark = guest.send("run fosplay device=loop0 upmix=on play b1k.flac &0")
+            mark = guest.send("run fosplay device=loop0 gfx=off upmix=on play b1k.flac &0")
             guest.wait_for("upmix needs 6 playback channels; the device has 2", 30, since=mark)
         finally:
             guest.stop()
@@ -175,6 +176,61 @@ def bass_test():
             level[name] = (sum(x * x for x in middle) / len(middle)) ** 0.5
         ratio = level["b100.flac"] / level["b1k.flac"]
         check(2.2 < ratio < 3.4, f"bass=9 makes 100 Hz {20 * __import__('math').log10(ratio):.1f} dB above 1 kHz (wanted 9)", str(level))
+
+
+def screenshot(monitor_path, tmp, name):
+    shot = Path(tmp) / name
+    monitor(str(monitor_path), f"screendump {shot}")
+    for _ in range(50):
+        if shot.exists() and shot.stat().st_size > 1000:
+            break
+        time.sleep(0.1)
+    time.sleep(0.3)
+    return read_ppm(shot)
+
+
+def ui_test():
+    """The touch screen (QEMU cannot send touch events, so the picture and the keys are what is checked): while a two-file playlist
+    plays the screen holds the amber highlight of the current list row; space pauses and the Play button turns amber too; q hands
+    the screen back to the console."""
+    amber = (255, 179, 71)
+    with tempfile.TemporaryDirectory() as tmp:
+        files = {}
+        for name in ("u1.flac", "u2.flac"):
+            path = Path(tmp) / name
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=500:sample_rate=48000:duration=60", "-ac", "2",
+                            "-sample_fmt", "s16", "-metadata", f"title=Screen {name[1]}", str(path)], check=True)
+            files[name] = path.read_bytes()
+        monitor_path = Path(tmp) / "monitor"
+        guest = Guest(tmp, "ui", MAC, extra=("-monitor", f"unix:{monitor_path},server,nowait"), files=files)
+        try:
+            guest.wait_for("M3 complete")
+            guest.wait_for("fos> ")
+            mark = guest.send("run fosplay device=loop0 play u1.flac u2.flac")
+            guest.wait_for("[1/2] u1.flac", 30, since=mark)
+            guest.pump(2)
+            width, height, pixel = screenshot(monitor_path, tmp, "playing.ppm")
+
+            def count(pixel):
+                return sum(1 for y in range(0, height, 2) for x in range(0, width, 2) if pixel(x, y) == amber)
+
+            playing = count(pixel)
+            check(pixel(width - 2, height - 2) == (12, 16, 20), "the picture has the panel's dark background", str(pixel(width - 2, height - 2)))
+            check(playing > 300, f"the current playlist row is highlighted ({playing} amber samples)", "")
+            guest.process.stdin.write(b" ")
+            guest.process.stdin.flush()
+            guest.pump(2)
+            _, _, pixel = screenshot(monitor_path, tmp, "paused.ppm")
+            paused = count(pixel)
+            check(paused > playing + 300, f"pausing lights the Play button ({playing} -> {paused} amber samples)", "")
+            guest.process.stdin.write(b"q")
+            guest.process.stdin.flush()
+            guest.wait_for("Tape returned", 30, since=mark)
+            guest.pump(1)
+            _, _, pixel = screenshot(monitor_path, tmp, "after.ppm")
+            check(count(pixel) < 20, "the screen is the console's again after q", "")
+        finally:
+            guest.stop()
 
 
 if __name__ == "__main__":

@@ -10,7 +10,10 @@
 #![no_std]
 #![no_main]
 
-use outfx::{Bass, Options, Upmix};
+mod ui;
+
+use outfx::{Bass, BassBoost, Options, Upmix};
+use ui::{Action, Ui};
 use audio_decode::{Decode, Source, SourceError, flac, mp3, opus, resample::Resampler, wav};
 use smb::{Client, Error, Handle, Transport};
 use tape_ip::net;
@@ -74,6 +77,12 @@ static mut EFFECTS: Options = Options::OFF;
 /// The 2 to 5.1 upmix (a 64 KiB delay line, so it lives here); `Output::upmix` says whether it is in use.
 static mut UPMIX: Upmix = Upmix::new();
 static mut RESAMPLER: Resampler = Resampler::new();
+/// The touch screen (`gfx=off` or no pixel screen: none) and the number of the screen it takes (`screen=N`).
+static mut UI: Option<Ui> = None;
+static mut GFX: bool = true;
+static mut UI_SCREEN: u32 = 0;
+/// The volume slider, 0..1, kept across devices restarts.
+static mut VOLUME: f32 = 1.0;
 
 /// libopus for the Ogg Opus reader in `audio-decode`.
 struct OpusCodec {
@@ -188,6 +197,15 @@ fn set_option(key: &str, value: &str) -> Result<(), &'static str> {
             "rate" => match value.parse::<u32>() {
                 Ok(rate) if (8000..=384_000).contains(&rate) => FORCED_RATE = rate,
                 _ => return Err("rate= needs a sample rate such as 48000"),
+            },
+            "gfx" => match value {
+                "on" => GFX = true,
+                "off" => GFX = false,
+                _ => return Err("gfx= takes on or off"),
+            },
+            "screen" => match value.parse::<u32>() {
+                Ok(number) => UI_SCREEN = number,
+                _ => return Err("screen= needs a screen number"),
             },
             _ => {
                 if !EFFECTS.set(key, value, tape_rt::parse_f32)? {
@@ -312,6 +330,10 @@ enum Outcome {
     Failed,
     /// Jump by this many seconds (handled inside the track, never returned from it).
     Skip(i32),
+    /// Seek to this permille of the track (likewise handled inside it).
+    SeekTo(u32),
+    /// Play this playlist entry.
+    Jump(usize),
 }
 
 /// The device end of playback: converts frames to the device's format and writes them, watching the keys between
@@ -329,6 +351,31 @@ struct Output {
     bass: Option<Bass>,
     /// `UPMIX` feeds the first six channels (L R C LFE Ls Rs); the device has at least six.
     upmix: bool,
+    /// The device has at least six outputs, so the upmix can be switched on.
+    wide: bool,
+    rate: u32,
+    gain: f32,
+    /// The largest left and right sample since the screen last looked.
+    peak: [f32; 2],
+    /// How far the decoder has got in the track, seconds (what is heard is `queued` earlier).
+    decoded: f32,
+    /// Ring space when it holds nothing.
+    empty: usize,
+}
+
+/// A line under the title on the screen (what went wrong with a track); the next track clears it.
+fn show_message(message: core::fmt::Arguments) {
+    use core::fmt::Write;
+    #[allow(static_mut_refs)]
+    if let Some(ui) = unsafe { (*core::ptr::addr_of_mut!(UI)).as_mut() } {
+        ui.view.message.clear();
+        let _ = ui.view.message.write_fmt(message);
+    }
+}
+
+/// The gain of the volume slider: `ui::VOLUME_RANGE_DB` below full scale at the bottom, silent at its very end.
+fn volume_gain(slider: f32) -> f32 {
+    if slider < 0.01 { 0.0 } else { dsp::level::db_amplitude((slider - 1.0) * ui::VOLUME_RANGE_DB) }
 }
 
 impl Output {
@@ -336,6 +383,8 @@ impl Output {
         if let Some(bass) = self.bass.as_mut() {
             frame = bass.process(frame);
         }
+        frame = [frame[0] * self.gain, frame[1] * self.gain];
+        self.peak = [self.peak[0].max(frame[0].abs()), self.peak[1].max(frame[1].abs())];
         if self.staged + self.channels * self.slot > self.staging.len() {
             self.flush();
         }
@@ -366,9 +415,99 @@ impl Output {
         }
     }
 
+    /// Carries out what a finger asked for.
+    fn apply(&mut self, action: Action) {
+        #[allow(static_mut_refs)]
+        let effects = unsafe { &mut *core::ptr::addr_of_mut!(EFFECTS) };
+        match action {
+            Action::Previous => self.command = Some(Outcome::Previous),
+            Action::Next => self.command = Some(Outcome::Next),
+            Action::Back => self.command = Some(Outcome::Skip(-SKIP_SECONDS)),
+            Action::Forward => self.command = Some(Outcome::Skip(SKIP_SECONDS)),
+            Action::Stop => self.command = Some(Outcome::Stop),
+            Action::PlayPause => self.paused = !self.paused,
+            Action::Seek(permille) => self.command = Some(Outcome::SeekTo(permille)),
+            Action::Jump(index) => self.command = Some(Outcome::Jump(index)),
+            Action::Volume(slider) => {
+                unsafe { VOLUME = slider };
+                self.gain = volume_gain(slider);
+            }
+            Action::Bass(db) => {
+                let db = db.clamp(0.0, 12.0);
+                effects.bass = BassBoost { gain_db: db, ..effects.bass };
+                match (self.bass.as_mut(), db > 0.0) {
+                    (Some(bass), true) => bass.set(effects.bass),
+                    _ => self.bass = Bass::new(self.rate, effects.bass),
+                }
+            }
+            Action::Width(width) => {
+                effects.surround.width = width;
+                self.retune();
+            }
+            Action::Upmix if self.wide => {
+                self.upmix = !self.upmix;
+                effects.upmix = self.upmix;
+                #[allow(static_mut_refs)]
+                unsafe { (*core::ptr::addr_of_mut!(UPMIX)).configure(self.rate, effects.surround) };
+            }
+            Action::Center => {
+                effects.surround.center = !effects.surround.center;
+                self.retune();
+            }
+            Action::Upmix => {}
+        }
+    }
+
+    /// Hands the upmix its settings again without clearing its delay line.
+    fn retune(&mut self) {
+        if self.upmix {
+            #[allow(static_mut_refs)]
+            unsafe { (*core::ptr::addr_of_mut!(UPMIX)).tune(self.rate, EFFECTS.surround) };
+        }
+    }
+
+    /// Fingers and the picture: runs often, draws at most every 50 ms and only when something changed.
+    fn service_ui(&mut self) {
+        #[allow(static_mut_refs)]
+        let Some(ui) = (unsafe { (*core::ptr::addr_of_mut!(UI)).as_mut() }) else { return };
+        while let Some(action) = ui.next_action() {
+            self.apply(action);
+        }
+        if !ui.due() {
+            return;
+        }
+        let mut info = AudioInfo::default();
+        (self.api.audio_info)(&mut info);
+        let queued = (self.empty.saturating_sub(info.playback_space as usize) / (self.channels * self.slot).max(1)) as f32 / self.rate.max(1) as f32;
+        let effects = unsafe { EFFECTS };
+        let view = &mut ui.view;
+        view.seconds = (self.decoded - queued).max(0.0);
+        view.paused = self.paused;
+        view.level = [view.level[0] * 0.8, view.level[1] * 0.8];
+        view.level = [view.level[0].max(self.peak[0]), view.level[1].max(self.peak[1])];
+        self.peak = [0.0; 2];
+        view.volume = unsafe { VOLUME };
+        view.bass_db = effects.bass.gain_db;
+        view.width = effects.surround.width;
+        view.center = effects.surround.center;
+        view.upmix = self.upmix;
+        view.upmix_ok = self.wide;
+        #[allow(static_mut_refs)]
+        let list = unsafe { &*core::ptr::addr_of!(PLAYLIST) };
+        ui.draw(|index| {
+            let name = list.get(index);
+            let name = name.rsplit('/').next().unwrap_or(name);
+            name.rsplit_once('.').map_or(name, |(stem, _)| stem)
+        });
+    }
+
     /// Reads the keys; while paused it waits here, so nothing is decoded or written.
     fn poll(&mut self) {
         loop {
+            self.service_ui();
+            if self.command.is_some() {
+                return;
+            }
             let key = (self.api.read_key)();
             let command = match key {
                 KEY_NONE if self.paused => {
@@ -586,6 +725,10 @@ fn run(api: &'static TapeApi, mut client: Option<&mut Player>) {
     let total = list.count;
     let mut index = 0;
     let mut stopped = false;
+    #[allow(static_mut_refs)]
+    unsafe {
+        *core::ptr::addr_of_mut!(UI) = if GFX { Ui::open(api, UI_SCREEN) } else { None };
+    }
     while index < total {
         let path = list.get(index);
         let outcome = match client.as_deref_mut() {
@@ -601,8 +744,9 @@ fn run(api: &'static TapeApi, mut client: Option<&mut Player>) {
             None => play_local(&mut session, path, index, total),
         };
         match outcome {
-            Outcome::Done | Outcome::Next | Outcome::Failed | Outcome::Skip(_) => index += 1,
+            Outcome::Done | Outcome::Next | Outcome::Failed | Outcome::Skip(_) | Outcome::SeekTo(_) => index += 1,
             Outcome::Previous => index = index.saturating_sub(1),
+            Outcome::Jump(target) => index = target.min(total.saturating_sub(1)),
             Outcome::Stop => {
                 stopped = true;
                 break;
@@ -610,6 +754,10 @@ fn run(api: &'static TapeApi, mut client: Option<&mut Player>) {
         }
     }
     session.close(!stopped, true);
+    #[allow(static_mut_refs)]
+    if let Some(ui) = unsafe { (*core::ptr::addr_of_mut!(UI)).take() } {
+        ui.close();
+    }
 }
 
 fn open_remote(client: &mut Player, path: &str) -> Option<Handle> {
@@ -665,6 +813,7 @@ fn play_track(session: &mut Session, path: &str, index: usize, total: usize) -> 
     let decoder = decoder_for(path);
     if let Err(error) = decoder.open() {
         println!("fosplay: {path}: {}.", error.describe());
+        show_message(format_args!("{path}: {}", error.describe()));
         return Outcome::Failed;
     }
     let rate = decoder.sample_rate();
@@ -731,6 +880,12 @@ fn play_track(session: &mut Session, path: &str, index: usize, total: usize) -> 
             command: None,
             bass: Bass::new(session.out_rate, unsafe { EFFECTS }.bass),
             upmix,
+            wide: info.playback_channels >= 6,
+            rate: session.out_rate,
+            gain: volume_gain(unsafe { VOLUME }),
+            peak: [0.0; 2],
+            decoded: 0.0,
+            empty: session.empty,
         });
     }
     let out_rate = session.out_rate;
@@ -751,7 +906,26 @@ fn play_track(session: &mut Session, path: &str, index: usize, total: usize) -> 
         );
     }
     session.tracks += 1;
+    #[allow(static_mut_refs)]
+    if let Some(ui) = unsafe { (*core::ptr::addr_of_mut!(UI)).as_mut() } {
+        use core::fmt::Write;
+        let view = &mut ui.view;
+        view.title.clear();
+        view.detail.clear();
+        view.format.clear();
+        view.message.clear();
+        let base = path.rsplit('/').next().unwrap_or(path);
+        let _ = write!(view.title, "{}", if tags.title.is_empty() { base } else { tags.title.as_str() });
+        let _ = write!(view.detail, "{}{}{}", tags.artist.as_str(), if tags.artist.is_empty() || tags.album.is_empty() { "" } else { " - " }, tags.album.as_str());
+        let _ = write!(view.format, "{depth} {rate} Hz, {} ch{}, {out_rate} Hz {}{}-bit", decoder.channels(),
+                       if out_rate == rate { "" } else { " (resampled)" }, if float { "float " } else { "" }, info.playback_bits);
+        view.index = index;
+        view.count = total;
+        view.total = decoder.total_samples() as f32 / rate as f32;
+        view.seconds = 0.0;
+    }
     let mut output = session.output.take().unwrap();
+    output.decoded = 0.0;
     output.command = None;
     #[allow(static_mut_refs)]
     let resampler = unsafe { &mut *core::ptr::addr_of_mut!(RESAMPLER) };
@@ -778,15 +952,19 @@ fn play_track(session: &mut Session, path: &str, index: usize, total: usize) -> 
                     resampler.push([frame[0], frame[1]], &mut |sample| output.frame(sample));
                 }
             }
-            if let Some(Outcome::Skip(seconds)) = output.command {
-                output.command = None;
-                let target = (decoder.position() as i64 + seconds as i64 * rate as i64).max(0) as u64;
+            if let Some(Outcome::Skip(_) | Outcome::SeekTo(_)) = output.command {
+                let target = match output.command.take() {
+                    Some(Outcome::Skip(seconds)) => (decoder.position() as i64 + seconds as i64 * rate as i64).max(0) as u64,
+                    Some(Outcome::SeekTo(permille)) => decoder.total_samples() * permille as u64 / 1000,
+                    _ => 0,
+                };
                 match decoder.seek(target) {
                     Ok(start) => {
                         // What is queued is from before the jump: drop what is staged, keep the device running.
                         output.staged = 0;
                         resampler.reset();
                         output.reset_effects();
+                        output.decoded = start as f32 / rate as f32;
                         println!("fosplay: at {}:{:02} of {}:{:02}.", start / rate as u64 / 60, start / rate as u64 % 60,
                                  decoder.total_samples() / rate as u64 / 60, decoder.total_samples() / rate as u64 % 60);
                         continue 'blocks;
@@ -802,6 +980,7 @@ fn play_track(session: &mut Session, path: &str, index: usize, total: usize) -> 
             }
             at += step;
         }
+        output.decoded = decoder.position() as f32 / rate as f32;
     }
     if output.command.is_none() && failure.is_none() && out_rate != rate {
         resampler.finish(&mut |sample| output.frame(sample));
@@ -813,10 +992,11 @@ fn play_track(session: &mut Session, path: &str, index: usize, total: usize) -> 
     session.output = Some(output);
     if let Some(why) = failure {
         println!("fosplay: stopped: {why}.");
+        show_message(format_args!("stopped: {why}"));
         return Outcome::Failed;
     }
     match command {
-        None | Some(Outcome::Skip(_)) => Outcome::Done,
+        None | Some(Outcome::Skip(_) | Outcome::SeekTo(_)) => Outcome::Done,
         // Next and previous cut the queued audio at once: stopping the device empties its ring.
         Some(outcome) => {
             if outcome != Outcome::Stop {
@@ -838,6 +1018,10 @@ tape_rt::tape_help!(br#"fosplay: play audio from an SMB share (guest access).
   A directory plays its .flac, .mp3, .wav and .opus files in name order.
   Keys: n next, p previous, space pause, f / b jump 10 s forward / back,
   Esc or q stop.
+  With a pixel screen it also shows a touch panel: title, a progress bar
+  (touch to seek), transport buttons, the playlist (touch to jump), a level
+  meter, volume, bass boost and the 5.1 upmix switches. gfx=off hides it,
+  screen=N picks the screen.
 
   HOST is an IPv4 address or a name (asked of the DNS server DHCP names, else
   the gateway); our address comes from DHCP on the NIC chosen with

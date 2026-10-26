@@ -84,7 +84,7 @@ def play_directory(directory):
             ask(guest, "nic use 2", "Using NIC 2")
             guest.send("run record device=loop0 smb 8 &0")
             guest.pump(2)
-            guest.send(f"run fosplay device=loop0 play //{HOST}/{SHARE}/{directory} &2")
+            guest.send(f"run fosplay device=loop0 gfx=off play //{HOST}/{SHARE}/{directory} &2")
             guest.wait_for("Service record ended", 60)
             guest.pump(1)
             text = guest.text()

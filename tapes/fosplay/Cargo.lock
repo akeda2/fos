@@ -15,6 +15,18 @@ name = "audio-sample"
 version = "0.1.0"
 
 [[package]]
+name = "audio-screen"
+version = "0.1.0"
+dependencies = [
+ "audio-sample",
+ "audio-wire",
+ "dsp",
+ "gfx",
+ "noise",
+ "tape-rt",
+]
+
+[[package]]
 name = "audio-wire"
 version = "0.1.0"
 dependencies = [
@@ -38,6 +50,10 @@ version = "0.1.0"
 dependencies = [
  "audio-decode",
  "audio-sample",
+ "audio-screen",
+ "dsp",
+ "gfx",
+ "instrument-rt",
  "opus-codec",
  "outfx",
  "smb",
@@ -47,10 +63,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "gfx"
+version = "0.1.0"
+dependencies = [
+ "dsp",
+]
+
+[[package]]
+name = "instrument-rt"
+version = "0.1.0"
+dependencies = [
+ "audio-sample",
+ "audio-screen",
+ "gfx",
+ "tape-rt",
+]
+
+[[package]]
 name = "nanomp3-core"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63fa2238e662d3d3c1a71168b3278f23422cf9bf76f6943ee6b1c2581d74eb5c"
+
+[[package]]
+name = "noise"
+version = "0.1.0"
+dependencies = [
+ "audio-sample",
+ "dsp",
+]
 
 [[package]]
 name = "opus-codec"

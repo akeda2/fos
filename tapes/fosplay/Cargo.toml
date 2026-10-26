@@ -16,6 +16,10 @@ audio-decode = { path = "../../crates/audio-decode" }
 audio-sample = { path = "../../crates/audio-sample" }
 outfx = { path = "../../crates/outfx" }
 opus-codec = { path = "../../crates/opus-codec" }
+audio-screen = { path = "../../crates/audio-screen" }
+gfx = { path = "../../crates/gfx" }
+instrument-rt = { path = "../../crates/instrument-rt" }
+dsp = { path = "../../crates/dsp" }
 
 [profile.release]
 panic = "abort"

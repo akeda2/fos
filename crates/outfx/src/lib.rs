@@ -74,6 +74,13 @@ impl Bass {
         Some(Bass { filter })
     }
 
+    /// A new boost without clearing the filter's state (a touch slider turned while the music plays); the caller makes sure
+    /// `bass.gain_db` is above 0 (`new` says `None` otherwise).
+    pub fn set(&mut self, bass: BassBoost) {
+        self.filter.set_bass_boost(bass);
+        self.filter.set_trim_db(-bass.gain_db);
+    }
+
     pub fn process(&mut self, frame: [f32; 2]) -> [f32; 2] {
         let (left, right) = self.filter.process_frame(frame[0], frame[1]);
         [left, right]

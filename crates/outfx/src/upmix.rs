@@ -84,6 +84,13 @@ impl Upmix {
 
     /// Sets the stream's rate and the settings and clears all history.
     pub fn configure(&mut self, rate: u32, settings: UpmixSettings) {
+        self.tune(rate, settings);
+        self.delay.fill(0.0);
+        self.write = 0;
+    }
+
+    /// Like `configure` but keeps the history, so a setting can be turned while the music plays (a touch slider).
+    pub fn tune(&mut self, rate: u32, settings: UpmixSettings) {
         let rate = rate as f64;
         let taps = |ms: f32| ((ms as f64 * rate / 1000.0) as usize).min(DELAY_CAPACITY - 1);
         let q = core::f64::consts::FRAC_1_SQRT_2;
@@ -92,8 +99,6 @@ impl Upmix {
         self.settings = settings;
         self.side = LowPass::new(SURROUND_CUTOFF_HZ, rate, q);
         self.lfe = [lfe, lfe];
-        self.delay.fill(0.0);
-        self.write = 0;
         self.ls_taps = taps(delay_ms);
         self.rs_taps = taps(delay_ms + RS_EXTRA_MS);
     }
