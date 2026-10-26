@@ -12,8 +12,8 @@
 
 mod ui;
 
-use outfx::{Bass, BassBoost, Options, Upmix};
-use ui::{Action, Ui};
+use outfx::{Bass, Layout, Options, Upmix};
+use ui::{Action, Page, Ui};
 use audio_decode::{Decode, Source, SourceError, flac, mp3, opus, resample::Resampler, wav};
 use smb::{Client, Error, Handle, Transport};
 use tape_ip::net;
@@ -83,6 +83,15 @@ static mut GFX: bool = true;
 static mut UI_SCREEN: u32 = 0;
 /// The volume slider, 0..1, kept across devices restarts.
 static mut VOLUME: f32 = 1.0;
+/// Settings changed since the file was written.
+static mut DIRTY: bool = false;
+/// Started with `browse`: Stop goes back to the list instead of leaving the tape.
+static mut QUIT: bool = false;
+/// The last share and folder browsed, `//HOST/SHARE/DIR`; kept in the settings file.
+static mut SAVED_SHARE: Line<200> = Line::new();
+/// The folder the browser page shows, and where (`remote`: a share, else a FOSFS or FAT volume named by `path`).
+static mut BROWSER: Browser = Browser { path: Line::new(), remote: false, host: Line::new(), share: Line::new(), loaded: false, pick: Line::new(), picked: false };
+const CONFIG_FILE: &str = "fosplay.cfg";
 
 /// libopus for the Ogg Opus reader in `audio-decode`.
 struct OpusCodec {
@@ -161,6 +170,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         Err(reason) => return println!("fosplay: {reason}."),
     };
     let mut arguments = arguments;
+    load_settings(api);
     // Options come before the command: rate=HZ bass=DB bassfreq=HZ bassq=Q.
     while let Some((word, after)) = arguments.split_once(char::is_whitespace).or(Some((arguments, ""))) {
         let Some((key, value)) = word.split_once('=') else { break };
@@ -171,8 +181,15 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     }
     let mut words = arguments.split_whitespace();
     let command = words.next().unwrap_or("");
+    if command.is_empty() {
+        return browse_command(api, words);
+    }
     if command == "play" {
-        return play_command(api, words);
+        play_command(api, words);
+        if unsafe { DIRTY } {
+            save_settings(api);
+        }
+        return;
     }
     if command == "browse" {
         return browse_command(api, words);
@@ -201,6 +218,14 @@ fn set_option(key: &str, value: &str) -> Result<(), &'static str> {
                 Ok(rate) if (8000..=384_000).contains(&rate) => FORCED_RATE = rate,
                 _ => return Err("rate= needs a sample rate such as 48000"),
             },
+            "volume" => match tape_rt::parse_f32(value) {
+                Some(volume) if (0.0..=1.0).contains(&volume) => VOLUME = volume,
+                _ => return Err("volume= needs 0 to 1"),
+            },
+            "share" => {
+                SAVED_SHARE.clear();
+                let _ = core::fmt::Write::write_str(&mut SAVED_SHARE, value);
+            }
             "gfx" => match value {
                 "on" => GFX = true,
                 "off" => GFX = false,
@@ -224,7 +249,7 @@ fn usage() {
     println!("usage: fosplay ls HOST SHARE [DIR] | cat HOST SHARE FILE");
     println!("       fosplay [device=N|loopN] [OPTIONS] play //HOST/SHARE[/FILE|DIR]");
     println!("       fosplay [device=N|loopN] [OPTIONS] play NAME...");
-    println!("       fosplay [device=N|loopN] [OPTIONS] browse [//HOST/SHARE[/DIR]]");
+    println!("       fosplay [device=N|loopN] [OPTIONS] [browse [//HOST/SHARE[/DIR]|local]]");
 }
 
 type Player = Client<Link, { 64 * 1024 + 1024 }>;
@@ -338,6 +363,10 @@ enum Outcome {
     SeekTo(u32),
     /// Play this playlist entry.
     Jump(usize),
+    /// The browser picked something: the playlist is rebuilt from its folder (`take_pick`).
+    Load,
+    /// Leave the tape.
+    Quit,
 }
 
 /// The device end of playback: converts frames to the device's format and writes them, watching the keys between
@@ -353,10 +382,8 @@ struct Output {
     command: Option<Outcome>,
     /// The bass boost, when asked for.
     bass: Option<Bass>,
-    /// `UPMIX` feeds the first six channels (L R C LFE Ls Rs); the device has at least six.
+    /// `UPMIX` feeds the first channels of the layout (5.1: L R C LFE Ls Rs); the device has that many.
     upmix: bool,
-    /// The device has at least six outputs, so the upmix can be switched on.
-    wide: bool,
     rate: u32,
     gain: f32,
     /// The largest left and right sample since the screen last looked.
@@ -382,6 +409,265 @@ fn volume_gain(slider: f32) -> f32 {
     if slider < 0.01 { 0.0 } else { dsp::level::db_amplitude((slider - 1.0) * ui::VOLUME_RANGE_DB) }
 }
 
+/// What the browser page shows: a folder of a share (`remote`) or a volume of this machine.
+struct Browser {
+    path: Line<200>,
+    remote: bool,
+    host: Line<64>,
+    share: Line<64>,
+    /// `ENTRIES` holds `path`'s listing.
+    loaded: bool,
+    /// What a tap chose to play, `""` for the whole folder; `picked` says there is one.
+    pick: Line<132>,
+    picked: bool,
+}
+
+fn browser() -> &'static mut Browser {
+    #[allow(static_mut_refs)]
+    unsafe { &mut *core::ptr::addr_of_mut!(BROWSER) }
+}
+
+fn client() -> &'static mut Player {
+    #[allow(static_mut_refs)]
+    unsafe { &mut *core::ptr::addr_of_mut!(CLIENT) }
+}
+
+fn effects() -> &'static mut Options {
+    #[allow(static_mut_refs)]
+    unsafe { &mut *core::ptr::addr_of_mut!(EFFECTS) }
+}
+
+/// Applies a settings action (a slider, a switch) to what is remembered; the sound follows via `Output::sync_effects`.
+fn change_setting(action: Action, device_channels: usize) {
+    let effects = effects();
+    match action {
+        Action::Volume(slider) => unsafe { VOLUME = slider },
+        Action::Bass(db) => effects.bass.gain_db = db.clamp(0.0, ui::BASS_MAX_DB),
+        Action::Width(width) => effects.surround.width = width.clamp(0.0, 1.0),
+        Action::Lfe(hz) => effects.surround.lfe_hz = hz.clamp(ui::LFE_RANGE.0, ui::LFE_RANGE.1),
+        Action::Delay(ms) => effects.surround.delay_ms = ms.clamp(ui::DELAY_RANGE.0, ui::DELAY_RANGE.1),
+        Action::Center => effects.surround.center = !effects.surround.center,
+        Action::Upmix => effects.upmix = !effects.upmix,
+        Action::Layout => {
+            // The next layout the device has the outputs for.
+            let all = Layout::ALL;
+            let at = all.iter().position(|layout| *layout == effects.surround.layout).unwrap_or(0);
+            if let Some(next) = (1..=all.len()).map(|step| all[(at + step) % all.len()]).find(|layout| layout.channels() <= device_channels) {
+                effects.surround.layout = next;
+            }
+        }
+        _ => return,
+    }
+    unsafe { DIRTY = true };
+}
+
+/// Copies the settings (and what the device allows) to the screen.
+fn show_settings(view: &mut ui::View, device_channels: usize) {
+    let effects = *effects();
+    let layout = effects.surround.layout;
+    view.volume = unsafe { VOLUME };
+    view.bass_db = effects.bass.gain_db;
+    view.width = effects.surround.width;
+    view.lfe_hz = effects.surround.lfe_hz;
+    view.delay_ms = effects.surround.delay_ms;
+    view.center = effects.surround.center;
+    view.layout = layout.name();
+    view.has_center = layout.has_center();
+    view.upmix_ok = layout.channels() <= device_channels;
+    view.upmix = effects.upmix && view.upmix_ok;
+}
+
+/// A layout the device can carry (the saved one may be too wide for this device); false when none fits.
+fn fit_layout(device_channels: usize) -> bool {
+    let effects = effects();
+    if effects.surround.layout.channels() <= device_channels {
+        return true;
+    }
+    match Layout::fitting(device_channels) {
+        Some(layout) => {
+            effects.surround.layout = layout;
+            true
+        }
+        None => false,
+    }
+}
+
+fn draw_ui(ui: &mut Ui) {
+    #[allow(static_mut_refs)]
+    let (list, entries) = unsafe { (&*core::ptr::addr_of!(PLAYLIST), &*core::ptr::addr_of!(ENTRIES)) };
+    ui.draw(
+        |index| {
+            let name = list.get(index);
+            let name = name.rsplit('/').next().unwrap_or(name);
+            name.rsplit_once('.').map_or(name, |(stem, _)| stem)
+        },
+        |index| match entries.get(index) {
+            "../" => ".. (up)",
+            name => name,
+        },
+    );
+}
+
+/// Work that follows a page change: the browser lists its folder when first shown, and leaving the settings saves them.
+fn page_changed(api: &TapeApi, ui: &mut Ui) {
+    static mut LAST: Page = Page::Player;
+    let page = ui.view.page;
+    unsafe {
+        if LAST == Page::Settings && page != Page::Settings && DIRTY {
+            save_settings(api);
+        }
+        LAST = page;
+    }
+    if page == Page::Browse && !browser().loaded {
+        browser_load(api, ui);
+    }
+}
+
+/// `fosplay.cfg`: one `key=value` per line, the command-line options plus `volume` and `share`.
+fn save_settings(api: &TapeApi) {
+    use core::fmt::Write;
+    let effects = *effects();
+    let mut body = Line::<1024>::new();
+    let _ = write!(body, "# fosplay settings, rewritten when they change\n");
+    let _ = write!(body, "volume={:.2}\nbass={:.1}\nbassfreq={:.0}\nbassq={:.2}\n", unsafe { VOLUME }, effects.bass.gain_db, effects.bass.hz, effects.bass.q);
+    let _ = write!(body, "upmix={}\ncenter={}\nwidth={:.2}\nlfe={:.0}\ndelay={:.0}\nlayout={}\n", if effects.upmix { "on" } else { "off" }, if effects.surround.center { "on" } else { "off" },
+                   effects.surround.width, effects.surround.lfe_hz, effects.surround.delay_ms, effects.surround.layout.name());
+    #[allow(static_mut_refs)]
+    let share = unsafe { SAVED_SHARE.as_str() };
+    if !share.is_empty() {
+        let _ = write!(body, "share={share}\n");
+    }
+    if (api.fs_write)(CONFIG_FILE.as_ptr(), CONFIG_FILE.len(), body.as_str().as_ptr(), body.as_str().len()) == 0 {
+        unsafe { DIRTY = false };
+    }
+}
+
+/// Reads `fosplay.cfg` if there is one; a line it does not understand is skipped.
+fn load_settings(api: &TapeApi) {
+    let capacity = 4096;
+    let buffer = (api.alloc)(capacity);
+    if buffer == 0 {
+        return;
+    }
+    let length = (api.fs_read)(CONFIG_FILE.as_ptr(), CONFIG_FILE.len(), buffer as *mut u8, capacity);
+    if length > 0 {
+        let text = unsafe { core::slice::from_raw_parts(buffer as *const u8, length as usize) };
+        for line in core::str::from_utf8(text).unwrap_or("").lines() {
+            if let Some((key, value)) = line.split_once('=') {
+                let _ = set_option(key.trim(), value.trim());
+            }
+        }
+    }
+    (api.free)(buffer, capacity);
+}
+
+/// Points the browser at `path` on a share (or, without one, on a volume of this machine) and remembers the share.
+fn set_browser(share: Option<(&str, &str)>, path: &str) {
+    use core::fmt::Write;
+    let browser = browser();
+    let path = path.trim_matches('/');
+    browser.path.clear();
+    let _ = write!(browser.path, "{path}");
+    browser.loaded = false;
+    browser.host.clear();
+    browser.share.clear();
+    browser.remote = share.is_some();
+    if let Some((host, name)) = share {
+        let _ = write!(browser.host, "{host}");
+        let _ = write!(browser.share, "{name}");
+        #[allow(static_mut_refs)]
+        unsafe {
+            SAVED_SHARE.clear();
+            let _ = write!(SAVED_SHARE, "//{host}/{name}{}{path}", if path.is_empty() { "" } else { "/" });
+            DIRTY = true;
+        }
+    }
+}
+
+/// Fills `ENTRIES` with the browser's folder and tells the screen.
+fn browser_load(api: &TapeApi, ui: &mut Ui) {
+    use core::fmt::Write;
+    let browser = browser();
+    ui.view.message.clear();
+    load_entries(api, browser.remote.then(client), browser.path.as_str());
+    #[allow(static_mut_refs)]
+    let count = unsafe { (*core::ptr::addr_of!(ENTRIES)).count };
+    ui.view.entries = count;
+    ui.view.folder.clear();
+    if browser.remote {
+        let _ = write!(ui.view.folder, "//{}/{}/{}", browser.host.as_str(), browser.share.as_str(), browser.path.as_str());
+    } else {
+        let _ = write!(ui.view.folder, "{}", if browser.path.is_empty() { "FOSFS" } else { browser.path.as_str() });
+    }
+    ui.reset_list();
+    browser.loaded = true;
+    if unsafe { DIRTY } && browser.remote {
+        save_settings(api);
+    }
+}
+
+/// A tap or key in the browser. True when it chose something to play (`take_pick` then builds the playlist).
+fn browser_action(api: &TapeApi, action: Action) -> bool {
+    use core::fmt::Write;
+    let browser = browser();
+    let Some(ui) = ui() else { return false };
+    #[allow(static_mut_refs)]
+    let entries = unsafe { &*core::ptr::addr_of!(ENTRIES) };
+    let mut next = Line::<200>::new();
+    let remote = browser.remote;
+    match action {
+        Action::PlayAll => {
+            browser.pick.clear();
+            browser.picked = true;
+            return true;
+        }
+        Action::Parent if browser.remote => {
+            let _ = write!(next, "{}", parent_of(browser.path.as_str()));
+        }
+        Action::Open(index) if index < entries.count => {
+            let name = entries.get(index);
+            if name == "../" {
+                let _ = write!(next, "{}", parent_of(browser.path.as_str()));
+            } else if let Some(folder) = name.strip_suffix('/') {
+                let join = if browser.path.is_empty() || !browser.remote { "" } else { "/" };
+                let _ = write!(next, "{}{join}{folder}", browser.path.as_str());
+            } else {
+                browser.pick.clear();
+                let _ = write!(browser.pick, "{name}");
+                browser.picked = true;
+                return true;
+            }
+        }
+        _ => return false,
+    }
+    let mut host = Line::<64>::new();
+    let mut name = Line::<64>::new();
+    let _ = write!(host, "{}", browser.host.as_str());
+    let _ = write!(name, "{}", browser.share.as_str());
+    set_browser(remote.then(|| (host.as_str(), name.as_str())), next.as_str());
+    browser_load(api, ui);
+    false
+}
+
+/// Builds the playlist from what `browser_action` chose and returns where in it to start; `None` (with a message on the
+/// screen) when the folder has no audio files.
+fn take_pick() -> Option<usize> {
+    let browser = browser();
+    if !core::mem::take(&mut browser.picked) {
+        return None;
+    }
+    let start = playlist_from_entries(browser.path.as_str(), browser.pick.as_str());
+    #[allow(static_mut_refs)]
+    if unsafe { (*core::ptr::addr_of!(PLAYLIST)).count } == 0 {
+        show_message(format_args!("no audio files here"));
+        return None;
+    }
+    if let Some(ui) = ui() {
+        ui.set_page(Page::Player);
+    }
+    Some(start)
+}
+
 impl Output {
     fn frame(&mut self, mut frame: [f32; 2]) {
         if let Some(bass) = self.bass.as_mut() {
@@ -392,6 +678,7 @@ impl Output {
         if self.staged + self.channels * self.slot > self.staging.len() {
             self.flush();
         }
+        let used = effects().surround.layout.channels();
         let wide = if self.upmix {
             #[allow(static_mut_refs)]
             Some(unsafe { (*core::ptr::addr_of_mut!(UPMIX)).process(frame) })
@@ -400,7 +687,7 @@ impl Output {
         };
         for channel in 0..self.channels {
             let value = match wide {
-                Some(six) => if channel < 6 { six[channel] } else { 0.0 },
+                Some(six) => if channel < used { six[channel] } else { 0.0 },
                 None => if channel < 2 { frame[channel] } else { 0.0 },
             };
             self.format.write(value.clamp(-1.0, 1.0), &mut self.staging[self.staged..self.staged + self.slot]);
@@ -421,8 +708,6 @@ impl Output {
 
     /// Carries out what a finger asked for.
     fn apply(&mut self, action: Action) {
-        #[allow(static_mut_refs)]
-        let effects = unsafe { &mut *core::ptr::addr_of_mut!(EFFECTS) };
         match action {
             Action::Previous => self.command = Some(Outcome::Previous),
             Action::Next => self.command = Some(Outcome::Next),
@@ -432,42 +717,36 @@ impl Output {
             Action::PlayPause => self.paused = !self.paused,
             Action::Seek(permille) => self.command = Some(Outcome::SeekTo(permille)),
             Action::Jump(index) => self.command = Some(Outcome::Jump(index)),
-            Action::Volume(slider) => {
-                unsafe { VOLUME = slider };
-                self.gain = volume_gain(slider);
-            }
-            Action::Bass(db) => {
-                let db = db.clamp(0.0, 12.0);
-                effects.bass = BassBoost { gain_db: db, ..effects.bass };
-                match (self.bass.as_mut(), db > 0.0) {
-                    (Some(bass), true) => bass.set(effects.bass),
-                    _ => self.bass = Bass::new(self.rate, effects.bass),
+            Action::Quit => self.command = Some(Outcome::Quit),
+            Action::Open(_) | Action::Parent | Action::PlayAll => {
+                if browser_action(self.api, action) {
+                    self.command = Some(Outcome::Load);
                 }
             }
-            Action::Width(width) => {
-                effects.surround.width = width;
-                self.retune();
+            _ => {
+                change_setting(action, self.channels);
+                self.sync_effects();
             }
-            Action::Upmix if self.wide => {
-                self.upmix = !self.upmix;
-                effects.upmix = self.upmix;
-                #[allow(static_mut_refs)]
-                unsafe { (*core::ptr::addr_of_mut!(UPMIX)).configure(self.rate, effects.surround) };
-            }
-            Action::Center => {
-                effects.surround.center = !effects.surround.center;
-                self.retune();
-            }
-            Action::Upmix | Action::Open(_) | Action::Parent | Action::PlayAll | Action::Quit => {}
         }
     }
 
-    /// Hands the upmix its settings again without clearing its delay line.
-    fn retune(&mut self) {
-        if self.upmix {
-            #[allow(static_mut_refs)]
-            unsafe { (*core::ptr::addr_of_mut!(UPMIX)).tune(self.rate, EFFECTS.surround) };
+    /// Brings the bass filter and the upmix in line with `EFFECTS` after a setting changed, keeping their history.
+    fn sync_effects(&mut self) {
+        #[allow(static_mut_refs)]
+        let effects = unsafe { &*core::ptr::addr_of!(EFFECTS) };
+        match self.bass.as_mut() {
+            Some(bass) if effects.bass.gain_db > 0.0 => bass.set(effects.bass),
+            _ => self.bass = Bass::new(self.rate, effects.bass),
         }
+        let fits = effects.surround.layout.channels() <= self.channels;
+        #[allow(static_mut_refs)]
+        let upmix = unsafe { &mut *core::ptr::addr_of_mut!(UPMIX) };
+        match (effects.upmix && fits, self.upmix) {
+            (true, false) => upmix.configure(self.rate, effects.surround),
+            (true, true) => upmix.tune(self.rate, effects.surround),
+            _ => {}
+        }
+        self.upmix = effects.upmix && fits;
     }
 
     /// Fingers and the picture: runs often, draws at most every 50 ms and only when something changed.
@@ -477,32 +756,21 @@ impl Output {
         while let Some(action) = ui.next_action() {
             self.apply(action);
         }
+        page_changed(self.api, ui);
         if !ui.due() {
             return;
         }
         let mut info = AudioInfo::default();
         (self.api.audio_info)(&mut info);
         let queued = (self.empty.saturating_sub(info.playback_space as usize) / (self.channels * self.slot).max(1)) as f32 / self.rate.max(1) as f32;
-        let effects = unsafe { EFFECTS };
         let view = &mut ui.view;
         view.seconds = (self.decoded - queued).max(0.0);
         view.paused = self.paused;
         view.level = [view.level[0] * 0.8, view.level[1] * 0.8];
         view.level = [view.level[0].max(self.peak[0]), view.level[1].max(self.peak[1])];
         self.peak = [0.0; 2];
-        view.volume = unsafe { VOLUME };
-        view.bass_db = effects.bass.gain_db;
-        view.width = effects.surround.width;
-        view.center = effects.surround.center;
-        view.upmix = self.upmix;
-        view.upmix_ok = self.wide;
-        #[allow(static_mut_refs)]
-        let list = unsafe { &*core::ptr::addr_of!(PLAYLIST) };
-        ui.draw(|index| {
-            let name = list.get(index);
-            let name = name.rsplit('/').next().unwrap_or(name);
-            name.rsplit_once('.').map_or(name, |(stem, _)| stem)
-        });
+        show_settings(view, self.channels);
+        draw_ui(ui);
     }
 
     /// Reads the keys; while paused it waits here, so nothing is decoded or written.
@@ -662,6 +930,7 @@ fn play_command<'a>(api: &'static TapeApi, mut words: impl Iterator<Item = &'a s
     #[allow(static_mut_refs)]
     let client = unsafe { &mut *core::ptr::addr_of_mut!(CLIENT) };
     let Some(()) = open(api, client, first, share) else { return };
+    set_browser(Some((first, share)), if is_audio(path) { parent_of(path) } else { path });
     if is_audio(path) {
         list.add("", path);
     } else {
@@ -685,6 +954,9 @@ fn play_command<'a>(api: &'static TapeApi, mut words: impl Iterator<Item = &'a s
         println!("fosplay: no .flac, .mp3, .wav or .opus files found.");
     } else {
         run(api, Some(client), 0);
+    }
+    if unsafe { DIRTY } {
+        save_settings(api);
     }
     client.transport().socket.close(api);
 }
@@ -746,10 +1018,7 @@ impl Session {
 
 /// Plays the playlist from entry `start`. Takes the touch screen unless the browser already holds it.
 fn run(api: &'static TapeApi, mut client: Option<&mut Player>, start: usize) {
-    #[allow(static_mut_refs)]
-    let list = unsafe { &*core::ptr::addr_of!(PLAYLIST) };
     let mut session = Session { api, output: None, wanted: 0, out_rate: 0, empty: 0, started: 0, tracks: 0 };
-    let total = list.count;
     let mut index = start;
     let mut stopped = false;
     #[allow(static_mut_refs)]
@@ -757,10 +1026,17 @@ fn run(api: &'static TapeApi, mut client: Option<&mut Player>, start: usize) {
     #[allow(static_mut_refs)]
     unsafe {
         if own_ui {
-            *core::ptr::addr_of_mut!(UI) = if GFX { Ui::open(api, UI_SCREEN) } else { None };
+            *core::ptr::addr_of_mut!(UI) = if GFX { Ui::open(api, UI_SCREEN, Page::Player) } else { None };
         }
     }
-    while index < total {
+    loop {
+        // The browser may have replaced the playlist while a track played, so look again every time.
+        #[allow(static_mut_refs)]
+        let list = unsafe { &*core::ptr::addr_of!(PLAYLIST) };
+        let total = list.count;
+        if index >= total {
+            break;
+        }
         let path = list.get(index);
         let outcome = match client.as_deref_mut() {
             Some(client) => match open_remote(client, path) {
@@ -778,8 +1054,17 @@ fn run(api: &'static TapeApi, mut client: Option<&mut Player>, start: usize) {
             Outcome::Done | Outcome::Next | Outcome::Failed | Outcome::Skip(_) | Outcome::SeekTo(_) => index += 1,
             Outcome::Previous => index = index.saturating_sub(1),
             Outcome::Jump(target) => index = target.min(total.saturating_sub(1)),
+            Outcome::Load => match take_pick() {
+                Some(first) => index = first,
+                None => {}
+            },
             Outcome::Stop => {
                 stopped = true;
+                break;
+            }
+            Outcome::Quit => {
+                stopped = true;
+                unsafe { QUIT = true };
                 break;
             }
         }
@@ -793,36 +1078,44 @@ fn run(api: &'static TapeApi, mut client: Option<&mut Player>, start: usize) {
     }
 }
 
-/// `fosplay browse //HOST/SHARE[/DIR]` (or `HOST SHARE [DIR]`) or `fosplay browse [VOLUME]` for FOSFS and `diskN` files:
-/// the touch screen lists folders and audio files; a tap on a folder enters it, on a file plays the folder from there.
+/// `fosplay [browse [//HOST/SHARE[/DIR]]]` (or `HOST SHARE [DIR]`); `browse local [VOLUME]` the files of this machine. With no
+/// share it goes back to the last one used. The touch screen lists folders and audio files; a tap on a folder enters it,
+/// on a file plays the folder from there.
 fn browse_command<'a>(api: &'static TapeApi, mut words: impl Iterator<Item = &'a str>) {
     if !unsafe { GFX } {
         return println!("fosplay: browse needs the touch screen (gfx=off is set).");
     }
     let first = words.next().unwrap_or("");
-    let target = parse_share(first, &mut words);
+    let mut saved = Line::<200>::new();
     #[allow(static_mut_refs)]
-    let client = unsafe { &mut *core::ptr::addr_of_mut!(CLIENT) };
+    let _ = core::fmt::Write::write_str(&mut saved, unsafe { SAVED_SHARE.as_str() });
+    let (target, volume) = if first == "local" {
+        (None, words.next().unwrap_or(""))
+    } else if first.is_empty() {
+        (parse_share(saved.as_str(), &mut core::iter::empty()), "")
+    } else {
+        (parse_share(first, &mut words), first)
+    };
     if let Some((host, share, _)) = target {
-        if host.is_empty() || share.is_empty() || open(api, client, host, share).is_none() {
+        if host.is_empty() || share.is_empty() || open(api, client(), host, share).is_none() {
             return;
         }
     }
-    match Ui::open(api, unsafe { UI_SCREEN }) {
-        Some(ui) => unsafe { *core::ptr::addr_of_mut!(UI) = Some(ui) },
-        None => println!("fosplay: browse needs a pixel screen."),
-    }
+    let Some(opened) = Ui::open(api, unsafe { UI_SCREEN }, Page::Browse) else {
+        return println!("fosplay: browse needs a pixel screen.");
+    };
+    unsafe { *core::ptr::addr_of_mut!(UI) = Some(opened) };
+    set_browser(target.map(|(host, share, _)| (host, share)), target.map_or(volume, |(_, _, path)| path));
+    browse(api);
     #[allow(static_mut_refs)]
-    if unsafe { (*core::ptr::addr_of!(UI)).is_some() } {
-        let remote = target.is_some();
-        browse(api, remote.then_some(&mut *client), target.map_or(first, |(_, _, path)| path), target.map(|(host, share, _)| (host, share)));
-        #[allow(static_mut_refs)]
-        if let Some(ui) = unsafe { (*core::ptr::addr_of_mut!(UI)).take() } {
-            ui.close();
-        }
+    if let Some(ui) = unsafe { (*core::ptr::addr_of_mut!(UI)).take() } {
+        ui.close();
+    }
+    if unsafe { DIRTY } {
+        save_settings(api);
     }
     if target.is_some() {
-        client.transport().socket.close(api);
+        client().transport().socket.close(api);
     }
 }
 
@@ -910,48 +1203,21 @@ fn parent_of(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
-fn browse(api: &'static TapeApi, mut client: Option<&mut Player>, start: &str, share: Option<(&str, &str)>) {
-    use core::fmt::Write;
-    let mut path = Line::<200>::new();
-    let _ = write!(path, "{}", start.trim_matches('/'));
-    let mut reload = true;
-    let mut refresh = true;
-    if let Some(ui) = ui() {
-        ui.set_browse(true);
-    }
+/// The browser with nothing playing: the browser and settings pages on their own, until Quit.
+fn browse(api: &'static TapeApi) {
     loop {
         let Some(ui) = ui() else { return };
-        if reload {
-            ui.view.message.clear();
-            load_entries(api, client.as_deref_mut(), path.as_str());
-            ui.reset_list();
-            reload = false;
-            refresh = true;
-        }
-        #[allow(static_mut_refs)]
-        let entries = unsafe { &*core::ptr::addr_of!(ENTRIES) };
-        if refresh {
-            refresh = false;
-            ui.view.count = entries.count;
-            ui.view.title.clear();
-            match share {
-                Some((host, name)) => {
-                    let _ = write!(ui.view.title, "//{host}/{name}/{}", path.as_str());
-                }
-                None => {
-                    let _ = write!(ui.view.title, "{}", if path.is_empty() { "FOSFS" } else { path.as_str() });
-                }
-            }
-            ui.view.detail.clear();
-            let _ = write!(ui.view.detail, "{} entries", entries.count);
-        }
+        let channels = || {
+            let mut info = AudioInfo::default();
+            (api.audio_info)(&mut info);
+            info.playback_channels as usize
+        };
         let mut action = ui.next_action();
-        if action.is_none() {
-            let key = (api.read_key)();
-            action = match key {
+        if action.is_none() && ui.view.page == Page::Browse {
+            action = match (api.read_key)() {
                 KEY_NONE => None,
                 KEY_ABORT => Some(Action::Quit),
-                _ => match (key - KEY_BASE) as u8 {
+                key => match (key - KEY_BASE) as u8 {
                     b'q' => Some(Action::Quit),
                     b'j' => {
                         ui.cursor_by(1);
@@ -961,70 +1227,50 @@ fn browse(api: &'static TapeApi, mut client: Option<&mut Player>, start: &str, s
                         ui.cursor_by(-1);
                         None
                     }
-                    b'\r' | b'\n' => (ui.view.cursor < entries.count).then_some(Action::Open(ui.view.cursor)),
+                    b'\r' | b'\n' => (ui.view.cursor < ui.view.entries).then_some(Action::Open(ui.view.cursor)),
                     0x08 | 0x7f => Some(Action::Parent),
                     b'a' => Some(Action::PlayAll),
+                    b's' => {
+                        ui.open_settings();
+                        None
+                    }
                     _ => None,
                 },
             };
         }
-        let Some(action) = action else {
-            if ui.due() {
-                ui.draw(|index| match entries.get(index) {
-                    "../" => ".. (up)",
-                    name => name,
-                });
-            } else {
-                tape_rt::idle();
-            }
-            continue;
-        };
-        let mut chosen = Line::<132>::new();
-        let mut play_from = None;
+        page_changed(api, ui);
         match action {
-            Action::Quit => return,
-            Action::Parent => {
-                if client.is_some() && !path.is_empty() {
-                    let parent = parent_of(path.as_str());
-                    let mut up = Line::<200>::new();
-                    let _ = write!(up, "{parent}");
-                    path = up;
-                    reload = true;
+            Some(Action::Quit) => return,
+            Some(action @ (Action::Open(_) | Action::Parent | Action::PlayAll)) => {
+                if browser_action(api, action) {
+                    if let Some(start) = take_pick() {
+                        play_picked(api, start);
+                        if unsafe { QUIT } {
+                            return;
+                        }
+                    }
                 }
             }
-            Action::PlayAll => play_from = Some(""),
-            Action::Open(index) if index < entries.count => {
-                let _ = write!(chosen, "{}", entries.get(index));
-                if chosen.as_str() == "../" {
-                    let mut up = Line::<200>::new();
-                    let _ = write!(up, "{}", parent_of(path.as_str()));
-                    path = up;
-                    reload = true;
-                } else if let Some(folder) = chosen.as_str().strip_suffix('/') {
-                    let mut down = Line::<200>::new();
-                    let _ = write!(down, "{}{}{folder}", path.as_str(), if path.is_empty() || client.is_none() { "" } else { "/" });
-                    path = down;
-                    reload = true;
-                } else {
-                    play_from = Some(chosen.as_str());
-                }
-            }
-            _ => {}
+            Some(action) => change_setting(action, channels()),
+            None => {}
         }
-        if let Some(first) = play_from {
-            let start = playlist_from_entries(path.as_str(), first);
-            #[allow(static_mut_refs)]
-            if unsafe { (*core::ptr::addr_of!(PLAYLIST)).count } == 0 {
-                show_message(format_args!("no audio files here"));
-                continue;
-            }
-            ui.set_browse(false);
-            run(api, client.as_deref_mut(), start);
-            if let Some(ui) = self::ui() {
-                ui.set_browse(true);
-            }
-            refresh = true;
+        let Some(ui) = self::ui() else { return };
+        if ui.due() {
+            show_settings(&mut ui.view, channels());
+            draw_ui(ui);
+        } else if action.is_none() {
+            tape_rt::idle();
         }
+    }
+}
+
+/// Plays the playlist from `start` over the browser, then goes back to it.
+fn play_picked(api: &'static TapeApi, start: usize) {
+    let remote = browser().remote;
+    run(api, remote.then(client), start);
+    if let Some(ui) = ui() {
+        ui.view.playing = false;
+        ui.set_page(Page::Browse);
     }
 }
 
@@ -1128,14 +1374,15 @@ fn play_track(session: &mut Session, path: &str, index: usize, total: usize) -> 
         session.started = tape_rt::micros();
         session.tracks = 0;
         let effects = unsafe { EFFECTS };
-        let upmix = effects.upmix && info.playback_channels >= 6;
+        let upmix = effects.upmix && fit_layout(info.playback_channels as usize);
         if effects.upmix && !upmix {
-            println!("fosplay: upmix needs 6 playback channels; the device has {} (`audio modes`, `audio use playback N`): stereo.", info.playback_channels);
+            println!("fosplay: upmix needs 4 playback channels; the device has {} (`audio modes`, `audio use playback N`): stereo.", info.playback_channels);
         }
+        let effects = unsafe { EFFECTS };
         if upmix {
             #[allow(static_mut_refs)]
             unsafe { (*core::ptr::addr_of_mut!(UPMIX)).configure(session.out_rate, effects.surround) };
-            println!("fosplay: upmix to 5.1 on {} channels (L R C LFE Ls Rs{}).", info.playback_channels, if effects.surround.center { "" } else { ", no centre" });
+            println!("fosplay: upmix {} on {} channels.", effects.surround.layout.name(), info.playback_channels);
         }
         session.output = Some(Output {
             api,
@@ -1148,7 +1395,6 @@ fn play_track(session: &mut Session, path: &str, index: usize, total: usize) -> 
             command: None,
             bass: Bass::new(session.out_rate, unsafe { EFFECTS }.bass),
             upmix,
-            wide: info.playback_channels >= 6,
             rate: session.out_rate,
             gain: volume_gain(unsafe { VOLUME }),
             peak: [0.0; 2],
@@ -1187,6 +1433,7 @@ fn play_track(session: &mut Session, path: &str, index: usize, total: usize) -> 
         let _ = write!(view.detail, "{}{}{}", tags.artist.as_str(), if tags.artist.is_empty() || tags.album.is_empty() { "" } else { " - " }, tags.album.as_str());
         let _ = write!(view.format, "{depth} {rate} Hz, {} ch{}, {out_rate} Hz {}{}-bit", decoder.channels(),
                        if out_rate == rate { "" } else { " (resampled)" }, if float { "float " } else { "" }, info.playback_bits);
+        view.playing = true;
         view.index = index;
         view.count = total;
         view.total = decoder.total_samples() as f32 / rate as f32;
@@ -1289,13 +1536,17 @@ tape_rt::tape_help!(br#"fosplay: play audio from an SMB share (guest access).
   Esc or q stop.
   With a pixel screen it also shows a touch panel: title, a progress bar
   (touch to seek), transport buttons, the playlist (touch to jump), a level
-  meter, volume, bass boost and the 5.1 upmix switches. gfx=off hides it,
-  screen=N picks the screen.
-  browse shows the folders and audio files of a share (or, without one, of
-  FOSFS; `browse diskN` a FAT volume) on that screen: touch a folder to open
-  it, a file to play its folder from there, Play all, Up, Quit. Keys: j k
-  move, Enter opens, Backspace up, a play all, q quits. Stop returns to the
-  list.
+  meter and volume, with buttons for two more pages: Browse (folders and
+  audio files: touch a folder to open it, a file to play its folder from
+  there, Play all, Up) and Settings (bass boost, upmix switch, layout, width,
+  LFE crossover, delay, centre). gfx=off hides the panel, screen=N picks the
+  screen.
+  Plain `fosplay`, or `browse` without a share, opens the browser on the last
+  share and folder used (`browse local [diskN]` shows FOSFS or a FAT volume).
+  Keys in the browser: j k move, Enter opens, Backspace up, a play all, s
+  settings, q quits. Stop returns to the list.
+  Volume, bass, upmix settings and the last share are saved in the file
+  fosplay.cfg (key=value lines) when they change; command-line options win.
 
   HOST is an IPv4 address or a name (asked of the DNS server DHCP names, else
   the gateway); our address comes from DHCP on the NIC chosen with
@@ -1311,8 +1562,10 @@ tape_rt::tape_help!(br#"fosplay: play audio from an SMB share (guest access).
                   clip
     bassfreq=HZ   its centre, 60-150 (default 100)
     bassq=Q       its width, 0.3 broad - 3 narrow (default 0.7)
-    upmix=on      stereo to 5.1 on the device's first six channels, order
-                  L R C LFE Ls Rs (pick a 6-channel mode: `audio use playback N`)
+    upmix=on      stereo to surround on the device's first channels (pick a
+                  multichannel mode: `audio use playback N`)
+    layout=5.1    L R C LFE Ls Rs; 4.1: L R LFE Ls Rs (no centre); 4.0: L R Ls
+                  Rs (quad)
     center=off    leave the centre silent, fronts untouched (default on)
     width=0..1    surround level (0.7), lfe=HZ crossover 40-200 (100),
     delay=MS      surround delay 0-40 (15)

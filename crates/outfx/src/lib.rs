@@ -8,7 +8,7 @@
 pub mod upmix;
 
 pub use phono::BassBoost;
-pub use upmix::{Upmix, UpmixSettings};
+pub use upmix::{Layout, Upmix, UpmixSettings};
 use phono::{Phono, curves};
 
 /// Settings of the output effects; `Options::OFF` changes nothing.
@@ -24,7 +24,7 @@ impl Options {
     pub const OFF: Options = Options { bass: BassBoost::OFF, upmix: false, surround: UpmixSettings::DEFAULT };
 
     /// Takes one `key=value` word: `bass=DB` (0-12), `bassfreq=HZ` (60-150), `bassq=Q` (0.3-3), `upmix=on|off`, `center=on|off`,
-    /// `width=0..1`, `lfe=HZ` (40-200), `delay=MS` (0-40). `Ok(false)` when the key is not
+    /// `width=0..1`, `lfe=HZ` (40-200), `delay=MS` (0-40), `layout=5.1|4.1|4.0`. `Ok(false)` when the key is not
     /// one of ours (the caller may know it), `Err` says what was wrong with the value.
     pub fn set(&mut self, key: &str, value: &str, parse: impl Fn(&str) -> Option<f32>) -> Result<bool, &'static str> {
         let number = |min: f32, max: f32| parse(value).filter(|v| *v >= min && *v <= max);
@@ -37,6 +37,7 @@ impl Options {
             "width" => self.surround.width = number(0.0, 1.0).ok_or("width= needs the surround level, 0 to 1")?,
             "lfe" => self.surround.lfe_hz = number(40.0, 200.0).ok_or("lfe= needs a crossover frequency, 40 to 200 Hz")?,
             "delay" => self.surround.delay_ms = number(0.0, 40.0).ok_or("delay= needs the surround delay in ms, 0 to 40")?,
+            "layout" => self.surround.layout = upmix::Layout::parse(value).ok_or("layout= needs 5.1, 4.1 or 4.0")?,
             _ => return Ok(false),
         }
         Ok(true)

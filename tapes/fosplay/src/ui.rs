@@ -1,6 +1,7 @@
-//! fosplay's touch screen: title, a progress bar that seeks, transport buttons, the playlist, a level meter, the volume and
-//! the output effects; or, in browse mode, a folder list with Up, Play all and Quit. `Ui` draws what `View` says and turns finger events into `Action`s; `Output` (main.rs) carries them out,
-//! so the picture never decides anything about the sound.
+//! fosplay's touch screen, three pages: the player (title, a progress bar that seeks, transport buttons, the playlist, a level
+//! meter and the volume), the file browser (folders and audio files of a share or of FOSFS) and the settings (bass boost and
+//! the upmix). `Ui` draws what `View` says and turns finger events into `Action`s; `Output` and the browser (main.rs) carry
+//! them out, so the picture never decides anything about the sound. Moving between pages is the screen's own business.
 
 use audio_screen::Screen;
 use core::fmt::Write;
@@ -11,7 +12,7 @@ use tape_rt::{Line, TapeApi};
 const GLYPH_H: i32 = gfx::GLYPH_HEIGHT as i32;
 const MAX_WIDTH: u32 = 1920;
 const MAX_HEIGHT: u32 = 1080;
-const MAX_ROWS: usize = 24;
+const MAX_ROWS: usize = 32;
 const MAX_WIDGETS: usize = MAX_ROWS + 16;
 const BACKGROUND: u32 = 0x0c1014;
 const EDGE: u32 = 0x4a5a68;
@@ -28,6 +29,16 @@ const FOLDER: u32 = 0x7fc8ff;
 pub const VOLUME_RANGE_DB: f32 = 50.0;
 /// The bass slider's top, as `bass=`.
 pub const BASS_MAX_DB: f32 = 12.0;
+/// The ends of the crossover and delay sliders.
+pub const LFE_RANGE: (f32, f32) = (40.0, 200.0);
+pub const DELAY_RANGE: (f32, f32) = (0.0, 40.0);
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Page {
+    Player,
+    Browse,
+    Settings,
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Hit {
@@ -44,11 +55,22 @@ pub enum Hit {
     Volume,
     Bass,
     Width,
+    Lfe,
+    Delay,
     Upmix,
     Center,
+    Layout,
+    ToBrowse,
+    ToSettings,
+    ToPlayer,
+    Done,
+    Parent,
+    PlayAll,
+    Quit,
 }
 
-/// What a finger asked for. Sliders send their value (0..1, `Bass` in dB), `Seek` a permille of the track.
+/// What a finger asked for. Sliders send their value (0..1, `Bass` in dB, `Lfe` in Hz, `Delay` in ms), `Seek` a permille of
+/// the track, `Open` an entry of the browser's list, `Jump` one of the playlist.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Action {
     Previous,
@@ -62,17 +84,22 @@ pub enum Action {
     Volume(f32),
     Bass(f32),
     Width(f32),
+    Lfe(f32),
+    Delay(f32),
     Upmix,
     Center,
-    /// Browse mode: open entry `n` of the list (a folder to enter, a file to play).
+    Layout,
     Open(usize),
     Parent,
     PlayAll,
     Quit,
 }
 
-/// What the screen shows; `Output` and `play_track` keep it current.
+/// What the screen shows; `Output`, `play_track` and the browser keep it current.
 pub struct View {
+    pub page: Page,
+    /// A track is loaded, so the player page has something to show.
+    pub playing: bool,
     pub title: Line<96>,
     pub detail: Line<96>,
     pub format: Line<96>,
@@ -85,13 +112,19 @@ pub struct View {
     pub volume: f32,
     pub bass_db: f32,
     pub width: f32,
+    pub lfe_hz: f32,
+    pub delay_ms: f32,
     pub upmix: bool,
-    /// The device has the six outputs the upmix needs.
+    /// The device has the outputs the layout needs, so the upmix can be switched on.
     pub upmix_ok: bool,
     pub center: bool,
+    pub layout: &'static str,
+    /// The layout has a centre channel (so the Centre switch means something).
+    pub has_center: bool,
     pub message: Line<96>,
-    /// Browse mode: the list is a folder's entries (names ending in `/` are folders), the progress bar and sliders are hidden.
-    pub browse: bool,
+    /// The browser's folder: its name and how many entries it lists.
+    pub folder: Line<200>,
+    pub entries: usize,
     /// The entry the keys act on; `usize::MAX` until a key moves it.
     pub cursor: usize,
 }
@@ -99,6 +132,8 @@ pub struct View {
 impl View {
     fn new() -> Self {
         View {
+            page: Page::Player,
+            playing: false,
             title: Line::new(),
             detail: Line::new(),
             format: Line::new(),
@@ -111,11 +146,16 @@ impl View {
             volume: 1.0,
             bass_db: 0.0,
             width: 0.7,
+            lfe_hz: 100.0,
+            delay_ms: 15.0,
             upmix: false,
             upmix_ok: false,
             center: true,
+            layout: "5.1",
+            has_center: true,
             message: Line::new(),
-            browse: false,
+            folder: Line::new(),
+            entries: 0,
             cursor: usize::MAX,
         }
     }
@@ -134,22 +174,21 @@ pub struct Layout {
     margin: i32,
     pub header: Rect,
     pub meter: Rect,
-    /// The whole right column (the browser's help text goes here).
-    pub side: Rect,
     pub rows: usize,
     widgets: [Widget; MAX_WIDGETS],
     count: usize,
 }
 
 impl Layout {
-    /// Header and progress bar on top, the transport row under them; below, the playlist on the left (rows, then page
-    /// buttons) and on the right the meter, three sliders and the two upmix switches.
-    pub fn new(width: i32, height: i32) -> Self {
+    /// Every page has the header on top. The player: the progress bar, the transport row, the playlist with a slim scroll
+    /// column and on the right the meter, the volume and the buttons to the other pages. The browser: a row of buttons and the
+    /// list across the whole width. The settings: Back, then two columns of sliders and switches.
+    pub fn new(width: i32, height: i32, page: Page) -> Self {
         let scale = if width >= 1200 { 2 } else { 1 };
         let margin = 6 * scale;
         let gap = margin / 2;
         let text = GLYPH_H * scale;
-        let header_h = text * 3 + margin;
+        let header_h = text * if page == Page::Player { 3 } else { 2 } + margin;
         let mut layout = Layout {
             width,
             height,
@@ -157,46 +196,59 @@ impl Layout {
             margin,
             header: Rect { x: margin, y: margin, w: width - 2 * margin, h: header_h },
             meter: Rect::ZERO,
-            side: Rect::ZERO,
             rows: 0,
             widgets: [Widget { rect: Rect::ZERO, hit: Hit::Stop }; MAX_WIDGETS],
             count: 0,
         };
         let mut y = margin + header_h + margin;
-        layout.add(Rect { x: margin, y, w: width - 2 * margin, h: text * 2 }, Hit::Progress);
-        y += text * 2 + margin;
-        let buttons = [Hit::Previous, Hit::Back, Hit::PlayPause, Hit::Forward, Hit::Next, Hit::Stop];
-        let cell = (width - 2 * margin - 5 * gap) / 6;
-        for (index, hit) in buttons.into_iter().enumerate() {
-            layout.add(Rect { x: margin + index as i32 * (cell + gap), y, w: cell, h: text * 3 }, hit);
+        let row = |layout: &mut Layout, y: i32, hits: &[Hit]| {
+            let cell = (width - 2 * margin - (hits.len() as i32 - 1) * gap) / hits.len() as i32;
+            for (index, hit) in hits.iter().enumerate() {
+                layout.add(Rect { x: margin + index as i32 * (cell + gap), y, w: cell, h: text * 3 }, *hit);
+            }
+        };
+        match page {
+            Page::Player => {
+                layout.add(Rect { x: margin, y, w: width - 2 * margin, h: text * 2 }, Hit::Progress);
+                y += text * 2 + margin;
+                row(&mut layout, y, &[Hit::Previous, Hit::Back, Hit::PlayPause, Hit::Forward, Hit::Next, Hit::Stop]);
+            }
+            Page::Browse => row(&mut layout, y, &[Hit::Parent, Hit::PlayAll, Hit::ToPlayer, Hit::ToSettings, Hit::Quit]),
+            Page::Settings => row(&mut layout, y, &[Hit::Done]),
         }
         y += text * 3 + margin;
         let body_h = height - y - margin;
-        let list_w = (width - 3 * margin) * 58 / 100;
+        if page == Page::Settings {
+            let column = (width - 3 * margin) / 2;
+            let cell_h = (body_h - 3 * gap) / 4;
+            for (index, (left, right)) in [(Hit::Bass, Hit::Volume), (Hit::Width, Hit::Upmix), (Hit::Lfe, Hit::Center), (Hit::Delay, Hit::Layout)].into_iter().enumerate() {
+                let cell_y = y + index as i32 * (cell_h + gap);
+                layout.add(Rect { x: margin, y: cell_y, w: column, h: cell_h }, left);
+                layout.add(Rect { x: 2 * margin + column, y: cell_y, w: column, h: cell_h }, right);
+            }
+            return layout;
+        }
+        let region_w = if page == Page::Player { (width - 3 * margin) * 62 / 100 } else { width - 2 * margin };
+        let scroll_w = text * 2 + margin;
+        let list_w = region_w - scroll_w - gap;
         let row_h = text * 2 + gap;
-        let page_h = text * 3;
-        layout.rows = (((body_h - page_h - gap) / row_h).max(1) as usize).min(MAX_ROWS);
+        layout.rows = ((body_h / row_h).max(1) as usize).min(MAX_ROWS);
         for row in 0..layout.rows {
             layout.add(Rect { x: margin, y: y + row as i32 * row_h, w: list_w, h: row_h - gap }, Hit::Row(row as u8));
         }
-        let page_y = y + body_h - page_h;
-        let half = (list_w - gap) / 2;
-        layout.add(Rect { x: margin, y: page_y, w: half, h: page_h }, Hit::PageUp);
-        layout.add(Rect { x: margin + half + gap, y: page_y, w: half, h: page_h }, Hit::PageDown);
-        let right_x = margin + list_w + margin;
-        let right_w = width - right_x - margin;
-        // Five equal cells down the right: the meter, three sliders, the two switches side by side.
-        let cell_h = (body_h - 4 * gap) / 5;
-        layout.side = Rect { x: right_x, y, w: right_w, h: body_h };
-        layout.meter = Rect { x: right_x, y, w: right_w, h: cell_h };
-        let mut cell_y = y + cell_h + gap;
-        for hit in [Hit::Volume, Hit::Bass, Hit::Width] {
-            layout.add(Rect { x: right_x, y: cell_y, w: right_w, h: cell_h }, hit);
-            cell_y += cell_h + gap;
+        let half = (body_h - gap) / 2;
+        let scroll_x = margin + list_w + gap;
+        layout.add(Rect { x: scroll_x, y, w: scroll_w, h: half }, Hit::PageUp);
+        layout.add(Rect { x: scroll_x, y: y + half + gap, w: scroll_w, h: half }, Hit::PageDown);
+        if page == Page::Player {
+            let right_x = margin + region_w + margin;
+            let right_w = width - right_x - margin;
+            let cell_h = (body_h - 3 * gap) / 4;
+            layout.meter = Rect { x: right_x, y, w: right_w, h: cell_h };
+            layout.add(Rect { x: right_x, y: y + cell_h + gap, w: right_w, h: cell_h }, Hit::Volume);
+            layout.add(Rect { x: right_x, y: y + 2 * (cell_h + gap), w: right_w, h: cell_h }, Hit::ToBrowse);
+            layout.add(Rect { x: right_x, y: y + 3 * (cell_h + gap), w: right_w, h: cell_h }, Hit::ToSettings);
         }
-        let half = (right_w - gap) / 2;
-        layout.add(Rect { x: right_x, y: cell_y, w: half, h: cell_h }, Hit::Upmix);
-        layout.add(Rect { x: right_x + half + gap, y: cell_y, w: half, h: cell_h }, Hit::Center);
         layout
     }
 
@@ -256,21 +308,29 @@ impl Actions {
 
 struct Target<'a> {
     layout: &'a Layout,
+    page: Page,
+    playing: bool,
+    /// The page Done returns to.
+    back: Page,
     scroll: usize,
+    /// How many rows the page's list has.
     count: usize,
     actions: &'a mut Actions,
     seek: &'a mut Option<u32>,
     scroll_by: &'a mut i32,
-    browsing: bool,
+    goto: &'a mut Option<Page>,
 }
 
 impl Target<'_> {
     fn slide(&mut self, hit: Hit, x: i32) {
         let value = self.layout.fraction(hit, x);
+        let between = |(low, high): (f32, f32)| low + value * (high - low);
         match hit {
             Hit::Volume => self.actions.push(Action::Volume(value)),
             Hit::Bass => self.actions.push(Action::Bass(value * BASS_MAX_DB)),
             Hit::Width => self.actions.push(Action::Width(value)),
+            Hit::Lfe => self.actions.push(Action::Lfe(between(LFE_RANGE))),
+            Hit::Delay => self.actions.push(Action::Delay(between(DELAY_RANGE))),
             Hit::Progress => *self.seek = Some((value * 1000.0) as u32),
             _ => {}
         }
@@ -282,23 +342,6 @@ impl TouchTarget for Target<'_> {
 
     fn down(&mut self, x: i32, y: i32) -> Option<Hit> {
         let hit = self.layout.hit(x, y)?;
-        if self.browsing {
-            match hit {
-                Hit::Previous => self.actions.push(Action::Parent),
-                Hit::PlayPause => self.actions.push(Action::PlayAll),
-                Hit::Stop => self.actions.push(Action::Quit),
-                Hit::PageUp => *self.scroll_by -= self.layout.rows as i32,
-                Hit::PageDown => *self.scroll_by += self.layout.rows as i32,
-                Hit::Row(row) => {
-                    let index = self.scroll + row as usize;
-                    if index < self.count {
-                        self.actions.push(Action::Open(index));
-                    }
-                }
-                _ => return None,
-            }
-            return Some(hit);
-        }
         match hit {
             Hit::Previous => self.actions.push(Action::Previous),
             Hit::Back => self.actions.push(Action::Back),
@@ -308,15 +351,24 @@ impl TouchTarget for Target<'_> {
             Hit::Stop => self.actions.push(Action::Stop),
             Hit::Upmix => self.actions.push(Action::Upmix),
             Hit::Center => self.actions.push(Action::Center),
+            Hit::Layout => self.actions.push(Action::Layout),
+            Hit::Parent => self.actions.push(Action::Parent),
+            Hit::PlayAll => self.actions.push(Action::PlayAll),
+            Hit::Quit => self.actions.push(Action::Quit),
+            Hit::ToBrowse => *self.goto = Some(Page::Browse),
+            Hit::ToSettings => *self.goto = Some(Page::Settings),
+            Hit::ToPlayer if self.playing => *self.goto = Some(Page::Player),
+            Hit::ToPlayer => return None,
+            Hit::Done => *self.goto = Some(self.back),
             Hit::PageUp => *self.scroll_by -= self.layout.rows as i32,
             Hit::PageDown => *self.scroll_by += self.layout.rows as i32,
             Hit::Row(row) => {
                 let index = self.scroll + row as usize;
                 if index < self.count {
-                    self.actions.push(Action::Jump(index));
+                    self.actions.push(if self.page == Page::Browse { Action::Open(index) } else { Action::Jump(index) });
                 }
             }
-            Hit::Progress | Hit::Volume | Hit::Bass | Hit::Width => self.slide(hit, x),
+            Hit::Progress | Hit::Volume | Hit::Bass | Hit::Width | Hit::Lfe | Hit::Delay => self.slide(hit, x),
         }
         Some(hit)
     }
@@ -338,40 +390,46 @@ impl TouchTarget for Target<'_> {
 
 pub struct Ui {
     screen: Screen,
-    layout: Layout,
+    layouts: [Layout; 3],
     touches: Touches<Hit>,
     pub view: View,
-    scroll: usize,
+    /// The first row shown, per page (the settings have no list).
+    scroll: [usize; 3],
     /// Where a finger on the progress bar would seek to, shown while it is down.
     seek: Option<u32>,
     actions: Actions,
     next_animation: u64,
-    /// The index the list was last scrolled to follow.
+    /// The index the player's list was last scrolled to follow.
     followed: usize,
-    /// Where the browser's list was when the player took the screen.
-    saved_scroll: usize,
+    back: Page,
+}
+
+fn slot(page: Page) -> usize {
+    page as usize
 }
 
 impl Ui {
     /// Takes tape screen `number`; `None` when there is no pixel screen (BIOS text mode) or no memory.
-    pub fn open(api: &'static TapeApi, number: u32) -> Option<Ui> {
+    pub fn open(api: &'static TapeApi, number: u32, page: Page) -> Option<Ui> {
         let (width, height) = tape_rt::gfx_info_on(number)?;
-        let layout = Layout::new(width.min(MAX_WIDTH) as i32, height.min(MAX_HEIGHT) as i32);
-        let screen = Screen::new(api, layout.width as u32, layout.height as u32)?.on(number);
+        let (width, height) = (width.min(MAX_WIDTH) as i32, height.min(MAX_HEIGHT) as i32);
+        let screen = Screen::new(api, width as u32, height as u32)?.on(number);
         if !screen.open() {
             return None;
         }
+        let mut view = View::new();
+        view.page = page;
         Some(Ui {
-            touches: Touches::new(layout.width, layout.height, number),
+            touches: Touches::new(width, height, number),
             screen,
-            layout,
-            view: View::new(),
-            scroll: 0,
+            layouts: [Layout::new(width, height, Page::Player), Layout::new(width, height, Page::Browse), Layout::new(width, height, Page::Settings)],
+            view,
+            scroll: [0; 3],
             seek: None,
             actions: Actions { queue: [None; 8] },
             next_animation: 0,
             followed: usize::MAX,
-            saved_scroll: 0,
+            back: page,
         })
     }
 
@@ -379,85 +437,88 @@ impl Ui {
         self.screen.close();
     }
 
+    fn layout(&self) -> &Layout {
+        &self.layouts[slot(self.view.page)]
+    }
+
+    pub fn set_page(&mut self, page: Page) {
+        self.view.page = page;
+        self.back = page;
+        self.screen.mark_dirty();
+    }
+
+    /// The settings page, from wherever the panel is now (the key for the Settings button).
+    pub fn open_settings(&mut self) {
+        let from = self.view.page;
+        self.set_page(Page::Settings);
+        self.back = from;
+    }
+
+    /// A new browser list is on show (a folder was entered): from the top, no entry chosen.
+    pub fn reset_list(&mut self) {
+        self.scroll[slot(Page::Browse)] = 0;
+        self.view.cursor = usize::MAX;
+        self.screen.mark_dirty();
+    }
+
+    /// Moves the chosen entry of the browser by `delta` (keys), scrolling to keep it in sight.
+    pub fn cursor_by(&mut self, delta: i32) {
+        let last = self.view.entries.saturating_sub(1) as i32;
+        let from = if self.view.cursor == usize::MAX { if delta > 0 { -1 } else { last + 1 } } else { self.view.cursor as i32 };
+        let cursor = (from + delta).clamp(0, last) as usize;
+        self.view.cursor = cursor;
+        let rows = self.layouts[slot(Page::Browse)].rows;
+        let scroll = &mut self.scroll[slot(Page::Browse)];
+        if cursor < *scroll {
+            *scroll = cursor;
+        } else if cursor >= *scroll + rows {
+            *scroll = cursor + 1 - rows;
+        }
+        self.screen.mark_dirty();
+    }
+
     /// Handles the finger events and returns the next thing a finger asked for.
     pub fn next_action(&mut self) -> Option<Action> {
+        let page = self.view.page;
         let mut scroll_by = 0;
+        let mut goto = None;
+        let count = if page == Page::Browse { self.view.entries } else { self.view.count };
+        let layout = &self.layouts[slot(page)];
         let changed = self.touches.poll(&mut Target {
-            layout: &self.layout,
-            scroll: self.scroll,
-            count: self.view.count,
+            layout,
+            page,
+            playing: self.view.playing,
+            back: self.back,
+            scroll: self.scroll[slot(page)],
+            count,
             actions: &mut self.actions,
             seek: &mut self.seek,
             scroll_by: &mut scroll_by,
-            browsing: self.view.browse,
+            goto: &mut goto,
         });
         if scroll_by != 0 {
-            let moved = self.scroll as i32 + scroll_by;
-            self.scroll = clamp_scroll(moved.max(0) as usize, self.layout.rows, self.view.count);
-            // The list stays where the finger put it until the track changes.
+            let rows = layout.rows;
+            let moved = self.scroll[slot(page)] as i32 + scroll_by;
+            self.scroll[slot(page)] = clamp_scroll(moved.max(0) as usize, rows, count);
+            // The player's list stays where the finger put it until the track changes.
             self.followed = self.view.index;
         }
-        if changed {
+        if let Some(next) = goto {
+            if next == Page::Settings {
+                self.back = page;
+            }
+            self.view.page = next;
+        }
+        if changed || goto.is_some() {
             self.screen.mark_dirty();
         }
         self.actions.pop()
     }
 
-    /// Switches between the browser and the player; the track's text, clock and the list position start afresh.
-    pub fn set_browse(&mut self, browse: bool) {
-        if browse != self.view.browse {
-            if browse {
-                self.scroll = self.saved_scroll;
-            } else {
-                self.saved_scroll = self.scroll;
-            }
-        }
-        let view = &mut self.view;
-        view.browse = browse;
-        view.title.clear();
-        view.detail.clear();
-        view.format.clear();
-        view.message.clear();
-        view.index = 0;
-        view.count = 0;
-        view.seconds = 0.0;
-        view.total = 0.0;
-        view.paused = false;
-        view.cursor = usize::MAX;
-        if !browse {
-            self.scroll = 0;
-        }
-        self.followed = usize::MAX;
-        self.screen.mark_dirty();
-    }
-
-    /// A new list is on show (a folder was entered): from the top, no entry chosen.
-    pub fn reset_list(&mut self) {
-        self.scroll = 0;
-        self.view.cursor = usize::MAX;
-        self.followed = self.view.index;
-        self.screen.mark_dirty();
-    }
-
-    /// Moves the chosen entry by `delta` (keys), scrolling to keep it in sight.
-    pub fn cursor_by(&mut self, delta: i32) {
-        let last = self.view.count.saturating_sub(1) as i32;
-        let from = if self.view.cursor == usize::MAX { if delta > 0 { -1 } else { last + 1 } } else { self.view.cursor as i32 };
-        let cursor = (from + delta).clamp(0, last) as usize;
-        self.view.cursor = cursor;
-        let rows = self.layout.rows;
-        if cursor < self.scroll {
-            self.scroll = cursor;
-        } else if cursor >= self.scroll + rows {
-            self.scroll = cursor + 1 - rows;
-        }
-        self.screen.mark_dirty();
-    }
-
     /// True when a frame should be drawn now: something changed, or the meter and clock are due.
     pub fn due(&mut self) -> bool {
         let now = tape_rt::micros();
-        let interval = if self.view.paused { 500_000 } else { 100_000 };
+        let interval = if self.view.paused || self.view.page != Page::Player { 500_000 } else { 100_000 };
         if now >= self.next_animation {
             self.next_animation = now + interval;
             self.screen.mark_dirty();
@@ -465,27 +526,40 @@ impl Ui {
         self.screen.due()
     }
 
-    /// Draws the picture and sends it. `name(i)` is entry `i` of the playlist.
-    pub fn draw<'n>(&mut self, name: impl Fn(usize) -> &'n str) {
-        if !self.view.browse && self.followed != self.view.index {
+    /// Draws the picture and sends it. `track(i)` is entry `i` of the playlist, `entry(i)` one of the browser's list.
+    pub fn draw<'n>(&mut self, track: impl Fn(usize) -> &'n str, entry: impl Fn(usize) -> &'n str) {
+        let page = self.view.page;
+        if page == Page::Player && self.followed != self.view.index {
             self.followed = self.view.index;
-            let rows = self.layout.rows;
-            self.scroll = clamp_scroll(self.view.index.saturating_sub(rows / 3), rows, self.view.count);
+            let rows = self.layouts[slot(Page::Player)].rows;
+            self.scroll[slot(Page::Player)] = clamp_scroll(self.view.index.saturating_sub(rows / 3), rows, self.view.count);
         }
-        let scroll = self.scroll;
+        let scroll = self.scroll[slot(page)];
         {
-            let (layout, view, seek) = (&self.layout, &self.view, self.seek);
+            let (layout, view, seek) = (&self.layouts[slot(page)], &self.view, self.seek);
             let mut canvas = self.screen.frame();
             canvas.clear(BACKGROUND);
             draw_header(&mut canvas, layout, view);
-            draw_buttons(&mut canvas, layout, view);
-            draw_list(&mut canvas, layout, view, scroll, name);
-            if view.browse {
-                draw_help(&mut canvas, layout);
-            } else {
-                draw_progress(&mut canvas, layout, view, seek);
-                draw_meter(&mut canvas, layout, view);
-                draw_controls(&mut canvas, layout, view);
+            match page {
+                Page::Player => {
+                    draw_progress(&mut canvas, layout, view, seek);
+                    draw_transport(&mut canvas, layout, view);
+                    draw_list(&mut canvas, layout, view.count, view.index, true, scroll, track);
+                    draw_meter(&mut canvas, layout, view);
+                    slider(&mut canvas, layout, Hit::Volume, view.volume, volume_text(view).as_str(), true);
+                    button(&mut canvas, layout, Hit::ToBrowse, "Browse", false, true);
+                    button(&mut canvas, layout, Hit::ToSettings, "Settings", false, true);
+                }
+                Page::Browse => {
+                    for (hit, label, enabled) in [(Hit::Parent, "Parent", true), (Hit::PlayAll, "Play all", true), (Hit::ToPlayer, "Player", view.playing), (Hit::ToSettings, "Settings", true), (Hit::Quit, "Quit", true)] {
+                        button(&mut canvas, layout, hit, label, false, enabled);
+                    }
+                    draw_list(&mut canvas, layout, view.entries, view.cursor, false, scroll, entry);
+                }
+                Page::Settings => {
+                    button(&mut canvas, layout, Hit::Done, "Done", false, true);
+                    draw_settings(&mut canvas, layout, view);
+                }
             }
         }
         blit_banded(&self.screen, || {});
@@ -506,28 +580,39 @@ fn clock(out: &mut impl Write, seconds: f32) {
 fn draw_header(canvas: &mut Canvas, layout: &Layout, view: &View) {
     let (rect, scale) = (layout.header, layout.scale);
     let text = GLYPH_H * scale;
-    let title = if view.title.is_empty() { "fosplay" } else { view.title.as_str() };
-    canvas.text_scaled(rect.x, rect.y, title, scale as u32, INK);
-    canvas.text_scaled(rect.x, rect.y + text, view.detail.as_str(), scale as u32, DIM);
     let mut line = Line::<96>::new();
-    if !view.message.is_empty() {
-        let _ = write!(line, "{}", view.message.as_str());
-    } else {
-        let _ = write!(line, "{}", view.format.as_str());
+    match view.page {
+        Page::Player => {
+            let title = if view.title.is_empty() { "fosplay" } else { view.title.as_str() };
+            canvas.text_scaled(rect.x, rect.y, title, scale as u32, INK);
+            canvas.text_scaled(rect.x, rect.y + text, view.detail.as_str(), scale as u32, DIM);
+            let _ = write!(line, "{}", if view.message.is_empty() { view.format.as_str() } else { view.message.as_str() });
+            canvas.text_scaled(rect.x, rect.y + 2 * text, line.as_str(), scale as u32, DIM);
+            let mut position = Line::<48>::new();
+            if view.count > 1 {
+                let _ = write!(position, "{}/{}  ", view.index + 1, view.count);
+            }
+            clock(&mut position, view.seconds);
+            let _ = write!(position, " / ");
+            clock(&mut position, view.total);
+            let width = gfx::text_width(position.as_str()) as i32 * scale;
+            canvas.text_scaled(rect.x + rect.w - width, rect.y, position.as_str(), scale as u32, INK);
+        }
+        Page::Browse => {
+            canvas.text_scaled(rect.x, rect.y, view.folder.as_str(), scale as u32, INK);
+            if view.message.is_empty() {
+                let _ = write!(line, "{} entries", view.entries);
+            } else {
+                let _ = write!(line, "{}", view.message.as_str());
+            }
+            canvas.text_scaled(rect.x, rect.y + text, line.as_str(), scale as u32, DIM);
+        }
+        Page::Settings => {
+            canvas.text_scaled(rect.x, rect.y, "Settings", scale as u32, INK);
+            let _ = write!(line, "saved when you leave this page");
+            canvas.text_scaled(rect.x, rect.y + text, line.as_str(), scale as u32, DIM);
+        }
     }
-    canvas.text_scaled(rect.x, rect.y + 2 * text, line.as_str(), scale as u32, DIM);
-    if view.browse {
-        return;
-    }
-    let mut position = Line::<48>::new();
-    if view.count > 1 {
-        let _ = write!(position, "{}/{}  ", view.index + 1, view.count);
-    }
-    clock(&mut position, view.seconds);
-    let _ = write!(position, " / ");
-    clock(&mut position, view.total);
-    let width = gfx::text_width(position.as_str()) as i32 * scale;
-    canvas.text_scaled(rect.x + rect.w - width, rect.y, position.as_str(), scale as u32, INK);
 }
 
 fn draw_progress(canvas: &mut Canvas, layout: &Layout, view: &View, seek: Option<u32>) {
@@ -542,8 +627,14 @@ fn draw_progress(canvas: &mut Canvas, layout: &Layout, view: &View, seek: Option
     canvas.rect(rect.x, rect.y, rect.w as u32, rect.h as u32, EDGE);
 }
 
-fn draw_buttons(canvas: &mut Canvas, layout: &Layout, view: &View) {
-    let browse_labels = [(Hit::Previous, "Parent"), (Hit::Back, ""), (Hit::PlayPause, "Play all"), (Hit::Forward, ""), (Hit::Next, ""), (Hit::Stop, "Quit")];
+fn button(canvas: &mut Canvas, layout: &Layout, hit: Hit, label: &str, lit: bool, enabled: bool) {
+    let rect = layout.rect(hit);
+    canvas.fill_rect(rect.x, rect.y, rect.w as u32, rect.h as u32, if lit { ACTIVE } else { BUTTON_OFF });
+    canvas.rect(rect.x, rect.y, rect.w as u32, rect.h as u32, EDGE);
+    center(canvas, rect, label, layout.scale, if lit { 0x000000 } else if enabled { INK } else { DIM });
+}
+
+fn draw_transport(canvas: &mut Canvas, layout: &Layout, view: &View) {
     let labels = [
         (Hit::Previous, "|<"),
         (Hit::Back, "-10s"),
@@ -552,50 +643,37 @@ fn draw_buttons(canvas: &mut Canvas, layout: &Layout, view: &View) {
         (Hit::Next, ">|"),
         (Hit::Stop, "Stop"),
     ];
-    for (hit, label) in if view.browse { browse_labels } else { labels } {
-        let rect = layout.rect(hit);
-        let lit = hit == Hit::PlayPause && view.paused && !view.browse;
-        canvas.fill_rect(rect.x, rect.y, rect.w as u32, rect.h as u32, if lit { ACTIVE } else { BUTTON_OFF });
-        canvas.rect(rect.x, rect.y, rect.w as u32, rect.h as u32, EDGE);
-        center(canvas, rect, label, layout.scale, if lit { 0x000000 } else { INK });
+    for (hit, label) in labels {
+        button(canvas, layout, hit, label, hit == Hit::PlayPause && view.paused, true);
     }
 }
 
-fn draw_list<'n>(canvas: &mut Canvas, layout: &Layout, view: &View, scroll: usize, name: impl Fn(usize) -> &'n str) {
+/// The list rows (`current` is lit; the player numbers them, the browser colours folders) and the slim scroll column.
+fn draw_list<'n>(canvas: &mut Canvas, layout: &Layout, count: usize, current: usize, numbered: bool, scroll: usize, name: impl Fn(usize) -> &'n str) {
     for row in 0..layout.rows {
         let index = scroll + row;
-        let rect = layout.rect(Hit::Row(row as u8));
-        if index >= view.count {
+        if index >= count {
             break;
         }
-        let current = if view.browse { index == view.cursor } else { index == view.index };
-        canvas.fill_rect(rect.x, rect.y, rect.w as u32, rect.h as u32, if current { ACTIVE } else { BUTTON_OFF });
-        let mut line = Line::<96>::new();
+        let rect = layout.rect(Hit::Row(row as u8));
+        let lit = index == current;
+        canvas.fill_rect(rect.x, rect.y, rect.w as u32, rect.h as u32, if lit { ACTIVE } else { BUTTON_OFF });
         let label = name(index);
-        if view.browse {
-            let _ = write!(line, "{label}");
-        } else {
+        let mut line = Line::<132>::new();
+        if numbered {
             let _ = write!(line, "{:>2} {label}", index + 1);
+        } else {
+            let _ = write!(line, "{label}");
         }
-        let folder = view.browse && label.ends_with('/');
-        let ink = if current { 0x000000 } else if folder { FOLDER } else { INK };
+        let ink = if lit { 0x000000 } else if !numbered && label.ends_with('/') { FOLDER } else { INK };
         let y = rect.y + (rect.h - GLYPH_H * layout.scale) / 2;
         canvas.text_scaled(rect.x + layout.margin, y, line.as_str(), layout.scale as u32, ink);
     }
-    for (hit, label) in [(Hit::PageUp, "Up"), (Hit::PageDown, "Down")] {
+    for (hit, label) in [(Hit::PageUp, "Up"), (Hit::PageDown, "Dn")] {
         let rect = layout.rect(hit);
         canvas.fill_rect(rect.x, rect.y, rect.w as u32, rect.h as u32, BUTTON_OFF);
         canvas.rect(rect.x, rect.y, rect.w as u32, rect.h as u32, EDGE);
-        center(canvas, rect, label, layout.scale, INK);
-    }
-}
-
-fn draw_help(canvas: &mut Canvas, layout: &Layout) {
-    let rect = layout.side;
-    let lines = ["Tap a folder to open it", "Tap a file to play from it", "Play all: this folder", "Parent: the folder above", "Quit: leave fosplay", "", "Keys: j k move, Enter opens", "a plays all, Backspace is up", "q quits"];
-    let step = GLYPH_H * layout.scale * 3 / 2;
-    for (index, line) in lines.iter().enumerate() {
-        canvas.text_scaled(rect.x + layout.margin, rect.y + layout.margin + index as i32 * step, line, layout.scale as u32, DIM);
+        center(canvas, rect, label, 1, INK);
     }
 }
 
@@ -621,27 +699,36 @@ fn slider(canvas: &mut Canvas, layout: &Layout, hit: Hit, value: f32, label: &st
     center(canvas, rect, label, layout.scale, if enabled { INK } else { DIM });
 }
 
-fn switch(canvas: &mut Canvas, layout: &Layout, hit: Hit, on: bool, label: &str, enabled: bool) {
-    let rect = layout.rect(hit);
-    canvas.fill_rect(rect.x, rect.y, rect.w as u32, rect.h as u32, if on { ACTIVE } else { BUTTON_OFF });
-    canvas.rect(rect.x, rect.y, rect.w as u32, rect.h as u32, EDGE);
-    center(canvas, rect, label, layout.scale, if on { 0x000000 } else if enabled { INK } else { DIM });
-}
-
-fn draw_controls(canvas: &mut Canvas, layout: &Layout, view: &View) {
+fn volume_text(view: &View) -> Line<48> {
     let mut text = Line::<48>::new();
     if view.volume < 0.01 {
         let _ = write!(text, "Volume: off");
     } else {
         let _ = write!(text, "Volume: {} dB", ((view.volume - 1.0) * VOLUME_RANGE_DB) as i32);
     }
-    slider(canvas, layout, Hit::Volume, view.volume, text.as_str(), true);
-    text.clear();
+    text
+}
+
+fn draw_settings(canvas: &mut Canvas, layout: &Layout, view: &View) {
+    let mut text = Line::<48>::new();
+    let ok = view.upmix_ok;
     let _ = write!(text, "Bass boost: {} dB", (view.bass_db + 0.5) as i32);
     slider(canvas, layout, Hit::Bass, view.bass_db / BASS_MAX_DB, text.as_str(), true);
     text.clear();
     let _ = write!(text, "Surround: {}%", (view.width * 100.0 + 0.5) as i32);
-    slider(canvas, layout, Hit::Width, view.width, text.as_str(), view.upmix_ok);
-    switch(canvas, layout, Hit::Upmix, view.upmix, if view.upmix_ok { "5.1 upmix" } else { "5.1: no" }, view.upmix_ok);
-    switch(canvas, layout, Hit::Center, view.center, "Centre", view.upmix_ok);
+    slider(canvas, layout, Hit::Width, view.width, text.as_str(), ok);
+    text.clear();
+    let _ = write!(text, "Sub crossover: {} Hz", (view.lfe_hz + 0.5) as i32);
+    slider(canvas, layout, Hit::Lfe, (view.lfe_hz - LFE_RANGE.0) / (LFE_RANGE.1 - LFE_RANGE.0), text.as_str(), ok);
+    text.clear();
+    let _ = write!(text, "Surround delay: {} ms", (view.delay_ms + 0.5) as i32);
+    slider(canvas, layout, Hit::Delay, (view.delay_ms - DELAY_RANGE.0) / (DELAY_RANGE.1 - DELAY_RANGE.0), text.as_str(), ok);
+    slider(canvas, layout, Hit::Volume, view.volume, volume_text(view).as_str(), true);
+    text.clear();
+    let _ = write!(text, "Upmix {}", if view.upmix { "on" } else if ok { "off" } else { "(too few outputs)" });
+    button(canvas, layout, Hit::Upmix, text.as_str(), view.upmix, ok);
+    button(canvas, layout, Hit::Center, "Centre", view.center && view.has_center, ok && view.has_center);
+    text.clear();
+    let _ = write!(text, "Layout: {}", view.layout);
+    button(canvas, layout, Hit::Layout, text.as_str(), false, true);
 }

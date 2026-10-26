@@ -1,5 +1,6 @@
 //! Stereo to 5.1 by matrix, the way a passive surround decoder does it; no analysis of the music, so it is cheap and
-//! predictable. Output order is SMPTE (and USB audio): L R C LFE Ls Rs.
+//! predictable. Output order is SMPTE (and USB audio): L R C LFE Ls Rs. A `Layout` leaves out what a smaller speaker
+//! set lacks: 4.1 is L R LFE Ls Rs (no centre, fronts untouched), 4.0 is quad, L R Ls Rs.
 //!
 //! * **Centre**: the mid signal (L+R)/2, and half of it is taken out of the fronts, so a voice panned to the middle moves
 //!   to the centre speaker while the energy stays about the same (`C` is scaled so that mono content keeps its power).
@@ -22,6 +23,58 @@ const CENTER_TAKEN_FROM_FRONTS: f32 = 0.5;
 const CENTER_GAIN: f32 = 1.2247449;
 const SIDE_GAIN: f32 = core::f32::consts::FRAC_1_SQRT_2;
 
+/// Which of the six upmix channels the device gets, in this order.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Layout {
+    /// L R C LFE Ls Rs.
+    Surround51,
+    /// L R LFE Ls Rs: no centre speaker.
+    Quad41,
+    /// L R Ls Rs: quad, no centre and no sub.
+    Quad40,
+}
+
+impl Layout {
+    pub const ALL: [Layout; 3] = [Layout::Surround51, Layout::Quad41, Layout::Quad40];
+
+    pub fn channels(self) -> usize {
+        match self {
+            Layout::Surround51 => 6,
+            Layout::Quad41 => 5,
+            Layout::Quad40 => 4,
+        }
+    }
+
+    pub fn has_center(self) -> bool {
+        self == Layout::Surround51
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Layout::Surround51 => "5.1",
+            Layout::Quad41 => "4.1",
+            Layout::Quad40 => "4.0",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Layout> {
+        Layout::ALL.into_iter().find(|layout| layout.name() == text)
+    }
+
+    /// The first of 5.1, 4.1, 4.0 that fits `channels` device outputs, `None` below four.
+    pub fn fitting(channels: usize) -> Option<Layout> {
+        Layout::ALL.into_iter().find(|layout| layout.channels() <= channels)
+    }
+
+    fn pick(self, six: [f32; 6]) -> [f32; 6] {
+        match self {
+            Layout::Surround51 => six,
+            Layout::Quad41 => [six[0], six[1], six[3], six[4], six[5], 0.0],
+            Layout::Quad40 => [six[0], six[1], six[4], six[5], 0.0, 0.0],
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct UpmixSettings {
     /// Surround level, 0 (none) to 1 (full).
@@ -32,10 +85,11 @@ pub struct UpmixSettings {
     pub delay_ms: f32,
     /// Feed the centre channel.
     pub center: bool,
+    pub layout: Layout,
 }
 
 impl UpmixSettings {
-    pub const DEFAULT: UpmixSettings = UpmixSettings { width: 0.7, lfe_hz: 100.0, delay_ms: 15.0, center: true };
+    pub const DEFAULT: UpmixSettings = UpmixSettings { width: 0.7, lfe_hz: 100.0, delay_ms: 15.0, center: true, layout: Layout::Surround51 };
 }
 
 #[derive(Clone, Copy)]
@@ -103,7 +157,7 @@ impl Upmix {
         self.rs_taps = taps(delay_ms + RS_EXTRA_MS);
     }
 
-    /// One stereo frame to L R C LFE Ls Rs.
+    /// One stereo frame to the channels of the layout (the first `layout.channels()` of the result; 5.1 is L R C LFE Ls Rs).
     pub fn process(&mut self, frame: [f32; 2]) -> [f32; 6] {
         let (left, right) = (frame[0], frame[1]);
         let mid = 0.5 * (left + right);
@@ -115,12 +169,13 @@ impl Upmix {
         self.write = (self.write + 1) % DELAY_CAPACITY;
         let first = self.lfe[0].process(mid as f64);
         let lfe = self.lfe[1].process(first) as f32;
-        if self.settings.center {
+        let six = if self.settings.center && self.settings.layout.has_center() {
             let taken = CENTER_TAKEN_FROM_FRONTS * mid;
             [left - taken, right - taken, CENTER_GAIN * mid, lfe, ls, rs]
         } else {
             [left, right, 0.0, lfe, ls, rs]
-        }
+        };
+        self.settings.layout.pick(six)
     }
 
     /// Silences the filters and the delay line (after a seek).
@@ -186,6 +241,18 @@ mod tests {
         let low = run(UpmixSettings::DEFAULT, tone(50.0), |n| -tone(50.0)(n), 48000);
         let sum: Vec<[f32; 6]> = low.iter().map(|f| [0.0, 0.0, 0.0, 0.0, f[4] + f[5], 0.0]).collect();
         assert!(rms(&sum, 4) < 0.5 * rms(&low, 4));
+    }
+
+    #[test]
+    fn smaller_layouts_drop_centre_and_sub() {
+        let side = |layout| run(UpmixSettings { layout, ..UpmixSettings::DEFAULT }, tone(500.0), |n| -tone(500.0)(n), 48000);
+        let quad = side(Layout::Quad40);
+        assert!(rms(&quad, 2) > 0.3 && rms(&quad, 3) > 0.3 && rms(&quad, 4) == 0.0);
+        let mono = run(UpmixSettings { layout: Layout::Quad41, ..UpmixSettings::DEFAULT }, tone(60.0), tone(60.0), 48000);
+        // No centre: the fronts keep the signal whole, and the sub is the third channel.
+        assert!((rms(&mono, 0) - 0.707).abs() < 0.01 && rms(&mono, 2) > 0.3 && rms(&mono, 3) < 0.001);
+        assert_eq!(Layout::fitting(5), Some(Layout::Quad41));
+        assert_eq!(Layout::fitting(3), None);
     }
 
     #[test]

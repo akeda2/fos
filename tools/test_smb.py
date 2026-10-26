@@ -123,6 +123,8 @@ def browse_directory(directory):
                 guest.process.stdin.flush()
                 guest.pump(1)
             guest.wait_for("Tape returned", 30, since=mark)
+            guest.wait_for("fos> ", 10, since=mark)
+            check("fosplay.cfg" in ask(guest, "ls", "fos> "), "the share is remembered in fosplay.cfg", guest.text()[-600:])
         finally:
             guest.stop()
 

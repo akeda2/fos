@@ -105,6 +105,7 @@ def main():
     jump_test()
     bass_test()
     ui_test()
+    config_test()
     browse_test()
     print("PASS: fosplay")
 
@@ -164,7 +165,7 @@ def bass_test():
                         break
             # loop0 has two channels: the upmix must say so and play stereo, not fail.
             mark = guest.send("run fosplay device=loop0 gfx=off upmix=on play b1k.flac &0")
-            guest.wait_for("upmix needs 6 playback channels; the device has 2", 30, since=mark)
+            guest.wait_for("upmix needs 4 playback channels; the device has 2", 30, since=mark)
         finally:
             guest.stop()
         out = fosfs_files(Path(tmp) / "bass.img")
@@ -193,7 +194,7 @@ def screenshot(monitor_path, tmp, name):
 def browse_test():
     """`fosplay browse` on FOSFS (QEMU has no touch input, so the keys stand in for fingers): the list shows the audio files
     only, j moves the chosen row (amber), Enter plays the folder from that file, q ends the track and brings the list back
-    (nothing chosen, so no amber), q again leaves the tape."""
+    (the chosen row kept), q again leaves the tape."""
     amber = (255, 179, 71)
     with tempfile.TemporaryDirectory() as tmp:
         files = {"notes.txt": b"not audio\n"}
@@ -226,12 +227,37 @@ def browse_test():
             check(chosen > 300, f"j chooses a row, and stops at the last audio file ({chosen} amber samples)", "")
             key(b"\r")
             guest.wait_for("[2/2] a2.flac", 30, since=mark)
+            green = (60, 207, 106)
+            _, _, pixel = screenshot(monitor_path, tmp, "browse.ppm")
+            check(any(pixel(x, 360) == green for x in range(800, 1200, 4)), "the player page shows the level meter while playing", "")
             key(b"q")
             guest.pump(1)
-            check(count() < 20, "q at a track returns to the list", "")
+            width, height, pixel = screenshot(monitor_path, tmp, "browse.ppm")
+            meter = sum(1 for y in range(0, height, 4) for x in range(0, width, 4) if pixel(x, y) == green)
+            check(meter == 0 and count() > 300, "q at a track returns to the list, the chosen row kept", "")
             check("Tape returned" not in guest.text()[mark:], "the tape is still running in the list", "")
-            key(b"q")
-            guest.wait_for("Tape returned", 30, since=mark)
+            key(b"s")
+            width, height, pixel = screenshot(monitor_path, tmp, "settings.ppm")
+            check(pixel(700, 540) == amber, "s opens the settings page (the Centre switch is lit)", str(pixel(700, 540)))
+        finally:
+            guest.stop()
+
+
+def config_test():
+    """fosplay.cfg is read at start: `upmix=on` from the file (not the command line) reaches the player, which on the two-channel
+    loop0 says it needs four channels for the saved layout."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "c.flac"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=500:sample_rate=48000:duration=5", "-ac", "2",
+                        "-sample_fmt", "s16", str(path)], check=True)
+        files = {"c.flac": path.read_bytes(), "fosplay.cfg": b"# saved\nupmix=on\nlayout=4.0\nvolume=0.5\n"}
+        guest = Guest(tmp, "config", MAC, files=files)
+        try:
+            guest.wait_for("M3 complete")
+            guest.wait_for("fos> ")
+            mark = guest.send("run fosplay device=loop0 gfx=off play c.flac &0")
+            guest.wait_for("upmix needs 4 playback channels; the device has 2", 30, since=mark)
+            check(True, "fosplay.cfg settings are applied", "")
         finally:
             guest.stop()
 
