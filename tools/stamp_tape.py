@@ -4,7 +4,8 @@
 The stamp is 16 bytes: the build time (u64, seconds since 1970), the tape ABI version the tape is built for (u32), the CPU
 (u8: 0 x86-64, 1 aarch64, from the ELF machine) and three reserved zero bytes. The build time is the commit time of HEAD when the working tree is clean, so two machines
 that build the same commit stamp the same value; with local changes it is the current time, so a dirty build counts
-as newer than the commit it started from. `tapesync` compares these stamps to decide which machine has the newer tape.
+as newer than the commit it started from. If OUT already exists as the same program (same bytes without the stamp, same ABI and CPU) it is left alone, so a rebuild that
+changed nothing keeps its build time and a deploy or `tapesync` does not send the tape again. `tapesync` compares these stamps to decide which machine has the newer tape.
 
 The input is never modified (cargo owns it); OUT is a copy with the section added (GNU objcopy, as the BIOS boot chain
 already needs binutils). The section is not loaded: the kernel's ELF loader only maps program headers.
@@ -61,6 +62,44 @@ def objcopy_for(arch):
     sys.exit("stamp_tape.py: no working objcopy for aarch64 (install llvm-objcopy or `rustup component add llvm-tools`)")
 
 
+def without_stamp(arch, path):
+    """The bytes of a tape with its `.fos_build` section removed."""
+    with tempfile.NamedTemporaryFile(delete=False) as handle:
+        bare = handle.name
+    try:
+        subprocess.run([objcopy_for(arch), "--remove-section", ".fos_build", path, bare], check=True)
+        with open(bare, "rb") as handle:
+            return handle.read()
+    finally:
+        os.unlink(bare)
+
+
+def unchanged(arch, old, new, stamp):
+    """True when `old` (a stamped tape from an earlier build) is the same program as `new` with the same ABI and CPU: it
+    then keeps its build time, so a rebuild that changed nothing does not make a deploy or `tapesync` send the tape again."""
+    if not os.path.exists(old):
+        return False
+    try:
+        with open(old, "rb") as handle:
+            data = handle.read()
+        from_old = elf_stamp(data)
+        return from_old is not None and from_old[1:] == struct.unpack("<QIB3x", stamp)[1:] and without_stamp(arch, old) == without_stamp(arch, new)
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
+def elf_stamp(data):
+    """(build time, ABI, CPU) from an ELF's `.fos_build` section, or None."""
+    shoff, shentsize, shnum, shstrndx = struct.unpack_from("<Q", data, 0x28)[0], *struct.unpack_from("<HHH", data, 0x3A)
+    sections = [struct.unpack_from("<IIQQQQIIQQ", data, shoff + index * shentsize) for index in range(shnum)]
+    names = sections[shstrndx]
+    for section in sections:
+        start = names[4] + section[0]
+        if data[start:data.index(b"\0", start)] == b".fos_build":
+            return struct.unpack_from("<QIB", data, section[4])
+    return None
+
+
 def main():
     if len(sys.argv) != 3:
         sys.exit("usage: stamp_tape.py IN OUT")
@@ -74,7 +113,10 @@ def main():
             [objcopy_for(arch), "--remove-section", ".fos_build", "--add-section", f".fos_build={handle.name}", "--set-section-flags", ".fos_build=noload,readonly", source, destination + ".tmp"],
             check=True,
         )
-        os.replace(destination + ".tmp", destination)
+        if unchanged(arch, destination, destination + ".tmp", stamp):
+            os.unlink(destination + ".tmp")
+        else:
+            os.replace(destination + ".tmp", destination)
     finally:
         os.unlink(handle.name)
 
