@@ -1,6 +1,6 @@
 ---
 name: fosadm
-description: Deploys and inspects Fosfor OS (fos) machines over Ethernet with tools/fosadm.py - discover hosts, compare kernel and tapes against the build, push the kernel (KUP) and tapes, run commands, copy files. Use when asked to deploy, push the kernel or tapes, update or check what the machines run, or add a tape to a host.
+description: Deploys and inspects Fosfor OS (fos) machines over Ethernet or a console serial line with tools/fosadm.py - discover hosts, compare kernel and tapes against the build, push the kernel (KUP) and tapes, run commands, copy files. Use when asked to deploy, push the kernel or tapes, update or check what the machines run, or add a tape to a host.
 ---
 
 # fosadm
@@ -27,11 +27,28 @@ Also: `run HOST cmd...`, `put HOST FILE [NAME] [--disk N]`, `shell HOST`, `bootc
 
 Order: `status` (or `deploy --dry-run`) first, show the plan to the user, then deploy.
 
+## Serial deploy (one machine on its console line)
+```
+python3 tools/fosadm.py --serial PORT [--fast 921600] status [-v]
+python3 tools/fosadm.py --serial PORT [--fast 921600] deploy [--dry-run|-y|--tapes-only|--kernel-only|--force-kernel|--add-missing]
+python3 tools/fosadm.py --serial PORT run serial "ls"            # HOST argument is ignored
+python3 tools/fosadm.py --serial PORT [--fast 921600] put serial FILE [NAME]
+```
+- No `--iface`, no raw-socket rights. The kernel goes through `kup serial`, tapes/files through `recv` (x86 and Pi 4 shells).
+- The shell must be at its prompt; a running tape is stopped with ESC like over Ethernet. `shell` and `bootcode` need Ethernet.
+- Ports: `ls -l /dev/serial/by-id /dev/ttyUSB*`; the user must be in `dialout`. A workstation may have several adapters
+  (an LTE modem shows up as ttyUSB2-4); probe with `status` and ask the user when unsure which is the target.
+- Speed: ~11 KB/s at 115200 baud (a 1 MB tape is about 90 s); `--fast 921600` is ~4x faster but the **Pi 4 shell only**
+  (x86 COM1 keeps its speed). Measured on a Pi 4: 200 KB in 18 s normal, 4.3 s fast; forced kernel deploy 40 s.
+- `status` compares the kernel by size in sectors, so a changed kernel of the same sector count reads "current":
+  use `--force-kernel` to push anyway. The Pi comes back on the other slot (slot 0 <-> 1) after a deploy.
+- A Pi 4 SD card once refused the first write and then failed all reads until `reset` (not reproduced; the kernel now
+  prints `SD: error: ...` on the first SD error). If a put is refused with "could not be written", look at the console
+  for that line, then `reset` and retry.
+- `make test-fosadm-serial` tests it against QEMU (COM1 on a pty).
+
 ## Behaviour to know
-- **Serial instead of Ethernet:** `--serial PORT [--baud N] [--fast N]` makes one machine on its console line the target
-  (no `--iface`, no raw-socket rights): `status`, `deploy` (kernel via `kup serial`, tapes via `recv`), `run`, `put`
-  (pass any HOST word). The shell must be at its prompt; no `shell`/`bootcode`. Slow at 115200 baud; `--fast` is Pi 4 only.
-  `ls /dev/serial/by-id` finds the port; ask the user which one if several.
+- **Serial instead of Ethernet:** see "Serial deploy" above; `--serial` replaces discovery with the one machine on that port.
 - Tapes are compared by **size** (stored tapes are staged images, bytes differ). Say what was verified.
 - By default only tapes a host **already has** are updated. A host lacking a tape says "up to date";
   use `--add-missing` to install new ones (it installs every missing tape, so check `status -v` first;
