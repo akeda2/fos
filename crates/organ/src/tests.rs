@@ -225,6 +225,17 @@ fn the_pitch_wheel_held_at_the_floor_stops_the_leslie() {
         organ.midi(&[0xe0, (value & 127) as u8, (value >> 7) as u8]);
     }
     assert_eq!(organ.leslie(), Leslie::Stop);
+    // The next push down is Slow again, a bounce of the spring on the way back is not, and up is Fast.
+    organ.midi(&[0xe0, 0, 0]);
+    assert_eq!(organ.leslie(), Leslie::Slow);
+    render(&mut organ, RATE as usize);
+    assert_eq!(organ.leslie(), Leslie::Stop);
+    for value in [3000u16, 9000, 7000, 8192] {
+        organ.midi(&[0xe0, (value & 127) as u8, (value >> 7) as u8]);
+    }
+    assert_eq!(organ.leslie(), Leslie::Stop, "the bounce does not undo it");
+    organ.midi(&[0xe0, 0, 100]);
+    assert_eq!(organ.leslie(), Leslie::Fast);
     // A flick to the floor and back before the hold time does not.
     organ.set_leslie(Leslie::Fast);
     organ.midi(&[0xe0, 0, 0]);

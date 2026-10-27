@@ -40,15 +40,6 @@ pub enum Percussion {
     Third,
 }
 
-/// Where the pitch wheel is, for switching the Leslie (`WheelTarget::Drive`).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BendZone {
-    Floor,
-    Low,
-    Centre,
-    High,
-}
-
 /// How long the pitch wheel must be held fully down for the Leslie to stop, in seconds.
 const STOP_HOLD: f32 = 0.4;
 
@@ -58,7 +49,8 @@ pub enum WheelTarget {
     /// The mod wheel picks the Leslie speed (Stop, Slow, Fast); the pitch wheel does nothing.
     Leslie,
     /// The mod wheel is the overdrive amount; the pitch wheel takes over the Leslie: up is Fast, down is Slow, and the
-    /// speed stays where it was put when the wheel springs back to the middle. Held fully down for 0.4 s it is Stop.
+    /// speed stays where it was put when the wheel springs back to the middle. Held fully down for 0.4 s it is Stop. This
+    /// works from every state, Off and Stop included.
     Drive,
 }
 
@@ -113,7 +105,10 @@ pub struct Organ {
     scanner: Scanner,
     drive: f32,
     wheels: WheelTarget,
-    bend_zone: BendZone,
+    /// The pitch wheel has already acted on this side of the middle; the middle band clears both (`pitch_wheel`).
+    bend_low_done: bool,
+    bend_high_done: bool,
+    bend_floor_done: bool,
     /// Frames the pitch wheel has been at its floor, 0 when it is not (or the Leslie already stopped).
     floor_frames: u32,
     overdrive: Overdrive,
@@ -160,7 +155,9 @@ impl Organ {
             scanner: Scanner::Off,
             drive: 0.0,
             wheels: WheelTarget::Leslie,
-            bend_zone: BendZone::Centre,
+            bend_low_done: false,
+            bend_high_done: false,
+            bend_floor_done: false,
             floor_frames: 0,
             overdrive: Overdrive::new(),
             volume: 0.7,
@@ -391,30 +388,39 @@ impl Organ {
         true
     }
 
-    /// Acts on the pitch wheel (0..=16383, 8192 in the middle) when it enters a zone, so the spring back to the middle
-    /// leaves what was chosen: high is Fast, low is Slow, and the floor, held for `STOP_HOLD`, is Stop (see `render`).
+    /// Acts on the pitch wheel (0..=16383, 8192 in the middle): going down is always Slow, going up always Fast, and the
+    /// floor held for `STOP_HOLD` is Stop (see `render`). Each side acts once until the wheel is back in the middle band,
+    /// so the bounce of the spring leaves what was chosen.
     fn pitch_wheel(&mut self, value: u32) {
-        let zone = match value {
-            12288.. => BendZone::High,
-            ..512 => BendZone::Floor,
-            ..4096 => BendZone::Low,
-            _ => BendZone::Centre,
-        };
-        let before = core::mem::replace(&mut self.bend_zone, zone);
-        if before == zone {
-            return;
-        }
-        self.floor_frames = 0;
-        match zone {
-            BendZone::High => self.set_leslie(Leslie::Fast),
-            BendZone::Low if before != BendZone::Floor => self.set_leslie(Leslie::Slow),
-            BendZone::Floor => {
-                if before != BendZone::Low {
-                    self.set_leslie(Leslie::Slow);
-                }
-                self.floor_frames = 1;
+        const BAND: u32 = 2048;
+        const FLOOR: u32 = 512;
+        if value < 8192 - BAND {
+            if !self.bend_low_done {
+                self.bend_low_done = true;
+                self.bend_high_done = false;
+                self.set_leslie(Leslie::Slow);
             }
-            _ => {}
+            if value < FLOOR {
+                if !self.bend_floor_done && self.floor_frames == 0 {
+                    self.floor_frames = 1;
+                }
+            } else {
+                self.bend_floor_done = false;
+                self.floor_frames = 0;
+            }
+        } else {
+            self.bend_floor_done = false;
+            self.floor_frames = 0;
+            if value > 8192 + BAND {
+                if !self.bend_high_done {
+                    self.bend_high_done = true;
+                    self.bend_low_done = false;
+                    self.set_leslie(Leslie::Fast);
+                }
+            } else {
+                self.bend_low_done = false;
+                self.bend_high_done = false;
+            }
         }
     }
 
@@ -452,6 +458,7 @@ impl Organ {
             self.floor_frames += frames.len() as u32;
             if self.floor_frames as f32 >= STOP_HOLD * self.sample_rate {
                 self.floor_frames = 0;
+                self.bend_floor_done = true;
                 self.set_leslie(Leslie::Stop);
             }
         }
