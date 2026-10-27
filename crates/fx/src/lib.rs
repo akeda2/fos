@@ -16,7 +16,7 @@ mod spring;
 mod wah;
 
 pub use ensemble::Ensemble;
-pub use oversample::Overdrive;
+pub use oversample::{Decimator, Overdrive};
 pub use phaser::Phaser;
 pub use reverb::Reverb;
 pub use rotary::{Rotary, RotaryMode};

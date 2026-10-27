@@ -19,6 +19,7 @@
 
 use dsp::math;
 use fx::{Ensemble, Phaser, Reverb, Wah, WahShape};
+use fx::Decimator;
 use tape_echo::TapeEcho;
 
 pub const FIRST_KEY: u8 = 36;
@@ -27,6 +28,8 @@ pub const SECTIONS: usize = 6;
 pub const SECTION_NAMES: [&str; SECTIONS] = ["Violin", "Viola", "Cello", "Bass", "Brass", "Piano"];
 /// MIDI note of the top octave's C: the octave that is generated; every other note is divided down from it.
 const TOP: i32 = 108;
+/// With high quality on, the sawtooth bank runs at 4x the rate while at most this many keys sound (the cost is per key).
+const HQ_KEYS: usize = 16;
 /// Low-pass cutoff of each section in Hz.
 const CUTOFF: [f32; SECTIONS] = [6000.0, 3000.0, 1500.0, 500.0, 2500.0, 3500.0];
 /// Gain per unit of saw amplitude: leaves room for a chord of several keys on several sections.
@@ -59,6 +62,9 @@ pub struct Strings {
     rate: f32,
     counter: [u64; 12],
     step: [u32; 12],
+    hq: bool,
+    active: usize,
+    decimators: [Decimator; 7],
     held: [bool; KEYS],
     sustained: [bool; KEYS],
     pedal: bool,
@@ -113,6 +119,9 @@ impl Strings {
             rate: 48000.0,
             counter: [0; 12],
             step: [0; 12],
+            hq: false,
+            active: 0,
+            decimators: core::array::from_fn(|_| Decimator::new()),
             held: [false; KEYS],
             sustained: [false; KEYS],
             pedal: false,
@@ -210,22 +219,18 @@ impl Strings {
     /// The sawtooth, -1..1, of MIDI note `note` (24..=108), divided down from the top octave's generator of its pitch class.
     fn saw(&self, note: i32) -> f32 {
         let pc = note.rem_euclid(12) as usize;
-        let octaves = (TOP + pc as i32 - note) / 12;
-        let phase = (self.counter[pc] >> octaves) as u32;
-        let t = (phase >> 8) as f32 * (1.0 / 16777216.0);
-        let dt = (self.step[pc] >> octaves) as f32 * (1.0 / 4294967296.0);
-        // PolyBLEP: a naive sawtooth's jump has harmonics far above Nyquist that fold back as inharmonic tones; smoothing
-        // the jump over the two samples around it takes most of them away for the cost of a branch.
-        let blep = if t < dt {
-            let x = t / dt;
-            x + x - x * x - 1.0
-        } else if t > 1.0 - dt {
-            let x = (t - 1.0) / dt;
-            x * x + x + x + 1.0
-        } else {
-            0.0
-        };
-        2.0 * t - 1.0 - blep
+        saw_at(note, self.counter[pc], self.step[pc])
+    }
+
+    pub fn hq(&self) -> bool {
+        self.hq
+    }
+
+    /// High quality: while at most `HQ_KEYS` keys sound, the sawtooth bank runs at 4x the sample rate (on top of the PolyBLEP
+    /// smoothing) and is filtered down by half-band stages, so the notes' folded-back partials are far lower; with more keys it
+    /// falls back to the plain bank, through the same filters so the switch does not click. Off costs nothing.
+    pub fn set_hq(&mut self, hq: bool) {
+        self.hq = hq;
     }
 
     pub fn note_on(&mut self, note: u8) {
@@ -461,8 +466,19 @@ impl Strings {
             for pc in 0..12 {
                 self.counter[pc] = self.counter[pc].wrapping_add(self.step[pc] as u64);
             }
-            // Buses: strings 16'/8'/4', brass 8'/4', piano 8'/4'.
-            let mut bus = [0.0f32; 7];
+            // Buses: strings 16'/8'/4', brass 8'/4', piano 8'/4'. With high quality on and few keys down, `quad` holds four
+            // sub-samples of each (oldest first) from oscillators at 4x the rate; otherwise only `quad[0]` is used.
+            let fast = self.hq && self.active <= HQ_KEYS;
+            let mut sub = [[0u64; 4]; 12];
+            if fast {
+                for pc in 0..12 {
+                    for (j, counter) in sub[pc].iter_mut().enumerate() {
+                        *counter = self.counter[pc].wrapping_sub(self.step[pc] as u64 * (3 - j as u64) / 4);
+                    }
+                }
+            }
+            let mut quad = [[0.0f32; 7]; 4];
+            let mut active = 0;
             for key in 0..KEYS {
                 let gate = self.held[key] || self.sustained[key];
                 let target = if gate { 1.0 } else { 0.0 };
@@ -472,6 +488,7 @@ impl Strings {
                     self.piano_env[key] = 0.0;
                     continue;
                 }
+                active += 1;
                 self.strings_env[key] += (target - self.strings_env[key]) * if gate { self.strings_attack } else { self.strings_release };
                 self.brass_env[key] += (target - self.brass_env[key]) * if gate { self.brass_attack } else { self.brass_release };
                 self.piano_amp[key] *= if gate { self.piano_decay } else { self.piano_release };
@@ -479,15 +496,30 @@ impl Strings {
                 let note = FIRST_KEY as i32 + key as i32;
                 // The 4' of the top keys would alias badly: fade it out over the top octave.
                 let fade = ((97 - note) as f32 / 13.0).clamp(0.0, 1.0);
-                let (low, mid, high) = (self.saw(note - 12), self.saw(note), self.saw(note + 12) * fade);
                 let (s, b, p) = (self.strings_env[key], self.brass_env[key], self.piano_env[key]);
-                bus[0] += s * low;
-                bus[1] += s * mid;
-                bus[2] += s * high;
-                bus[3] += b * mid;
-                bus[4] += b * high;
-                bus[5] += p * mid;
-                bus[6] += p * high;
+                for j in 0..if fast { 4 } else { 1 } {
+                    let at = |note: i32| {
+                        let pc = note.rem_euclid(12) as usize;
+                        if fast { saw_at(note, sub[pc][j], self.step[pc] / 4) } else { self.saw(note) }
+                    };
+                    let (low, mid, high) = (at(note - 12), at(note), at(note + 12) * fade);
+                    let bus = &mut quad[j];
+                    bus[0] += s * low;
+                    bus[1] += s * mid;
+                    bus[2] += s * high;
+                    bus[3] += b * mid;
+                    bus[4] += b * high;
+                    bus[5] += p * mid;
+                    bus[6] += p * high;
+                }
+            }
+            self.active = active;
+            let mut bus = quad[0];
+            if self.hq {
+                for (index, value) in bus.iter_mut().enumerate() {
+                    let samples = if fast { [quad[0][index], quad[1][index], quad[2][index], quad[3][index]] } else { [*value; 4] };
+                    *value = self.decimators[index].process(samples);
+                }
             }
             let input = [
                 0.6 * bus[1] + 0.8 * bus[2],
@@ -522,6 +554,26 @@ impl Strings {
             frame[1] = (right * self.volume).clamp(-1.0, 1.0);
         }
     }
+}
+
+/// The sawtooth, -1..1, of MIDI note `note` (24..=108) for the top octave generator of its pitch class at phase `counter`
+/// advancing `step` per sample; PolyBLEP: a naive sawtooth's jump has harmonics far above Nyquist that fold back as
+/// inharmonic tones, and smoothing the jump over the two samples around it takes most of them away for the cost of a branch.
+fn saw_at(note: i32, counter: u64, step: u32) -> f32 {
+    let pc = note.rem_euclid(12);
+    let octaves = (TOP + pc - note) / 12;
+    let t = ((counter >> octaves) as u32 >> 8) as f32 * (1.0 / 16777216.0);
+    let dt = (step >> octaves) as f32 * (1.0 / 4294967296.0);
+    let blep = if t < dt {
+        let x = t / dt;
+        x + x - x * x - 1.0
+    } else if t > 1.0 - dt {
+        let x = (t - 1.0) / dt;
+        x * x + x + x + 1.0
+    } else {
+        0.0
+    };
+    2.0 * t - 1.0 - blep
 }
 
 #[cfg(test)]

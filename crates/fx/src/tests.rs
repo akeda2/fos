@@ -257,3 +257,19 @@ fn oversampled_overdrive_is_a_bypass_at_zero() {
     let mut over = Overdrive::new();
     assert_eq!(over.process(0.3, 0.0), 0.3);
 }
+
+#[test]
+fn decimator_keeps_the_band_and_removes_what_the_base_rate_cannot_hold() {
+    // At the 4x rate (192 kHz): 1 kHz must pass at unit gain, 40 kHz (above the base Nyquist) must be gone.
+    let rms_of = |hz: f32| {
+        let mut decimator = Decimator::new();
+        let mut out = Vec::new();
+        for n in 0..2400 {
+            let quad = core::array::from_fn(|j| math::sin(2.0 * core::f32::consts::PI * hz * (n * 4 + j) as f32 / (4 * RATE) as f32));
+            out.push(decimator.process(quad));
+        }
+        rms(&out[400..]) * core::f32::consts::SQRT_2
+    };
+    assert!((rms_of(1000.0) - 1.0).abs() < 0.02);
+    assert!(rms_of(40000.0) < 0.01);
+}

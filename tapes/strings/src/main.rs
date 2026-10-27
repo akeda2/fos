@@ -31,9 +31,11 @@ keyboard plays it (note on/off, sustain pedal, controller 123 stops all
 notes, an expression pedal, CC 11, works the wah); the mod wheel sweeps the
 phaser speed and/or the ensemble depth, or works the wah, as the Phaser /
 Ens / Both / Wah buttons say. Pedal on the screen holds notes like
-the sustain pedal. While a MIDI keyboard is connected the on-screen keyboard
-is hidden. The sound is stereo, 32-bit float inside, whatever the audio device
-takes. latency=MS is how much audio is kept queued (10-200, default 40).
+the sustain pedal. HQ runs the oscillators at 4x the rate (far less aliasing on
+high notes) while 16 keys or fewer sound; it costs CPU per key. While a MIDI
+keyboard is connected the on-screen keyboard is hidden. The sound is stereo,
+32-bit float inside, whatever the audio device takes. latency=MS is how much
+audio is kept queued (10-200, default 40).
 out=N picks the output pair on a multichannel card: N is the left channel
 (out=9 plays on outputs 9 and 10; default 1).
 Keys: z s x d c v g b h n j m , and q 2 w 3 e r 5 t 6 y 7 u i play notes

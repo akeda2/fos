@@ -106,3 +106,33 @@ impl Default for Overdrive {
         Self::new()
     }
 }
+
+/// Brings a signal generated at 4x the sample rate down to it: a short half-band filter 4x -> 2x, then the long one 2x -> 1x
+/// (the same pair `Overdrive` uses). For sources that are cheaper to synthesise fast than to filter, such as a bank of
+/// sawtooth oscillators: the caller makes four samples per output sample, oldest first.
+pub struct Decimator {
+    first: Fir<15>,
+    second: Fir<47>,
+}
+
+impl Decimator {
+    pub fn new() -> Self {
+        Decimator { first: Fir::half_band(), second: Fir::half_band() }
+    }
+
+    pub fn process(&mut self, quad: [f32; 4]) -> f32 {
+        self.first.push(quad[0]);
+        self.first.push(quad[1]);
+        self.second.push(self.first.output());
+        self.first.push(quad[2]);
+        self.first.push(quad[3]);
+        self.second.push(self.first.output());
+        self.second.output()
+    }
+}
+
+impl Default for Decimator {
+    fn default() -> Self {
+        Self::new()
+    }
+}

@@ -531,4 +531,4 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
 
 Status (2026-10-27): the organ's source is clean (91 sine wheels, top one about 5.9 kHz, nothing above Nyquist). `fx::Overdrive` now runs
 `overdrive` at 4x (two half-band stages, `crates/fx/src/oversample.rs`; host test counts the folded power) and the organ and epiano drive
-use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limited saw about 0.4x of the naive one); its 4' fade on the top keys is kept. Still open: `phono`, the `wah`/`rotary` stages, and a listening check on real hardware.
+use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limited saw about 0.4x of the naive one); its 4' fade on the top keys is kept. An HQ switch (strings tape button) runs the sawtooth bank at 4x with `fx::Decimator` while 16 keys or fewer sound (CPU cost not yet measured on the Pi). Still open: `phono`, the `wah`/`rotary` stages, and a listening check on real hardware.

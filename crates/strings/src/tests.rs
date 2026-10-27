@@ -329,3 +329,35 @@ fn the_saw_is_band_limited_so_high_notes_fold_less() {
         assert!(blep < naive * 0.5, "note {note}: error {blep} vs naive {naive}");
     }
 }
+
+/// Power of what is left of a held note after taking away its harmonics (the folded-back partials, mostly), relative to
+/// the whole, in dB.
+fn inharmonic_db(hq: bool, note: u8) -> f64 {
+    let mut machine = dry(0);
+    machine.set_hq(hq);
+    machine.note_on(note);
+    render(&mut machine, 24000);
+    let sound = render(&mut machine, 48000);
+    let hz = 440.0 * 2f64.powf((note as f64 - 69.0) / 12.0);
+    let signal: Vec<f64> = sound.iter().map(|f| f[0] as f64).collect();
+    let total: f64 = signal.iter().map(|v| v * v).sum();
+    let mut explained = 0.0;
+    for n in 1..=(RATE as f64 / 2.0 / hz) as usize {
+        let (mut re, mut im) = (0.0, 0.0);
+        for (i, v) in signal.iter().enumerate() {
+            let angle = 2.0 * std::f64::consts::PI * hz * n as f64 * i as f64 / RATE as f64;
+            re += v * angle.cos();
+            im += v * angle.sin();
+        }
+        explained += 2.0 * (re * re + im * im) / signal.len() as f64;
+    }
+    10.0 * ((total - explained).max(1e-12) / total).log10()
+}
+
+#[test]
+fn high_quality_lowers_the_folded_partials() {
+    for note in [84u8, 91] {
+        let (plain, hq) = (inharmonic_db(false, note), inharmonic_db(true, note));
+        assert!(hq < plain - 6.0, "note {note}: plain {plain:.1} dB, hq {hq:.1} dB");
+    }
+}

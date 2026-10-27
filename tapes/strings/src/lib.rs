@@ -25,6 +25,8 @@ pub enum Hit {
     Sustain,
     /// The wah on or off.
     Wah,
+    /// High-quality (4x oversampled) oscillators on or off.
+    Hq,
     /// A key, by MIDI note.
     Key(u8),
 }
@@ -99,8 +101,8 @@ impl Layout {
         for index in 0..TARGETS.len() {
             layout.add(Rect { x: control_panel.x + margin + index as i32 * button_w, y, w: button_w - margin / 2, h: row_h - margin }, Hit::Target(index as u8));
         }
-        let (y, button_w) = (y + row_h, (control_panel.w - 2 * margin) / 2);
-        for (index, hit) in [Hit::Sustain, Hit::Wah].into_iter().enumerate() {
+        let (y, button_w) = (y + row_h, (control_panel.w - 2 * margin) / 3);
+        for (index, hit) in [Hit::Sustain, Hit::Wah, Hit::Hq].into_iter().enumerate() {
             layout.add(Rect { x: control_panel.x + margin + index as i32 * button_w, y, w: button_w - margin / 2, h: row_h - margin }, hit);
         }
         layout
@@ -194,6 +196,7 @@ pub fn lit(machine: &Strings, hit: Hit) -> bool {
         Hit::Target(index) => machine.mod_target() == TARGETS[index as usize].1,
         Hit::Sustain => machine.sustain(),
         Hit::Wah => machine.wah_on(),
+        Hit::Hq => machine.hq(),
         _ => false,
     }
 }
@@ -203,6 +206,7 @@ pub fn label(hit: Hit) -> &'static str {
         Hit::Target(index) => TARGETS[index as usize].0,
         Hit::Sustain => "Pedal",
         Hit::Wah => "Wah",
+        Hit::Hq => "HQ",
         _ => "",
     }
 }
@@ -214,6 +218,7 @@ pub fn press(layout: &Layout, machine: &mut Strings, hit: Hit, x: i32, y: i32) {
         Hit::Target(index) => machine.set_mod_target(TARGETS[index as usize].1),
         Hit::Sustain => machine.set_sustain(!machine.sustain()),
         Hit::Wah => machine.set_wah(!machine.wah_on()),
+        Hit::Hq => machine.set_hq(!machine.hq()),
         _ => drag(layout, machine, hit, x, y),
     }
 }
@@ -292,5 +297,9 @@ mod tests {
         assert_eq!(layout.hit(wah.x + 2, wah.y + 2), Some(Hit::Wah));
         press(&layout, &mut machine, Hit::Wah, 0, 0);
         assert!(lit(&machine, Hit::Wah));
+        let hq = layout.widget_rect(Hit::Hq).unwrap();
+        assert_eq!(layout.hit(hq.x + 2, hq.y + 2), Some(Hit::Hq));
+        press(&layout, &mut machine, Hit::Hq, 0, 0);
+        assert!(lit(&machine, Hit::Hq));
     }
 }
