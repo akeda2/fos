@@ -16,6 +16,9 @@
 
 use crate::{pci, timer};
 
+/// Set by the first reported error (see `recover`).
+static REPORTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 const MAX_DRIVES: usize = 2;
 /// Blocks per read or write command (the command's own limit is 65535).
 const CHUNK_BLOCKS: usize = 128;
@@ -216,8 +219,13 @@ impl Controller {
         }
     }
 
-    /// After an error: reset the command and data lines and clear the status.
+    /// After an error: reset the command and data lines and clear the status. The first error is reported (once) with the
+    /// controller's own view, because a card that stops answering after one failed write has otherwise left no trace.
     fn recover(&self) {
+        if !REPORTED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            crate::println!("SD: error: interrupt status {:#x}, present state {:#x}, clock {:#x}.", self.read(INT_STATUS),
+                            self.read(PRESENT), self.read(CLOCK));
+        }
         self.write(CLOCK, self.read(CLOCK) | 3 << 25);
         let _ = self.wait(CLOCK, 3 << 25, 0, 100_000);
         self.write(INT_STATUS, 0xffff_ffff);
