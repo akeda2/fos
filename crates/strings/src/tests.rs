@@ -50,14 +50,17 @@ fn octaves_are_divided_down_from_one_generator() {
     let wraps = |machine: &mut Strings, note: i32| {
         let mut last = machine.saw(note);
         let mut count = 0;
+        let mut in_jump = false;
         for _ in 0..RATE {
             for pc in 0..12 {
                 machine.counter[pc] = machine.counter[pc].wrapping_add(machine.step[pc] as u64);
             }
             let now = machine.saw(note);
-            if now < last - 1.0 {
+            // The band-limited jump is spread over two samples: count it once.
+            if now < last - 0.5 && !in_jump {
                 count += 1;
             }
+            in_jump = now < last - 0.5;
             last = now;
         }
         count
@@ -295,4 +298,34 @@ fn the_tape_echo_repeats_a_note_after_it_ends() {
     };
     assert!(tail(0.0) < 1e-4);
     assert!(tail(1.0) > 10.0 * tail(0.0).max(1e-5));
+}
+
+/// RMS distance of `saw(note)` over a few periods from an ideal sawtooth that stops at Nyquist, plus the same for the
+/// naive sawtooth of the same phase.
+fn saw_errors(note: i32) -> (f64, f64) {
+    let mut machine = Strings::new(RATE);
+    let pc = note.rem_euclid(12) as usize;
+    let octaves = (TOP + pc as i32 - note) / 12;
+    let hz = RATE as f64 * (machine.step[pc] >> octaves) as f64 / 4294967296.0;
+    let harmonics = (RATE as f64 / 2.0 / hz) as usize;
+    let (mut blep, mut naive) = (0.0, 0.0);
+    let frames = 4800;
+    for _ in 0..frames {
+        machine.counter[pc] = machine.counter[pc].wrapping_add(machine.step[pc] as u64);
+        let t = ((machine.counter[pc] >> octaves) as u32 >> 8) as f64 / 16777216.0;
+        let ideal: f64 = (1..=harmonics)
+            .map(|n| -(2.0 / std::f64::consts::PI) * (2.0 * std::f64::consts::PI * n as f64 * t).sin() / n as f64)
+            .sum();
+        blep += (machine.saw(note) as f64 - ideal).powi(2);
+        naive += (2.0 * t - 1.0 - ideal).powi(2);
+    }
+    ((blep / frames as f64).sqrt(), (naive / frames as f64).sqrt())
+}
+
+#[test]
+fn the_saw_is_band_limited_so_high_notes_fold_less() {
+    for note in [72, 84, 96] {
+        let (blep, naive) = saw_errors(note);
+        assert!(blep < naive * 0.5, "note {note}: error {blep} vs naive {naive}");
+    }
 }

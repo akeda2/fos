@@ -212,7 +212,20 @@ impl Strings {
         let pc = note.rem_euclid(12) as usize;
         let octaves = (TOP + pc as i32 - note) / 12;
         let phase = (self.counter[pc] >> octaves) as u32;
-        (phase >> 8) as f32 * (2.0 / 16777216.0) - 1.0
+        let t = (phase >> 8) as f32 * (1.0 / 16777216.0);
+        let dt = (self.step[pc] >> octaves) as f32 * (1.0 / 4294967296.0);
+        // PolyBLEP: a naive sawtooth's jump has harmonics far above Nyquist that fold back as inharmonic tones; smoothing
+        // the jump over the two samples around it takes most of them away for the cost of a branch.
+        let blep = if t < dt {
+            let x = t / dt;
+            x + x - x * x - 1.0
+        } else if t > 1.0 - dt {
+            let x = (t - 1.0) / dt;
+            x * x + x + x + 1.0
+        } else {
+            0.0
+        };
+        2.0 * t - 1.0 - blep
     }
 
     pub fn note_on(&mut self, note: u8) {
