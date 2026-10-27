@@ -100,6 +100,16 @@ pub fn pow10(x: f32) -> f32 {
     exp64(x as f64 * LN_10) as f32
 }
 
+/// Hyperbolic tangent for waveshaping: a [7/6] Pade rational, within 1e-4 of the true value (-80 dB) and monotonic, with no
+/// exponential in it, so it is cheap enough for a stage run at 4x the sample rate. It reaches 1 at |x| = 4.97 and stays there.
+pub fn tanh(x: f32) -> f32 {
+    if x.abs() >= 4.97 {
+        return 1.0f32.copysign(x);
+    }
+    let x2 = x * x;
+    x * (135135.0 + x2 * (17325.0 + x2 * (378.0 + x2))) / (135135.0 + x2 * (62370.0 + x2 * (3150.0 + 28.0 * x2)))
+}
+
 /// 20*log10 of an amplitude / 10*log10 of a power, floored at `floor_db` so silence stays on the chart.
 pub fn power_to_db(power: f32, floor_db: f32) -> f32 {
     let db = 10.0 * log10(power);
@@ -129,6 +139,18 @@ mod tests {
         assert!((pow10(-2.0) - 0.01).abs() < 1e-8);
         assert_eq!(floor64(-1.5), -2.0);
         assert_eq!(floor64(2.0), 2.0);
+    }
+
+    #[test]
+    fn tanh_is_close_and_bounded() {
+        let mut x = -12.0f32;
+        let mut last = -1.0;
+        while x < 12.0 {
+            let y = tanh(x);
+            assert!((y - x.tanh()).abs() < 1.5e-4 && y.abs() <= 1.0 && y >= last, "tanh {x}");
+            last = y;
+            x += 0.013;
+        }
     }
 
     #[test]

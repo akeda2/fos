@@ -15,6 +15,7 @@
 use dsp::math;
 
 use fx::{Delay, Overdrive, Rotary};
+pub use fx::DriveKind;
 pub use fx::RotaryMode as Leslie;
 pub use fx::Reverb;
 
@@ -157,6 +158,7 @@ impl Organ {
             vibrato_step: 0,
             rotary: Rotary::new(sample_rate),
         };
+        organ.overdrive.set_kind(DriveKind::PushPull);
         organ.set_sample_rate(sample_rate);
         organ
     }
@@ -173,6 +175,7 @@ impl Organ {
         self.click_decay = math::exp64(-1.0 / (0.0015 * rate as f64)) as f32;
         self.vibrato_step = (6.1 / rate as f64 * 4294967296.0) as u32;
         self.rotary.set_sample_rate(sample_rate);
+        self.overdrive.set_sample_rate(sample_rate);
         self.reverb.set_sample_rate(rate);
         self.set_percussion_decay();
     }
@@ -249,6 +252,15 @@ impl Organ {
 
     pub fn drive(&self) -> f32 {
         self.drive
+    }
+
+    /// Which amplifier the overdrive models (default: a push-pull power stage, as in a Leslie's).
+    pub fn set_drive_kind(&mut self, kind: DriveKind) {
+        self.overdrive.set_kind(kind);
+    }
+
+    pub fn drive_kind(&self) -> DriveKind {
+        self.overdrive.kind()
     }
 
     /// Master volume 0..=1.

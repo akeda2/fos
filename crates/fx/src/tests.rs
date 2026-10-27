@@ -239,7 +239,7 @@ fn oversampled_overdrive_folds_far_less_and_keeps_the_level() {
 
     let mut over = Overdrive::new();
     let mut gentle = |x| over.process(x, 0.001);
-    let mut plain = |x| overdrive(x, 0.001);
+    let plain = |x| overdrive(x, 0.001);
     let tone = |i: usize| 0.05 * math::sin(2.0 * core::f32::consts::PI * 1000.0 * i as f32 / RATE as f32);
     let (mut a, mut b) = (Vec::new(), Vec::new());
     for i in 0..4800 {
@@ -272,4 +272,74 @@ fn decimator_keeps_the_band_and_removes_what_the_base_rate_cannot_hold() {
     };
     assert!((rms_of(1000.0) - 1.0).abs() < 0.02);
     assert!(rms_of(40000.0) < 0.01);
+}
+
+fn driven(kind: DriveKind, amount: f32, hz: f32, level: f32, frames: usize) -> Vec<f32> {
+    let mut over = Overdrive::new();
+    over.set_kind(kind);
+    (0..frames).map(|i| over.process(level * math::sin(2.0 * core::f32::consts::PI * hz * i as f32 / RATE as f32), amount)).collect()
+}
+
+/// Amplitude of the `hz` component (a whole number of cycles in the slice).
+fn component_at(out: &[f32], hz: f32) -> f64 {
+    let (mut re, mut im) = (0.0f64, 0.0f64);
+    for (i, v) in out.iter().enumerate() {
+        let angle = 2.0 * std::f64::consts::PI * hz as f64 * i as f64 / RATE as f64;
+        re += *v as f64 * angle.cos();
+        im += *v as f64 * angle.sin();
+    }
+    2.0 * (re * re + im * im).sqrt() / out.len() as f64
+}
+
+#[test]
+fn every_drive_kind_is_bounded_silent_at_rest_and_a_bypass_at_zero() {
+    for kind in DriveKind::ALL {
+        let mut over = Overdrive::new();
+        over.set_kind(kind);
+        assert_eq!(over.process(0.3, 0.0), 0.3, "{kind:?}");
+        let out = driven(kind, 1.0, 1000.0, 1.0, 4800);
+        // The biased kinds start off-centre until the DC blocker settles.
+        assert!(out.iter().skip(2400).all(|v| v.abs() <= 2.6), "{kind:?} peak");
+        assert!(out.iter().skip(2400).any(|v| v.abs() > 0.3), "{kind:?} makes sound");
+        assert!(driven(kind, 1.0, 1000.0, 0.0, 2400).iter().all(|v| v.abs() < 1e-6), "{kind:?} silence");
+    }
+}
+
+#[test]
+fn symmetric_kinds_make_odd_harmonics_and_the_biased_ones_even_too() {
+    // 1 kHz over 4800 frames is 100 whole cycles; 2 kHz is its second harmonic, 3 kHz its third.
+    for kind in DriveKind::ALL {
+        let out = driven(kind, 0.8, 1000.0, 0.3, 9600);
+        let out = &out[4800..];
+        let (second, third) = (component_at(out, 2000.0), component_at(out, 3000.0));
+        if matches!(kind, DriveKind::Triode | DriveKind::Vox) {
+            assert!(second > 0.02, "{kind:?}: second {second}");
+        } else {
+            assert!(second < 1e-3 && third > 0.02, "{kind:?}: second {second}, third {third}");
+        }
+        let mean = out.iter().map(|v| *v as f64).sum::<f64>() / out.len() as f64;
+        assert!(mean.abs() < 0.01, "{kind:?} DC {mean}");
+    }
+}
+
+#[test]
+fn transistor_clamps_hard_and_tanh_stays_round() {
+    let hard = driven(DriveKind::Transistor, 1.0, 1000.0, 1.0, 4800);
+    let flat = hard[2400..].iter().filter(|v| (**v - 2.0).abs() < 0.05).count();
+    assert!(flat > 400, "flat top {flat}");
+    let round = driven(DriveKind::Tanh, 1.0, 1000.0, 1.0, 4800);
+    assert!(round[2400..].iter().all(|v| v.abs() < 2.1));
+    // Hard clipping keeps its high harmonics (a corner), tanh's die away quickly.
+    let hard = driven(DriveKind::Transistor, 0.3, 1000.0, 0.5, 4800);
+    let round = driven(DriveKind::Tanh, 0.3, 1000.0, 0.5, 4800);
+    assert!(component_at(&hard[2400..], 11000.0) > 20.0 * component_at(&round[2400..], 11000.0));
+}
+
+#[test]
+fn sag_compresses_a_sustained_loud_signal() {
+    let rms_of = |kind| {
+        let out = driven(kind, 0.7, 500.0, 0.5, 48000);
+        rms(&out[24000..])
+    };
+    assert!(rms_of(DriveKind::Sag) < 0.9 * rms_of(DriveKind::Tanh));
 }

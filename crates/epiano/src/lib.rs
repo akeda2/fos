@@ -20,7 +20,8 @@
 #![cfg_attr(not(test), no_std)]
 
 use dsp::math;
-use fx::{Ensemble, Phaser, Sine, Svf, Overdrive, Wah, WahShape, overdrive, phase_step};
+use fx::{Ensemble, Phaser, Sine, Svf, Overdrive, Wah, WahShape, phase_step};
+pub use fx::DriveKind;
 use tape_echo::TapeEcho;
 
 /// The MIDI range of an 88-key piano.
@@ -299,7 +300,11 @@ impl EPiano {
             bark: 0.5,
             decay: 0.5,
             drive: 0.0,
-            overdrive: Overdrive::new(),
+            overdrive: {
+                let mut overdrive = Overdrive::new();
+                overdrive.set_kind(DriveKind::Triode);
+                overdrive
+            },
             chorus: 0.25,
             phaser: 0.0,
             tremolo_rate: 0.5,
@@ -349,6 +354,7 @@ impl EPiano {
         let rate = sample_rate.clamp(8000, 192000) as f32;
         self.rate = rate;
         self.ensemble.set_sample_rate(sample_rate);
+        self.overdrive.set_sample_rate(sample_rate);
         self.phaser_fx.set_sample_rate(sample_rate);
         self.echo.set_sample_rate(sample_rate);
         self.damper_coef = math::pow10(-3.0 / (DAMPER_T60 * rate));
@@ -754,6 +760,15 @@ impl EPiano {
         self.drive
     }
 
+    /// Which amplifier the tube stage models (default: a biased triode stage).
+    pub fn set_drive_kind(&mut self, kind: DriveKind) {
+        self.overdrive.set_kind(kind);
+    }
+
+    pub fn drive_kind(&self) -> DriveKind {
+        self.overdrive.kind()
+    }
+
     pub fn set_chorus(&mut self, mix: f32) {
         self.chorus = mix.clamp(0.0, 1.0);
         self.update_effects();
@@ -861,13 +876,13 @@ impl EPiano {
         self.mod_target
     }
 
-    /// The tube stage: a bias gives even harmonics, the squash is `fx::Overdrive` (4x oversampled), and the highs go as it is driven.
+    /// The tube stage: `fx::Overdrive` of the chosen kind (4x oversampled; the default, a biased triode, gives even harmonics),
+    /// and the highs go as it is driven.
     fn tube(&mut self, x: f32) -> f32 {
         if self.drive <= 0.0 {
             return x;
         }
-        let bias = 0.25 * self.drive;
-        let y = self.overdrive.process(x + bias, self.drive) - overdrive(bias, self.drive);
+        let y = self.overdrive.process(x, self.drive);
         self.drive_state += self.drive_pole * (y - self.drive_state);
         self.drive_state
     }

@@ -2,11 +2,11 @@
 //! `press`, `drag`) and what a control currently shows. `main.rs` draws and runs it; the geometry is testable on the host.
 #![cfg_attr(not(test), no_std)]
 
-use epiano::{EPiano, ModTarget, Model, Voicing};
+use epiano::{DriveKind, EPiano, ModTarget, Model, Voicing};
 use instrument_rt::{Keyboard, Rect};
 
 pub const GLYPH_H: i32 = gfx::GLYPH_HEIGHT as i32;
-const MAX_WIDGETS: usize = 40;
+const MAX_WIDGETS: usize = 48;
 pub const SLIDERS: [&str; 22] = [
     "Bell", "Bark", "Decay", "Drive", "Chorus", "Phaser", "Trem rate", "Trem depth", "Echo", "Repeat", "Feedback", "Reverb", "Volume", "Mod", "Detune", "Touch", "Vowel", "Glide", "Q",
     "Range", "Soft", "Wah",
@@ -28,6 +28,8 @@ pub enum Hit {
     Model(u8),
     /// The vowel filter (lit) or the old sweep after each pickup.
     Voicing,
+    /// The kind of amplifier the tube stage models (index into `DriveKind::ALL`).
+    Amp(u8),
     /// A key, by MIDI note.
     Key(u8),
 }
@@ -75,8 +77,9 @@ impl Layout {
             widget_count: 0,
         };
 
-        // Two columns of sliders, a row with the five mod targets and the pedal, a row with the tine models and the voicing.
-        let row_h = (panel.h - margin) / (ROWS as i32 + 2);
+        // Two columns of sliders, a row with the five mod targets and the pedal, a row with the tine models and the voicing,
+        // and a double-height row with the amplifier kinds.
+        let row_h = (panel.h - margin) / (ROWS as i32 + 4);
         let column_w = (panel.w - margin) / 2;
         for index in 0..SLIDERS.len() {
             let (column, row) = ((index / ROWS) as i32, (index % ROWS) as i32);
@@ -96,6 +99,11 @@ impl Layout {
         }
         let index = Model::ALL.len() as i32;
         layout.add(Rect { x: panel.x + margin + index * button_w, y, w: button_w - margin, h: row_h - margin }, Hit::Voicing);
+        let y = y + row_h;
+        let button_w = (panel.w - margin) / DriveKind::ALL.len() as i32;
+        for index in 0..DriveKind::ALL.len() {
+            layout.add(Rect { x: panel.x + margin + index as i32 * button_w, y, w: button_w - margin, h: row_h * 2 - margin }, Hit::Amp(index as u8));
+        }
         layout
     }
 
@@ -198,6 +206,7 @@ pub fn lit(piano: &EPiano, hit: Hit) -> bool {
         Hit::Sustain => piano.sustain(),
         Hit::Model(index) => piano.model() == Model::ALL[index as usize],
         Hit::Voicing => piano.voicing() == Voicing::Vowel,
+        Hit::Amp(index) => piano.drive_kind() == DriveKind::ALL[index as usize],
         _ => false,
     }
 }
@@ -208,6 +217,7 @@ pub fn label(hit: Hit) -> &'static str {
         Hit::Sustain => "Pedal",
         Hit::Model(index) => Model::ALL[index as usize].name(),
         Hit::Voicing => "Vowel",
+        Hit::Amp(index) => DriveKind::ALL[index as usize].short(),
         _ => "",
     }
 }
@@ -220,6 +230,7 @@ pub fn press(layout: &Layout, piano: &mut EPiano, hit: Hit, x: i32, y: i32) {
         Hit::Sustain => piano.set_sustain(!piano.sustain()),
         Hit::Model(index) => piano.set_model(Model::ALL[index as usize]),
         Hit::Voicing => piano.set_voicing(if piano.voicing() == Voicing::Vowel { Voicing::Sweep } else { Voicing::Vowel }),
+        Hit::Amp(index) => piano.set_drive_kind(DriveKind::ALL[index as usize]),
         Hit::Slider(_) => drag(layout, piano, hit, x, y),
     }
 }
@@ -235,7 +246,7 @@ pub fn drag(layout: &Layout, piano: &mut EPiano, hit: Hit, x: i32, _y: i32) {
 mod tests {
     use super::*;
 
-    const SIZES: [(i32, i32); 4] = [(640, 480), (1366, 768), (1280, 1024), (3312, 1872)];
+    const SIZES: [(i32, i32); 5] = [(640, 480), (1344, 768), (1366, 768), (1280, 1024), (3312, 1872)];
 
     #[test]
     fn every_widget_is_on_screen_and_none_overlap() {
@@ -243,7 +254,7 @@ mod tests {
             for keys in [true, false] {
                 let layout = Layout::new(w, h, keys);
                 let screen = Rect { x: 0, y: 0, w, h };
-                assert_eq!(layout.widgets().len(), SLIDERS.len() + TARGETS.len() + 1 + Model::ALL.len() + 1);
+                assert_eq!(layout.widgets().len(), SLIDERS.len() + TARGETS.len() + 1 + Model::ALL.len() + 1 + DriveKind::ALL.len());
                 for (i, a) in layout.widgets().iter().enumerate() {
                     let r = a.rect;
                     assert!(r.w > 4 && r.h > 4, "{w}x{h} {:?}", a.hit);
@@ -277,6 +288,9 @@ mod tests {
         assert!(lit(&piano, Hit::Sustain));
         press(&layout, &mut piano, Hit::Model(2), 0, 0);
         assert!(lit(&piano, Hit::Model(2)) && !lit(&piano, Hit::Model(0)));
+        assert!(lit(&piano, Hit::Amp(2)) && piano.drive_kind() == DriveKind::Triode);
+        press(&layout, &mut piano, Hit::Amp(5), 0, 0);
+        assert!(lit(&piano, Hit::Amp(5)) && !lit(&piano, Hit::Amp(2)));
         assert!(lit(&piano, Hit::Voicing));
         press(&layout, &mut piano, Hit::Voicing, 0, 0);
         assert!(!lit(&piano, Hit::Voicing) && piano.voicing() == Voicing::Sweep);

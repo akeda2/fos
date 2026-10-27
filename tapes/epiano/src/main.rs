@@ -25,7 +25,8 @@ vowel filter: two formants that a hard hit opens towards "a" and that close
 as the note dies (Vowel sets where it rests, Glide how far it moves, Q how
 sharp it is, Range how high it opens: low is a sung "a", high a wah's
 squeal; the Vowel button off gives the older pitch sweep instead). Then a
-tube overdrive (Drive), a chorus, a tremolo auto-pan, a phaser, the tape
+tube overdrive (Drive; one button per amp model: Soft, Tanh, Triode, P-P,
+Sag, Trans, Vox), a chorus, a tremolo auto-pan, a phaser, the tape
 echo (Echo, Repeat, Feedback) and a reverb.
 A USB-MIDI keyboard plays it, 88 keys (note on/off with velocity, sustain
 pedal, controller 123 stops all notes, an expression pedal (CC 11) is a wah

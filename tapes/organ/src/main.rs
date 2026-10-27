@@ -21,7 +21,8 @@ tape_rt::tape_help!(
 A drawbar organ in the Hammond B-3 mould. The screen has nine drawbars (drag
 them up and down), six presets, percussion (2nd/3rd harmonic, fast/slow,
 soft/normal), scanner vibrato V1-V3 and chorus C1-C3, a Leslie (Off, Stop,
-Slow, Fast: the rotors speed up and slow down like the real ones), overdrive,
+Slow, Fast: the rotors speed up and slow down like the real ones), overdrive
+with a button per amp model (Soft, Tanh, Triode, P-P, Sag, Trans, Vox),
 volume, key click, reverb, and a 61-key keyboard that a finger plays. A
 USB-MIDI keyboard plays it too (note on/off; controller 123 stops all notes;
 the mod wheel sets the Leslie: low Stop, middle Slow, high Fast); while one
