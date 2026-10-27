@@ -528,3 +528,7 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
   sweep with drive on, through `ltas` or an FFT on the host; aliases show as inharmonic lines. Fix if needed: 2x/4x oversampling around
   the nonlinearity with a half-band filter (the Kaiser-windowed sinc of `crates/audio-decode/src/resample.rs` is a starting point), in
   `crates/dsp` or `crates/fx`.
+
+Status (2026-10-27): the organ's source is clean (91 sine wheels, top one about 5.9 kHz, nothing above Nyquist). `fx::Overdrive` now runs
+`overdrive` at 4x (two half-band stages, `crates/fx/src/oversample.rs`; host test counts the folded power) and the organ and epiano drive
+use it. Still open: `strings` and `phono` sources, the `wah`/`rotary` stages, and a listening check on real hardware.

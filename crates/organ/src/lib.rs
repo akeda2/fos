@@ -14,7 +14,7 @@
 
 use dsp::math;
 
-use fx::{Delay, Rotary, overdrive};
+use fx::{Delay, Overdrive, Rotary};
 pub use fx::RotaryMode as Leslie;
 pub use fx::Reverb;
 
@@ -89,6 +89,7 @@ pub struct Organ {
     percussion_soft: bool,
     scanner: Scanner,
     drive: f32,
+    overdrive: Overdrive,
     volume: f32,
     click: f32,
     reverb: Reverb,
@@ -131,6 +132,7 @@ impl Organ {
             percussion_soft: false,
             scanner: Scanner::Off,
             drive: 0.0,
+            overdrive: Overdrive::new(),
             volume: 0.7,
             click: 0.5,
             reverb: Reverb::new(),
@@ -414,9 +416,7 @@ impl Organ {
                 sample = if chorus { 0.5 * (sample + delayed) } else { delayed };
             }
 
-            if self.drive > 0.0 {
-                sample = overdrive(sample, self.drive);
-            }
+            sample = self.overdrive.process(sample, self.drive);
 
             let (left, right) = self.rotary.process(sample);
             let (left, right) = self.reverb.process(left, right);

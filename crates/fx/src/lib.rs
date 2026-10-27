@@ -8,6 +8,7 @@
 use dsp::math;
 
 mod ensemble;
+mod oversample;
 mod phaser;
 mod reverb;
 mod rotary;
@@ -15,6 +16,7 @@ mod spring;
 mod wah;
 
 pub use ensemble::Ensemble;
+pub use oversample::Overdrive;
 pub use phaser::Phaser;
 pub use reverb::Reverb;
 pub use rotary::{Rotary, RotaryMode};

@@ -20,7 +20,7 @@
 #![cfg_attr(not(test), no_std)]
 
 use dsp::math;
-use fx::{Ensemble, Phaser, Sine, Svf, Wah, WahShape, overdrive, phase_step};
+use fx::{Ensemble, Phaser, Sine, Svf, Overdrive, Wah, WahShape, overdrive, phase_step};
 use tape_echo::TapeEcho;
 
 /// The MIDI range of an 88-key piano.
@@ -240,6 +240,7 @@ pub struct EPiano {
     bark: f32,
     decay: f32,
     drive: f32,
+    overdrive: Overdrive,
     chorus: f32,
     phaser: f32,
     tremolo_rate: f32,
@@ -298,6 +299,7 @@ impl EPiano {
             bark: 0.5,
             decay: 0.5,
             drive: 0.0,
+            overdrive: Overdrive::new(),
             chorus: 0.25,
             phaser: 0.0,
             tremolo_rate: 0.5,
@@ -859,13 +861,13 @@ impl EPiano {
         self.mod_target
     }
 
-    /// The tube stage: a bias gives even harmonics, the squash is `fx::overdrive`, and the highs go as it is driven.
+    /// The tube stage: a bias gives even harmonics, the squash is `fx::Overdrive` (4x oversampled), and the highs go as it is driven.
     fn tube(&mut self, x: f32) -> f32 {
         if self.drive <= 0.0 {
             return x;
         }
         let bias = 0.25 * self.drive;
-        let y = overdrive(x + bias, self.drive) - overdrive(bias, self.drive);
+        let y = self.overdrive.process(x + bias, self.drive) - overdrive(bias, self.drive);
         self.drive_state += self.drive_pole * (y - self.drive_state);
         self.drive_state
     }

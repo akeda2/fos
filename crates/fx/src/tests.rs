@@ -203,3 +203,57 @@ fn a_loud_input_at_full_decay_stays_bounded() {
         assert!(l.abs() < 10.0 && r.abs() < 10.0, "{n}");
     }
 }
+
+/// Power in every bin of a 4096-point DFT that is not a harmonic of bin `k` (the folded-back part), for one period of
+/// `render`'s periodic output.
+fn inharmonic_power(k: usize, render: &mut dyn FnMut(f32) -> f32) -> f64 {
+    const N: usize = 4096;
+    let tone = |i: usize| (2.0 * std::f64::consts::PI * (k * i) as f64 / N as f64).sin() as f32 * 0.3;
+    for i in 0..N {
+        render(tone(i));
+    }
+    let out: Vec<f64> = (0..N).map(|i| render(tone(i)) as f64).collect();
+    (1..N / 2)
+        .filter(|bin| bin % k != 0)
+        .map(|bin| {
+            let (mut re, mut im) = (0.0, 0.0);
+            for (i, v) in out.iter().enumerate() {
+                let angle = 2.0 * std::f64::consts::PI * (bin * i) as f64 / N as f64;
+                re += v * angle.cos();
+                im -= v * angle.sin();
+            }
+            re * re + im * im
+        })
+        .sum()
+}
+
+#[test]
+fn oversampled_overdrive_folds_far_less_and_keeps_the_level() {
+    // 6996 Hz at 48 kHz: its 3rd, 5th, 7th ... harmonics are above Nyquist and fold into the band.
+    let mut naive = |x| overdrive(x, 1.0);
+    let mut over = Overdrive::new();
+    let mut better = |x| over.process(x, 1.0);
+    let before = inharmonic_power(597, &mut naive);
+    let after = inharmonic_power(597, &mut better);
+    assert!(after < before * 0.01, "folded power {after} vs {before}");
+
+    let mut over = Overdrive::new();
+    let mut gentle = |x| over.process(x, 0.001);
+    let mut plain = |x| overdrive(x, 0.001);
+    let tone = |i: usize| 0.05 * math::sin(2.0 * core::f32::consts::PI * 1000.0 * i as f32 / RATE as f32);
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    for i in 0..4800 {
+        let (x, y) = (gentle(tone(i)), plain(tone(i)));
+        if i >= 2400 {
+            a.push(x);
+            b.push(y);
+        }
+    }
+    assert!((rms(&a) / rms(&b) - 1.0).abs() < 0.02);
+}
+
+#[test]
+fn oversampled_overdrive_is_a_bypass_at_zero() {
+    let mut over = Overdrive::new();
+    assert_eq!(over.process(0.3, 0.0), 0.3);
+}
