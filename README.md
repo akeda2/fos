@@ -114,7 +114,13 @@ make release                                # build/release/{x86_64,aarch64}/ + 
 pushes the kernel with KUP and reports if the host fell back to the old one, then copies only the tapes whose size differs
 (`--add-missing` also installs absent ones). `--from DIR` uses a release folder instead of the build tree. An optional
 `hosts.toml` (`./` or `~/.config/fosadm/`) holds `iface` and per-host `note`, `skip` and `restart` (see `fosadm.py`);
-`make test-fosadm` runs its unit tests. Not yet covered: an end-to-end QEMU test.
+`make test-fosadm` runs its unit tests.
+
+With `--serial PORT` (for example `/dev/ttyUSB0`) fosadm works on one machine through its console serial line and needs
+no Ethernet: `status`, `deploy` (the kernel through `kup serial`, tapes through `recv`), `run` and `put` (the HOST
+argument is ignored). The shell must be at its prompt; `--baud` is the console speed and `--fast` raises it for the
+transfers (Pi 4 shell only). x86 COM1 keeps its speed, so a 1 MB tape takes a minute or more at 115200 baud (not timed on real hardware).
+`make test-fosadm-serial` runs it against QEMU.
 
 ## Where things are
 

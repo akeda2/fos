@@ -1452,7 +1452,12 @@ differs, since stored tapes are staged images whose bytes differ from the build;
 slot's size in sectors (`debug slots`). A deploy shows its plan first, pushes the kernel by KUP, waits for the reboot and
 reports a fallback (the old kernel running) without touching tapes, then copies changed tapes and checks sizes.
 `bootcode --update` needs the host name typed back and sends `confirm` in the same session. Verified on real hardware:
-x86 (rack) and Pi 4 (bjuv) deploys; not covered by a QEMU end-to-end test yet.
+x86 (rack) and Pi 4 (bjuv) deploys. `--serial PORT` does the same over a console serial line instead of Ethernet:
+`kup serial` for the kernel and `recv NAME` for tapes and files (`tools/send_kernel_serial.py`, `send_file_serial.py`
+and `kernel/src/kup_serial.rs` are the protocol; the x86 shell got `recv` for this, the Pi shell already had it with a
+baud option). Command answers are read up to the next `fos> ` prompt after waiting out stray prompts, because the console
+echoes slowly. `make test-fosadm-serial` runs status, `put`, a tape deploy and a forced kernel deploy against QEMU with
+COM1 on a pty; Ethernet is still tested only on real hardware.
 
 ## Audio loopback
 

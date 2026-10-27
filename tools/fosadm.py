@@ -6,6 +6,11 @@
   fosadm.py deploy [HOST...]       push the kernel (KUP) and changed tapes, after showing a plan
   fosadm.py run|put|shell|bootcode HOST ...   one command, a file, a terminal, the boot code
 
+With `--serial PORT` (e.g. /dev/ttyUSB0) there is one machine, on that console serial line, and no Ethernet is used:
+status, deploy (kernel through `kup serial`, tapes through `recv`), run and put work as above. The shell must be at its
+prompt; --baud is the console speed (115200), --fast raises it for the transfers (aarch64 only). shell and bootcode need
+Ethernet. tools/send_kernel_serial.py and tools/send_file_serial.py are the single-purpose senders.
+
 Machines announce `hostname` + NIC number (skylake3 is NIC 3 of skylake), so the
 NICs of one machine are grouped under one host name. Tapes are compared by size
 against --from DIR (default: the build tree: build/fosfor/tapes and the release
@@ -28,6 +33,7 @@ TOOLS = Path(__file__).resolve().parent
 ROOT = TOOLS.parent
 sys.path.insert(0, str(TOOLS))
 import send_tape  # noqa: E402
+import send_kernel_serial as kup  # noqa: E402
 
 BUILD_KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fosfor-kernel"
 BUILD_TAPES = ROOT / "build/fosfor/tapes"
@@ -95,16 +101,75 @@ def machine_name(name: str) -> str:
     return re.sub(r"\d+$", "", name) or name
 
 
+class Serial:
+    """A machine on its console serial line: the shell at its prompt, `kup serial` and `recv` for the transfers."""
+
+    PROMPT = b"fos>"
+
+    def __init__(self, port: str, baud: int, fast: int):
+        import termios
+        self.termios, self.baud, self.fast = termios, baud, fast
+        self.fd = os.open(port, os.O_RDWR | os.O_NOCTTY)
+        self.attributes = termios.tcgetattr(self.fd)
+        self.attributes[0] = self.attributes[1] = self.attributes[3] = 0
+        self.attributes[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
+        self.set_speed(baud)
+
+    def set_speed(self, baud: int) -> None:
+        self.attributes[4] = self.attributes[5] = getattr(self.termios, f"B{baud}")
+        self.termios.tcsetattr(self.fd, self.termios.TCSADRAIN, self.attributes)
+
+    def read(self, timeout: float) -> bytes:
+        import select
+        ready, _, _ = select.select([self.fd], [], [], timeout)
+        return os.read(self.fd, 4096) if ready else b""
+
+    def write(self, data: bytes) -> None:
+        while data:
+            data = data[os.write(self.fd, data):]
+
+    def ask(self, commands: list[str], timeout: float = 20) -> str:
+        """Types each command and collects what the shell prints up to its next prompt."""
+        import time
+        text = b""
+        for command in commands:
+            self.write(b"\r")
+            self.until_prompt(min(timeout, 10))   # boot messages, a running command: wait for a prompt first
+            while self.read(1.0):                 # and for the prompts still on their way (the Enter's own, a finished transfer's)
+                pass
+            self.write(command.encode() + b"\r")
+            text += self.until_prompt(timeout)
+        return text.decode("utf-8", "replace").replace("\r", "")
+
+    def until_prompt(self, timeout: float) -> bytes:
+        import time
+        answer = b""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end and not answer.rstrip(b" ").endswith(self.PROMPT):
+            answer += self.read(0.2)
+        return answer
+
+    def send(self, shell_command: bytes, data: bytes) -> int:
+        try:
+            return kup.push(self.read, self.write, data, log=lambda message: None, baud=self.fast,
+                            set_speed=self.set_speed, shell_command=shell_command)
+        finally:
+            self.set_speed(self.baud)
+
+
 class Host:
     def __init__(self, name: str):
         self.name = name
         self.nics: dict[int, bytes] = {}
+        self.serial: Serial | None = None
 
     @property
     def mac(self) -> bytes:
         return self.nics[min(self.nics)]
 
     def label(self) -> str:
+        if self.serial:
+            return "serial"
         return ", ".join(f"{n}={send_tape.format_mac(m)}" for n, m in sorted(self.nics.items()))
 
 
@@ -132,7 +197,7 @@ def discover(iface: str, keep: bool, timeout: float) -> list[Host]:
 
 
 def pick(hosts: list[Host], wanted: list[str]) -> list[Host]:
-    if not wanted:
+    if not wanted or (hosts and hosts[0].serial):
         return hosts
     chosen = []
     for text in wanted:
@@ -144,7 +209,17 @@ def pick(hosts: list[Host], wanted: list[str]) -> list[Host]:
     return chosen
 
 
+def find_hosts(args, iface: str) -> list[Host]:
+    if args.serial:
+        host = Host("serial")
+        host.serial = Serial(args.serial, args.baud, args.fast)
+        return [host]
+    return discover(iface, args.keep, args.timeout)
+
+
 def ask_host(iface: str, host: Host, commands: list[str], timeout: float = 60) -> str:
+    if host.serial:
+        return host.serial.ask(commands, min(timeout, 60))
     result = subprocess.run(
         [sys.executable, str(TOOLS / "term_net.py"), "--iface", iface, "--mac", send_tape.format_mac(host.mac),
          "--command-timeout", "10", *commands], capture_output=True, text=True, timeout=timeout)
@@ -181,7 +256,7 @@ def arch_of(text: str) -> str:
 
 
 def cmd_hosts(args, iface: str) -> int:
-    hosts = discover(iface, args.keep, args.timeout)
+    hosts = find_hosts(args, iface)
     if not hosts:
         print("no fos machines answered.")
         return 1
@@ -192,7 +267,7 @@ def cmd_hosts(args, iface: str) -> int:
 
 
 def cmd_status(args, iface: str) -> int:
-    hosts = pick(discover(iface, args.keep, args.timeout), args.hosts)
+    hosts = pick(find_hosts(args, iface), args.hosts)
     for host in hosts:
         out = ask_host(iface, host, ["debug slots", "ls", "about"])
         print(f"{host.name} ({host.label()})")
@@ -220,6 +295,9 @@ def cmd_status(args, iface: str) -> int:
 
 def stop_running_tape(iface: str, host: Host) -> None:
     """A lone ESC through term net ends a foreground tape (ptp from a start file, say); harmless at an idle prompt."""
+    if host.serial:
+        host.serial.write(b"\x1b")
+        return
     send_tape_cmd = (f"(printf '\\x1b'; sleep 2) | {sys.executable} {TOOLS / 'term_net.py'} --iface {iface} "
                      f"--mac {send_tape.format_mac(host.mac)} --interactive")
     subprocess.run(["bash", "-c", send_tape_cmd], capture_output=True, timeout=30)
@@ -264,7 +342,7 @@ def probe_quiet(iface: str, host: Host) -> tuple[int, int] | None:
 
 def cmd_deploy(args, iface: str) -> int:
     do_tapes = not args.kernel_only
-    hosts = pick(discover(iface, args.keep, args.timeout), args.hosts)
+    hosts = pick(find_hosts(args, iface), args.hosts)
     plans = []
     for host in hosts:
         if host_setting(host, "skip", False):
@@ -296,17 +374,25 @@ def cmd_deploy(args, iface: str) -> int:
         return 1
     failed = 0
     for host, new_kernel, tape_list, stopped, arch in todo:
-        mac = send_tape.format_mac(host.mac)
+        mac = "" if host.serial else send_tape.format_mac(host.mac)
         kernel, tape_dir, tapes = source_files(Path(args.source) if args.source else None, arch)
         want = kernel_sectors(kernel)
         print(f"== {host.name}")
         if new_kernel:
-            result = subprocess.run([sys.executable, str(TOOLS / "send_kernel_update.py"), "--iface", iface, "--mac", mac,
-                                     str(kernel)], capture_output=True, text=True)
-            if "ACK" not in result.stdout:
-                print(f"  kernel: not accepted ({(result.stdout + result.stderr).strip().splitlines()[-1:]}); skipped")
-                failed += 1
-                continue
+            if host.serial:
+                try:
+                    host.serial.send(b"kup serial", kernel.read_bytes())
+                except SystemExit as refusal:
+                    print(f"  kernel: not accepted ({refusal}); skipped")
+                    failed += 1
+                    continue
+            else:
+                result = subprocess.run([sys.executable, str(TOOLS / "send_kernel_update.py"), "--iface", iface, "--mac", mac,
+                                         str(kernel)], capture_output=True, text=True)
+                if "ACK" not in result.stdout:
+                    print(f"  kernel: not accepted ({(result.stdout + result.stderr).strip().splitlines()[-1:]}); skipped")
+                    failed += 1
+                    continue
             print("  kernel: accepted, waiting for the reboot...")
             after = wait_up(iface, host)
             if after is None:
@@ -326,16 +412,27 @@ def cmd_deploy(args, iface: str) -> int:
                 failed += 1
                 continue
             for name in tape_list:
-                result = subprocess.run([sys.executable, str(TOOLS / "foscopy.py"), "--iface", iface, "--mac", mac,
-                                         str(tape_dir / name), f":disk1/{name}"], capture_output=True, text=True)
-                print(f"  tape {name}: {'ok' if result.returncode == 0 else 'FAILED'}")
-                failed += result.returncode != 0
+                if host.serial:
+                    try:
+                        host.serial.send(f"recv disk1/{name}".encode(), (tape_dir / name).read_bytes())
+                        ok = True
+                    except SystemExit as refusal:
+                        print(f"  tape {name}: {refusal}")
+                        ok = False
+                else:
+                    ok = subprocess.run([sys.executable, str(TOOLS / "foscopy.py"), "--iface", iface, "--mac", mac,
+                                         str(tape_dir / name), f":disk1/{name}"], capture_output=True, text=True).returncode == 0
+                print(f"  tape {name}: {'ok' if ok else 'FAILED'}")
+                failed += not ok
             files = parse_ls(ask_host(iface, host, ["ls"]))
             bad = [n for n in tape_list if files.get(n) != tapes[n]]
             print("  verified by size" if not bad else f"  size mismatch after copy: {' '.join(bad)}")
             failed += bool(bad)
         restart = host_setting(host, "restart")
-        if stopped and restart:
+        if stopped and restart and host.serial:
+            host.serial.ask([restart])
+            print(f"  a running tape was stopped; ran `{restart}` to bring it back (hosts.toml).")
+        elif stopped and restart:
             subprocess.run([sys.executable, str(TOOLS / "term_net.py"), "--iface", iface, "--mac", mac,
                             "--command-timeout", "8", restart], capture_output=True, timeout=60)
             print(f"  a running tape was stopped; ran `{restart}` to bring it back (hosts.toml).")
@@ -345,7 +442,7 @@ def cmd_deploy(args, iface: str) -> int:
 
 
 def one_host(iface: str, args) -> Host:
-    found = pick(discover(iface, args.keep, args.timeout), [args.host])
+    found = pick(find_hosts(args, iface), [args.host])
     if len(found) != 1:
         raise SystemExit(f"{args.host!r} matches {len(found)} hosts; use a MAC address")
     return found[0]
@@ -360,18 +457,29 @@ def cmd_run(args, iface: str) -> int:
 def cmd_put(args, iface: str) -> int:
     host = one_host(iface, args)
     name = args.name or Path(args.file).name
+    if host.serial:
+        try:
+            host.serial.send(f"recv disk{args.disk}/{name}".encode(), Path(args.file).read_bytes())
+        except SystemExit as refusal:
+            print(f"put: {refusal}")
+            return 1
+        return 0
     result = subprocess.run([sys.executable, str(TOOLS / "foscopy.py"), "--iface", iface, "--mac",
                              send_tape.format_mac(host.mac), args.file, f":disk{args.disk}/{name}"])
     return result.returncode
 
 
 def cmd_shell(args, iface: str) -> int:
+    if args.serial:
+        raise SystemExit(f"shell needs Ethernet; on a serial line use a terminal program (picocom -b {args.baud} {args.serial}).")
     host = one_host(iface, args)
     return subprocess.run([sys.executable, str(TOOLS / "term_net.py"), "--iface", iface, "--mac",
                            send_tape.format_mac(host.mac), "--interactive"]).returncode
 
 
 def cmd_bootcode(args, iface: str) -> int:
+    if args.serial:
+        raise SystemExit("bootcode needs Ethernet (its update must be confirmed in the same session).")
     host = one_host(iface, args)
     if not args.update:
         sys.stdout.write(ask_host(iface, host, ["bootcode"]))
@@ -389,6 +497,9 @@ def cmd_bootcode(args, iface: str) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--iface", help="network interface (default: auto-detected)")
+    parser.add_argument("--serial", metavar="PORT", help="use the console serial line of one machine instead of Ethernet")
+    parser.add_argument("--baud", type=int, default=115200, help="console speed for --serial (default 115200)")
+    parser.add_argument("--fast", type=int, default=0, help="--serial: raise the speed for transfers (aarch64 shell only)")
     parser.add_argument("--keep", "--no-discover-forget", dest="keep", action="store_true",
                         help="keep the remembered peers instead of forgetting them before discovery")
     parser.add_argument("--timeout", type=float, default=2.5, help="seconds to listen for announcements")
@@ -420,9 +531,10 @@ def main() -> int:
         if name == "bootcode":
             sp.add_argument("--update", action="store_true", help="rewrite it (asks you to type the host name)")
     args = parser.parse_args()
-    ensure_privilege()
+    if not args.serial:
+        ensure_privilege()
     CONFIG.update(load_config())
-    iface = args.iface or CONFIG.get("iface") or send_tape.default_interface()
+    iface = "" if args.serial else (args.iface or CONFIG.get("iface") or send_tape.default_interface())
     return {"hosts": cmd_hosts, "status": cmd_status, "deploy": cmd_deploy, "run": cmd_run,
             "put": cmd_put, "shell": cmd_shell, "bootcode": cmd_bootcode}[args.command](args, iface)
 

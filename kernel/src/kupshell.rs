@@ -30,11 +30,33 @@ pub fn command(rest: &str) {
     }
 }
 
+/// `recv NAME` (x86): one file from `tools/send_file_serial.py` over COM1, written as NAME or diskN/NAME. The aarch64 shell
+/// has its own `recv` with a baud option; COM1 here keeps its speed.
+#[cfg(target_arch = "x86_64")]
+pub fn recv(rest: &str) {
+    let Some(name) = rest.split_whitespace().next() else {
+        return crate::println!("Usage: recv NAME   (then run tools/send_file_serial.py PORT FILE NAME)");
+    };
+    let Some(staging) = crate::tape::staging() else {
+        return crate::println!("recv: no memory.");
+    };
+    crate::println!("KUP serial: ready for file {name} (the sender starts within 30 s).");
+    crate::term::flush_output();
+    let result = crate::kup_serial::serve_file(&mut imp::Com1, staging, |data| match crate::tape_fs::write(name.as_bytes(), data) {
+        0 => Ok(()),
+        _ => Err("the file could not be written (bad name, no space, or no such volume)"),
+    });
+    match result {
+        Ok(length) => crate::println!("recv: {length} bytes written to {name}."),
+        Err(message) => crate::println!("recv: {message}; nothing was written{}.", imp::dropped_note()),
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 mod imp {
     use crate::{term, timer};
 
-    struct Com1;
+    pub struct Com1;
 
     impl crate::kup_serial::Link for Com1 {
         fn read_byte(&mut self) -> Option<u8> {

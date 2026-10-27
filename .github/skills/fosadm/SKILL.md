@@ -28,6 +28,10 @@ Also: `run HOST cmd...`, `put HOST FILE [NAME] [--disk N]`, `shell HOST`, `bootc
 Order: `status` (or `deploy --dry-run`) first, show the plan to the user, then deploy.
 
 ## Behaviour to know
+- **Serial instead of Ethernet:** `--serial PORT [--baud N] [--fast N]` makes one machine on its console line the target
+  (no `--iface`, no raw-socket rights): `status`, `deploy` (kernel via `kup serial`, tapes via `recv`), `run`, `put`
+  (pass any HOST word). The shell must be at its prompt; no `shell`/`bootcode`. Slow at 115200 baud; `--fast` is Pi 4 only.
+  `ls /dev/serial/by-id` finds the port; ask the user which one if several.
 - Tapes are compared by **size** (stored tapes are staged images, bytes differ). Say what was verified.
 - By default only tapes a host **already has** are updated. A host lacking a tape says "up to date";
   use `--add-missing` to install new ones (it installs every missing tape, so check `status -v` first;
