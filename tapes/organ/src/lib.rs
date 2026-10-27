@@ -3,7 +3,7 @@
 //! draws and runs it; keeping this here makes the geometry testable on the host.
 #![cfg_attr(not(test), no_std)]
 
-use organ::{DRAWBARS, DriveKind, FIRST_KEY, KEYS, Leslie, Organ, PRESETS, Percussion, Scanner};
+use organ::{DRAWBARS, DriveKind, FIRST_KEY, KEYS, Leslie, Organ, PRESETS, Percussion, Scanner, WheelTarget};
 
 pub const GLYPH_W: i32 = gfx::GLYPH_WIDTH as i32;
 pub const GLYPH_H: i32 = gfx::GLYPH_HEIGHT as i32;
@@ -13,6 +13,8 @@ pub const SLIDERS: [&str; 4] = ["Drive", "Volume", "Click", "Reverb"];
 const PERCUSSION: [(&str, Percussion); 3] = [("Off", Percussion::Off), ("2nd", Percussion::Second), ("3rd", Percussion::Third)];
 const SCANNERS: [Scanner; 7] = [Scanner::Off, Scanner::V1, Scanner::V2, Scanner::V3, Scanner::C1, Scanner::C2, Scanner::C3];
 const LESLIES: [(&str, Leslie); 4] = [("Off", Leslie::Off), ("Stop", Leslie::Stop), ("Slow", Leslie::Slow), ("Fast", Leslie::Fast)];
+
+const WHEELS: [(&str, WheelTarget); 2] = [("Leslie", WheelTarget::Leslie), ("Drive", WheelTarget::Drive)];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rect {
@@ -42,6 +44,8 @@ pub enum Hit {
     Leslie(u8),
     /// The kind of amplifier the overdrive models (index into `DriveKind::ALL`).
     Amp(u8),
+    /// What the MIDI mod wheel steers (index into `WHEELS`); with Drive the pitch wheel switches the Leslie.
+    Wheel(u8),
     /// 0 drive, 1 volume, 2 key click.
     Slider(u8),
     /// A key, by MIDI note.
@@ -74,7 +78,7 @@ pub struct Layout {
     pub black_w: i32,
     pub black_h: i32,
     /// Row labels of the switch panel: text and its top left corner.
-    pub labels: [(&'static str, i32, i32); 9],
+    pub labels: [(&'static str, i32, i32); 10],
     pub widgets: [Widget; MAX_WIDGETS],
     pub widget_count: usize,
 }
@@ -119,7 +123,7 @@ impl Layout {
             white_w,
             black_w: white_w * 6 / 10,
             black_h: keyboard_h * 62 / 100,
-            labels: [("", 0, 0); 9],
+            labels: [("", 0, 0); 10],
             widgets: [Widget { rect: Rect::ZERO, hit: Hit::Preset(0) }; MAX_WIDGETS],
             widget_count: 0,
         };
@@ -130,7 +134,7 @@ impl Layout {
             layout.add(rect, Hit::Drawbar(index as u8));
         }
 
-        let rows = 9;
+        let rows = 10;
         let row_h = switch_panel.h / rows;
         let label_w = GLYPH_W * scale * 8 + margin;
         let gap = (margin / 2).max(2);
@@ -155,6 +159,7 @@ impl Layout {
         buttons(&mut layout, "Leslie", &[Hit::Leslie(0), Hit::Leslie(1), Hit::Leslie(2), Hit::Leslie(3)]);
         let amps: [Hit; DriveKind::ALL.len()] = core::array::from_fn(|index| Hit::Amp(index as u8));
         buttons(&mut layout, "Amp", &amps);
+        buttons(&mut layout, "Mod whl", &[Hit::Wheel(0), Hit::Wheel(1)]);
         for slider in 0..SLIDERS.len() as u8 {
             buttons(&mut layout, SLIDERS[slider as usize], &[Hit::Slider(slider)]);
         }
@@ -217,6 +222,7 @@ pub fn press(layout: &Layout, organ: &mut Organ, hit: Hit, x: i32, y: i32) {
         Hit::Scanner(index) => organ.set_scanner(SCANNERS[index as usize % 7]),
         Hit::Leslie(index) => organ.set_leslie(LESLIES[index as usize % 4].1),
         Hit::Amp(index) => organ.set_drive_kind(DriveKind::ALL[index as usize % DriveKind::ALL.len()]),
+        Hit::Wheel(index) => organ.set_wheel_target(WHEELS[index as usize % 2].1),
         Hit::Key(note) => organ.note_on(note),
         Hit::Drawbar(_) | Hit::Slider(_) => drag(layout, organ, hit, x, y),
     }
@@ -259,6 +265,7 @@ pub fn lit(organ: &Organ, hit: Hit) -> bool {
         Hit::Scanner(index) => organ.scanner() == SCANNERS[index as usize % 7],
         Hit::Leslie(index) => organ.leslie() == LESLIES[index as usize % 4].1,
         Hit::Amp(index) => organ.drive_kind() == DriveKind::ALL[index as usize % DriveKind::ALL.len()],
+        Hit::Wheel(index) => organ.wheel_target() == WHEELS[index as usize % 2].1,
         Hit::Key(note) => organ.is_held(note),
         Hit::Drawbar(_) | Hit::Slider(_) => false,
     }
@@ -274,6 +281,7 @@ pub fn label(organ: &Organ, hit: Hit) -> &'static str {
         Hit::Scanner(index) => SCANNERS[index as usize % 7].name(),
         Hit::Leslie(index) => LESLIES[index as usize % 4].0,
         Hit::Amp(index) => DriveKind::ALL[index as usize % DriveKind::ALL.len()].short(),
+        Hit::Wheel(index) => WHEELS[index as usize % 2].0,
         _ => "",
     }
 }
@@ -371,6 +379,8 @@ mod tests {
         assert_eq!(organ.drive_kind(), DriveKind::PushPull);
         press(&layout, &mut organ, Hit::Amp(6), 0, 0);
         assert!(lit(&organ, Hit::Amp(6)) && !lit(&organ, Hit::Amp(3)) && organ.drive_kind() == DriveKind::Vox);
+        press(&layout, &mut organ, Hit::Wheel(1), 0, 0);
+        assert!(lit(&organ, Hit::Wheel(1)) && !lit(&organ, Hit::Wheel(0)) && organ.wheel_target() == WheelTarget::Drive);
         press(&layout, &mut organ, Hit::Scanner(5), 0, 0);
         assert!(lit(&organ, Hit::Scanner(5)));
         press(&layout, &mut organ, Hit::PercussionFast, 0, 0);

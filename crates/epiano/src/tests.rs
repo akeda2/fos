@@ -53,6 +53,7 @@ fn a_note_rings_at_its_pitch() {
 fn a_hard_hit_is_much_brighter_than_a_soft_one() {
     let ratio = |velocity| {
         let mut piano = bare();
+        piano.set_model(Model::Bar);
         piano.set_bell(1.0);
         piano.note_on(60, velocity);
         let out = render(&mut piano, 4800);
@@ -67,6 +68,7 @@ fn a_hard_hit_is_much_brighter_than_a_soft_one() {
 fn the_bell_control_scales_the_high_resonances() {
     let high = |bell| {
         let mut piano = bare();
+        piano.set_model(Model::Bar);
         piano.set_bell(bell);
         piano.note_on(60, 110);
         component(&render(&mut piano, 1200), 261.63 * 6.267)

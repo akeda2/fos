@@ -191,6 +191,49 @@ fn mod_wheel_picks_the_leslie_zone() {
     }
 }
 
+#[test]
+fn drive_on_the_mod_wheel_leaves_the_leslie_to_the_pitch_wheel() {
+    let mut organ = Organ::new(RATE);
+    assert!(!organ.midi(&[0xe0, 0, 127]), "the pitch wheel does nothing while the mod wheel has the Leslie");
+    organ.set_wheel_target(WheelTarget::Drive);
+    assert!(organ.midi(&[0xb0, 1, 127]));
+    assert_eq!(organ.drive(), 1.0);
+    assert!(organ.midi(&[0xb0, 1, 0]));
+    assert_eq!(organ.drive(), 0.0);
+    assert_eq!(organ.leslie(), Leslie::Off, "the mod wheel no longer touches the Leslie");
+    assert!(organ.midi(&[0xe0, 0, 127]));
+    assert_eq!(organ.leslie(), Leslie::Fast);
+    assert!(organ.midi(&[0xe0, 0, 64]));
+    assert_eq!(organ.leslie(), Leslie::Fast, "centre: unchanged");
+    assert!(organ.midi(&[0xe0, 0, 0x10]));
+    assert_eq!(organ.leslie(), Leslie::Slow);
+}
+
+#[test]
+fn the_pitch_wheel_held_at_the_floor_stops_the_leslie() {
+    let mut organ = Organ::new(RATE);
+    organ.set_wheel_target(WheelTarget::Drive);
+    organ.set_leslie(Leslie::Fast);
+    organ.midi(&[0xe0, 0, 0]);
+    assert_eq!(organ.leslie(), Leslie::Slow, "going down is Slow at once");
+    render(&mut organ, RATE as usize / 10);
+    assert_eq!(organ.leslie(), Leslie::Slow, "a quick touch of the floor is not Stop");
+    render(&mut organ, RATE as usize / 2);
+    assert_eq!(organ.leslie(), Leslie::Stop);
+    // The spring back through the low zone and the middle leaves it stopped.
+    for value in [1000u16, 4000, 8192] {
+        organ.midi(&[0xe0, (value & 127) as u8, (value >> 7) as u8]);
+    }
+    assert_eq!(organ.leslie(), Leslie::Stop);
+    // A flick to the floor and back before the hold time does not.
+    organ.set_leslie(Leslie::Fast);
+    organ.midi(&[0xe0, 0, 0]);
+    render(&mut organ, RATE as usize / 10);
+    organ.midi(&[0xe0, 0, 64]);
+    render(&mut organ, RATE as usize);
+    assert_eq!(organ.leslie(), Leslie::Slow);
+}
+
 fn tail_energy(reverb: f32) -> f32 {
     let mut organ = Organ::new(RATE);
     only(&mut organ, [0, 0, 8, 0, 0, 0, 0, 0, 0]);

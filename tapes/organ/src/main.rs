@@ -25,8 +25,10 @@ Slow, Fast: the rotors speed up and slow down like the real ones), overdrive
 with a button per amp model (Soft, Tanh, Triode, P-P, Sag, Trans, Vox),
 volume, key click, reverb, and a 61-key keyboard that a finger plays. A
 USB-MIDI keyboard plays it too (note on/off; controller 123 stops all notes;
-the mod wheel sets the Leslie: low Stop, middle Slow, high Fast); while one
-is connected the on-screen keyboard is hidden. The sound
+the mod wheel sets the Leslie: low Stop, middle Slow, high Fast; the Mod whl
+button Drive makes it the overdrive amount and the pitch wheel the Leslie: up
+Fast, down Slow, held down 0.4 s Stop); while one is connected the
+on-screen keyboard is hidden. The sound
 is stereo, 32-bit float inside, whatever the audio device takes (24 bit, 48 kHz
 USB audio, say). latency=MS is how much audio is kept queued (10-200, default
 40): lower is quicker to respond, higher survives a slow screen. out=N picks

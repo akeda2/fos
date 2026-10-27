@@ -1314,6 +1314,8 @@ and sends the picture in 32-row bands, topping the queue up between bands, becau
 than the audio queue holds. `make test-organ` checks the picture and that a typed key sounds at the right pitch in a USB-audio
 recording; MIDI input, touch mapping, underruns and the Leslie/loudness balance need real hardware.
 
+The "Mod whl" button picks what the MIDI wheels steer (`organ::WheelTarget`): Leslie (the mod wheel's three zones, the default) or Drive (the mod wheel is the overdrive amount; the pitch wheel latches the Leslie, up Fast, down Slow, held fully down for 0.4 s Stop, the middle leaves it). Untested with a real keyboard.
+
 Reusable parts: `crates/fx` holds the effects (`Rotary` (the Leslie), `Reverb`, `Ensemble` (a three-voice string-machine
 chorus), `Phaser`, `Spring` (a two-spring reverb with dispersive allpass chains), `overdrive`, `Delay`, `Sine`); `crates/organ` re-exports `Leslie` and `Reverb` from it. `crates/instrument-rt`
 is the tape glue: `Output` (audio device, `rate=`/`latency=`/`out=`, queue pump, scope), `Touches` + `TouchTarget` (finger grabs),

@@ -9,7 +9,7 @@ pub const GLYPH_H: i32 = gfx::GLYPH_HEIGHT as i32;
 const MAX_WIDGETS: usize = 48;
 pub const SLIDERS: [&str; 22] = [
     "Bell", "Bark", "Decay", "Drive", "Chorus", "Phaser", "Trem rate", "Trem depth", "Echo", "Repeat", "Feedback", "Reverb", "Volume", "Mod", "Detune", "Touch", "Vowel", "Glide", "Q",
-    "Range", "Soft", "Wah",
+    "Range", "Wah", "Soft",
 ];
 pub const TARGETS: [(&str, ModTarget); 5] =
     [("Trem", ModTarget::Tremolo), ("Echo fb", ModTarget::Echo), ("Bark", ModTarget::Bark), ("All", ModTarget::All), ("Wah", ModTarget::Wah)];
@@ -78,8 +78,8 @@ impl Layout {
         };
 
         // Two columns of sliders, a row with the five mod targets and the pedal, a row with the tine models and the voicing,
-        // and a double-height row with the amplifier kinds.
-        let row_h = (panel.h - margin) / (ROWS as i32 + 4);
+        // and a row with the amplifier kinds.
+        let row_h = (panel.h - margin) / (ROWS as i32 + 3);
         let column_w = (panel.w - margin) / 2;
         for index in 0..SLIDERS.len() {
             let (column, row) = ((index / ROWS) as i32, (index % ROWS) as i32);
@@ -102,7 +102,7 @@ impl Layout {
         let y = y + row_h;
         let button_w = (panel.w - margin) / DriveKind::ALL.len() as i32;
         for index in 0..DriveKind::ALL.len() {
-            layout.add(Rect { x: panel.x + margin + index as i32 * button_w, y, w: button_w - margin, h: row_h * 2 - margin }, Hit::Amp(index as u8));
+            layout.add(Rect { x: panel.x + margin + index as i32 * button_w, y, w: button_w - margin, h: row_h - margin }, Hit::Amp(index as u8));
         }
         layout
     }
@@ -167,8 +167,8 @@ pub fn slider_value(piano: &EPiano, index: u8) -> f32 {
         17 => piano.glide(),
         18 => piano.q(),
         19 => piano.range(),
-        20 => piano.soft(),
-        _ => piano.wah_pedal(),
+        20 => piano.wah_pedal(),
+        _ => piano.soft(),
     }
 }
 
@@ -194,8 +194,8 @@ fn set_slider(piano: &mut EPiano, index: u8, value: f32) {
         17 => piano.set_glide(value),
         18 => piano.set_q(value),
         19 => piano.set_range(value),
-        20 => piano.set_soft(value),
-        _ => piano.set_wah_pedal(value),
+        20 => piano.set_wah_pedal(value),
+        _ => piano.set_soft(value),
     }
 }
 

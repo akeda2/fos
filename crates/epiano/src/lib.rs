@@ -1,7 +1,7 @@
 //! A Rhodes-style electric piano as a `no_std`, allocation-free, hard-float library: MIDI messages and settings in, stereo f32
 //! frames out. The tape owns the screen, touch and audio device.
 //!
-//! The sound is modal by default (`Model::Bar`; `Model` lists the other ways to make a tine, to be compared by ear). A Rhodes tine is a clamped bar, and an ideally clamped bar rings at 1 : 6.27 : 17.55 times its
+//! The default sound is `Model::Metal` (an FM tine with an inharmonic operator; `Model` lists the other ways to make a tine, `Bar` being the modal one). A Rhodes tine is a clamped bar, and an ideally clamped bar rings at 1 : 6.27 : 17.55 times its
 //! fundamental (the roots of the cantilever beam equation). Each note is therefore a few decaying sinusoids, each kept as a
 //! rotating phasor (`Mode`: one complex multiply a sample, no table, no oscillator state to click): the fundamental and a
 //! weak second harmonic ring on, the 6.27x "bell" and the 17.55x "ting" die within a fraction of a second, and a hard hit
@@ -295,7 +295,7 @@ impl EPiano {
             pedal: false,
             clock: 0,
             damper_coef: 0.0,
-            model: Model::Bar,
+            model: Model::Metal,
             bell: 0.45,
             bark: 0.5,
             decay: 0.5,

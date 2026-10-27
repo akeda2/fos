@@ -40,6 +40,28 @@ pub enum Percussion {
     Third,
 }
 
+/// Where the pitch wheel is, for switching the Leslie (`WheelTarget::Drive`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BendZone {
+    Floor,
+    Low,
+    Centre,
+    High,
+}
+
+/// How long the pitch wheel must be held fully down for the Leslie to stop, in seconds.
+const STOP_HOLD: f32 = 0.4;
+
+/// What the MIDI wheels steer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WheelTarget {
+    /// The mod wheel picks the Leslie speed (Stop, Slow, Fast); the pitch wheel does nothing.
+    Leslie,
+    /// The mod wheel is the overdrive amount; the pitch wheel takes over the Leslie: up is Fast, down is Slow, and the
+    /// speed stays where it was put when the wheel springs back to the middle. Held fully down for 0.4 s it is Stop.
+    Drive,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scanner {
     Off,
@@ -90,6 +112,10 @@ pub struct Organ {
     percussion_soft: bool,
     scanner: Scanner,
     drive: f32,
+    wheels: WheelTarget,
+    bend_zone: BendZone,
+    /// Frames the pitch wheel has been at its floor, 0 when it is not (or the Leslie already stopped).
+    floor_frames: u32,
     overdrive: Overdrive,
     volume: f32,
     click: f32,
@@ -133,6 +159,9 @@ impl Organ {
             percussion_soft: false,
             scanner: Scanner::Off,
             drive: 0.0,
+            wheels: WheelTarget::Leslie,
+            bend_zone: BendZone::Centre,
+            floor_frames: 0,
             overdrive: Overdrive::new(),
             volume: 0.7,
             click: 0.5,
@@ -245,6 +274,14 @@ impl Organ {
         self.rotary.set_mode(leslie);
     }
 
+    pub fn wheel_target(&self) -> WheelTarget {
+        self.wheels
+    }
+
+    pub fn set_wheel_target(&mut self, target: WheelTarget) {
+        self.wheels = target;
+    }
+
     /// Overdrive amount 0..=1 (0 is clean).
     pub fn set_drive(&mut self, drive: f32) {
         self.drive = drive.clamp(0.0, 1.0);
@@ -330,7 +367,7 @@ impl Organ {
     }
 
     /// Feeds one MIDI channel message (1-3 bytes; every channel is the same keyboard): note on/off, and "all notes off"
-    /// (controllers 120 and 123) and the mod wheel (controller 1: the Leslie, three zones). Returns whether it was one of those.
+    /// (controllers 120 and 123), the mod wheel (controller 1) and the pitch wheel, as `WheelTarget` says. Returns whether it was one of those.
     pub fn midi(&mut self, message: &[u8]) -> bool {
         let [status, data1, data2] = match *message {
             [status, data1, data2] => [status, data1, data2],
@@ -341,6 +378,8 @@ impl Organ {
             0x90 if data2 > 0 => self.note_on(data1),
             0x90 | 0x80 => self.note_off(data1),
             0xb0 if data1 == 123 || data1 == 120 => self.all_notes_off(),
+            0xb0 if data1 == 1 && self.wheels == WheelTarget::Drive => self.set_drive(data2 as f32 / 127.0),
+            0xe0 if self.wheels == WheelTarget::Drive => self.pitch_wheel((data2 as u32) << 7 | data1 as u32),
             // The mod wheel drives the Leslie in three zones: Stop, Slow, Fast.
             0xb0 if data1 == 1 => self.set_leslie(match data2 {
                 0..=42 => Leslie::Stop,
@@ -350,6 +389,33 @@ impl Organ {
             _ => return false,
         }
         true
+    }
+
+    /// Acts on the pitch wheel (0..=16383, 8192 in the middle) when it enters a zone, so the spring back to the middle
+    /// leaves what was chosen: high is Fast, low is Slow, and the floor, held for `STOP_HOLD`, is Stop (see `render`).
+    fn pitch_wheel(&mut self, value: u32) {
+        let zone = match value {
+            12288.. => BendZone::High,
+            ..512 => BendZone::Floor,
+            ..4096 => BendZone::Low,
+            _ => BendZone::Centre,
+        };
+        let before = core::mem::replace(&mut self.bend_zone, zone);
+        if before == zone {
+            return;
+        }
+        self.floor_frames = 0;
+        match zone {
+            BendZone::High => self.set_leslie(Leslie::Fast),
+            BendZone::Low if before != BendZone::Floor => self.set_leslie(Leslie::Slow),
+            BendZone::Floor => {
+                if before != BendZone::Low {
+                    self.set_leslie(Leslie::Slow);
+                }
+                self.floor_frames = 1;
+            }
+            _ => {}
+        }
     }
 
     /// Rebuilds the per-wheel target gains from the held keys and the drawbars.
@@ -381,6 +447,13 @@ impl Organ {
     pub fn render(&mut self, frames: &mut [[f32; 2]]) {
         if self.dirty {
             self.retarget();
+        }
+        if self.floor_frames > 0 {
+            self.floor_frames += frames.len() as u32;
+            if self.floor_frames as f32 >= STOP_HOLD * self.sample_rate {
+                self.floor_frames = 0;
+                self.set_leslie(Leslie::Stop);
+            }
         }
         let percussion_level = if self.percussion_soft { 0.6 } else { 1.5 };
         let scale = self.sample_rate / 48000.0;
