@@ -72,6 +72,7 @@ TAG_PUT_DATA = 0x36
 TAG_PUT_STOP = 0x37
 TAG_PUT_ACK = 0x38
 TAG_PUT_ERROR = 0x39
+TAG_SYNC_REQUEST = 0x40  # tapesync's signed manifest, answered as a GET stream (tools/tape_manifest.py)
 
 ERROR_NAMES = {
     1: "file not found",
@@ -269,7 +270,12 @@ def put(link: Transport, peer: bytes, disk: int, name: str, data: bytes, delay: 
 
 
 def get(link: Transport, peer: bytes, disk: int, name: str, timeout: float) -> bytes:
-    link.send(frame(peer, link.source, TAG_GET_REQUEST, bytes([disk]) + name.encode()))
+    return request_stream(link, peer, TAG_GET_REQUEST, bytes([disk]) + name.encode(), timeout)
+
+
+def request_stream(link: Transport, peer: bytes, tag: int, request: bytes, timeout: float) -> bytes:
+    """Sends a request frame and collects the START/DATA/STOP answer (the stream GET and the tape manifest share)."""
+    link.send(frame(peer, link.source, tag, request))
     total = None
     checksum = 0
     buffer = bytearray()

@@ -18,6 +18,11 @@ class Fosadm(unittest.TestCase):
         text = "hello               1234 bytes\nfos> \nbad name 5 bytes\n"
         self.assertEqual(fosadm.parse_ls(text), {"hello": 1234})
 
+    def test_sha256_lines(self):
+        digest = "ab" * 32
+        text = f"fos> sha256 hello gone\r\n{digest}  1234  hello\r\nsha256: gone: not found\r\nfos> "
+        self.assertEqual(fosadm.parse_sha256(text), {"hello": digest})
+
     def test_arch(self):
         self.assertEqual(fosadm.arch_of("Fosfor OS (aarch64 port): shell"), "aarch64")
         self.assertEqual(fosadm.arch_of("Fosfor OS (fos) is a small"), "x86_64")

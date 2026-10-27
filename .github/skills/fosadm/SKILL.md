@@ -49,7 +49,7 @@ python3 tools/fosadm.py --serial PORT [--fast 921600] put serial FILE [NAME]
 
 ## Behaviour to know
 - **Serial instead of Ethernet:** see "Serial deploy" above; `--serial` replaces discovery with the one machine on that port.
-- Tapes are compared by **size** by default; stored tapes are byte-identical to the build, so status and deploy compare SHA-256 by default (`--sizes` opts out) (Ethernet: fetched; serial: the kernel's `sha256` command, once the kernel has it) and a deploy verifies what it copied that way. Say what was verified.
+- Tapes are compared by **SHA-256** by default (`--sizes` opts out): with a `synckey` file in the repo root (gitignored, a copy of the machines' key) the machine's signed tapesync manifest is used first (`tools/tape_manifest.py`); otherwise the machine hashes its own files with its `sha256` command. Either way nothing is transferred. A kernel without that command is fetched over Ethernet (NETFS GET) or, over serial, compared by size. A deploy verifies what it copied the same way. Say what was verified.
 - By default only tapes a host **already has** are updated. A host lacking a tape says "up to date";
   use `--add-missing` to install new ones (it installs every missing tape, so check `status -v` first;
   for a single tape use `put HOST build/fosfor/tapes/NAME NAME`).

@@ -15,9 +15,9 @@ Machines announce `hostname` + NIC number (skylake3 is NIC 3 of skylake), so the
 NICs of one machine are grouped under one host name. Tapes are compared by SHA-256 (--sizes: by size)
 against --from DIR (default: the build tree: build/fosfor/tapes and the release
 kernel). Stored tapes are byte-identical to the build, so each tape is compared by SHA-256 (status and deploy: by default, --sizes opts out), which also catches a rebuild that kept its
-size; a deploy always verifies what it copied that way. Over Ethernet the tape is
-fetched (NETFS GET); over --serial the machine's `sha256` command hashes it (a kernel
-without that command falls back to sizes). tools/verify_tapes.py is the Ethernet check alone.
+size; a deploy always verifies what it copied that way. The machine hashes its own
+files (its `sha256` command), so no tape crosses the link; a kernel without that command
+means a NETFS fetch over Ethernet, sizes over --serial. tools/verify_tapes.py is the Ethernet check alone.
 
 Raw Ethernet needs CAP_NET_RAW; if it is missing the tool says how to grant it
 to a dedicated Python copy (it never does so silently).
@@ -37,6 +37,8 @@ ROOT = TOOLS.parent
 sys.path.insert(0, str(TOOLS))
 import send_tape  # noqa: E402
 import send_kernel_serial as kup  # noqa: E402
+import foscopy  # noqa: E402
+import tape_manifest  # noqa: E402
 import verify_tapes  # noqa: E402
 
 BUILD_KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fosfor-kernel"
@@ -308,26 +310,62 @@ def cmd_status(args, iface: str) -> int:
     return 0
 
 
+def parse_sha256(out: str) -> dict[str, str]:
+    """name -> hex digest from the lines of the shell's `sha256` command ("DIGEST  LENGTH  NAME")."""
+    return {m.group(3): m.group(1) for m in re.finditer(r"^([0-9a-f]{64})  (\d+)  (\S+)\s*$", out, re.M)}
+
+
+def manifest_hashes(iface: str, host: Host) -> dict[str, str] | None:
+    """name -> hex SHA-256 of the machine's stamped tapes from its signed tapesync manifest, or None (no `synckey` file
+    here, serial link, the machine has no key or another one, or it did not answer)."""
+    key = tape_manifest.read_key()
+    if key is None or host.serial:
+        return None
+    link = foscopy.RawTransport(iface)
+    try:
+        return {name: entry["sha256"] for name, entry in tape_manifest.fetch(link, host.mac, key).items()}
+    except (tape_manifest.ManifestError, foscopy.Fatal):
+        return None
+    finally:
+        link.sock.close()
+
+
 def content_states(iface: str, host: Host, tape_dir: Path, names: list[str]) -> dict[str, str]:
-    """name -> "same" | "differs" | "missing" by fetching each tape from the host and comparing SHA-256 with the build."""
+    """name -> "same" | "differs" | "missing" | "unsupported", comparing SHA-256 with the build. Three ways, best first:
+    the machine's signed tapesync manifest (needs `synckey` in the repository root; one small answer, authenticated);
+    its `sha256` shell command (it hashes its own files; either link); a NETFS fetch of each tape (Ethernet only).
+    Nothing but hashes crosses the link in the first two. "unsupported": serial and a kernel without `sha256`."""
     import hashlib
     import tempfile
-    if host.serial:
-        # The kernel's `sha256` command hashes the stored files; a kernel without it answers "unknown command".
-        states: dict[str, str] = {}
-        for start in range(0, len(names), 6):
-            batch = names[start:start + 6]
-            out = host.serial.ask(["sha256 " + " ".join(batch)], 60)
-            found = {m.group(3): m.group(1) for m in re.finditer(r"^([0-9a-f]{64})  (\d+)  (\S+)$", out, re.M)}
-            if not found and "not found" not in out:
-                return {name: "unsupported" for name in names}
-            for name in batch:
-                built = hashlib.sha256((tape_dir / name).read_bytes()).hexdigest()
-                states[name] = "missing" if name not in found else ("same" if found[name] == built else "differs")
+
+    def built(name: str) -> str:
+        return hashlib.sha256((tape_dir / name).read_bytes()).hexdigest()
+
+    states: dict[str, str] = {}
+    manifest = manifest_hashes(iface, host)
+    if manifest is not None:
+        for name in names:
+            if name in manifest:
+                states[name] = "same" if manifest[name] == built(name) else "differs"
+    rest = [name for name in names if name not in states]   # not stamped tapes there (or no manifest): ask the shell
+    for start in range(0, len(rest), 6):
+        batch = rest[start:start + 6]
+        out = ask_host(iface, host, ["sha256 " + " ".join(batch)], 60)
+        found = parse_sha256(out)
+        if not found and "not found" not in out:
+            break
+        for name in batch:
+            states[name] = "missing" if name not in found else ("same" if found[name] == built(name) else "differs")
+    else:
         return states
+    if host.serial:
+        return {name: "unsupported" for name in names}
     mac = send_tape.format_mac(host.mac)
     with tempfile.TemporaryDirectory() as scratch:
-        return {name: verify_tapes.compare(iface, mac, name, str(tape_dir / name), scratch)[0] for name in names}
+        for name in rest:
+            if name not in states:
+                states[name] = verify_tapes.compare(iface, mac, name, str(tape_dir / name), scratch)[0]
+    return states
 
 
 def stop_running_tape(iface: str, host: Host) -> None:

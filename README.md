@@ -104,7 +104,7 @@ checks for raw-socket rights and explains the one-time `setcap` step if they are
 
 ```sh
 tools/fosadm.py hosts                       # discover; stale peers are forgotten first (--keep to disable)
-tools/fosadm.py status [HOST...]            # kernel slot and tapes against the build (SHA-256; --sizes: quick)
+tools/fosadm.py status [HOST...]            # kernel slot and tapes against the build (SHA-256, via the signed tapesync manifest if ./synckey exists; --sizes: quick)
 tools/fosadm.py deploy [HOST...] --dry-run  # the plan; without --dry-run it asks, then acts (-y skips the question)
 tools/fosadm.py run HOST "uptime"           # also: put FILE HOST, shell HOST, bootcode HOST [--update]
 make release                                # build/release/{x86_64,aarch64}/ + manifest.json, for --from

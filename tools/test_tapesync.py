@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_audio_net import Guest  # noqa: E402
 from test_boot import ROOT, check  # noqa: E402
-from test_netfs import foscopy  # noqa: E402
+from test_netfs import GROUP, PORT, foscopy  # noqa: E402
 
 TAPES = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "build/cargo-target")) / "x86_64-fos-tape/release"
 
@@ -103,6 +103,18 @@ def main():
             check(result.returncode != 0, "nor replace it", result.stderr[-300:] + result.stdout[-300:])
             out = run(alpha, "cat synckey")
             check("correct horse" in out, "the key is unchanged", out[-300:])
+
+            # The host-side client (fosadm's content check): the same signed manifest, read from the PC.
+            def manifest(key, *names):
+                (work / "host-key").write_text(key + "\n")
+                return subprocess.run([sys.executable, str(ROOT / "tools/tape_manifest.py"), "--mcast", f"{GROUP}:{PORT}", "--mac", "52:54:00:12:35:a1",
+                                       "--key", str(work / "host-key"), *names], capture_output=True, text=True, timeout=120)
+            alpha.pump(2.5)
+            result = manifest("correct horse", "hello", "calc")
+            check(result.returncode == 0 and "2 of 2 identical" in result.stdout, "tape_manifest.py: the signed manifest matches the build", result.stdout[-500:] + result.stderr[-300:])
+            alpha.pump(2.5)
+            result = manifest("wrong key", "hello")
+            check(result.returncode == 2 and "not signed with our key" in result.stderr, "tape_manifest.py: another key is refused", result.stdout[-300:] + result.stderr[-300:])
         finally:
             for guest in guests.values():
                 guest.stop()

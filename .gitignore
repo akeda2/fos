@@ -32,3 +32,6 @@ __pycache__/
 # target); kernel/src/debug.rs include!()s this, but it is a build artifact
 # regenerated fresh every build, not source.
 kernel/src/generated_slots.rs
+
+# The shared tapesync key of the test machines (tools/tape_manifest.py, fosadm); never commit it.
+/synckey
