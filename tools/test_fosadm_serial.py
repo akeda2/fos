@@ -94,11 +94,20 @@ def main() -> None:
             wanted = (TAPES / "hello").read_bytes() + b"\0" * 7
             (source / "tapes/hello").write_bytes(wanted)
             out = fosadm(port, "deploy", "--from", str(source), "--tapes-only", "-y")
-            check("tape hello: ok" in out and "verified by size" in out, "deploy: a changed tape goes over `recv`", out)
+            check("tape hello: ok" in out and "verified by content" in out, "deploy: a changed tape goes over `recv`", out)
             out = fosadm(port, "deploy", "--from", str(source), "--force-kernel", "-y")
             check("kernel: running" in out and "FELL BACK" not in out, "deploy: the kernel goes over `kup serial` and runs", out)
             out = fosadm(port, "run", "serial", "ls")
             check(f"hello" in out and str(len(wanted)) in out, "the new tape survived the reboot", out)
+
+            # --content: a rebuild of the same size is seen by its SHA-256 (the kernel's `sha256` command), not by sizes
+            out = fosadm(port, "status", "--from", str(source))
+            check("(by content)" in out and "differ, 0 missing" in out and "hello" not in out.split("differ:")[-1], "status --content: the deployed tape is identical", out)
+            (source / "tapes/hello").write_bytes(wanted[:-8] + b"\x01" + wanted[-7:])
+            out = fosadm(port, "deploy", "--from", str(source), "--tapes-only", "--sizes", "--dry-run")
+            check("up to date" in out, "deploy --sizes misses a same-size change", out)
+            out = fosadm(port, "deploy", "--from", str(source), "--tapes-only", "--dry-run")
+            check("hello" in out and "1 tape(s)" in out, "deploy (default) plans the same-size change", out)
         finally:
             qemu.kill()
             qemu.wait()

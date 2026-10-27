@@ -53,6 +53,7 @@ pub static COMMANDS: &[Command] = &[
     Command::new("debug", "debug [status|slots|crash|hang|video ...]", "kernel-update setting and the A/B slots; `crash` and `hang` test the crash record and the watchdog; `video` (x86 BIOS boots) the video mode.", |_, rest| debug(rest)),
     Command::new("gpio", "gpio [@HOST] [list|read N|set N 0|1|mode N in|out 0|1|altK|pull N none|up|down]", "the Raspberry Pi's GPIO pins, here or on another machine (needs the synckey file for @HOST).", |_, rest| crate::gpio_shell::command(rest)),
     Command::new("tapesync", "tapesync [HOST] [apply]", "pulls newer tapes from one or all peers (needs the synckey file).", |_, rest| crate::tapesync::command(rest.split_whitespace())),
+    Command::new("sha256", "sha256 [diskN/]NAME...", "prints each file's SHA-256 and length (what tools/fosadm.py compares to the build, also over serial).", |_, rest| sha256(rest)),
     Command::new("pci", "pci [read B:D.F [OFFSET [LENGTH]] | write B:D.F OFFSET VALUE]", "lists PCI functions; read/write reach configuration space.", |_, rest| crate::diag::pci_command(rest.split_whitespace())),
     Command::new("cpuinfo", "cpuinfo", "what the CPU reports.", |_, _| crate::diag::cpuinfo()),
     Command::new("bootinfo", "bootinfo", "what the loader handed over.", |_, _| crate::diag::bootinfo()),
@@ -240,6 +241,27 @@ fn disks() {
     match crate::storage::boot_disk() {
         Some(disk) => crate::println!("boot disk: disk{}", disk + 1),
         None => crate::println!("boot disk: not identified"),
+    }
+}
+
+fn sha256(rest: &str) {
+    let Some(staging) = crate::netfs::staging() else { return crate::println!("sha256: no memory for the transfer buffer.") };
+    if rest.split_whitespace().next().is_none() {
+        return crate::println!("Usage: sha256 [diskN/]NAME...");
+    }
+    for reference in rest.split_whitespace() {
+        let read = crate::tape_fs::resolve_file(reference.as_bytes(), true).ok().and_then(|(volume, name)| volume.read(name, staging).ok().flatten());
+        let Some(length) = read else {
+            crate::println!("sha256: {reference}: not found");
+            continue;
+        };
+        let digest = tape_sync::sha256(&staging[..length]);
+        let mut hex = [0u8; 64];
+        for (index, byte) in digest.iter().enumerate() {
+            hex[index * 2] = b"0123456789abcdef"[usize::from(byte >> 4)];
+            hex[index * 2 + 1] = b"0123456789abcdef"[usize::from(byte & 15)];
+        }
+        crate::println!("{}  {length}  {reference}", core::str::from_utf8(&hex).unwrap_or(""));
     }
 }
 

@@ -2,8 +2,8 @@
 """fosadm: find fos machines on the network and show what they run.
 
   fosadm.py hosts                  discover machines (forgets stale peers first)
-  fosadm.py status [HOST...]       kernel slot and tape sizes against the build
-  fosadm.py deploy [HOST...]       push the kernel (KUP) and changed tapes, after showing a plan
+  fosadm.py status [HOST...]       kernel slot and tapes against the build (SHA-256; --sizes: sizes only)
+  fosadm.py deploy [HOST...]       push the kernel (KUP) and tapes that differ (by SHA-256), after showing a plan
   fosadm.py run|put|shell|bootcode HOST ...   one command, a file, a terminal, the boot code
 
 With `--serial PORT` (e.g. /dev/ttyUSB0) there is one machine, on that console serial line, and no Ethernet is used:
@@ -12,9 +12,12 @@ prompt; --baud is the console speed (115200), --fast raises it for the transfers
 Ethernet. tools/send_kernel_serial.py and tools/send_file_serial.py are the single-purpose senders.
 
 Machines announce `hostname` + NIC number (skylake3 is NIC 3 of skylake), so the
-NICs of one machine are grouped under one host name. Tapes are compared by size
+NICs of one machine are grouped under one host name. Tapes are compared by SHA-256 (--sizes: by size)
 against --from DIR (default: the build tree: build/fosfor/tapes and the release
-kernel), because stored tapes are staged images whose bytes differ.
+kernel). Stored tapes are byte-identical to the build, so each tape is compared by SHA-256 (status and deploy: by default, --sizes opts out), which also catches a rebuild that kept its
+size; a deploy always verifies what it copied that way. Over Ethernet the tape is
+fetched (NETFS GET); over --serial the machine's `sha256` command hashes it (a kernel
+without that command falls back to sizes). tools/verify_tapes.py is the Ethernet check alone.
 
 Raw Ethernet needs CAP_NET_RAW; if it is missing the tool says how to grant it
 to a dedicated Python copy (it never does so silently).
@@ -34,6 +37,7 @@ ROOT = TOOLS.parent
 sys.path.insert(0, str(TOOLS))
 import send_tape  # noqa: E402
 import send_kernel_serial as kup  # noqa: E402
+import verify_tapes  # noqa: E402
 
 BUILD_KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fosfor-kernel"
 BUILD_TAPES = ROOT / "build/fosfor/tapes"
@@ -272,7 +276,7 @@ def cmd_status(args, iface: str) -> int:
         out = ask_host(iface, host, ["debug slots", "ls", "about"])
         print(f"{host.name} ({host.label()})")
         arch = arch_of(out)
-        kernel, _, tapes = source_files(Path(args.source) if args.source else None, arch)
+        kernel, tape_dir, tapes = source_files(Path(args.source) if args.source else None, arch)
         want_sectors = kernel_sectors(kernel)
         booted = re.search(r"booted slot: (\d+)", out)
         sizes = re.search(r"slot sizes \(sectors\): (\d+) / (\d+)", out)
@@ -285,12 +289,45 @@ def cmd_status(args, iface: str) -> int:
         print(f"  {arch} kernel: slot {booted.group(1)}, {have} sectors, {state}")
         old = [n for n, s in tapes.items() if n in files and files[n] != s]
         missing = [n for n in tapes if n not in files]
-        print(f"  tapes: {sum(1 for n in tapes if n in files) - len(old)} current, {len(old)} differ, {len(missing)} missing")
+        states = content_states(iface, host, tape_dir, sorted(n for n in tapes if n in files)) if args.content else {}
+        if states and set(states.values()) == {"unsupported"}:
+            print("  this kernel has no `sha256` command yet (deploy it first); falling back to sizes")
+            states = {}
+        if states:
+            old = sorted(n for n, state in states.items() if state == "differs")
+            unread = sorted(n for n, state in states.items() if state == "missing")
+            if unread:
+                print(f"  could not read (no NETFS answer?): {' '.join(unread)}")
+            print(f"  tapes (by content): {sum(1 for state in states.values() if state == 'same')} identical, {len(old)} differ, {len(missing)} missing")
+        else:
+            print(f"  tapes: {sum(1 for n in tapes if n in files) - len(old)} current, {len(old)} differ, {len(missing)} missing")
         if old:
             print(f"    differ: {' '.join(sorted(old))}")
         if args.verbose and missing:
             print(f"    missing: {' '.join(sorted(missing))}")
     return 0
+
+
+def content_states(iface: str, host: Host, tape_dir: Path, names: list[str]) -> dict[str, str]:
+    """name -> "same" | "differs" | "missing" by fetching each tape from the host and comparing SHA-256 with the build."""
+    import hashlib
+    import tempfile
+    if host.serial:
+        # The kernel's `sha256` command hashes the stored files; a kernel without it answers "unknown command".
+        states: dict[str, str] = {}
+        for start in range(0, len(names), 6):
+            batch = names[start:start + 6]
+            out = host.serial.ask(["sha256 " + " ".join(batch)], 60)
+            found = {m.group(3): m.group(1) for m in re.finditer(r"^([0-9a-f]{64})  (\d+)  (\S+)$", out, re.M)}
+            if not found and "not found" not in out:
+                return {name: "unsupported" for name in names}
+            for name in batch:
+                built = hashlib.sha256((tape_dir / name).read_bytes()).hexdigest()
+                states[name] = "missing" if name not in found else ("same" if found[name] == built else "differs")
+        return states
+    mac = send_tape.format_mac(host.mac)
+    with tempfile.TemporaryDirectory() as scratch:
+        return {name: verify_tapes.compare(iface, mac, name, str(tape_dir / name), scratch)[0] for name in names}
 
 
 def stop_running_tape(iface: str, host: Host) -> None:
@@ -357,8 +394,15 @@ def cmd_deploy(args, iface: str) -> int:
         do_kernel = kernel is not None and not args.tapes_only
         want = kernel_sectors(kernel)
         new_kernel = do_kernel and (args.force_kernel or have != want)
-        tape_list = sorted(n for n, s in tapes.items() if do_tapes and n in files and files[n] != s) \
-            + (sorted(n for n in tapes if do_tapes and n not in files) if args.add_missing else [])
+        states = content_states(iface, host, tape_dir, sorted(n for n in tapes if n in files)) if do_tapes and args.content else {}
+        if states and set(states.values()) == {"unsupported"}:
+            print(f"{host.name}: this kernel has no `sha256` command yet; planning by size")
+            states = {}
+        if states:
+            changed = sorted(n for n, state in states.items() if state != "same")
+        else:
+            changed = sorted(n for n, s in tapes.items() if do_tapes and n in files and files[n] != s)
+        tape_list = changed + (sorted(n for n in tapes if do_tapes and n not in files) if args.add_missing else [])
         plans.append((host, new_kernel, tape_list, stopped, arch))
     print("Plan:")
     for host, new_kernel, tape_list, _, arch in plans:
@@ -424,9 +468,14 @@ def cmd_deploy(args, iface: str) -> int:
                                          str(tape_dir / name), f":disk1/{name}"], capture_output=True, text=True).returncode == 0
                 print(f"  tape {name}: {'ok' if ok else 'FAILED'}")
                 failed += not ok
-            files = parse_ls(ask_host(iface, host, ["ls"]))
-            bad = [n for n in tape_list if files.get(n) != tapes[n]]
-            print("  verified by size" if not bad else f"  size mismatch after copy: {' '.join(bad)}")
+            states = content_states(iface, host, tape_dir, tape_list)
+            if set(states.values()) == {"unsupported"}:
+                files = parse_ls(ask_host(iface, host, ["ls"]))
+                bad = [n for n in tape_list if files.get(n) != tapes[n]]
+                print("  verified by size (no `sha256` command on this kernel)" if not bad else f"  size mismatch after copy: {' '.join(bad)}")
+            else:
+                bad = [n for n, state in states.items() if state != "same"]
+                print("  verified by content (SHA-256)" if not bad else f"  not identical to the build after copy: {' '.join(bad)}")
             failed += bool(bad)
         restart = host_setting(host, "restart")
         if stopped and restart and host.serial:
@@ -508,10 +557,12 @@ def main() -> int:
     status = sub.add_parser("status", help="show kernel and tape state against the build")
     status.add_argument("hosts", nargs="*", help="host names or MACs (default: all)")
     status.add_argument("--from", dest="source", help="release folder (default: the build tree)")
+    status.add_argument("--sizes", dest="content", action="store_false", help="compare sizes, not SHA-256 (quicker, misses same-size changes)")
     status.add_argument("-v", "--verbose", action="store_true")
     deploy = sub.add_parser("deploy", help="push the kernel (KUP) and changed tapes")
     deploy.add_argument("hosts", nargs="*", help="host names or MACs (default: all)")
     deploy.add_argument("--from", dest="source", help="release folder (default: the build tree)")
+    deploy.add_argument("--sizes", dest="content", action="store_false", help="plan by comparing sizes, not SHA-256 (quicker, misses same-size changes)")
     deploy.add_argument("--kernel-only", action="store_true")
     deploy.add_argument("--tapes-only", action="store_true")
     deploy.add_argument("--force-kernel", action="store_true", help="push the kernel even if the size matches")

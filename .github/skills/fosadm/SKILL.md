@@ -18,11 +18,11 @@ Never `bootcode --update` or write boot code without an explicit yes. Never gran
 ## Commands
 ```
 python3 tools/fosadm.py --iface IFACE hosts                 # discover (forgets stale peers first)
-python3 tools/fosadm.py --iface IFACE status [-v] [HOST...] # kernel slot, tape sizes vs build; -v lists missing tapes
+python3 tools/fosadm.py --iface IFACE status [-v] [--sizes] [HOST...] # kernel slot, tapes vs build (SHA-256; --sizes: sizes only)
 python3 tools/fosadm.py --iface IFACE deploy [HOST...]      # plan, then kernel (KUP) + changed tapes
 ```
 `deploy` options: `--dry-run` (plan only), `-y` (no prompt), `--tapes-only`, `--kernel-only`,
-`--force-kernel` (size matches but push anyway), `--add-missing`, `--from DIR` (a release folder).
+`--sizes` (plan by size, not SHA-256; deploy compares content by default), `--force-kernel` (size matches but push anyway), `--add-missing`, `--from DIR` (a release folder).
 Also: `run HOST cmd...`, `put HOST FILE [NAME] [--disk N]`, `shell HOST`, `bootcode HOST [--update]`.
 
 Order: `status` (or `deploy --dry-run`) first, show the plan to the user, then deploy.
@@ -49,7 +49,7 @@ python3 tools/fosadm.py --serial PORT [--fast 921600] put serial FILE [NAME]
 
 ## Behaviour to know
 - **Serial instead of Ethernet:** see "Serial deploy" above; `--serial` replaces discovery with the one machine on that port.
-- Tapes are compared by **size** (stored tapes are staged images, bytes differ). Say what was verified.
+- Tapes are compared by **size** by default; stored tapes are byte-identical to the build, so status and deploy compare SHA-256 by default (`--sizes` opts out) (Ethernet: fetched; serial: the kernel's `sha256` command, once the kernel has it) and a deploy verifies what it copied that way. Say what was verified.
 - By default only tapes a host **already has** are updated. A host lacking a tape says "up to date";
   use `--add-missing` to install new ones (it installs every missing tape, so check `status -v` first;
   for a single tape use `put HOST build/fosfor/tapes/NAME NAME`).
