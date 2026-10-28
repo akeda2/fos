@@ -3,6 +3,7 @@
 the tone at the right pitch, for FLAC at 48 and 44.1 kHz and MP3 at 44.1 kHz stereo and 22.05 kHz mono. Needs ffmpeg on the host (SKIP without). No audio
 hardware or network needed. Run with `make test-fosplay`."""
 
+import re
 import shutil
 import subprocess
 import sys
@@ -29,6 +30,25 @@ CASES = [("t48.flac", 48000, 2, ["-sample_fmt", "s16"]), ("t44.flac", 44100, 2, 
          ("o24.opus", 24000, 1, ["-c:a", "libopus", "-b:a", "48k"])]
 # Files played with an output rate asked for (rate=44100: the loopback may refuse it; fosplay then falls back and resamples).
 PLAY_OPTIONS = {"r44.flac": "rate=44100 "}
+
+
+def start_service(guest, line):
+    """Types `line` until the shell says the service started: a line typed while the shell prints another service's end
+    message can be lost."""
+    for _ in range(4):
+        mark = guest.send(line)
+        end = time.monotonic() + 6
+        while time.monotonic() < end:
+            guest.pump(0.2)
+            if "Service" in guest.text()[mark:] and "started" in guest.text()[mark:]:
+                return
+    check(False, f"`{line}` starts a service", guest.text()[-400:])
+
+
+def listed(guest, *names):
+    """True while `ps` lists one of the services: only its listing lines count, not an asynchronous "Service record
+    ended." message that lands in the same stretch of console output."""
+    return bool(re.search(rf"^\d+\s+({'|'.join(names)})\b", ask(guest, "ps", "fos> "), re.M))
 
 
 def make_audio(path, rate, channels, options):
@@ -64,10 +84,10 @@ def main():
                 guest.send(f"run fosplay device=loop0 gfx=off {PLAY_OPTIONS.get(name, "")}play {name} &0")
                 deadline = time.monotonic() + 90
                 while time.monotonic() < deadline:
-                    if "record" not in ask(guest, "ps", "fos> "):
+                    if not listed(guest, "record"):
                         break
                     guest.pump(2)
-                check("record" not in ask(guest, "ps", "fos> "), f"the {name} recording finishes", guest.text()[-600:])
+                check(not listed(guest, "record"), f"the {name} recording finishes", guest.text()[-600:])
                 guest.pump(8)
             # The playlist: both tracks play, the second named [2/2], and the summary counts them.
             guest.send("run record device=loop0 list 9 &0")
@@ -75,7 +95,7 @@ def main():
             guest.send("run fosplay device=loop0 gfx=off play p1.flac p2.mp3 &0")
             deadline = time.monotonic() + 90
             while time.monotonic() < deadline:
-                if "record" not in ask(guest, "ps", "fos> "):
+                if not listed(guest, "record"):
                     break
                 guest.pump(2)
             guest.pump(3)
@@ -156,16 +176,20 @@ def bass_test():
             guest.wait_for("fos> ")
             for name in files:
                 take = "bass-" + name.split(".")[0]
-                guest.send(f"run record device=loop0 {take} 4 &0")
+                start_service(guest, f"run record device=loop0 {take} 4 &0")
                 guest.pump(2)
                 guest.send(f"run fosplay device=loop0 gfx=off bass=9 play {name} &0")
                 deadline = time.monotonic() + 60
                 while time.monotonic() < deadline:
-                    if "record" not in ask(guest, "ps", "fos> "):
+                    if not listed(guest, "record", "fosplay"):   # the player outlives the 4 s take; the next one needs the device
                         break
+            # The last player may still be running (the shell answers late meanwhile): let it end before the next one starts.
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline and listed(guest, "fosplay", "record"):
+                guest.pump(1)
             # loop0 has two channels: the upmix must say so and play stereo, not fail.
             mark = guest.send("run fosplay device=loop0 gfx=off upmix=on play b1k.flac &0")
-            guest.wait_for("upmix needs 3 playback channels; the device has 2", 30, since=mark)
+            guest.wait_for("upmix needs 3 playback channels; the device has 2", 60, since=mark)
         finally:
             guest.stop()
         out = fosfs_files(Path(tmp) / "bass.img")

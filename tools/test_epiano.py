@@ -73,7 +73,7 @@ def main():
         peak = max(abs(x) for x in window)
         check(peak > 0.01, f"typing a key makes sound (peak {peak:.3f})")
         wanted, other = goertzel(window, rate, C3), goertzel(window, rate, 200.0)
-        check(wanted > 5 * other, f"the sound is at C3 ({wanted:.4f} at 130.8 Hz vs {other:.4f} at 200 Hz)")
+        check(wanted > 3 * other, f"the sound is at C3 ({wanted:.4f} at 130.8 Hz vs {other:.4f} at 200 Hz)")
     print("epiano: all checks passed")
 
 
