@@ -120,8 +120,8 @@ pushes the kernel with KUP and reports if the host fell back to the old one, the
 `make test-fosadm` runs its unit tests.
 
 With `--serial PORT` (for example `/dev/ttyUSB0`) fosadm works on one machine through its console serial line and needs
-no Ethernet: `status`, `deploy` (the kernel through `kup serial`, tapes through `recv`), `run` and `put` (the HOST
-argument is ignored). The shell must be at its prompt; `--baud` is the console speed and `--fast` raises it for the
+no Ethernet: `status`, `deploy` (the kernel through `kup serial`, tapes through `recv`), `run`, `put` and `shell`
+(an interactive terminal; Ctrl-C or Ctrl-D leaves; the HOST argument is ignored). The shell must be at its prompt; `--baud` is the console speed and `--fast` raises it for the
 transfers (Pi 4 shell only). x86 COM1 keeps its speed, so a 1 MB tape takes a minute or more at 115200 baud (not timed on real hardware).
 `make test-fosadm-serial` runs it against QEMU.
 

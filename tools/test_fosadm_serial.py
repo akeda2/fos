@@ -87,6 +87,11 @@ def main() -> None:
             out = fosadm(port, "run", "serial", "ls")
             check(re.search(r"^blob\.txt\s+2100 bytes", out, re.M) is not None, "put: the file is on the machine, 2100 bytes", out)
 
+            # shell: a terminal on the line; piped input ends it after the last answer.
+            result = subprocess.run([sys.executable, str(FOSADM), "--serial", port, "shell"], input=b"ls\r", capture_output=True, timeout=60)
+            shown = (result.stdout + result.stderr).decode("utf-8", "replace")
+            check(result.returncode == 0 and "blob.txt" in shown and "fos>" in shown, "shell: typed input reaches the machine and its answer is shown", shown)
+
             # deploy: a tape whose size differs, and the kernel again (forced)
             source = scratch / "release"
             (source / "tapes").mkdir(parents=True)

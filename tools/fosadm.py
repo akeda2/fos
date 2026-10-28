@@ -8,8 +8,8 @@
 
 With `--serial PORT` (e.g. /dev/ttyUSB0) there is one machine, on that console serial line, and no Ethernet is used:
 status, deploy (kernel through `kup serial`, tapes through `recv`), run and put work as above. The shell must be at its
-prompt; --baud is the console speed (115200), --fast raises it for the transfers (aarch64 only). shell and bootcode need
-Ethernet. tools/send_kernel_serial.py and tools/send_file_serial.py are the single-purpose senders.
+prompt; --baud is the console speed (115200), --fast raises it for the transfers (aarch64 only). shell opens a terminal on
+the line (Ctrl-C or Ctrl-D leaves); bootcode needs Ethernet. tools/send_kernel_serial.py and tools/send_file_serial.py are the single-purpose senders.
 
 Machines announce `hostname` + NIC number (skylake3 is NIC 3 of skylake), so the
 NICs of one machine are grouped under one host name. Tapes are compared by SHA-256 (--sizes: by size)
@@ -154,6 +154,42 @@ class Serial:
         while time.monotonic() < end and not answer.rstrip(b" ").endswith(self.PROMPT):
             answer += self.read(0.2)
         return answer
+
+    def interactive(self) -> int:
+        """A terminal on the line: keys go out as typed (Escape aborts a running command), output is shown. Ctrl-C or Ctrl-D leaves,
+        like `term_net.py --interactive`; at the end of piped input it waits for the last answer, then leaves."""
+        import select
+        import time
+        import tty
+        stdin = sys.stdin.fileno()
+        saved = None
+        if os.isatty(stdin):
+            saved = self.termios.tcgetattr(stdin)
+            tty.setcbreak(stdin)
+        sys.stderr.write("[fosadm: serial shell, Ctrl-C or Ctrl-D leaves]\r\n")
+        self.write(b"\r")
+        closed_at = None
+        try:
+            while closed_at is None or time.monotonic() < closed_at:
+                watched = [self.fd] + ([stdin] if closed_at is None else [])
+                ready, _, _ = select.select(watched, [], [], 0.2)
+                if self.fd in ready:
+                    data = os.read(self.fd, 4096)
+                    os.write(sys.stdout.fileno(), data)
+                if stdin in ready:
+                    data = os.read(stdin, 1024)
+                    if not data:
+                        closed_at = time.monotonic() + 2.0
+                    elif b"\x03" in data or b"\x04" in data:
+                        break
+                    else:
+                        self.write(data.replace(b"\n", b"\r") if not os.isatty(stdin) else data)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            if saved is not None:
+                self.termios.tcsetattr(stdin, self.termios.TCSADRAIN, saved)
+        return 0
 
     def send(self, shell_command: bytes, data: bytes) -> int:
         try:
@@ -558,7 +594,7 @@ def cmd_put(args, iface: str) -> int:
 
 def cmd_shell(args, iface: str) -> int:
     if args.serial:
-        raise SystemExit(f"shell needs Ethernet; on a serial line use a terminal program (picocom -b {args.baud} {args.serial}).")
+        return Serial(args.serial, args.baud, args.fast).interactive()
     host = one_host(iface, args)
     return subprocess.run([sys.executable, str(TOOLS / "term_net.py"), "--iface", iface, "--mac",
                            send_tape.format_mac(host.mac), "--interactive"]).returncode
@@ -610,7 +646,7 @@ def main() -> int:
     for name, text in (("run", "run one shell command on a host"), ("put", "copy a file to a host's boot volume"),
                        ("shell", "open an interactive shell (term net)"), ("bootcode", "show or update the boot code")):
         sp = sub.add_parser(name, help=text)
-        sp.add_argument("host", help="host name or MAC")
+        sp.add_argument("host", **({"nargs": "?", "default": ""} if name == "shell" else {}), help="host name or MAC (shell: not needed with --serial)")
         if name == "run":
             sp.add_argument("words", nargs="+", help="the command")
         if name == "put":
@@ -620,6 +656,8 @@ def main() -> int:
         if name == "bootcode":
             sp.add_argument("--update", action="store_true", help="rewrite it (asks you to type the host name)")
     args = parser.parse_args()
+    if args.command == "shell" and not args.serial and not args.host:
+        parser.error("the following arguments are required: host")
     if not args.serial:
         ensure_privilege()
     CONFIG.update(load_config())
