@@ -66,8 +66,10 @@ def main():
         time.sleep(1)
         data, rate = samples(wav)
         check(len(data) > rate, "the recording holds more than a second of audio")
-        loud = max(range(0, len(data) - rate // 4, rate // 4), key=lambda i: sum(abs(x) for x in data[i:i + rate // 4]))
-        window = data[loud:loud + rate // 4]
+        # A second holds four of the repeated notes, however the 0.25 s grid falls on their attacks (the default Metal
+        # tine opens with a broadband click that a shorter window can be mostly made of).
+        loud = max(range(0, len(data) - rate, rate // 4), key=lambda i: sum(abs(x) for x in data[i:i + rate]))
+        window = data[loud:loud + rate]
         peak = max(abs(x) for x in window)
         check(peak > 0.01, f"typing a key makes sound (peak {peak:.3f})")
         wanted, other = goertzel(window, rate, C3), goertzel(window, rate, 200.0)

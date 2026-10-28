@@ -2,7 +2,8 @@
 """Runs `make test-NAME` targets in parallel: `run_tests.py JOBS TARGET...` (`make test-all TEST_JOBS=N` calls it).
 
 Each worker has a slot (`FOS_TEST_SLOT`, see tools/testslot.py) that moves the test's fixed host ports, so tests do not
-share a QEMU segment. A test's output goes to build/test-logs/TARGET.log. A target that fails is run once more, alone, at
+share a QEMU segment. A test's output goes to build/test-logs/TARGET.log. A failed run's log is kept as TARGET.failed.log (TARGET.alone.failed.log for the retry) and its last lines are
+printed, so a build log shows why. A target that fails is run once more, alone, at
 the end: a test that only fails while the machine is busy is reported as such ("PASS (alone)") instead of being hidden.
 Targets that took longest last time start first, so the run does not end on one long test."""
 import json
@@ -30,12 +31,18 @@ def slot_image(slot):
     return copy
 
 
-def run(target, slot):
+def run(target, slot, kind="failed"):
     environment = dict(os.environ, FOS_TEST_SLOT=str(slot), FOSFOR_IMAGE=str(slot_image(slot)))
     started = time.time()
     with open(LOGS / f"{target}.log", "w") as log:
         # -o image: test-all has built the image once; parallel makes must not rebuild it under each other
         code = subprocess.call(["make", "--no-print-directory", "-o", "image", target], cwd=ROOT, env=environment, stdout=log, stderr=subprocess.STDOUT)
+    if code != 0:
+        # The next run of this target overwrites TARGET.log, and a retry that passes would hide why the first try failed.
+        keep = LOGS / f"{target}.{kind}.log"
+        shutil.copyfile(LOGS / f"{target}.log", keep)
+        lines = [line for line in keep.read_text(errors="replace").splitlines() if not line.startswith("PASS")]
+        print(f"--- {target}: last lines that are not PASS (whole log: {keep.relative_to(ROOT)})", *("    " + line[:200] for line in lines[-12:]), sep="\n", flush=True)
     return code == 0, time.time() - started
 
 
@@ -70,7 +77,7 @@ def main():
     for target in failed:
         if os.environ.get("FOS_NO_RETRY"):
             break
-        ok, seconds = run(target, 0)
+        ok, seconds = run(target, 0, "alone.failed")
         print(f"{'PASS (alone)' if ok else 'FAIL (alone)'} {target} ({seconds:.0f}s)", flush=True)
         results[target] = ok
     TIMES.write_text(json.dumps(times))

@@ -76,7 +76,7 @@ def main() -> None:
             check(wait_prompt(port), "the shell reaches its prompt")
 
             out = fosadm(port, "status")
-            check("x86_64 kernel" in out and "tapes:" in out, "status answers over serial", out)
+            check("x86_64 kernel" in out and re.search(r"tapes[ (:]", out), "status answers over serial", out)
             check("differs" not in out.split("tapes:")[0], "status: the kernel is the build's", out)
 
             # put: a small file through `recv`, checked with `run ls`
