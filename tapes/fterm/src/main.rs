@@ -87,9 +87,11 @@ fn list(api: &TapeApi) {
     }
 }
 
-fn help() {
-    println!("\n[Ctrl-A then: x exit, s status, e local echo, l CR sends CRLF, c clear screen,");
-    println!(" a send Ctrl-A, h help; serial only: b break, d toggle DTR, r toggle RTS]");
+fn help(lead: u8) {
+    let key = (b'A' + lead - 1) as char;
+    println!("\n[Ctrl-{key} then: x exit, s status, e local echo, l CR sends CRLF, c clear screen,");
+    println!(" a send Ctrl-{key}, h help; serial only: b break, d toggle DTR, r toggle RTS]");
+    println!(" Inside another fterm: Ctrl-{key} a x leaves the inner one, or start it with prefix=b]");
 }
 
 /// A peer's MAC and the interface it was heard on, by announced name (case does not matter).
@@ -108,9 +110,15 @@ fn find_peer(api: &TapeApi, name: &str) -> Option<([u8; 6], u32)> {
     None
 }
 
+fn prefix_name(config: &Config) -> char {
+    (b'A' + config.prefix - 1) as char
+}
+
 /// Runs the terminal until the user leaves or the link closes.
-fn run(api: &TapeApi, link: &mut dyn Link, mut echo: bool, mut crlf: bool) {
-    let mut keys = Keys::new();
+fn run(api: &TapeApi, link: &mut dyn Link, config: &Config) {
+    let (mut echo, mut crlf) = (config.echo, config.crlf);
+    let lead = config.prefix;
+    let mut keys = Keys::with_prefix(lead);
     let mut buffer = [0u8; 256];
     'run: loop {
         let mut busy = link.poll();
@@ -133,7 +141,7 @@ fn run(api: &TapeApi, link: &mut dyn Link, mut echo: bool, mut crlf: bool) {
                     }
                 }
                 Action::Exit => break 'run,
-                Action::Help => help(),
+                Action::Help => help(lead),
                 Action::Status => {
                     link.status();
                     println!("[echo {}, crlf {}]", if echo { "on" } else { "off" }, if crlf { "on" } else { "off" });
@@ -147,7 +155,7 @@ fn run(api: &TapeApi, link: &mut dyn Link, mut echo: bool, mut crlf: bool) {
                     println!("\n[crlf {}]", if crlf { "on" } else { "off" });
                 }
                 Action::Clear => (api.puts)(b"\x1b[2J\x1b[H".as_ptr(), 7),
-                Action::Unknown => println!("\n[unknown command; Ctrl-A h lists them]"),
+                Action::Unknown => println!("\n[unknown command; Ctrl-{} h lists them]", (b'A' + lead - 1) as char),
                 action @ (Action::Break | Action::ToggleDtr | Action::ToggleRts) => {
                     if !link.command(&action) {
                         println!("\n[that command is for serial ports]");
@@ -254,12 +262,14 @@ fn connect(api: &'static TapeApi, config: &Config) {
             let mut format = [0u8; 3];
             fterm::format_name(config.format, &mut format);
             println!(
-                "fterm: port {}, {} baud {}. Ctrl-A x exits, Ctrl-A h helps.",
+                "fterm: port {}, {} baud {}. Ctrl-{} x exits, Ctrl-{} h helps.",
                 config.port,
                 config.baud,
-                core::str::from_utf8(&format).unwrap_or("")
+                core::str::from_utf8(&format).unwrap_or(""),
+                prefix_name(config),
+                prefix_name(config)
             );
-            run(api, &mut link, config.echo, config.crlf);
+            run(api, &mut link, config);
         }
         Target::Telnet(target) => {
             let Some(nic) = Nic::open(tape_rt::active_nic() as u32) else {
@@ -267,7 +277,7 @@ fn connect(api: &'static TapeApi, config: &Config) {
                 return;
             };
             let mut link = TelnetLink::open(nic, target);
-            run(api, &mut link, config.echo, config.crlf);
+            run(api, &mut link, config);
         }
         Target::Net(peer) => {
             let (mac, index) = match peer {
@@ -288,8 +298,8 @@ fn connect(api: &'static TapeApi, config: &Config) {
                 println!("fterm: the network interface refused the frame.");
                 return;
             };
-            println!("fterm: term net. Ctrl-A x leaves, Ctrl-A h helps.");
-            run(api, &mut link, config.echo, config.crlf);
+            println!("fterm: term net. Ctrl-{} x leaves, Ctrl-{} h helps.", prefix_name(config), prefix_name(config));
+            run(api, &mut link, config);
         }
     }
 }
@@ -308,10 +318,14 @@ tape_rt::tape_help!(br#"fterm: a terminal for serial ports, Telnet and other fos
                                   A NAME goes to the DNS server DHCP names,
                                   `dns`, or else the gateway
   run fterm net NAME|MAC          another fos machine's shell (term net)
+  Any form takes prefix=LETTER: Ctrl-LETTER starts the commands instead of
+  Ctrl-A (not c, h, i, j, m). Use it for an fterm run inside another fterm.
 
   Keys go out as typed (Ctrl-C and Esc too); incoming text is shown.
   Commands start with Ctrl-A, then a plain letter:
     x exit   s status   e echo   l CR->CRLF   c clear screen   a send Ctrl-A
     h help   serial only: b break   d DTR   r RTS
+  Nested: the outer fterm eats Ctrl-A x. Type Ctrl-A a x to leave the inner
+  one, or start the inner with prefix=b (then Ctrl-B x).
   Telnet and net use the interface chosen with `nic use`.
 "#);

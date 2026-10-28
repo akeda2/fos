@@ -1182,6 +1182,8 @@ bcdDevice is not read, so the older PL2303 (non-HX) variants are untried. Verifi
 console): `run fterm 1 115200` on rack showed skylake's whole boot log (5805 bytes), and typing `ver` from fterm reached skylake's shell, which answered.
 Not verified: unplug/replug, other baud rates and formats, modem-status lines.
 
+**Nested sessions.** The outermost fterm eats Ctrl-A x, so leaving it strands the machine behind it inside its own fterm. Ctrl-A a sends a literal Ctrl-A, so `Ctrl-A a x` reaches the inner fterm; or run the inner one with `prefix=LETTER` (not c, h, i, j, m) and its commands move to Ctrl-LETTER. The banner and Ctrl-A h name the key. `make test-fterm-net`, `cargo test --lib` in `tapes/fterm`.
+
 ### USB-MIDI (kernel/src/usb_midi.rs)
 
 Class-compliant MIDIStreaming interfaces (audio class 1, subclass 3) on xHCI, directly on a root port or behind a hub: `usb_hid::probe_device` finds one

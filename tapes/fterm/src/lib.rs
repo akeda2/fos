@@ -88,11 +88,13 @@ pub struct Config<'a> {
     /// Send LF after every CR.
     pub crlf: bool,
     pub list: bool,
+    /// The command prefix byte: Ctrl-A, or the Ctrl letter `prefix=LETTER` names (for a session inside a session).
+    pub prefix: u8,
 }
 
 impl Default for Config<'_> {
     fn default() -> Self {
-        Config { target: Target::Serial, port: 1, baud: DEFAULT_BAUD, format: DEFAULT_FORMAT, echo: false, crlf: false, list: false }
+        Config { target: Target::Serial, port: 1, baud: DEFAULT_BAUD, format: DEFAULT_FORMAT, echo: false, crlf: false, list: false, prefix: PREFIX }
     }
 }
 
@@ -152,7 +154,16 @@ pub fn format_name(format: u32, out: &mut [u8; 3]) {
     out[2] = if format & 0x04 != 0 { b'2' } else { b'1' };
 }
 
-/// `[PORT] [BAUD] [FORMAT] [echo] [crlf]`, `list`, `telnet IP|NAME [PORT] [static LOCAL/PREFIX GATEWAY] [dns IP[:PORT]]` or `net NAME|MAC`. In the serial
+/// `prefix=b` (or `prefix=B`): Ctrl-B is the command prefix. Not c, h, i, j, m (Ctrl-C, backspace, tab, LF, CR), which a
+/// terminal needs for itself.
+pub fn parse_prefix(text: &str) -> Result<u8, &'static str> {
+    match text.as_bytes() {
+        [letter] if letter.is_ascii_alphabetic() && !b"chijmCHIJM".contains(letter) => Ok(letter.to_ascii_lowercase() - b'a' + 1),
+        _ => Err("prefix= takes one letter (not c, h, i, j or m): Ctrl-LETTER starts the commands"),
+    }
+}
+
+/// `[PORT] [BAUD] [FORMAT] [echo] [crlf] [prefix=LETTER]`, `list`, `telnet IP|NAME [PORT] [static LOCAL/PREFIX GATEWAY] [dns IP[:PORT]]` or `net NAME|MAC`. In the serial
 /// form the first number is the port, the second the baud rate; `echo` and `crlf` may come anywhere.
 pub fn parse_args(text: &str) -> Result<Config<'_>, &'static str> {
     let mut config = Config::default();
@@ -187,6 +198,7 @@ pub fn parse_args(text: &str) -> Result<Config<'_>, &'static str> {
             "list" if config.target == Target::Serial => config.list = true,
             "echo" => config.echo = true,
             "crlf" => config.crlf = true,
+            _ if word.starts_with("prefix=") => config.prefix = parse_prefix(&word[7..])?,
             "static" if matches!(config.target, Target::Telnet(_)) => {
                 let local = words.next().ok_or("static needs LOCAL/PREFIX and GATEWAY")?;
                 let (address, prefix) = local.split_once('/').ok_or("write the address as LOCAL/PREFIX")?;
@@ -252,14 +264,25 @@ pub enum Action {
 /// Turns `read_key` values into actions. Enter is sent as CR (the local keyboard gives LF, a `term net` client CR; a
 /// remote terminal expects CR); the Escape key, which the kernel reports as an abort request, is sent as ESC so that it
 /// reaches vi and friends. The tape is left with `Ctrl-A x`.
-#[derive(Default)]
 pub struct Keys {
     prefix: bool,
+    /// The byte that starts a command (Ctrl-A unless `prefix=` says otherwise).
+    lead: u8,
+}
+
+impl Default for Keys {
+    fn default() -> Self {
+        Keys::new()
+    }
 }
 
 impl Keys {
     pub const fn new() -> Self {
-        Keys { prefix: false }
+        Keys::with_prefix(PREFIX)
+    }
+
+    pub const fn with_prefix(lead: u8) -> Self {
+        Keys { prefix: false, lead }
     }
 
     pub fn feed(&mut self, key: u32) -> Action {
@@ -280,13 +303,14 @@ impl Keys {
                 b'e' => Action::ToggleEcho,
                 b'l' => Action::ToggleCrlf,
                 b'c' => Action::Clear,
-                b'a' | PREFIX => Action::Send(PREFIX),
+                b'a' => Action::Send(self.lead),
+                _ if byte == self.lead => Action::Send(self.lead),
                 0x1b => Action::Send(0x1b),
                 _ => Action::Unknown,
             };
         }
         match byte {
-            PREFIX => {
+            _ if byte == self.lead => {
                 self.prefix = true;
                 Action::Nothing
             }
@@ -365,6 +389,23 @@ mod tests {
         assert_eq!(keys.feed(key(b'\n')), Action::Send(b'\r'));
         assert_eq!(keys.feed(tape_rt::KEY_ABORT), Action::Send(0x1b));
         assert_eq!(keys.feed(tape_rt::KEY_NONE), Action::Nothing);
+    }
+
+    #[test]
+    fn another_prefix_leaves_ctrl_a_to_the_remote_end() {
+        assert_eq!(parse_prefix("b"), Ok(2));
+        assert_eq!(parse_prefix("B"), Ok(2));
+        for bad in ["", "c", "h", "i", "j", "m", "1", "bb"] {
+            assert!(parse_prefix(bad).is_err(), "{bad}");
+        }
+        assert_eq!(parse_args("net x prefix=b").unwrap().prefix, 2);
+        let mut keys = Keys::with_prefix(2);
+        assert_eq!(keys.feed(key(PREFIX)), Action::Send(PREFIX)); // reaches an inner fterm
+        assert_eq!(keys.feed(key(b'x')), Action::Send(b'x'));
+        assert_eq!(keys.feed(key(2)), Action::Nothing);
+        assert_eq!(keys.feed(key(b'x')), Action::Exit);
+        keys.feed(key(2));
+        assert_eq!(keys.feed(key(2)), Action::Send(2));
     }
 
     #[test]

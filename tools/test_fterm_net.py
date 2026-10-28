@@ -234,6 +234,20 @@ def main():
             check(wait_frame(TAG_BYE) is not None, "term net: Ctrl-A x sends BYE", str(frames))
             wait_for("fos> ", 20, mark)
 
+            # An fterm inside another fterm: prefix=b leaves Ctrl-A (and Ctrl-A x) to the machine behind it.
+            frames.clear()
+            mark = len(text())
+            type_(f"run fterm net {HOST_MAC_TEXT} prefix=b\r".encode())
+            check(wait_frame(TAG_HELLO) is not None, "prefix=b: the session opens", "")
+            check("Ctrl-B x leaves" in text()[mark:], "prefix=b: the banner names Ctrl-B", text()[mark:])
+            frames.clear()
+            type_(b"\x01x")
+            check(wait_frame(TAG_DATA, b"\x01x") is not None, "prefix=b: Ctrl-A x goes to the other end as data", str(frames))
+            frames.clear()
+            type_(b"\x02x")
+            check(wait_frame(TAG_BYE) is not None, "prefix=b: Ctrl-B x sends BYE", str(frames))
+            wait_for("fos> ", 20, mark)
+
             # A peer by its announced name, as `nic peers` lists it.
             wire.send(BROADCAST, TAG_DISCOVER_REPLY, b"labbox")
             pump(1)
