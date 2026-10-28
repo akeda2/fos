@@ -587,6 +587,15 @@ line-based input (reading a whole line, not one keystroke) is
 deliberately left as something you build yourself out of `read_key`
 in ordinary Rust, rather than a second kernel callback.
 
+### Touch screens and mice
+
+`tape_rt::touch_event()` returns the next finger event; `touch_extent(event.panel)` is the panel's coordinate range, so the screen
+position is `x * width / extent.0`. A USB touchscreen is a panel with several fingers (ids); a PS/2 or USB mouse or touchpad is panel 6
+with finger id 100 (`event.is_mouse()`), its extent is the screen size, `down` means the left button is held, and a move with the
+button up arrives as `down == false` (hover). Treat a mouse click as a one-finger tap and your tape works with both. To show a
+cursor, remember the last mouse position and paint `gfx::Canvas::cursor(x, y, 2, fill, outline)` last in each frame (see `tapes/miccal`).
+The shell's `touch` lists the panels and `touch monitor` prints the events (Escape ends it). Details: `docs/design.md` "Mouse and touchpad".
+
 ## 8. Building a networking tape
 
 For protocol applications, keep the same boundary as `tapes/ip-chat/`:

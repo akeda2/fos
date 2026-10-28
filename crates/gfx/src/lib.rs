@@ -74,6 +74,24 @@ impl<'a> Canvas<'a> {
         self.fill_rect(x + w as i32 - 1, y, 1, h, rgb);
     }
 
+    /// A mouse arrow with its tip at (`x`, `y`), `scale` pixels per sprite pixel: `fill` inside, `outline` around it.
+    pub fn cursor(&mut self, x: i32, y: i32, scale: u32, fill: u32, outline: u32) {
+        const ARROW: [&str; 16] = [
+            "X          ", "XX         ", "X.X        ", "X..X       ", "X...X      ", "X....X     ", "X.....X    ", "X......X   ",
+            "X.......X  ", "X....XXXXX ", "X..X..X    ", "X.X X..X   ", "XX  X..X   ", "X    X..X  ", "     X..X  ", "      XX   ",
+        ];
+        for (row, line) in ARROW.iter().enumerate() {
+            for (column, pixel) in line.bytes().enumerate() {
+                let color = match pixel {
+                    b'X' => outline,
+                    b'.' => fill,
+                    _ => continue,
+                };
+                self.fill_rect(x + (column as u32 * scale) as i32, y + (row as u32 * scale) as i32, scale, scale, color);
+            }
+        }
+    }
+
     /// Bresenham line, clipped per pixel.
     pub fn line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, rgb: u32) {
         let (mut x, mut y) = (x0, y0);

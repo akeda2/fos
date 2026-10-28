@@ -1,4 +1,4 @@
-//! USB touch panels (HID digitizers) on xHCI, shared by both kernels.
+//! USB touch panels (HID digitizers) and mice on xHCI, shared by both kernels.
 //!
 //! For every HID interface in the configuration this reads the report descriptor (GET_DESCRIPTOR(report), sent to the
 //! interface: request type 0x81, value 0x2200) and lets `hid::parse_pointer` say where tip, id, X and Y sit in a
@@ -9,6 +9,12 @@
 //! touchpad, an interface that is not a pointer) is only described: the descriptor as hex and what the parser made
 //! of it, and the slot is released by the caller.
 //!
+//! Mice: a boot-protocol mouse interface with relative X/Y (a USB mouse, or the mouse half of a laptop's USB touchpad) is
+//! claimed too. Every mouse (these and the PS/2 one in `keyboard.rs`) moves one shared cursor kept in the tape screen's
+//! pixels, and shows up to tapes as a panel (`MOUSE_PANEL`, extent = the screen) with finger id `MOUSE_ID`: pressed or
+//! dragged with the left button is `down`, a move with it up is `down` false at the new position (hover, so a tape can draw
+//! the cursor), the release is `down` false. No new tape call: a click is a one-finger tap to every touch tape.
+//!
 //! Written from the HID and Windows 8 multitouch descriptors; the first panel it ran against is an ELAN 04f3:249f
 //! (10 contacts, 3312 x 1872) on a Raspberry Pi 4's USB hub.
 
@@ -16,7 +22,7 @@ use crate::memory;
 use crate::xhci::{self, Controller, Device, Trb};
 use core::fmt::Write;
 
-const MAX_PANELS: usize = 2;
+const MAX_PANELS: usize = 4;
 const EVENTS: usize = 128;
 
 #[derive(Clone, Copy)]
@@ -51,6 +57,17 @@ pub struct TouchEvent {
     pub down: bool,
 }
 
+/// The panel number the shared mouse cursor reports as (after the USB panels' and the DSI display's numbers).
+pub const MOUSE_PANEL: usize = MAX_PANELS + 1;
+/// The finger id of the mouse's left button and cursor.
+pub const MOUSE_ID: u8 = 100;
+
+/// The cursor in the tape screen's pixels, whether the left button is down, whether a PS/2 mouse is there, mouse packets seen.
+static mut CURSOR: (i32, i32) = (-1, -1);
+static mut BUTTON: bool = false;
+static PS2_MOUSE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static MOUSE_PACKETS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 static mut PANELS: [Option<Panel>; MAX_PANELS] = [None; MAX_PANELS];
 static mut QUEUE: [TouchEvent; EVENTS] = [TouchEvent { panel: 0, id: 0, x: 0, y: 0, down: false }; EVENTS];
 static mut HEAD: usize = 0;
@@ -62,13 +79,17 @@ static mut DROPPED: u64 = 0;
 pub fn claim(controller: &mut Controller, device: &xhci::Device, configuration: &[u8], vendor: u16, product: u16) -> bool {
     let mut at = 0;
     let mut interface = None;
+    let mut protocol = 0;
     while at + 2 <= configuration.len() {
         let length = usize::from(configuration[at]);
         if length < 2 || at + length > configuration.len() {
             return false;
         }
         match configuration[at + 1] {
-            4 if length >= 9 => interface = (configuration[at + 5] == 3).then_some(configuration[at + 2]),
+            4 if length >= 9 => {
+                interface = (configuration[at + 5] == 3).then_some(configuration[at + 2]);
+                protocol = configuration[at + 7]; // 2: a boot mouse
+            }
             // HID descriptor: bLength, 0x21, bcdHID(2), country, numDescriptors, then (type, length(2)) pairs.
             0x21 if length >= 9 && configuration[at + 5] >= 1 && configuration[at + 6] == 0x22 => {
                 if let Some(number) = interface {
@@ -77,7 +98,12 @@ pub fn claim(controller: &mut Controller, device: &xhci::Device, configuration: 
                     match controller.control_transfer(device, 0x81, 0x06, 0x2200, u16::from(number), &mut buffer[..wanted]) {
                         Ok(got) => {
                             let descriptor = &buffer[..got.min(wanted)];
-                            let touch = hid::parse_pointer(descriptor).filter(|p| matches!(p.kind, hid::Kind::Touchscreen | hid::Kind::Digitizer) && p.contact_count > 0);
+                            // Only a relative boot mouse counts as a mouse: a touch panel's mouse-emulation interface must not
+                            // put a second, competing cursor on the screen.
+                            let touch = hid::parse_pointer(descriptor).filter(|p| {
+                                (matches!(p.kind, hid::Kind::Touchscreen | hid::Kind::Digitizer) && p.contact_count > 0)
+                                    || (p.kind == hid::Kind::Mouse && protocol == 2 && p.contacts[0].x.is_some_and(|f| f.relative) && p.contacts[0].tip.is_some())
+                            });
                             report(vendor, product, number, descriptor);
                             if touch.is_some_and(|pointer| attach(controller, device, configuration, number, pointer, vendor, product)) {
                                 return true;
@@ -158,6 +184,10 @@ fn attach(controller: &mut Controller, device: &Device, configuration: &[u8], in
     });
     controller.queue_interrupt_in(device.slot, dci, buffer, length);
     let (x, y) = extent(&pointer);
+    if pointer.kind == hid::Kind::Mouse {
+        crate::println!("USB mouse {vendor:04x}:{product:04x} on port {} ({}): {}-byte reports. Tapes see it as touch panel {}; `touch monitor` shows it.", device.path(), xhci::speed_name(device.speed), pointer.report_bytes, MOUSE_PANEL + 1);
+        return true;
+    }
     crate::println!("USB touch {vendor:04x}:{product:04x} on port {} ({}): {} contact(s), {x} x {y}, {}-byte reports. `touch monitor` shows it.", device.path(), xhci::speed_name(device.speed), pointer.contact_count, pointer.report_bytes);
     true
 }
@@ -197,6 +227,14 @@ pub fn background_event(controller: &mut Controller, event: &Trb) -> bool {
             let count = panel.pointer.decode(report, &mut touches);
             panel.reports += 1;
             xhci::LAST_TOUCH_US.store(crate::timer::micros(), core::sync::atomic::Ordering::Relaxed);
+            if panel.pointer.kind == hid::Kind::Mouse {
+                // A mouse's "contact" is its movement since the last report and its button 1.
+                if count > 0 {
+                    mouse_input(touches[0].x, touches[0].y, touches[0].down);
+                }
+                controller.queue_interrupt_in(panel.device.slot, panel.dci, panel.buffer, panel.length);
+                return true;
+            }
             for touch in touches[..count].iter().copied() {
                 let known = panel.down.iter().position(|entry| entry.is_some_and(|known| known.id == touch.id));
                 let changed = match (known, touch.down) {
@@ -262,7 +300,48 @@ fn poll_dsi() {
 }
 
 pub fn count() -> usize {
-    unsafe { (*core::ptr::addr_of!(PANELS)).iter().flatten().count() + usize::from(dsi_present()) }
+    unsafe { (*core::ptr::addr_of!(PANELS)).iter().flatten().filter(|panel| panel.pointer.kind != hid::Kind::Mouse).count() + usize::from(dsi_present()) + usize::from(mouse_present()) }
+}
+
+fn mouse_present() -> bool {
+    PS2_MOUSE.load(core::sync::atomic::Ordering::Relaxed) || unsafe { (*core::ptr::addr_of!(PANELS)).iter().flatten().any(|panel| panel.pointer.kind == hid::Kind::Mouse) }
+}
+
+/// The PS/2 mouse found (or not) by `keyboard::init_aux`.
+pub fn set_ps2_mouse(present: bool) {
+    PS2_MOUSE.store(present, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// A mouse moved by (`dx`, `dy`) pixels-ish (screen down is positive Y) with the left button `down`. Moves the shared cursor
+/// (clamped to the screen, a little acceleration) and queues what a tape needs: the press, the drag, the release and, with
+/// the button up, a hover move so a tape can draw the cursor. A screen without pixels (BIOS text mode) ignores it.
+pub fn mouse_input(dx: i32, dy: i32, down: bool) {
+    let Some((width, height)) = crate::framebuffer::gfx_info() else { return };
+    let (width, height) = (width as i32, height as i32);
+    MOUSE_PACKETS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // A touchpad reports a few counts per swipe: quadruple the slow moves, more for fast ones.
+    let speed = |d: i32| 4 * d + d * d.abs() / 2;
+    unsafe {
+        let cursor = &mut *core::ptr::addr_of_mut!(CURSOR);
+        if cursor.0 < 0 {
+            *cursor = (width / 2, height / 2);
+        }
+        let before = (*cursor, BUTTON);
+        *cursor = ((cursor.0 + speed(dx)).clamp(0, width - 1), (cursor.1 + speed(dy)).clamp(0, height - 1));
+        BUTTON = down;
+        if before == (*cursor, BUTTON) {
+            return;
+        }
+        let event = TouchEvent { panel: MOUSE_PANEL as u8, id: MOUSE_ID, x: cursor.0, y: cursor.1, down };
+        // Moves while the button state stays the same replace the newest queued move, so a fast mouse cannot flood the queue.
+        let last = (HEAD + EVENTS - 1) % EVENTS;
+        let queue = &mut *core::ptr::addr_of_mut!(QUEUE);
+        if HEAD != TAIL && before.1 == down && queue[last].panel == MOUSE_PANEL as u8 && queue[last].down == down {
+            queue[last] = event;
+        } else {
+            queue_push(event);
+        }
+    }
 }
 
 /// For drivers without a USB report pipe (the DSI touch chip).
@@ -285,6 +364,9 @@ pub fn take() -> Option<TouchEvent> {
 
 /// The largest X and Y panel `index` reports (its coordinates run from 0).
 pub fn range(index: usize) -> Option<(i32, i32)> {
+    if index == MOUSE_PANEL {
+        return mouse_present().then(|| crate::framebuffer::gfx_info()).flatten().map(|(width, height)| (width as i32, height as i32));
+    }
     #[cfg(target_arch = "aarch64")]
     if index == DSI_PANEL && dsi_present() {
         return Some((crate::dsitouch::WIDTH, crate::dsitouch::HEIGHT));
@@ -296,6 +378,9 @@ pub fn range(index: usize) -> Option<(i32, i32)> {
 /// How the monitor a panel sits on is turned (`framebuffer::Rotate`; tapes draw upright on the logical screen). Only panels
 /// whose screen is known follow a rotation.
 fn turn_of(panel: u8) -> Option<crate::framebuffer::Rotate> {
+    if usize::from(panel) == MOUSE_PANEL {
+        return None; // the cursor already lives on the logical screen
+    }
     usize::try_from(screen_of(panel)).ok().filter(|&screen| screen <= 1).and_then(crate::framebuffer::rotation)
 }
 
@@ -324,7 +409,7 @@ pub extern "C" fn api_touch_info(panel: u32) -> u64 {
 /// The tape screen a panel sits on, or -1 when not known (a USB touch screen could be on any monitor): the DSI display is
 /// display 0, which is tape screen 0.
 fn screen_of(panel: u8) -> i32 {
-    if usize::from(panel) == DSI_PANEL { 0 } else { -1 }
+    if usize::from(panel) == DSI_PANEL || usize::from(panel) == MOUSE_PANEL { 0 } else { -1 }
 }
 
 /// Tape ABI 24 `touch_read`: `out` points at six i32 (panel, id, x, y, down, screen).
@@ -342,8 +427,12 @@ pub extern "C" fn api_touch_read(out: *mut i32) -> i32 {
     }
 }
 
+fn usb_mice() -> usize {
+    unsafe { (*core::ptr::addr_of!(PANELS)).iter().flatten().filter(|panel| panel.pointer.kind == hid::Kind::Mouse).count() }
+}
+
 pub fn describe_devices(print: impl Fn(core::fmt::Arguments)) {
-    for (number, panel) in unsafe { (*core::ptr::addr_of!(PANELS)).iter().enumerate().filter_map(|(number, entry)| Some((number, entry.as_ref()?))) } {
+    for (number, panel) in unsafe { (*core::ptr::addr_of!(PANELS)).iter().enumerate().filter_map(|(number, entry)| Some((number, entry.as_ref()?))).filter(|(_, panel)| panel.pointer.kind != hid::Kind::Mouse) } {
         let (x, y) = extent(&panel.pointer);
         print(format_args!("Touch {}: {:04x}:{:04x} on port {}, {x} x {y}, {} report(s), {} event(s), {} error(s) (last code {})", number + 1, panel.vendor, panel.product, panel.device.path(), panel.reports, panel.events, panel.errors, panel.last_code));
         for index in 0..xhci::count() {
@@ -353,6 +442,10 @@ pub fn describe_devices(print: impl Fn(core::fmt::Arguments)) {
                 print(format_args!("  endpoint state {state}, dequeue {dequeue:#x}, next TRB {enqueue:#x}"));
             }
         }
+    }
+    if mouse_present() {
+        let (x, y) = unsafe { *core::ptr::addr_of!(CURSOR) };
+        print(format_args!("Touch {}: mouse cursor (PS/2 {}, USB {}), at {x},{y}, {} packet(s)", MOUSE_PANEL + 1, if PS2_MOUSE.load(core::sync::atomic::Ordering::Relaxed) { "yes" } else { "no" }, usb_mice(), MOUSE_PACKETS.load(core::sync::atomic::Ordering::Relaxed)));
     }
     #[cfg(target_arch = "aarch64")]
     if dsi_present() {

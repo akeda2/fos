@@ -115,6 +115,10 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
             keyboard::interrupt();
             apic::end_of_interrupt();
         }
+        v if v == u64::from(keyboard::MOUSE_VECTOR) => {
+            keyboard::interrupt();
+            apic::end_of_interrupt();
+        }
         v if v == u64::from(serial::VECTOR) => {
             serial::interrupt();
             apic::end_of_interrupt();
@@ -265,6 +269,10 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
                 keyboard::Ps2::Ready { gsi } => println!("PS/2 keyboard: 8042 ready, scancode set 1, IRQ 1 on GSI {gsi} -> vector {:#x}.", keyboard::KEYBOARD_VECTOR),
                 keyboard::Ps2::NoInterrupt => println!("PS/2 keyboard: controller present but its interrupt could not be routed; no PS/2 input."),
                 keyboard::Ps2::Absent => println!("PS/2 keyboard: no 8042 controller; no PS/2 input."),
+            }
+            if keyboard::init_aux() {
+                usb_pointer::set_ps2_mouse(true);
+                println!("PS/2 mouse: found on the 8042's second port, IRQ 12 -> vector {:#x}; tapes see it as a touch panel (`touch`).", keyboard::MOUSE_VECTOR);
             }
         }
         None => println!("No I/O APIC: no PS/2 keyboard interrupt (USB keyboards and the network still work)."),

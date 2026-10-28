@@ -800,6 +800,18 @@ pub struct TouchEvent {
     pub screen: i32,
 }
 
+impl TouchEvent {
+    /// True for the mouse (any USB or PS/2 mouse): finger `MOUSE_ID`, left button down means `down`, and a move with the
+    /// button up is `down` false at the new position (hover), so a tape can draw a cursor. The coordinates are the screen's
+    /// pixels (`touch_extent` is the screen size).
+    pub fn is_mouse(&self) -> bool {
+        self.id == MOUSE_ID
+    }
+}
+
+/// The finger id the kernel gives the mouse (`kernel/src/usb_pointer.rs`).
+pub const MOUSE_ID: i32 = 100;
+
 fn touch_table() -> Option<&'static TapeApi> {
     let table = api();
     let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, touch_read) + core::mem::size_of::<usize>();

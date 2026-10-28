@@ -1576,3 +1576,48 @@ the file formats (host tests); the tape is the screen, touch and audio plumbing.
 - **Test**: `make test-miccal` records the loopback device (`loop0`) so the "microphone" is flat: reference, coupler (FOSFS) and
   stepped-sine runs must give a flat correction; the saved files, the exFAT volume and the button picture are checked. QEMU cannot send
   touch events, so touch is untested there.
+
+## Mouse and touchpad (kernel/src/usb_pointer.rs, kernel/src/keyboard.rs, tapes/miccal)
+
+**Goal.** Clicking in tapes with a mouse or a laptop touchpad: piano and laptop1 have built-in PS/2 touchpads, rack has a USB mouse next
+to a USB touchscreen. Tapes only; the shell has no cursor. Gestures, tap-to-click, wheel and right button come later (`DEFERRED.md`).
+
+**Design: no new ABI call.** A mouse reuses the touch calls (ABI 24 `touch_info`/`touch_read`), so every touch tape can be clicked
+(`gpiopanel`, `organ`, `fosplay`, `kaffe`, ...) without a change, without a cursor drawn.
+- Panel number 6 (`usb_pointer::MOUSE_PANEL`; the shell lists it as `Touch 6: mouse cursor (PS/2 yes|no, USB n), at X,Y, N packet(s)`),
+  finger id 100 (`MOUSE_ID`, `tape_rt::TouchEvent::is_mouse`). Touch panels keep their own numbers (up to four, `MAX_PANELS`), so a
+  machine with both a touchscreen and a mouse (rack) shows both; which one a tape prefers is open (probably touch first).
+- `touch_info` gives the logical screen size as the panel's extent, so a tape's usual `x * width / extent` scaling is the identity.
+- `down` is true while the left button is held (a press, then every drag move); a move with the button up is an event with `down`
+  false at the new position (hover), so a tape can draw the cursor; so is the release. An existing touch tape sees a click as a
+  one-finger tap. Consecutive moves with the same button state replace the newest queued one, so a fast mouse cannot flood the queue.
+- The kernel keeps **one cursor**, in logical (rotated) screen coordinates, clamped to the screen, starting in the middle; the
+  touch rotation transform (`upright`) is skipped for it. Gain: `4d + d*|d|/2` per axis (`mouse_input`), tuned by hand on piano's
+  touchpad (a pad reports only a few counts per swipe; 1x, 2x and 2d+d|d|/4 were all too slow). A constant, not a setting.
+- **The tape draws the cursor.** `gfx::Canvas::cursor(x, y, scale, fill, outline)` paints a 16-row arrow; `miccal` does it last in its
+  frame, after the first mouse event (`Screen::frame` copies the grid every frame, so an overlay needs no erasing). Other tapes: not yet.
+
+**PS/2 (`keyboard::init_aux`).** After the keyboard is up: enable the 8042's second port (0xA8), clear config bit 5 (clock), send
+`0xF6` (defaults) and `0xF4` (streaming) through the 0xD4 prefix and wait for the ACK 0xFA; only then set config bit 1 (second-port
+interrupt) and route ISA IRQ 12 to vector 0x43 (`MOUSE_VECTOR`; 0x40 timer, 0x41 keyboard, 0x42 COM1 are taken). Without a mouse
+nothing answers and the port is switched off again (0xA7); the boot log says `PS/2 mouse: found ...` or stays silent.
+**Interrupts must be off while probing**: the keyboard interrupt is already live and read every reply byte (status bit 5 set) as a
+scancode, so the first version saw no ACK. `init_aux` wraps `probe_aux` in `interrupts_save_and_disable`; a stale byte is drained first
+(`drain`). `interrupt()` (IRQ 1 and 12) now reads the status per byte: bit 5 (`AUX_DATA`) goes to `mouse_byte`, which assembles
+3-byte packets (bit 3 is the sync bit; overflow packets are dropped; dy is negated). Synaptics pads stay in plain mouse mode: no
+tap, no scroll. On machines with no 8042 (status 0xFF) nothing happens.
+
+**USB (xHCI only, `usb_pointer::claim`).** A boot-protocol mouse is claimed when the interface protocol is 2, X is a relative axis
+(`crates/hid` parses it) and there is a button 1 field; reports go to `mouse_input(dx, dy, down)` from `background_event`. An
+absolute tablet (QEMU's `usb-tablet`) and a touch panel's own mouse-emulation interface are **not** claimed. No EHCI path exists, so
+a USB mouse on an EHCI-only machine (piano) is ignored; I2C-HID touchpads (newer laptops) are not supported either.
+
+**`miccal`** is the first tape with a cursor: events are scaled to the screen, the arrow is drawn last (`theme().text` with a
+`theme().background` outline), clicks go through the same `Fingers.pressed` and `button_at` as touch.
+
+**Test.** `make test-mouse` (`tools/test_mouse.py`) sends QEMU monitor `mouse_move`/`mouse_button`: the PS/2 mouse and a USB
+`usb-mouse` on xHCI each show in `touch`, give hover/press/drag/release events in `touch monitor` with sane coordinates and stay on
+the screen; in `miccal` the arrow is drawn at the centre, leaves it when the mouse moves, and a click inside the Quit button ends the
+tape (the corner pixel itself is in the gap beside the last button). QEMU's q35 always has a PS/2 mouse, so the USB run may be fed by it;
+a real USB mouse is the check (rack). **Real hardware, verified:** piano's built-in touchpad over PS/2 (detection, movement, gain).
+**Not verified:** laptop1's touchpad, rack's USB mouse beside the touchscreen, a real click in `miccal` on any of them.

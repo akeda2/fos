@@ -337,7 +337,9 @@ pub struct TapeApi {
     /// `touch_read(out)` (version 24): takes the next finger event (down, moved or lifted) from any touch panel and writes six
     /// i32 to `out`: panel, finger id, x, y, 1 if the finger is down and 0 if it lifted, the tape screen the panel sits on (-1: unknown,
     /// a USB touch screen could be on any monitor; the Pi's DSI display is screen 0). Returns 1 for an event, 0 for none.
-    /// Events nobody reads are dropped; the queue is shared with the shell's `touch monitor`.
+    /// Events nobody reads are dropped; the queue is shared with the shell's `touch monitor`. A mouse or touchpad (PS/2 or USB
+    /// boot mouse) is panel 6 (`touch_info` gives the screen size as its extent), finger id 100: down while the left button is held,
+    /// a hover move is an event with 0, and the kernel clamps and accelerates the cursor; the tape draws it.
     pub touch_read: extern "C" fn(*mut i32) -> i32,
     /// `midi_read(out)` (version 25): takes the next message received from any USB-MIDI device and writes six bytes to `out`:
     /// device number (0-based, as `midi` lists them), USB cable, how many of the three data bytes are valid (1-3), then the

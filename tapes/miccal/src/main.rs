@@ -23,7 +23,7 @@ Calibrates a measurement microphone: 1/3-octave levels of the input are drawn
 (dB re full scale) and become a correction (spl = level + correction), saved
 as NAME.cal (and NAME-rew.txt, a REW-style deviation file) on the first exFAT
 disk, else the first FAT32 disk, else the FOSFS disk. NAME is up to 8 of a-z
-0-9 . _ - (default mic). Touch the buttons or use the keys. Methods:
+0-9 . _ - (default mic). Touch or click the buttons, or use the keys. Methods:
  coupler    a closed pink-noise source (spl= its total level, or perband= the
             level in each 1/3-octave band) covers the mic: key 1 captures it
  reference  pink noise (or stepped sines) played out and measured with a
@@ -465,7 +465,7 @@ fn button_labels(app: &App) -> [(Line<16>, bool); view::BUTTONS] {
     })
 }
 
-fn draw(screen: &mut Screen, layout: &view::Layout, app: &App) {
+fn draw(screen: &mut Screen, layout: &view::Layout, app: &App, cursor: Option<(i32, i32)>) {
     let mut canvas = screen.frame();
     let n = app.count;
     view::draw_curves(
@@ -520,6 +520,9 @@ fn draw(screen: &mut Screen, layout: &view::Layout, app: &App) {
     let labels = button_labels(app);
     let shown: [(&str, bool); view::BUTTONS] = core::array::from_fn(|i| (labels[i].0.as_str(), labels[i].1));
     view::draw_buttons(&mut canvas, layout, &shown);
+    if let Some((x, y)) = cursor {
+        canvas.cursor(x, y, layout.text, theme().text, theme().background);
+    }
     screen.present();
 }
 
@@ -642,6 +645,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let (levels, block, samples) = unsafe { (&mut *(&raw mut LEVELS), &mut *(&raw mut BLOCK_BYTES), &mut *(&raw mut SAMPLES)) };
     let mut decoder = KeyDecoder::new();
     let mut fingers = Fingers { held: [None; 8] };
+    let mut cursor = None::<(i32, i32)>;
     let mut quit = false;
     while !quit {
         let mut actions = [None::<Action>; 8];
@@ -681,8 +685,12 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             if event.screen >= 0 && event.screen != started.screen as i32 {
                 continue;
             }
+            let (x, y) = (event.x * width as i32 / extent.0.max(1), event.y * height as i32 / extent.1.max(1));
+            if event.is_mouse() {
+                cursor = Some((x, y));
+                screen.mark_dirty();
+            }
             if fingers.pressed(&event) {
-                let (x, y) = (event.x * width as i32 / extent.0.max(1), event.y * height as i32 / extent.1.max(1));
                 if let Some(button) = layout.button_at(x, y) {
                     push(BUTTON_ACTIONS[button], &mut actions);
                 }
@@ -720,7 +728,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             worked |= playback.pump(api, &app.input, |mono| generator.fill(mono));
         }
         if screen.due() {
-            draw(&mut screen, &layout, &app);
+            draw(&mut screen, &layout, &app, cursor);
         }
         if !worked {
             tape_rt::idle();

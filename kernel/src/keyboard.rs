@@ -16,11 +16,15 @@ use fosfor_abi::keymap::{Layout, Set1Decoder};
 use crate::{cpu, ioapic};
 
 pub const KEYBOARD_VECTOR: u8 = 0x41;
+/// IRQ 12, the PS/2 mouse (the 8042's second port).
+pub const MOUSE_VECTOR: u8 = 0x43;
 
 const DATA: u16 = 0x60;
 const STATUS: u16 = 0x64;
 const OUTPUT_FULL: u8 = 1 << 0;
 const INPUT_FULL: u8 = 1 << 1;
+/// Status bit 5: the byte in the output buffer came from the second (mouse) port.
+const AUX_DATA: u8 = 1 << 5;
 
 const CAPACITY: usize = 64;
 static mut QUEUE: [u8; CAPACITY] = [0; CAPACITY];
@@ -149,10 +153,103 @@ pub fn init_ps2() -> Ps2 {
     }
 }
 
-/// IRQ 1: read the byte, decode, queue. Reading port 0x60 is what clears the request.
+/// The PS/2 mouse's packet assembly: three bytes, the first always has bit 3 set (which is how a lost byte is noticed).
+static mut PACKET: [u8; 3] = [0; 3];
+static mut PACKET_LEN: usize = 0;
+
+/// Mouse byte from port 0x60: a packet is flags (buttons, signs, overflow), dx, dy (up is positive, the screen's Y goes down).
+fn mouse_byte(byte: u8) {
+    unsafe {
+        let (packet, length) = (&mut *core::ptr::addr_of_mut!(PACKET), &mut *core::ptr::addr_of_mut!(PACKET_LEN));
+        if *length == 0 && byte & 0x08 == 0 {
+            return; // out of step: wait for a first byte
+        }
+        packet[*length] = byte;
+        *length += 1;
+        if *length < 3 {
+            return;
+        }
+        *length = 0;
+        let flags = packet[0];
+        if flags & 0xc0 != 0 {
+            return; // overflow: the deltas are meaningless
+        }
+        let dx = i32::from(packet[1]) - if flags & 0x10 != 0 { 256 } else { 0 };
+        let dy = i32::from(packet[2]) - if flags & 0x20 != 0 { 256 } else { 0 };
+        crate::usb_pointer::mouse_input(dx, -dy, flags & 1 != 0);
+    }
+}
+
+/// Throws away whatever the 8042 still holds (a keyboard's late acknowledge, say).
+fn drain() {
+    for _ in 0..16 {
+        if cpu::inb(STATUS) & OUTPUT_FULL != 0 {
+            cpu::inb(DATA);
+        }
+    }
+}
+
+/// Sends one byte to the mouse (through the 8042's 0xD4 prefix) and waits for its acknowledge (0xFA).
+fn mouse_send(byte: u8) -> bool {
+    drain();
+    if !(command(0xd4) && wait_input_ready()) {
+        return false;
+    }
+    cpu::outb(DATA, byte);
+    wait_output_ready() && cpu::inb(DATA) == 0xfa
+}
+
+/// Looks for a PS/2 mouse on the 8042's second port (a laptop's touchpad is one, in the mouse's own protocol) and routes IRQ 12.
+/// Call after `init_ps2`. True when a mouse answered. A touchpad stays a plain three-byte relative mouse (tap-to-click and
+/// scrolling are Synaptics extensions this does not switch on).
+pub fn init_aux() -> bool {
+    // The keyboard interrupt is already live and would swallow the controller's replies as scancodes.
+    let was = cpu::interrupts_save_and_disable();
+    let found = probe_aux();
+    cpu::interrupts_restore(was);
+    found
+}
+
+fn probe_aux() -> bool {
+    if cpu::inb(STATUS) == 0xff {
+        return false;
+    }
+    drain();
+    if !command(0xa8) || !command(0x20) || !wait_output_ready() {
+        return false;
+    }
+    let mut configuration = cpu::inb(DATA);
+    configuration &= !(1 << 5); // second port clock enabled
+    if !(command(0x60) && wait_input_ready()) {
+        return false;
+    }
+    cpu::outb(DATA, configuration);
+    // Defaults (reports off until enabled), then streaming on. Without a mouse nothing answers and the port is switched off again.
+    let found = mouse_send(0xf6) && mouse_send(0xf4);
+    if !found {
+        command(0xa7);
+        return false;
+    }
+    configuration |= 1 << 1; // second port's interrupt
+    if !(command(0x60) && wait_input_ready()) {
+        return false;
+    }
+    cpu::outb(DATA, configuration);
+    ioapic::route_isa(12, MOUSE_VECTOR).is_some()
+}
+
+/// IRQ 1 or IRQ 12: read the byte, decode, queue. Reading port 0x60 is what clears the request.
 pub fn interrupt() {
-    while cpu::inb(STATUS) & OUTPUT_FULL != 0 {
+    loop {
+        let status = cpu::inb(STATUS);
+        if status & OUTPUT_FULL == 0 {
+            break;
+        }
         let byte = cpu::inb(DATA);
+        if status & AUX_DATA != 0 {
+            mouse_byte(byte);
+            continue;
+        }
         unsafe {
             BYTES_SEEN += 1;
             if let Some(key) = (*core::ptr::addr_of_mut!(DECODER)).feed_layout(byte, layout()) {

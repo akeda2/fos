@@ -539,3 +539,11 @@ use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limi
 - `miccal` is tested in QEMU through the loopback device only. Real hardware: a real mic with a coupler or calibrator, the touch
   buttons on a panel, REW's reading of `NAME-rew.txt` (sign and format unverified). Not done: `ltas cal=FILE` to apply a file
   (`miccal::parse` and `interpolate` exist for it), the `calibrator` method is only covered by host tests.
+
+## Open after the mouse session
+
+- Real hardware not yet tried: laptop1's touchpad, rack's USB mouse beside its touchscreen, a click in `miccal` on any of them.
+- Not done: tap-to-click, gestures, wheel, right and middle button (Synaptics extended mode for touchpads), an EHCI pointer path (a USB
+  mouse on an EHCI-only machine is ignored), I2C-HID touchpads, a cursor in tapes other than `miccal`, a rule for tapes when a
+  touchscreen and a mouse are both present (probably touch first), the gain as a setting (`mouse_input` has a constant), the aarch64
+  Pi (`usb_pointer.rs` is shared and builds there; the mouse is untried on the Pi).
