@@ -1558,3 +1558,21 @@ reads. `make test-loopback` plays a WAV through `loop0` and records it with `rec
   `test_smb.py` check it.
 
 Only hardware shows: USB underruns, Pi 4 CPU load, track-boundary gaps over a network, real packet loss.
+
+## Microphone calibration: `miccal` (tapes/miccal, crates/miccal)
+
+`miccal` plays pink noise (or stepped sines, one 1/3-octave centre at a time) and analyses the input with the `ltas` analyser. The
+result is a correction per band, `spl = measured level + correction` (levels in dB re full scale). `crates/miccal` holds the maths and
+the file formats (host tests); the tape is the screen, touch and audio plumbing.
+
+- **Methods** (`method=`, `m`): `coupler` assumes a pink noise device covering the mic: with overall level `spl=` (default 94 dB) each
+  of N bands is `spl - 10 log10 N` (`perband=` gives the band level instead). `reference`: the same noise measured with a calibrated mic
+  (`1` = this mic, `2` = reference; `ref=FILE` loads that mic's own correction, which makes the result absolute). `calibrator`: a tone
+  of `tone=` dB at 1 kHz (key `3`) gives a flat offset; a tone capture on top of the other methods makes them absolute.
+- **Files**: `NAME.cal` (`#` comments, then `hz db`; says `# absolute yes|no`) and `NAME-rew.txt` (`*` comments, `hz deviation`,
+  relative to 1 kHz). Written to the first exFAT disk, else the first FAT32 disk, else the FOSFS volume (`save=N` picks a disk). `NAME` is
+  at most 8 characters so `NAME-rew.txt` fits FOSFS. REW's import of the file is not verified.
+- **Touch**: a 16-button bank at the bottom (same actions as the keys); touch coordinates are scaled to the screen like `gpiopanel`.
+- **Test**: `make test-miccal` records the loopback device (`loop0`) so the "microphone" is flat: reference, coupler (FOSFS) and
+  stepped-sine runs must give a flat correction; the saved files, the exFAT volume and the button picture are checked. QEMU cannot send
+  touch events, so touch is untested there.

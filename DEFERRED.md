@@ -533,3 +533,9 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
 Status (2026-10-27): the organ's source is clean (91 sine wheels, top one about 5.9 kHz, nothing above Nyquist). `fx::Overdrive` now runs
 `overdrive` at 4x (two half-band stages, `crates/fx/src/oversample.rs`; host test counts the folded power) and the organ and epiano drive
 use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limited saw about 0.4x of the naive one); its 4' fade on the top keys is kept. An HQ switch (strings tape button) runs the sawtooth bank at 4x with `fx::Decimator` while 16 keys or fewer sound (CPU cost not yet measured on the Pi). Checked and fine: `fx::Wah` is linear (TPT state-variable filters, only their coefficients move), so it cannot fold anything; `rotary` has no nonlinearity either (a Doppler delay and an amplitude modulation). `phono` is a cascade of linear biquads (`crates/phono/src/filter.rs`, no clipping or saturation), so it cannot fold either. The aliasing check is done; what is left is a listening check on real hardware (strings HQ, organ/epiano drive).
+
+## Open after the miccal session
+
+- `miccal` is tested in QEMU through the loopback device only. Real hardware: a real mic with a coupler or calibrator, the touch
+  buttons on a panel, REW's reading of `NAME-rew.txt` (sign and format unverified). Not done: `ltas cal=FILE` to apply a file
+  (`miccal::parse` and `interpolate` exist for it), the `calibrator` method is only covered by host tests.
