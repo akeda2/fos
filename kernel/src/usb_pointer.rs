@@ -312,6 +312,17 @@ pub fn set_ps2_mouse(present: bool) {
     PS2_MOUSE.store(present, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// The `mouse-speed` setting: the pointer gain in percent of the default (100).
+static SPEED_PERCENT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(100);
+
+/// Sets the pointer gain in percent (`mouse-speed` in `settings`); false when outside 25..=1000.
+pub fn set_speed_percent(percent: u32) -> bool {
+    (25..=1000).contains(&percent) && {
+        SPEED_PERCENT.store(percent, core::sync::atomic::Ordering::Relaxed);
+        true
+    }
+}
+
 /// A mouse moved by (`dx`, `dy`) pixels-ish (screen down is positive Y) with the left button `down`. Moves the shared cursor
 /// (clamped to the screen, a little acceleration) and queues what a tape needs: the press, the drag, the release and, with
 /// the button up, a hover move so a tape can draw the cursor. A screen without pixels (BIOS text mode) ignores it.
@@ -320,7 +331,8 @@ pub fn mouse_input(dx: i32, dy: i32, down: bool) {
     let (width, height) = (width as i32, height as i32);
     MOUSE_PACKETS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     // A touchpad reports a few counts per swipe: quadruple the slow moves, more for fast ones.
-    let speed = |d: i32| 4 * d + d * d.abs() / 2;
+    let percent = SPEED_PERCENT.load(core::sync::atomic::Ordering::Relaxed) as i32;
+    let speed = |d: i32| (4 * d + d * d.abs() / 2) * percent / 100;
     unsafe {
         let cursor = &mut *core::ptr::addr_of_mut!(CURSOR);
         if cursor.0 < 0 {

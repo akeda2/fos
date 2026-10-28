@@ -8,6 +8,7 @@
 //!   `park-idle` parks NICs without a link, `hwp performance|balanced|power` lets the CPU pick its speed; `gpio-remote` lets other machines write
 //!   pins, `gpio-deny N..` forbids pins, `gpio-sim` gives a RAM-backed bank (tests);
 //!   `serial-shell [PORT] [BAUD]` puts the shell on a serial port as well (COM2-COM4, numbered as `fterm list` does; off unless asked);
+//!   `mouse-speed PERCENT` scales the pointer gain of a mouse or touchpad (25-1000, default 100);
 //!   `keymap us|sv` picks the keyboard layout (US by default; sv is Swedish/Finnish);
 //!   `foreground gray|green|amber|black|#rrggbb` and `background black|blue|gray|#rrggbb` set the pixel console's colours (not in
 //!   BIOS text mode, which stays grey on black; the Pi kernel reads them too);
@@ -175,6 +176,15 @@ pub fn load() {
                             crate::println!("settings: keymap {name}.");
                         }
                         None => crate::println!("settings: `{line}` ignored (keymap us or sv)."),
+                    }
+                }
+                Some("mouse-speed") => {
+                    let percent = line.split_whitespace().nth(1).and_then(|word| word.parse::<u32>().ok());
+                    match percent {
+                        Some(percent) if crate::usb_pointer::set_speed_percent(percent) => {
+                            crate::println!("settings: mouse-speed {percent}% of the default pointer gain.");
+                        }
+                        _ => crate::println!("settings: `{line}` ignored (mouse-speed PERCENT, 25-1000; 100 is the default)."),
                     }
                 }
                 Some("prefer-msix") => unsafe { PREFER_MSIX = true },

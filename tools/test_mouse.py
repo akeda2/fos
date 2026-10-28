@@ -26,8 +26,8 @@ def send(machine, data, wait=0.5):
     machine.pump(wait)
 
 
-def boot(tmp, extra=(), binaries=None):
-    machine = Machine(tmp, {}, binaries or {})
+def boot(tmp, extra=(), binaries=None, files=None):
+    machine = Machine(tmp, files or {}, binaries or {})
     machine.monitor = Path(tmp) / "monitor"
     machine.extra = list(extra)
     machine.start()
@@ -75,6 +75,32 @@ def watch(label, extra):
             machine.stop()
 
 
+def travel(settings):
+    """How far one `mouse_move 20 0` takes the cursor from the centre with the given `settings` file."""
+    with tempfile.TemporaryDirectory() as tmp:
+        machine = boot(tmp, [], None, {"settings": settings} if settings else None)
+        try:
+            boot_log = machine.text()
+            send(machine, b"touch monitor\n", 1)
+            start = len(machine.text())
+            mouse(machine, "mouse_move 20 0")
+            machine.pump(1.0)
+            seen = events(machine.text()[start:])
+            check(seen, "a move arrives", machine.text()[start:][-400:])
+            return seen[-1][0] - 640, boot_log
+        finally:
+            machine.stop()
+
+
+def speed_setting():
+    full, _ = travel("")
+    half, log = travel("mouse-speed 50\n")
+    check("mouse-speed 50%" in log, "settings: `mouse-speed 50` is announced", log[-600:])
+    check(full > 0 and abs(half * 2 - full) <= 2, f"mouse-speed 50 halves the travel ({half} against {full})", "")
+    _, log = travel("mouse-speed 5\n")
+    check("mouse-speed 5` ignored" in log, "settings: an out-of-range mouse-speed is ignored", log[-600:])
+
+
 def clicks_in_miccal():
     with tempfile.TemporaryDirectory() as tmp:
         machine = boot(tmp, AUDIO, {"miccal": MICCAL})
@@ -107,6 +133,7 @@ def clicks_in_miccal():
 def main():
     watch("PS/2", [])
     watch("USB", ["-device", "qemu-xhci,id=hc", "-device", "usb-mouse,bus=hc.0"])
+    speed_setting()
     clicks_in_miccal()
     print("mouse: all checks passed")
 

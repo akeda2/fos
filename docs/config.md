@@ -25,6 +25,7 @@ unknown line is reported on the console ("unknown line ... ignored") and skipped
 | `park-idle` | Park every NIC whose link has been down for a minute. |
 | `hwp performance\|balanced\|power` | Let an Intel CPU with hardware P-states pick its own speed, with that preference. Use `performance` on machines doing line-rate network or audio work; `balanced` has cost an i350 receive overruns. |
 | `keymap us\|sv` | Local keyboard layout: US (default) or Swedish/Finnish. |
+| `mouse-speed PERCENT` | Pointer gain of a PS/2 or USB mouse or touchpad as a percentage of the default (25-1000, default 100). Touchpads differ a lot: piano's and rack's mouse are right at 100, laptop1's pad needs less. `docs/design.md`, "Mouse and touchpad". |
 | `foreground NAME\|#rrggbb`, `background NAME\|#rrggbb` | Pixel console colours (foreground gray, green, amber, black; background black, blue, gray). Not in BIOS text mode. The Pi kernel reads them too. |
 | `rotate [all\|0\|1] r\|l\|flip\|off` | Turn what tapes draw, for a monitor mounted in portrait. The text console stays upright. `run A \| B rotate=r` does it for one run. |
 | `serial-shell [PORT] [BAUD]` | The shell also on a serial port (COM2-COM4, numbered as `fterm list`; default port 1, 115200 baud, 8n1). No password, so off unless asked; see `docs/design.md`. |

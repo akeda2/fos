@@ -1593,7 +1593,7 @@ to a USB touchscreen. Tapes only; the shell has no cursor. Gestures, tap-to-clic
   one-finger tap. Consecutive moves with the same button state replace the newest queued one, so a fast mouse cannot flood the queue.
 - The kernel keeps **one cursor**, in logical (rotated) screen coordinates, clamped to the screen, starting in the middle; the
   touch rotation transform (`upright`) is skipped for it. Gain: `4d + d*|d|/2` per axis (`mouse_input`), tuned by hand on piano's
-  touchpad (a pad reports only a few counts per swipe; 1x, 2x and 2d+d|d|/4 were all too slow). A constant, not a setting.
+  touchpad (a pad reports only a few counts per swipe; 1x, 2x and 2d+d|d|/4 were all too slow). The `mouse-speed PERCENT` line in `settings` (25-1000, default 100; `usb_pointer::set_speed_percent`) scales it per machine: laptop1's pad was far too fast at 100.
 - **The tape draws the cursor.** `gfx::Canvas::cursor(x, y, scale, fill, outline)` paints a 16-row arrow; `miccal` does it last in its
   frame, after the first mouse event (`Screen::frame` copies the grid every frame, so an overlay needs no erasing). Other tapes: not yet.
 
