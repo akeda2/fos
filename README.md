@@ -89,6 +89,8 @@ A quiet tape can run in the background as a service that owns one NIC: `run ptp 
 
 Between machines, `tapesync [HOST] [apply]` pulls newer tapes from one peer, or from all discovered ones, that share the `synckey` file (see `docs/design.md`).
 
+Per-machine files (`hostname`, `settings`, `debug`, `start`, `synckey`) and every option they take are listed in `docs/config.md`.
+
 `debug` files on the machine's disk (see `AGENTS.md`) turn on reboot-on-crash, the watchdog and
 the network kernel update.
 

@@ -3,7 +3,9 @@
 //!
 //! * `hostname`: the base name announced in discovery replies (`NAME` + the interface
 //!   number, so `lab` becomes `lab1`);
-//! * `settings`: `deny-term-net` closes the network terminal, `no-msi` keeps NICs polling; `gpio-remote` lets other machines write
+//! (Every option is listed in docs/config.md; keep it in step with this parser.)
+//! * `settings`: `deny-term-net` closes the network terminal, `no-msi` keeps NICs polling, `prefer-msix` tries MSI-X first,
+//!   `park-idle` parks NICs without a link, `hwp performance|balanced|power` lets the CPU pick its speed; `gpio-remote` lets other machines write
 //!   pins, `gpio-deny N..` forbids pins, `gpio-sim` gives a RAM-backed bank (tests);
 //!   `serial-shell [PORT] [BAUD]` puts the shell on a serial port as well (COM2-COM4, numbered as `fterm list` does; off unless asked);
 //!   `keymap us|sv` picks the keyboard layout (US by default; sv is Swedish/Finnish);

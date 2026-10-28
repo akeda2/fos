@@ -44,7 +44,7 @@ plan and status are in `docs/shared-codebase.md`. The v2 prefix is gone from bui
 | `targets/` | Rust target specs. `x86_64-fos-tape.json` (soft-float) is what tapes really build with. |
 | `docs/` | `shared-codebase.md` (the unification plan and its status), `design.md` (the design and milestone log), `recorder.md`, `nettest.md`, `rust-tapes-for-dummies.md`, `history/` (append-only write-ups). |
 
-Also read on demand: `NETWORKING.md`, `AUDIO.md`, `DEFERRED.md` (things put aside),
+Also read on demand: `docs/config.md` (every `settings`, `debug`, `start` and `synckey` option), `NETWORKING.md`, `AUDIO.md`, `DEFERRED.md` (things put aside),
 `README.md`.
 
 ## Boot, memory, disks
