@@ -68,12 +68,16 @@ def main():
         check(len(data) > rate, "the recording holds more than a second of audio")
         # A second holds four of the repeated notes, however the 0.25 s grid falls on their attacks (the default Metal
         # tine opens with a broadband click that a shorter window can be mostly made of).
-        loud = max(range(0, len(data) - rate, rate // 4), key=lambda i: sum(abs(x) for x in data[i:i + rate]))
-        window = data[loud:loud + rate]
+        # Pick the window by its C3 energy, not its loudness: on a loaded host the recording can hold dropouts and clicks
+        # that are louder than the notes.
+        starts = range(0, len(data) - rate, rate // 4)
+        best = max(starts, key=lambda i: goertzel(data[i:i + rate], rate, C3))
+        window = data[best:best + rate]
         peak = max(abs(x) for x in window)
         check(peak > 0.01, f"typing a key makes sound (peak {peak:.3f})")
         wanted, other = goertzel(window, rate, C3), goertzel(window, rate, 200.0)
-        check(wanted > 3 * other, f"the sound is at C3 ({wanted:.4f} at 130.8 Hz vs {other:.4f} at 200 Hz)")
+        dominant = max(range(60, 1000, 5), key=lambda f: goertzel(window, rate, f))
+        check(wanted > 3 * other, f"the sound is at C3 ({wanted:.4f} at 130.8 Hz vs {other:.4f} at 200 Hz; strongest line {dominant} Hz, rate {rate})")
     print("epiano: all checks passed")
 
 

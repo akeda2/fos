@@ -14,4 +14,4 @@ jobs:
   test:
     - export PATH=$HOME/.cargo/bin:$HOME/.local/bin:$PATH && make all -j16
     - export PATH=$HOME/.cargo/bin:$HOME/.local/bin:$PATH && make test-all TEST_JOBS=8
-  interval: 7200
+  interval: 1800
