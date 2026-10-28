@@ -678,6 +678,7 @@ pub fn build_api(info: &BootInfo, arguments: &str) -> TapeApi {
         midi_send: crate::usb_midi::api_midi_send,
         midi_devices: crate::usb_midi::api_midi_devices,
         nic_owned: api_nic_owned,
+        gpio_pull_get: crate::gpio::api_gpio_pull_get,
     }
 }
 

@@ -1429,6 +1429,19 @@ has no velocity, so a finger strikes harder the lower it lands on a key. The eng
 run with `RUST_MIN_STACK=33554432`; the tape keeps it on its 1 MiB stack. `make test-epiano` records a typed note from a QEMU USB sound
 card and checks its pitch and the picture; the tone, the real latency (underruns at 10 ms), MIDI and touch need real hardware.
 
+### GPIO panel: `gpiopanel` (crates/gpio-panel, tapes/gpiopanel, tools/gpio.py)
+
+A touch tape for the Pi 4 header over the tape ABI 22 `gpio_*` calls or the signed GPIO-over-Ethernet protocol
+(`kernel/src/gpio_remote.rs`). `crates/gpio-panel` holds everything without hardware, with host tests: the connector map
+(`header`), the wire format and a non-blocking request client (`wire`, `client`: one request in flight, because the server
+keeps one nonce; challenge, signed request, signed answer), the button rules (`panel`: changes need ARM, an output starts low,
+a second tap on an armed output flips it) and the layout (`layout`, from 640x480 up). The tape draws, reads touch and keys, and
+polls: local pins every 100 ms, remote every 150 ms (no edge events yet). The kernel serves remote requests only at the shell
+prompt, so a Pi running a tape cannot be driven; the tape shows "no answer" then. A local panel reads the pulls back
+with ABI 28 `gpio_pull_get` (on an older kernel it shows `?` for pulls it did not set itself). `tools/gpio.py` is the host
+client (list/read/set/mode/pull). `make test-gpiopanel` (local sim pins, ARM lock, a second machine over Ethernet) and
+`make test-gpio` (including `gpio.py`); only a Pi 4 shows real pins, pull behaviour and touch feel.
+
 ### USB auto-reattach and the touch-panel drop (rack1, 2026-10)
 
 `usb_hid::auto_reattach` (called from `poll`, at most once a second) runs the `usb rescan` pass by itself when an in-use xHCI port lost its

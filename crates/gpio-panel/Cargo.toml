@@ -1,0 +1,13 @@
+[package]
+name = "gpio-panel"
+version = "0.1.0"
+edition = "2024"
+
+# The parts of the `gpiopanel` tape that need no hardware: the Raspberry Pi header, the GPIO-over-the-network client
+# (kernel/src/gpio_remote.rs is the server), the button logic and the screen layout. `no_std`, no allocation.
+[lib]
+name = "gpio_panel"
+path = "src/lib.rs"
+
+[dependencies]
+tape-sync = { package = "fosfor-tape-sync", path = "../tape-sync" }

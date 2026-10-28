@@ -5,13 +5,17 @@ alpha has pins (sim) and allows remote writes, bravo is a client with the same k
 none. Checks: local pin control and its refusals, remote read, remote write, a pin denied by `gpio-deny`, and that a wrong
 or missing key gets no answer. Real pins can only be checked on the Pi."""
 
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_audio_net import Guest  # noqa: E402
+from test_audio_net import GROUP, PORT, Guest  # noqa: E402
 from test_boot import check  # noqa: E402
+
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
 def run(guest, line, timeout=40):
@@ -73,6 +77,24 @@ def main():
             check("not signed" in out or "no answer" in out, "a machine with another key gets no good answer", out[-400:])
             out = run(bravo, "gpio @delta1 read 9")
             check("no answer" in out, "a machine without a key does not answer", out[-400:])
+
+            # The host-side client, tools/gpio.py, through the multicast seam.
+            def host(key, *words):
+                (Path(tmp) / "host-key").write_text(key + "\n")
+                return subprocess.run([sys.executable, str(ROOT / "tools/gpio.py"), "--mcast", f"{GROUP}:{PORT}", "--mac", "52:54:00:12:36:a1",
+                                       "--key", str(Path(tmp) / "host-key"), *words], capture_output=True, text=True, timeout=60)
+            alpha.pump(2.5)
+            result = host("correct horse", "read", "9")
+            check(result.returncode == 0 and "GPIO9" in result.stdout and "high" in result.stdout, "gpio.py reads a pin", result.stdout[-300:] + result.stderr[-300:])
+            alpha.pump(2.5)
+            result = host("correct horse", "mode", "10", "out", "1")
+            check(result.returncode == 0, "gpio.py changes a pin", result.stdout[-300:] + result.stderr[-300:])
+            alpha.pump(2.5)
+            out = run(alpha, "gpio read 10")
+            check("out" in out and "high" in out, "and alpha shows it", out[-300:])
+            alpha.pump(2.5)
+            result = host("wrong key", "read", "9")
+            check(result.returncode != 0, "gpio.py with another key gets no answer", result.stdout[-300:] + result.stderr[-300:])
         finally:
             for guest in guests.values():
                 guest.stop()

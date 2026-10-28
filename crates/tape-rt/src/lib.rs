@@ -736,6 +736,22 @@ pub fn gpio_pull(pin: u32, pull: u32) -> Result<(), i32> {
     }
 }
 
+/// Function of a pin: 0 input, 1 output, 2..=7 alt0..alt5; `None` without GPIO or for a bad pin.
+pub fn gpio_function(pin: u32) -> Option<u8> {
+    u8::try_from((gpio_table()?.gpio_function)(pin)).ok()
+}
+
+/// Pull of a pin as the pad has it now: 0 none, 1 up, 2 down; `None` without GPIO, for a bad pin or on a kernel older than
+/// version 28.
+pub fn gpio_pull_get(pin: u32) -> Option<u8> {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, gpio_pull_get) + core::mem::size_of::<usize>();
+    if table.version < 28 || (table.size as usize) < end {
+        return None;
+    }
+    u8::try_from((table.gpio_pull_get)(pin)).ok()
+}
+
 /// The I2C bus's SCL speed in Hz (Raspberry Pi 4 header); `Err(-4)` where there is none or the kernel is older than version 23.
 pub fn i2c_speed() -> Result<u32, i32> {
     let t = i2c_table().ok_or(-4)?;

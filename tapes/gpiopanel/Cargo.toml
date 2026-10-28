@@ -1,0 +1,21 @@
+[package]
+name = "gpiopanel"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "gpiopanel"
+path = "src/main.rs"
+
+[dependencies]
+audio-screen = { path = "../../crates/audio-screen" }
+gfx = { path = "../../crates/gfx" }
+gpio-panel = { path = "../../crates/gpio-panel" }
+tape-rt = { path = "../../crates/tape-rt" }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = 2
+strip = "symbols"

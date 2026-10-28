@@ -417,6 +417,11 @@ pub extern "C" fn api_gpio_function(pin: u32) -> i32 {
     function(pin as usize).map_or(-2, i32::from)
 }
 
+/// `gpio_pull_get(pin)`: 0 none, 1 up, 2 down; negative for an unknown pin or no GPIO.
+pub extern "C" fn api_gpio_pull_get(pin: u32) -> i32 {
+    pull(pin as usize).map_or(-2, i32::from)
+}
+
 fn status_code(error: Error) -> i32 {
     match error {
         Error::Refused => -1,
