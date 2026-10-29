@@ -547,3 +547,16 @@ use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limi
   mouse on an EHCI-only machine is ignored), I2C-HID touchpads, a cursor in tapes other than `miccal`, a rule for tapes when a
   touchscreen and a mouse are both present (probably touch first), the aarch64
   Pi (`usb_pointer.rs` is shared and builds there; the mouse is untried on the Pi).
+
+
+## Open after the frt60 session
+
+- `frt60` is tested in QEMU through the loopback only. Real hardware: a balloon in a real room (trigger level, low-octave dynamic range),
+  the sweep through real speakers, touch and mouse use. Not done: octave bands below 63 Hz, microphone correction from `miccal` files,
+  averaging several pops, a speech-transmission index.
+
+## Open after the siTD session
+
+- Full-speed USB audio on EHCI (split isochronous, `ehci.rs` `sitd_*`) is written but untested: QEMU has no transaction translator.
+  First try on piano1 (24-bit 48 kHz card behind the rate-matching hub). If it stays silent, check `debug`/`audio` error counts, the
+  c-mask (microframes 2 to n + 3), and whether the TT wants the start-split later than microframe 0.

@@ -1,0 +1,12 @@
+[package]
+name = "rt60"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "rt60"
+path = "src/lib.rs"
+
+[dependencies]
+dsp = { path = "../dsp" }
+ltas = { path = "../ltas" }

@@ -1621,3 +1621,45 @@ the screen; in `miccal` the arrow is drawn at the centre, leaves it when the mou
 tape (the corner pixel itself is in the gap beside the last button). QEMU's q35 always has a PS/2 mouse, so the USB run may be fed by it;
 a real USB mouse is the check (rack). **Real hardware, verified:** piano's built-in touchpad over PS/2 (detection, movement, gain).
 **Not verified:** laptop1's touchpad, rack's USB mouse beside the touchscreen, a real click in `miccal` on any of them.
+
+
+## Room acoustics: `frt60` (tapes/frt60, crates/rt60)
+
+`frt60` measures reverberation from an impulse response (IR). `crates/rt60` holds the maths (host tests); the tape is the UI.
+
+- **Balloon:** a level trigger (`thresh`, dBFS) with a 250 ms pre-roll; the IR starts at the direct sound. **Sweep:** an exponential sweep 20 Hz to
+  min(0.45 x rate, 20 kHz) is played and recorded, then deconvolved with its inverse filter. The window ends 0.4 x sweep length before the end of the
+  recording so the harmonic-distortion products, which land at negative time, are excluded. A latency message shows the first peak.
+- **Bands:** octave or 1/3-octave filters (`bands=`). Each band's IR is Schroeder-integrated (backward energy) into a decay curve; EDT, T20, T30 are
+  line fits with the ISO 3382 dynamic-range gates (20, 35, 45 dB); a time below its gate is blank (NaN). C50, C80 and D50 come from the same IR.
+- **Waterfall:** an energy-decay relief: each cell is the band's Schroeder curve, 96 time steps over 1.5 x the longest valid T20/EDT (0.3 to 6 s).
+  Views: summary (T20/T30/EDT against frequency), waterfall (painter's algorithm, 0 to -60 dB), heat map, decay (one band with its fit line).
+- **Text size:** `text=1|2|auto` (default auto: the large font from 1280x700 up) sets the font and button scale; 1 gives a taller plot on big screens.
+  Put it in the `@NAME` settings file to make it permanent.
+- **Help:** `h` (button "h Help", the 15th of five-per-row) replaces the plot with plain-language pages: what is measured, how to pop the balloon, what
+  T20/T30/EDT/C50/C80/D50/DR mean, typical room values and how to read each view. `tapes/frt60/src/help.rs` word-wraps and paginates the text to the
+  screen (small font on every size); `h` turns the page, the last page closes it, any other button closes it too.
+- **Files:** `NAME.csv` (`hz,edt_s,t20_s,t30_s,c50_db,c80_db,d50,dynamic_db`, row `all` for the broadband figure), `NAME.wav` (mono 32-bit float IR,
+  capped at 1 MiB) and `NAME.png` (clean redraw). Without `name=` the base is stamped (`frt60-DATE-TIME`) on a disk, `rtNNN` on FOSFS.
+- **Self-test:** `simroom=SEC` plays a click and noise decaying 60 dB in SEC seconds when Space is pressed, so the loopback device gives a known T60.
+- **Test:** `make test-frt60` (loopback: simroom 1.0 s gives T20 within 15 % overall and 20 % per band, a sweep through loopback gives a single click,
+  CSV/WAV/PNG on exFAT with a clean fsck, FOSFS fallback, argument refusals, all four views drawn, the help pages open, turn and close).
+- **Not verified:** a real balloon (low-frequency energy, dynamic range, trigger level), real mic and speakers for the sweep, touch and mouse feel.
+
+## Full-speed USB audio on EHCI: split isochronous (kernel/src/ehci.rs `sitd_*`, usb_audio.rs)
+
+A full-speed audio interface behind an EHCI hub (an ordinary USB 1.1 card on a laptop's rate-matching hub) is reached through the hub's
+transaction translator, so each 1 ms packet is a split transaction described by an **siTD** instead of an iTD. A ring of `ISO_RING`
+siTDs (one per frame, 128-byte stride, 32-byte aligned) takes the place of the iTD ring; `Controller::iso_install(.., split)` links them
+with link type 2. `sitd_init` writes the fixed part (device, endpoint, direction, the TT's hub address and port, the microframe masks),
+`sitd_arm` the per-lap part (buffer, length; the status word with Active last), `sitd_active` / `sitd_result` read it back; the service
+loop (`ehci_service`) is shared with the iTD path (`EhciPipe::split`).
+
+- **OUT**: one start-split per 188 bytes in consecutive microframes from 0 (S-mask `(1 << n) - 1`, T-count `n`, position "begin" when
+  `n > 1`); no complete-split.
+- **IN**: start-split in microframe 0, complete-splits in microframes 2 to `n + 3` (`n` = packet / 188 rounded up), which is why a
+  packet over 4 x 188 bytes is refused (`SITD_MAX_PACKET`). Layout follows EHCI 3.4 and Linux `ehci-sched.c` (`smask_out`, the c-mask rule of USB 2.0 11.18.4).
+- Only `bInterval` 1 (every frame). A full-speed device on a root port belongs to the companion controller and a low-speed one is not streamed.
+
+**Not verified:** QEMU's `usb-hub` is full speed and cannot sit on an EHCI port, and its EHCI has no transaction translator, so this path
+has never run; `make test-usb-audio` and `make test-keyboard` (iTD and QH paths, which share `relink`) still pass. Needs real hardware: piano1's USB card.
