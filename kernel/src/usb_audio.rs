@@ -539,6 +539,8 @@ struct EhciPipe {
     per_itd: usize,
     /// Bytes of buffer per iTD (a multiple of the page size, as the iTD's buffer pointers are page based).
     region: usize,
+    /// The ring holds split-transaction siTDs (a full-speed device behind a hub), one packet per descriptor.
+    split: bool,
 }
 
 impl Stream {
@@ -618,20 +620,26 @@ pub fn attach(controller: &mut Controller, device: Device, description: Descript
     true
 }
 
-/// The same for a device behind an EHCI controller. Only high-speed devices stream (a full-speed isochronous endpoint behind a
-/// hub needs split isochronous descriptors, which this driver does not build). The controller has one iTD ring per direction,
-/// so a second device on the same EHCI controller is refused (put it on another controller, or on xHCI).
+/// The same for a device behind an EHCI controller. A high-speed device streams with iTDs; a full-speed one behind a hub
+/// (the transaction translator carries it) with split-transaction siTDs, one 1 ms packet per frame (`ehci::sitd_init`).
+/// The controller has one descriptor ring per direction, so a second device on the same EHCI controller is refused (put it
+/// on another controller, or on xHCI).
 pub fn attach_ehci(controller: &mut ehci::Controller, controller_index: usize, target: ehci::Target, description: Description, configuration_value: u8) -> bool {
     let busy = units().any(|unit| matches!(audio(unit).map(|device| device.bus), Some(Bus::Ehci { controller_index: index, .. }) if index == controller_index));
     let Some(unit) = (0..UNITS).find(|&unit| audio(unit).is_none()).filter(|_| !busy) else {
         crate::println!("USB audio: no free slot for another device here (one per EHCI controller, {UNITS} in all); this one is ignored.");
         return false;
     };
-    if target.speed != ehci::Speed::High {
-        crate::println!("USB audio: a full- or low-speed device on EHCI needs split isochronous transfers, which are not supported.");
+    if target.speed == ehci::Speed::Low || target.speed == ehci::Speed::Full && target.hub_address == 0 {
+        crate::println!("USB audio: a low-speed device, or a full-speed one on an EHCI root port (the companion controller's), is not streamed.");
         return false;
     }
-    if description.alts[..description.alt_count].iter().any(|alt| alt.extra_transactions != 0 || alt.interval == 0 || alt.interval > 4) {
+    if target.speed == ehci::Speed::Full {
+        if description.alts[..description.alt_count].iter().any(|alt| alt.interval != 1 || alt.max_packet > ehci::SITD_MAX_PACKET) {
+            crate::println!("USB audio: this full-speed device has a slow-interval or over {}-byte isochronous endpoint, which the split path does not stream.", ehci::SITD_MAX_PACKET);
+            return false;
+        }
+    } else if description.alts[..description.alt_count].iter().any(|alt| alt.extra_transactions != 0 || alt.interval == 0 || alt.interval > 4) {
         crate::println!("USB audio: this device uses high-bandwidth or slow-interval endpoints, which the EHCI driver does not stream.");
         return false;
     }
@@ -1129,7 +1137,8 @@ fn build_ehci_stream(controller: &mut ehci::Controller, controller_index: usize,
     if alt.max_packet == 0 || alt.max_packet > 1024 {
         return Err("the endpoint has no usable packet size");
     }
-    let step = 1usize << (alt.interval.clamp(1, 4) - 1);
+    let split = target.speed == ehci::Speed::Full;
+    let step = if split { 8 } else { 1usize << (alt.interval.clamp(1, 4) - 1) };
     let per_itd = 8 / step;
     let region = (per_itd * usize::from(alt.max_packet)).next_multiple_of(4096);
     let frames = (ehci::ISO_RING * region / 4096) as u64;
@@ -1154,7 +1163,12 @@ fn build_ehci_stream(controller: &mut ehci::Controller, controller_index: usize,
         return Err(reason);
     }
     for k in 0..ehci::ISO_RING {
-        ehci::itd_init(itds as usize + k * ehci::ITD_BYTES, &target, alt.endpoint, alt.max_packet, capture, buffers + (k * region) as u64, region / 4096);
+        let at = itds as usize + k * ehci::ITD_BYTES;
+        if split {
+            ehci::sitd_init(at, &target, alt.endpoint, alt.max_packet, capture);
+        } else {
+            ehci::itd_init(at, &target, alt.endpoint, alt.max_packet, capture, buffers + (k * region) as u64, region / 4096);
+        }
     }
     let which = usize::from(capture);
     let mut stream = Stream {
@@ -1165,7 +1179,7 @@ fn build_ehci_stream(controller: &mut ehci::Controller, controller_index: usize,
         doorbell: 0,
         buffers,
         frames,
-        ehci: Some(EhciPipe { controller_index, which, itds, next: 0, step, per_itd, region }),
+        ehci: Some(EhciPipe { controller_index, which, itds, next: 0, step, per_itd, region, split }),
         next: 0,
         trbs: [0; WINDOW],
         window: ehci::ISO_RING,
@@ -1198,7 +1212,12 @@ fn ehci_fill(stream: &mut Stream, k: usize) {
     for (j, length) in lengths[..pipe.per_itd].iter_mut().enumerate() {
         *length = if stream.capture { max_packet as u16 } else { fill_playback_packet(stream, region + (j * max_packet) as u64) as u16 };
     }
-    ehci::itd_arm(pipe.itds as usize + k * ehci::ITD_BYTES, pipe.step, &lengths[..pipe.per_itd], stream.alt.max_packet);
+    let at = pipe.itds as usize + k * ehci::ITD_BYTES;
+    if pipe.split {
+        ehci::sitd_arm(at, region, lengths[0], stream.capture);
+    } else {
+        ehci::itd_arm(at, pipe.step, &lengths[..pipe.per_itd], stream.alt.max_packet);
+    }
 }
 
 /// Links the iTD ring into the periodic list, then (interrupts off, so `ehci_event` sees the stream complete or not at all)
@@ -1208,7 +1227,7 @@ fn publish_ehci(controller: &mut ehci::Controller, slot: &mut Option<Stream>, st
     if !controller.enable_interrupts(pipe.controller_index) {
         crate::println!("audio: no interrupt path for EHCI; the descriptors are serviced from the foreground (`audio::poll`).");
     }
-    controller.iso_install(pipe.which, pipe.itds as usize);
+    controller.iso_install(pipe.which, pipe.itds as usize, pipe.split);
     let was = crate::cpu::interrupts_save_and_disable();
     *slot = Some(stream);
     let stream = slot.as_mut().unwrap();
@@ -1230,12 +1249,22 @@ fn publish_ehci(controller: &mut ehci::Controller, slot: &mut Option<Stream>, st
 static ISO_LEN: [AtomicU64; ehci::ISO_RING] = [const { AtomicU64::new(0) }; ehci::ISO_RING];
 static ISO_NONZERO: [AtomicU64; ehci::ISO_RING] = [const { AtomicU64::new(0) }; ehci::ISO_RING];
 
+/// The finished transaction `j` of an iTD (or the one packet of an siTD): (bytes moved, error bits).
+fn iso_result(pipe: &EhciPipe, stream: &Stream, descriptor: usize, j: usize) -> (usize, u32) {
+    if pipe.split {
+        ehci::sitd_result(descriptor, usize::from(stream.alt.max_packet))
+    } else {
+        ehci::itd_result(descriptor, pipe.step, j)
+    }
+}
+
 fn ehci_service(stream: &mut Stream, frame: usize) {
     for _ in 0..ehci::ISO_RING {
         let Some(pipe) = stream.ehci else { return };
         let itd = pipe.itds as usize + pipe.next * ehci::ITD_BYTES;
         let since = (frame + ehci::ISO_RING - pipe.next) % ehci::ISO_RING;
-        if ehci::itd_active(itd, pipe.step, pipe.per_itd) {
+        let active = if pipe.split { ehci::sitd_active(itd) } else { ehci::itd_active(itd, pipe.step, pipe.per_itd) };
+        if active {
             if since == 0 || since > ehci::ISO_RING / 2 {
                 return; // running now, or not due yet
             }
@@ -1243,7 +1272,7 @@ fn ehci_service(stream: &mut Stream, frame: usize) {
         } else if stream.capture {
             let region = stream.buffers + (pipe.next * pipe.region) as u64;
             for j in 0..pipe.per_itd {
-                let (length, errors) = ehci::itd_result(itd, pipe.step, j);
+                let (length, errors) = iso_result(&pipe, stream, itd, j);
                 if errors != 0 {
                     stream.errors.fetch_add(1, Ordering::Relaxed);
                 } else if length > 0 && stream.monitor {
@@ -1258,7 +1287,7 @@ fn ehci_service(stream: &mut Stream, frame: usize) {
             }
         } else {
             for j in 0..pipe.per_itd {
-                if ehci::itd_result(itd, pipe.step, j).1 != 0 {
+                if iso_result(&pipe, stream, itd, j).1 != 0 {
                     stream.errors.fetch_add(1, Ordering::Relaxed);
                 }
             }

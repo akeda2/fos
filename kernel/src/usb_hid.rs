@@ -727,7 +727,7 @@ fn setup_ohci_keyboard(controller_index: usize, controller: &mut ohci::Controlle
 fn setup_ehci_keyboard(controller_index: usize, controller: &mut ehci::Controller, found: &ehci::Found, root_port: u8, claimed_port: u8) -> Result<bool, ehci::Error> {
     let target = found.target;
     let (vendor, product) = (u16::from_le_bytes([found.descriptor[8], found.descriptor[9]]), u16::from_le_bytes([found.descriptor[10], found.descriptor[11]]));
-    let mut configuration = [0u8; 256];
+    let mut configuration = [0u8; 1024];
     controller.get_descriptor(&target, 2, 0, &mut configuration[..9])?;
     let total = usize::from(u16::from_le_bytes([configuration[2], configuration[3]])).clamp(9, configuration.len());
     controller.get_descriptor(&target, 2, 0, &mut configuration[..total])?;

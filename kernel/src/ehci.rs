@@ -80,6 +80,7 @@ const PID_IN: u32 = 1;
 const PID_SETUP: u32 = 2;
 const TERMINATE: u32 = 1;
 const LINK_QH: u32 = 1 << 1;
+const LINK_SITD: u32 = 2 << 1;
 
 // One DMA frame per controller (below 4 GiB: EHCI pointers are 32-bit).
 const OFFSET_CONTROL_QH: usize = 0x000;
@@ -182,6 +183,57 @@ pub fn itd_active(itd: usize, step: usize, count: usize) -> bool {
 pub fn itd_result(itd: usize, step: usize, j: usize) -> (usize, u32) {
     let word = read32(itd + 4 * (1 + j * step));
     (((word >> 16) & 0xfff) as usize, (word >> 28) & 0x7)
+}
+
+/// The most bytes a full-speed isochronous packet may have for the split path: an IN packet is fetched with complete-splits
+/// of at most 188 bytes each, and they must all fit into microframes 2..7 of the frame (start-split in microframe 0).
+pub const SITD_MAX_PACKET: u16 = 4 * 188;
+
+/// Builds a split-transaction isochronous transfer descriptor (siTD, EHCI 3.4). A full-speed isochronous endpoint behind a
+/// hub moves one packet per 1 ms frame, and the controller reaches it through the hub's transaction translator (TT) with
+/// split transactions in the microframes of that frame:
+/// - OUT: one start-split per 188 bytes (the most a start-split carries), in consecutive microframes from 0 (the S-mask is
+///   `1 << n` bits; no complete-split, isochronous OUT has no handshake).
+/// - IN: a start-split in microframe 0 asks the TT to fetch the packet from the device; complete-splits in microframes
+///   2 .. 2 + n + 1 (n = packets of 188 bytes, USB 2.0 11.18.4) collect it from the TT.
+/// The device (address, endpoint, direction) and the TT (hub address, port) never change, so they are written once here;
+/// `sitd_arm` sets the length and buffer for each lap. The descriptor starts inactive.
+pub fn sitd_init(sitd: usize, target: &Target, endpoint: u8, max_packet: u16, input: bool) {
+    for word in 0..ITD_BYTES / 4 {
+        write32(sitd + 4 * word, 0);
+    }
+    write32(sitd, TERMINATE);
+    write32(sitd + 4, u32::from(target.address) | (u32::from(endpoint & 0xf) << 8) | (u32::from(target.hub_address) << 16) | (u32::from(target.hub_port) << 24) | (u32::from(input) << 31));
+    let chunks = usize::from(max_packet).div_ceil(188).clamp(1, 4) as u32;
+    let masks = if input { 0x01 | (((1 << (chunks + 2)) - 1) << 2) << 8 } else { (1 << chunks) - 1 };
+    write32(sitd + 8, masks);
+    write32(sitd + 4 * 6, TERMINATE); // no back link
+}
+
+/// Arms an siTD for its next visit: one packet of `length` bytes at `buffer` (inside one page, as an audio packet is much
+/// smaller than a page and `buffer` is page aligned). The status word is written last: it is what makes the descriptor
+/// active. An OUT packet longer than 188 bytes says how many start-splits carry it (T-count) and that the first is the
+/// "begin" one; the controller steps the position itself.
+pub fn sitd_arm(sitd: usize, buffer: u64, length: u16, input: bool) {
+    let chunks = if input { 0 } else { usize::from(length).div_ceil(188).max(1) as u32 };
+    let position = if chunks > 1 { 1 << 3 } else { 0 };
+    write32(sitd + 4 * 4, buffer as u32);
+    write32(sitd + 4 * 5, (((buffer as u32) & !0xfff).wrapping_add(0x1000)) | position | chunks);
+    write32(sitd + 4 * 3, (1 << 31) | (u32::from(length) << 16) | 0x80);
+}
+
+/// True while the siTD has not completed (its Active bit is still set).
+pub fn sitd_active(sitd: usize) -> bool {
+    read32(sitd + 4 * 3) & 0x80 != 0
+}
+
+/// A finished siTD armed with `length` bytes: (bytes moved, error bits). The controller counts the bytes still to move down
+/// in the status word; the error bits are ERR (the TT reported one), data buffer error, babble, transaction error and
+/// missed microframe.
+pub fn sitd_result(sitd: usize, length: usize) -> (usize, u32) {
+    let word = read32(sitd + 4 * 3);
+    let left = ((word >> 16) & 0x3ff) as usize;
+    (length.saturating_sub(left), (word >> 2) & 0x1f)
 }
 
 /// Interrupts this driver claimed: the INTx self-test counts these, not the vector's raw count (a floating pin delivers
@@ -313,6 +365,8 @@ pub struct Controller {
     wait_limit: u64,
     /// Isochronous iTD rings linked into the periodic list: 0 = playback, 1 = capture (`ISO_RING` iTDs each).
     iso: [Option<usize>; 2],
+    /// Whether each ring holds siTDs (a full-speed device behind a transaction translator) instead of iTDs.
+    iso_split: [bool; 2],
     /// The I/O APIC vector the controller's INTx line was routed to (0 = none) and whether probing already failed.
     irq_vector: u8,
     irq_failed: bool,
@@ -447,7 +501,7 @@ impl Controller {
             }
         }
         timer::wait_ticks(15);
-        Ok(Controller { pci: device, operational, ports, frame, periodic, next_address: 1, step: "", last_toggle: false, wait_limit: TIMEOUT_TICKS, iso: [None; 2], irq_vector: 0, irq_failed: false, fault: None, claimed_ports: 0, hubs: [None; MAX_HUBS], keyboards: [None; MAX_KEYBOARDS] })
+        Ok(Controller { pci: device, operational, ports, frame, periodic, next_address: 1, step: "", last_toggle: false, wait_limit: TIMEOUT_TICKS, iso: [None; 2], iso_split: [false; 2], irq_vector: 0, irq_failed: false, fault: None, claimed_ports: 0, hubs: [None; MAX_HUBS], keyboards: [None; MAX_KEYBOARDS] })
     }
 
     fn port_register(&self, port: u8) -> usize {
@@ -952,7 +1006,7 @@ impl Controller {
                 if let Some(base) = self.iso[which] {
                     let itd = base + k * ITD_BYTES;
                     write32(itd, *link); // type 0 = iTD, so the address is the link
-                    *link = itd as u32;
+                    *link = itd as u32 | if self.iso_split[which] { LINK_SITD } else { 0 };
                 }
             }
         }
@@ -973,8 +1027,10 @@ impl Controller {
 
     /// Links a ring of `ISO_RING` iTDs (at `itds`, 64 bytes each, built by `itd_init`) into every frame: slot 0 is
     /// playback, 1 is capture.
-    pub fn iso_install(&mut self, which: usize, itds: usize) {
+    /// `split` says the ring holds siTDs (`sitd_init`) rather than iTDs.
+    pub fn iso_install(&mut self, which: usize, itds: usize, split: bool) {
         self.iso[which] = Some(itds);
+        self.iso_split[which] = split;
         self.relink();
     }
 

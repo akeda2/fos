@@ -5,7 +5,10 @@ pub const ISO_RING: usize = 8;
 pub const ITD_BYTES: usize = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum Speed {
+    Low,
+    Full,
     High,
 }
 
@@ -48,7 +51,7 @@ impl Controller {
     pub fn set_configuration(&mut self, _target: &Target, _value: u8) -> Result<(), ()> {
         Err(())
     }
-    pub fn iso_install(&mut self, _which: usize, _itds: usize) {}
+    pub fn iso_install(&mut self, _which: usize, _itds: usize, _split: bool) {}
     pub fn iso_remove(&mut self, _which: usize) {}
     pub fn enable_interrupts(&mut self, _index: usize) -> bool {
         false
@@ -68,5 +71,15 @@ pub fn itd_active(_itd: usize, _step: usize, _count: usize) -> bool {
     false
 }
 pub fn itd_result(_itd: usize, _step: usize, _j: usize) -> (usize, u32) {
+    (0, 0)
+}
+
+pub const SITD_MAX_PACKET: u16 = 0;
+pub fn sitd_init(_at: usize, _target: &Target, _endpoint: u8, _max_packet: u16, _capture: bool) {}
+pub fn sitd_arm(_at: usize, _buffer: u64, _length: u16, _capture: bool) {}
+pub fn sitd_active(_sitd: usize) -> bool {
+    false
+}
+pub fn sitd_result(_sitd: usize, _length: usize) -> (usize, u32) {
     (0, 0)
 }
