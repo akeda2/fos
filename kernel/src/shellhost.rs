@@ -25,7 +25,7 @@ fn error(code: isize) -> FsError {
 /// A bare name means the boot volume. `tape_fs` would also look on other disks for a tape's configuration file; the
 /// shell does not, so `cat NAME` says "no such file" for a file that lives on another disk.
 fn pin<'a>(reference: &'a str, storage: &'a mut [u8; 96]) -> &'a [u8] {
-    let Some(boot) = crate::storage::boot_disk().filter(|_| !reference.contains('/') || tape_fs::split_selector(reference.as_bytes()).0.is_empty()) else { return reference.as_bytes() };
+    let Some(boot) = crate::storage::boot_disk().filter(|_| !reference.contains('/') || (tape_fs::split_selector(reference.as_bytes()).0.is_empty() && crate::mounts::lookup(reference.as_bytes()).is_none())) else { return reference.as_bytes() };
     let mut cursor = Cursor(storage, 0);
     if fmt::write(&mut cursor, format_args!("disk{}/{reference}", boot + 1)).is_err() {
         return reference.as_bytes();

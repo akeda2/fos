@@ -909,6 +909,20 @@ impl Volume {
         self.put_entry(slot.0, slot.1, &Spec { folder: true, leaf, parent, length: 0, sectors: 0, extents: [(0, 0); MAX_EXTENTS], extent_count: 0, modified: self.now() })
     }
 
+    /// Makes every folder on the way to the file `path` that is missing (`a/b/c` makes `a` and `a/b`); a bare name
+    /// has none. What a write under a mount point does, so that `config/phono.cfg` works on a root that has no
+    /// `config` folder yet.
+    pub fn make_parents(&self, path: &[u8]) -> Result<(), Error> {
+        let (folder, _) = split_path(path);
+        let mut end = 0;
+        while end < folder.len() {
+            end = folder[end..].iter().position(|&b| b == b'/').map_or(folder.len(), |at| end + at);
+            self.mkdir(&folder[..end])?;
+            end += 1;
+        }
+        Ok(())
+    }
+
     fn write_data(&self, start: u64, data: &[u8]) -> Result<(), Error> {
         let whole = data.len() / 512 * 512;
         if whole > 0 {

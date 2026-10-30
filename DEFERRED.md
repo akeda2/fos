@@ -575,6 +575,5 @@ use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limi
 
 ## Planned: FOSFS v4 and the mount tree (2026-10-30)
 
-- In `docs/fosfs-v4.md`; built: v4 on disk (`format diskN v4`, `build_image.py --fosfs 4`), real folders, per-entry CRC, backup superblock, mtime, 3-extent files. Still design: a mount table
-  (by label, lazy) for `config`, `settings`, `rec`, real subfolders on exFAT, early-boot settings read from the root first, tapes and configs moved into folders, v4 as the default.
+- In `docs/fosfs-v4.md`; built: v4 on disk (`format diskN v4`, `build_image.py --fosfs 4`), real folders, per-entry CRC, backup superblock, mtime, 3-extent files. Mount table built (`kernel/src/mounts.rs`, `fstab`, `mount`; FOSFS volumes only). Still design: the boot-time wait and settings overlay (step 4), real subfolders on exFAT, early-boot settings read from the root first, tapes and configs moved into folders, v4 as the default.
 - Put aside until timing on a real 16 GB stick says they matter: an allocation bitmap or mount-time free-space cache (each write rescans the directory), and 4 KiB allocation units. v4 has not run on real hardware yet.

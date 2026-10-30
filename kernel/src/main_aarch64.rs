@@ -46,6 +46,7 @@ mod shellhost;
 mod storage;
 mod tape_aarch64;
 mod tasks;
+mod mounts;
 mod tape_fs;
 mod genet;
 mod kup_serial;

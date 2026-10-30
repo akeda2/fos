@@ -21,9 +21,9 @@ bite sooner than the clutter does. Folders alone would not fix the limits.
 
 ## The model
 
-1. **FOSFS v4 stays flat.** New magic, a larger directory region that can be relocated and grown, longer names (about 48
-   characters, same alphabet plus `/`). A "folder" is a name prefix: `bin/phono`, `config/phono.cfg`. `ls bin` is a prefix
-   filter. There is no `mkdir`, no empty folder, no current directory: paths are always absolute.
+1. **FOSFS v4 has real folders** (a parent field in each entry; `mkdir`, `ls PATH`; see "v4 layout revision" below). New
+   magic, a larger directory region, names of up to 48 characters per component. There is no current directory: paths are
+   always absolute.
 2. **A small mount table gives the tree.** A path is resolved by the longest mounted prefix; the rest of the path goes to the
    filesystem mounted there. No match means the root volume with the whole path as the file name.
    - Single-drive machines need nothing: `config/` is then simply a prefix on the root volume. Mounting a volume at `config`
@@ -77,7 +77,13 @@ says which one a save used.
 ## Order of work (each step testable in QEMU)
 
 1. v4 on disk (done, except the conversion command and prefix `ls`): bigger directory, longer names, prefix `ls`, v3 mount, conversion command, host tools.
-2. Mount table: `fstab`, lazy label resolution, `mount` shell command, bare-name rule, boot order above.
+2. Mount table (**built**, `kernel/src/mounts.rs`, `make test-mounts`): `fstab` (`PATH @LABEL` lines, `#` comments),
+   lazy label lookup at every use, longest mount point wins, `mount` / `umount` / `mount fstab` shell commands. A path
+   under a mount goes to the volume without the mount path; reads fall back to the boot volume's own folder when the
+   volume lacks the file or is absent, writes go there when it is absent; a write under a mount makes the folders on the
+   way. Only FOSFS volumes mount (exFAT needs step 3). `fstab` is read after `config::load()`; the **bounded boot wait
+   and the settings overlay move to step 4**, when `settings/` actually exists. The fallback to a boot-volume folder
+   needs a v4 boot volume (v3 has no folders), so it is untested until the default flips.
 3. exFAT subfolders in `crates/fat` (directory traversal, create/delete in subdirectories, long names, the contiguous
    writer for streams). This is the largest piece.
 4. Move tapes, configs and settings into their folders; `tape-rt` and the tapes use the new paths; deploy tooling follows.

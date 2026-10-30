@@ -87,7 +87,8 @@ Also read on demand: `docs/config.md` (every `settings`, `debug`, `start` and `s
   `tools/build_image.py`, which must be kept in sync. **FOSFS v4** (`format diskN v4`,
   `build_image.py --fosfs 4`, 48-character case-sensitive names, directory sized from the
   volume, real folders, per-entry CRC32, backup superblock in sector 1, mtime, up to 3 extents per file)
-  is mounted by the same `Volume`; v3 stays the default; `docs/fosfs-v4.md`, `make test-fosfs4`.
+  is mounted by the same `Volume`; v3 stays the default; `docs/fosfs-v4.md`, `make test-fosfs4`. The mount table
+  (`kernel/src/mounts.rs`: `fstab`, `mount`/`umount`, folder paths on other labelled volumes) is `make test-mounts`.
 
 ## Drivers
 

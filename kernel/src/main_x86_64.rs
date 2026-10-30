@@ -46,6 +46,7 @@ mod service_host;
 mod tasks;
 mod shellcmds;
 mod shellhost;
+mod mounts;
 mod tape_fs;
 mod tapesync;
 mod gpio;
@@ -313,6 +314,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
 
     // ---- per-machine configuration files, then the start script ----
     config::load();
+    mounts::load();
     // xHCI events by MSI (decided by the settings file's `no-msi`, so only now; until here the foreground drained the ring)
     xhci::enable_interrupts_all(config::no_msi());
     // HD Audio controllers: reset, find codecs, choose playback/capture paths, prove an interrupt path (MSI, INTx or none)

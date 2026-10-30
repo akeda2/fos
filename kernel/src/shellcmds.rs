@@ -48,6 +48,8 @@ pub static COMMANDS: &[Command] = &[
         }
     }),
     Command::new("grow", "grow diskN", "makes the disk's FOSFS volume fill the disk (files are kept).", |_, rest| grow(rest)),
+    Command::new("mount", "mount [PATH @LABEL | fstab]", "shows the mount table, mounts the volume @LABEL at the folder PATH of the boot volume, or reloads fstab.", |_, rest| mount(rest)),
+    Command::new("umount", "umount PATH", "removes a mount; PATH is then the boot volume's own folder again.", |_, rest| umount(rest)),
     Command::new("label", "label [diskN|@LABEL [NAME|-]]", "shows or sets a FOSFS volume's label (@LABEL names a volume).", |_, rest| label(rest)),
     Command::new("format", "format diskN [NAME] [force] | format diskN exfat [LABEL]", "erases a disk's FOSFS volume, or makes it one exFAT volume for PCs; asks first (then `format diskN confirm`).", |_, rest| crate::formatshell::command(rest)),
     Command::new("debug", "debug [status|slots|crash|hang|video ...]", "kernel-update setting and the A/B slots; `crash` and `hang` test the crash record and the watchdog; `video` (x86 BIOS boots) the video mode.", |_, rest| debug(rest)),
@@ -125,6 +127,45 @@ fn label(rest: &str) {
         Ok(()) if wanted.is_empty() => crate::println!("disk{number}: label cleared."),
         Ok(()) => crate::println!("disk{number} is now @{wanted}."),
         Err(error) => crate::println!("label: {error:?}"),
+    }
+}
+
+fn mount(rest: &str) {
+    let mut words = rest.split_whitespace();
+    match (words.next(), words.next(), words.next()) {
+        (None, ..) => {
+            let mut any = false;
+            crate::mounts::each(|path, label| {
+                any = true;
+                let (path, label) = (core::str::from_utf8(path).unwrap_or("?"), core::str::from_utf8(label).unwrap_or("?"));
+                match crate::storage::volume_labelled(label.as_bytes()) {
+                    Some((number, _)) => crate::println!("{path} -> @{label} (disk{number})"),
+                    None => crate::println!("{path} -> @{label} (not present: {path}/ is the boot volume's own folder)"),
+                }
+            });
+            if !any {
+                crate::println!("No mounts (a `fstab` file on the boot volume lists them: PATH @LABEL per line).");
+            }
+        }
+        (Some("fstab"), None, _) => {
+            let (set, bad) = crate::mounts::load();
+            crate::println!("fstab: {set} mount(s){}.", if bad > 0 { " and lines it could not use" } else { "" });
+        }
+        (Some(path), Some(label), None) if label.starts_with('@') => match crate::mounts::add(path.as_bytes(), label[1..].as_bytes()) {
+            Ok(()) => crate::println!("{path} is now {label}{}.", if crate::storage::volume_labelled(label[1..].as_bytes()).is_some() { "" } else { " (not present yet: the boot volume's folder is used until it appears)" }),
+            Err(crate::mounts::Error::BadPath) => crate::println!("mount: {path} is not a folder path (names of letters, digits, . _ - +, at most 48 characters)."),
+            Err(crate::mounts::Error::BadLabel) => crate::println!("mount: {label} is not a volume label."),
+            Err(crate::mounts::Error::Full) => crate::println!("mount: the table is full."),
+        },
+        _ => crate::println!("Usage: mount [PATH @LABEL | fstab]"),
+    }
+}
+
+fn umount(rest: &str) {
+    match rest.split_whitespace().next() {
+        Some(path) if crate::mounts::remove(path.as_bytes()) => crate::println!("{path} is no longer a mount point."),
+        Some(path) => crate::println!("umount: {path} is not mounted."),
+        None => crate::println!("Usage: umount PATH"),
     }
 }
 

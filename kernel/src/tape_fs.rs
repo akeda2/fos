@@ -21,6 +21,15 @@ static mut FAT_STREAM: Option<(crate::fatvol::Fs, fat::Stream, [u8; 64], usize)>
 pub fn resolve_file(reference: &[u8], reading: bool) -> Result<(Volume, &[u8]), isize> {
     let (selector, name) = split_selector(reference);
     if selector.is_empty() {
+        // A path under a mount point goes to the mounted volume (reads: only if it has the file, else the boot
+        // volume's own copy shows through); with the volume absent it is the boot volume's folder.
+        if let Some((label, rest)) = crate::mounts::lookup(name) {
+            if let Some((_, volume)) = storage::volume_labelled(label.as_bytes()) {
+                if !reading || matches!(volume.file_length(rest), Ok(Some(_))) {
+                    return Ok((volume, rest));
+                }
+            }
+        }
         let found = if reading { storage::volume_with_file(name) } else { None };
         return found.or_else(storage::boot_volume).map(|volume| (volume, name)).ok_or(FS_NO_VOLUME);
     }
@@ -106,6 +115,16 @@ pub fn read(reference: &[u8], buffer: &mut [u8]) -> isize {
     }
 }
 
+/// A file written under a mount point makes the folders on its way, on the mounted volume or (volume absent) the boot
+/// volume, so a mount point needs no `mkdir` first. Elsewhere a missing folder stays an error.
+fn make_mount_folders(reference: &[u8], volume: &Volume, name: &[u8]) -> Result<(), Error> {
+    let (selector, path) = split_selector(reference);
+    if selector.is_empty() && crate::mounts::lookup(path).is_some() && volume.version() == 4 {
+        return volume.make_parents(name);
+    }
+    Ok(())
+}
+
 pub fn write(reference: &[u8], data: &[u8]) -> isize {
     // Replace the file the way the shell's `write` does on FAT: reserve its whole length, write it, then finish (the
     // directory entry appears with the final size).
@@ -127,6 +146,9 @@ pub fn write(reference: &[u8], data: &[u8]) -> isize {
         Ok(found) => found,
         Err(code) => return code,
     };
+    if make_mount_folders(reference, &volume, name).is_err() {
+        return FS_ERROR;
+    }
     match volume.write(name, data) {
         Ok(()) => 0,
         Err(Error::InvalidName) => FS_BAD_NAME,
@@ -186,8 +208,15 @@ pub fn each_entry(reference: &[u8], each: &mut dyn FnMut(&[u8], u64, bool, Optio
         let kind = if fs.kind() == fat::Kind::ExFat { "exFAT" } else { "FAT32" };
         return fs.list(|entry| each(entry.name(), u64::from(entry.size), entry.is_directory, entry.modified)).map(|()| kind).map_err(fat_error);
     }
-    let (selector, folder) = split_selector(reference);
-    let volume = resolve_volume(selector).ok_or(FS_NO_VOLUME)?;
+    let (selector, mut folder) = split_selector(reference);
+    let mut volume = resolve_volume(selector).ok_or(FS_NO_VOLUME)?;
+    if selector.is_empty() {
+        if let Some((label, rest)) = crate::mounts::lookup_dir(folder) {
+            if let Some((_, mounted)) = storage::volume_labelled(label.as_bytes()) {
+                (volume, folder) = (mounted, rest);
+            }
+        }
+    }
     volume
         .for_each_in(folder, |entry| each(entry.name(), entry.length, entry.is_dir, (entry.modified != 0).then(|| crate::clock::time_at_unix(entry.modified))))
         .map(|()| "FOSFS")
@@ -292,6 +321,9 @@ pub fn stream_open(reference: &[u8], max_bytes: u64) -> isize {
         Ok(found) => found,
         Err(code) => return code,
     };
+    if make_mount_folders(reference, &volume, name).is_err() {
+        return FS_ERROR;
+    }
     match volume.reserve(name, max_bytes) {
         Ok((entry, capacity)) => {
             unsafe { STREAM = Some((volume, entry)) };
