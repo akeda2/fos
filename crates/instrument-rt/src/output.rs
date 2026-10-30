@@ -32,6 +32,26 @@ pub fn pack(frames: &[[f32; 2]], channels: usize, first: usize, format: Format, 
     }
 }
 
+/// Writes `width` channels per frame of `frames` into `out` as device frames of `channels` samples, starting at channel
+/// `first` (0-based); silence elsewhere. A mono device gets the first two mixed.
+pub fn pack_wide(frames: &[[f32; 6]], width: usize, channels: usize, first: usize, format: Format, out: &mut [u8]) {
+    let slot = format.slot;
+    let frame_bytes = channels * slot;
+    for (n, frame) in frames.iter().enumerate() {
+        for channel in 0..channels {
+            let value = if channels == 1 {
+                0.5 * (frame[0] + frame[1])
+            } else if channel >= first && channel < first + width.min(6) {
+                frame[channel - first]
+            } else {
+                0.0
+            };
+            let at = n * frame_bytes + channel * slot;
+            format.write(value, &mut out[at..at + slot]);
+        }
+    }
+}
+
 /// The capture side of a duplex `Output`: the input pair and the device's sample layout.
 struct Capture {
     channels: usize,
@@ -55,9 +75,12 @@ pub struct Output {
     capture: Option<Capture>,
     capacity: u32,
     target: usize,
+    /// Extra captured frames tolerated before the oldest are dropped (0 = live use; raised while archiving).
+    headroom: usize,
     scope: [f32; SCOPE_LEN],
     scope_at: usize,
     frames: [[f32; 2]; CHUNK],
+    wide: [[f32; 6]; CHUNK],
     packed: [u8; CHUNK * MAX_FRAME_BYTES],
 }
 
@@ -144,9 +167,11 @@ impl Output {
             capture,
             capacity: info.playback_space,
             target: (rate * latency_ms / 1000) as usize,
+            headroom: 0,
             scope: [0.0; SCOPE_LEN],
             scope_at: 0,
             frames: [[0.0; 2]; CHUNK],
+            wide: [[0.0; 6]; CHUNK],
             packed: [0; CHUNK * MAX_FRAME_BYTES],
         })
     }
@@ -194,7 +219,36 @@ impl Output {
     /// and it stays put because the one device clocks both sides. If the loop stalled and a backlog grew past the latency,
     /// the oldest frames are dropped (a glitch) instead of keeping the delay for good. True when it wrote something.
     pub fn pump_duplex(&mut self, mut process: impl FnMut(&mut [[f32; 2]])) -> bool {
-        let Some(capture) = self.capture.as_mut() else { return false };
+        let Some(got) = self.take_capture() else { return false };
+        self.finish(got, &mut process);
+        true
+    }
+
+    /// Like `pump_duplex`, but `process` gets the captured stereo frames (to change in place, as there) and fills frames of up to six channels, of which
+    /// the first `width` are played on the device's channels from `first` on (the caller checks the device has them).
+    /// The meter and the scope follow those channels. True when it wrote something.
+    pub fn pump_duplex_wide(&mut self, width: usize, mut process: impl FnMut(&mut [[f32; 2]], &mut [[f32; 6]])) -> bool {
+        let Some(got) = self.take_capture() else { return false };
+        let width = width.clamp(1, 6);
+        process(&mut self.frames[..got], &mut self.wide[..got]);
+        let mut peak = self.peak * 0.98;
+        for frame in &self.wide[..got] {
+            for &value in &frame[..width] {
+                peak = peak.max(value.abs());
+            }
+            self.scope[self.scope_at] = frame[0];
+            self.scope_at = (self.scope_at + 1) % SCOPE_LEN;
+        }
+        self.peak = peak;
+        pack_wide(&self.wide[..got], width, self.channels, self.first, self.format, &mut self.packed);
+        (self.api.audio_write)(self.packed.as_ptr(), got * self.channels * self.format.slot);
+        true
+    }
+
+    /// Reads the waiting capture into `self.frames` (the part `pump_duplex` and `pump_duplex_wide` share); the number of
+    /// frames, or `None` when nothing was read.
+    fn take_capture(&mut self) -> Option<usize> {
+        let capture = self.capture.as_mut()?;
         let mut info = AudioInfo::default();
         (self.api.audio_info)(&mut info);
         self.capacity = self.capacity.max(info.playback_space);
@@ -202,18 +256,18 @@ impl Output {
         let out_bytes = self.channels * self.format.slot;
         let room = info.playback_space as usize / out_bytes;
         let mut waiting = info.capture_available as usize / in_bytes;
-        while waiting > self.target + CHUNK {
+        while waiting > self.target + CHUNK + self.headroom {
             let drop = (waiting - self.target).min(CHUNK);
             (self.api.audio_read)(capture.bytes.as_mut_ptr(), drop * in_bytes);
             waiting -= drop;
         }
         let frames = waiting.min(room).min(CHUNK);
         if frames == 0 {
-            return false;
+            return None;
         }
         let got = (self.api.audio_read)(capture.bytes.as_mut_ptr(), frames * in_bytes) / in_bytes;
         if got == 0 {
-            return false;
+            return None;
         }
         let slot = capture.format.slot;
         let mut input_peak = self.input_peak * 0.98;
@@ -225,8 +279,18 @@ impl Output {
             *frame = [left, right];
         }
         self.input_peak = input_peak;
-        self.finish(got, &mut process);
-        true
+        Some(got)
+    }
+
+    /// Lets up to `frames` more captured frames wait before the oldest are dropped. A live instrument wants none (a
+    /// backlog is latency); an archive must not lose samples when the disk stalls for a moment.
+    pub fn capture_headroom(&mut self, frames: usize) {
+        self.headroom = frames;
+    }
+
+    /// Significant bits of the captured samples as integers (at most 24; a float device gives 24), 0 without capture.
+    pub fn capture_bits(&self) -> u32 {
+        self.capture.as_ref().map_or(0, |c| if c.format.float { 24 } else { c.format.bits.min(24) as u32 })
     }
 
     /// Fills the queue before the first picture: the first draw is the slowest.

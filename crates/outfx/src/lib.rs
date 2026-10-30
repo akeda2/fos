@@ -5,9 +5,19 @@
 //! effects spells them the same way.
 #![cfg_attr(not(test), no_std)]
 
+pub mod logic;
+pub mod phase;
+pub mod qs;
+pub mod sq;
+pub mod surround;
 pub mod upmix;
 
 pub use phono::BassBoost;
+pub use logic::{Logic, Preset};
+pub use phase::Quadrature;
+pub use qs::QsDecoder;
+pub use sq::SqDecoder;
+pub use surround::{Mode, Surround, SurroundSettings};
 pub use upmix::{Layout, Upmix, UpmixSettings};
 use phono::{Phono, curves};
 

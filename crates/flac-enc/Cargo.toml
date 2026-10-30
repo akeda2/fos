@@ -1,0 +1,12 @@
+[package]
+name = "flac-enc"
+version = "0.1.0"
+edition = "2024"
+description = "Streaming FLAC encoder (fixed predictors, Rice coding, stereo decorrelation, wasted bits) and the bit-depth helpers for archiving; no_std, allocation-free"
+
+[lib]
+name = "flac_enc"
+path = "src/lib.rs"
+
+[dev-dependencies]
+audio-decode = { path = "../audio-decode" }

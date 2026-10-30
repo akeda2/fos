@@ -1,0 +1,16 @@
+[package]
+name = "archive"
+version = "0.1.0"
+edition = "2024"
+description = "Archiving for the phono tape: a FLAC file written through a Sink, output file names, and the second pass that decodes a raw Lt/Rt take into a 4.0 / 5.1 file at a bit depth chosen from its noise floor; no_std, allocation-free"
+
+[lib]
+name = "archive"
+path = "src/lib.rs"
+
+[dependencies]
+audio-decode = { path = "../audio-decode" }
+audio-rec = { path = "../audio-rec" }
+flac-enc = { path = "../flac-enc" }
+outfx = { path = "../outfx" }
+phono = { path = "../phono" }

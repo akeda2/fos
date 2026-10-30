@@ -82,7 +82,27 @@ impl Layout {
         Layout::ALL.into_iter().find(|layout| layout.channels() <= channels)
     }
 
-    fn pick(self, six: [f32; 6]) -> [f32; 6] {
+    /// Positions of the channels that carry full-range sound (not the centre, which is silent here, nor the LFE).
+    pub fn full_range(self) -> &'static [usize] {
+        match self {
+            Layout::Surround51 => &[0, 1, 4, 5],
+            Layout::Quad41 => &[0, 1, 3, 4],
+            Layout::Quad40 => &[0, 1, 2, 3],
+            Layout::Stereo21 => &[0, 1],
+        }
+    }
+
+    /// Position of the LFE channel, if any.
+    pub fn lfe_index(self) -> Option<usize> {
+        match self {
+            Layout::Surround51 => Some(3),
+            Layout::Quad41 => Some(2),
+            Layout::Stereo21 => Some(2),
+            Layout::Quad40 => None,
+        }
+    }
+
+    pub(crate) fn pick(self, six: [f32; 6]) -> [f32; 6] {
         match self {
             Layout::Surround51 => six,
             Layout::Quad41 => [six[0], six[1], six[3], six[4], six[5], 0.0],
@@ -112,7 +132,7 @@ impl UpmixSettings {
 }
 
 #[derive(Clone, Copy)]
-struct Biquad {
+pub(crate) struct Biquad {
     b: [f64; 3],
     a: [f64; 2],
     z: [f64; 2],
@@ -120,7 +140,7 @@ struct Biquad {
 
 impl Biquad {
     /// RBJ low-pass; Q 0.7071 is a Butterworth section.
-    fn new(hz: f64, rate: f64, q: f64) -> Biquad {
+    pub(crate) fn new(hz: f64, rate: f64, q: f64) -> Biquad {
         let (sin, cos) = sin_cos64(core::f64::consts::TAU * hz.min(0.45 * rate) / rate);
         let alpha = sin / (2.0 * q);
         let a0 = 1.0 + alpha;
@@ -138,7 +158,7 @@ impl Biquad {
     }
 
     #[inline]
-    fn process(&mut self, x: f64) -> f64 {
+    pub(crate) fn process(&mut self, x: f64) -> f64 {
         let y = self.b[0] * x + self.z[0];
         self.z[0] = self.b[1] * x - self.a[0] * y + self.z[1];
         self.z[1] = self.b[2] * x - self.a[1] * y;
@@ -159,7 +179,7 @@ pub struct Upmix {
 }
 
 impl Upmix {
-    const IDLE: Biquad = Biquad { b: [0.0; 3], a: [0.0; 2], z: [0.0; 2] };
+    pub(crate) const IDLE: Biquad = Biquad { b: [0.0; 3], a: [0.0; 2], z: [0.0; 2] };
 
     /// A silent upmix for a `static`; `configure` before use (it holds a 64 KiB delay line, so it is not built by value).
     pub const fn new() -> Upmix {

@@ -118,3 +118,13 @@ fn every_key_is_found_at_its_own_centre_and_typed_keys_map() {
     assert_eq!(note_for_char(b'z', 97), None);
     assert_eq!(note_for_char(b'!', 48), None);
 }
+
+#[test]
+fn pack_wide_puts_the_channels_from_first_and_leaves_silence_around() {
+    let format = Format::new(4, 32, true);
+    let frames = [[0.1, 0.2, 0.0, 0.3, 0.4, 0.5]];
+    let mut out = [0u8; 8 * 4];
+    pack_wide(&frames, 4, 8, 1, format, &mut out);
+    let sample = |channel: usize| format.read(&out[channel * 4..channel * 4 + 4]);
+    assert_eq!([0, 1, 2, 3, 4, 5, 6, 7].map(sample), [0.0, 0.1, 0.2, 0.0, 0.3, 0.0, 0.0, 0.0]);
+}

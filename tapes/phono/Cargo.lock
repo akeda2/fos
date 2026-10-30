@@ -3,6 +3,32 @@
 version = 4
 
 [[package]]
+name = "archive"
+version = "0.1.0"
+dependencies = [
+ "audio-decode",
+ "audio-rec",
+ "flac-enc",
+ "outfx",
+ "phono",
+]
+
+[[package]]
+name = "audio-decode"
+version = "0.1.0"
+dependencies = [
+ "dsp",
+ "nanomp3-core",
+]
+
+[[package]]
+name = "audio-rec"
+version = "0.1.0"
+dependencies = [
+ "audio-wire",
+]
+
+[[package]]
 name = "audio-sample"
 version = "0.1.0"
 
@@ -33,6 +59,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "flac-enc"
+version = "0.1.0"
+
+[[package]]
 name = "fosfor-abi"
 version = "0.1.0"
 
@@ -54,11 +84,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanomp3-core"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63fa2238e662d3d3c1a71168b3278f23422cf9bf76f6943ee6b1c2581d74eb5c"
+
+[[package]]
 name = "noise"
 version = "0.1.0"
 dependencies = [
  "audio-sample",
  "dsp",
+]
+
+[[package]]
+name = "outfx"
+version = "0.1.0"
+dependencies = [
+ "dsp",
+ "phono",
 ]
 
 [[package]]
@@ -72,10 +116,15 @@ dependencies = [
 name = "phono-tape"
 version = "0.1.0"
 dependencies = [
+ "archive",
+ "audio-decode",
+ "audio-rec",
  "audio-screen",
  "dsp",
+ "flac-enc",
  "gfx",
  "instrument-rt",
+ "outfx",
  "phono",
  "tape-rt",
 ]

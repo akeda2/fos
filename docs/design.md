@@ -1377,6 +1377,57 @@ foreground tape. Settings are `key=value` words (`curve= mono= polarity= rumble=
 reads. `make test-phono` uses QEMU's HD Audio duplex codec and checks the screen mode, keys, Save, a service run reading the saved file
 and a bad curve name; the sound itself needs real hardware. Record-to-file and speed correction are not done.
 
+**Surround decoding in phono** (`crates/outfx`: `phase`, `sq`, `qs`, `logic`, `surround`; host tests in the crate). The equalised
+stereo (Lt/Rt) can be decoded to 4.0, 4.1 or 5.1 (always no centre: C is silent in 5.1, LFE is its own LR4 low-pass of the front
+sum, the fronts stay full range). `surround=off|sq|qs|ambience`, `logic=off|music|film`, `swap=on|off`, `layout=4.0|4.1|5.1`,
+`lfe=HZ`, `delay=MS`; touch buttons Surround, Logic, Swap rear, Out layout (keys `s g x o`). Channel order is the layout's:
+4.0 LF RF LB RB; 4.1 LF RF LFE LB RB; 5.1 LF RF C LFE LB RB, starting at `out=`. A device without those channels gets stereo
+and a message in the header. Off uses the old stereo path unchanged (`Output::pump_duplex`); on uses `pump_duplex_wide`.
+- *Phase network* (`phase::Quadrature`): two all-pass chains 90 degrees apart over the audio band, giving the `j` of the matrices.
+- *QS* (Ito/Ishida, as in the open `quarkquad/qs`): encode Lt = a LF + b RF - j(a LB + b RB), Rt = b LF + a RF + j(b LB + a RB),
+  a = 0.924, b = 0.383. The decoder is the conjugate transpose: LF = a Lt + b Rt, RF = b Lt + a Rt, LB = a Lt_j - b Rt_j,
+  RB = b Lt_j - a Rt_j. Diagonal pairs null, neighbours are -3 dB, mono goes to both rears about 7.7 dB down.
+- *SQ* (`sq.rs`): the passive CBS decoder: LF = Lt, RF = Rt, LB = 0.707 (j Lt - Rt), RB = 0.707 (Lt - j Rt), on the same phase network.
+- *Logic*: a downward expander of every channel's power relative to the strongest one, gain = r^(slope/2) with a floor, smoothed
+  attack/release, gated at -70 dBFS. Music: slope 1, floor 6 dB, 20 ms follower, 10 ms attack, 250 ms release. Film: slope 3,
+  floor 24 dB, 10/5/120 ms. QS plus Music logic is a gentle stereo-to-quad "horseshoe" upmix. Logic does not act on Ambience.
+- *Ambience*: the passive `Upmix` (rear difference signal, delayed, low-passed) for stereo classical and organ music.
+- `crates/flac-enc` (no allocation, no_std, fixed 4096-sample blocks, 1-8 channels, 4-24 bits, fixed predictors with Rice coding,
+  wasted-bits detection, four stereo modes, no LPC, MD5 left zero) and its `depth` module (`NoiseMeter`: histogram of 1024-sample
+  block levels, 10th percentile floor; `pick_bits`; `Quantizer`: TPDF dither into a 24-bit container) are written and tested
+  (ffmpeg decodes 1, 2, 4 and 6 channels bit-exactly); the archive below uses them.
+What QEMU verifies: the maths (host tests), the keys, the buttons' layout and the settings file. What only real records and a
+multichannel interface verify: **SQ rear order and the sign of `j`** (hence Swap rear on both decoders), how the logic sounds, and
+the wide output on a real device (the UFX on rack1).
+
+**Archiving in phono** (`crates/archive`, `tapes/phono/src/take.rs`). Listening is unchanged when nothing is recorded. Two steps
+produce two files from one name:
+- *Record* (button, key `t`) writes the captured Lt/Rt **before any equalisation** as `NAME.lr.flac`: the integer samples as the
+  device delivered them (up to 24 bits; a float device is rounded to 24), the raw master, bit-exact. It records while any
+  surround mode is playing, also when the device has too few outputs for it. `Output::capture_headroom` lets 3 s of capture wait
+  while the disk is busy instead of being dropped. A checkpoint every 2 s brings the FLAC header and the file length up to date, so
+  a reset keeps the take up to there; Escape finishes a running take. Tags: encoder, content, curve, title.
+- *Decode* (button, key `d`) reads the latest raw take (this session's, else the highest-numbered `NAME*.lr.flac`) into memory and
+  runs a second pass with its own equaliser and decoder (the one being listened to is untouched), one FLAC block per main-loop
+  turn so listening goes on: the RIAA (or chosen) equalisation, then the chosen surround decode, to `NAME.flac` with 4 (4.0),
+  5 (4.1) or 6 (5.1, centre silent) channels. The settings at the moment of pressing are used and tagged (decoder, logic, swap,
+  curve, source, bit depth); a cancelled run (press again) leaves a short file. An older `NAME.flac` is replaced; the raw take is
+  never touched, so a take can be decoded again with other settings.
+- *Bit depth* (`depth=auto|16|18|20|24`, button/key `b`): `auto` first measures the decoded take (equalised, full-range channels)
+  with `NoiseMeter` over the whole file: the 10th percentile of 1024-sample block levels is the noise floor, and the depth is the
+  floor plus 12 dB margin, in 16-24 bits (a record's surface noise often means 16-18 bits suffice). Samples go through TPDF
+  dither into that depth; FLAC stores the lower depth in the header, and its wasted-bits and Rice coding make quiet or noisy
+  low-depth files smaller. The percentage shown covers measuring (first half) and writing.
+- *Names* (Name field, key `n` or tap; `name=` at startup; saved by Save): lowercase letters, digits, `.`, `_`, `-`; on FOSFS at
+  most 6 characters (a file name is at most 16: room for `.lr.flac` and a number), after `diskN/` up to 40, `@LABEL/` for a label.
+  Keys go to the field while it is edited (starts from the current name; Enter keeps, Escape cancels); Escape quits otherwise.
+  When `NAME.lr.flac` or `NAME.flac` exists the next number goes after the base (`lp2.lr.flac`, `lp2.flac`, up to 99).
+Limits of this stage: the kernel has one file stream (`fs_stream_*`) and no partial file read, so a take and a decode never run
+together and a decode holds the whole raw file in memory (about 100-200 MB of FLAC for a 22 minute side, 24 bit 48 kHz; if
+`alloc` fails it says so). QEMU verifies the files, names and keys (`make test-phono`) and the host tests the encoder, decoder
+round trips and ffmpeg's reading of 4 and 6 channels; a real disk's write speed under a running take, memory on the Pi and the
+sound of the decode need real hardware.
+
 ### Electric piano (crates/epiano, tapes/epiano)
 
 A Rhodes-style piano meant for playing live. Each of 20 voices is four decaying phasors (`Mode`): the fundamental, 2f, and the

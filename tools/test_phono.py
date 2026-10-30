@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The `phono` tape (phono equaliser): booted with an HD Audio duplex codec on QEMU's `none` backend. Proves what QEMU can: the
-screen mode starts, draws the response curve (green) and the controls, answers keys (m mono, ] next curve, w Save) and
+screen mode starts, draws the response curve (green) and the controls, answers keys (m mono, ] next curve, s surround, x swap rear, w Save) and
 writes phono.cfg; `phono service` then reads that file, runs without taking the screen and stops on Escape. The filter maths is
 checked by the host tests of `crates/phono`; live listening needs real hardware. Run with `make test-phono`."""
 
@@ -41,7 +41,16 @@ def main():
             width, height, pixel = screenshot(monitor, "phono.ppm")
             greens = sum(1 for x in range(0, width, 2) for y in range(0, height, 2) if pixel(x, y)[1] > pixel(x, y)[0] + 60)
             check(greens > 100, "the screen shows the live response curve")
-            type_keys(guest, b"m]w")
+            type_keys(guest, b"m]sx")
+            # The name field (starts as "lp"): n, more characters (a capital folds down, the space is ignored), Enter; w saves it too.
+            type_keys(guest, b"nTs t\r")
+            # A take of about two seconds (silence from the null backend), stopped, then the decoded copy.
+            type_keys(guest, b"t")
+            time.sleep(2.5)
+            type_keys(guest, b"t")
+            type_keys(guest, b"d")
+            time.sleep(4)
+            type_keys(guest, b"w")
             guest.pump(1)
             width, height, pixel = screenshot(monitor, "phono2.ppm")
             guest.process.stdin.write(b"\x1b")
@@ -52,6 +61,13 @@ def main():
             guest.wait_for("fos> ", 10, mark)
             text = guest.text()[mark:]
             check("curve=iec" in text and "mono=on" in text, "Save wrote phono.cfg with the changed settings", text[-300:])
+            check("surround=sq" in text and "swap=on" in text, "the surround and swap-rear keys reach phono.cfg", text[-300:])
+            check("name=lptst" in text, "the typed name reaches phono.cfg", text[-300:])
+            mark = guest.send("ls")
+            guest.wait_for("fos> ", 10, mark)
+            text = guest.text()[mark:]
+            check("lptst.lr.flac" in text, "the raw take was written under the typed name", text[-500:])
+            check("lptst.flac" in text.replace("lptst.lr.flac", ""), "the decoded file was written beside it", text[-500:])
 
             mark = guest.send("run phono service bass=6")
             guest.wait_for("Escape quits.", 30, mark)

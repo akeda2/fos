@@ -5,18 +5,24 @@
 #![no_std]
 #![no_main]
 
+mod take;
+
 use audio_screen::{Screen, poll_keys};
 use core::fmt::Write;
 use gfx::Canvas;
 use gfx::theme::theme;
 use instrument_rt::{Output, Rect, TouchTarget, Touches, blit_banded};
+use outfx::{Mode, Surround};
 use phono::{CURVES, Phono, curve_db, curves::Groove};
 use phono_tape::{DB_MAX, DB_MIN, GLYPH_H, Hit, Layout, Setup, TAPE_NAME, drag, label, lit, press, slider_text, slider_value};
+use take::Archive;
 use tape_rt::{Key, KeyDecoder, Line, TapeApi, println};
 
 tape_rt::tape_help!(
     br#"phono [service] [@FILE] [curve=ID] [mono=on|off] [polarity=P] [rumble=HZ]
 [bass=DB] [bassfreq=HZ] [bassq=Q] [trim=DB]
+[surround=off|sq|qs|ambience] [logic=off|music|film] [swap=on|off]
+[layout=4.0|4.1|5.1] [lfe=HZ] [delay=MS] [name=NAME] [depth=auto|16|18|20|24]
 [device=N|loopN] [outdev=N|loopN] [screen=N]
 [rate=HZ] [latency=MS] [in=N] [out=N]
 A phono equaliser: a flat cartridge or preamp signal on the audio input comes
@@ -31,7 +37,23 @@ iec-78 ccir-78 decca-78 columbia-78 rca-78 euro-78 blumlein-300 flat-500
 american-78-6 american-78-8 flat. polarity= normal, left, right or both.
 rumble=off or 10-100 Hz (steep high-pass). bass= 0-12 dB boost at bassfreq=
 60-150 Hz with width bassq= 0.3-3. trim= -24 to +12 dB.
-Keys: m mono, l / r invert, [ ] previous / next curve, w save; Escape quits.
+surround= decodes the equalised stereo to 4 channels: sq or qs (matrix
+records), ambience (stereo to quad, for classical and organ). logic= steers
+the decoded channels (music: gentle, film: strong). swap=on mirrors the rear
+pair when the rears come out reversed. layout= 4.0, 4.1 (LFE on out+2) or
+5.1 (C silent, LFE on out+3); lfe= 40-200 Hz. The device needs the channels
+from out= on; otherwise phono plays stereo and says so.
+Archive: Record (key t) writes the captured Lt/Rt as NAME.lr.flac, flat, as
+delivered; the raw master. Record again stops it. Decode (key d) turns the
+latest take into NAME.flac with the equalisation and the chosen surround
+decode (4, 4.1 or 6 channels), at the bit depth depth= (auto picks it from
+the take's noise floor; b cycles it). It needs no extra outputs and listening
+goes on. Name (key n) edits NAME from the keyboard (Enter keeps, Escape
+cancels): lowercase letters, digits . _ -, at most 6 on FOSFS or up to 40
+after disk2/. A taken name gets a number (lp2.lr.flac, lp2.flac).
+Keys: m mono, l / r invert, [ ] previous / next curve, s surround, g logic,
+x swap rear, o layout, t record, d decode, b depth, n name, w save; Escape
+quits.
 "#
 );
 
@@ -47,6 +69,7 @@ const BAR: u32 = 0x1c6a8a;
 const GRID: u32 = 0x26323c;
 const REFERENCE: u32 = 0x5a6e7c;
 const LIVE: u32 = 0x4ade80;
+const RECORDING: u32 = 0xff6060;
 
 fn center(canvas: &mut Canvas, rect: Rect, text: &str, scale: i32, rgb: u32) {
     let width = gfx::text_width(text) as i32 * scale;
@@ -58,7 +81,7 @@ fn meter(canvas: &mut Canvas, x: i32, y: i32, w: i32, level: f32) {
     canvas.fill_rect(x, y, (w as f32 * level.min(1.0)) as u32, 4, if level > 0.95 { theme().red } else { theme().green });
 }
 
-fn draw_header(canvas: &mut Canvas, layout: &Layout, setup: &Setup, output: &Output, message: &str) {
+fn draw_header(canvas: &mut Canvas, layout: &Layout, setup: &Setup, output: &Output, width: usize, status: &str, message: &str) {
     let header = layout.header;
     canvas.fill_rect(header.x, header.y, header.w as u32, header.h as u32, PANEL);
     canvas.rect(header.x, header.y, header.w as u32, header.h as u32, EDGE);
@@ -66,10 +89,21 @@ fn draw_header(canvas: &mut Canvas, layout: &Layout, setup: &Setup, output: &Out
     let _ = write!(title, "FOSFOR PHONO  {}", CURVES[setup.curve].name);
     canvas.text_scaled(header.x + layout.margin, header.y + layout.margin, title.as_str(), layout.scale as u32, ACTIVE);
     let curve = &CURVES[setup.curve];
-    let mut detail = Line::<96>::new();
+    let mut detail = Line::<128>::new();
     let groove = if curve.groove == Groove::Micro { "microgroove" } else { "78 rpm" };
     let _ = write!(detail, "{}  {}  {} Hz", curve.period, groove, output.rate);
-    canvas.text(header.x + layout.margin, header.y + header.h - layout.margin - GLYPH_H, detail.as_str(), INK);
+    if setup.surround.mode != Mode::Off {
+        let _ = write!(detail, "  {}", setup.surround.mode.name());
+        if width > 2 {
+            let _ = write!(detail, " {}ch", width);
+        } else {
+            let _ = write!(detail, " (device has too few outputs)");
+        }
+    }
+    if !status.is_empty() {
+        let _ = write!(detail, "  {status}");
+    }
+    canvas.text(header.x + layout.margin, header.y + header.h - layout.margin - GLYPH_H, detail.as_str(), if status.is_empty() { INK } else { RECORDING });
     let right = header.x + header.w - layout.margin;
     if !message.is_empty() {
         canvas.text_right(right, header.y + layout.margin, message, INK);
@@ -118,7 +152,7 @@ fn draw_plot(canvas: &mut Canvas, layout: &Layout, setup: &Setup, eq: &Phono) {
     canvas.rect(plot.x, plot.y, plot.w as u32, plot.h as u32, EDGE);
 }
 
-fn draw_controls(canvas: &mut Canvas, layout: &Layout, setup: &Setup) {
+fn draw_controls(canvas: &mut Canvas, layout: &Layout, setup: &Setup, archive: &Archive) {
     for widget in layout.widgets() {
         let rect = widget.rect;
         match widget.hit {
@@ -130,11 +164,34 @@ fn draw_controls(canvas: &mut Canvas, layout: &Layout, setup: &Setup) {
                 slider_text(setup, index, &mut text);
                 center(canvas, rect, text.as_str(), layout.scale, INK);
             }
-            hit => {
-                let on = lit(setup, hit);
-                canvas.fill_rect(rect.x, rect.y, rect.w as u32, rect.h as u32, if on { ACTIVE } else { BUTTON_OFF });
+            Hit::Name => {
+                let editing = archive.editing.as_ref();
+                let shown = editing.unwrap_or(&archive.name);
+                canvas.fill_rect(rect.x, rect.y, rect.w as u32, rect.h as u32, if editing.is_some() { ACTIVE } else { BUTTON_OFF });
                 canvas.rect(rect.x, rect.y, rect.w as u32, rect.h as u32, EDGE);
-                center(canvas, rect, label(hit), layout.scale, if on { 0x000000 } else { INK });
+                let mut text = Line::<64>::new();
+                let _ = write!(text, "Name {}{}", shown.as_str(), if editing.is_some() { "_" } else { "" });
+                // A long name loses its beginning, so the end being typed stays visible.
+                let fits = ((rect.w - 4) / (layout.scale * 8)).max(1) as usize;
+                let from = text.length.saturating_sub(fits);
+                center(canvas, rect, &text.as_str()[from..], layout.scale, if editing.is_some() { 0x000000 } else { INK });
+            }
+            hit => {
+                let (mut on, mut fill) = (lit(setup, hit), ACTIVE);
+                let mut text = Line::<24>::new();
+                let _ = text.write_str(label(setup, hit));
+                if hit == Hit::Record && archive.recording {
+                    (on, fill) = (true, RECORDING);
+                    text.clear();
+                    let _ = write!(text, "Stop rec");
+                } else if hit == Hit::Decode && archive.decoding() {
+                    on = true;
+                    text.clear();
+                    let _ = write!(text, "Decoding {}%", archive.percent);
+                }
+                canvas.fill_rect(rect.x, rect.y, rect.w as u32, rect.h as u32, if on { fill } else { BUTTON_OFF });
+                canvas.rect(rect.x, rect.y, rect.w as u32, rect.h as u32, EDGE);
+                center(canvas, rect, text.as_str(), layout.scale, if on { 0x000000 } else { INK });
             }
         }
     }
@@ -144,6 +201,8 @@ struct PhonoTouch<'a> {
     layout: &'a Layout,
     setup: &'a mut Setup,
     save: &'a mut bool,
+    /// Record, Decode or Name: the main loop owns what they do.
+    action: &'a mut Option<Hit>,
 }
 
 impl TouchTarget for PhonoTouch<'_> {
@@ -153,6 +212,8 @@ impl TouchTarget for PhonoTouch<'_> {
         let hit = self.layout.hit(x, y)?;
         if hit == Hit::Save {
             *self.save = true;
+        } else if matches!(hit, Hit::Record | Hit::Decode | Hit::Name) {
+            *self.action = Some(hit);
         } else {
             press(self.layout, self.setup, hit, x);
         }
@@ -167,9 +228,10 @@ impl TouchTarget for PhonoTouch<'_> {
     fn up(&mut self, _grab: Hit) {}
 }
 
-fn save(api: &TapeApi, config: &tape_rt::config::Config, setup: &Setup, message: &mut Line<64>) {
-    let mut body = tape_rt::config::Settings::<320>::new();
+fn save(api: &TapeApi, config: &tape_rt::config::Config, setup: &Setup, name: &str, message: &mut Line<64>) {
+    let mut body = tape_rt::config::Settings::<512>::new();
     setup.write(&mut body);
+    body.put("name", format_args!("{name}"));
     message.clear();
     match config.save(api, body.as_str()) {
         Ok(name) => {
@@ -189,9 +251,47 @@ fn handle_key(key: Key, setup: &mut Setup) -> bool {
         Key::Char(b'r') => setup.set_inversion(setup.invert_left(), !setup.invert_right()),
         Key::Char(b'[') => setup.curve = (setup.curve + CURVES.len() - 1) % CURVES.len(),
         Key::Char(b']') => setup.curve = (setup.curve + 1) % CURVES.len(),
+        Key::Char(b's') => setup.surround.mode = setup.surround.mode.next(),
+        Key::Char(b'g') => press_logic(setup),
+        Key::Char(b'x') => setup.surround.swap_rear = !setup.surround.swap_rear,
+        Key::Char(b'o') => setup.cycle_speakers(),
         _ => return false,
     }
     true
+}
+
+fn say_unchanged(message: &mut Line<64>) {
+    message.clear();
+    let _ = write!(message, "name unchanged");
+}
+
+fn press_logic(setup: &mut Setup) {
+    let layout = Layout::new(640, 480);
+    press(&layout, setup, Hit::Logic, 0);
+}
+
+/// Channels to play for the chosen surround settings: stereo when the device lacks the outputs.
+fn play_width(setup: &Setup, output: &Output) -> usize {
+    let wanted = setup.surround.channels();
+    if wanted > 2 && output.first + wanted <= output.channels { wanted } else { 2 }
+}
+
+/// Equalises the captured frames; with a wider output also decodes them into the surround channels.
+fn pump(output: &mut Output, eq: &mut Phono, surround: &mut Surround, width: usize, archive: &mut Archive) {
+    if width > 2 {
+        output.pump_duplex_wide(width, |frames, wide| {
+            archive.tap(frames);
+            eq.process_frames(frames);
+            for (frame, out) in frames.iter().zip(wide.iter_mut()) {
+                *out = surround.process(*frame);
+            }
+        });
+    } else {
+        output.pump_duplex(|frames| {
+            archive.tap(frames);
+            eq.process_frames(frames);
+        });
+    }
 }
 
 /// `device=`, `outdev=` and the hard-float check; the screen is the caller's business.
@@ -229,6 +329,17 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     };
     let mut eq = Phono::new(output.rate);
     setup.apply(&mut eq);
+    // About 64 KiB (the ambience delay line): a static, not stack.
+    static mut SURROUND: Surround = Surround::new();
+    let surround = unsafe { &mut *core::ptr::addr_of_mut!(SURROUND) };
+    surround.tune(output.rate, setup.surround);
+    let mut width = play_width(&setup, &output);
+    let name = config.value("name").unwrap_or(take::DEFAULT_NAME);
+    if let Err(error) = archive::Names::parse(name) {
+        output.stop();
+        return println!("phono: name={name} is not usable ({error:?}); lowercase letters, digits . _ - and diskN/ or @LABEL/.");
+    }
+    let mut archive = Archive::new(api, name);
 
     let screen_number = tape_rt::screen_arg(arguments);
     let mut graphics = None;
@@ -255,44 +366,87 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         output.rate,
         output.latency_ms,
         output.first + 1,
-        output.first + 2
+        output.first + width.max(2)
     );
     output.prime(|frames| frames.fill([0.0; 2]));
+    let mut status = Line::<48>::new();
 
     let mut decoder = KeyDecoder::new();
     let mut touches = graphics.as_ref().map(|(layout, _)| Touches::new(layout.width, layout.height, screen_number));
     let mut message = Line::<64>::new();
+    let mut cursor = None::<(i32, i32)>;
     let mut next_animation = 0u64;
     let mut clipped = 0u32;
     loop {
         let mut changed = false;
         let mut save_requested = false;
+        let mut action = None;
         let keep_going = poll_keys(api, &mut decoder, |key| {
-            if key == Key::Char(b'w') {
-                save_requested = true;
-            } else {
-                changed |= handle_key(key, &mut setup);
+            if archive.editing.is_some() {
+                archive.edit_key(key, &mut message);
+                changed = true;
+                return;
+            }
+            match key {
+                Key::Char(b'w') => save_requested = true,
+                Key::Char(b't') => action = Some(Hit::Record),
+                Key::Char(b'd') => action = Some(Hit::Decode),
+                Key::Char(b'n') => action = Some(Hit::Name),
+                Key::Char(b'b') => {
+                    press(&Layout::new(640, 480), &mut setup, Hit::Depth, 0);
+                    changed = true;
+                }
+                _ => changed |= handle_key(key, &mut setup),
             }
         });
         if !keep_going {
-            break;
+            // Escape while the name is edited only drops the edit.
+            if archive.editing.take().is_none() {
+                break;
+            }
+            say_unchanged(&mut message);
+            changed = true;
         }
         if let (Some((layout, _)), Some(touches)) = (graphics.as_ref(), touches.as_mut()) {
-            changed |= touches.poll(&mut PhonoTouch { layout, setup: &mut setup, save: &mut save_requested });
+            let mut target = PhonoTouch { layout, setup: &mut setup, save: &mut save_requested, action: &mut action };
+            while let Some(event) = tape_rt::touch_event() {
+                let Some(extent) = tape_rt::touch_extent(event.panel) else { continue };
+                if event.is_mouse() && (event.screen < 0 || event.screen == screen_number as i32) {
+                    cursor = Some((event.x * layout.width / extent.0.max(1), event.y * layout.height / extent.1.max(1)));
+                    changed = true;
+                }
+                changed |= touches.handle(&event, extent, &mut target);
+            }
         }
         if save_requested && graphics.is_some() {
-            save(api, &config, &setup, &mut message);
+            save(api, &config, &setup, archive.name.as_str(), &mut message);
             changed = true;
-        } else if changed {
+        } else if changed && action.is_none() {
             message.clear();
+        }
+        if let Some(hit) = action {
+            changed = true;
+            match hit {
+                Hit::Record if archive.recording => archive.stop_recording(&mut output, &mut message),
+                Hit::Record => archive.start_recording(&setup, &mut output, &mut message),
+                Hit::Decode if archive.decoding() => archive.cancel_decode(&mut message),
+                Hit::Decode => archive.start_decode(&setup, &mut message),
+                _ => archive.begin_edit(),
+            }
         }
         if changed {
             setup.apply(&mut eq);
+            surround.tune(output.rate, setup.surround);
+            width = play_width(&setup, &output);
+            if setup.surround.mode != Mode::Off && width == 2 && message.is_empty() {
+                let _ = write!(message, "device has {} outputs, need {}", output.channels - output.first, setup.surround.channels());
+            }
         }
-        output.pump_duplex(|frames| eq.process_frames(frames));
+        pump(&mut output, &mut eq, surround, width, &mut archive);
         if output.peak >= 1.0 {
             clipped += 1;
         }
+        changed |= archive.service(&mut output, &mut message);
         let Some((layout, screen)) = graphics.as_mut() else {
             tape_rt::idle();
             continue;
@@ -309,15 +463,22 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             {
                 let mut canvas = screen.frame();
                 canvas.clear(BACKGROUND);
-                draw_header(&mut canvas, layout, &setup, &output, message.as_str());
+                archive.status(&mut status);
+                draw_header(&mut canvas, layout, &setup, &output, width, status.as_str(), message.as_str());
                 draw_plot(&mut canvas, layout, &setup, &eq);
-                draw_controls(&mut canvas, layout, &setup);
+                draw_controls(&mut canvas, layout, &setup, &archive);
+                if let Some((x, y)) = cursor {
+                    canvas.cursor(x, y, layout.scale as u32 + 1, INK, BACKGROUND);
+                }
             }
-            blit_banded(screen, || {
-                output.pump_duplex(|frames| eq.process_frames(frames));
-            });
+            blit_banded(screen, || pump(&mut output, &mut eq, surround, width, &mut archive));
         }
         tape_rt::idle();
+    }
+    let mut closing = Line::<64>::new();
+    archive.shut_down(&mut output, &mut closing);
+    if !closing.is_empty() {
+        println!("phono: {}.", closing.as_str());
     }
     output.stop();
     if let Some((_, screen)) = graphics.as_mut() {

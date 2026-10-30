@@ -12,10 +12,15 @@ name = "phono"
 path = "src/main.rs"
 
 [dependencies]
+archive = { path = "../../crates/archive" }
+audio-decode = { path = "../../crates/audio-decode" }
+audio-rec = { path = "../../crates/audio-rec" }
 audio-screen = { path = "../../crates/audio-screen" }
+flac-enc = { path = "../../crates/flac-enc" }
 dsp = { path = "../../crates/dsp" }
 gfx = { path = "../../crates/gfx" }
 instrument-rt = { path = "../../crates/instrument-rt" }
+outfx = { path = "../../crates/outfx" }
 phono = { path = "../../crates/phono" }
 tape-rt = { path = "../../crates/tape-rt" }
 

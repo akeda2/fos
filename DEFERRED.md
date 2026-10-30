@@ -560,3 +560,14 @@ use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limi
 - Full-speed USB audio on EHCI (split isochronous, `ehci.rs` `sitd_*`) is written but untested: QEMU has no transaction translator.
   First try on piano1 (24-bit 48 kHz card behind the rate-matching hub). If it stays silent, check `debug`/`audio` error counts, the
   c-mask (microframes 2 to n + 3), and whether the TT wants the start-split later than microframe 0.
+
+## Open after the surround session
+
+- Phono's SQ/QS/logic decoders are tested on the host and in QEMU (keys, settings) only. On real records: check the SQ rear order and
+  the sign of `j` (Swap rear), tune the logic presets, and try the wide output on a multichannel interface (UFX on rack1).
+- Phono archive, done: raw `NAME.lr.flac` while listening, then an offline decode to `NAME.flac` (see `docs/design.md`). Not done:
+  decoding *live* into a second file while recording (kernel ABI: more than one `fs_stream`), reading the raw take in pieces instead
+  of whole into memory (an `fs_read_at` call) and rewriting a live decoded file at the depth the finished take's floor suggests.
+  No LPC (about 2-5 % smaller files, needs f64 and much code); the MD5 in the FLAC header is zero.
+- Fosplay: Pro Logic-style decoder, Ambiophonic/RACE and logic modes (listening only, no archive).
+- Logic steering for the Ambience mode.

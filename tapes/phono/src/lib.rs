@@ -4,12 +4,14 @@
 #![cfg_attr(not(test), no_std)]
 
 use core::fmt::Write;
+use archive::Depth;
 use instrument_rt::Rect;
+use outfx::{Layout as Speakers, Mode, Preset, SurroundSettings};
 use phono::{BassBoost, CURVES, Polarity, Phono, Rumble, curves};
 use tape_rt::Line;
 
 pub const GLYPH_H: i32 = gfx::GLYPH_HEIGHT as i32;
-const MAX_WIDGETS: usize = 40;
+const MAX_WIDGETS: usize = 48;
 pub const SLIDERS: [&str; 5] = ["Bass boost", "Bass freq", "Bass Q", "Rumble", "Trim"];
 pub const F_MIN: f32 = 20.0;
 pub const F_MAX: f32 = 20000.0;
@@ -36,13 +38,20 @@ pub struct Setup {
     pub rumble_hz: f32,
     pub bass: BassBoost,
     pub trim_db: f32,
+    /// SQ / QS / ambience decoding to four or more outputs; `Mode::Off` is plain stereo.
+    pub surround: SurroundSettings,
+    /// Bit depth of the decoded archive file: `Auto` picks it from the take's noise floor.
+    pub depth: Depth,
 }
 
 impl Default for Setup {
     fn default() -> Self {
-        Setup { curve: curves::RIAA, mono: false, polarity: Polarity::Normal, rumble_hz: 0.0, bass: BassBoost::OFF, trim_db: 0.0 }
+        Setup { curve: curves::RIAA, mono: false, polarity: Polarity::Normal, rumble_hz: 0.0, bass: BassBoost::OFF, trim_db: 0.0, surround: SurroundSettings::DEFAULT, depth: Depth::Auto }
     }
 }
+
+/// The speaker sets a record player can have: never a centre, so 4.0, 4.1 (with a sub) and 5.1 (C silent).
+pub const SPEAKERS: [Speakers; 3] = [Speakers::Quad40, Speakers::Quad41, Speakers::Surround51];
 
 fn parse_switch(value: &str) -> Option<bool> {
     match value {
@@ -116,6 +125,27 @@ impl Setup {
         if let Some(value) = tape_rt::arg_value(text, "trim") {
             self.trim_db = number("trim", value, TRIM_MIN_DB, TRIM_MAX_DB)?;
         }
+        if let Some(value) = tape_rt::arg_value(text, "surround") {
+            self.surround.mode = Mode::parse(value).ok_or_else(|| bad("surround", "off, sq, qs or ambience"))?;
+        }
+        if let Some(value) = tape_rt::arg_value(text, "logic") {
+            self.surround.logic = if value == "off" { None } else { Some(Preset::parse(value).ok_or_else(|| bad("logic", "off, music or film"))?) };
+        }
+        if let Some(value) = tape_rt::arg_value(text, "swap") {
+            self.surround.swap_rear = parse_switch(value).ok_or_else(|| bad("swap", "on or off"))?;
+        }
+        if let Some(value) = tape_rt::arg_value(text, "layout") {
+            self.surround.layout = Speakers::parse(value).filter(|layout| SPEAKERS.contains(layout)).ok_or_else(|| bad("layout", "4.0, 4.1 or 5.1"))?;
+        }
+        if let Some(value) = tape_rt::arg_value(text, "lfe") {
+            self.surround.lfe_hz = number("lfe", value, 40.0, 200.0)?;
+        }
+        if let Some(value) = tape_rt::arg_value(text, "delay") {
+            self.surround.delay_ms = number("delay", value, 0.0, 40.0)?;
+        }
+        if let Some(value) = tape_rt::arg_value(text, "depth") {
+            self.depth = Depth::parse(value).ok_or_else(|| bad("depth", "auto, 16, 18, 20 or 24"))?;
+        }
         Ok(())
     }
 
@@ -136,6 +166,20 @@ impl Setup {
             tenths(&mut text, value);
             out.put(key, format_args!("{}", text.as_str()));
         }
+        let surround = &self.surround;
+        out.put("surround", format_args!("{}", surround.mode.name()));
+        out.put("logic", format_args!("{}", surround.logic.map_or("off", Preset::name)));
+        out.put("swap", format_args!("{}", if surround.swap_rear { "on" } else { "off" }));
+        out.put("layout", format_args!("{}", surround.layout.name()));
+        for (key, value) in [("lfe", surround.lfe_hz), ("delay", surround.delay_ms)] {
+            let mut text = Line::<16>::new();
+            tenths(&mut text, value);
+            out.put(key, format_args!("{}", text.as_str()));
+        }
+        match self.depth {
+            Depth::Auto => out.put("depth", format_args!("auto")),
+            Depth::Bits(bits) => out.put("depth", format_args!("{bits}")),
+        }
     }
 
     pub fn apply(&self, eq: &mut Phono) {
@@ -145,6 +189,12 @@ impl Setup {
         eq.set_rumble(if self.rumble_hz > 0.0 { Rumble::Steep(self.rumble_hz) } else { Rumble::Off });
         eq.set_bass_boost(self.bass);
         eq.set_trim_db(self.trim_db);
+    }
+
+    /// 4.0, 4.1, 5.1 and round again.
+    pub fn cycle_speakers(&mut self) {
+        let at = SPEAKERS.iter().position(|layout| *layout == self.surround.layout).unwrap_or(0);
+        self.surround.layout = SPEAKERS[(at + 1) % SPEAKERS.len()];
     }
 
     pub fn invert_left(&self) -> bool {
@@ -175,6 +225,22 @@ pub enum Hit {
     InvertLeft,
     InvertRight,
     Save,
+    /// Cycles off, SQ, QS, ambience.
+    Surround,
+    /// Cycles off, music, film.
+    Logic,
+    /// Mirrors the rear pair.
+    SwapRear,
+    /// Cycles 4.0, 4.1, 5.1.
+    Speakers,
+    /// Starts or stops the raw Lt/Rt take (`main.rs` owns the file).
+    Record,
+    /// Decodes the last take into the surround file.
+    Decode,
+    /// Cycles the decoded file's bit depth: auto, 16, 18, 20, 24.
+    Depth,
+    /// The output name field: a tap starts keyboard editing.
+    Name,
 }
 
 #[derive(Clone, Copy)]
@@ -195,8 +261,9 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// The response plot top left, the curve buttons top right (3 columns), five sliders bottom left, the switches and Save
-    /// bottom right.
+    /// The response plot top left, the curve buttons top right (3 columns), five sliders bottom left, bottom right two
+    /// columns of switches: Mono, Invert L/R and Save, the surround mode, logic, rear swap and speaker layout, then Record,
+    /// Decode, the archive bit depth and the output name.
     pub fn new(width: i32, height: i32) -> Self {
         let scale = if width >= 1200 { 2 } else { 1 };
         let margin = 6 * scale;
@@ -233,8 +300,10 @@ impl Layout {
         }
         let switches_x = margin + sliders_w + margin;
         let switches_w = width - switches_x - margin;
-        let (cell_w, cell_h) = ((switches_w - gap) / 2, (lower_h - gap) / 2);
-        for (index, hit) in [Hit::Mono, Hit::InvertLeft, Hit::InvertRight, Hit::Save].into_iter().enumerate() {
+        let rows = 6;
+        let (cell_w, cell_h) = ((switches_w - gap) / 2, (lower_h - (rows - 1) * gap) / rows);
+        let switches = [Hit::Mono, Hit::InvertLeft, Hit::InvertRight, Hit::Save, Hit::Surround, Hit::Logic, Hit::SwapRear, Hit::Speakers, Hit::Record, Hit::Decode, Hit::Depth, Hit::Name];
+        for (index, hit) in switches.into_iter().enumerate() {
             let (column, row) = (index as i32 % 2, index as i32 / 2);
             layout.add(Rect { x: switches_x + column * (cell_w + gap), y: lower_y + row * (cell_h + gap), w: cell_w, h: cell_h }, hit);
         }
@@ -356,7 +425,7 @@ pub fn slider_text(setup: &Setup, index: u8, out: &mut impl Write) {
     }
 }
 
-pub fn label(hit: Hit) -> &'static str {
+pub fn label(setup: &Setup, hit: Hit) -> &'static str {
     match hit {
         Hit::Curve(index) => CURVES[index as usize].short,
         Hit::Slider(index) => SLIDERS[index as usize],
@@ -364,6 +433,33 @@ pub fn label(hit: Hit) -> &'static str {
         Hit::InvertLeft => "Invert L",
         Hit::InvertRight => "Invert R",
         Hit::Save => "Save",
+        Hit::Surround => match setup.surround.mode {
+            Mode::Off => "Surround off",
+            Mode::Sq => "Surround SQ",
+            Mode::Qs => "Surround QS",
+            Mode::Ambience => "Surround amb",
+        },
+        Hit::Logic => match setup.surround.logic {
+            None => "Logic off",
+            Some(Preset::Music) => "Logic music",
+            Some(Preset::Film) => "Logic film",
+        },
+        Hit::SwapRear => "Swap rear",
+        Hit::Record => "Record",
+        Hit::Decode => "Decode",
+        Hit::Depth => match setup.depth {
+            Depth::Auto => "Depth auto",
+            Depth::Bits(16) => "Depth 16",
+            Depth::Bits(18) => "Depth 18",
+            Depth::Bits(20) => "Depth 20",
+            Depth::Bits(_) => "Depth 24",
+        },
+        Hit::Name => "Name",
+        Hit::Speakers => match setup.surround.layout {
+            Speakers::Quad41 => "Out 4.1",
+            Speakers::Surround51 => "Out 5.1",
+            _ => "Out 4.0",
+        },
     }
 }
 
@@ -373,6 +469,9 @@ pub fn lit(setup: &Setup, hit: Hit) -> bool {
         Hit::Mono => setup.mono,
         Hit::InvertLeft => setup.invert_left(),
         Hit::InvertRight => setup.invert_right(),
+        Hit::Surround => setup.surround.mode != Mode::Off,
+        Hit::Logic => setup.surround.logic.is_some(),
+        Hit::SwapRear => setup.surround.swap_rear,
         _ => false,
     }
 }
@@ -385,7 +484,16 @@ pub fn press(layout: &Layout, setup: &mut Setup, hit: Hit, x: i32) {
         Hit::InvertLeft => setup.set_inversion(!setup.invert_left(), setup.invert_right()),
         Hit::InvertRight => setup.set_inversion(setup.invert_left(), !setup.invert_right()),
         Hit::Slider(_) => drag(layout, setup, hit, x),
-        Hit::Save => {}
+        Hit::Surround => setup.surround.mode = setup.surround.mode.next(),
+        Hit::Logic => setup.surround.logic = match setup.surround.logic {
+            None => Some(Preset::Music),
+            Some(Preset::Music) => Some(Preset::Film),
+            Some(Preset::Film) => None,
+        },
+        Hit::SwapRear => setup.surround.swap_rear = !setup.surround.swap_rear,
+        Hit::Speakers => setup.cycle_speakers(),
+        Hit::Depth => setup.depth = setup.depth.next(),
+        Hit::Save | Hit::Record | Hit::Decode | Hit::Name => {}
     }
 }
 
@@ -407,7 +515,7 @@ mod tests {
         for (w, h) in SIZES {
             let layout = Layout::new(w, h);
             let screen = Rect { x: 0, y: 0, w, h };
-            assert_eq!(layout.widgets().len(), CURVES.len() + SLIDERS.len() + 4);
+            assert_eq!(layout.widgets().len(), CURVES.len() + SLIDERS.len() + 12);
             assert!(layout.plot.w > 100 && layout.plot.h > 60, "{w}x{h}");
             for (i, a) in layout.widgets().iter().enumerate() {
                 let r = a.rect;
@@ -427,10 +535,60 @@ mod tests {
             let layout = Layout::new(w, h);
             for widget in layout.widgets() {
                 if let Hit::Curve(_) = widget.hit {
-                    let need = gfx::text_width(label(widget.hit)) as i32 * layout.scale;
-                    assert!(need + 4 <= widget.rect.w, "{w}x{h} {} needs {need}, has {}", label(widget.hit), widget.rect.w);
+                    let need = gfx::text_width(label(&Setup::default(), widget.hit)) as i32 * layout.scale;
+                    assert!(need + 4 <= widget.rect.w, "{w}x{h} {} needs {need}, has {}", label(&Setup::default(), widget.hit), widget.rect.w);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn surround_labels_fit_their_buttons_in_every_state() {
+        for (w, h) in SIZES {
+            let layout = Layout::new(w, h);
+            let mut setup = Setup::default();
+            for _ in 0..12 {
+                for widget in layout.widgets() {
+                    if matches!(widget.hit, Hit::Surround | Hit::Logic | Hit::SwapRear | Hit::Speakers | Hit::Record | Hit::Decode | Hit::Depth) {
+                        let need = gfx::text_width(label(&setup, widget.hit)) as i32 * layout.scale;
+                        assert!(need + 4 <= widget.rect.w, "{w}x{h} {} needs {need}, has {}", label(&setup, widget.hit), widget.rect.w);
+                        press(&layout, &mut setup, widget.hit, 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_surround_buttons_cycle_and_swap_rear_toggles() {
+        let layout = Layout::new(1280, 1024);
+        let mut setup = Setup::default();
+        let hit_at = |hit: Hit| layout.widget_rect(hit).map(|r| (r.x + 2, r.y + 2)).unwrap();
+        let tap = |setup: &mut Setup, hit: Hit| {
+            let (x, y) = hit_at(hit);
+            let found = layout.hit(x, y).unwrap();
+            assert_eq!(found, hit);
+            press(&layout, setup, found, x);
+        };
+        for expected in [Mode::Sq, Mode::Qs, Mode::Ambience, Mode::Off] {
+            tap(&mut setup, Hit::Surround);
+            assert_eq!(setup.surround.mode, expected);
+        }
+        tap(&mut setup, Hit::SwapRear);
+        assert!(setup.surround.swap_rear && lit(&setup, Hit::SwapRear));
+        tap(&mut setup, Hit::SwapRear);
+        assert!(!setup.surround.swap_rear);
+        for expected in [Some(Preset::Music), Some(Preset::Film), None] {
+            tap(&mut setup, Hit::Logic);
+            assert_eq!(setup.surround.logic, expected);
+        }
+        for expected in [Depth::Bits(16), Depth::Bits(18), Depth::Bits(20), Depth::Bits(24), Depth::Auto] {
+            tap(&mut setup, Hit::Depth);
+            assert_eq!(setup.depth, expected);
+        }
+        for expected in [Speakers::Quad41, Speakers::Surround51, Speakers::Quad40] {
+            tap(&mut setup, Hit::Speakers);
+            assert_eq!(setup.surround.layout, expected);
         }
     }
 
@@ -443,13 +601,16 @@ mod tests {
             rumble_hz: 30.0,
             bass: BassBoost { gain_db: 4.5, hz: 90.0, q: 1.2 },
             trim_db: -3.5,
+            surround: SurroundSettings { mode: Mode::Qs, logic: Some(Preset::Film), swap_rear: true, layout: Speakers::Surround51, lfe_hz: 80.0, width: 0.7, delay_ms: 20.0 },
+            depth: Depth::Bits(18),
         };
-        let mut body = tape_rt::config::Settings::<256>::new();
+        let mut body = tape_rt::config::Settings::<512>::new();
         setup.write(&mut body);
         assert!(body.as_str().contains("curve=columbia-lp\n") && body.as_str().contains("trim=-3.5\n"), "{}", body.as_str());
         let mut read = Setup::default();
         assert!(read.read(&body.as_str().replace('\n', " ")).is_ok());
         assert_eq!(read, setup);
+        assert!(body.as_str().contains("depth=18\n") && body.as_str().contains("surround=qs\n") && body.as_str().contains("swap=on\n") && body.as_str().contains("layout=5.1\n"));
         let mut off = Setup::default();
         assert!(off.read("rumble=off mono=off").is_ok());
         assert_eq!(off, Setup::default());
@@ -460,7 +621,9 @@ mod tests {
         let mut setup = Setup::default();
         assert!(setup.read("curve=nonsense").unwrap_err().as_str().contains("nonsense"));
         assert!(setup.read("bass=20").unwrap_err().as_str().starts_with("bass="));
-        assert!(setup.read("mono=maybe").is_err() && setup.read("polarity=sideways").is_err() && setup.read("rumble=5").is_err());
+        assert!(setup.read("surround=quadraphonic").unwrap_err().as_str().starts_with("surround="));
+        assert!(setup.read("layout=2.1").is_err() && setup.read("logic=heavy").is_err() && setup.read("swap=flip").is_err());
+        assert!(setup.read("depth=17").is_err() && setup.read("mono=maybe").is_err() && setup.read("polarity=sideways").is_err() && setup.read("rumble=5").is_err());
     }
 
     #[test]
