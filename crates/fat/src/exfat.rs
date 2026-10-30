@@ -357,6 +357,23 @@ impl<D: Device> Fs<D> {
         self.exfat_write_set(lba, offset, name, 0x10, ALLOCATION_POSSIBLE, cluster, bytes)
     }
 
+    /// Turns the current contiguous (NoFatChain) directory into a FAT-chained one: the FAT is written first, then the flag
+    /// in its entry set is cleared, so a cut in between leaves a directory that still reads as contiguous.
+    pub(crate) fn exfat_unchain_dir(&mut self) -> Result<(), Error> {
+        let Some((lba, offset, entries)) = self.dir_set else { return Err(Error::NoSpace) };
+        let (first, count) = (self.dir, self.dir_clusters.max(1));
+        self.fat_set_range(first, count, |cluster| if cluster == first + count - 1 { 0xffff_ffff } else { cluster + 1 })?;
+        let mut sector = [0u8; SECTOR];
+        self.device.read(lba, &mut sector)?;
+        let set = &mut sector[offset..offset + entries * 32];
+        set[33] &= !NO_FAT_CHAIN;
+        let checksum = set_checksum(set);
+        set[2..4].copy_from_slice(&checksum.to_le_bytes());
+        self.device.write(lba, &sector)?;
+        self.dir_contiguous = false;
+        Ok(())
+    }
+
     /// The current (non-root, FAT-chained) directory got another cluster: its own entry records the size, so add it.
     pub(crate) fn exfat_dir_grew(&mut self) -> Result<(), Error> {
         let Some((lba, offset, entries)) = self.dir_set else { return Ok(()) };

@@ -607,7 +607,9 @@ impl<D: Device> Fs<D> {
     /// onto the root directory and returns its number.
     pub(crate) fn extend_root(&mut self, cluster: u32) -> Result<(), Error> {
         if self.dir_contiguous {
-            return Err(Error::NoSpace); // no FAT chain to extend; such a directory is read and filled, not grown
+            // A directory another system wrote as one run has no FAT chain to extend: give it one (the clusters it
+            // has, linked in order), clear NoFatChain in its entry set, then grow it like any other.
+            self.exfat_unchain_dir()?;
         }
         self.zero_cluster(cluster)?;
         let end = if self.kind == Kind::Fat32 { 0x0fff_ffff } else { 0xffff_ffff };

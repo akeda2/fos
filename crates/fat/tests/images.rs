@@ -442,3 +442,77 @@ fn exfat_subdirectories() {
     drop(fs);
     fsck(&path, &["fsck.exfat", "-n"]);
 }
+
+/// A directory another system wrote as one consecutive run (NoFatChain, no FAT entries) is read, and when it fills up it
+/// gets a FAT chain and grows instead of failing. The test turns a directory made by `mkdir` into that shape by hand:
+/// flag 0x03 in its stream extension, its FAT entry cleared.
+#[test]
+fn a_contiguous_exfat_directory_grows() {
+    if !tool("mkfs.exfat") {
+        return;
+    }
+    let path = scratch("exfat-contiguous.img");
+    let _cleanup = Cleanup(path.clone());
+    make_image(&path, 64, &["mkfs.exfat", "-c", "4096"]);
+    let mut fs = open(&path);
+    fs.mkdir(b"rec").unwrap();
+    let cluster = fs.entry(b"rec").unwrap().unwrap().first_cluster;
+    drop(fs);
+    {
+        let mut device = FileDevice(OpenOptions::new().read(true).write(true).open(&path).unwrap());
+        let mut sector = [0u8; 512];
+        let mut boot = [0u8; 512];
+        device.read(0, &mut boot).unwrap();
+        let le32 = |at: usize| u64::from(u32::from_le_bytes(boot[at..at + 4].try_into().unwrap()));
+        let (fat_lba, data_lba, root) = (le32(80), le32(88), le32(96));
+        let spc = 1u64 << boot[109];
+        // find the entry set of "rec" in the root directory: file entry 0x85, stream 0xc0, one name entry
+        let (mut lba, mut at) = (0, 0);
+        'search: for index in 0..spc {
+            device.read(data_lba + (root - 2) * spc + index, &mut sector).unwrap();
+            for slot in 0..16 {
+                if sector[slot * 32] == 0x85 && sector[slot * 32 + 32] == 0xc0 && sector[slot * 32 + 32 + 20..slot * 32 + 32 + 24] == (cluster as u32).to_le_bytes() {
+                    (lba, at) = (data_lba + (root - 2) * spc + index, slot * 32);
+                    break 'search;
+                }
+            }
+        }
+        assert!(at != 0 || lba != 0, "the entry set");
+        let set = &mut sector[at..at + 96];
+        set[33] = 0x03;
+        // the set checksum covers every byte but its own field
+        let mut sum = 0u16;
+        for (index, &byte) in set.iter().enumerate() {
+            if index != 2 && index != 3 {
+                sum = (if sum & 1 != 0 { 0x8000u16 } else { 0 }).wrapping_add(sum >> 1).wrapping_add(u16::from(byte));
+            }
+        }
+        set[2..4].copy_from_slice(&sum.to_le_bytes());
+        device.write(lba, &sector).unwrap();
+        // the FAT entry of a NoFatChain run is unused: clear it
+        let at = u64::from(cluster) * 4;
+        device.read(fat_lba + at / 512, &mut sector).unwrap();
+        sector[(at % 512) as usize..(at % 512) as usize + 4].fill(0);
+        device.write(fat_lba + at / 512, &sector).unwrap();
+    }
+    fsck(&path, &["fsck.exfat", "-n"]);
+
+    let mut fs = open(&path);
+    fs.enter(b"rec").unwrap();
+    // 128 entries per 4 KiB cluster: 60 long names need several clusters
+    for number in 0..60 {
+        let name = format!("take number {number:03} of the long evening.wav");
+        put(&mut fs, name.as_bytes(), &pattern(number, 500 + number));
+    }
+    drop(fs);
+    fsck(&path, &["fsck.exfat", "-n"]);
+    let mut fs = open(&path);
+    fs.enter(b"rec").unwrap();
+    let mut names = 0;
+    fs.list(|_| names += 1).unwrap();
+    assert_eq!(names, 60);
+    let file = fs.find(b"take number 059 of the long evening.wav").unwrap().unwrap();
+    let mut data = vec![0u8; file.size as usize];
+    fs.read(&file, 0, &mut data).unwrap();
+    assert!(data == pattern(59, 559));
+}

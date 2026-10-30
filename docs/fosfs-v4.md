@@ -86,11 +86,11 @@ says which one a save used.
    needs a v4 boot volume (v3 has no folders), so it is untested until the default flips.
 3. exFAT subfolders in `crates/fat` (**built**, `make test-format-exfat` and `cargo test` in `crates/fat`): `Fs::enter`,
    `mkdir`, `remove_dir`; a FAT-chained directory grows (its own entry's size follows), a contiguous (NoFatChain)
-   directory made by another system is read and filled but not grown (`NoSpace`). `tape_fs` resolves
+   directory made by another system is read, and when full gets a FAT chain (`exfat_unchain_dir`: FAT first, then the flag
+   cleared) and grows (`a_contiguous_exfat_directory_grows`). `tape_fs` resolves
    `diskN/rec/session1/x` on exFAT; `ls`, `mkdir`, `rm`, `write`, `cat` and the tape stream calls work in folders.
-   `fsck.exfat -n` accepts the result. FAT32 stays root-only (names stay ASCII, 60 characters). Not done: mounting an
-   exFAT volume at a path (needs its label read; the mount table takes FOSFS labels only), and a test of a
-   contiguous directory.
+   `fsck.exfat -n` accepts the result. FAT32 stays root-only (names stay ASCII, 60 characters). exFAT volumes mount by label
+   (`Fs::label`, `test-mounts`).
 4. Move tapes, configs and settings into their folders; `tape-rt` and the tapes use the new paths; deploy tooling follows.
    *Built so far (search path, bare names stay valid for good: v3 volumes and FAT sticks keep working):* a bare tape
    name falls back to `bin/NAME` (`tape_fs::resolve_file`); boot config (`hostname`, `settings`, `debug`, `start`) is read
