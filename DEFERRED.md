@@ -567,7 +567,7 @@ use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limi
   the sign of `j` (Swap rear), tune the logic presets, and try the wide output on a multichannel interface (UFX on rack1).
 - Phono archive, done: raw `NAME.lr.flac` while listening, then an offline decode to `NAME.flac` (see `docs/design.md`). Not done:
   decoding *live* into a second file while recording (kernel ABI: more than one `fs_stream`), reading the raw take in pieces instead
-  of whole into memory (an `fs_read_at` call) and rewriting a live decoded file at the depth the finished take's floor suggests.
+  of whole into memory (the `fs_read_at` call exists since ABI 29, `tape_rt::read_file_at`; phono does not use it yet) and rewriting a live decoded file at the depth the finished take's floor suggests.
   LPC and the STREAMINFO MD5 are in `crates/flac-enc` (LPC costs about 3.5 % of one fast core for 48 kHz stereo; a Pi 4 and the
   checkpointing recorder were not timed: if a take underruns there, try fewer LPC orders in `analyse_lpc`).
 - Fosplay: Pro Logic-style decoder, Ambiophonic/RACE and logic modes (listening only, no archive).

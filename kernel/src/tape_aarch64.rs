@@ -205,6 +205,7 @@ fn make_api(info: &BootInfo, arguments: &str) -> TapeApi {
         midi_devices: crate::usb_midi::api_midi_devices,
         nic_owned: api_nic_owned,
         gpio_pull_get: crate::gpio::api_gpio_pull_get,
+        fs_read_at: crate::tape_fs::api_fs_read_at,
     }
 }
 

@@ -1715,3 +1715,16 @@ loop (`ehci_service`) is shared with the iTD path (`EhciPipe::split`).
 
 **Not verified:** QEMU's `usb-hub` is full speed and cannot sit on an EHCI port, and its EHCI has no transaction translator, so this path
 has never run; `make test-usb-audio` and `make test-keyboard` (iTD and QH paths, which share `relink`) still pass. Needs real hardware: piano1's USB card.
+
+### Reading part of a file: `fs_read_at` (tape ABI 29)
+
+`fs_read` needs room for a whole file, which is wrong for a long take (a phono raw capture is hundreds of MiB). `fs_read_at(name, name_len,
+offset, buffer, capacity)` returns up to `capacity` bytes from byte `offset` (0 at or past the end, a negative `FS_*` code for a missing
+file or volume) and touches only the sectors that hold the range. The reference is whatever `fs_read` takes (`NAME`, `diskN/folder/NAME`,
+`@LABEL/NAME`, a mount path), on FOSFS (`Volume::read_at`, extent by extent, an unaligned start reads its first sector through a copy) and on
+FAT32/exFAT (`fat::Fs::read` already took an offset). `tape_rt::read_file_at` checks the table's `version` and `size` and gives `Err(-6)` on an
+older kernel. `tapes/fscheck` (`tape run fscheck NAME OFFSET LENGTH`) is the test tape: `make test-fs-read-at` compares ranges of a 5000-byte
+file on a v4 volume, in a v4 folder and on exFAT (offsets inside a sector, across sectors, the last bytes, the end, past it).
+
+**Not verified:** a file of several FOSFS extents (v4 holds up to three) is only covered by code reading; QEMU's fresh volumes give one extent.
+Not on real hardware. phono does not use the call yet (`DEFERRED.md`).

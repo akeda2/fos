@@ -728,6 +728,37 @@ impl Volume {
         Ok(Some(length))
     }
 
+    /// Reads up to `buffer.len()` bytes of a file starting at byte `offset`; returns how many (0 at or past the end), or
+    /// None if the file is absent. Only the sectors that hold the range are read.
+    pub fn read_at(&self, name: &[u8], offset: u64, buffer: &mut [u8]) -> Result<Option<usize>, Error> {
+        let Some(entry) = self.find_file(name)? else { return Ok(None) };
+        let wanted = entry.length.saturating_sub(offset).min(buffer.len() as u64) as usize;
+        let (mut done, mut skip) = (0usize, offset);
+        for &(start, count) in &entry.extents[..entry.extent_count] {
+            if done == wanted {
+                break;
+            }
+            let extent_bytes = u64::from(count) * 512;
+            if skip >= extent_bytes {
+                skip -= extent_bytes;
+                continue;
+            }
+            let mut sector = start + skip / 512;
+            let within = (skip % 512) as usize;
+            let mut left = (extent_bytes - skip).min((wanted - done) as u64) as usize;
+            skip = 0;
+            if within != 0 {
+                let head = self.read_sector(sector)?;
+                let take = (512 - within).min(left);
+                buffer[done..done + take].copy_from_slice(&head[within..within + take]);
+                (done, left, sector) = (done + take, left - take, sector + 1);
+            }
+            self.read_data(sector, &mut buffer[done..done + left])?;
+            done += left;
+        }
+        Ok(Some(done))
+    }
+
     /// Reads `out.len()` bytes starting at sector `start`: whole sectors go straight into `out`, a partial last
     /// sector via a copy.
     fn read_data(&self, start: u64, out: &mut [u8]) -> Result<(), Error> {

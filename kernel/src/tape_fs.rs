@@ -196,6 +196,35 @@ pub fn read(reference: &[u8], buffer: &mut [u8]) -> isize {
     }
 }
 
+/// `fs_read_at`: up to `buffer.len()` bytes of a file from byte `offset`; the count (0 at or past the end) or an `FS_*` code.
+pub fn read_at(reference: &[u8], offset: u64, buffer: &mut [u8]) -> isize {
+    if let Some((mut fs, name)) = resolve_fat(reference) {
+        return match fs.find(name) {
+            Ok(Some(file)) => match fs.read(&file, offset, buffer) {
+                Ok(length) => length as isize,
+                Err(error) => fat_error(error),
+            },
+            Ok(None) => FS_NOT_FOUND,
+            Err(error) => fat_error(error),
+        };
+    }
+    let (volume, name) = match resolve_file(reference, true) {
+        Ok(found) => found,
+        Err(code) => return code,
+    };
+    match volume.read_at(name, offset, buffer) {
+        Ok(Some(length)) => length as isize,
+        Ok(None) => FS_NOT_FOUND,
+        Err(_) => FS_ERROR,
+    }
+}
+
+/// Tape ABI 29 `fs_read_at(name, name_len, offset, buffer, capacity)`; shared by the x86 and aarch64 tape tables.
+pub extern "C" fn api_fs_read_at(name: *const u8, name_length: usize, offset: u64, buffer: *mut u8, capacity: usize) -> isize {
+    let (name, buffer) = unsafe { (core::slice::from_raw_parts(name, name_length), core::slice::from_raw_parts_mut(buffer, capacity)) };
+    read_at(name, offset, buffer)
+}
+
 /// A file written under a mount point makes the folders on its way, on the mounted volume or (volume absent) the boot
 /// volume, so a mount point needs no `mkdir` first. Elsewhere a missing folder stays an error.
 fn make_mount_folders(reference: &[u8], volume: &Volume, name: &[u8]) -> Result<(), Error> {

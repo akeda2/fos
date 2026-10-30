@@ -752,6 +752,20 @@ pub fn gpio_pull_get(pin: u32) -> Option<u8> {
     u8::try_from((table.gpio_pull_get)(pin)).ok()
 }
 
+/// Reads up to `buffer.len()` bytes of the file `name` from byte `offset` (any file reference `fs_read` takes); the count, 0
+/// at the end. `Err(FS_*)` for a missing file, `Err(-6)` on a kernel older than version 29.
+pub fn read_file_at(name: &str, offset: u64, buffer: &mut [u8]) -> Result<usize, isize> {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, fs_read_at) + core::mem::size_of::<usize>();
+    if table.version < 29 || (table.size as usize) < end {
+        return Err(-6);
+    }
+    match (table.fs_read_at)(name.as_ptr(), name.len(), offset, buffer.as_mut_ptr(), buffer.len()) {
+        length if length >= 0 => Ok(length as usize),
+        code => Err(code),
+    }
+}
+
 /// The I2C bus's SCL speed in Hz (Raspberry Pi 4 header); `Err(-4)` where there is none or the kernel is older than version 23.
 pub fn i2c_speed() -> Result<u32, i32> {
     let t = i2c_table().ok_or(-4)?;
