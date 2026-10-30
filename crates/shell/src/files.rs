@@ -10,7 +10,7 @@ pub static COMMANDS: &[Command] = &[
     Command::new("cat", "cat NAME", "shows a file as text (NAME, diskN/NAME, @LABEL/NAME or esp/NAME); other bytes show as dots.", cat),
     Command::new("write", "write NAME TEXT", "makes or replaces a small text file (NAME, diskN/NAME, @LABEL/NAME or esp/NAME).", write),
     Command::new("rm", "rm NAME|PATTERN [confirm]", "removes a file, or every match of a pattern (more than one needs `confirm` at the end).", rm),
-    Command::new("cp", "cp SRC|PATTERN DST", "copies a file between volumes; DST may be a volume or folder to keep the name (required for a pattern).", cp).alias(&["copy"]),
+    Command::new("cp", "cp [-r] SRC|PATTERN DST", "copies a file between volumes; DST may be a volume or folder to keep the name (required for a pattern); -r copies folders with everything in them.", cp).alias(&["copy"]),
     Command::new("mv", "mv SRC|PATTERN DST", "moves a file (copy, read back, remove); DST may be a volume or folder (required for a pattern).", mv),
     Command::new("cmp", "cmp A B", "says whether two files are byte-identical (a read-back check of `cp`).", cmp),
     Command::new("mkdir", "mkdir NAME", "makes a folder on a FOSFS v4 or exFAT volume (NAME, diskN/NAME or @LABEL/NAME); `ls diskN/NAME` lists it.", mkdir),
@@ -283,6 +283,10 @@ fn mv(host: &mut dyn Host, rest: &str) {
 
 fn copy_or_move(host: &mut dyn Host, rest: &str, moving: bool) {
     let verb = if moving { "mv" } else { "cp" };
+    let (first, after) = split_word(rest);
+    if matches!(first, "-r" | "-R") && !moving {
+        return copy_recursive(host, after);
+    }
     let (from, to) = split_word(rest);
     let (to, _) = split_word(to);
     if from.is_empty() || to.is_empty() {
@@ -422,6 +426,127 @@ fn walk(host: &mut dyn Host, scratch: &mut [u8], path: &mut [u8; 192], length: u
         }
     }
     Ok(())
+}
+
+/// `base/name` in `out`.
+fn join<'a>(out: &'a mut [u8; 192], base: &str, name: &[u8]) -> Option<&'a str> {
+    let base = base.trim_end_matches('/');
+    let end = base.len() + 1 + name.len();
+    out.get_mut(..base.len())?.copy_from_slice(base.as_bytes());
+    *out.get_mut(base.len())? = b'/';
+    out.get_mut(base.len() + 1..end)?.copy_from_slice(name);
+    core::str::from_utf8(&out[..end]).ok()
+}
+
+/// `cp -r SRC|PATTERN DST`: files copy as without `-r`; a folder is copied with everything in it, into DST when that is a
+/// volume or an existing folder (a pattern always needs one), else as DST itself.
+fn copy_recursive(host: &mut dyn Host, rest: &str) {
+    let (from, to) = split_word(rest);
+    let (to, _) = split_word(to);
+    if from.is_empty() || to.is_empty() {
+        return sayln!(host, "Usage: cp -r SRC|PATTERN DST   (a folder is copied with everything in it)");
+    }
+    let wild = has_wildcards(from);
+    let mut into = is_volume(to.trim_end_matches('/')) || host.list(to.trim_end_matches('/'), &mut |_, _| {}).is_ok();
+    if wild {
+        if !ensure_folder(host, to) {
+            return sayln!(host, "cp: {to} is not a folder and cannot be made one (a pattern needs a folder or volume as DST).");
+        }
+        into = true;
+    }
+    // (files copied, folders made, failures)
+    let mut totals = (0usize, 0usize, 0usize);
+    let mut sources = 0;
+    let mut one = |host: &mut dyn Host, reference: &str, directory: bool| {
+        sources += 1;
+        let mut buffer = [0u8; 192];
+        let name = reference.trim_end_matches('/').rsplit('/').next().unwrap_or(reference);
+        if !directory {
+            match target(&mut buffer, to, reference, into) {
+                Some(destination) if transfer(host, reference, destination, false) => totals.0 += 1,
+                _ => totals.2 += 1,
+            }
+            return;
+        }
+        let destination = if into { join(&mut buffer, to, name.as_bytes()) } else { Some(to.trim_end_matches('/')) };
+        let Some(destination) = destination else {
+            totals.2 += 1;
+            return sayln!(host, "cp: the name {reference} is too long to place in {to}.");
+        };
+        let (source, inside) = (reference.trim_end_matches('/'), destination.trim_end_matches('/'));
+        if inside == source || inside.strip_prefix(source).is_some_and(|tail| tail.starts_with('/')) {
+            totals.2 += 1;
+            return sayln!(host, "cp: cannot copy {source} into itself ({destination}).");
+        }
+        let found = host.with_buffer(DEPTH * LEVEL, &mut |host, scratch| copy_tree(host, scratch, source, destination, 0, &mut totals));
+        if !found {
+            totals.2 += 1;
+            sayln!(host, "cp: not enough free memory to copy {source}.");
+        }
+    };
+    if wild {
+        if let Err(error) = expand(host, from, &mut |host, reference, directory, _| one(host, reference, directory)) {
+            return sayln!(host, "cp: {from}: {error}.");
+        }
+    } else {
+        let directory = host.list(from.trim_end_matches('/'), &mut |_, _| {}).is_ok();
+        one(host, from, directory);
+    }
+    if sources == 0 {
+        return sayln!(host, "cp: no match for {from}.");
+    }
+    sayln!(host, "Copied {} file(s) and {} folder(s){}.", totals.0, totals.1, if totals.2 > 0 { ", some failed" } else { "" });
+}
+
+/// Copies the contents of folder `from` into folder `to` (made when missing), folder by folder.
+fn copy_tree(host: &mut dyn Host, scratch: &mut [u8], from: &str, to: &str, depth: usize, totals: &mut (usize, usize, usize)) {
+    if depth >= DEPTH {
+        totals.2 += 1;
+        return sayln!(host, "cp: {from} nests deeper than {DEPTH} folders; the rest is skipped.");
+    }
+    if !ensure_folder(host, to) {
+        totals.2 += 1;
+        return sayln!(host, "cp: cannot make the folder {to} (only FOSFS v4 and exFAT volumes have folders).");
+    }
+    totals.1 += 1;
+    let (region, deeper) = scratch.split_at_mut(LEVEL);
+    let capacity = region.len() / RECORD;
+    let (mut found, mut skipped) = (0, 0);
+    let listed = host.list(from.trim_end_matches('/'), &mut |_, entry| {
+        if entry.name.len() > NAME_MAX || found >= capacity {
+            skipped += 1;
+            return;
+        }
+        let record = &mut region[found * RECORD..(found + 1) * RECORD];
+        record[0] = entry.name.len() as u8;
+        record[1] = u8::from(entry.directory);
+        record[10..10 + entry.name.len()].copy_from_slice(entry.name);
+        found += 1;
+    });
+    if let Err(error) = listed {
+        totals.2 += 1;
+        return sayln!(host, "cp: {from}: {error}.");
+    }
+    if skipped > 0 {
+        totals.2 += skipped;
+        sayln!(host, "cp: {skipped} entries of {from} were skipped (names over {NAME_MAX} bytes, or more than {capacity} in a folder).");
+    }
+    for index in 0..found {
+        let record = &region[index * RECORD..(index + 1) * RECORD];
+        let (name, directory) = (&record[10..10 + usize::from(record[0])], record[1] != 0);
+        let (mut source, mut destination) = ([0u8; 192], [0u8; 192]);
+        let (Some(source), Some(destination)) = (join(&mut source, from, name), join(&mut destination, to, name)) else {
+            totals.2 += 1;
+            continue;
+        };
+        if directory {
+            copy_tree(host, deeper, source, destination, depth + 1, totals);
+        } else if transfer(host, source, destination, false) {
+            totals.0 += 1;
+        } else {
+            totals.2 += 1;
+        }
+    }
 }
 
 /// A `fmt::Write` into a byte array.
@@ -685,11 +810,29 @@ mod tests {
     }
 
     #[test]
+    fn cp_r_copies_folders_with_their_contents() {
+        let mut host = Mock::default();
+        put(&mut host, &["disk2/rec/a.txt", "disk2/rec/sub/b.txt", "disk2/rec/sub/deep/c.txt"]);
+        let out = run(&mut host, "cp -r disk2/rec disk2/copy");
+        assert!(out.contains("Copied 3 file(s) and 3 folder(s)."), "{out}");
+        assert_eq!(run(&mut host, "cat disk2/copy/sub/deep/c.txt"), "disk2/rec/sub/deep/c.txt\n");
+        // into an existing folder it goes inside, under its own name
+        let out = run(&mut host, "cp -r disk2/rec disk2/copy");
+        assert!(out.contains("Copied 3 file(s)"), "{out}");
+        assert!(run(&mut host, "cat disk2/copy/rec/a.txt").contains("a.txt"));
+        assert!(run(&mut host, "cp -r disk2/rec disk2/rec/inner").contains("into itself"));
+        // a pattern needs a folder; files in it copy as they do without -r
+        let out = run(&mut host, "cp -r disk2/rec/*.txt disk2/flat");
+        assert!(out.contains("Copied 1 file(s) and 0 folder(s)."), "{out}");
+        assert_eq!(run(&mut host, "cp -r disk2/none disk2/x"), "cp: disk2/none: no such file.\nCopied 0 file(s) and 0 folder(s), some failed.\n");
+    }
+
+    #[test]
     fn help_lists_commands_and_one_usage() {
         let mut host = Mock::default();
         assert!(run(&mut host, "help").contains("ls cat write rm cp mv cmp"));
-        assert!(run(&mut host, "help cp").starts_with("cp SRC|PATTERN DST\n"));
-        assert!(run(&mut host, "help copy").starts_with("cp SRC|PATTERN DST\n"));
+        assert!(run(&mut host, "help cp").starts_with("cp [-r] SRC|PATTERN DST\n"));
+        assert!(run(&mut host, "help copy").starts_with("cp [-r] SRC|PATTERN DST\n"));
         assert!(run(&mut host, "help nothing").contains("no command"));
         assert!(!crate::execute(&mut host, &[COMMANDS], "nothing"));
     }

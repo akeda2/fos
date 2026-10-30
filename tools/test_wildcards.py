@@ -65,6 +65,18 @@ def scenario(run):
     fsck = run("fsck")
     check("directory consistent" in fsck, "fsck is happy after the renames", fsck[-300:])
 
+    # cp -r: folders with everything in them, onto FOSFS and (below) exFAT
+    run("mkdir tree")
+    run("mkdir tree/sub")
+    run("write tree/a.txt aa")
+    run("write tree/sub/b.txt bb")
+    out = run("cp -r tree tree2")
+    check("Copied 2 file(s) and 2 folder(s)." in out, "cp -r copies a folder tree", out)
+    check("bb" in run("cat tree2/sub/b.txt"), "with the nested file's contents", "")
+    run("cp -r tree tree2")
+    check("bb" in run("cat tree2/tree/sub/b.txt"), "into an existing folder it goes inside, under its own name", "")
+    check("into itself" in run("cp -r tree tree/inner"), "a folder cannot be copied into itself", "")
+
     # exFAT: names compare ignoring case, so a lower-case pattern finds upper-case files
     run("format disk2 exfat wild")
     run("format disk2 confirm")
@@ -74,6 +86,11 @@ def scenario(run):
     check("REC1.TXT" in out.upper() and "rec2.txt" in out.lower() and "Other" not in out, "exFAT matches ignore case", out)
     out = run("cp disk2/rec*.txt backup")
     check("Copied 2 of 2 file(s)." in out, "cp from exFAT to a FOSFS folder", out)
+    out = run("cp -r tree disk2")
+    check("Copied 2 file(s) and 2 folder(s)." in out, "cp -r onto an exFAT volume makes its folders", out)
+    check("bb" in run("cat disk2/tree/sub/b.txt"), "and the files in them", "")
+    out = run("cp -r disk2/tree back")
+    check("Copied 2 file(s) and 2 folder(s)." in out and "bb" in run("cat back/sub/b.txt"), "cp -r from exFAT to FOSFS", out)
     out = run("rm disk2/rec*.txt confirm")
     check("Removed 2 of 2." in out and "Other" in run("ls disk2"), "rm on exFAT", out)
 
