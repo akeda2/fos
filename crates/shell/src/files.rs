@@ -11,7 +11,7 @@ pub static COMMANDS: &[Command] = &[
     Command::new("rm", "rm NAME", "removes a file (NAME, diskN/NAME, @LABEL/NAME or esp/NAME).", rm),
     Command::new("cp", "cp SRC DST", "copies a file between volumes; DST may be just a volume (diskN, @LABEL, esp) to keep the name.", cp).alias(&["copy"]),
     Command::new("cmp", "cmp A B", "says whether two files are byte-identical (a read-back check of `cp`).", cmp),
-    Command::new("mkdir", "mkdir NAME", "makes a folder on a FOSFS v4 volume (NAME, diskN/NAME or @LABEL/NAME); `ls diskN/NAME` lists it.", mkdir),
+    Command::new("mkdir", "mkdir NAME", "makes a folder on a FOSFS v4 or exFAT volume (NAME, diskN/NAME or @LABEL/NAME); `ls diskN/NAME` lists it.", mkdir),
 ];
 
 /// The largest file `cat` shows.
@@ -113,11 +113,11 @@ fn mkdir(host: &mut dyn Host, rest: &str) {
     let mut joined = [0u8; 192];
     let (reference, _) = split_word(join_volume(rest, &mut joined));
     if reference.is_empty() {
-        return sayln!(host, "Usage: mkdir NAME   (NAME, diskN/NAME or @LABEL/NAME; FOSFS v4 volumes only)");
+        return sayln!(host, "Usage: mkdir NAME   (NAME, diskN/NAME or @LABEL/NAME; FOSFS v4 and exFAT volumes only)");
     }
     match host.mkdir(reference) {
         Ok(()) => sayln!(host, "Folder {reference} is there."),
-        Err(FsError::BadName) => sayln!(host, "mkdir: {reference}: only a FOSFS v4 volume has folders, with valid names."),
+        Err(FsError::BadName) => sayln!(host, "mkdir: {reference}: only FOSFS v4 and exFAT volumes have folders; the name is invalid or taken."),
         Err(FsError::Failed) => sayln!(host, "mkdir: {reference}: the parent folder is missing, or the volume is full."),
         Err(error) => sayln!(host, "mkdir: {reference}: {error}."),
     }

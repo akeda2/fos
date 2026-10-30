@@ -162,7 +162,7 @@ def first_scenario(work):
         fsck = run("fsck disk2")
         check("FOSFS v4" in fsck and "directory consistent" in fsck, "fsck reports a consistent v4 directory", fsck[-400:])
         check("FOSFS v3" in run("fsck disk3"), "and v3 for the other volume", "")
-        check("only a FOSFS v4" in run("mkdir disk3 bin"), "a v3 volume has no folders", "")
+        check("only FOSFS v4" in run("mkdir disk3 bin"), "a v3 volume has no folders", "")
         run("mkdir disk2 bin")
         run("mkdir disk2 bin/tools")
         run("mkdir disk2 doc")

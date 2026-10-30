@@ -68,14 +68,35 @@ fn fat_disk(number: usize) -> Option<crate::fatvol::Fs> {
     crate::fatvol::mount(number.checked_sub(1)?)
 }
 
-/// A FAT32/exFAT volume named by a reference `diskN/NAME`.
+/// Enters the folders of `path` on an exFAT volume (FAT32 has none here: it stays root-only) and returns the last
+/// component. A folder that is missing leaves the volume at its root and the whole path as the name, which the file
+/// calls then report as not found or a bad name.
+fn enter_path<'a>(fs: &mut crate::fatvol::Fs, path: &'a [u8]) -> &'a [u8] {
+    if fs.kind() != fat::Kind::ExFat {
+        return path;
+    }
+    let mut rest = path;
+    while let Some(slash) = rest.iter().position(|&byte| byte == b'/') {
+        if fs.enter(&rest[..slash]).is_err() {
+            fs.enter_root();
+            return path;
+        }
+        rest = &rest[slash + 1..];
+    }
+    rest
+}
+
+/// A FAT32/exFAT volume named by a reference `diskN/NAME`; on exFAT, `diskN/rec/take1` is the file `take1` of the
+/// folder `rec`, which is entered, and the name returned is the last component.
 fn resolve_fat(reference: &[u8]) -> Option<(crate::fatvol::Fs, &[u8])> {
     let slash = reference.iter().position(|&byte| byte == b'/')?;
     if &reference[..slash] == b"esp" {
         return crate::fatvol::mount_esp().map(|fs| (fs, &reference[slash + 1..]));
     }
     let number = disk_number(&reference[..slash])?;
-    fat_disk(number).map(|fs| (fs, &reference[slash + 1..]))
+    let mut fs = fat_disk(number)?;
+    let name = enter_path(&mut fs, &reference[slash + 1..]);
+    Some((fs, name))
 }
 
 /// Whether a reference names a FAT32/exFAT volume (`esp/`, or `diskN/` of a disk with no FOSFS volume).
@@ -87,6 +108,7 @@ fn fat_error(error: fat::Error) -> isize {
     match error {
         fat::Error::NotFound => FS_NOT_FOUND,
         fat::Error::BadName => FS_BAD_NAME,
+        fat::Error::Exists => FS_BAD_NAME,
         _ => FS_ERROR,
     }
 }
@@ -158,7 +180,11 @@ pub fn write(reference: &[u8], data: &[u8]) -> isize {
 
 pub fn remove(reference: &[u8]) -> isize {
     if let Some((mut fs, file)) = resolve_fat(reference) {
-        return match fs.remove(file) {
+        let outcome = match fs.remove(file) {
+            Ok(false) if fs.kind() == fat::Kind::ExFat => fs.remove_dir(file),
+            other => other,
+        };
+        return match outcome {
             Ok(true) => 0,
             Ok(false) => FS_NOT_FOUND,
             Err(error) => fat_error(error),
@@ -175,8 +201,15 @@ pub fn remove(reference: &[u8]) -> isize {
     }
 }
 
-/// Makes a folder (FOSFS v4 volumes only).
+/// Makes a folder (FOSFS v4 and exFAT volumes only).
 pub fn mkdir(reference: &[u8]) -> isize {
+    if let Some((mut fs, name)) = resolve_fat(reference) {
+        crate::fatvol::stamp(&mut fs);
+        return match fs.mkdir(name) {
+            Ok(()) => 0,
+            Err(error) => fat_error(error),
+        };
+    }
     let (volume, name) = match resolve_file(reference, false) {
         Ok(found) => found,
         Err(code) => return code,
@@ -206,6 +239,15 @@ pub fn each_entry(reference: &[u8], each: &mut dyn FnMut(&[u8], u64, bool, Optio
     let fat = if reference == b"esp" { crate::fatvol::mount_esp() } else { disk_number(split_selector(reference).0).and_then(fat_disk) };
     if let Some(mut fs) = fat {
         let kind = if fs.kind() == fat::Kind::ExFat { "exFAT" } else { "FAT32" };
+        // exFAT: `diskN/rec/session1` lists that folder; FAT32 and `esp` list the root as before.
+        if fs.kind() == fat::Kind::ExFat {
+            let folder = split_selector(reference).1;
+            for part in folder.split(|&byte| byte == b'/').filter(|part| !part.is_empty()) {
+                if fs.enter(part).is_err() {
+                    return Err(FS_NOT_FOUND);
+                }
+            }
+        }
         return fs.list(|entry| each(entry.name(), u64::from(entry.size), entry.is_directory, entry.modified)).map(|()| kind).map_err(fat_error);
     }
     let (selector, mut folder) = split_selector(reference);

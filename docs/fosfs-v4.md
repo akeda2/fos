@@ -84,10 +84,47 @@ says which one a save used.
    way. Only FOSFS volumes mount (exFAT needs step 3). `fstab` is read after `config::load()`; the **bounded boot wait
    and the settings overlay move to step 4**, when `settings/` actually exists. The fallback to a boot-volume folder
    needs a v4 boot volume (v3 has no folders), so it is untested until the default flips.
-3. exFAT subfolders in `crates/fat` (directory traversal, create/delete in subdirectories, long names, the contiguous
-   writer for streams). This is the largest piece.
+3. exFAT subfolders in `crates/fat` (**built**, `make test-format-exfat` and `cargo test` in `crates/fat`): `Fs::enter`,
+   `mkdir`, `remove_dir`; a FAT-chained directory grows (its own entry's size follows), a contiguous (NoFatChain)
+   directory made by another system is read and filled but not grown (`NoSpace`). `tape_fs` resolves
+   `diskN/rec/session1/x` on exFAT; `ls`, `mkdir`, `rm`, `write`, `cat` and the tape stream calls work in folders.
+   `fsck.exfat -n` accepts the result. FAT32 stays root-only (names stay ASCII, 60 characters). Not done: mounting an
+   exFAT volume at a path (needs its label read; the mount table takes FOSFS labels only), and a test of a
+   contiguous directory.
 4. Move tapes, configs and settings into their folders; `tape-rt` and the tapes use the new paths; deploy tooling follows.
 5. Crash safety, only if real hardware shows a need (see "Journaling" below).
+6. Wildcards in `ls`, `cp`, `rm` and a new `mv` (see "Wildcards in shell tools" below).
+
+## Wildcards in shell tools (2026-10-30: to build, step 6)
+
+`ls`, `cp`/`copy`, `rm` and a new `mv` take bash-style patterns. Today every argument is one literal reference.
+
+- **Syntax.** `*` (any run of characters), `?` (one character), `[abc]` / `[a-z]` / `[!a-z]` (a set). Case-sensitive on FOSFS v4,
+  case-insensitive on FAT/exFAT (as those volumes already compare names). `/` is never matched by `*` or `?`: a pattern
+  works within one folder, and each folder component of a path may carry its own pattern (`rec/*/lp1.flac`). No `**`, no
+  brace expansion, no quoting rules beyond a backslash to take the next character literally.
+- **Where it expands.** In the shell, not in the kernel file calls or the tape ABI, so tapes keep taking exact names. The
+  shell host asks `Host::list` for the folder, filters with a shared matcher (a `no_std` function in `crates/shell`, with
+  host unit tests), and runs the command once per match, in listing order. The volume selector (`diskN`, `@LABEL`, `esp`)
+  and mount points are literal; wildcards start after them. Dot files are not special.
+- **No match.** An argument with wildcard characters that matches nothing is an error ("no match for PATTERN"), never passed
+  on literally. An argument without wildcard characters behaves exactly as now (a file called `a*b` is reachable with
+  `a\*b`).
+- **`ls PATTERN`** lists the matches (folders by their own name, not their contents, unlike `ls FOLDER`).
+- **`cp PATTERN DST`** needs DST to be a folder or a volume (`diskN`, `@LABEL/FOLDER`): several sources cannot share one
+  file name. It makes DST's folders when they are missing on FOSFS v4 and exFAT, reports each file and carries on after a
+  failure, with a count at the end. Copying a folder is not part of this (`-r` is a later step).
+- **`mv SRC DST`** (new): same volume and FOSFS v4 means renaming the directory entry (one sector write, crash-safe, no data
+  copied; moving between folders changes the parent field); across volumes it is copy, then remove the source only after
+  the copy read back right. The pattern and destination rules are those of `cp`. exFAT rename is a rewrite of the entry set
+  (new checksum), FAT32 stays copy and remove.
+- **`rm PATTERN`** removes every match; more than one match asks first (`rm ... confirm` as the very next command, as the
+  disk-destroying commands do) because a typo such as `rm *` has no undo. Folders match only when named by a pattern that
+  matches no files, and are removed only when empty.
+- **Mount points.** A pattern under a mount point expands on the mounted volume (or the boot volume's folder when it is
+  absent), the same lookup as a literal path.
+- **Tests.** Matcher unit tests in `crates/shell` (classes, `?`, escapes, `/` not matched, empty pattern); a QEMU test over a
+  v4 volume and an exFAT volume for `ls`, `cp`, `mv` and `rm` with and without matches, fsck afterwards.
 
 ## Journaling (2026-10-30: decided, not built)
 
