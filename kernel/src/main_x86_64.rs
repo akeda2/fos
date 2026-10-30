@@ -313,8 +313,22 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     debug::report_previous_crash();
 
     // ---- per-machine configuration files, then the start script ----
+    // fstab first: a `settings` mount puts a config volume's files over the root's, and that volume may be a slow stick.
+    let (mounted, _) = mounts::load();
+    if mounted > 0 && mounts::absent() > 0 && controllers + ehci_controllers + ohci_controllers > 0 {
+        println!("fstab: waiting for a mounted volume (up to 10 s; the root's folders are used if it never appears).");
+        for _ in 0..20 {
+            timer::wait_ticks(50);
+            usb_hid::probe_all();
+            if mounts::absent() == 0 {
+                break;
+            }
+        }
+        if mounts::absent() > 0 {
+            println!("fstab: {} mounted volume(s) still absent; the boot volume's folders stand (`usb rescan` looks again).", mounts::absent());
+        }
+    }
     config::load();
-    mounts::load();
     // xHCI events by MSI (decided by the settings file's `no-msi`, so only now; until here the foreground drained the ring)
     xhci::enable_interrupts_all(config::no_msi());
     // HD Audio controllers: reset, find codecs, choose playback/capture paths, prove an interrupt path (MSI, INTx or none)

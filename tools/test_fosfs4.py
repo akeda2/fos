@@ -74,11 +74,12 @@ def v4_files(volume: bytes):
     return found, meta
 
 
-def boot(tmp, disks, scenario):
+def boot(tmp, disks, scenario, reuse=False):
     """Boots the image with `disks` after it and runs `scenario(run)`."""
     code, variables = find("FOS_OVMF_CODE", CODE_CANDIDATES), find("FOS_OVMF_VARS", VARS_CANDIDATES)
     boot_image = tmp / "boot.img"
-    shutil.copy(IMAGE, boot_image)
+    if not (reuse and boot_image.exists()):  # reuse: boot again from the disk the last boot left behind
+        shutil.copy(IMAGE, boot_image)
     vars_copy = tmp / "vars.fd"
     shutil.copy(variables, vars_copy)
     command = ["qemu-system-x86_64", "-machine", "q35", "-m", "512", "-display", "none", "-serial", "stdio", "-no-reboot",

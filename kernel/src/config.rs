@@ -74,6 +74,13 @@ fn read(name: &str) -> Option<&'static str> {
         path[..9].copy_from_slice(b"settings/");
         path[9..9 + name.len()].copy_from_slice(name.as_bytes());
         if let Ok(folder) = core::str::from_utf8(&path[..9 + name.len()]) {
+            // `settings` mounted from a config volume (fstab): its copy overrides the root's.
+            if let Some((label, rest)) = crate::mounts::lookup(folder.as_bytes()) {
+                if let Some((_, volume)) = storage::volume_labelled(label.as_bytes()).filter(|(_, volume)| matches!(volume.file_length(rest), Ok(Some(_)))) {
+                    crate::println!("{name}: read from @{} (mounted at settings).", core::str::from_utf8(label.as_bytes()).unwrap_or("?"));
+                    return read_volume(volume, rest, name);
+                }
+            }
             if storage::volume_with_file(folder.as_bytes()).is_some() {
                 return read_root(folder);
             }
@@ -85,7 +92,12 @@ fn read(name: &str) -> Option<&'static str> {
 fn read_root(name: &str) -> Option<&'static str> {
     let buffer = unsafe { &mut *core::ptr::addr_of_mut!(BUFFER) };
     let Some(volume) = storage::volume_with_file(name.as_bytes()) else { return read_fat(name, buffer) };
-    match volume.read(name.as_bytes(), buffer) {
+    read_volume(volume, name.as_bytes(), name)
+}
+
+fn read_volume(volume: crate::fosfs::Volume, file: &[u8], name: &str) -> Option<&'static str> {
+    let buffer = unsafe { &mut *core::ptr::addr_of_mut!(BUFFER) };
+    match volume.read(file, buffer) {
         Ok(Some(length)) => core::str::from_utf8(&buffer[..length]).ok(),
         Ok(None) => None,
         Err(error) => {

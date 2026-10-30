@@ -44,6 +44,15 @@ def main():
             a.pump(1.0)
             check("hello from the host" in a.text()[mark:], "and the machine has it", a.text()[mark:])
 
+            # On a v4 volume a tape lives in bin/: a pushed update replaces it there instead of shadowing it from the root.
+            result = foscopy(["--mac", mac_a, "note.txt", ":disk1/hello"], work)
+            mark = a.send("cat bin/hello")
+            a.pump(1.0)
+            check(result.returncode == 0 and "hello from the host" in a.text()[mark:], "a pushed tape name replaces bin/NAME", a.text()[mark:])
+            mark = a.send("ls")
+            a.pump(1.0)
+            check("hello" not in a.text()[mark:].replace("hello from", ""), "and leaves no copy in the root", a.text()[mark:])
+
             result = foscopy(["--mac", mac_a, "big.bin", ":disk1/big.bin"], work)
             check(result.returncode == 0, "a file of 37,000 bytes (37 chunks) is stored", result.stderr[-600:])
             result = foscopy(["--mac", mac_a, ":disk1/big.bin", "back.bin"], work)

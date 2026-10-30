@@ -91,6 +91,17 @@ pub fn each(mut visit: impl FnMut(&[u8], &[u8])) {
     }
 }
 
+/// How many mounts name a volume that is not present right now.
+pub fn absent() -> usize {
+    let mut count = 0;
+    each(|_, label| {
+        if crate::storage::volume_labelled(label).is_none() {
+            count += 1;
+        }
+    });
+    count
+}
+
 /// The longest mount point that `reference` lies at or under: its label and what is left of the path (empty for the
 /// mount point itself).
 pub fn lookup_dir(reference: &[u8]) -> Option<(Label, &[u8])> {
@@ -119,7 +130,13 @@ pub fn load() -> (usize, usize) {
     clear();
     let Some(volume) = crate::storage::boot_volume() else { return (0, 0) };
     let mut buffer = [0u8; FSTAB_MAX];
-    let Ok(Some(length)) = volume.read(b"fstab", &mut buffer) else { return (0, 0) };
+    // `fstab` is boot configuration: settings/fstab on a v4 volume, else the root's.
+    let Ok(Some(length)) = volume.read(b"settings/fstab", &mut buffer).and_then(|found| match found {
+        Some(length) => Ok(Some(length)),
+        None => volume.read(b"fstab", &mut buffer),
+    }) else {
+        return (0, 0);
+    };
     let Ok(text) = core::str::from_utf8(&buffer[..length]) else { return (0, 1) };
     let (mut set, mut bad) = (0, 0);
     for line in text.lines() {

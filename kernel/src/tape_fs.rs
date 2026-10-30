@@ -199,15 +199,16 @@ pub fn write(reference: &[u8], data: &[u8]) -> isize {
     if make_mount_folders(reference, &volume, name).is_err() {
         return FS_ERROR;
     }
-    match volume.write(replace_target(&volume, name), data) {
+    match volume.write(name, data) {
         Ok(()) => 0,
         Err(Error::InvalidName) => FS_BAD_NAME,
         Err(_) => FS_ERROR,
     }
 }
 
-/// Where a write of bare `name` goes: a tape that lives only in `bin/` is replaced there, so a pushed update (`foscopy`,
-/// NETFS) is not shadowed by a new copy in the root. Anything else keeps its name.
+/// Where a pushed file (NETFS put: `foscopy`, `tapesync`) of bare `name` goes: a tape that lives only in `bin/` is
+/// replaced there, so an update is not shadowed by a new copy in the root. Not used by the shell's `write` or a tape's
+/// own writes, where a bare name means the root even when `bin/` has the same name.
 pub(crate) fn replace_target<'a>(volume: &Volume, name: &'a [u8]) -> &'a [u8] {
     if matches!(volume.file_length(name), Ok(Some(_))) {
         return name;

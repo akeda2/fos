@@ -23,16 +23,31 @@ def scenario(run):
     check("hello from a v2 tape" in out, "run hello starts bin/hello", out)
     run("write note.txt plain")
     check("plain" in run("cat note.txt"), "a bare file in the root is read as itself", "")
-    run("write hello replaced")
-    check("replaced" in run("cat bin/hello"), "a bare write replaces the tape where it lives, in bin/", "")
-    check("hello " not in run("ls").replace("bin", ""), "and leaves no copy in the root", "")
     run("rm hello")
     check("no such file" in run("cat bin/hello"), "a bare rm removes it from bin/", "")
+
+
+def prepare(run):
+    run("format disk2 cfgvol")
+    run("format disk2 confirm")
+    run("write disk2 debug watchdog 17")
+    run("write settings/fstab settings @cfgvol")
+
+
+def overlay(run):
+    check("settings -> @cfgvol" in run("mount"), "settings/fstab mounts the config volume at boot", "")
+    status = run("debug status")
+    check("watchdog: 17 s" in status, "its debug file overrides settings/debug", status)
 
 
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         boot(Path(tmp), [], scenario)
+    with tempfile.TemporaryDirectory() as tmp:
+        disk = Path(tmp) / "cfg.img"
+        disk.write_bytes(bytes(64 << 20))
+        boot(Path(tmp), [disk], prepare)
+        boot(Path(tmp), [disk], overlay, reuse=True)
     print("v4-boot: all checks passed")
 
 
