@@ -1392,8 +1392,9 @@ and a message in the header. Off uses the old stereo path unchanged (`Output::pu
   attack/release, gated at -70 dBFS. Music: slope 1, floor 6 dB, 20 ms follower, 10 ms attack, 250 ms release. Film: slope 3,
   floor 24 dB, 10/5/120 ms. QS plus Music logic is a gentle stereo-to-quad "horseshoe" upmix. Logic does not act on Ambience.
 - *Ambience*: the passive `Upmix` (rear difference signal, delayed, low-passed) for stereo classical and organ music.
-- `crates/flac-enc` (no allocation, no_std, fixed 4096-sample blocks, 1-8 channels, 4-24 bits, fixed predictors with Rice coding,
-  wasted-bits detection, four stereo modes, no LPC, MD5 left zero) and its `depth` module (`NoiseMeter`: histogram of 1024-sample
+- `crates/flac-enc` (no allocation, no_std, fixed 4096-sample blocks, 1-8 channels, 4-24 bits, fixed predictors and LPC (order 1-12, f64 analysis,
+  14-bit coefficients, integer residual) with Rice coding, wasted-bits detection, four stereo modes, the STREAMINFO MD5 of the
+  audio (a checkpoint signs the audio so far; `md5` module)) and its `depth` module (`NoiseMeter`: histogram of 1024-sample
   block levels, 10th percentile floor; `pick_bits`; `Quantizer`: TPDF dither into a 24-bit container) are written and tested
   (ffmpeg decodes 1, 2, 4 and 6 channels bit-exactly); the archive below uses them.
 What QEMU verifies: the maths (host tests), the keys, the buttons' layout and the settings file. What only real records and a

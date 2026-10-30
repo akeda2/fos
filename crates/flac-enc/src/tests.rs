@@ -231,3 +231,131 @@ fn quantizer_keeps_the_grid_and_dither_is_unbiased() {
     let b = encode(Info { sample_rate: 48000, channels: 2, bits: 24 }, &qd, BLOCK).len();
     assert!(b < a * 3 / 4, "{b} vs {a}");
 }
+
+fn hex(d: [u8; 16]) -> String {
+    d.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[test]
+fn md5_matches_the_rfc_vectors() {
+    let md5 = |s: &[u8], chunk: usize| {
+        let mut m = Md5::new();
+        for c in s.chunks(chunk.max(1)) {
+            m.update(c);
+        }
+        hex(m.finish())
+    };
+    assert_eq!(md5(b"", 1), "d41d8cd98f00b204e9800998ecf8427e");
+    assert_eq!(md5(b"abc", 1), "900150983cd24fb0d6963f7d28e17f72");
+    assert_eq!(md5(b"message digest", 5), "f96b697d7cb7938d525a2f31aaf161d0");
+    let long = b"12345678901234567890123456789012345678901234567890123456789012345678901234567890";
+    for chunk in [1, 7, 63, 64, 65, 1000] {
+        assert_eq!(md5(long, chunk), "57edf4a22be3c955ac49da2e2107b67a");
+    }
+    // padding boundary: 55, 56 and 64 bytes
+    assert_eq!(md5(&[b'a'; 56], 3), "3b0c8ac703f828b04c6c197006d17218");
+}
+
+/// The signature in STREAMINFO is MD5 of the interleaved little-endian samples, whole bytes each.
+fn expected_md5(data: &[Vec<i32>], bits: u32) -> String {
+    let width = (bits as usize).div_ceil(8);
+    let mut m = Md5::new();
+    for i in 0..data[0].len() {
+        for c in data {
+            m.update(&c[i].to_le_bytes()[..width]);
+        }
+    }
+    hex(m.finish())
+}
+
+#[test]
+fn streaminfo_carries_the_md5() {
+    for (ch, bits) in [(2usize, 24u32), (2, 16), (1, 18), (4, 24)] {
+        let data = signal(ch, 9000, bits, 30, 0);
+        let file = encode(Info { sample_rate: 48000, channels: ch as u32, bits }, &data, BLOCK);
+        assert_eq!(hex(file[26..42].try_into().unwrap()), expected_md5(&data, bits), "{ch} ch {bits} bit");
+    }
+    // Before any audio it stays zero ("not computed"); a checkpoint mid-stream signs the audio so far.
+    let info = Info { sample_rate: 48000, channels: 2, bits: 24 };
+    let mut enc = Box::new(Encoder::new(info));
+    let mut header = vec![0u8; 256];
+    let h = enc.write_header(&mut header, &[]).unwrap();
+    assert_eq!(&header[26..42], &[0u8; 16]);
+    let data = signal(2, 4096, 24, 30, 0);
+    let mut out = vec![0u8; max_frame_bytes(2)];
+    enc.encode_frame(&[&data[0], &data[1]], &mut out).unwrap();
+    enc.patch_header(&mut header[..42]);
+    assert_eq!(hex(header[26..42].try_into().unwrap()), expected_md5(&data, 24));
+    assert!(h > 42);
+}
+
+/// ffmpeg's own MD5 of the decoded PCM must equal the signature we wrote.
+#[test]
+fn ffmpeg_agrees_with_the_signature() {
+    if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+        eprintln!("ffmpeg not installed: skipped");
+        return;
+    }
+    let data = signal(2, 12_000, 24, 30, 0);
+    let file = encode(Info { sample_rate: 48000, channels: 2, bits: 24 }, &data, BLOCK);
+    let path = std::env::temp_dir().join("flac-enc-test-md5.flac");
+    std::fs::write(&path, &file).unwrap();
+    let o = std::process::Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&path).args(["-c:a", "pcm_s24le", "-f", "md5", "-"]).output().unwrap();
+    std::fs::remove_file(&path).ok();
+    assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), format!("MD5={}", hex(file[26..42].try_into().unwrap())));
+}
+
+/// A resonant signal (two poles near the unit circle, a little noise) that the fixed polynomials predict badly.
+fn resonant(n: usize, bits: u32) -> Vec<i32> {
+    let mut rng = Rng(4242);
+    let (mut y1, mut y2) = (0f64, 0f64);
+    let amp = (1i64 << (bits - 6)) as f64;
+    (0..n)
+        .map(|_| {
+            let e = (rng.next() % 1000) as f64 / 1000.0 * amp * 0.02;
+            let y = 1.97 * y1 - 0.985 * y2 + e;
+            y2 = y1;
+            y1 = y;
+            y as i32
+        })
+        .collect()
+}
+
+#[test]
+fn lpc_is_chosen_for_predictable_audio_and_beats_fixed() {
+    let x = resonant(BLOCK, 20);
+    let mut s = Box::new(Scratch { shifted: [0; BLOCK], res: [0; BLOCK], win: [0.0; BLOCK] });
+    let plan = analyse(&x, 20, &mut s);
+    assert!(plan.kind == Kind::Lpc, "expected LPC");
+    // The fixed order-2 predictor on the same block, exact cost.
+    let mut res = vec![0i32; BLOCK];
+    residual(&x, 2, &mut res);
+    let (fixed, _) = best_partition(&res[..BLOCK - 2], BLOCK, 2);
+    assert!(plan.bits < fixed + 40 + 2 * 20, "lpc {} vs fixed {}", plan.bits, fixed);
+    // It must round trip through our decoder and ffmpeg's rules (the in-tree decoder follows the spec).
+    for bits in [16, 24] {
+        let data = vec![resonant(20_000, bits), resonant(20_000, bits).iter().map(|v| v / 3).collect()];
+        let file = encode(Info { sample_rate: 48000, channels: 2, bits }, &data, BLOCK);
+        assert!(decode(&file).0 == data, "{bits}-bit LPC round trip");
+    }
+}
+
+#[test]
+fn lpc_shrinks_a_tonal_file() {
+    // Reference: what the fixed predictors alone would need (orders 0-4, same Rice coder), per channel, summed.
+    let data = vec![resonant(40_960, 24), resonant(40_960, 24)];
+    let file = encode(Info { sample_rate: 48000, channels: 2, bits: 24 }, &data, BLOCK);
+    let mut fixed_bits = 0u64;
+    for ch in &data {
+        for blk in ch.chunks(BLOCK) {
+            let mut res = vec![0i32; BLOCK];
+            let mut best = u64::MAX;
+            for p in 0..=4 {
+                residual(blk, p, &mut res);
+                best = best.min(p as u64 * 24 + best_partition(&res[..BLOCK - p], BLOCK, p).0);
+            }
+            fixed_bits += best;
+        }
+    }
+    assert!((file.len() as u64 * 8) < fixed_bits * 9 / 10, "{} bytes vs fixed {} bytes", file.len(), fixed_bits / 8);
+}

@@ -1,23 +1,30 @@
 //! A small FLAC encoder for archiving: the caller hands it blocks of integer samples and gets finished frames back.
-//! `no_std`, no allocation: the scratch lives in `Encoder` (about 64 KiB; keep it in a `static` on a tape) and the
+//! `no_std`, no allocation: the scratch lives in `Encoder` (about 100 KiB; keep it in a `static` on a tape) and the
 //! caller supplies the output buffer.
 //!
 //! What it does, in the order a frame is built:
 //! * **Wasted bits.** If every sample of a channel has its low `w` bits clear, they are dropped and the subframe header
 //!   says so. This is how a 24-bit container holding 18-bit audio (see `depth`) costs what an 18-bit file would.
-//! * **Subframes.** Constant, verbatim, or a fixed polynomial predictor of order 0-4 with Rice-coded residuals in
-//!   partitions. The order is picked by the smallest sum of residual magnitudes; the partition order and Rice
-//!   parameters by exact bit counts. No LPC: it is a few percent bigger than `flac -8`, and every decoder reads it.
+//! * **Subframes.** Constant, verbatim, a fixed polynomial predictor of order 0-4, or linear prediction (LPC,
+//!   order 1-12, `lpc`) with Rice-coded residuals in partitions. The best fixed order is picked by the smallest sum of
+//!   residual magnitudes and the best LPC order by an estimate of the coded size; the partition order and Rice
+//!   parameters, and the choice between the two, by exact bit counts. The LPC analysis is floating point (hard-float
+//!   tapes only), the coefficients written are quantised integers, so decoders reproduce the samples exactly.
 //! * **Stereo.** For two channels the four assignments (left/right, left/side, side/right, mid/side) are all
 //!   costed and the cheapest is written. The side channel needs one more bit than the sample.
 //! * **Multichannel** (up to 8): independent channels in the order the caller gives. FLAC's own order is L R C LFE Ls Rs
 //!   for 5.1 and L R Ls Rs for 4.0.
 //!
-//! The STREAMINFO MD5 is left zero ("not computed", which every decoder accepts); the total sample count and frame
-//! sizes are patched into the header after the last frame with `Encoder::patch_header`.
+//! The STREAMINFO MD5 signature (`md5`) covers the samples as given (interleaved, little-endian, whole bytes per
+//! sample), as FLAC defines it. It, the total sample count and the frame sizes are patched into the header with
+//! `Encoder::patch_header`, after the last frame or at a checkpoint: the signature then is that of the audio so far.
 #![cfg_attr(not(test), no_std)]
 
 pub mod depth;
+mod lpc;
+pub mod md5;
+
+use md5::Md5;
 
 /// Samples per channel in a full block. Fixed so the scratch is a plain array.
 pub const BLOCK: usize = 4096;
@@ -215,6 +222,8 @@ struct Plan {
     wasted: u32,
     order: usize,
     po: u32,
+    coefs: [i32; lpc::MAX_ORDER],
+    shift: i32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -222,16 +231,36 @@ enum Kind {
     Constant,
     Verbatim,
     Fixed,
+    Lpc,
 }
 
 struct Scratch {
     shifted: [i32; BLOCK],
     res: [i32; BLOCK],
+    win: [f64; BLOCK],
 }
 
 fn wasted_bits(x: &[i32]) -> u32 {
     let or = x.iter().fold(0i32, |a, &v| a | v);
     if or == 0 { 0 } else { or.trailing_zeros() }
+}
+
+/// Bits of the residual coding method, partition order and the partitions for the best partition order, and that order.
+fn best_partition(res: &[i32], n: usize, order: usize) -> (u64, u32) {
+    let mut best = (u64::MAX, 0);
+    for po in 0..=max_po(n, order) {
+        let mut bits = 2 + 4;
+        let mut start = 0;
+        for i in 0..1usize << po {
+            let len = part_len(n, order, po, i);
+            bits += 4 + best_param(&res[start..start + len]).0;
+            start += len;
+        }
+        if bits < best.0 {
+            best = (bits, po);
+        }
+    }
+    best
 }
 
 fn analyse(x: &[i32], bps: u32, s: &mut Scratch) -> Plan {
@@ -243,10 +272,11 @@ fn analyse(x: &[i32], bps: u32, s: &mut Scratch) -> Plan {
     }
     let sh = &s.shifted[..n];
     let bps = bps - w;
+    let plain = Plan { bits: 0, kind: Kind::Verbatim, wasted: w, order: 0, po: 0, coefs: [0; lpc::MAX_ORDER], shift: 0 };
     if sh.iter().all(|&v| v == sh[0]) {
-        return Plan { bits: hdr + bps as u64, kind: Kind::Constant, wasted: w, order: 0, po: 0 };
+        return Plan { bits: hdr + bps as u64, kind: Kind::Constant, ..plain };
     }
-    let mut best = Plan { bits: hdr + n as u64 * bps as u64, kind: Kind::Verbatim, wasted: w, order: 0, po: 0 };
+    let mut best = Plan { bits: hdr + n as u64 * bps as u64, ..plain };
     // The order with the smallest residual magnitude; then the exact Rice cost for that one only.
     let mut order = 0;
     let mut least = u64::MAX;
@@ -259,20 +289,62 @@ fn analyse(x: &[i32], bps: u32, s: &mut Scratch) -> Plan {
         }
     }
     residual(sh, order, &mut s.res);
-    let res = &s.res[..n - order];
-    for po in 0..=max_po(n, order) {
-        let mut bits = hdr + order as u64 * bps as u64 + 2 + 4;
-        let mut start = 0;
-        for i in 0..1usize << po {
-            let len = part_len(n, order, po, i);
-            bits += 4 + best_param(&res[start..start + len]).0;
-            start += len;
-        }
-        if bits < best.bits {
-            best = Plan { bits, kind: Kind::Fixed, wasted: w, order, po };
+    let (part, po) = best_partition(&s.res[..n - order], n, order);
+    let bits = hdr + order as u64 * bps as u64 + part;
+    if bits < best.bits {
+        best = Plan { bits, kind: Kind::Fixed, order, po, ..plain };
+    }
+    if n >= 64 {
+        if let Some(lpc) = analyse_lpc(sh, bps, &mut s.win, &mut s.res) {
+            let bits = hdr + lpc.order as u64 * bps as u64 + 4 + 5 + lpc.order as u64 * lpc::PRECISION as u64 + lpc.bits;
+            if bits < best.bits {
+                best = Plan { bits, kind: Kind::Lpc, order: lpc.order, po: lpc.po, coefs: lpc.coefs, shift: lpc.shift, ..plain };
+            }
         }
     }
     best
+}
+
+struct LpcPlan {
+    bits: u64,
+    order: usize,
+    po: u32,
+    coefs: [i32; lpc::MAX_ORDER],
+    shift: i32,
+}
+
+/// The best linear predictor of the (wasted-bits-shifted) block `sh`: orders 1-12 are ranked by an estimate of
+/// their coded size, the best one gets the exact Rice cost (`bits` covers the residual coding only).
+fn analyse_lpc(sh: &[i32], bps: u32, win: &mut [f64], res: &mut [i32]) -> Option<LpcPlan> {
+    let n = sh.len();
+    let mut ac = [0.0; lpc::MAX_ORDER + 1];
+    lpc::autocorrelate(sh, win, &mut ac);
+    if ac[0] <= 0.0 {
+        return None;
+    }
+    let mut table = [[0.0; lpc::MAX_ORDER]; lpc::MAX_ORDER];
+    let usable = lpc::levinson(&ac, &mut table);
+    let mut best: Option<(u64, usize, [i32; lpc::MAX_ORDER], i32)> = None;
+    for m in 0..usable {
+        let order = m + 1;
+        let Some((coefs, shift)) = lpc::quantize(&table[m][..order]) else { continue };
+        if !lpc::residual(sh, &coefs[..order], shift, res) {
+            continue;
+        }
+        let count = (n - order) as u64;
+        let mag: u64 = res[..n - order].iter().map(|&v| v.unsigned_abs() as u64).sum();
+        let mean_q8 = (mag << 8) / count + 256;
+        let est = count * lpc::log2_q8(mean_q8) + 256 * order as u64 * (lpc::PRECISION as u64 + bps as u64);
+        if best.is_none_or(|b| est < b.0) {
+            best = Some((est, order, coefs, shift));
+        }
+    }
+    let (_, order, coefs, shift) = best?;
+    if !lpc::residual(sh, &coefs[..order], shift, res) {
+        return None;
+    }
+    let (bits, po) = best_partition(&res[..n - order], n, order);
+    Some(LpcPlan { bits, order, po, coefs, shift })
 }
 
 fn write_subframe(b: &mut Bits, x: &[i32], bps: u32, plan: &Plan, s: &mut Scratch) {
@@ -283,6 +355,7 @@ fn write_subframe(b: &mut Bits, x: &[i32], bps: u32, plan: &Plan, s: &mut Scratc
         Kind::Constant => 0,
         Kind::Verbatim => 1,
         Kind::Fixed => 8 + plan.order as u64,
+        Kind::Lpc => 32 + plan.order as u64 - 1,
     };
     b.put(ty, 6);
     if w > 0 {
@@ -300,12 +373,21 @@ fn write_subframe(b: &mut Bits, x: &[i32], bps: u32, plan: &Plan, s: &mut Scratc
     match plan.kind {
         Kind::Constant => b.put_signed(sh[0], bps),
         Kind::Verbatim => sh.iter().for_each(|&v| b.put_signed(v, bps)),
-        Kind::Fixed => {
+        Kind::Fixed | Kind::Lpc => {
             let p = plan.order;
             for &v in &sh[..p] {
                 b.put_signed(v, bps);
             }
-            residual(sh, p, &mut s.res);
+            if plan.kind == Kind::Lpc {
+                b.put(lpc::PRECISION as u64 - 1, 4);
+                b.put(plan.shift as u64 & 0x1f, 5);
+                for &c in &plan.coefs[..p] {
+                    b.put_signed(c, lpc::PRECISION);
+                }
+                lpc::residual(sh, &plan.coefs[..p], plan.shift, &mut s.res);
+            } else {
+                residual(sh, p, &mut s.res);
+            }
             let res = &s.res[..n - p];
             b.put(0, 2);
             b.put(plan.po as u64, 4);
@@ -354,6 +436,7 @@ pub struct Encoder {
     mid: [i32; BLOCK],
     side: [i32; BLOCK],
     scratch: Scratch,
+    md5: Md5,
 }
 
 impl Encoder {
@@ -368,7 +451,8 @@ impl Encoder {
             max_block: 0,
             mid: [0; BLOCK],
             side: [0; BLOCK],
-            scratch: Scratch { shifted: [0; BLOCK], res: [0; BLOCK] },
+            scratch: Scratch { shifted: [0; BLOCK], res: [0; BLOCK], win: [0.0; BLOCK] },
+            md5: Md5::new(),
         }
     }
 
@@ -391,6 +475,9 @@ impl Encoder {
             | (((self.info.bits - 1) as u64) << 36)
             | (self.total & 0xF_FFFF_FFFF);
         s[10..18].copy_from_slice(&packed.to_be_bytes());
+        if self.total > 0 {
+            s[18..34].copy_from_slice(&self.md5.clone().finish());
+        }
         s
     }
 
@@ -458,18 +545,20 @@ impl Encoder {
 
         // Stereo: cost all four assignments; the choice is made before any bit is written.
         let mut assign = ch as u32 - 1;
+        let mut plans = [None; 4];
         if ch == 2 {
             let (l, r) = (chans[0], chans[1]);
             for i in 0..n {
                 self.mid[i] = (l[i] + r[i]) >> 1;
                 self.side[i] = l[i] - r[i];
             }
-            let pl = analyse(l, bps, &mut self.scratch).bits;
-            let pr = analyse(r, bps, &mut self.scratch).bits;
-            let pm = analyse(&self.mid[..n], bps, &mut self.scratch).bits;
-            let ps = analyse(&self.side[..n], bps + 1, &mut self.scratch).bits;
-            let options = [(pl + pr, 1), (pl + ps, 8), (ps + pr, 9), (pm + ps, 10)];
+            let pl = analyse(l, bps, &mut self.scratch);
+            let pr = analyse(r, bps, &mut self.scratch);
+            let pm = analyse(&self.mid[..n], bps, &mut self.scratch);
+            let ps = analyse(&self.side[..n], bps + 1, &mut self.scratch);
+            let options = [(pl.bits + pr.bits, 1), (pl.bits + ps.bits, 8), (ps.bits + pr.bits, 9), (pm.bits + ps.bits, 10)];
             assign = options.iter().min_by_key(|o| o.0).map(|o| o.1).unwrap();
+            plans = [Some(pl), Some(pr), Some(pm), Some(ps)];
         }
 
         let (bs_code, bs_ext): (u64, Option<(u64, u32)>) = match n {
@@ -522,15 +611,15 @@ impl Encoder {
         if ch == 2 {
             // Assignment codes: 1 = independent L/R, 8 = left/side, 9 = side/right, 10 = mid/side.
             let (l, r) = (chans[0], chans[1]);
-            let (first, second, bits1, bits2): (&[i32], &[i32], u32, u32) = match assign {
-                1 => (l, r, bps, bps),
-                8 => (l, &self.side[..n], bps, bps + 1),
-                9 => (&self.side[..n], r, bps + 1, bps),
-                _ => (&self.mid[..n], &self.side[..n], bps, bps + 1),
+            // plans: left, right, mid, side
+            let [pl, pr, pm, ps] = plans.map(|p| p.unwrap());
+            let (first, second, bits1, bits2, p1, p2): (&[i32], &[i32], u32, u32, Plan, Plan) = match assign {
+                1 => (l, r, bps, bps, pl, pr),
+                8 => (l, &self.side[..n], bps, bps + 1, pl, ps),
+                9 => (&self.side[..n], r, bps + 1, bps, ps, pr),
+                _ => (&self.mid[..n], &self.side[..n], bps, bps + 1, pm, ps),
             };
-            let p1 = analyse(first, bits1, &mut self.scratch);
             write_subframe(&mut b, first, bits1, &p1, &mut self.scratch);
-            let p2 = analyse(second, bits2, &mut self.scratch);
             write_subframe(&mut b, second, bits2, &p2, &mut self.scratch);
         } else {
             for c in chans {
@@ -544,6 +633,12 @@ impl Encoder {
         b.put(c16 as u64, 16);
         let len = b.pos;
 
+        let width = (bps as usize).div_ceil(8);
+        for i in 0..n {
+            for c in chans {
+                self.md5.update(&c[i].to_le_bytes()[..width]);
+            }
+        }
         self.frames += 1;
         self.total += n as u64;
         self.min_frame = self.min_frame.min(len as u32);
