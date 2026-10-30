@@ -20,6 +20,7 @@ unknown line is reported on the console ("unknown line ... ignored") and skipped
 | Line | Effect |
 | --- | --- |
 | `deny-term-net` | Close the network terminal (`term net`): nobody gets a shell over Ethernet. |
+| `replace-in-place` | A rewrite of a FOSFS file with no room beside the old copy reuses the old copy's space (a power cut then loses the file). Without it the write fails and the old file stays. |
 | `no-msi` | NICs stay on polling instead of MSI interrupts. |
 | `prefer-msix` | Try MSI-X before MSI on devices that offer both (a test aid; `docs/design.md`, interrupt delivery). |
 | `park-idle` | Park every NIC whose link has been down for a minute. |

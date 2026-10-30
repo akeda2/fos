@@ -176,6 +176,9 @@ pub enum Error {
     InvalidName,
     DirectoryFull,
     DataFull,
+    /// A rewrite would fit only by reusing the old copy's space, which a power cut would turn into a lost file
+    /// (`replace-in-place` in `settings` allows it).
+    NoRoomToReplace,
     TooBig,
     TooSmall,
     /// A folder in the path does not exist (or is a file).
@@ -191,6 +194,18 @@ impl From<block::Error> for Error {
     fn from(_: block::Error) -> Self {
         Error::Disk
     }
+}
+
+static REPLACE_IN_PLACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// `replace-in-place` in `settings`: let a rewrite that has no room beside the old copy reuse the old copy's space (a
+/// power cut in the middle then loses the file). Off by default.
+pub fn allow_replace_in_place() {
+    REPLACE_IN_PLACE.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn replace_in_place() -> bool {
+    REPLACE_IN_PLACE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// A file name any FOSFS version could hold: up to 48 letters, digits, `.`, `_`, `-` or `+`. A v3 volume applies
@@ -695,6 +710,58 @@ impl Volume {
         Ok((entries, problems))
     }
 
+    /// Repairs what `check` can name without guessing: clears damaged entries (they were already ignored, this frees the
+    /// slot and silences the report), moves a file or folder whose folder is gone to the root (unless the root already has
+    /// that name; then it is left and reported), and rewrites both superblock copies after a mount from the copy. Extents that
+    /// overlap and names used twice need a human decision and are only reported by `check`. Returns the number of repairs.
+    pub fn repair(&self, mut line: impl FnMut(core::fmt::Arguments)) -> Result<usize, Error> {
+        let (mut fixed, mut failed) = (0, None);
+        if self.backup_used {
+            self.write_super(&self.read_super()?)?;
+            fixed += 1;
+            line(format_args!("both superblock copies rewritten from sector 1"));
+        }
+        let per_sector = self.entries_per_sector() as u64;
+        self.scan(|lba, index, slot| {
+            if slot[0] == 0 {
+                return true;
+            }
+            let number = (lba - self.dir_start()) * per_sector + index as u64;
+            let result = match self.parse(slot) {
+                None => {
+                    line(format_args!("directory entry {number}: damaged, cleared"));
+                    self.edit_slot(lba, index, |slot| slot.fill(0)).map(|()| 1)
+                }
+                Some(parsed) if parsed.parent != 0 && !matches!(self.is_folder(parsed.parent), Ok(true)) => {
+                    let at = self.name_at();
+                    let name = &slot[at..at + parsed.name_length];
+                    let text = core::str::from_utf8(name).unwrap_or("?");
+                    match self.find_child(0, name) {
+                        Ok(None) => {
+                            line(format_args!("{text}: its folder is gone, moved to the root"));
+                            self.edit_slot(lba, index, |slot| slot[PARENT_AT..PARENT_AT + 4].fill(0)).map(|()| 1)
+                        }
+                        Ok(Some(_)) => {
+                            line(format_args!("{text}: its folder is gone and the root has that name already, left as it is"));
+                            Ok(0)
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                Some(_) => Ok(0),
+            };
+            match result {
+                Ok(done) => fixed += done,
+                Err(error) => {
+                    failed = Some(error);
+                    return false;
+                }
+            }
+            true
+        })?;
+        failed.map_or(Ok(fixed), Err)
+    }
+
     /// The entry at `path` (a name, or `folder/name` on v4); `None` if there is none or a folder in the path is missing.
     pub fn find(&self, path: &[u8]) -> Result<Option<Entry>, Error> {
         let (folder, name) = split_path(path);
@@ -792,7 +859,8 @@ impl Volume {
     /// write that points the entry at them is the commit, so a power cut leaves the old file or the new one, never a mix
     /// (there is no allocation map to repair: the directory is the only record of what is used). A v4 file takes one
     /// free run when one fits, else up to three. Only when the disk has no room for the new copy next to the old one is
-    /// the old one's space reused, and that case is not crash-safe.
+    /// the old one's space reused; that case is not crash-safe, so it fails with `NoRoomToReplace` unless `settings` says
+    /// `replace-in-place`.
     pub fn write(&self, name: &[u8], data: &[u8]) -> Result<(), Error> {
         if !self.accepts_name(name) {
             return Err(Error::InvalidName);
@@ -805,7 +873,16 @@ impl Volume {
         }
         let needed = data.len().div_ceil(512) as u64;
         let (extents, extent_count) = match self.allocate(needed, None) {
-            Err(Error::DataFull) if existing.is_some() => self.allocate(needed, existing.as_ref())?,
+            Err(Error::DataFull) if existing.is_some() => {
+                if !replace_in_place() {
+                    // Fails only when the rewrite would fit by reusing the old copy's space; otherwise it is just full.
+                    return Err(match self.allocate(needed, existing.as_ref()) {
+                        Ok(_) => Error::NoRoomToReplace,
+                        Err(error) => error,
+                    });
+                }
+                self.allocate(needed, existing.as_ref())?
+            }
             other => other?,
         };
         let slot = match &existing {
@@ -879,14 +956,18 @@ impl Volume {
 
     /// Changes bytes of an existing entry's slot in place; a v4 entry that is still in use gets its CRC refreshed.
     fn patch_slot(&self, entry: &Entry, patch: impl FnOnce(&mut [u8])) -> Result<(), Error> {
-        let mut directory = self.read_sector(entry.directory_lba)?;
-        let at = entry.index * self.entry_size();
+        self.edit_slot(entry.directory_lba, entry.index, patch)
+    }
+
+    fn edit_slot(&self, lba: u64, index: usize, patch: impl FnOnce(&mut [u8])) -> Result<(), Error> {
+        let mut directory = self.read_sector(lba)?;
+        let at = index * self.entry_size();
         let slot = &mut directory[at..at + self.entry_size()];
         patch(slot);
         if self.version == 4 && slot[0] != 0 {
             seal(slot);
         }
-        block::write(self.disk, self.base + entry.directory_lba, &directory)?;
+        block::write(self.disk, self.base + lba, &directory)?;
         Ok(())
     }
 
@@ -1147,4 +1228,14 @@ pub fn report(volume: &Volume) {
         Ok((files, problems)) => crate::println!("fsck: FOSFS v{}, {files} file(s), {problems} problem(s) (damaged entries are ignored, nothing is changed).", volume.version()),
         Err(error) => crate::println!("fsck: {error:?}"),
     }
+}
+
+/// `fsck repair`: clears damaged entries, re-roots orphans, rewrites both superblocks; then checks again.
+pub fn repair(volume: &Volume) {
+    match volume.repair(|text| crate::println!("{text}")) {
+        Ok(0) => crate::println!("fsck repair: nothing to repair."),
+        Ok(fixed) => crate::println!("fsck repair: {fixed} repair(s) made."),
+        Err(error) => return crate::println!("fsck repair: {error:?}"),
+    }
+    report(volume);
 }

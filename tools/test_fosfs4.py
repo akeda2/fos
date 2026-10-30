@@ -209,6 +209,12 @@ def first_scenario(work):
         check(result.returncode == 0 and (work / "big.back").read_bytes() == big, "and reads back byte for byte", result.stderr[-400:])
         fsck = run("fsck disk4")
         check("3 extents" in fsck and "directory consistent" in fsck, "fsck names the extents and finds nothing wrong", fsck[-500:])
+        # No room beside the old copy: the rewrite is refused (it used to reuse the old extents, which a power cut loses).
+        (work / "big2").write_bytes(os.urandom(2500 * SECTOR))
+        result = foscopy(["big2", ":disk4/big"], work)
+        check(result.returncode != 0 and "full" in result.stderr + result.stdout, "a rewrite with no room beside the old copy is refused", result.stderr[-300:] + result.stdout[-300:])
+        result = foscopy([":disk4/big", "big.again"], work)
+        check(result.returncode == 0 and (work / "big.again").read_bytes() == big, "and the old copy is still intact", result.stderr[-300:])
         for name in stored[0:6:2]:
             result = foscopy([f":disk4/{name}", f"{name}.back"], work)
             check(result.returncode == 0 and (work / f"{name}.back").read_bytes() == contents[name], f"the files around it ({name}) are untouched", result.stderr[-300:])
@@ -222,6 +228,11 @@ def second_scenario(run):
     check("file000" not in listing, "and the entry with a broken CRC is not listed", listing[:300])
     fsck = run("fsck disk2")
     check("damaged" in fsck and "sector 1" in fsck, "fsck names the damaged entry and the superblock fallback", fsck[-500:])
+    repair = run("fsck repair disk2")
+    check("damaged, cleared" in repair and "superblock copies rewritten" in repair, "fsck repair clears the damaged entry and rewrites both superblocks", repair[-500:])
+    check("moved to the root" in repair and "content 1" in run("cat disk2 file001"), "and moves a file whose folder is gone to the root", repair[-500:])
+    again = run("fsck disk2")
+    check("directory consistent" in again and "superblock" not in again, "a second fsck finds nothing wrong", again[-400:])
     run("write disk2 after.txt written after the fallback")
     check("written after" in run("cat disk2 after.txt"), "the fallback volume can still be written", "")
     run("label disk2 keep")
@@ -264,6 +275,15 @@ def main():
                 break
         else:
             raise SystemExit("FAIL: file000 not found in the directory")
+        for number in range(256):
+            at = (start + 2) * SECTOR + number * 128
+            if image[at + 40:at + 47] == b"file001":
+                image[at + 24:at + 28] = (200).to_bytes(4, "little")  # a folder that does not exist
+                image[at + 4:at + 8] = bytes(4)
+                image[at + 4:at + 8] = zlib.crc32(bytes(image[at:at + 128])).to_bytes(4, "little")
+                break
+        else:
+            raise SystemExit("FAIL: file001 not found in the directory")
         image[start * SECTOR:(start + 1) * SECTOR] = bytes(SECTOR)
         four.write_bytes(image)
         boot(tmp, [four, three, small], second_scenario)

@@ -238,6 +238,10 @@ pub fn load() {
                         None => crate::println!("settings: `{line}` ignored (hwp performance, balanced or power)."),
                     }
                 }
+                Some("replace-in-place") => {
+                    crate::fosfs::allow_replace_in_place();
+                    crate::println!("settings: replace-in-place -- a rewrite with no room beside the old copy reuses it (not crash-safe).");
+                }
                 Some("no-msi") => {
                     unsafe { NO_MSI = true };
                     crate::println!("settings: no-msi -- NICs stay on polling.");

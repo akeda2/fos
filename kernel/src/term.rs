@@ -1344,6 +1344,7 @@ fn copy_error(stage: &'static str, error: crate::fosfs::Error) -> CopyError {
     CopyError(match (stage, error) {
         ("write", Error::DirectoryFull) => "the destination directory is full",
         ("write", Error::DataFull) => "the destination volume is full",
+        ("write", Error::NoRoomToReplace) => "no room beside the old copy (rm it first)",
         ("write", Error::InvalidName) => "the destination name is invalid",
         ("write", _) => "writing the destination failed",
         _ => "reading the source failed",

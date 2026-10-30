@@ -106,7 +106,7 @@ says which one a save used.
    narrates), then `settings/NAME` is read from the mounted volume when it has the file, else the root's `settings/`,
    else the bare root name (`make test-v4-boot` covers the mount and override; the late-stick wait needs real USB).
    **aarch64:** the image is v4 too (tapes in `bin/`, `FOSFS=3` for flat); boot loads `fstab` and `settings/settings` before applying settings and waits up to 10 s for a late USB stick, as x86 does (`make test-aarch64-boot`; the wait itself needs real USB). **Not done:** the deploy skill's paths (bare names work).
-5. Crash safety, only if real hardware shows a need (see "Journaling" below).
+5. Crash safety: refuse unsafe rewrites and `fsck repair` built; a mirrored directory only if real hardware shows a need (see "Journaling" below).
 6. Wildcards in `ls`, `cp`, `rm` and a new `mv` (see "Wildcards in shell tools" below).
 
 ## Wildcards in shell tools (2026-10-30: built, step 6)
@@ -145,7 +145,7 @@ backslash only counts inside a pattern (an argument with no `*?[` is passed on e
 - **Tests.** Matcher unit tests in `crates/shell` (classes, `?`, escapes, `/` not matched, empty pattern); a QEMU test over a
   v4 volume and an exFAT volume for `ls`, `cp`, `mv` and `rm` with and without matches, fsck afterwards.
 
-## Journaling (2026-10-30: decided, not built)
+## Journaling (2026-10-30: no journal; (a) and (c) built, (b) not)
 
 No full journal: it doubles the writes on sticks and small disks, and the directory is already the only record of what is
 used (no allocation map to disagree with it). What the code does today:
@@ -155,15 +155,19 @@ used (no allocation map to disagree with it). What the code does today:
   write each; `grow` and `label` write only the superblock (backup in sector 1 first, then sector 0), and `mount` falls
   back to the backup. A torn entry write is caught by its CRC and the entry is skipped (`fsck` reports it).
 - **Known gaps.**
-  1. Replacing a file when the disk has no room for the new copy beside the old one reuses the old extents, which is not
-     crash-safe. The alternative, failing with "disk full", is safer but refuses a rewrite that would fit.
+  1. **Built (a):** replacing a file when the disk has no room for the new copy beside the old one used to reuse the old
+     extents, which is not crash-safe. It now fails (`NoRoomToReplace`, "no room beside the old copy (rm it first)"; NETFS
+     says "full") and the old file stays, unless `settings` says `replace-in-place` (`docs/config.md`). `make test-fosfs4`.
   2. `reserve` / `write_extent` (recorder streams) overwrite in place by design; the length is written last, so a reset
      keeps everything up to the previous length.
-  3. A torn entry sector loses that entry (the CRC detects it; nothing repairs it).
+  3. A torn entry sector loses that entry (the CRC detects it). **Built (c):** `fsck repair [diskN|@LABEL]` clears damaged
+     entries, moves a file or folder whose folder is gone to the root (unless the root has that name), and rewrites both
+     superblock copies after a mount from the backup. Overlapping extents and a name used twice need a human and are only
+     reported. It writes nothing without the word `repair`.
   4. Operations over several files (`copy` of a folder, `tapesync`) are not atomic as a set.
-- **If real hardware shows trouble:** (a) make gap 1 refuse unless a flag allows it; (b) keep a second copy of each directory
-  sector (or a one-sector intent record replayed at mount) so a torn write can be repaired instead of only detected;
-  (c) let `fsck` repair, not just report. Only (b) is real work; (a) and (c) are small.
+- **If real hardware shows trouble:** (b) keep a second copy of each directory sector (or a one-sector intent record
+  replayed at mount) so a torn write can be repaired instead of only detected. Not built: a 512-byte sector write is
+  atomic on practically all media, and it would double directory writes on sticks.
 
 ## Decisions (2026-10-30)
 

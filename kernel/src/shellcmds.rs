@@ -33,7 +33,7 @@ pub static COMMANDS: &[Command] = &[
             _ => crate::println!("Usage: hexdump ADDRESS [LENGTH <= 4096]  (decimal or 0x hex)"),
         }
     }),
-    Command::new("fsck", "fsck [diskN|@LABEL]", "checks a FOSFS volume's directory (default: the boot volume).", |_, rest| fsck(rest)),
+    Command::new("fsck", "fsck [repair] [diskN|@LABEL]", "checks a FOSFS volume's directory, repair fixes what it can (default: the boot volume).", |_, rest| fsck(rest)),
     Command::new("nic", "nic [list|sniff [N]|promisc N on|off|peers|discover|use N|map|send|recv]", "the network interfaces: list, watch the frames, promiscuous mode, the other fos machines.", |_, rest| crate::nicshell::command(rest)),
     Command::new("usb", "usb [rescan|debug [off]]", "the USB controllers and what is plugged in; `rescan` looks again; `debug` adds PORTSC and port events.", |_, rest| crate::usbshell::command(rest)),
     Command::new("kup", "kup serial [BAUD]", "takes a kernel update over the console serial port.", |_, rest| crate::kupshell::command(rest)),
@@ -510,25 +510,30 @@ fn hexdump(address: u64, length: usize) {
     }
 }
 
-/// `fsck [diskN|@LABEL]`: the same volume names as the file commands.
+/// `fsck [repair] [diskN|@LABEL]`: the same volume names as the file commands.
 fn fsck(rest: &str) {
+    let (repair, rest) = match rest.strip_prefix("repair") {
+        Some(after) if after.is_empty() || after.starts_with(' ') => (true, after.trim()),
+        _ => (false, rest),
+    };
+    let run = |volume: &crate::fosfs::Volume| if repair { crate::fosfs::repair(volume) } else { crate::fosfs::report(volume) };
     if rest.is_empty() {
         match crate::storage::boot_volume() {
-            Some(volume) => crate::fosfs::report(&volume),
+            Some(volume) => run(&volume),
             None => crate::println!("fsck: no FOSFS volume is mounted (see `disks`)."),
         }
     } else if let Some(label) = rest.strip_prefix('@') {
         match crate::storage::volume_labelled(label.as_bytes()) {
-            Some((_, volume)) => crate::fosfs::report(&volume),
+            Some((_, volume)) => run(&volume),
             None => crate::println!("fsck: no volume carries the label @{label} (see `label`)."),
         }
     } else if let Some(number) = rest.strip_prefix("disk").and_then(|digits| digits.parse().ok()) {
         match crate::storage::volume_on(number) {
-            Ok(volume) => crate::fosfs::report(&volume),
+            Ok(volume) => run(&volume),
             Err(error) => crate::println!("fsck: {rest}: {error}."),
         }
     } else {
-        crate::println!("Usage: fsck [diskN|@LABEL]");
+        crate::println!("Usage: fsck [repair] [diskN|@LABEL]");
     }
 }
 

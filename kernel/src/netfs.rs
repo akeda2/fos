@@ -232,7 +232,7 @@ fn netfs_put_stop(index: usize, source: [u8; 6]) {
             netfs_reply(index, &source, TAG_PUT_ACK, &[]);
         }
         Err(crate::fosfs::Error::DirectoryFull) => reply_error(NETFS_DIRECTORY_FULL),
-        Err(crate::fosfs::Error::DataFull) => reply_error(NETFS_DATA_FULL),
+        Err(crate::fosfs::Error::DataFull | crate::fosfs::Error::NoRoomToReplace) => reply_error(NETFS_DATA_FULL),
         Err(crate::fosfs::Error::InvalidName) => reply_error(NETFS_BAD_NAME),
         Err(_) => reply_error(NETFS_DISK_ERROR),
     }
@@ -644,6 +644,7 @@ fn write_error(error: crate::fosfs::Error) -> &'static str {
     match error {
         Error::DirectoryFull => "the destination directory is full",
         Error::DataFull => "the destination volume is full",
+        Error::NoRoomToReplace => "no room beside the old copy (rm it first)",
         Error::InvalidName => "the destination name is invalid",
         _ => "writing the destination failed",
     }
