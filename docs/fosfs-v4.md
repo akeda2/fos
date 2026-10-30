@@ -87,6 +87,27 @@ says which one a save used.
 3. exFAT subfolders in `crates/fat` (directory traversal, create/delete in subdirectories, long names, the contiguous
    writer for streams). This is the largest piece.
 4. Move tapes, configs and settings into their folders; `tape-rt` and the tapes use the new paths; deploy tooling follows.
+5. Crash safety, only if real hardware shows a need (see "Journaling" below).
+
+## Journaling (2026-10-30: decided, not built)
+
+No full journal: it doubles the writes on sticks and small disks, and the directory is already the only record of what is
+used (no allocation map to disagree with it). What the code does today:
+
+- **`write` is copy-on-write.** The new data goes to free extents, and one directory-sector write (the commit) points the
+  entry at them. A power cut leaves the old file or the new one. `mkdir`, `rm` and a rename-like replace are one entry
+  write each; `grow` and `label` write only the superblock (backup in sector 1 first, then sector 0), and `mount` falls
+  back to the backup. A torn entry write is caught by its CRC and the entry is skipped (`fsck` reports it).
+- **Known gaps.**
+  1. Replacing a file when the disk has no room for the new copy beside the old one reuses the old extents, which is not
+     crash-safe. The alternative, failing with "disk full", is safer but refuses a rewrite that would fit.
+  2. `reserve` / `write_extent` (recorder streams) overwrite in place by design; the length is written last, so a reset
+     keeps everything up to the previous length.
+  3. A torn entry sector loses that entry (the CRC detects it; nothing repairs it).
+  4. Operations over several files (`copy` of a folder, `tapesync`) are not atomic as a set.
+- **If real hardware shows trouble:** (a) make gap 1 refuse unless a flag allows it; (b) keep a second copy of each directory
+  sector (or a one-sector intent record replayed at mount) so a torn write can be repaired instead of only detected;
+  (c) let `fsck` repair, not just report. Only (b) is real work; (a) and (c) are small.
 
 ## Decisions (2026-10-30)
 
