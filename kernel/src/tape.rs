@@ -680,6 +680,9 @@ pub fn build_api(info: &BootInfo, arguments: &str) -> TapeApi {
         nic_owned: api_nic_owned,
         gpio_pull_get: crate::gpio::api_gpio_pull_get,
         fs_read_at: crate::tape_fs::api_fs_read_at,
+        fs_stream_open2: crate::tape_fs::api_fs_stream_open2,
+        fs_stream_write2: crate::tape_fs::api_fs_stream_write2,
+        fs_stream_close2: crate::tape_fs::api_fs_stream_close2,
     }
 }
 
@@ -693,6 +696,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
     let info = unsafe { INFO.as_ref() }.ok_or("no boot info")?;
     let stack = memory::allocate_contiguous(STACK_BYTES / memory::FRAME, None).ok_or("no memory for the tape's stack")?;
     let api = build_api(info, arguments);
+    crate::tape_fs::stream_reset();
     term::clear_frame_queue();
     term::set_tape_mode(true);
     crate::debug::set_tape_running(true);

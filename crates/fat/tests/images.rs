@@ -516,3 +516,57 @@ fn a_contiguous_exfat_directory_grows() {
     fs.read(&file, 0, &mut data).unwrap();
     assert!(data == pattern(59, 559));
 }
+
+/// Two streams open at once, each through its own mount of the same volume (as the kernel's `fs_stream_open2` does): the
+/// mounts were made before either file existed, so any cache they kept would be stale. Neither file may take the other's
+/// clusters, and `fsck` must stay quiet.
+fn two_writers(path: &Path, fsck_command: &[&str]) {
+    let (mut first, mut second) = (open(path), open(path));
+    let a = first.create(b"A.BIN", 300_000).unwrap();
+    let b = second.create(b"B.BIN", 300_000).unwrap();
+    let (total_a, total_b) = (200_000usize, 150_001usize);
+    let block = 8 * 1024;
+    let mut written = 0;
+    while written < total_a {
+        let count = block.min(total_a - written);
+        first.write(&a, written as u64, &pattern(written, count), (written + count) as u64).unwrap();
+        if written < total_b {
+            let count = block.min(total_b - written);
+            second.write(&b, written as u64, &pattern(written + 7, count), (written + count) as u64).unwrap();
+        }
+        written += block;
+    }
+    second.finish(&b, b"B.BIN", total_b as u64).unwrap();
+    first.finish(&a, b"A.BIN", total_a as u64).unwrap();
+    let mut check = open(path);
+    for (name, total, shift) in [(&b"A.BIN"[..], total_a, 0), (&b"B.BIN"[..], total_b, 7)] {
+        let file = check.find(name).unwrap().unwrap();
+        assert_eq!(file.size, total as u64);
+        let mut data = vec![0u8; total];
+        assert_eq!(check.read(&file, 0, &mut data).unwrap(), total);
+        assert!(data == pattern(shift, total), "{} differs", String::from_utf8_lossy(name));
+    }
+    fsck(path, fsck_command);
+}
+
+#[test]
+fn two_streams_at_once_on_fat32() {
+    if !tool("mkfs.vfat") {
+        return;
+    }
+    let path = scratch("two-fat32.img");
+    let _cleanup = Cleanup(path.clone());
+    make_image(&path, 128, &["mkfs.vfat", "-F", "32", "-s", "1"]);
+    two_writers(&path, &["fsck.vfat", "-n"]);
+}
+
+#[test]
+fn two_streams_at_once_on_exfat() {
+    if !tool("mkfs.exfat") {
+        return;
+    }
+    let path = scratch("two-exfat.img");
+    let _cleanup = Cleanup(path.clone());
+    make_image(&path, 128, &["mkfs.exfat"]);
+    two_writers(&path, &["fsck.exfat", "-n"]);
+}

@@ -42,6 +42,15 @@ def scenario(work):
             check("fscheck: 0 bytes []" in ranged(name, 9000, 10), f"{name}: past the end gives 0 bytes", "")
         check("error -1" in ranged("disk2/none.txt", 0, 10), "a missing file is FS_NOT_FOUND", "")
 
+        # ABI 30: two streams open at once, on FOSFS v4, in a folder, and on exFAT.
+        for first, second in (("disk2/s1.bin", "disk2/s2.bin"), ("disk2/sub/s3.bin", "disk2/sub/s4.bin"), ("disk3/s5.bin", "disk3/s6.bin"), ("disk2/s7.bin", "disk3/s8.bin")):
+            out = run(f"run fscheck streams {first} {second}")
+            check("streams 0: 20000 bytes, 0 wrong" in out and "streams 1: 19900 bytes, 0 wrong" in out, f"two streams at once: {first} and {second}", out[-500:])
+        listing = run("ls disk2")
+        check("s1.bin" in listing and "s2.bin" in listing, "both streamed files are listed", listing[-300:])
+        fsck = run("fsck disk2")
+        check("directory consistent" in fsck, "and the FOSFS directory is consistent", fsck[-300:])
+
     return scenario
 
 

@@ -420,6 +420,8 @@ impl<D: Device> Fs<D> {
     /// the biggest run there is when `reserve` is 0 (never more than the format allows). The file's length is 0 until
     /// `write` sets it. Returns the stream and the most it can hold.
     pub fn create(&mut self, name: &[u8], reserve: u64) -> Result<Stream, Error> {
+        // Another mount of this volume may have changed the FAT since this one read its cached sector.
+        self.fat_cache_lba = u64::MAX;
         if let Some(existing) = self.entry(name)? {
             if existing.is_directory {
                 return Err(Error::BadName);
@@ -459,6 +461,7 @@ impl<D: Device> Fs<D> {
 
     /// Ends the file at `length` bytes and frees the rest of the run. A length of 0 removes the file.
     pub fn finish(&mut self, stream: &Stream, name: &[u8], length: u64) -> Result<(), Error> {
+        self.fat_cache_lba = u64::MAX;
         match self.kind {
             Kind::Fat32 => self.fat32_finish(stream, name, length),
             Kind::ExFat => self.exfat_finish(stream, name, length),

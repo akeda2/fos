@@ -766,6 +766,14 @@ pub fn read_file_at(name: &str, offset: u64, buffer: &mut [u8]) -> Result<usize,
     }
 }
 
+/// The tape table when the kernel has ABI 30's stream handles (`fs_stream_open2` and friends), else `None`: the caller
+/// falls back to the single stream of `fs_stream_open`.
+pub fn multi_stream_table() -> Option<&'static TapeApi> {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, fs_stream_close2) + core::mem::size_of::<usize>();
+    (table.version >= 30 && table.size as usize >= end).then_some(table)
+}
+
 /// The I2C bus's SCL speed in Hz (Raspberry Pi 4 header); `Err(-4)` where there is none or the kernel is older than version 23.
 pub fn i2c_speed() -> Result<u32, i32> {
     let t = i2c_table().ok_or(-4)?;

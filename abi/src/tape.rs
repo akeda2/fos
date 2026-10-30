@@ -16,7 +16,7 @@
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
 /// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`. Version 20 added `gfx_screens` and the `gfx_*_on` calls (a screen number). Version 21 added `audio_float`. Version 22 added the `gpio_*` calls. Version 23 added `i2c_speed` and `i2c_transfer`. Version 24 added `touch_info` and `touch_read`. Version 25 added `midi_read` and `midi_send`. Version 26 added `midi_devices`. Version 27 added `nic_owned`. Version 28 added `gpio_pull_get`.
-pub const TAPE_API_VERSION: u32 = 29;
+pub const TAPE_API_VERSION: u32 = 30;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -363,7 +363,19 @@ pub struct TapeApi {
     /// `offset`, without reading the rest (`fs_read` needs room for the whole file). Returns the bytes read, 0 at or past the
     /// end, or a negative `FS_*` code. The file reference is the one `fs_read` takes; a short count only means the end.
     pub fs_read_at: extern "C" fn(*const u8, usize, u64, *mut u8, usize) -> isize,
+    /// `fs_stream_open2(name, name_len, max_bytes, capacity_out)` (version 30): like `fs_stream_open`, but up to
+    /// `FS_STREAMS` files can be open at once. Returns a handle (0 to `FS_STREAMS` - 1) or a negative code (`FS_ERROR` when
+    /// all are in use) and stores the reserved size in bytes in `*capacity_out`. Give every stream an explicit `max_bytes`: with
+    /// 0 the first one takes the largest free run and the next finds none. Handles are dropped when a tape starts.
+    pub fs_stream_open2: extern "C" fn(*const u8, usize, u64, *mut u64) -> isize,
+    /// `fs_stream_write2(handle, offset, data, len, file_length)` (version 30): as `fs_stream_write` on that stream.
+    pub fs_stream_write2: extern "C" fn(isize, u64, *const u8, usize, u64) -> isize,
+    /// `fs_stream_close2(handle, file_length)` (version 30): as `fs_stream_close` on that stream; frees the handle.
+    pub fs_stream_close2: extern "C" fn(isize, u64) -> isize,
 }
+
+/// How many streams `fs_stream_open2` can have open at once.
+pub const FS_STREAMS: usize = 4;
 
 /// `audio_float` bits: the capture stream / the playback stream carries IEEE 754 single-precision samples.
 pub const AUDIO_FLOAT_CAPTURE: u32 = 1;

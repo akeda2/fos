@@ -1423,10 +1423,11 @@ produce two files from one name:
   most 6 characters (a file name is at most 16: room for `.lr.flac` and a number), after `diskN/` up to 40, `@LABEL/` for a label.
   Keys go to the field while it is edited (starts from the current name; Enter keeps, Escape cancels); Escape quits otherwise.
   When `NAME.lr.flac` or `NAME.flac` exists the next number goes after the base (`lp2.lr.flac`, `lp2.flac`, up to 99).
-Limits of this stage: the kernel has one file stream (`fs_stream_*`) and no partial file read, so a take and a decode never run
-together and a decode holds the whole raw file in memory (about 100-200 MB of FLAC for a 22 minute side, 24 bit 48 kHz; if
-`alloc` fails it says so). QEMU verifies the files, names and keys (`make test-phono`) and the host tests the encoder, decoder
-round trips and ffmpeg's reading of 4 and 6 channels; a real disk's write speed under a running take, memory on the Pi and the
+Limits of this stage: the decode reads the raw take in pieces (`fs_read_at`, `RawFile` in `tapes/phono/src/take.rs`), so it
+needs no memory for the file, and on a kernel with ABI 30 the take and the decode own separate file streams (`fs_stream_*2`);
+an older kernel keeps one stream, and phono then refuses to start one while the other runs. The decode still starts only
+after the take has stopped. QEMU verifies the files, names and keys (`make test-phono`) and the host tests the encoder, decoder
+round trips and ffmpeg's reading of 4 and 6 channels; a real disk's write speed under a running take and the
 sound of the decode need real hardware.
 
 ### Electric piano (crates/epiano, tapes/epiano)
@@ -1726,5 +1727,18 @@ FAT32/exFAT (`fat::Fs::read` already took an offset). `tape_rt::read_file_at` ch
 older kernel. `tapes/fscheck` (`tape run fscheck NAME OFFSET LENGTH`) is the test tape: `make test-fs-read-at` compares ranges of a 5000-byte
 file on a v4 volume, in a v4 folder and on exFAT (offsets inside a sector, across sectors, the last bytes, the end, past it).
 
-**Not verified:** a file of several FOSFS extents (v4 holds up to three) is only covered by code reading; QEMU's fresh volumes give one extent.
-Not on real hardware. phono does not use the call yet (`DEFERRED.md`).
+### More than one file stream (tape ABI 30)
+
+`fs_stream_open` kept one stream in two kernel statics. ABI 30 adds `fs_stream_open2(name, len, max_bytes, *capacity) -> handle`,
+`fs_stream_write2(handle, offset, data, len, file_length)` and `fs_stream_close2(handle, file_length)`: up to `FS_STREAMS` (4)
+files open at once, on FOSFS (each `reserve` is committed to the directory at once, so the next one sees those sectors as used),
+on FAT32/exFAT (each stream has its own mount of the volume; `fat` drops its one cached FAT sector in `create` and `finish`, so a
+mount made before the other stream existed cannot hand out its clusters: `cargo test -p fosfor-fat two_streams`, with
+`fsck.vfat`/`fsck.exfat`), or one of each. Give every stream a `max_bytes`: 0 means "the largest free run", which the first
+stream would take whole. The older single-stream calls keep their own slot. Handles are dropped when a tape starts. `StreamSink::with_handle`
+(`crates/audio-rec`) uses them and `tape_rt::multi_stream_table()` says whether the kernel has them; `tapes/fscheck`'s `streams` mode
+writes two files in turn through two handles and reads both back (`make test-fs-read-at`). **Not verified:** real hardware, and four
+streams at full audio rate on a USB stick.
+
+**Not verified (`fs_read_at`):** a file of several FOSFS extents (v4 holds up to three) is only covered by code reading; QEMU's fresh volumes give one extent.
+Not on real hardware. phono's decode reads its raw take with it.

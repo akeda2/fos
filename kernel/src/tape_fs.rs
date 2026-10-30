@@ -9,10 +9,18 @@ use fosfor_abi::tape::*;
 use crate::fosfs::{Entry, Error, Volume};
 use crate::storage;
 
-/// The file a tape is streaming into (`fs_stream_open`): its volume and reserved entry.
-static mut STREAM: Option<(Volume, Entry)> = None;
-/// Or, on a FAT32/exFAT volume: the mounted volume, the stream and the file's name (for `finish`).
-static mut FAT_STREAM: Option<(crate::fatvol::Fs, fat::Stream, [u8; 64], usize)> = None;
+/// A file a tape is streaming into: on FOSFS its volume and reserved entry, on a FAT32/exFAT volume the mounted volume,
+/// the stream and the file's name (for `finish`). Every open stream has its own mount of its volume: the only state
+/// a mount caches is one FAT sector, which `fat` drops at `create` and `finish` and before it changes any FAT entries,
+/// and the free-space search reads the bitmap or FAT afresh, so two streams on one FAT volume cannot hand out the same clusters.
+enum Open {
+    Fos(Volume, Entry),
+    Fat(crate::fatvol::Fs, fat::Stream, [u8; 64], usize),
+}
+
+/// The streams of `fs_stream_open2` (handles 0 to `FS_STREAMS` - 1) and, last, the one of the older `fs_stream_open`.
+static mut STREAMS: [Option<Open>; FS_STREAMS + 1] = [const { None }; FS_STREAMS + 1];
+const LEGACY: usize = FS_STREAMS;
 
 static mut BIN_PATH: [u8; 4 + crate::fosfs::MAX_NAME] = [0; 4 + crate::fosfs::MAX_NAME];
 
@@ -470,16 +478,18 @@ pub fn disk_info(number: usize, out: &mut DiskInfo) -> u32 {
     1
 }
 
-/// Forgets the stream in progress (a new `fs_stream_open` replaces it).
+/// Forgets every stream (done when a tape starts; a file left open keeps what was written and its reservation).
 pub fn stream_reset() {
-    unsafe {
-        STREAM = None;
-        FAT_STREAM = None;
-    }
+    unsafe { *core::ptr::addr_of_mut!(STREAMS) = [const { None }; FS_STREAMS + 1] };
 }
 
-pub fn stream_open(reference: &[u8], max_bytes: u64) -> isize {
-    stream_reset();
+fn streams() -> &'static mut [Option<Open>; FS_STREAMS + 1] {
+    unsafe { &mut *core::ptr::addr_of_mut!(STREAMS) }
+}
+
+/// Opens `reference` into `slot`: the reserved capacity in bytes, or a negative code.
+fn open_into(slot: usize, reference: &[u8], max_bytes: u64) -> isize {
+    streams()[slot] = None;
     if let Some((mut fs, file)) = resolve_fat(reference) {
         if file.len() > 64 {
             return FS_BAD_NAME;
@@ -489,7 +499,7 @@ pub fn stream_open(reference: &[u8], max_bytes: u64) -> isize {
                 let mut stored = [0u8; 64];
                 stored[..file.len()].copy_from_slice(file);
                 let capacity = stream.capacity();
-                unsafe { FAT_STREAM = Some((fs, stream, stored, file.len())) };
+                streams()[slot] = Some(Open::Fat(fs, stream, stored, file.len()));
                 capacity as isize
             }
             Err(error) => fat_error(error),
@@ -504,7 +514,7 @@ pub fn stream_open(reference: &[u8], max_bytes: u64) -> isize {
     }
     match volume.reserve(name, max_bytes) {
         Ok((entry, capacity)) => {
-            unsafe { STREAM = Some((volume, entry)) };
+            streams()[slot] = Some(Open::Fos(volume, entry));
             capacity as isize
         }
         Err(Error::InvalidName) => FS_BAD_NAME,
@@ -512,34 +522,77 @@ pub fn stream_open(reference: &[u8], max_bytes: u64) -> isize {
     }
 }
 
-pub fn stream_write(offset: u64, data: &[u8], file_length: u64) -> isize {
-    if let Some((fs, stream, _, _)) = unsafe { (*(&raw mut FAT_STREAM)).as_mut() } {
-        crate::fatvol::stamp(fs);
-        return match fs.write(stream, offset, data, file_length) {
+fn write_to(slot: usize, offset: u64, data: &[u8], file_length: u64) -> isize {
+    match streams().get_mut(slot).and_then(Option::as_mut) {
+        Some(Open::Fat(fs, stream, _, _)) => {
+            crate::fatvol::stamp(fs);
+            match fs.write(stream, offset, data, file_length) {
+                Ok(()) => 0,
+                Err(fat::Error::OutOfRange) => FS_TOO_BIG,
+                Err(error) => fat_error(error),
+            }
+        }
+        Some(Open::Fos(volume, entry)) => match volume.write_extent(entry, offset, data, file_length) {
             Ok(()) => 0,
-            Err(fat::Error::OutOfRange) => FS_TOO_BIG,
-            Err(error) => fat_error(error),
-        };
-    }
-    let Some((volume, entry)) = (unsafe { *(&raw const STREAM) }) else { return FS_ERROR };
-    match volume.write_extent(&entry, offset, data, file_length) {
-        Ok(()) => 0,
-        Err(Error::TooBig) => FS_TOO_BIG,
-        Err(_) => FS_ERROR,
+            Err(Error::TooBig) => FS_TOO_BIG,
+            Err(_) => FS_ERROR,
+        },
+        None => FS_ERROR,
     }
 }
 
-pub fn stream_close(file_length: u64) -> isize {
-    if let Some((mut fs, stream, name, length)) = unsafe { (*(&raw mut FAT_STREAM)).take() } {
-        crate::fatvol::stamp(&mut fs);
-        return match fs.finish(&stream, &name[..length], file_length) {
+fn close_slot(slot: usize, file_length: u64) -> isize {
+    match streams().get_mut(slot).and_then(Option::take) {
+        Some(Open::Fat(mut fs, stream, name, length)) => {
+            crate::fatvol::stamp(&mut fs);
+            match fs.finish(&stream, &name[..length], file_length) {
+                Ok(()) => 0,
+                Err(error) => fat_error(error),
+            }
+        }
+        Some(Open::Fos(volume, entry)) => match volume.trim_extent(&entry, file_length) {
             Ok(()) => 0,
-            Err(error) => fat_error(error),
-        };
+            Err(_) => FS_ERROR,
+        },
+        None => FS_ERROR,
     }
-    let Some((volume, entry)) = (unsafe { (*(&raw mut STREAM)).take() }) else { return FS_ERROR };
-    match volume.trim_extent(&entry, file_length) {
-        Ok(()) => 0,
-        Err(_) => FS_ERROR,
+}
+
+/// `fs_stream_open`: the one stream of the older calls; opening replaces the last.
+pub fn stream_open(reference: &[u8], max_bytes: u64) -> isize {
+    open_into(LEGACY, reference, max_bytes)
+}
+
+pub fn stream_write(offset: u64, data: &[u8], file_length: u64) -> isize {
+    write_to(LEGACY, offset, data, file_length)
+}
+
+pub fn stream_close(file_length: u64) -> isize {
+    close_slot(LEGACY, file_length)
+}
+
+/// `fs_stream_open2`: the first free handle, with the capacity stored in `*capacity_out`.
+pub extern "C" fn api_fs_stream_open2(name: *const u8, name_length: usize, max_bytes: u64, capacity_out: *mut u64) -> isize {
+    let reference = unsafe { core::slice::from_raw_parts(name, name_length) };
+    let Some(handle) = streams()[..FS_STREAMS].iter().position(Option::is_none) else { return FS_ERROR };
+    let capacity = open_into(handle, reference, max_bytes);
+    if capacity < 0 {
+        return capacity;
     }
+    unsafe { *capacity_out = capacity as u64 };
+    handle as isize
+}
+
+pub extern "C" fn api_fs_stream_write2(handle: isize, offset: u64, data: *const u8, length: usize, file_length: u64) -> isize {
+    if !(0..FS_STREAMS as isize).contains(&handle) {
+        return FS_ERROR;
+    }
+    write_to(handle as usize, offset, unsafe { core::slice::from_raw_parts(data, length) }, file_length)
+}
+
+pub extern "C" fn api_fs_stream_close2(handle: isize, file_length: u64) -> isize {
+    if !(0..FS_STREAMS as isize).contains(&handle) {
+        return FS_ERROR;
+    }
+    close_slot(handle as usize, file_length)
 }

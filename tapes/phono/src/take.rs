@@ -2,14 +2,16 @@
 //! into a 4.0 / 4.1 / 5.1 FLAC (`Decode`), and the output name both use. The files and the maths are `crates/archive`;
 //! this is the glue to the tape ABI and the state the screen shows.
 //!
-//! The kernel has one file stream, so a take and a decode never run together, and a decode reads the whole raw file into
-//! memory (the raw FLAC of one record side is a few hundred MB at most; there is no partial read yet, see DEFERRED.md).
+//! The decode reads the raw take in pieces with `fs_read_at` (tape ABI 29), so a long side does not have to fit in memory.
+//! With ABI 30's stream handles the take and the decode have a stream each and can run together (a decode of an older take
+//! while recording a new one); on an older kernel there is one stream and the two exclude each other.
 
 use archive::file::Error as FileError;
 use archive::names::{self, Name};
 use archive::transcode::{Error as DecodeError, Job};
-use archive::{Bytes, FlacFile, Names, Progress, Transcoder};
+use archive::{FlacFile, Names, Progress, Transcoder};
 use audio_decode::flac::Decoder;
+use audio_decode::{Source, SourceError};
 use audio_rec::stream::StreamSink;
 use core::fmt::Write;
 use flac_enc::Info;
@@ -26,9 +28,12 @@ const CHECKPOINT_US: u64 = 2_000_000;
 /// The default base name.
 pub const DEFAULT_NAME: &str = "lp";
 
+/// The take being recorded and the decoded file being written, each with its own stream.
 static mut FILE: FlacFile = FlacFile::new();
 static mut SINK: Option<StreamSink> = None;
-static mut DECODER: Decoder<Bytes<'static>> = Decoder::new(Bytes(&[]));
+static mut OUT_FILE: FlacFile = FlacFile::new();
+static mut OUT_SINK: Option<StreamSink> = None;
+static mut DECODER: Decoder<RawFile> = Decoder::new(RawFile::none());
 static mut TRANSCODER: Transcoder = Transcoder::new();
 /// The decode pass has its own decoder and equaliser, so what is heard is not touched by it.
 static mut PASS_SURROUND: Surround = Surround::new();
@@ -42,11 +47,40 @@ fn sink() -> &'static mut StreamSink {
     unsafe { (*core::ptr::addr_of_mut!(SINK)).as_mut().expect("sink") }
 }
 
+fn out_file() -> &'static mut FlacFile {
+    unsafe { &mut *core::ptr::addr_of_mut!(OUT_FILE) }
+}
+
+fn out_sink() -> &'static mut StreamSink {
+    unsafe { (*core::ptr::addr_of_mut!(OUT_SINK)).as_mut().expect("sink") }
+}
+
+/// The raw take as a decoder source: every read is an `fs_read_at` of the piece asked for.
+pub struct RawFile {
+    name: Name,
+    size: u64,
+}
+
+impl RawFile {
+    const fn none() -> RawFile {
+        RawFile { name: Name::new(), size: 0 }
+    }
+}
+
+impl Source for RawFile {
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    fn read_at(&mut self, offset: u64, out: &mut [u8]) -> Result<usize, SourceError> {
+        let name = core::str::from_utf8(self.name.as_bytes()).map_err(|_| SourceError)?;
+        tape_rt::read_file_at(name, offset, out).map_err(|_| SourceError)
+    }
+}
+
 /// What the decode pass was started with (settings can change while it runs).
 #[derive(Clone, Copy)]
 struct DecodeRun {
-    buffer: usize,
-    size: usize,
     raw: Name,
     out: Name,
     settings: SurroundSettings,
@@ -111,7 +145,20 @@ fn name_error(error: names::NameError, message: &mut Line<64>) {
 
 impl Archive {
     pub fn new(api: &'static TapeApi, name: &str) -> Archive {
-        unsafe { *core::ptr::addr_of_mut!(SINK) = Some(StreamSink::new(api.fs_stream_open, api.fs_stream_write, api.fs_stream_close, tape_rt::micros, 64 * 1024)) };
+        let (take, decode) = match tape_rt::multi_stream_table() {
+            Some(api) => (
+                StreamSink::with_handle(api.fs_stream_open2, api.fs_stream_write2, api.fs_stream_close2, tape_rt::micros, 64 * 1024),
+                StreamSink::with_handle(api.fs_stream_open2, api.fs_stream_write2, api.fs_stream_close2, tape_rt::micros, 64 * 1024),
+            ),
+            None => (
+                StreamSink::new(api.fs_stream_open, api.fs_stream_write, api.fs_stream_close, tape_rt::micros, 64 * 1024),
+                StreamSink::new(api.fs_stream_open, api.fs_stream_write, api.fs_stream_close, tape_rt::micros, 64 * 1024),
+            ),
+        };
+        unsafe {
+            *core::ptr::addr_of_mut!(SINK) = Some(take);
+            *core::ptr::addr_of_mut!(OUT_SINK) = Some(decode);
+        }
         let mut line = Line::new();
         set(&mut line, name);
         Archive { api, name: line, editing: None, recording: false, failed: None, bits: 24, rate: 48000, next_checkpoint: 0, raw: Name::new(), last_raw: None, run: None, percent: 0 }
@@ -141,8 +188,8 @@ impl Archive {
     }
 
     pub fn start_recording(&mut self, setup: &Setup, output: &mut Output, message: &mut Line<64>) {
-        if self.run.is_some() {
-            return say(message, format_args!("a decode is running: the disk has one file stream"));
+        if self.run.is_some() && tape_rt::multi_stream_table().is_none() {
+            return say(message, format_args!("a decode is running: this kernel has one file stream"));
         }
         let bits = output.capture_bits();
         if bits == 0 {
@@ -218,7 +265,7 @@ impl Archive {
             let tags = [("ENCODER", "fosfor phono"), ("DECODER", run.settings.mode.name()), ("LOGIC", run.settings.logic.map_or("off", outfx::Preset::name)), ("SWAP", if run.settings.swap_rear { "on" } else { "off" }), ("CURVE", CURVES[run.curve].id), ("SOURCE", run.raw.as_str())];
             let (decoder, surround, transcoder) = unsafe { (&mut *core::ptr::addr_of_mut!(DECODER), &mut *core::ptr::addr_of_mut!(PASS_SURROUND), &mut *core::ptr::addr_of_mut!(TRANSCODER)) };
             let Some(eq) = (unsafe { (*core::ptr::addr_of_mut!(PASS_EQ)).as_mut() }) else { return true };
-            let mut job = Job { file: file(), sink: sink(), eq, name: run.out.as_bytes(), tags: &tags };
+            let mut job = Job { file: out_file(), sink: out_sink(), eq, name: run.out.as_bytes(), tags: &tags };
             match transcoder.step(decoder, surround, &mut job, 1) {
                 Ok(Progress::Working(percent)) => self.percent = percent,
                 Ok(Progress::Done(report)) => {
@@ -249,8 +296,8 @@ impl Archive {
     }
 
     pub fn start_decode(&mut self, setup: &Setup, message: &mut Line<64>) {
-        if self.recording {
-            return say(message, format_args!("stop the take first: the disk has one file stream"));
+        if self.recording && tape_rt::multi_stream_table().is_none() {
+            return say(message, format_args!("stop the take first: this kernel has one file stream"));
         }
         if setup.surround.mode == outfx::Mode::Off {
             return say(message, format_args!("surround is off: choose sq, qs or ambience to decode"));
@@ -266,21 +313,9 @@ impl Archive {
         let Some(length) = file_length(api, raw.as_str()) else {
             return say(message, format_args!("cannot find {}", raw.as_str()));
         };
-        let size = length as usize;
-        let buffer = (api.alloc)(size);
-        if buffer == 0 {
-            return say(message, format_args!("not enough memory for {} ({} MB)", raw.as_str(), size >> 20));
-        }
-        let read = (api.fs_read)(raw.as_bytes().as_ptr(), raw.as_bytes().len(), buffer as *mut u8, size);
-        if read < 0 || read as usize != size {
-            (api.free)(buffer, size);
-            return say(message, format_args!("cannot read {}", raw.as_str()));
-        }
-        let bytes: &'static [u8] = unsafe { core::slice::from_raw_parts(buffer as *const u8, size) };
         let (decoder, surround, transcoder) = unsafe { (&mut *core::ptr::addr_of_mut!(DECODER), &mut *core::ptr::addr_of_mut!(PASS_SURROUND), &mut *core::ptr::addr_of_mut!(TRANSCODER)) };
-        *decoder = Decoder::new(Bytes(bytes));
+        *decoder = Decoder::new(RawFile { name: raw, size: length });
         if decoder.open().is_err() {
-            (api.free)(buffer, size);
             return say(message, format_args!("{} is not a FLAC file", raw.as_str()));
         }
         surround.tune(decoder.sample_rate, setup.surround);
@@ -289,7 +324,6 @@ impl Archive {
         unsafe { *core::ptr::addr_of_mut!(PASS_EQ) = Some(eq) };
         let Some(eq) = (unsafe { (*core::ptr::addr_of_mut!(PASS_EQ)).as_mut() }) else { return };
         if let Err(error) = transcoder.start(decoder, surround, eq, setup.depth) {
-            (api.free)(buffer, size);
             return say(message, format_args!("{}", decode_error(error)));
         }
         // The decoded file is derived from the raw take, which stays: an older one is replaced.
@@ -297,23 +331,21 @@ impl Archive {
             (api.fs_remove)(out.as_bytes().as_ptr(), out.as_bytes().len());
         }
         self.percent = 0;
-        self.run = Some(DecodeRun { buffer, size, raw, out, settings: setup.surround, curve: setup.curve });
+        self.run = Some(DecodeRun { raw, out, settings: setup.surround, curve: setup.curve });
         say(message, format_args!("decoding {} to {}", raw.as_str(), out.as_str()));
     }
 
     pub fn cancel_decode(&mut self, message: &mut Line<64>) {
         if let Some(run) = self.run {
             unsafe { (*core::ptr::addr_of_mut!(TRANSCODER)).cancel() };
-            file().abandon(sink());
+            out_file().abandon(out_sink());
             self.end_decode();
             say(message, format_args!("decode cancelled; {} is incomplete", run.out.as_str()));
         }
     }
 
     fn end_decode(&mut self) {
-        if let Some(run) = self.run.take() {
-            (self.api.free)(run.buffer, run.size);
-        }
+        self.run = None;
     }
 
     /// Leaves cleanly: a running take is finished (so its file is complete), a decode is dropped.
