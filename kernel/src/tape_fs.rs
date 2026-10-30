@@ -114,9 +114,40 @@ fn enter_path<'a>(fs: &mut crate::fatvol::Fs, path: &'a [u8]) -> &'a [u8] {
     rest
 }
 
+/// The exFAT volume labelled `label` (any case), on a disk that has no FOSFS volume.
+pub fn fat_labelled(label: &[u8]) -> Option<(usize, crate::fatvol::Fs)> {
+    (1..=crate::block::count()).find_map(|number| {
+        let mut fs = fat_disk(number)?;
+        let (bytes, length) = fs.label().ok()??;
+        bytes[..length].eq_ignore_ascii_case(label).then_some((number, fs))
+    })
+}
+
+/// A FAT volume reached by label: `@LABEL/path`, or a path under a mount point (`directory`: the path may be the mount
+/// point itself) whose label no FOSFS volume has. Returns the volume at its root and what is left of the path. None when
+/// the reference is neither, the label is a FOSFS volume's, or no such volume is present.
+fn fat_by_label<'a>(selector: &'a [u8], path: &'a [u8], directory: bool) -> Option<(crate::fatvol::Fs, &'a [u8])> {
+    let mounted;
+    let (label, rest) = match selector.strip_prefix(b"@") {
+        Some(label) => (label, path),
+        None if selector.is_empty() => {
+            mounted = if directory { crate::mounts::lookup_dir(path)? } else { crate::mounts::lookup(path)? };
+            (mounted.0.as_bytes(), mounted.1)
+        }
+        None => return None,
+    };
+    storage::volume_labelled(label).is_none().then(|| fat_labelled(label)).flatten().map(|(_, fs)| (fs, rest))
+}
+
 /// A FAT32/exFAT volume named by a reference `diskN/NAME`; on exFAT, `diskN/rec/take1` is the file `take1` of the
 /// folder `rec`, which is entered, and the name returned is the last component.
 fn resolve_fat(reference: &[u8]) -> Option<(crate::fatvol::Fs, &[u8])> {
+    let (selector, path) = split_selector(reference);
+    if selector.is_empty() || selector.starts_with(b"@") {
+        let (mut fs, rest) = fat_by_label(selector, path, false)?;
+        let name = enter_path(&mut fs, rest);
+        return Some((fs, name));
+    }
     let slash = reference.iter().position(|&byte| byte == b'/')?;
     if &reference[..slash] == b"esp" {
         return crate::fatvol::mount_esp().map(|fs| (fs, &reference[slash + 1..]));
@@ -307,12 +338,18 @@ pub fn resolve_volume(reference: &[u8]) -> Option<Volume> {
 /// was written; the result is the kind of volume (`FOSFS`, `FAT32`, `exFAT`) or an `FS_*` code. A disk with only a
 /// FAT32/exFAT volume lists its root directory.
 pub fn each_entry(reference: &[u8], each: &mut dyn FnMut(&[u8], u64, bool, Option<fat::Time>)) -> Result<&'static str, isize> {
-    let fat = if reference == b"esp" { crate::fatvol::mount_esp() } else { disk_number(split_selector(reference).0).and_then(fat_disk) };
+    let (selector, path) = split_selector(reference);
+    let mut folder = path;
+    let mut fat = if reference == b"esp" { crate::fatvol::mount_esp() } else { disk_number(selector).and_then(fat_disk) };
+    if fat.is_none() {
+        if let Some((fs, rest)) = fat_by_label(selector, path, true) {
+            (fat, folder) = (Some(fs), rest);
+        }
+    }
     if let Some(mut fs) = fat {
         let kind = if fs.kind() == fat::Kind::ExFat { "exFAT" } else { "FAT32" };
         // exFAT: `diskN/rec/session1` lists that folder; FAT32 and `esp` list the root as before.
         if fs.kind() == fat::Kind::ExFat {
-            let folder = split_selector(reference).1;
             for part in folder.split(|&byte| byte == b'/').filter(|part| !part.is_empty()) {
                 if fs.enter(part).is_err() {
                     return Err(FS_NOT_FOUND);
@@ -321,7 +358,6 @@ pub fn each_entry(reference: &[u8], each: &mut dyn FnMut(&[u8], u64, bool, Optio
         }
         return fs.list(|entry| each(entry.name(), u64::from(entry.size), entry.is_directory, entry.modified)).map(|()| kind).map_err(fat_error);
     }
-    let (selector, mut folder) = split_selector(reference);
     let mut volume = resolve_volume(selector).ok_or(FS_NO_VOLUME)?;
     if selector.is_empty() {
         if let Some((label, rest)) = crate::mounts::lookup_dir(folder) {

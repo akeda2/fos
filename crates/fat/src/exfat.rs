@@ -78,6 +78,31 @@ impl<D: Device> Fs<D> {
         Ok(())
     }
 
+    /// The volume label (the type 0x83 entry of the root directory) as ASCII; `None` without one. Characters outside ASCII
+    /// come back as `?`.
+    pub(crate) fn exfat_label(&mut self) -> Result<Option<([u8; 11], usize)>, Error> {
+        let found = self.root_sectors(|_, sector| {
+            for slot in 0..SECTOR / 32 {
+                let entry = &sector[slot * 32..slot * 32 + 32];
+                match entry[0] {
+                    0 => return Visit::Done(None),
+                    0x83 => {
+                        let count = usize::from(entry[1]).min(11);
+                        let mut label = [0u8; 11];
+                        for (index, byte) in label.iter_mut().enumerate().take(count) {
+                            let unit = u16::from_le_bytes([entry[2 + index * 2], entry[3 + index * 2]]);
+                            *byte = if (0x20..0x7f).contains(&unit) { unit as u8 } else { b'?' };
+                        }
+                        return Visit::Done(Some((label, count)));
+                    }
+                    _ => {}
+                }
+            }
+            Visit::Continue
+        })?;
+        Ok(found.flatten())
+    }
+
     /// Visits every file and directory of the root directory until `visit` returns true. Sets from other writers may
     /// cross sector boundaries; this walks them with a small state machine.
     pub(crate) fn exfat_walk(&mut self, visit: &mut dyn FnMut(&Entry) -> bool) -> Result<(), Error> {

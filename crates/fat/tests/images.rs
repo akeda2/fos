@@ -279,6 +279,7 @@ fn formatted_exfat_volumes_pass_fsck_and_work() {
         fsck(&path, &["fsck.exfat", "-n"]);
         let mut fs = open(&path);
         assert_eq!(fs.kind(), Kind::ExFat);
+        assert_eq!(fs.label().unwrap(), Some((*b"FOS TEST\0\0\0", 8)));
         let (free, longest) = fs.free_space().unwrap();
         assert!(free > (megabytes << 20) * 9 / 10 && free == longest, "{free} {longest}");
         record(&mut fs, b"take001.wav", 0, 3_000_017, 262_144);

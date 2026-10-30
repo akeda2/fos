@@ -8,7 +8,7 @@
 //!
 //! The table is filled from the boot volume's `fstab` at boot (`load`), one `PATH @LABEL` per line, `#` starts a
 //! comment; the `mount` and `umount` shell commands change it until the next boot (edit `fstab` to keep a change).
-//! Only FOSFS volumes can be mounted so far: exFAT needs subfolders first (step 3).
+//! The volume may be FOSFS or exFAT (matched by label, any case); an exFAT mount point is a folder of that volume.
 
 use crate::fosfs;
 
@@ -95,7 +95,7 @@ pub fn each(mut visit: impl FnMut(&[u8], &[u8])) {
 pub fn absent() -> usize {
     let mut count = 0;
     each(|_, label| {
-        if crate::storage::volume_labelled(label).is_none() {
+        if crate::storage::volume_labelled(label).is_none() && crate::tape_fs::fat_labelled(label).is_none() {
             count += 1;
         }
     });

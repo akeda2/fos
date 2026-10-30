@@ -138,8 +138,8 @@ fn mount(rest: &str) {
             crate::mounts::each(|path, label| {
                 any = true;
                 let (path, label) = (core::str::from_utf8(path).unwrap_or("?"), core::str::from_utf8(label).unwrap_or("?"));
-                match crate::storage::volume_labelled(label.as_bytes()) {
-                    Some((number, _)) => crate::println!("{path} -> @{label} (disk{number})"),
+                match crate::storage::volume_labelled(label.as_bytes()).map(|(number, _)| number).or_else(|| crate::tape_fs::fat_labelled(label.as_bytes()).map(|(number, _)| number)) {
+                    Some(number) => crate::println!("{path} -> @{label} (disk{number})"),
                     None => crate::println!("{path} -> @{label} (not present: {path}/ is the boot volume's own folder)"),
                 }
             });
@@ -152,7 +152,7 @@ fn mount(rest: &str) {
             crate::println!("fstab: {set} mount(s){}.", if bad > 0 { " and lines it could not use" } else { "" });
         }
         (Some(path), Some(label), None) if label.starts_with('@') => match crate::mounts::add(path.as_bytes(), label[1..].as_bytes()) {
-            Ok(()) => crate::println!("{path} is now {label}{}.", if crate::storage::volume_labelled(label[1..].as_bytes()).is_some() { "" } else { " (not present yet: the boot volume's folder is used until it appears)" }),
+            Ok(()) => crate::println!("{path} is now {label}{}.", if crate::storage::volume_labelled(label[1..].as_bytes()).is_some() || crate::tape_fs::fat_labelled(label[1..].as_bytes()).is_some() { "" } else { " (not present yet: the boot volume's folder is used until it appears)" }),
             Err(crate::mounts::Error::BadPath) => crate::println!("mount: {path} is not a folder path (names of letters, digits, . _ - +, at most 48 characters)."),
             Err(crate::mounts::Error::BadLabel) => crate::println!("mount: {label} is not a volume label."),
             Err(crate::mounts::Error::Full) => crate::println!("mount: the table is full."),

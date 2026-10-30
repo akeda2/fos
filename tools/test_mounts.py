@@ -40,6 +40,23 @@ def scenario(run):
     check("No mounts" in run("mount"), "umount empties it", "")
     run("mount settings @nothere")
     check("not present" in run("mount"), "a mount whose volume is absent is reported", "")
+    # An exFAT volume mounts by label too (any case); its mount point is a folder of that volume.
+    run("umount settings")
+    run("format disk3 exfat STICK")
+    run("format disk3 confirm")
+    done = run("mount rec @stick")
+    check("not present" not in done and "rec -> @stick (disk3)" in run("mount"), "an exFAT volume mounts by its label", "")
+    run("write rec/a.txt hello")
+    check("hello" in run("cat rec/a.txt") and "hello" in run("cat disk3/a.txt"), "a file under it is on the exFAT volume", "")
+    run("mkdir rec/sub")
+    run("write rec/sub/b.txt deep")
+    listing = run("ls rec")
+    check("a.txt" in listing and "sub" in listing, "ls of the mount point lists the exFAT volume", listing)
+    check("deep" in run("cat @stick/sub/b.txt"), "@LABEL/path reaches it too", "")
+    run("cp rec/a.txt copy.txt")
+    check("hello" in run("cat copy.txt"), "cp reads from it", "")
+    run("rm rec/a.txt")
+    check("a.txt" not in run("ls rec"), "rm removes from it", "")
 
 
 def main():
@@ -47,7 +64,9 @@ def main():
         tmp = Path(tmp)
         disk = tmp / "cfg.img"
         disk.write_bytes(bytes(64 << 20))
-        boot(tmp, [disk], scenario)
+        stick = tmp / "stick.img"
+        stick.write_bytes(bytes(64 << 20))
+        boot(tmp, [disk, stick], scenario)
         image = disk.read_bytes()
         found, meta = v4_files(image[partition_start(image) * SECTOR:])
         check(found.get("phono.cfg") == b"gain=3" and found.get("sub/deep.cfg") == b"deep" and "sub/" in found and meta["damaged"] == 0,

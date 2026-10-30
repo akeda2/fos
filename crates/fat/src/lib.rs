@@ -189,6 +189,11 @@ pub struct Fs<D: Device> {
 }
 
 impl<D: Device> Fs<D> {
+    /// The volume's label (exFAT only: FAT32 volumes here have none that is read); `None` when there is none.
+    pub fn label(&mut self) -> Result<Option<([u8; 11], usize)>, Error> {
+        if self.kind == Kind::ExFat { self.exfat_label() } else { Ok(None) }
+    }
+
     pub fn mount(mut device: D) -> Result<Fs<D>, Error> {
         let mut boot = [0u8; SECTOR];
         device.read(0, &mut boot)?;
