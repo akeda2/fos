@@ -80,6 +80,10 @@ pub trait Host {
     /// Creates or replaces the file.
     fn write(&mut self, reference: &str, data: &[u8]) -> Result<(), FsError>;
     fn remove(&mut self, reference: &str) -> Result<(), FsError>;
+    /// Makes a folder (`NAME`, `diskN/NAME`...); only FOSFS v4 volumes have them.
+    fn mkdir(&mut self, _reference: &str) -> Result<(), FsError> {
+        Err(FsError::BadName)
+    }
     /// Calls `each` (handing it the host back, to print with) for every entry of the volume and returns its kind (`"FOSFS"`, `"FAT32"`, `"exFAT"`).
     fn list(&mut self, volume: &str, each: &mut dyn FnMut(&mut dyn Host, Entry)) -> Result<&'static str, FsError>;
     /// Runs `run` with a scratch buffer of `size` bytes; false if there is no memory for it.

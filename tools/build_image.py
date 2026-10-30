@@ -298,7 +298,7 @@ def build_fosfs(files, label: str = "", version: int = 3) -> bytes:
     else:
         directory_sectors, entry_size = 8, 64
         magic, max_name, allowed = b"FOSFS3\0\0", 16, b"abcdefghijklmnopqrstuvwxyz0123456789._-"
-    data_start = 1 + directory_sectors
+    data_start = (2 if version == 4 else 1) + directory_sectors
     volume = bytearray(FOSFS_SECTORS * SECTOR)
     superblock = bytearray(SECTOR)
     superblock[0:8] = magic
@@ -309,6 +309,8 @@ def build_fosfs(files, label: str = "", version: int = 3) -> bytes:
             raise SystemExit(f"invalid FOSFS label {label!r}")
         superblock[64:64 + len(raw_label)] = raw_label  # the volume label (see kernel/src/fosfs.rs)
     volume[0:SECTOR] = superblock
+    if version == 4:
+        volume[SECTOR:2 * SECTOR] = superblock  # the backup superblock
     next_sector = data_start
     for index, (name, contents) in enumerate(files):
         raw = name.encode("ascii")
@@ -320,10 +322,19 @@ def build_fosfs(files, label: str = "", version: int = 3) -> bytes:
         if next_sector + count > FOSFS_SECTORS:
             raise SystemExit("FOSFS volume full")
         entry = bytearray(entry_size)
-        entry[0], entry[1] = 1, len(raw)
-        struct.pack_into("<QQQ", entry, 4, next_sector, len(contents), count)
-        entry[28:28 + len(raw)] = raw
-        at = SECTOR + index * entry_size
+        if version == 4:
+            # kind, name length, extents; length, sectors, parent (root), mtime (unknown), name, extent 0, CRC32.
+            entry[0], entry[1], entry[2] = 1, len(raw), 1 if count else 0
+            struct.pack_into("<QQ", entry, 8, len(contents), count)
+            entry[40:40 + len(raw)] = raw
+            if count:
+                struct.pack_into("<QI", entry, 88, next_sector, count)
+            struct.pack_into("<I", entry, 4, crc32(bytes(entry)))
+        else:
+            entry[0], entry[1] = 1, len(raw)
+            struct.pack_into("<QQQ", entry, 4, next_sector, len(contents), count)
+            entry[28:28 + len(raw)] = raw
+        at = (2 if version == 4 else 1) * SECTOR + index * entry_size
         volume[at:at + entry_size] = entry
         volume[next_sector * SECTOR:next_sector * SECTOR + len(contents)] = contents
         next_sector += count

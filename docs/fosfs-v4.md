@@ -103,3 +103,24 @@ says which one a save used.
   chunks of about 64 MiB as it is written; a full disk is a write error. Tape end closes all handles.
 - `fs_read_at(name, len, offset, buf, cap)` in the same ABI bump (version 29), so a decode need not hold the whole file.
 - exFAT side (`crates/fat`) to be reviewed separately for two concurrent writers.
+
+## v4 layout revision (2026-10-30, agreed: "all points sound good")
+
+v4 is not deployed, so the on-disk layout is changed freely before step 1 is final. Folders (parent index in the flat
+entry table) are built; this revision adds:
+
+- **Backup superblock** in sector 1 (the directory starts at sector 2). Written before the primary; `mount` falls back to
+  it when sector 0 is bad. `grow` and `set_label` write both.
+- **Per-entry CRC32** (IEEE, as `zlib.crc32`) over the entry with its CRC field zeroed. A slot that fails it counts as
+  damaged: skipped by `for_each`, named by `fsck`.
+- **Timestamps**: `mtime`, Unix seconds of the local clock reading (the clock holds local time, as FAT does), 0 when the clock is unset; `ls` shows it as on exFAT.
+- **Up to 3 extents per file.** A write takes one free run when one fits, else the three largest free runs. Streams
+  (`reserve`) stay one extent. Rewriting a file that cannot be allocated alongside its old copy frees the old copy first
+  (not crash-safe, as before).
+
+Entry (128 bytes): 0 kind (1 file, 2 folder), 1 name length, 2 extent count, 4 CRC32, 8 length, 16 total sectors,
+24 parent (slot+1), 32 mtime, 40 name (48), 88 three extents of (start u64, count u32), 124 reserved.
+Built and tested (`make test-fosfs4`: a fragmented 4 MiB disk, a broken CRC, a wiped sector 0).
+
+Not done, deliberately: an allocation bitmap or mount-time free-space cache (rescanning is the cost, measure on a real
+stick before adding one) and 4 KiB allocation units.

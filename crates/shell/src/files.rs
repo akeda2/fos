@@ -5,12 +5,13 @@ use core::fmt;
 use crate::{Command, Entry, FsError, Host, say, sayln, split_word};
 
 pub static COMMANDS: &[Command] = &[
-    Command::new("ls", "ls [diskN|@LABEL|esp]", "lists the files of a volume (the boot volume by default).", ls),
+    Command::new("ls", "ls [diskN|@LABEL|esp][/FOLDER]", "lists the files of a volume or folder (the boot volume by default).", ls),
     Command::new("cat", "cat NAME", "shows a file as text (NAME, diskN/NAME, @LABEL/NAME or esp/NAME); other bytes show as dots.", cat),
     Command::new("write", "write NAME TEXT", "makes or replaces a small text file (NAME, diskN/NAME, @LABEL/NAME or esp/NAME).", write),
     Command::new("rm", "rm NAME", "removes a file (NAME, diskN/NAME, @LABEL/NAME or esp/NAME).", rm),
     Command::new("cp", "cp SRC DST", "copies a file between volumes; DST may be just a volume (diskN, @LABEL, esp) to keep the name.", cp).alias(&["copy"]),
     Command::new("cmp", "cmp A B", "says whether two files are byte-identical (a read-back check of `cp`).", cmp),
+    Command::new("mkdir", "mkdir NAME", "makes a folder on a FOSFS v4 volume (NAME, diskN/NAME or @LABEL/NAME); `ls diskN/NAME` lists it.", mkdir),
 ];
 
 /// The largest file `cat` shows.
@@ -108,6 +109,20 @@ fn write(host: &mut dyn Host, rest: &str) {
     }
 }
 
+fn mkdir(host: &mut dyn Host, rest: &str) {
+    let mut joined = [0u8; 192];
+    let (reference, _) = split_word(join_volume(rest, &mut joined));
+    if reference.is_empty() {
+        return sayln!(host, "Usage: mkdir NAME   (NAME, diskN/NAME or @LABEL/NAME; FOSFS v4 volumes only)");
+    }
+    match host.mkdir(reference) {
+        Ok(()) => sayln!(host, "Folder {reference} is there."),
+        Err(FsError::BadName) => sayln!(host, "mkdir: {reference}: only a FOSFS v4 volume has folders, with valid names."),
+        Err(FsError::Failed) => sayln!(host, "mkdir: {reference}: the parent folder is missing, or the volume is full."),
+        Err(error) => sayln!(host, "mkdir: {reference}: {error}."),
+    }
+}
+
 fn rm(host: &mut dyn Host, rest: &str) {
     let mut joined = [0u8; 192];
     let (reference, _) = split_word(join_volume(rest, &mut joined));
@@ -116,7 +131,8 @@ fn rm(host: &mut dyn Host, rest: &str) {
     }
     match host.remove(reference) {
         Ok(()) => sayln!(host, "Removed {reference}."),
-        Err(FsError::NotFound) => sayln!(host, "rm: {reference}: no such file (directories are not removed here)."),
+        Err(FsError::NotFound) => sayln!(host, "rm: {reference}: no such file (a folder must be empty)."),
+        Err(FsError::Failed) => sayln!(host, "rm: {reference}: not removed (a folder must be empty first, or the volume could not be written)."),
         Err(error) => sayln!(host, "rm: {reference}: {error}."),
     }
 }

@@ -166,6 +166,20 @@ pub fn now() -> Option<Time> {
     Some(from_seconds(base + elapsed))
 }
 
+/// Seconds from 1970-01-01 (Unix) to 2000-01-01, the clock's own epoch.
+const UNIX_OFFSET: u64 = 946_684_800;
+
+/// The local wall-clock reading as Unix seconds (as if it were UTC, like FAT's local timestamps), or 0 if the clock
+/// was never set.
+pub fn unix_seconds() -> u64 {
+    now().map_or(0, |time| to_seconds(&time) + UNIX_OFFSET)
+}
+
+/// The inverse of `unix_seconds` for a stored non-zero value (before 2000 shows as 2000-01-01 00:00:00).
+pub fn time_at_unix(seconds: u64) -> Time {
+    from_seconds(seconds.saturating_sub(UNIX_OFFSET))
+}
+
 /// `YYYY-MM-DD HH:MM:SS`.
 pub struct Display(pub Time);
 

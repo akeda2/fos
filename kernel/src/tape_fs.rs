@@ -19,17 +19,32 @@ static mut FAT_STREAM: Option<(crate::fatvol::Fs, fat::Stream, [u8; 64], usize)>
 /// A bare name is the boot volume's; for reading (`reading`) it falls back to the first other disk that has the file, so
 /// a configuration file moved to another disk is still found.
 pub fn resolve_file(reference: &[u8], reading: bool) -> Result<(Volume, &[u8]), isize> {
-    let Some(slash) = reference.iter().position(|&byte| byte == b'/') else {
-        let found = if reading { storage::volume_with_file(reference) } else { None };
-        return found.or_else(storage::boot_volume).map(|volume| (volume, reference)).ok_or(FS_NO_VOLUME);
-    };
-    let (selector, name) = (&reference[..slash], &reference[slash + 1..]);
+    let (selector, name) = split_selector(reference);
+    if selector.is_empty() {
+        let found = if reading { storage::volume_with_file(name) } else { None };
+        return found.or_else(storage::boot_volume).map(|volume| (volume, name)).ok_or(FS_NO_VOLUME);
+    }
     let volume = if let Some(label) = selector.strip_prefix(b"@") {
         storage::volume_labelled(label).map(|(_, volume)| volume)
     } else {
         disk_number(selector).and_then(|number| storage::volume_on(number).ok())
     };
     volume.map(|volume| (volume, name)).ok_or(FS_NO_VOLUME)
+}
+
+/// Splits a reference into its volume selector (`diskN`, `@LABEL`, `esp`, or empty for the boot volume) and the path
+/// on that volume. A first component that is none of those is a folder of the boot volume: `bin/phono`.
+pub fn split_selector(reference: &[u8]) -> (&[u8], &[u8]) {
+    let (first, rest) = match reference.iter().position(|&byte| byte == b'/') {
+        Some(slash) => (&reference[..slash], Some(&reference[slash + 1..])),
+        None => (reference, None),
+    };
+    let is_selector = first == b"esp" || first.strip_prefix(b"@").is_some_and(|label| !label.is_empty()) || disk_number(first).is_some();
+    match (is_selector, rest) {
+        (true, Some(rest)) => (first, rest),
+        (true, None) => (first, &[]),
+        (false, _) => (&[], reference),
+    }
 }
 
 fn disk_number(selector: &[u8]) -> Option<usize> {
@@ -138,6 +153,19 @@ pub fn remove(reference: &[u8]) -> isize {
     }
 }
 
+/// Makes a folder (FOSFS v4 volumes only).
+pub fn mkdir(reference: &[u8]) -> isize {
+    let (volume, name) = match resolve_file(reference, false) {
+        Ok(found) => found,
+        Err(code) => return code,
+    };
+    match volume.mkdir(name) {
+        Ok(()) => 0,
+        Err(Error::InvalidName) => FS_BAD_NAME,
+        Err(_) => FS_ERROR,
+    }
+}
+
 /// The volume a `fs_list` reference names: empty (boot volume), `diskN` or `@LABEL`.
 pub fn resolve_volume(reference: &[u8]) -> Option<Volume> {
     if reference.is_empty() {
@@ -153,13 +181,17 @@ pub fn resolve_volume(reference: &[u8]) -> Option<Volume> {
 /// was written; the result is the kind of volume (`FOSFS`, `FAT32`, `exFAT`) or an `FS_*` code. A disk with only a
 /// FAT32/exFAT volume lists its root directory.
 pub fn each_entry(reference: &[u8], each: &mut dyn FnMut(&[u8], u64, bool, Option<fat::Time>)) -> Result<&'static str, isize> {
-    let fat = if reference == b"esp" { crate::fatvol::mount_esp() } else { disk_number(reference).and_then(fat_disk) };
+    let fat = if reference == b"esp" { crate::fatvol::mount_esp() } else { disk_number(split_selector(reference).0).and_then(fat_disk) };
     if let Some(mut fs) = fat {
         let kind = if fs.kind() == fat::Kind::ExFat { "exFAT" } else { "FAT32" };
         return fs.list(|entry| each(entry.name(), u64::from(entry.size), entry.is_directory, entry.modified)).map(|()| kind).map_err(fat_error);
     }
-    let volume = resolve_volume(reference).ok_or(FS_NO_VOLUME)?;
-    volume.for_each(|entry| each(entry.name(), entry.length, false, None)).map(|()| "FOSFS").map_err(|_| FS_ERROR)
+    let (selector, folder) = split_selector(reference);
+    let volume = resolve_volume(selector).ok_or(FS_NO_VOLUME)?;
+    volume
+        .for_each_in(folder, |entry| each(entry.name(), entry.length, entry.is_dir, (entry.modified != 0).then(|| crate::clock::time_at_unix(entry.modified))))
+        .map(|()| "FOSFS")
+        .map_err(|error| if error == Error::NoDirectory { FS_NOT_FOUND } else { FS_ERROR })
 }
 
 /// `fs_list`: the `index`th file of a volume (`""`, `diskN`, `@LABEL`); a FAT disk lists its root directory.

@@ -925,7 +925,7 @@ fn execute(command: &str) {
         crate::bootcode::cancel(); // and a boot-code update
     }
     // The file commands and the common ones (shellcmds.rs) are the shared shell's (`crates/shell`, docs/shell.md); `copy` (other machines too) stays here.
-    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill" | "about" | "version" | "hexdump" | "sha256" | "fsck" | "kup" | "recv" | "audio" | "label" | "format" | "debug" | "tapesync" | "gpio" | "copy" | "pci" | "cpuinfo" | "bootinfo" | "memmap" | "irqstat" | "mmio" | "io") || (word == "usb" && !matches!(words.clone().next(), Some("try" | "abort-test"))) || (word == "nic" && matches!(words.clone().next(), None | Some("list" | "sniff" | "promisc" | "peers" | "discover" | "use" | "map" | "send" | "recv"))) {
+    if matches!(word, "help" | "ls" | "cat" | "write" | "mkdir" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill" | "about" | "version" | "hexdump" | "sha256" | "fsck" | "kup" | "recv" | "audio" | "label" | "format" | "debug" | "tapesync" | "gpio" | "copy" | "pci" | "cpuinfo" | "bootinfo" | "memmap" | "irqstat" | "mmio" | "io") || (word == "usb" && !matches!(words.clone().next(), Some("try" | "abort-test"))) || (word == "nic" && matches!(words.clone().next(), None | Some("list" | "sniff" | "promisc" | "peers" | "discover" | "use" | "map" | "send" | "recv"))) {
         fosfor_shell::execute(&mut crate::shellhost::KernelHost, &[crate::shellcmds::COMMANDS, fosfor_shell::files::COMMANDS], command);
         return;
     }
@@ -1141,9 +1141,6 @@ fn copy_with_fat(source: &str, name: &str, destination: &str, new_name: &str, so
             None => return crate::println!("copy: {source} is not diskN or @LABEL."),
         }
     };
-    if destination_fat.is_none() && !crate::fosfs::valid_name(new_name.as_bytes()) {
-        return crate::println!("copy: {new_name} is not a FOSFS file name (lowercase letters, digits . _ -, up to 16): give a new name, `copy {source} {name} {destination} NEWNAME`.");
-    }
     if length > LIMIT {
         return crate::println!("copy: {name} is {} MiB; the limit is {} MiB.", length >> 20, LIMIT >> 20);
     }
@@ -1160,6 +1157,9 @@ fn copy_with_fat(source: &str, name: &str, destination: &str, new_name: &str, so
     } else {
         None
     };
+    if destination_volume.is_some_and(|volume| !volume.accepts_name(new_name.as_bytes())) {
+        return crate::println!("copy: {new_name} is not a FOSFS file name here (v3: lowercase letters, digits . _ -, up to 16): give a new name, `copy {source} {name} {destination} NEWNAME`.");
+    }
     let frames = (length.max(1) as u64).div_ceil(crate::memory::FRAME);
     let Some(buffer) = crate::memory::allocate_contiguous(frames, None) else {
         return crate::println!("copy: not enough free memory for {length} bytes.");
@@ -1256,7 +1256,7 @@ fn copy_between(source: &str, name: &str, destination: &str, new_name: &str) {
     if source_number == destination_number && name == new_name {
         return crate::println!("copy: source and destination are the same file.");
     }
-    if !crate::fosfs::valid_name(new_name.as_bytes()) {
+    if !destination_volume.accepts_name(new_name.as_bytes()) {
         return crate::println!("copy: {new_name} is not a valid file name.");
     }
     let length = match source_volume.file_length(name.as_bytes()) {
