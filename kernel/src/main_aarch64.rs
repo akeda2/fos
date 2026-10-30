@@ -259,8 +259,21 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
     if dsitouch::init() {
         println!("DSI touch: FT5406-style controller at 0x38 on the display connector's I2C bus (`touch`).");
     }
-    // fstab before the settings: a `settings` mount overlays the root's folder (no boot wait here yet: xHCI is already up).
-    mounts::load();
+    // fstab before the settings: a `settings` mount overlays the root's folder (waits for a late USB stick, as x86 does).
+    let (mounted, _) = mounts::load();
+    if mounted > 0 && mounts::absent() > 0 && xhci::count() > 0 {
+        println!("fstab: waiting for a mounted volume (up to 10 s; the root's folders are used if it never appears).");
+        for _ in 0..20 {
+            timer::busy_wait_ms(500);
+            usb_kbd::probe_all();
+            if mounts::absent() == 0 {
+                break;
+            }
+        }
+        if mounts::absent() > 0 {
+            println!("fstab: {} mounted volume(s) still absent; the boot volume's folders stand (`usb rescan` looks again).", mounts::absent());
+        }
+    }
     let no_msi = shell::apply_settings();
     xhci::enable_interrupts_all(no_msi);
     cpu::interrupts_enable();

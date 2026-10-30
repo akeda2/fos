@@ -105,7 +105,7 @@ says which one a save used.
    `fstab`) is read first, then, with USB present and a mounted label absent, a bounded wait of up to 10 s (it
    narrates), then `settings/NAME` is read from the mounted volume when it has the file, else the root's `settings/`,
    else the bare root name (`make test-v4-boot` covers the mount and override; the late-stick wait needs real USB).
-   **aarch64:** the image is v4 too (tapes in `bin/`, `FOSFS=3` for flat); boot loads `fstab` and `settings/settings` before applying settings (no late-stick wait yet; `make test-aarch64-boot`). **Not done:** the deploy skill's paths (bare names work).
+   **aarch64:** the image is v4 too (tapes in `bin/`, `FOSFS=3` for flat); boot loads `fstab` and `settings/settings` before applying settings and waits up to 10 s for a late USB stick, as x86 does (`make test-aarch64-boot`; the wait itself needs real USB). **Not done:** the deploy skill's paths (bare names work).
 5. Crash safety, only if real hardware shows a need (see "Journaling" below).
 6. Wildcards in `ls`, `cp`, `rm` and a new `mv` (see "Wildcards in shell tools" below).
 
