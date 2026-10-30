@@ -297,7 +297,11 @@ fn copy_or_move(host: &mut dyn Host, rest: &str, moving: bool) {
         let folder = moving && host.list(to.trim_end_matches('/'), &mut |_, _| {}).is_ok();
         let mut buffer = [0u8; 192];
         let Some(to) = target(&mut buffer, to, from, folder) else { return sayln!(host, "{verb}: the name is too long.") };
-        transfer(host, from, to, moving);
+        if moving && !is_volume(from.trim_end_matches('/')) && host.list(from.trim_end_matches('/'), &mut |_, _| {}).is_ok() {
+            move_folder(host, from, to);
+        } else {
+            transfer(host, from, to, moving);
+        }
         return;
     }
     // Several sources cannot share one file name: DST is a folder (made when missing).
@@ -318,6 +322,8 @@ fn copy_or_move(host: &mut dyn Host, rest: &str, moving: bool) {
         }
         let mut buffer = [0u8; 192];
         match target(&mut buffer, to, reference, true) {
+            Some(destination) if directory && move_folder(host, reference, destination) => worked += 1,
+            Some(_) if directory => failed += 1,
             Some(destination) if transfer(host, reference, destination, moving) => worked += 1,
             Some(_) => failed += 1,
             None => {
@@ -478,7 +484,7 @@ fn copy_recursive(host: &mut dyn Host, rest: &str) {
             totals.2 += 1;
             return sayln!(host, "cp: cannot copy {source} into itself ({destination}).");
         }
-        let found = host.with_buffer(DEPTH * LEVEL, &mut |host, scratch| copy_tree(host, scratch, source, destination, 0, &mut totals));
+        let found = host.with_buffer(DEPTH * LEVEL, &mut |host, scratch| copy_tree(host, scratch, source, destination, 0, false, &mut totals));
         if !found {
             totals.2 += 1;
             sayln!(host, "cp: not enough free memory to copy {source}.");
@@ -499,7 +505,8 @@ fn copy_recursive(host: &mut dyn Host, rest: &str) {
 }
 
 /// Copies the contents of folder `from` into folder `to` (made when missing), folder by folder.
-fn copy_tree(host: &mut dyn Host, scratch: &mut [u8], from: &str, to: &str, depth: usize, totals: &mut (usize, usize, usize)) {
+fn copy_tree(host: &mut dyn Host, scratch: &mut [u8], from: &str, to: &str, depth: usize, moving: bool, totals: &mut (usize, usize, usize)) {
+    let failures_before = totals.2;
     if depth >= DEPTH {
         totals.2 += 1;
         return sayln!(host, "cp: {from} nests deeper than {DEPTH} folders; the rest is skipped.");
@@ -540,13 +547,50 @@ fn copy_tree(host: &mut dyn Host, scratch: &mut [u8], from: &str, to: &str, dept
             continue;
         };
         if directory {
-            copy_tree(host, deeper, source, destination, depth + 1, totals);
-        } else if transfer(host, source, destination, false) {
+            copy_tree(host, deeper, source, destination, depth + 1, moving, totals);
+        } else if transfer(host, source, destination, moving) {
             totals.0 += 1;
         } else {
             totals.2 += 1;
         }
     }
+    // A move removes the folder once everything in it has been moved (each file was read back before its removal);
+    // after any failure the source folder stays with what is left.
+    if moving && totals.2 == failures_before {
+        if let Err(error) = host.remove(from.trim_end_matches('/')) {
+            totals.2 += 1;
+            sayln!(host, "mv: {from}: moved, but the folder was not removed: {error}.");
+        }
+    }
+}
+
+/// `mv` of a folder to `destination`: in place when the volume can (v4), else copied file by file with each source file
+/// removed after its copy reads back, then the emptied folders. Returns whether it all moved.
+fn move_folder(host: &mut dyn Host, source: &str, destination: &str) -> bool {
+    let (source, inside) = (source.trim_end_matches('/'), destination.trim_end_matches('/'));
+    if inside == source || inside.strip_prefix(source).is_some_and(|tail| tail.starts_with('/')) {
+        sayln!(host, "mv: cannot move {source} into itself ({destination}).");
+        return false;
+    }
+    match host.rename(source, inside) {
+        Ok(true) => {
+            sayln!(host, "Moved {source} to {inside} (renamed in place).");
+            return true;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            sayln!(host, "mv: {source}: {error}.");
+            return false;
+        }
+    }
+    let mut totals = (0usize, 0usize, 0usize);
+    let found = host.with_buffer(DEPTH * LEVEL, &mut |host, scratch| copy_tree(host, scratch, source, inside, 0, true, &mut totals));
+    if !found {
+        sayln!(host, "mv: not enough free memory to move {source}.");
+        return false;
+    }
+    sayln!(host, "Moved {} file(s) of {source} to {inside}{}.", totals.0, if totals.2 > 0 { "; some failed and stay in the source" } else { "" });
+    totals.2 == 0
 }
 
 /// A `fmt::Write` into a byte array.
@@ -644,6 +688,10 @@ mod tests {
             let found: Vec<(String, u64)> = self.files.iter().filter_map(|(name, data)| name.strip_prefix(&prefix).map(|name| (name.to_string(), data.len() as u64))).collect();
             if volume == "disk9" {
                 return Err(FsError::NoVolume);
+            }
+            // a bare file name is not a folder
+            if !volume.is_empty() && !volume.contains('/') && !is_volume(volume) {
+                return Err(FsError::NotFound);
             }
             // a folder that holds nothing does not exist here
             if volume.contains('/') && found.is_empty() {
@@ -825,6 +873,18 @@ mod tests {
         let out = run(&mut host, "cp -r disk2/rec/*.txt disk2/flat");
         assert!(out.contains("Copied 1 file(s) and 0 folder(s)."), "{out}");
         assert_eq!(run(&mut host, "cp -r disk2/none disk2/x"), "cp: disk2/none: no such file.\nCopied 0 file(s) and 0 folder(s), some failed.\n");
+    }
+
+    #[test]
+    fn mv_moves_folders_across_volumes() {
+        let mut host = Mock::default();
+        put(&mut host, &["disk2/rec/a.txt", "disk2/rec/sub/b.txt"]);
+        // (the mock has no real folders, so the final folder removal reports NotFound; the files are what moved)
+        let out = run(&mut host, "mv disk2/rec disk3/rec");
+        assert!(out.contains("Moved 2 file(s) of disk2/rec to disk3/rec"), "{out}");
+        assert_eq!(run(&mut host, "cat disk3/rec/sub/b.txt"), "disk2/rec/sub/b.txt\n");
+        assert!(run(&mut host, "cat disk2/rec/a.txt").contains("no such file"));
+        assert!(run(&mut host, "mv disk3/rec disk3/rec/inner").contains("into itself"));
     }
 
     #[test]

@@ -94,6 +94,19 @@ def scenario(run):
     out = run("rm disk2/rec*.txt confirm")
     check("Removed 2 of 2." in out and "Other" in run("ls disk2"), "rm on exFAT", out)
 
+    # mv of a folder across volumes: copied file by file, sources removed, emptied folders removed
+    out = run("mv tree disk2/moved")
+    check("Moved 2 file(s) of tree to disk2/moved" in out and "some failed" not in out, "mv of a folder onto exFAT", out)
+    check("bb" in run("cat disk2/moved/sub/b.txt") and "no such file" in run("cat tree/a.txt"), "the files arrived and left", "")
+    listing = run("ls")
+    check("\ntree " not in listing, "the emptied source folder is gone", listing)
+    out = run("mv disk2/moved fromfat")
+    check("Moved 2 file(s) of disk2/moved to fromfat" in out and "bb" in run("cat fromfat/sub/b.txt"), "mv of a folder off exFAT", out)
+    listing = run("ls disk2")
+    check("moved" not in listing, "and the exFAT folder is removed", listing)
+    fsck = run("fsck")
+    check("directory consistent" in fsck, "fsck is happy after the moves", fsck[-300:])
+
 
 def main():
     with tempfile.TemporaryDirectory() as tmp:
