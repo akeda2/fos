@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fosfs_image  # noqa: E402
 from test_audio_net import Guest, tone_frequency  # noqa: E402
 from test_boot import check  # noqa: E402
 
@@ -21,24 +22,8 @@ SECTOR = 512
 
 
 def fosfs_files(image: Path):
-    """{name: bytes} of the first FOSFS volume found through the GPT of a disk image."""
-    data = image.read_bytes()
-    entries_lba = struct.unpack_from("<Q", data, SECTOR + 72)[0]
-    count, size = struct.unpack_from("<II", data, SECTOR + 80)
-    for index in range(count):
-        entry = data[entries_lba * SECTOR + index * size:entries_lba * SECTOR + (index + 1) * size]
-        first, last = struct.unpack_from("<QQ", entry, 32)
-        if entry[:16] != bytes(16) and data[first * SECTOR:first * SECTOR + 8] == b"FOSFS3\0\0":
-            files = {}
-            for sector in range(1, 9):
-                directory = data[(first + sector) * SECTOR:(first + sector + 1) * SECTOR]
-                for slot in range(8):
-                    raw = directory[slot * 64:(slot + 1) * 64]
-                    if raw[0]:
-                        start, length = struct.unpack_from("<QQ", raw, 4)
-                        files[raw[28:28 + raw[1]].decode()] = data[(first + start) * SECTOR:(first + start) * SECTOR + length]
-            return files
-    raise SystemExit("FAIL: no FOSFS volume found in the image")
+    """{name: bytes} of the first FOSFS volume found through the GPT of a disk image (v3 or v4; v4 paths are dir/name)."""
+    return fosfs_image.files(image)
 
 
 def wav(blob: bytes):

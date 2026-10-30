@@ -71,6 +71,7 @@ def main():
             check("not a tape" in out, "the plain file named ptp was left alone", out[-400:])
             alpha.pump(2.5)
             out = run(bravo, "rm ptp")
+            out = run(bravo, "rm ptp")  # on a v4 volume the first removed the root file, this removes the tape in bin/
             out = run(bravo, "tapesync alpha1")
             check("ptp" in out and "new here" in out, "(with it gone, ptp is new)", out[-800:])
             check("calc" in out and "the same" in out, "calc and hello now match alpha's", out[-800:])

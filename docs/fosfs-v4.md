@@ -92,6 +92,16 @@ says which one a save used.
    exFAT volume at a path (needs its label read; the mount table takes FOSFS labels only), and a test of a
    contiguous directory.
 4. Move tapes, configs and settings into their folders; `tape-rt` and the tapes use the new paths; deploy tooling follows.
+   *Built so far (search path, bare names stay valid for good: v3 volumes and FAT sticks keep working):* a bare tape
+   name falls back to `bin/NAME` (`tape_fs::resolve_file`); boot config (`hostname`, `settings`, `debug`, `start`) is read
+   from `settings/NAME` first (`config::read`); a tape's config tries `config/NAME` first and `save` writes where it
+   found the file (`tape-rt` `Config::load`). `make image FOSFS=4` builds a v4 volume with `bin/` and `settings/`
+   (`build_image.py` turns `/` in a `--file` name into folders); `make test-v4-boot` boots it. **The default is now v4**
+   (2026-10-30): `make image` builds v4 (`FOSFS=3` for the old volume), `format diskN` makes v4 (`format diskN v3` the old
+   one; `install` still makes v3). A bare `rm`/`write`/NETFS put of a tape that lives only in `bin/` acts on `bin/NAME`,
+   so `foscopy :disk1/NAME` and `tapesync` replace the tape instead of shadowing it from the root; `tapesync` scans `bin/`
+   too. Host tests read and stage image files through `tools/fosfs_image.py` (v3 and v4). **Not done:** the boot-time
+   wait and settings overlay, `install` to v4, the aarch64 image (still flat v3), the deploy skill's paths (bare names work).
 5. Crash safety, only if real hardware shows a need (see "Journaling" below).
 6. Wildcards in `ls`, `cp`, `rm` and a new `mv` (see "Wildcards in shell tools" below).
 

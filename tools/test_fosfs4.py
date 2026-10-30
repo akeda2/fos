@@ -141,8 +141,8 @@ def first_scenario(work):
         run("format disk2 vol4 v4")
         done = run("format disk2 confirm")
         check("FOSFS v4" in done, "`format diskN v4` makes a v4 volume", done)
-        run("format disk3 vol3")
-        check("FOSFS v3" in run("format disk3 confirm"), "and without `v4` it stays v3", "")
+        run("format disk3 vol3 v3")
+        check("FOSFS v3" in run("format disk3 confirm"), "`format diskN v3` still makes the flat v3 volume", "")
 
         run(f"write disk2 {LONG_NAME} long name")
         check("long name" in run(f"cat disk2 {LONG_NAME}"), "a 48-character mixed-case name works on v4", "")

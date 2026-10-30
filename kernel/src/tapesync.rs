@@ -92,12 +92,32 @@ fn scan(volume: &Volume, state: &mut State) -> Result<(usize, usize), &'static s
             }
         })
         .map_err(|_| "cannot read the FOSFS directory")?;
+    // A v4 volume keeps its tapes in bin/; a name already seen in the root is that file.
+    let _ = volume.for_each_in(b"bin", |entry| {
+        let name = entry.name();
+        let known = state.names[..files].iter().zip(&state.name_lengths).any(|(known, &length)| &known[..usize::from(length)] == name);
+        if files < MAX_TAPES && !known && !entry.is_dir && name.len() <= NAME_LEN {
+            state.names[files] = [0; NAME_LEN];
+            state.names[files][..name.len()].copy_from_slice(name);
+            state.name_lengths[files] = name.len() as u8;
+            files += 1;
+        }
+    });
     let staging = crate::netfs::staging().ok_or("no memory for the transfer buffer")?;
     let mut tapes = 0;
     for index in 0..files {
         let name = &state.names[index][..usize::from(state.name_lengths[index])];
         crate::netfs::pet();
-        let Ok(Some(length)) = volume.read(name, staging) else { continue };
+        let length = match volume.read(name, staging) {
+            Ok(Some(length)) => length,
+            _ => {
+                let mut path = [0u8; 4 + NAME_LEN];
+                path[..4].copy_from_slice(b"bin/");
+                path[4..4 + name.len()].copy_from_slice(name);
+                let Ok(Some(length)) = volume.read(&path[..4 + name.len()], staging) else { continue };
+                length
+            }
+        };
         let image = &staging[..length];
         let Some(stamp) = fosfor_abi::elf::section(image, tape_sync::SECTION).and_then(Stamp::decode) else { continue };
         let entry = &mut state.local[tapes];
@@ -273,7 +293,18 @@ fn run(host: Option<&str>, apply: bool) {
             failed += 1;
             continue;
         }
-        match volume.write(remote.name_bytes(), image) {
+        // Replace the file where it lives: the root's if it has one, else bin/ on a volume that has that folder.
+        let mut path = [0u8; 4 + NAME_LEN];
+        let target = remote.name_bytes();
+        let in_root = matches!(volume.file_length(target), Ok(Some(_)));
+        let target = if !in_root && volume.for_each_in(b"bin", |_| {}).is_ok() && target.len() <= NAME_LEN {
+            path[..4].copy_from_slice(b"bin/");
+            path[4..4 + target.len()].copy_from_slice(target);
+            &path[..4 + target.len()]
+        } else {
+            target
+        };
+        match volume.write(target, image) {
             Ok(()) => {
                 println!("{name}: installed ({length} bytes).");
                 done += 1;

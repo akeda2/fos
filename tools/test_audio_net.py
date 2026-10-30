@@ -22,6 +22,7 @@ import wave
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fosfs_image  # noqa: E402
 from testslot import port  # noqa: E402
 from test_boot import CODE_CANDIDATES, IMAGE, VARS_CANDIDATES, check, clean, find  # noqa: E402
 
@@ -29,36 +30,8 @@ GROUP, PORT = "230.42.42.77", port(4277)
 
 
 def fosfs_add(image, files):
-    """Adds `files` ({name: text}) to the first FOSFS volume of a disk image (a first-fit append after the last extent)."""
-    data = bytearray(Path(image).read_bytes())
-    entries_lba = struct.unpack_from("<Q", data, 512 + 72)[0]
-    count, size = struct.unpack_from("<II", data, 512 + 80)
-    for index in range(count):
-        entry = data[entries_lba * 512 + index * size:entries_lba * 512 + (index + 1) * size]
-        first = struct.unpack_from("<Q", entry, 32)[0]
-        if entry[:16] != bytes(16) and data[first * 512:first * 512 + 8] == b"FOSFS3\0\0":
-            break
-    else:
-        raise SystemExit("FAIL: no FOSFS volume in the image")
-    for name, text in files.items():
-        body = text if isinstance(text, bytes) else text.encode()
-        end, slot = 9, None
-        for sector in range(1, 9):
-            for number in range(8):
-                at = (first + sector) * 512 + number * 64
-                if data[at]:
-                    start, _, sectors = struct.unpack_from("<QQQ", data, at + 4)
-                    end = max(end, start + sectors)
-                elif slot is None:
-                    slot = at
-        sectors = -(-len(body) // 512)
-        data[(first + end) * 512:(first + end) * 512 + len(body)] = body
-        data[slot:slot + 64] = bytes(64)
-        data[slot] = 1
-        data[slot + 1] = len(name)
-        struct.pack_into("<QQQ", data, slot + 4, end, len(body), sectors)
-        data[slot + 28:slot + 28 + len(name)] = name.encode()
-    Path(image).write_bytes(data)
+    """Adds `files` ({name: text}) to the root of the first FOSFS volume of a disk image (v3 or v4)."""
+    fosfs_image.add(image, files)
 
 
 class Guest:

@@ -14,6 +14,8 @@ static mut STREAM: Option<(Volume, Entry)> = None;
 /// Or, on a FAT32/exFAT volume: the mounted volume, the stream and the file's name (for `finish`).
 static mut FAT_STREAM: Option<(crate::fatvol::Fs, fat::Stream, [u8; 64], usize)> = None;
 
+static mut BIN_PATH: [u8; 4 + crate::fosfs::MAX_NAME] = [0; 4 + crate::fosfs::MAX_NAME];
+
 /// Resolves a tape's file reference to its FOSFS volume and the name on it.
 ///
 /// A bare name is the boot volume's; for reading (`reading`) it falls back to the first other disk that has the file, so
@@ -31,6 +33,13 @@ pub fn resolve_file(reference: &[u8], reading: bool) -> Result<(Volume, &[u8]), 
             }
         }
         let found = if reading { storage::volume_with_file(name) } else { None };
+        if reading && found.is_none() {
+            if let Some(path) = bin_path(name) {
+                if let Some(volume) = storage::volume_with_file(path) {
+                    return Ok((volume, path));
+                }
+            }
+        }
         return found.or_else(storage::boot_volume).map(|volume| (volume, name)).ok_or(FS_NO_VOLUME);
     }
     let volume = if let Some(label) = selector.strip_prefix(b"@") {
@@ -38,7 +47,26 @@ pub fn resolve_file(reference: &[u8], reading: bool) -> Result<(Volume, &[u8]), 
     } else {
         disk_number(selector).and_then(|number| storage::volume_on(number).ok())
     };
-    volume.map(|volume| (volume, name)).ok_or(FS_NO_VOLUME)
+    let volume = volume.ok_or(FS_NO_VOLUME)?;
+    if reading && !matches!(volume.file_length(name), Ok(Some(_))) {
+        if let Some(path) = bin_path(name).filter(|path| matches!(volume.file_length(path), Ok(Some(_)))) {
+            return Ok((volume, path));
+        }
+    }
+    Ok((volume, name))
+}
+
+/// `bin/NAME` for a bare NAME, in a buffer that outlives the call (file calls are synchronous and the caller uses the
+/// name at once). A tape is found in `bin/` when its bare name is not there: `run NAME`, and a tape that loads another
+/// one, need not know whether the volume keeps its tapes in a folder.
+pub(crate) fn bin_path(name: &[u8]) -> Option<&'static [u8]> {
+    if name.contains(&b'/') || name.len() > crate::fosfs::MAX_NAME {
+        return None;
+    }
+    let path: &'static mut [u8; 4 + crate::fosfs::MAX_NAME] = unsafe { &mut *core::ptr::addr_of_mut!(BIN_PATH) };
+    path[..4].copy_from_slice(b"bin/");
+    path[4..4 + name.len()].copy_from_slice(name);
+    Some(&path[..4 + name.len()])
 }
 
 /// Splits a reference into its volume selector (`diskN`, `@LABEL`, `esp`, or empty for the boot volume) and the path
@@ -171,10 +199,22 @@ pub fn write(reference: &[u8], data: &[u8]) -> isize {
     if make_mount_folders(reference, &volume, name).is_err() {
         return FS_ERROR;
     }
-    match volume.write(name, data) {
+    match volume.write(replace_target(&volume, name), data) {
         Ok(()) => 0,
         Err(Error::InvalidName) => FS_BAD_NAME,
         Err(_) => FS_ERROR,
+    }
+}
+
+/// Where a write of bare `name` goes: a tape that lives only in `bin/` is replaced there, so a pushed update (`foscopy`,
+/// NETFS) is not shadowed by a new copy in the root. Anything else keeps its name.
+pub(crate) fn replace_target<'a>(volume: &Volume, name: &'a [u8]) -> &'a [u8] {
+    if matches!(volume.file_length(name), Ok(Some(_))) {
+        return name;
+    }
+    match bin_path(name) {
+        Some(path) if matches!(volume.file_length(path), Ok(Some(_))) => path,
+        _ => name,
     }
 }
 
@@ -194,7 +234,14 @@ pub fn remove(reference: &[u8]) -> isize {
         Ok(found) => found,
         Err(code) => return code,
     };
-    match volume.remove(name) {
+    let mut outcome = volume.remove(name);
+    // A bare name that is not in the root removes the tape in `bin/`, the same file `run NAME` would start.
+    if matches!(outcome, Ok(false)) {
+        if let Some(path) = bin_path(name) {
+            outcome = volume.remove(path);
+        }
+    }
+    match outcome {
         Ok(true) => 0,
         Ok(false) => FS_NOT_FOUND,
         Err(_) => FS_ERROR,

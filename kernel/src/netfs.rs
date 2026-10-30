@@ -122,7 +122,13 @@ fn netfs_get_request(index: usize, source: [u8; 6], payload: &[u8]) {
     }
     let Ok(volume) = crate::storage::volume_on(usize::from(payload[0])) else { return reply_error(NETFS_NO_DISK) };
     let Some(staging) = imp::staging() else { return reply_error(NETFS_TOO_LARGE) };
-    let length = match volume.read(name, staging) {
+    let mut result = volume.read(name, staging);
+    if matches!(result, Ok(None)) {
+        if let Some(path) = crate::tape_fs::bin_path(name) {
+            result = volume.read(path, staging);
+        }
+    }
+    let length = match result {
         Ok(Some(0)) => return reply_error(NETFS_TOO_LARGE),
         Ok(Some(length)) => length,
         Ok(None) => return reply_error(NETFS_NOT_FOUND),
@@ -220,7 +226,7 @@ fn netfs_put_stop(index: usize, source: [u8; 6]) {
         return reply_error(NETFS_CHECKSUM);
     }
     let Ok(volume) = crate::storage::volume_on(put.disk) else { return reply_error(NETFS_NO_DISK) };
-    match volume.write(&put.name[..put.name_length], &staging[..put.expected]) {
+    match volume.write(crate::tape_fs::replace_target(&volume, &put.name[..put.name_length]), &staging[..put.expected]) {
         Ok(()) => {
             crate::println!("NETFS: stored {} ({} bytes).", core::str::from_utf8(&put.name[..put.name_length]).unwrap_or("?"), put.expected);
             netfs_reply(index, &source, TAG_PUT_ACK, &[]);

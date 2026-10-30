@@ -312,7 +312,23 @@ def build_fosfs(files, label: str = "", version: int = 3) -> bytes:
     if version == 4:
         volume[SECTOR:2 * SECTOR] = superblock  # the backup superblock
     next_sector = data_start
-    for index, (name, contents) in enumerate(files):
+    if version == 4:
+        # A name with `/` is a path: its folders become entries first (kind 2, parent = slot + 1 of the folder above).
+        folders, expanded = {}, []
+        for name, contents in files:
+            *parents, leaf = name.split("/")
+            for depth in range(len(parents)):
+                path = "/".join(parents[:depth + 1])
+                if path not in folders:
+                    folders[path] = len(expanded) + 1
+                    expanded.append((parents[depth], None, folders["/".join(parents[:depth])] if depth else 0))
+            expanded.append((leaf, contents, folders["/".join(parents)] if parents else 0))
+        entries_list = expanded
+    else:
+        entries_list = [(name, contents, 0) for name, contents in files]
+    for index, (name, contents, parent) in enumerate(entries_list):
+        folder = contents is None
+        contents = b"" if folder else contents
         raw = name.encode("ascii")
         if not (0 < len(raw) <= max_name and all(byte in allowed for byte in raw)):
             raise SystemExit(f"invalid FOSFS name {name!r}")
@@ -324,8 +340,9 @@ def build_fosfs(files, label: str = "", version: int = 3) -> bytes:
         entry = bytearray(entry_size)
         if version == 4:
             # kind, name length, extents; length, sectors, parent (root), mtime (unknown), name, extent 0, CRC32.
-            entry[0], entry[1], entry[2] = 1, len(raw), 1 if count else 0
+            entry[0], entry[1], entry[2] = 2 if folder else 1, len(raw), 1 if count else 0
             struct.pack_into("<QQ", entry, 8, len(contents), count)
+            struct.pack_into("<I", entry, 24, parent)
             entry[40:40 + len(raw)] = raw
             if count:
                 struct.pack_into("<QI", entry, 88, next_sector, count)
@@ -425,7 +442,7 @@ def main():
     parser.add_argument("--arch", choices=("x86_64", "aarch64"), default="x86_64", help="the CPU the loader and kernel are built for (names the loader BOOTAA64.EFI for aarch64; aarch64 images have no BIOS boot code)")
     parser.add_argument("--esp-dir", type=Path, help="copy this directory tree into the ESP's root (the Raspberry Pi 4's edk2 firmware files: "
                         "RPI_EFI.fd, start4.elf, config.txt, ...; its own firmware reads them from the first FAT volume)")
-    parser.add_argument("--fosfs", type=int, choices=(3, 4), default=3, help="the FOSFS version of the data volume (4: docs/fosfs-v4.md; the default stays 3 until the move to folders)")
+    parser.add_argument("--fosfs", type=int, choices=(3, 4), default=3, help="the FOSFS version of the data volume (4: docs/fosfs-v4.md; a --file name with / puts the file in folders)")
     parser.add_argument("--no-bios", action="store_true", help="build a UEFI-only image")
     arguments = parser.parse_args()
     root = Path(__file__).resolve().parent.parent

@@ -39,7 +39,22 @@ impl Config {
     /// Reads the file through the tape ABI. `tape` names the default file (`TAPE.cfg`).
     pub fn load(api: &TapeApi, tape: &str, arguments: &str) -> Result<Self, &'static str> {
         let Some(buffer) = alloc_bytes(api, MAX_BYTES) else { return Err("out of memory") };
+        let in_folder = core::cell::Cell::new(false);
         let mut read = |name: &str, out: &mut [u8]| -> Result<Option<usize>, &'static str> {
+            // FOSFS v4 keeps configuration in `config/`; a bare name falls back to the root (v3, FAT).
+            let mut path = [0u8; MAX_NAME + 7];
+            let mut name = name;
+            if !name.contains('/') && name.len() <= MAX_NAME {
+                path[..7].copy_from_slice(b"config/");
+                path[7..7 + name.len()].copy_from_slice(name.as_bytes());
+                if let Ok(folder) = core::str::from_utf8(&path[..7 + name.len()]) {
+                    let probe = (api.fs_read)(folder.as_ptr(), folder.len(), out.as_mut_ptr(), 0);
+                    if probe >= 0 || probe == crate::FS_TOO_BIG {
+                        in_folder.set(true);
+                        name = folder;
+                    }
+                }
+            }
             match (api.fs_read)(name.as_ptr(), name.len(), out.as_mut_ptr(), out.len()) {
                 length if length >= 0 => Ok(Some(length as usize)),
                 FS_NOT_FOUND => Ok(None),
@@ -47,7 +62,13 @@ impl Config {
                 _ => Err("cannot read the configuration file"),
             }
         };
-        let (length, file, file_length) = compose(buffer, tape, arguments, &mut read)?;
+        let (length, mut file, mut file_length) = compose(buffer, tape, arguments, &mut read)?;
+        // `save` writes where the file was found
+        if in_folder.get() && file_length + 7 <= MAX_NAME {
+            file.copy_within(..file_length, 7);
+            file[..7].copy_from_slice(b"config/");
+            file_length += 7;
+        }
         let text = core::str::from_utf8(&buffer[..length]).map_err(|_| "the configuration file is not text")?;
         let text: &'static str = unsafe { core::mem::transmute::<&str, &'static str>(text) };
         Ok(Self { text, file, file_length })

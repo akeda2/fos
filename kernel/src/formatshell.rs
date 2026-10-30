@@ -9,7 +9,7 @@ struct PendingFormat {
     force: bool,
     /// `format diskN exfat`: a PC-readable exFAT volume instead of FOSFS.
     exfat: bool,
-    /// `format diskN v4`: a FOSFS v4 volume (docs/fosfs-v4.md) instead of v3.
+    /// FOSFS v4 (docs/fosfs-v4.md), the default; `format diskN v3` makes the old flat volume.
     v4: bool,
 }
 static mut PENDING_FORMAT: Option<PendingFormat> = None;
@@ -46,10 +46,10 @@ fn plan_format(disk: usize, force: bool) -> Result<FormatPlan, &'static str> {
 pub fn command(rest: &str) {
     let mut words = rest.split_whitespace();
     let Some(target) = words.next() else {
-        return crate::println!("Usage: format diskN [NAME] [v4] [force]   or   format diskN exfat [LABEL]   (then: format diskN confirm)");
+        return crate::println!("Usage: format diskN [NAME] [v3] [force]   or   format diskN exfat [LABEL]   (then: format diskN confirm)");
     };
     let Some(number) = target.strip_prefix("disk").and_then(|number| number.parse::<usize>().ok()) else {
-        return crate::println!("Usage: format diskN [NAME] [v4] [force]   (then: format diskN confirm)");
+        return crate::println!("Usage: format diskN [NAME] [v3] [force]   (then: format diskN confirm)");
     };
     let Some(info) = number.checked_sub(1).and_then(crate::block::get) else {
         return crate::println!("disk{number}: no such disk (see `disks`).");
@@ -58,13 +58,14 @@ pub fn command(rest: &str) {
     if crate::storage::boot_disk() == Some(disk) {
         return crate::println!("disk{number} is the boot disk (the running kernel's); format refuses it. Use `rm` for its files.");
     }
-    let (mut confirm, mut force, mut exfat, mut v4, mut label) = (false, false, false, false, "");
+    let (mut confirm, mut force, mut exfat, mut v4, mut label) = (false, false, false, true, "");
     for word in words {
         match word {
             "confirm" => confirm = true,
             "force" => force = true,
             "exfat" => exfat = true,
             "v4" => v4 = true,
+            "v3" => v4 = false,
             name => label = name,
         }
     }

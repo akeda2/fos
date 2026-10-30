@@ -68,6 +68,21 @@ pub fn hostname() -> Option<&'static str> {
 
 /// Reads `name` into the shared buffer (from the boot volume, else the first other disk that has it); the text, if present.
 fn read(name: &str) -> Option<&'static str> {
+    // A FOSFS v4 volume keeps these files in `settings/`; the bare name in the root stays valid (v3, FAT sticks).
+    let mut path = [0u8; 40];
+    if name.len() + 9 <= path.len() {
+        path[..9].copy_from_slice(b"settings/");
+        path[9..9 + name.len()].copy_from_slice(name.as_bytes());
+        if let Ok(folder) = core::str::from_utf8(&path[..9 + name.len()]) {
+            if storage::volume_with_file(folder.as_bytes()).is_some() {
+                return read_root(folder);
+            }
+        }
+    }
+    read_root(name)
+}
+
+fn read_root(name: &str) -> Option<&'static str> {
     let buffer = unsafe { &mut *core::ptr::addr_of_mut!(BUFFER) };
     let Some(volume) = storage::volume_with_file(name.as_bytes()) else { return read_fat(name, buffer) };
     match volume.read(name.as_bytes(), buffer) {
