@@ -270,7 +270,13 @@ pub(crate) fn run_tape(rest: &str) {
 pub fn apply_settings() -> bool {
     let Some(volume) = storage::boot_volume() else { return false };
     let mut buffer = [0u8; 1024];
-    let Ok(Some(length)) = volume.read(b"settings", &mut buffer) else { return false };
+    // v4 keeps it in settings/ (a root file would clash with the folder); v3 and FAT keep it in the root.
+    let Ok(Some(length)) = volume.read(b"settings/settings", &mut buffer).and_then(|found| match found {
+        Some(length) => Ok(Some(length)),
+        None => volume.read(b"settings", &mut buffer),
+    }) else {
+        return false;
+    };
     let mut no_msi = false;
     for line in core::str::from_utf8(&buffer[..length]).unwrap_or("").lines() {
         let mut words = line.split_whitespace();

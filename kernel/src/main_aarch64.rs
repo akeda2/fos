@@ -259,6 +259,8 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
     if dsitouch::init() {
         println!("DSI touch: FT5406-style controller at 0x38 on the display connector's I2C bus (`touch`).");
     }
+    // fstab before the settings: a `settings` mount overlays the root's folder (no boot wait here yet: xHCI is already up).
+    mounts::load();
     let no_msi = shell::apply_settings();
     xhci::enable_interrupts_all(no_msi);
     cpu::interrupts_enable();

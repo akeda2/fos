@@ -219,6 +219,9 @@ kernel-aarch64:
 A64_TAPES := hello gfxcheck calc ed netcheck fosplay clock gonio ptp play record recorder ltas kaffe organ strings tape-echo epiano phono fterm telnet net-chat ip-chat bridge nettest router audio-net opus-bench i2cscan gpiopanel miccal frt60
 A64_TAPE_DIR := $(CARGO_TARGET_DIR)/aarch64-unknown-none/release
 A64_TAPE_STAMPED := build/fosfor-aarch64/tapes
+A64_FILES_V3 = $(foreach tape,$(A64_TAPES),--file $(tape)=$(A64_TAPE_STAMPED)/$(tape))
+A64_FILES_V4 = $(foreach tape,$(A64_TAPES),--file bin/$(tape)=$(A64_TAPE_STAMPED)/$(tape)) --fosfs 4
+A64_FILES = $(A64_FILES_V$(FOSFS))
 
 tapes-aarch64: $(OPUS_A64_LIB)
 	for tape in $(A64_TAPES); do (cd tapes/$$tape && cargo +nightly-2026-09-13 build --release --target aarch64-unknown-none -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem) || exit 1; done
@@ -227,13 +230,13 @@ tapes-aarch64: $(OPUS_A64_LIB)
 
 image-aarch64: loader-aarch64 kernel-aarch64 tapes-aarch64
 	mkdir -p $(dir $(A64_IMAGE))
-	python3 tools/build_image.py --arch aarch64 --loader $(A64_LOADER) --kernel $(A64_KERNEL) $(foreach tape,$(A64_TAPES),--file $(tape)=$(A64_TAPE_STAMPED)/$(tape)) --output $(A64_IMAGE)
+	python3 tools/build_image.py --arch aarch64 --loader $(A64_LOADER) --kernel $(A64_KERNEL) $(A64_FILES) --output $(A64_IMAGE)
 
 # The SD card image for a Raspberry Pi 4: the same image plus the pftf edk2 firmware files in the ESP (fetched once, pinned by hash).
 # Flash it with `sudo python3 tools/write_stick.py /dev/sdX --image build/fosfor-aarch64/fosfor-pi4.img` (a person runs that).
 image-pi4: image-aarch64
 	python3 tools/fetch_rpi4_firmware.py build/rpi4-firmware
-	python3 tools/build_image.py --arch aarch64 --loader $(A64_LOADER) --kernel $(A64_KERNEL) $(foreach tape,$(A64_TAPES),--file $(tape)=$(A64_TAPE_STAMPED)/$(tape)) --esp-dir build/rpi4-firmware --output build/fosfor-aarch64/fosfor-pi4.img
+	python3 tools/build_image.py --arch aarch64 --loader $(A64_LOADER) --kernel $(A64_KERNEL) $(A64_FILES) --esp-dir build/rpi4-firmware --output build/fosfor-aarch64/fosfor-pi4.img
 
 test-aarch64-boot: image-aarch64
 	python3 tools/test_aarch64_boot.py
