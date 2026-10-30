@@ -98,14 +98,14 @@ says which one a save used.
    found the file (`tape-rt` `Config::load`). `make image FOSFS=4` builds a v4 volume with `bin/` and `settings/`
    (`build_image.py` turns `/` in a `--file` name into folders); `make test-v4-boot` boots it. **The default is now v4**
    (2026-10-30): `make image` builds v4 (`FOSFS=3` for the old volume), `format diskN` makes v4 (`format diskN v3` the old
-   one; `install` still makes v3). A bare `rm` of a tape that lives only in `bin/` removes `bin/NAME`, and a NETFS put
+   one; `install` copies the boot volume's version, v4 with its folders, recursively to 6 levels). A bare `rm` of a tape that lives only in `bin/` removes `bin/NAME`, and a NETFS put
    (`foscopy :disk1/NAME`, `tapesync`) replaces it there instead of shadowing it from the root (the shell's `write` and
    a tape's own writes keep a bare name in the root); `tapesync` scans `bin/`
    too. Host tests read and stage image files through `tools/fosfs_image.py` (v3 and v4). **Boot order built:** `settings/fstab` (else
    `fstab`) is read first, then, with USB present and a mounted label absent, a bounded wait of up to 10 s (it
    narrates), then `settings/NAME` is read from the mounted volume when it has the file, else the root's `settings/`,
    else the bare root name (`make test-v4-boot` covers the mount and override; the late-stick wait needs real USB).
-   **Not done:** `install` to v4, the aarch64 image (still flat v3), the deploy skill's paths (bare names work).
+   **Not done:** the aarch64 image (still flat v3), the deploy skill's paths (bare names work).
 5. Crash safety, only if real hardware shows a need (see "Journaling" below).
 6. Wildcards in `ls`, `cp`, `rm` and a new `mv` (see "Wildcards in shell tools" below).
 

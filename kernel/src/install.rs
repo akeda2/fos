@@ -204,51 +204,90 @@ fn run(boot: usize, disk: usize, number: usize, pending: &Pending) {
     }
 
     let label = &pending.label[..pending.label_length];
-    let volume = match fosfs::Volume::format(disk, data.start, data.sectors, label) {
+    // The copy has the boot volume's FOSFS version, so a v4 machine (tapes in bin/) installs as v4 with its folders.
+    let version = fosfs::Volume::mount(boot, layout.fosfs.start, layout.fosfs.sectors).map(|volume| volume.version()).unwrap_or(4);
+    let volume = match fosfs::Volume::format_version(disk, data.start, data.sectors, label, version) {
         Ok(volume) => volume,
         Err(error) => return crate::println!("install: formatting the FOSFS volume failed ({error:?})."),
     };
     if pending.bare {
-        return crate::println!("disk{number} is now bootable, with an empty FOSFS volume of {} MiB.", data.sectors / 2048);
+        return crate::println!("disk{number} is now bootable, with an empty FOSFS v{version} volume of {} MiB.", data.sectors / 2048);
     }
     let Ok(source_volume) = fosfs::Volume::mount(boot, layout.fosfs.start, layout.fosfs.sectors) else {
         return crate::println!("install: the boot volume cannot be read; disk{number} boots but has no files.");
     };
-    let mut names = [[0u8; fosfs::MAX_NAME]; 64];
-    let mut lengths = [0usize; 64];
-    let mut count = 0;
-    let _ = source_volume.for_each(|entry| {
-        if count < names.len() {
-            names[count][..entry.name().len()].copy_from_slice(entry.name());
-            lengths[count] = entry.name().len();
-            count += 1;
-        }
-    });
-    let (mut copied, mut bytes_total) = (0, 0usize);
-    for index in 0..count {
-        let name = &names[index][..lengths[index]];
-        let length = match source_volume.file_length(name) {
-            Ok(Some(length)) => length as usize,
-            _ => continue,
-        };
-        let frames = (length.max(1) as u64).div_ceil(crate::memory::FRAME);
-        let Some(buffer) = crate::memory::allocate_contiguous(frames, None) else {
-            crate::println!("install: not enough memory to copy {} ({length} bytes); skipped.", core::str::from_utf8(name).unwrap_or("?"));
-            continue;
-        };
-        let data = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, length) };
-        let outcome = match source_volume.read(name, data) {
-            Ok(Some(read)) if read == length => volume.write(name, &data[..length]).is_ok(),
-            _ => false,
-        };
-        crate::memory::free(buffer, frames);
-        if outcome {
-            copied += 1;
-            bytes_total += length;
-        } else {
-            crate::println!("install: copying {} failed.", core::str::from_utf8(name).unwrap_or("?"));
-        }
-    }
+    let (mut copied, mut count, mut bytes_total) = (0, 0, 0usize);
+    copy_folder(&source_volume, &volume, &mut [0u8; fosfs::MAX_PATH], 0, 0, &mut (&mut copied, &mut count, &mut bytes_total));
     crate::println!("Copied {copied} of {count} file(s) ({} KiB).", bytes_total / 1024);
     crate::println!("disk{number} is now bootable: put it first in the firmware's boot order (or boot it from the boot menu).");
+}
+
+const FOLDER_DEPTH: usize = 6;
+const FOLDER_ENTRIES: usize = 128;
+/// One listing per folder depth, so the recursion needs no stack for them (the install runs one at a time).
+static mut LISTING: [[([u8; fosfs::MAX_NAME], u8, bool); FOLDER_ENTRIES]; FOLDER_DEPTH] = [[([0; fosfs::MAX_NAME], 0, false); FOLDER_ENTRIES]; FOLDER_DEPTH];
+
+/// Copies the files of folder `path[..length]` (the root when empty) from `from` to `to`, then its folders. A v3 source has
+/// no folders; a v4 destination makes them first. Counts go in `totals` = (copied, seen, bytes).
+fn copy_folder(from: &fosfs::Volume, to: &fosfs::Volume, path: &mut [u8; fosfs::MAX_PATH], length: usize, depth: usize, totals: &mut (&mut usize, &mut usize, &mut usize)) {
+    if depth >= FOLDER_DEPTH {
+        return crate::println!("install: folders nest deeper than {FOLDER_DEPTH}; the rest is skipped.");
+    }
+    let listing = unsafe { &mut (*core::ptr::addr_of_mut!(LISTING))[depth] };
+    let mut found = 0;
+    let _ = from.for_each_in(&path[..length], |entry| {
+        if found < FOLDER_ENTRIES {
+            listing[found] = ([0; fosfs::MAX_NAME], entry.name().len() as u8, entry.is_dir);
+            listing[found].0[..entry.name().len()].copy_from_slice(entry.name());
+            found += 1;
+        }
+    });
+    for pass_folders in [false, true] {
+        for index in 0..found {
+            let (bytes, name_length, is_dir) = listing[index];
+            if is_dir != pass_folders {
+                continue;
+            }
+            let name = &bytes[..usize::from(name_length)];
+            let end = length + usize::from(length > 0) + name.len();
+            if end > fosfs::MAX_PATH {
+                continue;
+            }
+            if length > 0 {
+                path[length] = b'/';
+            }
+            path[length + usize::from(length > 0)..end].copy_from_slice(name);
+            if is_dir {
+                if to.mkdir(&path[..end]).is_ok() {
+                    copy_folder(from, to, path, end, depth + 1, totals);
+                } else {
+                    crate::println!("install: cannot make the folder {}.", core::str::from_utf8(&path[..end]).unwrap_or("?"));
+                }
+                continue;
+            }
+            *totals.1 += 1;
+            let shown = core::str::from_utf8(&path[..end]).unwrap_or("?");
+            let size = match from.file_length(&path[..end]) {
+                Ok(Some(size)) => size as usize,
+                _ => continue,
+            };
+            let frames = (size.max(1) as u64).div_ceil(crate::memory::FRAME);
+            let Some(buffer) = crate::memory::allocate_contiguous(frames, None) else {
+                crate::println!("install: not enough memory to copy {shown} ({size} bytes); skipped.");
+                continue;
+            };
+            let data = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, size) };
+            let done = match from.read(&path[..end], data) {
+                Ok(Some(read)) if read == size => to.write(&path[..end], &data[..size]).is_ok(),
+                _ => false,
+            };
+            crate::memory::free(buffer, frames);
+            if done {
+                *totals.0 += 1;
+                *totals.2 += size;
+            } else {
+                crate::println!("install: copying {shown} failed.");
+            }
+        }
+    }
 }

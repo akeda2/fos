@@ -70,8 +70,10 @@ def main():
             check(copy[64 * 512:(64 + 24) * 512] == source[64 * 512:(64 + 24) * 512], "and stage two, byte for byte, at LBA 64", "")
             check("BIOS boot code" in out[8], "the install says so", out[8])
         # Booting the installed disk alone: it must find itself by its own new GUIDs.
-        out = session(tmp, "inst2", target, ["ls", "cat marker.txt", "debug slots"])
+        out = session(tmp, "inst2", target, ["ls", "cat marker.txt", "debug slots", "ls bin", "help ptp"])
         check("marker.txt" in out[0], "the installed disk boots on its own and has the files", out[0])
+        check("bin" in out[0] and "ptp" in out[3], "folders and the tapes inside them are copied (v4)", out[0] + out[3])
+        check("usage" in out[4].lower() or "ptp" in out[4], "a tape in bin/ is found by its bare name", out[4])
         check("installed copy" in out[1], "with their contents", out[1])
         print("install: all checks passed")
 

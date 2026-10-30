@@ -41,7 +41,7 @@ const EXTENTS_AT: usize = 88;
 const MAX_EXTENTS: usize = 3;
 type Extent = (u64, u32);
 /// The longest path: folders nest by name, so this only bounds a line the shell passes in.
-const MAX_PATH: usize = 192;
+pub const MAX_PATH: usize = 192;
 /// The longest name or label any version holds; callers size their buffers with it.
 pub const MAX_NAME: usize = 48;
 /// The most entries a directory has (v4 at 16 GiB and up); sizes the scratch table.
