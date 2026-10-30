@@ -81,6 +81,15 @@ fn read(name: &str) -> Option<&'static str> {
                     return read_volume(volume, rest, name);
                 }
             }
+            // The same mount on an exFAT stick.
+            if crate::mounts::lookup(folder.as_bytes()).is_some_and(|(label, _)| storage::volume_labelled(label.as_bytes()).is_none()) {
+                let buffer = unsafe { &mut *core::ptr::addr_of_mut!(BUFFER) };
+                let length = crate::tape_fs::read(folder.as_bytes(), buffer);
+                if length >= 0 {
+                    crate::println!("{name}: read from the exFAT volume mounted at settings.");
+                    return core::str::from_utf8(&buffer[..length as usize]).ok();
+                }
+            }
             if storage::volume_with_file(folder.as_bytes()).is_some() {
                 return read_root(folder);
             }

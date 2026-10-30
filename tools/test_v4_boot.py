@@ -34,6 +34,18 @@ def prepare(run):
     run("write settings/fstab settings @cfgvol")
 
 
+def prepare_exfat(run):
+    run("format disk2 exfat cfgvol")
+    run("format disk2 confirm")
+    run("write disk2/debug watchdog 19")
+    run("write settings/fstab settings @cfgvol")
+
+
+def overlay_exfat(run):
+    status = run("debug status")
+    check("watchdog: 19 s" in status, "an exFAT config volume mounted at settings overrides settings/debug", status)
+
+
 def overlay(run):
     check("settings -> @cfgvol" in run("mount"), "settings/fstab mounts the config volume at boot", "")
     status = run("debug status")
@@ -48,6 +60,11 @@ def main():
         disk.write_bytes(bytes(64 << 20))
         boot(Path(tmp), [disk], prepare)
         boot(Path(tmp), [disk], overlay, reuse=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        disk = Path(tmp) / "cfg.img"
+        disk.write_bytes(bytes(64 << 20))
+        boot(Path(tmp), [disk], prepare_exfat)
+        boot(Path(tmp), [disk], overlay_exfat, reuse=True)
     print("v4-boot: all checks passed")
 
 
