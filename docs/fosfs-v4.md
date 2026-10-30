@@ -109,9 +109,14 @@ says which one a save used.
 5. Crash safety, only if real hardware shows a need (see "Journaling" below).
 6. Wildcards in `ls`, `cp`, `rm` and a new `mv` (see "Wildcards in shell tools" below).
 
-## Wildcards in shell tools (2026-10-30: to build, step 6)
+## Wildcards in shell tools (2026-10-30: built, step 6)
 
-`ls`, `cp`/`copy`, `rm` and a new `mv` take bash-style patterns. Today every argument is one literal reference.
+`ls`, `cp`/`copy`, `rm` and a new `mv` take bash-style patterns. **Built** in `crates/shell` (`glob.rs` the matcher,
+`files.rs` the expansion; `make test` for the matcher, `make test-wildcards` over v4 and exFAT). Differences from the
+plan below: `rm` asks by a `confirm` word at the end of the same line (`rm PATTERN confirm`, stateless) instead of as the
+very next command; `mv` is copy, read back, remove on every volume (the in-place v4 rename is not built); the escape
+backslash only counts inside a pattern (an argument with no `*?[` is passed on exactly as typed); a folder lists at most
+256 entries per pattern level and 2048 at the last one, names over 54 bytes are skipped with a message.
 
 - **Syntax.** `*` (any run of characters), `?` (one character), `[abc]` / `[a-z]` / `[!a-z]` (a set). Case-sensitive on FOSFS v4,
   case-insensitive on FAT/exFAT (as those volumes already compare names). `/` is never matched by `*` or `?`: a pattern

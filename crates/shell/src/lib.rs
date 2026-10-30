@@ -6,6 +6,7 @@
 use core::fmt;
 
 pub mod files;
+pub mod glob;
 
 /// Writes formatted text to the console.
 #[macro_export]

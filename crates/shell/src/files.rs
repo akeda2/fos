@@ -1,15 +1,17 @@
-//! The file commands: `ls cat write rm cp cmp`, on references the host resolves (see `Host`).
+//! The file commands: `ls cat write rm cp mv cmp mkdir`, on references the host resolves (see `Host`).
 
 use core::fmt;
 
+use crate::glob::{has_wildcards, matches, unescape};
 use crate::{Command, Entry, FsError, Host, say, sayln, split_word};
 
 pub static COMMANDS: &[Command] = &[
-    Command::new("ls", "ls [diskN|@LABEL|esp][/FOLDER]", "lists the files of a volume or folder (the boot volume by default).", ls),
+    Command::new("ls", "ls [diskN|@LABEL|esp][/FOLDER|PATTERN]", "lists the files of a volume or folder, or the matches of a pattern (* ? [a-z]).", ls),
     Command::new("cat", "cat NAME", "shows a file as text (NAME, diskN/NAME, @LABEL/NAME or esp/NAME); other bytes show as dots.", cat),
     Command::new("write", "write NAME TEXT", "makes or replaces a small text file (NAME, diskN/NAME, @LABEL/NAME or esp/NAME).", write),
-    Command::new("rm", "rm NAME", "removes a file (NAME, diskN/NAME, @LABEL/NAME or esp/NAME).", rm),
-    Command::new("cp", "cp SRC DST", "copies a file between volumes; DST may be just a volume (diskN, @LABEL, esp) to keep the name.", cp).alias(&["copy"]),
+    Command::new("rm", "rm NAME|PATTERN [confirm]", "removes a file, or every match of a pattern (more than one needs `confirm` at the end).", rm),
+    Command::new("cp", "cp SRC|PATTERN DST", "copies a file between volumes; DST may be a volume or folder to keep the name (required for a pattern).", cp).alias(&["copy"]),
+    Command::new("mv", "mv SRC|PATTERN DST", "moves a file (copy, read back, remove); DST may be a volume or folder (required for a pattern).", mv),
     Command::new("cmp", "cmp A B", "says whether two files are byte-identical (a read-back check of `cp`).", cmp),
     Command::new("mkdir", "mkdir NAME", "makes a folder on a FOSFS v4 or exFAT volume (NAME, diskN/NAME or @LABEL/NAME); `ls diskN/NAME` lists it.", mkdir),
 ];
@@ -38,6 +40,22 @@ fn join_volume<'a>(rest: &'a str, out: &'a mut [u8; 192]) -> &'a str {
 
 fn ls(host: &mut dyn Host, rest: &str) {
     let volume = rest.trim().trim_end_matches('/');
+    if has_wildcards(volume) {
+        let mut any = false;
+        let outcome = expand(host, volume, &mut |host, reference, directory, length| {
+            any = true;
+            if directory {
+                sayln!(host, "{reference:<24} {:>10}", "<dir>");
+            } else {
+                sayln!(host, "{reference:<24} {length:>10} bytes");
+            }
+        });
+        return match outcome {
+            Ok(()) if !any => sayln!(host, "ls: no match for {volume}."),
+            Ok(()) => {}
+            Err(error) => sayln!(host, "ls: {volume}: {error}."),
+        };
+    }
     let mut any = false;
     let outcome = host.list(volume, &mut |host, entry: Entry| {
         any = true;
@@ -125,9 +143,12 @@ fn mkdir(host: &mut dyn Host, rest: &str) {
 
 fn rm(host: &mut dyn Host, rest: &str) {
     let mut joined = [0u8; 192];
-    let (reference, _) = split_word(join_volume(rest, &mut joined));
+    let (reference, after) = split_word(join_volume(rest, &mut joined));
     if reference.is_empty() {
-        return sayln!(host, "Usage: rm NAME   (NAME, diskN/NAME, @LABEL/NAME or esp/NAME)");
+        return sayln!(host, "Usage: rm NAME|PATTERN [confirm]   (NAME, diskN/NAME, @LABEL/NAME or esp/NAME)");
+    }
+    if has_wildcards(reference) {
+        return rm_matches(host, reference, split_word(after).0 == "confirm");
     }
     match host.remove(reference) {
         Ok(()) => sayln!(host, "Removed {reference}."),
@@ -137,55 +158,257 @@ fn rm(host: &mut dyn Host, rest: &str) {
     }
 }
 
-/// The destination of `cp`: `to` itself, or `to` with the source's file name when `to` names only a volume.
-struct Destination<'a>(&'a str, &'a str);
-
-impl fmt::Display for Destination<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Destination(to, from) = *self;
-        if is_volume(to) || to.ends_with('/') {
-            let name = from.rsplit('/').next().unwrap_or(from);
-            write!(formatter, "{}{}{name}", to, if to.ends_with('/') { "" } else { "/" })
-        } else {
-            formatter.write_str(to)
-        }
+/// `rm PATTERN`: the files that match (the folders only when no file does). More than one needs `confirm`: `rm *` has no undo.
+fn rm_matches(host: &mut dyn Host, pattern: &str, confirmed: bool) {
+    let (mut files, mut folders) = (0, 0);
+    let counted = expand(host, pattern, &mut |_, _, directory, _| if directory { folders += 1 } else { files += 1 });
+    if let Err(error) = counted {
+        return sayln!(host, "rm: {pattern}: {error}.");
     }
+    let (count, want_folders) = if files > 0 { (files, false) } else { (folders, true) };
+    if count == 0 {
+        return sayln!(host, "rm: no match for {pattern}.");
+    }
+    if count > 1 && !confirmed {
+        return sayln!(host, "rm: {pattern} matches {count} {}; `rm {pattern} confirm` removes them.", if want_folders { "folders" } else { "files" });
+    }
+    let (mut removed, mut failed) = (0, 0);
+    let _ = expand(host, pattern, &mut |host, reference, directory, _| {
+        if directory != want_folders {
+            return;
+        }
+        match host.remove(reference) {
+            Ok(()) => {
+                removed += 1;
+                sayln!(host, "Removed {reference}.");
+            }
+            Err(error) => {
+                failed += 1;
+                sayln!(host, "rm: {reference}: {error}.");
+            }
+        }
+    });
+    sayln!(host, "Removed {removed} of {count}{}.", if failed > 0 { ", some failed" } else { "" });
 }
 
-fn cp(host: &mut dyn Host, rest: &str) {
-    let (from, to) = split_word(rest);
-    let (to, _) = split_word(to);
-    if from.is_empty() || to.is_empty() {
-        return sayln!(host, "Usage: cp SRC DST   (names are NAME, diskN/NAME, @LABEL/NAME or esp/NAME; DST may be a volume)");
+/// `to` made into the file to write for source `from`: `to` itself, or `to` plus `from`'s file name when `to` is a folder.
+fn target<'a>(out: &'a mut [u8; 192], to: &'a str, from: &str, folder: bool) -> Option<&'a str> {
+    if !folder && !is_volume(to) && !to.ends_with('/') {
+        return Some(to);
     }
-    let mut target = [0u8; 192];
-    let mut writer = Cursor(&mut target, 0);
-    if fmt::write(&mut writer, format_args!("{}", Destination(to, from))).is_err() {
-        return sayln!(host, "cp: the name is too long.");
-    }
+    let mut writer = Cursor(out, 0);
+    let name = from.rsplit('/').next().unwrap_or(from);
+    fmt::write(&mut writer, format_args!("{to}{}{name}", if to.ends_with('/') { "" } else { "/" })).ok()?;
     let end = writer.1;
-    let to = core::str::from_utf8(&target[..end]).unwrap_or(to);
+    core::str::from_utf8(&out[..end]).ok()
+}
+
+/// A folder the files of a pattern go to: a volume, an existing folder, or one made now.
+fn ensure_folder(host: &mut dyn Host, to: &str) -> bool {
+    let folder = to.trim_end_matches('/');
+    is_volume(folder) || host.list(folder, &mut |_, _| {}).is_ok() || host.mkdir(folder).is_ok()
+}
+
+/// Copies one file; `moving` also checks the copy by reading it back and then removes the source. Whether it worked.
+fn transfer(host: &mut dyn Host, from: &str, to: &str, moving: bool) -> bool {
+    let verb = if moving { "mv" } else { "cp" };
     if from == to {
-        return sayln!(host, "cp: source and destination are the same file.");
+        sayln!(host, "{verb}: source and destination are the same file.");
+        return false;
     }
     let length = match host.length(from) {
-        Ok(length) if length > COPY_LIMIT => return sayln!(host, "cp: {from} is {} MiB; the limit is {} MiB.", length >> 20, COPY_LIMIT >> 20),
+        Ok(length) if length > COPY_LIMIT => {
+            sayln!(host, "{verb}: {from} is {} MiB; the limit is {} MiB.", length >> 20, COPY_LIMIT >> 20);
+            return false;
+        }
         Ok(length) => length as usize,
-        Err(error) => return sayln!(host, "cp: {from}: {error}."),
+        Err(error) => {
+            sayln!(host, "{verb}: {from}: {error}.");
+            return false;
+        }
     };
-    let found = host.with_buffer(length.max(1), &mut |host, buffer| {
-        match host.read(from, &mut buffer[..length]) {
-            Ok(read) if read == length => match host.write(to, &buffer[..length]) {
-                Ok(()) => sayln!(host, "Copied {from} ({length} bytes) to {to}."),
-                Err(error) => sayln!(host, "cp: {to}: {error}."),
-            },
-            Ok(_) => sayln!(host, "cp: {from} changed while it was being read."),
-            Err(error) => sayln!(host, "cp: {from}: {error}."),
+    let mut done = false;
+    let found = host.with_buffer((length * if moving { 2 } else { 1 }).max(1), &mut |host, buffer| {
+        let (data, check) = buffer.split_at_mut(length);
+        match host.read(from, data) {
+            Ok(read) if read == length => {}
+            Ok(_) => return sayln!(host, "{verb}: {from} changed while it was being read."),
+            Err(error) => return sayln!(host, "{verb}: {from}: {error}."),
+        }
+        if let Err(error) = host.write(to, data) {
+            return sayln!(host, "{verb}: {to}: {error}.");
+        }
+        if !moving {
+            done = true;
+            return sayln!(host, "Copied {from} ({length} bytes) to {to}.");
+        }
+        match host.read(to, check) {
+            Ok(read) if read == length && check[..read] == data[..length] => {}
+            _ => return sayln!(host, "mv: {to} did not read back the same; {from} is kept."),
+        }
+        match host.remove(from) {
+            Ok(()) => {
+                done = true;
+                sayln!(host, "Moved {from} ({length} bytes) to {to}.");
+            }
+            Err(error) => sayln!(host, "mv: copied to {to}, but {from} was not removed: {error}."),
         }
     });
     if !found {
-        sayln!(host, "cp: not enough free memory for {length} bytes.");
+        sayln!(host, "{verb}: not enough free memory for {length} bytes.");
     }
+    done
+}
+
+fn cp(host: &mut dyn Host, rest: &str) {
+    copy_or_move(host, rest, false);
+}
+
+fn mv(host: &mut dyn Host, rest: &str) {
+    copy_or_move(host, rest, true);
+}
+
+fn copy_or_move(host: &mut dyn Host, rest: &str, moving: bool) {
+    let verb = if moving { "mv" } else { "cp" };
+    let (from, to) = split_word(rest);
+    let (to, _) = split_word(to);
+    if from.is_empty() || to.is_empty() {
+        return sayln!(host, "Usage: {verb} SRC|PATTERN DST   (names are NAME, diskN/NAME, @LABEL/NAME or esp/NAME; DST may be a volume or folder)");
+    }
+    if !has_wildcards(from) {
+        // A move also takes an existing folder as DST, the way a shell does.
+        let folder = moving && host.list(to.trim_end_matches('/'), &mut |_, _| {}).is_ok();
+        let mut buffer = [0u8; 192];
+        let Some(to) = target(&mut buffer, to, from, folder) else { return sayln!(host, "{verb}: the name is too long.") };
+        transfer(host, from, to, moving);
+        return;
+    }
+    // Several sources cannot share one file name: DST is a folder (made when missing).
+    let mut sources = 0;
+    if let Err(error) = expand(host, from, &mut |_, _, directory, _| sources += usize::from(!directory)) {
+        return sayln!(host, "{verb}: {from}: {error}.");
+    }
+    if sources == 0 {
+        return sayln!(host, "{verb}: no match for {from}.");
+    }
+    if !ensure_folder(host, to) {
+        return sayln!(host, "{verb}: {to} is not a folder and cannot be made one (a pattern needs a folder or volume as DST).");
+    }
+    let (mut worked, mut failed) = (0, 0);
+    let _ = expand(host, from, &mut |host, reference, directory, _| {
+        if directory {
+            return;
+        }
+        let mut buffer = [0u8; 192];
+        match target(&mut buffer, to, reference, true) {
+            Some(destination) if transfer(host, reference, destination, moving) => worked += 1,
+            Some(_) => failed += 1,
+            None => {
+                failed += 1;
+                sayln!(host, "{verb}: the name {reference} is too long to place in {to}.");
+            }
+        }
+    });
+    sayln!(host, "{} {worked} of {sources} file(s){}.", if moving { "Moved" } else { "Copied" }, if failed > 0 { ", some failed" } else { "" });
+}
+
+const RECORD: usize = 64;
+const NAME_MAX: usize = RECORD - 10;
+/// Pattern depth: folders with a pattern of their own (`rec/*/lp1.flac` has one).
+const DEPTH: usize = 6;
+const LEVEL: usize = 256 * RECORD;
+const SCRATCH: usize = DEPTH * LEVEL + 2048 * RECORD;
+
+type Visit<'a> = &'a mut dyn FnMut(&mut dyn Host, &str, bool, u64);
+
+/// Calls `visit(host, reference, is_folder, length)` for everything `pattern` names, in listing order. The listings are
+/// collected before anything is visited, so a visitor may write or remove files. A pattern matching nothing visits nothing.
+fn expand(host: &mut dyn Host, pattern: &str, visit: Visit) -> Result<(), FsError> {
+    let mut outcome = Err(FsError::Failed);
+    host.with_buffer(SCRATCH, &mut |host, scratch| {
+        outcome = walk(host, scratch, &mut [0u8; 192], 0, pattern, 0, visit);
+    });
+    outcome
+}
+
+/// Appends `/` (unless the path is empty) and `part` to `path[..length]`.
+fn push(path: &mut [u8; 192], length: usize, part: &[u8]) -> Option<usize> {
+    let start = if length > 0 {
+        *path.get_mut(length)? = b'/';
+        length + 1
+    } else {
+        0
+    };
+    path.get_mut(start..start + part.len())?.copy_from_slice(part);
+    Some(start + part.len())
+}
+
+fn walk(host: &mut dyn Host, scratch: &mut [u8], path: &mut [u8; 192], length: usize, rest: &str, depth: usize, visit: Visit) -> Result<(), FsError> {
+    let (component, tail) = match rest.split_once('/') {
+        Some((component, tail)) => (component, Some(tail)),
+        None => (rest, None),
+    };
+    if component.is_empty() {
+        return match tail {
+            Some(tail) => walk(host, scratch, path, length, tail, depth, visit),
+            None => Ok(()),
+        };
+    }
+    // A component without a pattern (a volume, a mount point, a folder) is followed as it stands.
+    if let Some(tail) = tail.filter(|_| !has_wildcards(component)) {
+        let mut name = [0u8; 64];
+        let used = unescape(component, &mut name).ok_or(FsError::BadName)?;
+        let length = push(path, length, &name[..used]).ok_or(FsError::BadName)?;
+        return walk(host, scratch, path, length, tail, depth, visit);
+    }
+    if tail.is_some() && depth >= DEPTH {
+        return Err(FsError::Failed);
+    }
+    let (region, deeper) = if tail.is_some() { scratch.split_at_mut(LEVEL) } else { (&mut scratch[..], &mut [][..]) };
+    let capacity = region.len() / RECORD;
+    let (mut found, mut skipped) = (0, 0);
+    let directory = core::str::from_utf8(&path[..length]).map_err(|_| FsError::BadName)?;
+    // Entries are kept when they match ignoring case; the exact test follows once the kind of volume is known.
+    let kind = host.list(directory, &mut |_, entry| {
+        if tail.is_some() && !entry.directory {
+            return;
+        }
+        if entry.name.len() > NAME_MAX {
+            skipped += 1;
+            return;
+        }
+        if found >= capacity {
+            skipped += 1;
+            return;
+        }
+        if !matches(component, entry.name, true) {
+            return;
+        }
+        let record = &mut region[found * RECORD..(found + 1) * RECORD];
+        record[0] = entry.name.len() as u8;
+        record[1] = u8::from(entry.directory);
+        record[2..10].copy_from_slice(&entry.length.to_le_bytes());
+        record[10..10 + entry.name.len()].copy_from_slice(entry.name);
+        found += 1;
+    })?;
+    if skipped > 0 {
+        sayln!(host, "{component}: {skipped} entries were skipped (names over {NAME_MAX} bytes, or more than {capacity} in a folder).");
+    }
+    let fold = kind != "FOSFS";
+    for index in 0..found {
+        let record = &region[index * RECORD..(index + 1) * RECORD];
+        let name = &record[10..10 + usize::from(record[0])];
+        if !fold && !matches(component, name, false) {
+            continue;
+        }
+        let (is_folder, size) = (record[1] != 0, u64::from_le_bytes(record[2..10].try_into().unwrap_or([0; 8])));
+        let Some(end) = push(path, length, name) else { continue };
+        match tail {
+            Some(tail) => walk(host, deeper, path, end, tail, depth + 1, visit)?,
+            None => visit(host, core::str::from_utf8(&path[..end]).unwrap_or("?"), is_folder, size),
+        }
+    }
+    Ok(())
 }
 
 /// A `fmt::Write` into a byte array.
@@ -275,14 +498,30 @@ mod tests {
             self.files.retain(|(name, _)| *name != canonical(reference));
             if self.files.len() == before { Err(FsError::NotFound) } else { Ok(()) }
         }
+        fn mkdir(&mut self, _reference: &str) -> Result<(), FsError> {
+            Ok(())
+        }
         fn list(&mut self, volume: &str, each: &mut dyn FnMut(&mut dyn Host, Entry)) -> Result<&'static str, FsError> {
             let prefix = std::format!("{}/", if volume.is_empty() { "boot" } else { volume });
             let found: Vec<(String, u64)> = self.files.iter().filter_map(|(name, data)| name.strip_prefix(&prefix).map(|name| (name.to_string(), data.len() as u64))).collect();
             if volume == "disk9" {
                 return Err(FsError::NoVolume);
             }
+            // a folder that holds nothing does not exist here
+            if volume.contains('/') && found.is_empty() {
+                return Err(FsError::NotFound);
+            }
+            // A name with a `/` is in a folder: the folder is listed once, as a directory.
+            let mut folders: Vec<String> = Vec::new();
             for (name, length) in found {
-                each(self, Entry { name: name.as_bytes(), length, directory: false, modified: None });
+                match name.split_once('/') {
+                    Some((folder, _)) if folders.iter().any(|seen| seen == folder) => {}
+                    Some((folder, _)) => {
+                        folders.push(folder.to_string());
+                        each(self, Entry { name: folder.as_bytes(), length: 0, directory: true, modified: None });
+                    }
+                    None => each(self, Entry { name: name.as_bytes(), length, directory: false, modified: None }),
+                }
             }
             Ok(if volume == "esp" { "FAT32" } else { "FOSFS" })
         }
@@ -372,12 +611,72 @@ mod tests {
         assert_eq!(run(&mut host, "cmp a c"), "cmp: DIFFER (3 and 4 bytes).\n");
     }
 
+    fn put(host: &mut Mock, names: &[&str]) {
+        for name in names {
+            run(host, &std::format!("write {name} {name}"));
+        }
+    }
+
+    #[test]
+    fn ls_with_a_pattern_lists_matches_in_folders() {
+        let mut host = Mock::default();
+        put(&mut host, &["disk2/rec/a.flac", "disk2/rec/b.flac", "disk2/rec/c.txt", "disk2/lp/a.flac", "disk2/top.flac"]);
+        let shown = run(&mut host, "ls disk2/rec/*.flac");
+        assert!(shown.contains("disk2/rec/a.flac") && shown.contains("disk2/rec/b.flac") && !shown.contains("c.txt"), "{shown}");
+        let shown = run(&mut host, "ls disk2/*/a.flac");
+        assert!(shown.contains("disk2/rec/a.flac") && shown.contains("disk2/lp/a.flac") && !shown.contains("top"), "{shown}");
+        assert_eq!(run(&mut host, "ls disk2/rec/*.wav"), "ls: no match for disk2/rec/*.wav.\n");
+        // a folder matched by a pattern is listed by its own name
+        assert!(run(&mut host, "ls disk2/r*").contains("disk2/rec"));
+    }
+
+    #[test]
+    fn cp_and_mv_with_patterns_need_a_folder() {
+        let mut host = Mock::default();
+        put(&mut host, &["disk2/rec/a.flac", "disk2/rec/b.flac", "disk2/rec/c.txt"]);
+        let out = run(&mut host, "cp disk2/rec/*.flac disk2/backup");
+        assert!(out.contains("Copied 2 of 2 file(s)."), "{out}");
+        assert_eq!(run(&mut host, "cat disk2/backup/b.flac"), "disk2/rec/b.flac\n");
+        assert_eq!(run(&mut host, "cp disk2/rec/*.wav disk2"), "cp: no match for disk2/rec/*.wav.\n");
+        let out = run(&mut host, "mv disk2/rec/*.flac disk2/moved/");
+        assert!(out.contains("Moved 2 of 2 file(s)."), "{out}");
+        assert!(run(&mut host, "cat disk2/rec/a.flac").contains("no such file"));
+        assert_eq!(run(&mut host, "cat disk2/moved/a.flac"), "disk2/rec/a.flac\n");
+        assert!(run(&mut host, "cat disk2/rec/c.txt").contains("c.txt"));
+    }
+
+    #[test]
+    fn mv_of_one_file_to_a_name_or_a_volume() {
+        let mut host = Mock::default();
+        put(&mut host, &["a.txt"]);
+        assert!(run(&mut host, "mv a.txt disk2/b.txt").starts_with("Moved boot/a.txt".replace("boot/", "").as_str()));
+        assert!(run(&mut host, "cat a.txt").contains("no such file"));
+        assert_eq!(run(&mut host, "cat disk2/b.txt"), "a.txt\n");
+        assert!(run(&mut host, "mv disk2/b.txt disk2/b.txt").contains("same file"));
+    }
+
+    #[test]
+    fn rm_with_a_pattern_asks_before_removing_several() {
+        let mut host = Mock::default();
+        put(&mut host, &["disk2/a.tmp", "disk2/b.tmp", "disk2/keep.txt", "disk2/one.log"]);
+        let out = run(&mut host, "rm disk2/*.tmp");
+        assert!(out.contains("matches 2 files") && out.contains("rm disk2/*.tmp confirm"), "{out}");
+        assert!(run(&mut host, "cat disk2/a.tmp").contains("a.tmp"));
+        let out = run(&mut host, "rm disk2/*.tmp confirm");
+        assert!(out.contains("Removed 2 of 2."), "{out}");
+        assert!(run(&mut host, "cat disk2/b.tmp").contains("no such file"));
+        assert!(run(&mut host, "cat disk2/keep.txt").contains("keep.txt"));
+        // one match needs no confirmation; none is an error
+        assert!(run(&mut host, "rm disk2/*.log").contains("Removed 1 of 1."));
+        assert_eq!(run(&mut host, "rm disk2/*.log"), "rm: no match for disk2/*.log.\n");
+    }
+
     #[test]
     fn help_lists_commands_and_one_usage() {
         let mut host = Mock::default();
-        assert!(run(&mut host, "help").contains("ls cat write rm cp cmp"));
-        assert!(run(&mut host, "help cp").starts_with("cp SRC DST\n"));
-        assert!(run(&mut host, "help copy").starts_with("cp SRC DST\n"));
+        assert!(run(&mut host, "help").contains("ls cat write rm cp mv cmp"));
+        assert!(run(&mut host, "help cp").starts_with("cp SRC|PATTERN DST\n"));
+        assert!(run(&mut host, "help copy").starts_with("cp SRC|PATTERN DST\n"));
         assert!(run(&mut host, "help nothing").contains("no command"));
         assert!(!crate::execute(&mut host, &[COMMANDS], "nothing"));
     }

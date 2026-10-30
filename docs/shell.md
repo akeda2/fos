@@ -8,7 +8,7 @@ One shell core for every port: `crates/shell` (`fosfor_shell`, `no_std`, host-te
 - **`Command`** is a table row: name, aliases, usage, summary, handler. `fosfor_shell::execute(host, &[PORT, files::COMMANDS], line)`
   looks a line up (a port's table first, so it may override) and builds `help` / `help NAME` from the tables; for a name
   that is no command `help NAME` shows a tape's `.fos_help`.
-- **Shared commands** (`files.rs`): `ls cat write rm cp (copy) cmp`. The older `cat diskN NAME` spelling still means `diskN/NAME`.
+- **Shared commands** (`files.rs`): `ls cat write rm cp (copy) mv cmp mkdir`; `ls`, `cp`, `mv` and `rm` take `* ? [a-z]` patterns (`glob.rs`, docs/fosfs-v4.md). The older `cat diskN NAME` spelling still means `diskN/NAME`.
   `cp SRC DST` accepts a bare volume as DST (keeps the name); files up to 32 MiB.
 - **A port** keeps only what is hardware- or port-specific, as its own table (Pi: `kernel/src/shell.rs`), plus what to do with
   a line that is no command (tape names, `PATH/NAME`).
