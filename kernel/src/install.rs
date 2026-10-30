@@ -78,7 +78,7 @@ pub fn command(mut words: core::str::SplitWhitespace) {
             name => label = name,
         }
     }
-    if !label.is_empty() && !fosfs::valid_name(label.as_bytes()) {
+    if !label.is_empty() && !fosfs::valid_label(label.as_bytes()) {
         return crate::println!("install: a label is up to 16 lowercase letters, digits, `.`, `_` or `-`.");
     }
     if confirm {

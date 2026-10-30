@@ -1,6 +1,16 @@
-# FOSFS v4 and the mount tree (design, not built)
+# FOSFS v4 and the mount tree (step 1 built)
 
-Status: **design agreed in conversation, nothing implemented.** Written 2026-10-30. Everything below is a plan; check the
+Status: **step 1 is built (2026-10-30)**: `kernel/src/fosfs.rs` mounts v3 and v4; `format diskN [NAME] v4` makes a v4
+volume; `tools/build_image.py --fosfs 4` builds one; `make test-fosfs4`. v3 stays the default. The rest is a plan.
+
+What step 1 does exactly: magic `FOSFS4`; 128-byte entries whose first 28 bytes match v3 (used, name length, start,
+length, sector count; name at 28, up to 48 characters of letters either case, digits, `. _ - +`, compared
+case-sensitively; the remaining bytes are zero, reserved); a directory of one entry per 4 MiB of volume, 256 to 4096
+entries, fixed at format time; **still one contiguous extent per file** (inline multi-extent is not built: first-fit already
+fills a stick, only fragmentation would need it); labels stay v3-style (16 lowercase). No `/` in names yet (folders arrive
+with the mount table). The directory is scanned 16 sectors per request; extent searches and `fsck` use a 96 KiB static
+scratch table (`fsck` names a duplicate by sector, since it checks names by hash). Not yet built: conversion v3 to v4,
+prefix `ls`, the stream handles and `fs_read_at`. Everything below is the plan; check the
 code (`kernel/src/fosfs.rs`, `crates/fat`, `crates/shell`) before relying on a detail.
 
 ## Why
@@ -66,16 +76,30 @@ says which one a save used.
 
 ## Order of work (each step testable in QEMU)
 
-1. v4 on disk: bigger directory, longer names, prefix `ls`, v3 mount, conversion command, host tools.
+1. v4 on disk (done, except the conversion command and prefix `ls`): bigger directory, longer names, prefix `ls`, v3 mount, conversion command, host tools.
 2. Mount table: `fstab`, lazy label resolution, `mount` shell command, bare-name rule, boot order above.
 3. exFAT subfolders in `crates/fat` (directory traversal, create/delete in subdirectories, long names, the contiguous
    writer for streams). This is the largest piece.
 4. Move tapes, configs and settings into their folders; `tape-rt` and the tapes use the new paths; deploy tooling follows.
 
-## Open questions
+## Decisions (2026-10-30)
 
-- Is `doc/` needed on disk at all, or served from the kernel image?
-- A per-tape search path (`run phono` finds `bin/phono`): the shell only, or also `tape` calls from tapes?
-- Case and character rules for exFAT names that FOSFS cannot hold (recordings named on another OS).
-- Whether `rec/` on the root should stay available as a fallback when no exFAT disk is attached (a small root fills up).
-- One `fs_stream` at a time is still the kernel rule (see `DEFERRED.md`); streams on a mount follow the same rule.
+- `doc/` exists on disk but may be empty.
+- Every tape lives in `bin/`; `run NAME` finds `bin/NAME`, from the shell **and** from tapes starting tapes (the tape call
+  resolves the same way).
+- Names: FOSFS prefers lowercase, but v4 and exFAT mounts accept upper and lower case, any sensible characters and long
+  names, as a modern filesystem would. Case is kept and FOSFS lookups are **case-sensitive** (decided).
+- `rec/` falls back to the root when no exFAT disk is mounted, and v4 must be able to fill a 16 GB stick: files need a short
+  **extent list** instead of one contiguous run (free space fragments as takes are deleted), still first-fit, no defrag.
+- More than one stream: the one-stream limit is only two kernel statics (`tape_fs.rs`). New append-only ABI calls with a stream
+  handle (about 4 at once), explicit `max_bytes` per stream (0 = "largest extent" would starve the next stream), trim on close.
+  exFAT: check that `fat::Stream` and the allocation bitmap are safe with two writers. This enables live decode in phono.
+
+## Proposals awaiting a yes (2026-10-30)
+
+- Entry: 128 bytes, 48-character name, length, 4-6 inline `(start, count)` extents; a chained extent block only if inline
+  proves too few. Data first, length last, as today.
+- Streams: `fs_stream_open2/write2/close2` with a handle (about 4 at once); `max_bytes` becomes a limit and the file grows in
+  chunks of about 64 MiB as it is written; a full disk is a write error. Tape end closes all handles.
+- `fs_read_at(name, len, offset, buf, cap)` in the same ABI bump (version 29), so a decode need not hold the whole file.
+- exFAT side (`crates/fat`) to be reviewed separately for two concurrent writers.

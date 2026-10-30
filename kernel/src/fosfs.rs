@@ -1,24 +1,37 @@
-//! FOSFS version 3: a deliberately small flat filesystem, byte-compatible with v1's
-//! (so the same host tools and the same volumes work): one superblock sector, eight
-//! directory sectors of 64 fixed 64-byte entries, and files stored as one contiguous
-//! run of sectors each, placed first-fit. Names are up to 16 lowercase letters,
-//! digits, `.`, `_` or `-`.
+//! FOSFS versions 3 and 4: a deliberately small flat filesystem. Both have one superblock sector, then a
+//! directory of fixed-size entries, then data; files are one contiguous run of sectors each, placed first-fit,
+//! and the directory is the only allocation record. They differ in size limits (`docs/fosfs-v4.md`):
+//!
+//! * v3 (magic `FOSFS3`): eight directory sectors of 64 entries of 64 bytes; names up to 16 lowercase letters,
+//!   digits, `.`, `_` or `-`. Byte-compatible with v1.
+//! * v4 (magic `FOSFS4`): 128-byte entries and a directory sized from the volume (one entry per 4 MiB, 256 to
+//!   4096 entries); names up to 48 letters of either case, digits, `.`, `_`, `-` or `+`, compared case-sensitively.
+//!
+//! The entry's first 28 bytes are the same in both: used flag, name length, start sector (4), length in bytes
+//! (12), sector count (20); the name follows at 28. The rest of a v4 entry is zero and reserved (more extents).
 
 use crate::block;
 
-const MAGIC: &[u8; 8] = b"FOSFS3\0\0";
-const VERSION: u16 = 3;
-const DIRECTORY_SECTORS: u64 = 8;
-const DATA_START: u64 = 9;
-const ENTRY_SIZE: usize = 64;
-const ENTRIES_PER_SECTOR: usize = 512 / ENTRY_SIZE;
-const MAX_ENTRIES: usize = DIRECTORY_SECTORS as usize * ENTRIES_PER_SECTOR;
-pub const MAX_NAME: usize = 16;
-/// Where the volume label lives in the superblock: 16 bytes, zero padded, written by `label`
+const MAGIC3: &[u8; 8] = b"FOSFS3\0\0";
+const MAGIC4: &[u8; 8] = b"FOSFS4\0\0";
+const DIRECTORY_SECTORS_V3: u64 = 8;
+const ENTRY_SIZE_V3: usize = 64;
+const ENTRY_SIZE_V4: usize = 128;
+const MAX_NAME_V3: usize = 16;
+/// The longest name or label any version holds; callers size their buffers with it.
+pub const MAX_NAME: usize = 48;
+/// The most entries a directory has (v4 at 16 GiB and up); sizes the scratch table.
+const MAX_ENTRIES: usize = 4096;
+const MIN_ENTRIES_V4: u64 = 256;
+/// Sectors per entry of directory growth: one entry per 4 MiB of volume.
+const SECTORS_PER_ENTRY_V4: u64 = 8192;
+/// Where the volume label lives in the superblock: up to 16 bytes (v4: 48), zero padded, written by `label`
 /// (v1's FOSFS leaves these bytes alone, and a v1 `format` clears them).
 const LABEL_OFFSET: usize = 64;
+/// Directory sectors read per disk request while scanning.
+const CHUNK_SECTORS: usize = 16;
 
-/// A volume label: the same characters as a file name, up to 16 of them. It names a volume
+/// A volume label: the same characters as a file name, up to 16 of them (v4: 48). It names a volume
 /// in a way that survives disks being numbered differently from one boot to the next.
 #[derive(Clone, Copy)]
 pub struct Label {
@@ -41,6 +54,8 @@ pub struct Volume {
     pub disk: usize,
     pub base: u64,
     pub sectors: u64,
+    version: u8,
+    directory_sectors: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -77,12 +92,38 @@ impl From<block::Error> for Error {
     }
 }
 
+/// A file name any FOSFS version could hold: up to 48 letters, digits, `.`, `_`, `-` or `+`. A v3 volume applies
+/// the stricter `valid_name_v3` itself, so a caller may check with this and let the volume refuse the rest.
 pub fn valid_name(name: &[u8]) -> bool {
-    !name.is_empty() && name.len() <= MAX_NAME && name.iter().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
+    !name.is_empty() && name.len() <= MAX_NAME && name.iter().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'+'))
+}
+
+/// The v3 rule: up to 16 lowercase letters, digits, `.`, `_` or `-`.
+pub fn valid_name_v3(name: &[u8]) -> bool {
+    !name.is_empty() && name.len() <= MAX_NAME_V3 && name.iter().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
+}
+
+/// A volume label: the v3 name rule, so it stays lowercase and fits every version.
+pub fn valid_label(label: &[u8]) -> bool {
+    valid_name_v3(label)
 }
 
 fn get_u64(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+}
+
+/// Scratch for extent searches and `check`: (start, end, name hash) of every file. Static because a v4 directory
+/// can hold 4096 entries (96 KiB), too much for the stack; the shell is single-threaded and no caller nests.
+static mut SCRATCH: [(u64, u64, u64); MAX_ENTRIES] = [(0, 0, 0); MAX_ENTRIES];
+
+fn hash(name: &[u8]) -> u64 {
+    name.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+}
+
+/// The directory size a new v4 volume of `sectors` sectors gets.
+fn directory_sectors_v4(sectors: u64) -> u64 {
+    let entries = (sectors / SECTORS_PER_ENTRY_V4).clamp(MIN_ENTRIES_V4, MAX_ENTRIES as u64);
+    entries * ENTRY_SIZE_V4 as u64 / 512
 }
 
 impl Volume {
@@ -92,63 +133,138 @@ impl Volume {
         Ok(sector)
     }
 
-    /// Checks the superblock; `Err(NotFormatted)` if this is not a FOSFS v3 volume that fits the `sectors` of its partition.
+    fn entry_size(&self) -> usize {
+        if self.version == 4 { ENTRY_SIZE_V4 } else { ENTRY_SIZE_V3 }
+    }
+
+    fn entries_per_sector(&self) -> usize {
+        512 / self.entry_size()
+    }
+
+    /// The first data sector: the superblock and the directory come before it.
+    fn data_start(&self) -> u64 {
+        1 + self.directory_sectors
+    }
+
+    fn max_name(&self) -> usize {
+        if self.version == 4 { MAX_NAME } else { MAX_NAME_V3 }
+    }
+
+    /// Whether this version can hold `name` (v3: lowercase only, 16 characters).
+    pub fn accepts_name(&self, name: &[u8]) -> bool {
+        if self.version == 4 { valid_name(name) } else { valid_name_v3(name) }
+    }
+
+    /// 3 or 4.
+    pub fn version(&self) -> u8 {
+        self.version
+    }
+
+    /// Calls `visit(lba, index, entry bytes)` for every directory slot, in order, until it returns false. The
+    /// directory is read `CHUNK_SECTORS` sectors per request, which matters on USB with 4096 entries.
+    fn scan(&self, mut visit: impl FnMut(u64, usize, &[u8]) -> bool) -> Result<(), Error> {
+        let (size, per_sector) = (self.entry_size(), self.entries_per_sector());
+        let mut chunk = [0u8; CHUNK_SECTORS * 512];
+        let mut done = 0;
+        while done < self.directory_sectors {
+            let count = (self.directory_sectors - done).min(CHUNK_SECTORS as u64) as usize;
+            block::read(self.disk, self.base + 1 + done, &mut chunk[..count * 512])?;
+            for sector in 0..count {
+                for index in 0..per_sector {
+                    let at = sector * 512 + index * size;
+                    if !visit(1 + done + sector as u64, index, &chunk[at..at + size]) {
+                        return Ok(());
+                    }
+                }
+            }
+            done += count as u64;
+        }
+        Ok(())
+    }
+
+    /// Checks the superblock; `Err(NotFormatted)` if this is not a FOSFS v3 or v4 volume that fits the `sectors` of its partition.
     /// The volume may be smaller than its partition (the partition was grown first, `grow` is about to enlarge the volume,
     /// or it was interrupted between the two): the superblock's size is the volume's size.
     pub fn mount(disk: usize, base: u64, sectors: u64) -> Result<Volume, Error> {
-        let mut volume = Volume { disk, base, sectors };
+        let mut volume = Volume { disk, base, sectors, version: 3, directory_sectors: DIRECTORY_SECTORS_V3 };
         let sector = volume.read_sector(0)?;
         let recorded = get_u64(&sector, 28);
-        let valid = &sector[..8] == MAGIC
-            && u16::from_le_bytes([sector[8], sector[9]]) == VERSION
-            && u16::from_le_bytes([sector[10], sector[11]]) as usize == ENTRY_SIZE
+        let version = match &sector[..8] {
+            m if m == MAGIC3 => 3,
+            m if m == MAGIC4 => 4,
+            _ => return Err(Error::NotFormatted),
+        };
+        let (entry_size, directory_sectors) = (u16::from_le_bytes([sector[10], sector[11]]) as usize, u64::from(u32::from_le_bytes(sector[16..20].try_into().unwrap())));
+        let expected_entry = if version == 4 { ENTRY_SIZE_V4 } else { ENTRY_SIZE_V3 };
+        let geometry = if version == 4 { (1..=MAX_ENTRIES as u64 * 128 / 512).contains(&directory_sectors) } else { directory_sectors == DIRECTORY_SECTORS_V3 };
+        let data_start = 1 + directory_sectors;
+        let valid = u16::from_le_bytes([sector[8], sector[9]]) == u16::from(version)
+            && entry_size == expected_entry
             && u32::from_le_bytes(sector[12..16].try_into().unwrap()) == 1
-            && u32::from_le_bytes(sector[16..20].try_into().unwrap()) == DIRECTORY_SECTORS as u32
-            && get_u64(&sector, 20) == DATA_START
+            && geometry
+            && get_u64(&sector, 20) == data_start
             && recorded >= 8
-            && recorded <= sectors.saturating_sub(DATA_START);
+            && recorded <= sectors.saturating_sub(data_start);
         if !valid {
             return Err(Error::NotFormatted);
         }
-        volume.sectors = DATA_START + recorded;
+        volume.version = version;
+        volume.directory_sectors = directory_sectors;
+        volume.sectors = data_start + recorded;
         Ok(volume)
     }
 
     /// Enlarges the volume to `sectors` sectors of its (grown) partition: only the size in the superblock changes, since
-    /// files are extents addressed from the start of the volume and the new space is simply free. Returns the volume as it is
-    /// now. The partition must already be at least that big.
+    /// files are extents addressed from the start of the volume and the new space is simply free (a v4 directory keeps
+    /// the size it was formatted with). Returns the volume as it is now. The partition must already be at least that big.
     pub fn grow(&self, sectors: u64) -> Result<Volume, Error> {
         if sectors <= self.sectors {
             return Ok(*self);
         }
         let mut sector = self.read_sector(0)?;
-        sector[28..36].copy_from_slice(&(sectors - DATA_START).to_le_bytes());
+        sector[28..36].copy_from_slice(&(sectors - self.data_start()).to_le_bytes());
         block::write(self.disk, self.base, &sector)?;
         Volume::mount(self.disk, self.base, sectors)
     }
 
-    /// Writes an empty FOSFS v3 volume over the `sectors` sectors at `base` of `disk`: the
-    /// superblock (magic, version, geometry, optional label) and eight zeroed directory
-    /// sectors. The data area is not touched (it is unreachable until a file is written).
-    /// Destroys whatever volume was there; callers confirm first.
+    /// Writes an empty FOSFS v3 volume; see `format_version`.
     pub fn format(disk: usize, base: u64, sectors: u64, label: &[u8]) -> Result<Volume, Error> {
-        if sectors < DATA_START + 8 {
+        Volume::format_version(disk, base, sectors, label, 3)
+    }
+
+    /// Writes an empty FOSFS volume of `version` (3 or 4) over the `sectors` sectors at `base` of `disk`: the
+    /// superblock (magic, version, geometry, optional label) and zeroed directory sectors. The data area is
+    /// not touched (it is unreachable until a file is written). Destroys whatever volume was there; callers confirm first.
+    pub fn format_version(disk: usize, base: u64, sectors: u64, label: &[u8], version: u8) -> Result<Volume, Error> {
+        let (magic, entry_size, directory_sectors) = match version {
+            3 => (MAGIC3, ENTRY_SIZE_V3, DIRECTORY_SECTORS_V3),
+            4 => (MAGIC4, ENTRY_SIZE_V4, directory_sectors_v4(sectors)),
+            _ => return Err(Error::NotFormatted),
+        };
+        let data_start = 1 + directory_sectors;
+        if sectors < data_start + 8 {
             return Err(Error::TooSmall);
         }
-        if !label.is_empty() && !valid_name(label) {
+        if !label.is_empty() && !valid_label(label) {
             return Err(Error::InvalidName);
         }
         let mut sector = [0u8; 512];
-        sector[..8].copy_from_slice(MAGIC);
-        sector[8..10].copy_from_slice(&VERSION.to_le_bytes());
-        sector[10..12].copy_from_slice(&(ENTRY_SIZE as u16).to_le_bytes());
+        sector[..8].copy_from_slice(magic);
+        sector[8..10].copy_from_slice(&u16::from(version).to_le_bytes());
+        sector[10..12].copy_from_slice(&(entry_size as u16).to_le_bytes());
         sector[12..16].copy_from_slice(&1u32.to_le_bytes());
-        sector[16..20].copy_from_slice(&(DIRECTORY_SECTORS as u32).to_le_bytes());
-        sector[20..28].copy_from_slice(&DATA_START.to_le_bytes());
-        sector[28..36].copy_from_slice(&(sectors - DATA_START).to_le_bytes());
+        sector[16..20].copy_from_slice(&(directory_sectors as u32).to_le_bytes());
+        sector[20..28].copy_from_slice(&data_start.to_le_bytes());
+        sector[28..36].copy_from_slice(&(sectors - data_start).to_le_bytes());
         sector[LABEL_OFFSET..LABEL_OFFSET + label.len()].copy_from_slice(label);
         // Directory first, superblock last: a half-finished format is not a valid volume.
-        block::write(disk, base + 1, &[0u8; DIRECTORY_SECTORS as usize * 512])?;
+        let zeros = [0u8; CHUNK_SECTORS * 512];
+        let mut done = 0;
+        while done < directory_sectors {
+            let count = (directory_sectors - done).min(CHUNK_SECTORS as u64) as usize;
+            block::write(disk, base + 1 + done, &zeros[..count * 512])?;
+            done += count as u64;
+        }
         block::write(disk, base, &sector)?;
         Volume::mount(disk, base, sectors)
     }
@@ -156,12 +272,12 @@ impl Volume {
     /// The volume's label (empty if it has none).
     pub fn label(&self) -> Result<Label, Error> {
         let sector = self.read_sector(0)?;
-        let field = &sector[LABEL_OFFSET..LABEL_OFFSET + MAX_NAME];
-        let length = field.iter().position(|&byte| byte == 0).unwrap_or(MAX_NAME);
+        let field = &sector[LABEL_OFFSET..LABEL_OFFSET + self.max_name()];
+        let length = field.iter().position(|&byte| byte == 0).unwrap_or(field.len());
         let mut label = Label { bytes: [0; MAX_NAME], length };
         label.bytes[..length].copy_from_slice(&field[..length]);
         // A field holding anything but a valid name (junk in a volume some other tool made) counts as no label.
-        if length != 0 && !valid_name(&label.bytes[..length]) {
+        if length != 0 && !valid_label(&label.bytes[..length]) {
             return Ok(Label { bytes: [0; MAX_NAME], length: 0 });
         }
         Ok(label)
@@ -169,7 +285,7 @@ impl Volume {
 
     /// The length in bytes of file `name`, or `None` if there is no such file.
     pub fn file_length(&self, name: &[u8]) -> Result<Option<u64>, Error> {
-        if !valid_name(name) {
+        if !self.accepts_name(name) {
             return Err(Error::InvalidName);
         }
         Ok(self.find(name)?.map(|entry| entry.length))
@@ -177,42 +293,43 @@ impl Volume {
 
     /// Sets the label; an empty slice clears it.
     pub fn set_label(&self, label: &[u8]) -> Result<(), Error> {
-        if !label.is_empty() && !valid_name(label) {
+        if !label.is_empty() && !(valid_label(label) && label.len() <= self.max_name()) {
             return Err(Error::InvalidName);
         }
         let mut sector = self.read_sector(0)?;
-        sector[LABEL_OFFSET..LABEL_OFFSET + MAX_NAME].fill(0);
+        sector[LABEL_OFFSET..LABEL_OFFSET + self.max_name()].fill(0);
         sector[LABEL_OFFSET..LABEL_OFFSET + label.len()].copy_from_slice(label);
         block::write(self.disk, self.base, &sector)?;
         Ok(())
     }
 
+    /// Whether the slot bytes hold a plausible file: (start, length, sector count, name length), or `None` for an
+    /// empty slot or a damaged entry.
+    fn parse(&self, slot: &[u8]) -> Option<(u64, u64, u64, usize)> {
+        if slot[0] != 1 {
+            return None;
+        }
+        let name_length = usize::from(slot[1]);
+        let (start, length, sector_count) = (get_u64(slot, 4), get_u64(slot, 12), get_u64(slot, 20));
+        let good = name_length != 0
+            && name_length <= self.max_name()
+            && start >= self.data_start()
+            && start.saturating_add(sector_count) <= self.sectors
+            && length <= sector_count.saturating_mul(512);
+        good.then_some((start, length, sector_count, name_length))
+    }
+
     /// Calls `visit` for every valid directory entry.
     pub fn for_each(&self, mut visit: impl FnMut(Entry)) -> Result<(), Error> {
-        for sector_offset in 0..DIRECTORY_SECTORS {
-            let lba = 1 + sector_offset;
-            let contents = self.read_sector(lba)?;
-            for index in 0..ENTRIES_PER_SECTOR {
-                let at = index * ENTRY_SIZE;
-                if contents[at] != 1 {
-                    continue;
-                }
-                let name_length = usize::from(contents[at + 1]);
-                let (start, length, sector_count) = (get_u64(&contents, at + 4), get_u64(&contents, at + 12), get_u64(&contents, at + 20));
-                if name_length == 0
-                    || name_length > MAX_NAME
-                    || start < DATA_START
-                    || start.saturating_add(sector_count) > self.sectors
-                    || length > sector_count.saturating_mul(512)
-                {
-                    continue; // a damaged entry is skipped, not trusted
-                }
+        self.scan(|lba, index, slot| {
+            // A damaged entry is skipped, not trusted.
+            if let Some((start, length, sector_count, name_length)) = self.parse(slot) {
                 let mut name = [0u8; MAX_NAME];
-                name.copy_from_slice(&contents[at + 28..at + 44]);
+                name[..name_length].copy_from_slice(&slot[28..28 + name_length]);
                 visit(Entry { directory_lba: lba, index, start, length, sector_count, name, name_length });
             }
-        }
-        Ok(())
+            true
+        })
     }
 
     /// Reads the directory the way a repair tool would: reports every file's extent through `line`, and every problem
@@ -220,56 +337,46 @@ impl Volume {
     /// nothing to replay or roll back after a power cut, so this only makes visible what mount and `for_each` already
     /// skip over.
     pub fn check(&self, mut line: impl FnMut(core::fmt::Arguments)) -> Result<(usize, usize), Error> {
-        let mut files = [(0u64, 0u64, [0u8; MAX_NAME], 0usize); MAX_ENTRIES];
+        let table = unsafe { &mut *core::ptr::addr_of_mut!(SCRATCH) };
         let (mut count, mut problems, mut slots) = (0, 0, 0);
-        for sector_offset in 0..DIRECTORY_SECTORS {
-            let contents = self.read_sector(1 + sector_offset)?;
-            for index in 0..ENTRIES_PER_SECTOR {
-                let at = index * ENTRY_SIZE;
-                if contents[at] == 0 {
-                    continue;
-                }
-                slots += 1;
-                let name_length = usize::from(contents[at + 1]);
-                let (start, length, sectors) = (get_u64(&contents, at + 4), get_u64(&contents, at + 12), get_u64(&contents, at + 20));
-                let good = contents[at] == 1
-                    && (1..=MAX_NAME).contains(&name_length)
-                    && start >= DATA_START
-                    && start.saturating_add(sectors) <= self.sectors
-                    && length <= sectors.saturating_mul(512);
-                if !good {
-                    problems += 1;
-                    line(format_args!("directory entry {} is damaged (ignored)", slots - 1));
-                    continue;
-                }
-                let mut name = [0u8; MAX_NAME];
-                name.copy_from_slice(&contents[at + 28..at + 44]);
-                files[count] = (start, sectors, name, name_length);
-                count += 1;
-                line(format_args!(
-                    "{:<16} {:>9} bytes at sector {}, {} sectors",
-                    core::str::from_utf8(&name[..name_length]).unwrap_or("?"),
-                    length,
-                    start,
-                    sectors
-                ));
+        let mut failed = false;
+        self.scan(|_, _, slot| {
+            if slot[0] == 0 {
+                return true;
+            }
+            slots += 1;
+            let Some((start, length, sectors, name_length)) = self.parse(slot) else {
+                problems += 1;
+                line(format_args!("directory entry {} is damaged (ignored)", slots - 1));
+                return true;
+            };
+            if count == table.len() {
+                failed = true;
+                return false;
+            }
+            let name = &slot[28..28 + name_length];
+            table[count] = (start, start + sectors, hash(name));
+            count += 1;
+            line(format_args!("{:<16} {:>9} bytes at sector {}, {} sectors", core::str::from_utf8(name).unwrap_or("?"), length, start, sectors));
+            true
+        })?;
+        if failed {
+            return Err(Error::DirectoryFull);
+        }
+        let files = &mut table[..count];
+        files.sort_unstable();
+        for pair in files.windows(2) {
+            // Zero-length reservations (empty files) occupy nothing, so they cannot overlap.
+            if pair[0].1 > pair[0].0 && pair[1].1 > pair[1].0 && pair[0].1 > pair[1].0 {
+                problems += 1;
+                line(format_args!("the files at sectors {} and {} share sectors", pair[0].0, pair[1].0));
             }
         }
-        for a in 0..count {
-            for b in a + 1..count {
-                let (x, y) = (&files[a], &files[b]);
-                if x.3 == y.3 && x.2[..x.3] == y.2[..y.3] {
-                    problems += 1;
-                    line(format_args!("{} appears twice", core::str::from_utf8(&x.2[..x.3]).unwrap_or("?")));
-                }
-                if x.1 != 0 && y.1 != 0 && x.0 < y.0 + y.1 && y.0 < x.0 + x.1 {
-                    problems += 1;
-                    line(format_args!(
-                        "{} and {} share sectors",
-                        core::str::from_utf8(&x.2[..x.3]).unwrap_or("?"),
-                        core::str::from_utf8(&y.2[..y.3]).unwrap_or("?")
-                    ));
-                }
+        files.sort_unstable_by_key(|file| file.2);
+        for pair in files.windows(2) {
+            if pair[0].2 == pair[1].2 {
+                problems += 1;
+                line(format_args!("a name appears twice (the files at sectors {} and {})", pair[0].0, pair[1].0));
             }
         }
         Ok((count, problems))
@@ -305,13 +412,24 @@ impl Volume {
         Ok(Some(length))
     }
 
+    /// Writes directory slot (`lba`, `index`) after `fill` has set its bytes (zeroed first).
+    fn put_slot(&self, lba: u64, index: usize, fill: impl FnOnce(&mut [u8])) -> Result<(), Error> {
+        let mut directory = self.read_sector(lba)?;
+        let at = index * self.entry_size();
+        let slot = &mut directory[at..at + self.entry_size()];
+        slot.fill(0);
+        fill(slot);
+        block::write(self.disk, self.base + lba, &directory)?;
+        Ok(())
+    }
+
     /// Creates or replaces a file. The new contents go to a free extent of their own and the single directory-sector
     /// write that points the entry at it is the commit, so a power cut leaves the old file or the new one, never a mix
     /// (there is no allocation map to repair: the directory is the only record of what is used). Only when the disk has
     /// no free run for the new copy is an existing file rewritten in place (or moved over its own old extent), and that
     /// case is not crash-safe.
     pub fn write(&self, name: &[u8], data: &[u8]) -> Result<(), Error> {
-        if !valid_name(name) {
+        if !self.accepts_name(name) {
             return Err(Error::InvalidName);
         }
         let existing = self.find(name)?;
@@ -329,17 +447,14 @@ impl Volume {
         };
         // Data first, directory entry last: a failure in between leaves the old file intact.
         self.write_data(start, data)?;
-        let mut directory = self.read_sector(slot.0)?;
-        let at = slot.1 * ENTRY_SIZE;
-        directory[at..at + ENTRY_SIZE].fill(0);
-        directory[at] = 1;
-        directory[at + 1] = name.len() as u8;
-        directory[at + 4..at + 12].copy_from_slice(&start.to_le_bytes());
-        directory[at + 12..at + 20].copy_from_slice(&(data.len() as u64).to_le_bytes());
-        directory[at + 20..at + 28].copy_from_slice(&needed.to_le_bytes());
-        directory[at + 28..at + 28 + name.len()].copy_from_slice(name);
-        block::write(self.disk, self.base + slot.0, &directory)?;
-        Ok(())
+        self.put_slot(slot.0, slot.1, |entry| {
+            entry[0] = 1;
+            entry[1] = name.len() as u8;
+            entry[4..12].copy_from_slice(&start.to_le_bytes());
+            entry[12..20].copy_from_slice(&(data.len() as u64).to_le_bytes());
+            entry[20..28].copy_from_slice(&needed.to_le_bytes());
+            entry[28..28 + name.len()].copy_from_slice(name);
+        })
     }
 
     /// Reserves a file for streaming: one contiguous extent of `max_bytes` (the largest free extent when 0), with
@@ -347,7 +462,7 @@ impl Volume {
     /// entry and the reserved capacity in bytes. Nothing is written to the extent, so the old contents show through
     /// until they are overwritten; that is why the length stays 0 until data has really been written.
     pub fn reserve(&self, name: &[u8], max_bytes: u64) -> Result<(Entry, u64), Error> {
-        if !valid_name(name) {
+        if !self.accepts_name(name) {
             return Err(Error::InvalidName);
         }
         let existing = self.find(name)?;
@@ -361,15 +476,13 @@ impl Volume {
             let count = max_bytes.div_ceil(512);
             (self.free_extent(count, existing.as_ref())?.ok_or(Error::DataFull)?, count)
         };
-        let mut directory = self.read_sector(slot.0)?;
-        let at = slot.1 * ENTRY_SIZE;
-        directory[at..at + ENTRY_SIZE].fill(0);
-        directory[at] = 1;
-        directory[at + 1] = name.len() as u8;
-        directory[at + 4..at + 12].copy_from_slice(&start.to_le_bytes());
-        directory[at + 20..at + 28].copy_from_slice(&count.to_le_bytes());
-        directory[at + 28..at + 28 + name.len()].copy_from_slice(name);
-        block::write(self.disk, self.base + slot.0, &directory)?;
+        self.put_slot(slot.0, slot.1, |entry| {
+            entry[0] = 1;
+            entry[1] = name.len() as u8;
+            entry[4..12].copy_from_slice(&start.to_le_bytes());
+            entry[20..28].copy_from_slice(&count.to_le_bytes());
+            entry[28..28 + name.len()].copy_from_slice(name);
+        })?;
         let mut entry = Entry { directory_lba: slot.0, index: slot.1, start, length: 0, sector_count: count, name: [0; MAX_NAME], name_length: name.len() };
         entry.name[..name.len()].copy_from_slice(name);
         Ok((entry, count * 512))
@@ -384,11 +497,17 @@ impl Volume {
         }
         self.write_data(entry.start + offset / 512, data)?;
         if file_length != 0 {
-            let mut directory = self.read_sector(entry.directory_lba)?;
-            let at = entry.index * ENTRY_SIZE;
-            directory[at + 12..at + 20].copy_from_slice(&file_length.to_le_bytes());
-            block::write(self.disk, self.base + entry.directory_lba, &directory)?;
+            self.patch_slot(entry, |slot| slot[12..20].copy_from_slice(&file_length.to_le_bytes()))?;
         }
+        Ok(())
+    }
+
+    /// Changes bytes of an existing entry's slot in place.
+    fn patch_slot(&self, entry: &Entry, patch: impl FnOnce(&mut [u8])) -> Result<(), Error> {
+        let mut directory = self.read_sector(entry.directory_lba)?;
+        let at = entry.index * self.entry_size();
+        patch(&mut directory[at..at + self.entry_size()]);
+        block::write(self.disk, self.base + entry.directory_lba, &directory)?;
         Ok(())
     }
 
@@ -396,19 +515,15 @@ impl Volume {
     /// space a take reserved but did not fill is free again.
     pub fn trim_extent(&self, entry: &Entry, file_length: u64) -> Result<(), Error> {
         let sectors = file_length.div_ceil(512).min(entry.sector_count);
-        let mut directory = self.read_sector(entry.directory_lba)?;
-        let at = entry.index * ENTRY_SIZE;
-        directory[at + 12..at + 20].copy_from_slice(&file_length.to_le_bytes());
-        directory[at + 20..at + 28].copy_from_slice(&sectors.to_le_bytes());
-        block::write(self.disk, self.base + entry.directory_lba, &directory)?;
-        Ok(())
+        self.patch_slot(entry, |slot| {
+            slot[12..20].copy_from_slice(&file_length.to_le_bytes());
+            slot[20..28].copy_from_slice(&sectors.to_le_bytes());
+        })
     }
 
     pub fn remove(&self, name: &[u8]) -> Result<bool, Error> {
         let Some(entry) = self.find(name)? else { return Ok(false) };
-        let mut directory = self.read_sector(entry.directory_lba)?;
-        directory[entry.index * ENTRY_SIZE..(entry.index + 1) * ENTRY_SIZE].fill(0);
-        block::write(self.disk, self.base + entry.directory_lba, &directory)?;
+        self.patch_slot(&entry, |slot| slot.fill(0))?;
         Ok(true)
     }
 
@@ -426,13 +541,15 @@ impl Volume {
     }
 
     fn free_slot(&self) -> Result<Option<(u64, usize)>, Error> {
-        for sector_offset in 0..DIRECTORY_SECTORS {
-            let contents = self.read_sector(1 + sector_offset)?;
-            if let Some(index) = (0..ENTRIES_PER_SECTOR).find(|&index| contents[index * ENTRY_SIZE] == 0) {
-                return Ok(Some((1 + sector_offset, index)));
+        let mut found = None;
+        self.scan(|lba, index, slot| {
+            if slot[0] == 0 {
+                found = Some((lba, index));
+                return false;
             }
-        }
-        Ok(None)
+            true
+        })?;
+        Ok(found)
     }
 
     /// (free bytes in all, bytes of the largest free run): a recording needs one contiguous run, so the second figure
@@ -440,28 +557,34 @@ impl Volume {
     pub fn free_space(&self) -> Result<(u64, u64), Error> {
         let mut used = 0u64;
         self.for_each(|entry| used += entry.sector_count)?;
-        let total = self.sectors.saturating_sub(DATA_START).saturating_sub(used);
+        let total = self.sectors.saturating_sub(self.data_start()).saturating_sub(used);
         let largest = self.largest_free_extent(None)?.map_or(0, |(_, count)| count);
         Ok((total * 512, largest * 512))
     }
 
-    /// The largest run of free sectors (start, count), ignoring the extent of `replacing`.
-    fn largest_free_extent(&self, replacing: Option<&Entry>) -> Result<Option<(u64, u64)>, Error> {
-        let mut extents = [(0u64, 0u64); MAX_ENTRIES];
+    /// The (start, end) extents of every file except `replacing`, sorted by start, in the static scratch table.
+    fn sorted_extents(&self, replacing: Option<&Entry>) -> Result<&'static mut [(u64, u64, u64)], Error> {
+        let table = unsafe { &mut *core::ptr::addr_of_mut!(SCRATCH) };
         let mut used = 0;
         self.for_each(|entry| {
             if replacing.is_some_and(|r| r.directory_lba == entry.directory_lba && r.index == entry.index) {
                 return;
             }
-            if used < extents.len() {
-                extents[used] = (entry.start, entry.start + entry.sector_count);
+            if used < table.len() {
+                table[used] = (entry.start, entry.start + entry.sector_count, 0);
                 used += 1;
             }
         })?;
-        let extents = &mut extents[..used];
+        let extents = &mut table[..used];
         extents.sort_unstable();
-        let (mut best, mut candidate) = ((0u64, 0u64), DATA_START);
-        for &(start, end) in extents.iter() {
+        Ok(extents)
+    }
+
+    /// The largest run of free sectors (start, count), ignoring the extent of `replacing`.
+    fn largest_free_extent(&self, replacing: Option<&Entry>) -> Result<Option<(u64, u64)>, Error> {
+        let extents = self.sorted_extents(replacing)?;
+        let (mut best, mut candidate) = ((0u64, 0u64), self.data_start());
+        for &(start, end, _) in extents.iter() {
             if start > candidate && start - candidate > best.1 {
                 best = (candidate, start - candidate);
             }
@@ -476,23 +599,11 @@ impl Volume {
     /// First-fit search for `count` free sectors, ignoring the extent of `replacing`.
     fn free_extent(&self, count: u64, replacing: Option<&Entry>) -> Result<Option<u64>, Error> {
         if count == 0 {
-            return Ok(Some(DATA_START));
+            return Ok(Some(self.data_start()));
         }
-        let mut extents = [(0u64, 0u64); MAX_ENTRIES];
-        let mut used = 0;
-        self.for_each(|entry| {
-            if replacing.is_some_and(|r| r.directory_lba == entry.directory_lba && r.index == entry.index) {
-                return;
-            }
-            if used < extents.len() {
-                extents[used] = (entry.start, entry.start + entry.sector_count);
-                used += 1;
-            }
-        })?;
-        let extents = &mut extents[..used];
-        extents.sort_unstable();
-        let mut candidate = DATA_START;
-        for &(start, end) in extents.iter() {
+        let extents = self.sorted_extents(replacing)?;
+        let mut candidate = self.data_start();
+        for &(start, end, _) in extents.iter() {
             if start >= candidate + count {
                 break;
             }
@@ -505,8 +616,8 @@ impl Volume {
 /// `fsck`: prints where every file lives and what, if anything, is wrong with the directory.
 pub fn report(volume: &Volume) {
     match volume.check(|text| crate::println!("{text}")) {
-        Ok((files, 0)) => crate::println!("fsck: {files} file(s), directory consistent."),
-        Ok((files, problems)) => crate::println!("fsck: {files} file(s), {problems} problem(s) (damaged entries are ignored, nothing is changed)."),
+        Ok((files, 0)) => crate::println!("fsck: FOSFS v{}, {files} file(s), directory consistent.", volume.version()),
+        Ok((files, problems)) => crate::println!("fsck: FOSFS v{}, {files} file(s), {problems} problem(s) (damaged entries are ignored, nothing is changed).", volume.version()),
         Err(error) => crate::println!("fsck: {error:?}"),
     }
 }

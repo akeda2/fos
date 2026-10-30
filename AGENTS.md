@@ -84,7 +84,9 @@ Also read on demand: `docs/config.md` (every `settings`, `debug`, `start` and `s
 - **FOSFS v3** (flat, 64 entries, 64-bit contiguous extents) is byte-compatible
   with the legacy edition. File names: up to 16 of lowercase letters, digits, `.`, `_`,
   `-`; enforced in `kernel/src/fosfs.rs`, the tape file-system calls and
-  `tools/build_image.py`, which must be kept in sync.
+  `tools/build_image.py`, which must be kept in sync. **FOSFS v4** (`format diskN v4`,
+  `build_image.py --fosfs 4`, 48-character case-sensitive names, directory sized from the
+  volume) is mounted by the same `Volume`; v3 stays the default; `docs/fosfs-v4.md`.
 
 ## Drivers
 

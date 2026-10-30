@@ -575,5 +575,5 @@ use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limi
 
 ## Planned: FOSFS v4 and the mount tree (2026-10-30)
 
-- Design only, in `docs/fosfs-v4.md`: flat v4 with longer names and a bigger directory, folders as name prefixes, a mount table
+- In `docs/fosfs-v4.md`; step 1 (v4 on disk, `format diskN v4`, `build_image.py --fosfs 4`) is built, the rest is design: flat v4 with longer names and a bigger directory, folders as name prefixes, a mount table
   (by label, lazy) for `config`, `settings`, `rec`, real subfolders on exFAT, early-boot settings read from the root first.

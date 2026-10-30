@@ -9,6 +9,8 @@ struct PendingFormat {
     force: bool,
     /// `format diskN exfat`: a PC-readable exFAT volume instead of FOSFS.
     exfat: bool,
+    /// `format diskN v4`: a FOSFS v4 volume (docs/fosfs-v4.md) instead of v3.
+    v4: bool,
 }
 static mut PENDING_FORMAT: Option<PendingFormat> = None;
 
@@ -44,10 +46,10 @@ fn plan_format(disk: usize, force: bool) -> Result<FormatPlan, &'static str> {
 pub fn command(rest: &str) {
     let mut words = rest.split_whitespace();
     let Some(target) = words.next() else {
-        return crate::println!("Usage: format diskN [NAME] [force]   or   format diskN exfat [LABEL]   (then: format diskN confirm)");
+        return crate::println!("Usage: format diskN [NAME] [v4] [force]   or   format diskN exfat [LABEL]   (then: format diskN confirm)");
     };
     let Some(number) = target.strip_prefix("disk").and_then(|number| number.parse::<usize>().ok()) else {
-        return crate::println!("Usage: format diskN [NAME] [force]   (then: format diskN confirm)");
+        return crate::println!("Usage: format diskN [NAME] [v4] [force]   (then: format diskN confirm)");
     };
     let Some(info) = number.checked_sub(1).and_then(crate::block::get) else {
         return crate::println!("disk{number}: no such disk (see `disks`).");
@@ -56,16 +58,17 @@ pub fn command(rest: &str) {
     if crate::storage::boot_disk() == Some(disk) {
         return crate::println!("disk{number} is the boot disk (the running kernel's); format refuses it. Use `rm` for its files.");
     }
-    let (mut confirm, mut force, mut exfat, mut label) = (false, false, false, "");
+    let (mut confirm, mut force, mut exfat, mut v4, mut label) = (false, false, false, false, "");
     for word in words {
         match word {
             "confirm" => confirm = true,
             "force" => force = true,
             "exfat" => exfat = true,
+            "v4" => v4 = true,
             name => label = name,
         }
     }
-    if !exfat && !label.is_empty() && !crate::fosfs::valid_name(label.as_bytes()) {
+    if !exfat && !label.is_empty() && !crate::fosfs::valid_label(label.as_bytes()) {
         return crate::println!("format: a label is up to 16 lowercase letters, digits, `.`, `_` or `-`.");
     }
     if confirm {
@@ -79,7 +82,7 @@ pub fn command(rest: &str) {
                 Err(error) => crate::println!("format: disk{number}: {error}."),
             };
         }
-        return do_format(disk, number, &pending.label[..pending.label_length], pending.force);
+        return do_format(disk, number, &pending.label[..pending.label_length], pending.force, pending.v4);
     }
     if exfat {
         // What the disk holds now, so that the user knows what the confirmation will destroy.
@@ -103,7 +106,7 @@ pub fn command(rest: &str) {
             }
         }
         crate::println!("ALL of it will be erased: one exFAT partition of about {} MiB replaces it.", info.sectors / 2048 - 1);
-        let mut stored = PendingFormat { number, label: [0; crate::fosfs::MAX_NAME], label_length: label.len(), force: false, exfat: true };
+        let mut stored = PendingFormat { number, label: [0; crate::fosfs::MAX_NAME], label_length: label.len(), force: false, exfat: true, v4: false };
         stored.label[..label.len()].copy_from_slice(label.as_bytes());
         unsafe { PENDING_FORMAT = Some(stored) };
         return crate::println!("To go ahead, type exactly: format disk{number} confirm");
@@ -134,13 +137,13 @@ pub fn command(rest: &str) {
             crate::println!("It will be repartitioned as one FOSFS partition of {} MiB, replacing {replaces}.", info.sectors / 2048 - 1);
         }
     }
-    let mut stored = PendingFormat { number, label: [0; crate::fosfs::MAX_NAME], label_length: label.len(), force, exfat: false };
+    let mut stored = PendingFormat { number, label: [0; crate::fosfs::MAX_NAME], label_length: label.len(), force, exfat: false, v4 };
     stored.label[..label.len()].copy_from_slice(label.as_bytes());
     unsafe { PENDING_FORMAT = Some(stored) };
     crate::println!("To go ahead, type exactly: format disk{number} confirm");
 }
 
-fn do_format(disk: usize, number: usize, label: &[u8], force: bool) {
+fn do_format(disk: usize, number: usize, label: &[u8], force: bool, v4: bool) {
     let partition = match plan_format(disk, force) {
         Ok(FormatPlan::Reformat(partition)) => partition,
         Ok(FormatPlan::Partition { .. }) => match crate::gpt::write_single_fosfs_partition(disk) {
@@ -152,9 +155,9 @@ fn do_format(disk: usize, number: usize, label: &[u8], force: bool) {
         },
         Err(reason) => return crate::println!("format: disk{number}: {reason}."),
     };
-    match crate::fosfs::Volume::format(disk, partition.start, partition.sectors, label) {
-        Ok(_) if label.is_empty() => crate::println!("disk{number}: formatted; an empty FOSFS volume of {} MiB.", partition.sectors / 2048),
-        Ok(_) => crate::println!("disk{number}: formatted as @{}; an empty FOSFS volume of {} MiB.", core::str::from_utf8(label).unwrap_or("?"), partition.sectors / 2048),
+    match crate::fosfs::Volume::format_version(disk, partition.start, partition.sectors, label, if v4 { 4 } else { 3 }) {
+        Ok(_) if label.is_empty() => crate::println!("disk{number}: formatted; an empty FOSFS v{} volume of {} MiB.", if v4 { 4 } else { 3 }, partition.sectors / 2048),
+        Ok(_) => crate::println!("disk{number}: formatted as @{}; an empty FOSFS v{} volume of {} MiB.", core::str::from_utf8(label).unwrap_or("?"), if v4 { 4 } else { 3 }, partition.sectors / 2048),
         Err(error) => crate::println!("format: disk{number}: {error:?}"),
     }
 }

@@ -287,14 +287,22 @@ def build_payload(kernel: bytes) -> bytes:
     return bytes(partition)
 
 
-def build_fosfs(files, label: str = "") -> bytes:
-    """A preformatted FOSFS v3 volume (the same layout as v1's tools/build_image.py):
-    a superblock, eight directory sectors of 64-byte entries, contiguous extents."""
-    directory_sectors, entry_size, data_start = 8, 64, 9
+def build_fosfs(files, label: str = "", version: int = 3) -> bytes:
+    """A preformatted FOSFS volume. v3 (the same layout as v1's tools/build_image.py): a superblock, eight
+    directory sectors of 64-byte entries, contiguous extents, names of 16 lowercase characters. v4 (docs/fosfs-v4.md):
+    128-byte entries, a directory of one entry per 4 MiB of volume (256 at least), names of 48 characters of either case."""
+    if version == 4:
+        entries = min(max(FOSFS_SECTORS // 8192, 256), 4096)
+        directory_sectors, entry_size = entries * 128 // SECTOR, 128
+        magic, max_name, allowed = b"FOSFS4\0\0", 48, b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-+"
+    else:
+        directory_sectors, entry_size = 8, 64
+        magic, max_name, allowed = b"FOSFS3\0\0", 16, b"abcdefghijklmnopqrstuvwxyz0123456789._-"
+    data_start = 1 + directory_sectors
     volume = bytearray(FOSFS_SECTORS * SECTOR)
     superblock = bytearray(SECTOR)
-    superblock[0:8] = b"FOSFS3\0\0"
-    struct.pack_into("<HHIIQQ", superblock, 8, 3, entry_size, 1, directory_sectors, data_start, FOSFS_SECTORS - data_start)
+    superblock[0:8] = magic
+    struct.pack_into("<HHIIQQ", superblock, 8, version, entry_size, 1, directory_sectors, data_start, FOSFS_SECTORS - data_start)
     if label:
         raw_label = label.encode("ascii")
         if not (len(raw_label) <= 16 and all(byte in b"abcdefghijklmnopqrstuvwxyz0123456789._-" for byte in raw_label)):
@@ -304,7 +312,7 @@ def build_fosfs(files, label: str = "") -> bytes:
     next_sector = data_start
     for index, (name, contents) in enumerate(files):
         raw = name.encode("ascii")
-        if not (0 < len(raw) <= 16 and all(byte in b"abcdefghijklmnopqrstuvwxyz0123456789._-" for byte in raw)):
+        if not (0 < len(raw) <= max_name and all(byte in allowed for byte in raw)):
             raise SystemExit(f"invalid FOSFS name {name!r}")
         if index >= directory_sectors * SECTOR // entry_size:
             raise SystemExit("too many FOSFS files")
@@ -355,7 +363,7 @@ BIOS_STAGE2_SECTORS = 24
 
 
 def build_image(loader: bytes, kernel: bytes, files=(), label: str = "", payload_guid: uuid.UUID = PAYLOAD_GUID,
-                bios_stage1=None, bios_stage2=None, arch: str = "x86_64", esp_files=None) -> bytes:
+                bios_stage1=None, bios_stage2=None, arch: str = "x86_64", esp_files=None, fosfs_version: int = 3) -> bytes:
     if arch == "aarch64":
         bios_stage1 = bios_stage2 = b""  # no BIOS boot code for a Pi
     if bios_stage1 is None and bios_stage2 is None:
@@ -384,7 +392,7 @@ def build_image(loader: bytes, kernel: bytes, files=(), label: str = "", payload
     image[ESP_START * SECTOR:ESP_START * SECTOR + len(esp)] = esp
     payload = build_payload(kernel)
     image[PAYLOAD_START * SECTOR:PAYLOAD_START * SECTOR + len(payload)] = payload
-    fosfs = build_fosfs(files, label)
+    fosfs = build_fosfs(files, label, fosfs_version)
     image[FOSFS_START * SECTOR:FOSFS_START * SECTOR + len(fosfs)] = fosfs
     return bytes(image)
 
@@ -406,6 +414,7 @@ def main():
     parser.add_argument("--arch", choices=("x86_64", "aarch64"), default="x86_64", help="the CPU the loader and kernel are built for (names the loader BOOTAA64.EFI for aarch64; aarch64 images have no BIOS boot code)")
     parser.add_argument("--esp-dir", type=Path, help="copy this directory tree into the ESP's root (the Raspberry Pi 4's edk2 firmware files: "
                         "RPI_EFI.fd, start4.elf, config.txt, ...; its own firmware reads them from the first FAT volume)")
+    parser.add_argument("--fosfs", type=int, choices=(3, 4), default=3, help="the FOSFS version of the data volume (4: docs/fosfs-v4.md; the default stays 3 until the move to folders)")
     parser.add_argument("--no-bios", action="store_true", help="build a UEFI-only image")
     arguments = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
@@ -425,7 +434,7 @@ def main():
     esp_files = {str(path.relative_to(arguments.esp_dir)): path.read_bytes() for path in sorted(arguments.esp_dir.rglob("*")) if path.is_file()} if arguments.esp_dir else None
     arguments.output.write_bytes(build_image(arguments.loader.read_bytes(), arguments.kernel.read_bytes(), files, arguments.label, arguments.payload_guid,
                                                 arguments.bios_stage1.read_bytes() if arguments.bios_stage1 else b"",
-                                                arguments.bios_stage2.read_bytes() if arguments.bios_stage2 else b"", arguments.arch, esp_files))
+                                                arguments.bios_stage2.read_bytes() if arguments.bios_stage2 else b"", arguments.arch, esp_files, arguments.fosfs))
     print(f"wrote {arguments.output}")
 
 
