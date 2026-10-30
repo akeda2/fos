@@ -216,6 +216,19 @@ fn transfer(host: &mut dyn Host, from: &str, to: &str, moving: bool) -> bool {
         sayln!(host, "{verb}: source and destination are the same file.");
         return false;
     }
+    if moving {
+        match host.rename(from, to) {
+            Ok(true) => {
+                sayln!(host, "Moved {from} to {to} (renamed in place).");
+                return true;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                sayln!(host, "mv: {from}: {error}.");
+                return false;
+            }
+        }
+    }
     let length = match host.length(from) {
         Ok(length) if length > COPY_LIMIT => {
             sayln!(host, "{verb}: {from} is {} MiB; the limit is {} MiB.", length >> 20, COPY_LIMIT >> 20);
@@ -285,7 +298,7 @@ fn copy_or_move(host: &mut dyn Host, rest: &str, moving: bool) {
     }
     // Several sources cannot share one file name: DST is a folder (made when missing).
     let mut sources = 0;
-    if let Err(error) = expand(host, from, &mut |_, _, directory, _| sources += usize::from(!directory)) {
+    if let Err(error) = expand(host, from, &mut |_, _, directory, _| sources += usize::from(moving || !directory)) {
         return sayln!(host, "{verb}: {from}: {error}.");
     }
     if sources == 0 {
@@ -296,7 +309,7 @@ fn copy_or_move(host: &mut dyn Host, rest: &str, moving: bool) {
     }
     let (mut worked, mut failed) = (0, 0);
     let _ = expand(host, from, &mut |host, reference, directory, _| {
-        if directory {
+        if directory && !moving {
             return;
         }
         let mut buffer = [0u8; 192];

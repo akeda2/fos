@@ -249,6 +249,29 @@ pub fn remove(reference: &[u8]) -> isize {
     }
 }
 
+/// Renames or moves `from` to `to` in place when both are on the same FOSFS v4 volume: `Ok(true)` done, `Ok(false)` not
+/// possible here (another volume, FAT, FOSFS v3, a name that exists: the caller copies instead), `Err` a code for a source
+/// that is missing.
+pub fn rename(from: &[u8], to: &[u8]) -> Result<bool, isize> {
+    if resolve_fat(from).is_some() || resolve_fat(to).is_some() {
+        return Ok(false);
+    }
+    let ((source, old), (target, new)) = (resolve_file(from, false)?, resolve_file(to, false)?);
+    if (source.disk, source.base) != (target.disk, target.base) || source.version() != 4 {
+        return Ok(false);
+    }
+    // A bare name that is only in `bin/` moves that tape, as `rm` removes it.
+    let old = if matches!(source.find(old), Ok(Some(_))) { old } else { bin_path(old).unwrap_or(old) };
+    if make_mount_folders(to, &target, new).is_err() {
+        return Ok(false);
+    }
+    match source.rename(old, new) {
+        Ok(true) => Ok(true),
+        Ok(false) => Err(FS_NOT_FOUND),
+        Err(_) => Ok(false),
+    }
+}
+
 /// Makes a folder (FOSFS v4 and exFAT volumes only).
 pub fn mkdir(reference: &[u8]) -> isize {
     if let Some((mut fs, name)) = resolve_fat(reference) {

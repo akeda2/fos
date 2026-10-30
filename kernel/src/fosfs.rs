@@ -909,6 +909,44 @@ impl Volume {
         self.put_entry(slot.0, slot.1, &Spec { folder: true, leaf, parent, length: 0, sectors: 0, extents: [(0, 0); MAX_EXTENTS], extent_count: 0, modified: self.now() })
     }
 
+    /// Renames or moves a file or a folder (with everything in it) to `to` inside this volume; false if `from` does not
+    /// exist. v4 only. No data is copied: the entry's name and parent change in one directory-sector write, so a power cut
+    /// leaves it under the old name or the new one. `to` must not exist (`Exists`) and its folder must (`NoDirectory`);
+    /// a folder cannot move into itself (`InvalidName`).
+    pub fn rename(&self, from: &[u8], to: &[u8]) -> Result<bool, Error> {
+        if self.version != 4 || !valid_path(from) || !valid_path(to) {
+            return Err(Error::InvalidName);
+        }
+        let Some(entry) = self.find(from)? else { return Ok(false) };
+        let (folder, leaf) = split_path(to);
+        let parent = self.resolve_folder(folder)?;
+        if let Some(existing) = self.find_child(parent, leaf)? {
+            return if existing.id == entry.id { Ok(true) } else { Err(Error::Exists) };
+        }
+        if entry.is_dir {
+            let mut current = parent;
+            while current != 0 {
+                if current == entry.id {
+                    return Err(Error::InvalidName);
+                }
+                let mut next = 0;
+                self.for_each_all(|other| {
+                    if other.id == current {
+                        next = other.parent;
+                    }
+                })?;
+                current = next;
+            }
+        }
+        self.patch_slot(&entry, |slot| {
+            slot[1] = leaf.len() as u8;
+            slot[NAME_AT_V4..NAME_AT_V4 + MAX_NAME].fill(0);
+            slot[NAME_AT_V4..NAME_AT_V4 + leaf.len()].copy_from_slice(leaf);
+            slot[PARENT_AT..PARENT_AT + 4].copy_from_slice(&parent.to_le_bytes());
+        })?;
+        Ok(true)
+    }
+
     /// Makes every folder on the way to the file `path` that is missing (`a/b/c` makes `a` and `a/b`); a bare name
     /// has none. What a write under a mount point does, so that `config/phono.cfg` works on a root that has no
     /// `config` folder yet.

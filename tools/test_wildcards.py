@@ -47,6 +47,24 @@ def scenario(run):
     check("c.txt" in run("cat rec/c.txt"), "other files stay", "")
     check("no match" in run("rm moved/*.flac confirm"), "rm with no match fails", "")
 
+    # In-place rename on FOSFS v4: folders and files move with no data copied, the contents follow.
+    run("mkdir deep")
+    run("write deep/x.txt xdata")
+    out = run("mv deep renamed")
+    check("renamed in place" in out, "mv of a folder renames it in place", out)
+    check("xdata" in run("cat renamed/x.txt") and "no such file" in run("cat deep/x.txt"), "its files moved with it", "")
+    out = run("mv renamed/x.txt rec/x2.txt")
+    check("renamed in place" in out and "xdata" in run("cat rec/x2.txt"), "a file moves between folders in place", out)
+    run("mkdir inner")
+    out = run("mv renamed renamed/inner")
+    check("renamed/inner" in out and "Moved" not in out.split("\n")[0], "a folder cannot move into itself", out)
+    run("write rec/old.txt old")
+    run("write rec/new.txt new")
+    out = run("mv rec/new.txt rec/old.txt")
+    check("renamed in place" not in out and "new" in run("cat rec/old.txt") and "no such file" in run("cat rec/new.txt"), "moving onto an existing file replaces it by copy", out)
+    fsck = run("fsck")
+    check("directory consistent" in fsck, "fsck is happy after the renames", fsck[-300:])
+
     # exFAT: names compare ignoring case, so a lower-case pattern finds upper-case files
     run("format disk2 exfat wild")
     run("format disk2 confirm")

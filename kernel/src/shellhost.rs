@@ -87,6 +87,10 @@ impl Host for KernelHost {
         }
     }
 
+    fn rename(&mut self, from: &str, to: &str) -> Result<bool, FsError> {
+        tape_fs::rename(from.as_bytes(), to.as_bytes()).map_err(error)
+    }
+
     fn list(&mut self, volume: &str, each: &mut dyn FnMut(&mut dyn Host, Entry)) -> Result<&'static str, FsError> {
         tape_fs::each_entry(volume.as_bytes(), &mut |name, length, directory, modified| {
             let modified = modified.map(|time| Stamp { year: time.year, month: time.month, day: time.day, hour: time.hour, minute: time.minute, second: time.second });

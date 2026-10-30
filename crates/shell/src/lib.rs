@@ -85,6 +85,11 @@ pub trait Host {
     fn mkdir(&mut self, _reference: &str) -> Result<(), FsError> {
         Err(FsError::BadName)
     }
+    /// Renames or moves a file or folder without copying it: `Ok(true)` done, `Ok(false)` not possible here (another volume,
+    /// a volume without in-place rename, or the name is taken), so the caller copies.
+    fn rename(&mut self, _from: &str, _to: &str) -> Result<bool, FsError> {
+        Ok(false)
+    }
     /// Calls `each` (handing it the host back, to print with) for every entry of the volume and returns its kind (`"FOSFS"`, `"FAT32"`, `"exFAT"`).
     fn list(&mut self, volume: &str, each: &mut dyn FnMut(&mut dyn Host, Entry)) -> Result<&'static str, FsError>;
     /// Runs `run` with a scratch buffer of `size` bytes; false if there is no memory for it.

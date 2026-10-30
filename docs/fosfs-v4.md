@@ -114,7 +114,7 @@ says which one a save used.
 `ls`, `cp`/`copy`, `rm` and a new `mv` take bash-style patterns. **Built** in `crates/shell` (`glob.rs` the matcher,
 `files.rs` the expansion; `make test` for the matcher, `make test-wildcards` over v4 and exFAT). Differences from the
 plan below: `rm` asks by a `confirm` word at the end of the same line (`rm PATTERN confirm`, stateless) instead of as the
-very next command; `mv` is copy, read back, remove on every volume (the in-place v4 rename is not built); the escape
+very next command; `mv` renames the entry in place on one FOSFS v4 volume (`Volume::rename`, `Host::rename`: name and parent change in one directory-sector write, folders move with their contents; a folder cannot move into itself) and otherwise is copy, read back, remove (another volume, FAT/exFAT, v3, a name that exists); the escape
 backslash only counts inside a pattern (an argument with no `*?[` is passed on exactly as typed); a folder lists at most
 256 entries per pattern level and 2048 at the last one, names over 54 bytes are skipped with a message.
 
