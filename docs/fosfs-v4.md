@@ -1,0 +1,81 @@
+# FOSFS v4 and the mount tree (design, not built)
+
+Status: **design agreed in conversation, nothing implemented.** Written 2026-10-30. Everything below is a plan; check the
+code (`kernel/src/fosfs.rs`, `crates/fat`, `crates/shell`) before relying on a detail.
+
+## Why
+
+FOSFS v3 is flat: one superblock sector, eight directory sectors of 64 entries, names of at most 16 characters, files as one
+contiguous run each. The root is crowded (tapes, configs, boot scripts, recordings) and the 64-entry and 16-character limits
+bite sooner than the clutter does. Folders alone would not fix the limits.
+
+## The model
+
+1. **FOSFS v4 stays flat.** New magic, a larger directory region that can be relocated and grown, longer names (about 48
+   characters, same alphabet plus `/`). A "folder" is a name prefix: `bin/phono`, `config/phono.cfg`. `ls bin` is a prefix
+   filter. There is no `mkdir`, no empty folder, no current directory: paths are always absolute.
+2. **A small mount table gives the tree.** A path is resolved by the longest mounted prefix; the rest of the path goes to the
+   filesystem mounted there. No match means the root volume with the whole path as the file name.
+   - Single-drive machines need nothing: `config/` is then simply a prefix on the root volume. Mounting a volume at `config`
+     replaces it. Both cases use the same lookup, so "falls back to the root" is not a separate code path.
+   - Real subfolders exist only on **exFAT** mounts (`/rec/session1/lp1.flac` is a real path on the stick). FAT32 stays
+     root-only and is to be avoided.
+3. **Mount by label, resolve lazily.** `@LABEL` survives disk renumbering; a stick that appears after boot (or after
+   `usb rescan`) starts working at the next lookup. `diskN/NAME` and `@LABEL/NAME` stay as explicit volume paths.
+4. **The table lives on the root** (`fstab`, plain text, one `PATH @LABEL` per line) and is read first.
+5. **Bare names keep meaning the root** (`phono.cfg`), so old tapes and the tape ABI do not change; new code (`tape-rt`
+   config, the shell) uses full paths such as `config/phono.cfg`. `fs_*` already take names as strings.
+
+## The folders
+
+| Folder | Holds | Typically on |
+| --- | --- | --- |
+| `bin/` | tapes | root (can be rewritten at will) |
+| `doc/` | help and documentation files | root |
+| `config/` | per-tape configs (`phono.cfg`, `TAPE.cfg`, `@NAME` files) | a small USB stick, or the root |
+| `settings/` | FOS configs: `settings`, `start`, `hostname`, `debug` | the config volume, or the root |
+| `rec/` | recordings | an exFAT disk (readable on other systems) |
+
+The point of the split: the root (kernel, tapes) can be rewritten or reflashed without touching the machine's configuration,
+and a fast NVMe boot disk need not carry the slow stick's data.
+
+## Boot order (the one hard constraint)
+
+Some settings are needed **before** the drivers that bring up the config volume. `no-msi` exists because MSI breaks some
+machines, and a USB stick sits behind that same xHCI controller; if its only copy lived on the stick the machine could not
+boot. So:
+
+1. Read `fstab` and the root's `settings/` first, before driver init (as today the config is read from the boot volume).
+2. Bring up disks and USB; wait for the config volume with a **bounded** wait (about 10 s).
+3. Mount it at `settings` and `config` as `fstab` says; its files override the root's copies.
+4. Settings read after the drivers are up (`keymap`, `hostname`, `start`) may come from the stick alone.
+5. If the volume never appears, the root's directories stand and the shell says so. Nothing blocks.
+
+**Writes when the volume is missing** go to the root (the same prefix). The stick's copy wins when it returns; the shell
+says which one a save used.
+
+## Compatibility and migration
+
+- The new kernel mounts v3 and v4. Old kernels need not read v4 (the legacy tree is frozen at `legacy-v1`).
+- A host/shell command converts a v3 volume to v4 in place (rewrite directory, same data extents) and moves the known files
+  into their folders; a reformat is the fallback.
+- Touch points to keep in sync: `kernel/src/fosfs.rs` (name rules), the tape file-system calls, `tools/build_image.py`,
+  `tools/foscopy.py`, NETFS and `tools/devloop.py`, `crates/tape-sync` (`tapesync` pulls `bin/` tapes), `crates/tape-rt`
+  config search, the shell's `ls`/`copy`/`cat`, boot-time config in the kernel. `AGENTS.md` repeats the name rule: change
+  it with the code.
+
+## Order of work (each step testable in QEMU)
+
+1. v4 on disk: bigger directory, longer names, prefix `ls`, v3 mount, conversion command, host tools.
+2. Mount table: `fstab`, lazy label resolution, `mount` shell command, bare-name rule, boot order above.
+3. exFAT subfolders in `crates/fat` (directory traversal, create/delete in subdirectories, long names, the contiguous
+   writer for streams). This is the largest piece.
+4. Move tapes, configs and settings into their folders; `tape-rt` and the tapes use the new paths; deploy tooling follows.
+
+## Open questions
+
+- Is `doc/` needed on disk at all, or served from the kernel image?
+- A per-tape search path (`run phono` finds `bin/phono`): the shell only, or also `tape` calls from tapes?
+- Case and character rules for exFAT names that FOSFS cannot hold (recordings named on another OS).
+- Whether `rec/` on the root should stay available as a fallback when no exFAT disk is attached (a small root fills up).
+- One `fs_stream` at a time is still the kernel rule (see `DEFERRED.md`); streams on a mount follow the same rule.

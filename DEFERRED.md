@@ -572,3 +572,8 @@ use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limi
   checkpointing recorder were not timed: if a take underruns there, try fewer LPC orders in `analyse_lpc`).
 - Fosplay: Pro Logic-style decoder, Ambiophonic/RACE and logic modes (listening only, no archive).
 - Logic steering for the Ambience mode.
+
+## Planned: FOSFS v4 and the mount tree (2026-10-30)
+
+- Design only, in `docs/fosfs-v4.md`: flat v4 with longer names and a bigger directory, folders as name prefixes, a mount table
+  (by label, lazy) for `config`, `settings`, `rec`, real subfolders on exFAT, early-boot settings read from the root first.
