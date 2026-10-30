@@ -50,6 +50,10 @@ pub enum Error {
     Corrupt,
     /// A write outside the reserved run.
     OutOfRange,
+    /// `mkdir` of a name that is already there.
+    Exists,
+    /// `remove_dir` of a directory that still has entries.
+    NotEmpty,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,6 +173,11 @@ pub struct Fs<D: Device> {
     pub(crate) root: u32,
     /// The directory every lookup, listing and creation works on: the root until `enter` says otherwise.
     pub(crate) dir: u32,
+    /// exFAT: the current directory is a run of `dir_clusters` consecutive clusters (NoFatChain) instead of a FAT chain,
+    /// and `dir_set` is where its own entry set sits in its parent (sector, byte offset, entries; None for the root).
+    pub(crate) dir_contiguous: bool,
+    pub(crate) dir_clusters: u32,
+    pub(crate) dir_set: Option<(u64, usize, usize)>,
     /// FAT32: the FSInfo sector (0 = none). exFAT: the allocation bitmap's first cluster and length in bytes.
     pub(crate) fsinfo: u32,
     pub(crate) bitmap_cluster: u32,
@@ -187,7 +196,7 @@ impl<D: Device> Fs<D> {
             return Err(Error::NotFat);
         }
         let mut fs = Fs {
-            device, kind: Kind::Fat32, spc: 0, data_lba: 0, clusters: 0, fat_lba: 0, fat_sectors: 0, fats: 0, root: 0, dir: 0, fsinfo: 0, bitmap_cluster: 0, bitmap_bytes: 0, time: Time::DEFAULT,
+            device, kind: Kind::Fat32, spc: 0, data_lba: 0, clusters: 0, fat_lba: 0, fat_sectors: 0, fats: 0, root: 0, dir: 0, dir_contiguous: false, dir_clusters: 0, dir_set: None, fsinfo: 0, bitmap_cluster: 0, bitmap_bytes: 0, time: Time::DEFAULT,
             fat_cache_lba: u64::MAX, fat_cache: [0; SECTOR],
         };
         if &boot[3..11] == b"EXFAT   " {
@@ -220,16 +229,22 @@ impl<D: Device> Fs<D> {
         self.device
     }
 
-    /// Makes the subdirectory `name` of the current directory the current one: lookups, listings, `create` and `remove` then
-    /// work in it. FAT32 only (an EFI System Partition is FAT32 by specification). `enter_root` goes back.
+    /// Makes the subdirectory `name` of the current directory the current one: lookups, listings, `create`, `mkdir` and
+    /// `remove` then work in it. `enter_root` goes back; a path is entered one component at a time. On FAT32 this is
+    /// for reading and for the EFI System Partition's loader; exFAT subdirectories can also be made and removed.
     pub fn enter(&mut self, name: &[u8]) -> Result<(), Error> {
-        if self.kind != Kind::Fat32 {
-            return Err(Error::Unsupported);
-        }
         match self.entry(name)? {
             Some(entry) if entry.is_directory => {
                 // A subdirectory's ".." entry says cluster 0 for the root; a named entry never does, but be safe.
-                self.dir = if entry.first_cluster < 2 { self.root } else { entry.first_cluster };
+                if entry.first_cluster < 2 {
+                    self.enter_root();
+                    return Ok(());
+                }
+                self.dir = entry.first_cluster;
+                // exFAT: a directory written by another system may be one consecutive run with no FAT chain.
+                self.dir_contiguous = self.kind == Kind::ExFat && entry.contiguous;
+                self.dir_clusters = entry.size.div_ceil(self.cluster_bytes()) as u32;
+                self.dir_set = (self.kind == Kind::ExFat).then_some((entry.set_lba, entry.set_offset, entry.set_entries));
                 Ok(())
             }
             Some(_) => Err(Error::NotFound),
@@ -239,6 +254,41 @@ impl<D: Device> Fs<D> {
 
     pub fn enter_root(&mut self) {
         self.dir = self.root;
+        self.dir_contiguous = false;
+        self.dir_clusters = 0;
+        self.dir_set = None;
+    }
+
+    /// Makes the directory `name` in the current directory. exFAT only; the new directory is one zeroed cluster that
+    /// grows through the FAT. Fails with `Exists` if the name is taken (by a file too).
+    pub fn mkdir(&mut self, name: &[u8]) -> Result<(), Error> {
+        if self.kind != Kind::ExFat {
+            return Err(Error::Unsupported);
+        }
+        self.exfat_mkdir(name)
+    }
+
+    /// Removes the empty directory `name` of the current directory and frees its clusters. exFAT only. False if there
+    /// is no such directory; `NotEmpty` if it still holds anything.
+    pub fn remove_dir(&mut self, name: &[u8]) -> Result<bool, Error> {
+        if self.kind != Kind::ExFat {
+            return Err(Error::Unsupported);
+        }
+        let Some(entry) = self.entry(name)? else { return Ok(false) };
+        if !entry.is_directory {
+            return Ok(false);
+        }
+        let saved = (self.dir, self.dir_contiguous, self.dir_clusters, self.dir_set);
+        self.enter(name)?;
+        let mut empty = true;
+        let listed = self.list(|_| empty = false);
+        (self.dir, self.dir_contiguous, self.dir_clusters, self.dir_set) = saved;
+        listed?;
+        if !empty {
+            return Err(Error::NotEmpty);
+        }
+        self.exfat_remove(&entry)?;
+        Ok(true)
     }
 
     /// Makes the file `target` hold what the file `source` holds, in one sector write: the directory entry of `target` is
@@ -518,6 +568,7 @@ impl<D: Device> Fs<D> {
         let mut cluster = self.dir;
         let mut guard = 0u32;
         let mut sector = [0u8; SECTOR];
+        let mut cluster_number = 0u32;
         loop {
             for index in 0..self.spc {
                 let lba = self.cluster_lba(cluster) + u64::from(index);
@@ -528,9 +579,17 @@ impl<D: Device> Fs<D> {
                     Visit::Rewrite => self.device.write(lba, &sector)?,
                 }
             }
-            match self.chain_next(cluster)? {
-                Some(next) => cluster = next,
-                None => return Ok(None),
+            cluster_number += 1;
+            if self.dir_contiguous {
+                if cluster_number >= self.dir_clusters {
+                    return Ok(None);
+                }
+                cluster += 1;
+            } else {
+                match self.chain_next(cluster)? {
+                    Some(next) => cluster = next,
+                    None => return Ok(None),
+                }
             }
             guard += 1;
             if guard > self.clusters {
@@ -542,6 +601,9 @@ impl<D: Device> Fs<D> {
     /// Chains one more zeroed cluster (already claimed by the caller in whatever allocation record the format has)
     /// onto the root directory and returns its number.
     pub(crate) fn extend_root(&mut self, cluster: u32) -> Result<(), Error> {
+        if self.dir_contiguous {
+            return Err(Error::NoSpace); // no FAT chain to extend; such a directory is read and filled, not grown
+        }
         self.zero_cluster(cluster)?;
         let end = if self.kind == Kind::Fat32 { 0x0fff_ffff } else { 0xffff_ffff };
         self.fat_set_range(cluster, 1, |_| end)?;
@@ -549,7 +611,11 @@ impl<D: Device> Fs<D> {
         while let Some(next) = self.chain_next(last)? {
             last = next;
         }
-        self.fat_set_range(last, 1, |_| cluster)
+        self.fat_set_range(last, 1, |_| cluster)?;
+        if self.kind == Kind::ExFat && self.dir_set.is_some() {
+            self.exfat_dir_grew()?;
+        }
+        Ok(())
     }
 
     /// `count` consecutive free entries inside one sector of the root directory, as (sector, byte offset) -- or None

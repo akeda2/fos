@@ -379,3 +379,65 @@ fn replacing_a_file_in_a_subdirectory_keeps_the_volume_valid() {
     assert!(!fs.forget_alias(b"bootx64.new", b"bootx64.efi").unwrap(), "different chains: nothing to forget");
     assert!(fs.find(b"bootx64.new").unwrap().is_some());
 }
+
+/// exFAT subdirectories: made, nested, filled until they grow past a cluster (the parent's recorded size grows with them),
+/// listed, read, emptied and removed; `fsck.exfat` agrees at every stage, and a fresh mount sees the same tree.
+#[test]
+fn exfat_subdirectories() {
+    if !tool("mkfs.exfat") {
+        return;
+    }
+    let path = scratch("exfat-dirs.img");
+    let _cleanup = Cleanup(path.clone());
+    make_image(&path, 64, &["mkfs.exfat", "-c", "4096"]);
+    let mut fs = open(&path);
+    fs.set_time(Time { year: 2026, month: 10, day: 30, hour: 12, minute: 0, second: 0 });
+    fs.mkdir(b"rec").unwrap();
+    assert_eq!(fs.mkdir(b"REC"), Err(Error::Exists));
+    assert!(fs.create(b"rec", 4096).is_err(), "a file cannot replace a directory");
+    put(&mut fs, b"top.bin", &pattern(0, 700));
+    fs.enter(b"rec").unwrap();
+    fs.mkdir(b"session1").unwrap();
+    // 4 KiB clusters hold 128 entries; each name below needs 3 or 4, so 60 files force the directory to grow.
+    for number in 0..60 {
+        let name = format!("take number {number:03} of the long evening.wav");
+        put(&mut fs, name.as_bytes(), &pattern(number, 1000 + number));
+    }
+    fs.enter(b"session1").unwrap();
+    put(&mut fs, b"lp1.flac", &pattern(7, 5000));
+    fs.enter_root();
+    assert!(fs.find(b"lp1.flac").unwrap().is_none() && fs.find(b"top.bin").unwrap().is_some());
+    drop(fs);
+    fsck(&path, &["fsck.exfat", "-n"]);
+
+    let mut fs = open(&path);
+    fs.enter(b"rec").unwrap();
+    let mut names = 0;
+    let mut subdirectories = 0;
+    fs.list(|entry| if entry.is_directory { subdirectories += 1 } else { names += 1 }).unwrap();
+    assert_eq!((names, subdirectories), (60, 1));
+    let file = fs.find(b"take number 059 of the long evening.wav").unwrap().unwrap();
+    let mut data = vec![0u8; file.size as usize];
+    fs.read(&file, 0, &mut data).unwrap();
+    assert!(data == pattern(59, 1059));
+    fs.enter(b"session1").unwrap();
+    let file = fs.find(b"LP1.FLAC").unwrap().unwrap();
+    let mut data = vec![0u8; 5000];
+    fs.read(&file, 0, &mut data).unwrap();
+    assert!(data == pattern(7, 5000));
+    fs.enter_root();
+
+    // A directory with anything in it stays; an emptied one goes and its space comes back.
+    fs.enter(b"rec").unwrap();
+    assert_eq!(fs.remove_dir(b"session1"), Err(Error::NotEmpty));
+    fs.enter(b"session1").unwrap();
+    assert!(fs.remove(b"lp1.flac").unwrap());
+    fs.enter_root();
+    fs.enter(b"rec").unwrap();
+    assert!(fs.remove_dir(b"session1").unwrap());
+    assert!(!fs.remove_dir(b"session1").unwrap());
+    fs.enter_root();
+    assert_eq!(fs.remove_dir(b"rec"), Err(Error::NotEmpty));
+    drop(fs);
+    fsck(&path, &["fsck.exfat", "-n"]);
+}

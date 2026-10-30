@@ -267,6 +267,15 @@ impl<D: Device> Fs<D> {
             }
         };
         let (lba, offset) = found;
+        // Size 0 and no cluster until the first length is set (with it, `set_length` points the entry at the run).
+        self.exfat_write_set(lba, offset, name, 0x20, ALLOCATION_POSSIBLE | NO_FAT_CHAIN, 0, 0)?;
+        Ok(Stream { first_cluster: start, clusters: count, capacity: u64::from(count) * cluster_bytes, entry_lba: lba, entry_offset: offset, entries })
+    }
+
+    /// Writes a complete entry set for `name` at (`lba`, `offset`): attributes `attributes` (0x20 archive, 0x10 directory),
+    /// stream flags, first cluster and data length (valid length is the same), stamped with the current time.
+    fn exfat_write_set(&mut self, lba: u64, offset: usize, name: &[u8], attributes: u16, flags: u8, first_cluster: u32, length: u64) -> Result<(), Error> {
+        let entries = 2 + name.len().div_ceil(15);
         let (date, time) = self.time.dos();
         let stamp = (u32::from(date) << 16) | u32::from(time);
         let mut sector = [0u8; SECTOR];
@@ -275,14 +284,17 @@ impl<D: Device> Fs<D> {
         set.fill(0);
         set[0] = 0x85;
         set[1] = (entries - 1) as u8;
-        set[4..6].copy_from_slice(&0x20u16.to_le_bytes()); // archive
+        set[4..6].copy_from_slice(&attributes.to_le_bytes());
         for field in [8usize, 12, 16] {
             set[field..field + 4].copy_from_slice(&stamp.to_le_bytes());
         }
         set[32] = 0xc0;
-        set[33] = ALLOCATION_POSSIBLE | NO_FAT_CHAIN;
+        set[33] = flags;
         set[35] = name.len() as u8;
         set[36..38].copy_from_slice(&name::exfat_hash(name).to_le_bytes());
+        set[40..48].copy_from_slice(&length.to_le_bytes());
+        set[52..56].copy_from_slice(&first_cluster.to_le_bytes());
+        set[56..64].copy_from_slice(&length.to_le_bytes());
         for (index, chunk) in name.chunks(15).enumerate() {
             let at = 64 + index * 32;
             set[at] = 0xc1;
@@ -290,11 +302,49 @@ impl<D: Device> Fs<D> {
                 set[at + 2 + position * 2..at + 4 + position * 2].copy_from_slice(&u16::from(byte).to_le_bytes());
             }
         }
-        // Size 0 and no cluster until the first length is set (with it, `set_length` points the entry at the run).
         let checksum = set_checksum(set);
         set[2..4].copy_from_slice(&checksum.to_le_bytes());
-        self.device.write(lba, &sector)?;
-        Ok(Stream { first_cluster: start, clusters: count, capacity: u64::from(count) * cluster_bytes, entry_lba: lba, entry_offset: offset, entries })
+        self.device.write(lba, &sector)
+    }
+
+    /// A new directory: one zeroed cluster with its own end-of-chain mark, claimed in the bitmap, and only then the
+    /// entry set that makes it visible (a cut before that leaks a cluster, which `fsck.exfat` repairs).
+    pub(crate) fn exfat_mkdir(&mut self, name: &[u8]) -> Result<(), Error> {
+        name::validate(name)?;
+        if self.entry(name)?.is_some() {
+            return Err(Error::Exists);
+        }
+        let (cluster, found) = self.exfat_find_run(1)?;
+        if found == 0 {
+            return Err(Error::NoSpace);
+        }
+        self.bitmap_mark(cluster, 1, true)?;
+        let prepared = self.zero_cluster(cluster).and_then(|_| self.fat_set_range(cluster, 1, |_| 0xffff_ffff));
+        let placed = prepared.and_then(|_| self.exfat_free_entries(2 + name.len().div_ceil(15)));
+        let (lba, offset) = match placed {
+            Ok(place) => place,
+            Err(error) => {
+                let _ = self.bitmap_mark(cluster, 1, false);
+                return Err(error);
+            }
+        };
+        let bytes = self.cluster_bytes();
+        self.exfat_write_set(lba, offset, name, 0x10, ALLOCATION_POSSIBLE, cluster, bytes)
+    }
+
+    /// The current (non-root, FAT-chained) directory got another cluster: its own entry records the size, so add it.
+    pub(crate) fn exfat_dir_grew(&mut self) -> Result<(), Error> {
+        let Some((lba, offset, entries)) = self.dir_set else { return Ok(()) };
+        let bytes = self.cluster_bytes();
+        let mut sector = [0u8; SECTOR];
+        self.device.read(lba, &mut sector)?;
+        let set = &mut sector[offset..offset + entries * 32];
+        let length = le64(set, 56) + bytes;
+        set[40..48].copy_from_slice(&length.to_le_bytes());
+        set[56..64].copy_from_slice(&length.to_le_bytes());
+        let checksum = set_checksum(set);
+        set[2..4].copy_from_slice(&checksum.to_le_bytes());
+        self.device.write(lba, &sector)
     }
 
     /// Room for an entry set of `entries` entries in one sector of the root directory (growing it if full).
