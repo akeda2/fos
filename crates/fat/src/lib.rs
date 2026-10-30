@@ -327,6 +327,38 @@ impl<D: Device> Fs<D> {
         Ok(true)
     }
 
+    /// Renames `from` to `to` inside the current directory (exFAT only). False when `to` is already taken.
+    pub fn rename(&mut self, from: &[u8], to: &[u8]) -> Result<bool, Error> {
+        if self.kind != Kind::ExFat {
+            return Err(Error::Unsupported);
+        }
+        self.exfat_rename(from, to)
+    }
+
+    /// Moves `name` of the current directory into the current directory of `into` (the same exFAT volume, mounted
+    /// again): the new entry set is written first, then the old one deleted, so a power cut leaves two names on one
+    /// chain (`fsck.exfat` repairs it) and never loses the file. False when the name is taken in `into`.
+    pub fn move_to(&mut self, name: &[u8], into: &mut Fs<D>, new_name: &[u8]) -> Result<bool, Error> {
+        if self.kind != Kind::ExFat || into.kind != Kind::ExFat {
+            return Err(Error::Unsupported);
+        }
+        let head = self.exfat_park(name)?.ok_or(Error::NotFound)?;
+        if !into.exfat_put(&head, new_name)? {
+            return Ok(false);
+        }
+        self.exfat_forget(name)
+    }
+
+    /// Whether `other` (a mount of the same volume) has the same current directory.
+    pub fn same_directory(&self, other: &Fs<D>) -> bool {
+        self.dir == other.dir
+    }
+
+    /// The device the volume sits on.
+    pub fn device(&self) -> &D {
+        &self.device
+    }
+
     /// Looks `name` up in the current directory (the root until `enter`).
     pub fn find(&mut self, name: &[u8]) -> Result<Option<File>, Error> {
         Ok(self.entry(name)?.map(|entry| entry.file()))

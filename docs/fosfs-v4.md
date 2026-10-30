@@ -114,7 +114,7 @@ says which one a save used.
 `ls`, `cp`/`copy`, `rm` and a new `mv` take bash-style patterns. **Built** in `crates/shell` (`glob.rs` the matcher,
 `files.rs` the expansion; `make test` for the matcher, `make test-wildcards` over v4 and exFAT). Differences from the
 plan below: `rm` asks by a `confirm` word at the end of the same line (`rm PATTERN confirm`, stateless) instead of as the
-very next command; `mv` renames the entry in place on one FOSFS v4 volume (`Volume::rename`, `Host::rename`: name and parent change in one directory-sector write, folders move with their contents; a folder cannot move into itself) and otherwise is copy, read back, remove (another volume, FAT/exFAT, v3, a name that exists); the escape
+very next command; `mv` renames the entry in place on one FOSFS v4 volume (`Volume::rename`, `Host::rename`: name and parent change in one directory-sector write, folders move with their contents; a folder cannot move into itself) and likewise renames or moves in place inside one exFAT volume (`Fs::rename`, `Fs::move_to`: the same number of name entries is one sector write; otherwise the new entry set is written before the old is deleted, so a cut leaves two names on one chain for `fsck.exfat`, never a lost file), and otherwise is copy, read back, remove (another volume, FAT32, v3, a name that exists); the escape
 backslash only counts inside a pattern (an argument with no `*?[` is passed on exactly as typed); a folder lists at most
 256 entries per pattern level and 2048 at the last one, names over 54 bytes are skipped with a message.
 
@@ -132,7 +132,7 @@ backslash only counts inside a pattern (an argument with no `*?[` is passed on e
 - **`ls PATTERN`** lists the matches (folders by their own name, not their contents, unlike `ls FOLDER`).
 - **`cp PATTERN DST`** needs DST to be a folder or a volume (`diskN`, `@LABEL/FOLDER`): several sources cannot share one
   file name. It makes DST's folders when they are missing on FOSFS v4 and exFAT, reports each file and carries on after a
-  failure, with a count at the end. `cp -r SRC DST` (built) copies a folder with everything in it: into DST when that is a volume or an existing folder, else as DST itself; a folder cannot be copied into itself; six levels deep. `mv` of a folder renames it in place on one FOSFS v4 volume; across volumes (or onto exFAT) it copies the tree file by file, removing each source file once its copy read back right and the emptied folders last, so a failure leaves the rest in the source. An existing destination folder is merged into.
+  failure, with a count at the end. `cp -r SRC DST` (built) copies a folder with everything in it: into DST when that is a volume or an existing folder, else as DST itself; a folder cannot be copied into itself; six levels deep. `mv` of a folder renames it in place on one FOSFS v4 or one exFAT volume; across volumes it copies the tree file by file, removing each source file once its copy read back right and the emptied folders last, so a failure leaves the rest in the source. An existing destination folder is merged into.
 - **`mv SRC DST`** (new): same volume and FOSFS v4 means renaming the directory entry (one sector write, crash-safe, no data
   copied; moving between folders changes the parent field); across volumes it is copy, then remove the source only after
   the copy read back right. The pattern and destination rules are those of `cp`. exFAT rename is a rewrite of the entry set

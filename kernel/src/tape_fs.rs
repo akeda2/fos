@@ -317,12 +317,14 @@ pub fn remove(reference: &[u8]) -> isize {
     }
 }
 
-/// Renames or moves `from` to `to` in place when both are on the same FOSFS v4 volume: `Ok(true)` done, `Ok(false)` not
-/// possible here (another volume, FAT, FOSFS v3, a name that exists: the caller copies instead), `Err` a code for a source
-/// that is missing.
+/// Renames or moves `from` to `to` in place when both are on the same FOSFS v4 volume or the same exFAT volume: `Ok(true)`
+/// done, `Ok(false)` not possible here (another volume, FAT32, FOSFS v3, a name that exists: the caller copies instead),
+/// `Err` a code for a source that is missing.
 pub fn rename(from: &[u8], to: &[u8]) -> Result<bool, isize> {
-    if resolve_fat(from).is_some() || resolve_fat(to).is_some() {
-        return Ok(false);
+    match (resolve_fat(from), resolve_fat(to)) {
+        (None, None) => {}
+        (Some((mut source, old)), Some((mut target, new))) => return rename_exfat(&mut source, old, &mut target, new),
+        _ => return Ok(false),
     }
     let ((source, old), (target, new)) = (resolve_file(from, false)?, resolve_file(to, false)?);
     if (source.disk, source.base) != (target.disk, target.base) || source.version() != 4 {
@@ -336,6 +338,21 @@ pub fn rename(from: &[u8], to: &[u8]) -> Result<bool, isize> {
     match source.rename(old, new) {
         Ok(true) => Ok(true),
         Ok(false) => Err(FS_NOT_FOUND),
+        Err(_) => Ok(false),
+    }
+}
+
+/// `rename` inside one exFAT volume: a new name in the same folder, or a move to another folder of it.
+fn rename_exfat(source: &mut crate::fatvol::Fs, old: &[u8], target: &mut crate::fatvol::Fs, new: &[u8]) -> Result<bool, isize> {
+    let (a, b) = (source.device(), target.device());
+    if source.kind() != fat::Kind::ExFat || target.kind() != fat::Kind::ExFat || (a.disk, a.base) != (b.disk, b.base) {
+        return Ok(false);
+    }
+    crate::fatvol::stamp(target);
+    let outcome = if source.same_directory(target) { source.rename(old, new) } else { source.move_to(old, target, new) };
+    match outcome {
+        Ok(done) => Ok(done),
+        Err(fat::Error::NotFound) => Err(FS_NOT_FOUND),
         Err(_) => Ok(false),
     }
 }

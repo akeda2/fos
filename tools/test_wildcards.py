@@ -107,6 +107,20 @@ def scenario(run):
     fsck = run("fsck")
     check("directory consistent" in fsck, "fsck is happy after the moves", fsck[-300:])
 
+    # exFAT: a rename or move inside one volume is done in place, not copied (same and different name-entry count)
+    out = run("mv disk2/Other.bin disk2/other-renamed.bin")
+    check("renamed in place" in out and "other-renamed.bin" in run("ls disk2") and "Other.bin" not in run("ls disk2"), "mv renames a file on exFAT in place", out)
+    out = run("mv disk2/other-renamed.bin disk2/o.bin")
+    check("renamed in place" in out and "o.bin" in run("ls disk2"), "also to a name with fewer name entries", out)
+    run("mkdir disk2/box")
+    out = run("mv disk2/o.bin disk2/box/o.bin")
+    check("renamed in place" in out and "no such file" in run("cat disk2/o.bin"), "mv moves a file into an exFAT folder in place", out)
+    out = run("mv disk2/tree disk2/box/tree")
+    check("renamed in place" in out and "bb" in run("cat disk2/box/tree/sub/b.txt"), "mv moves a whole exFAT folder in place", out)
+    check("tree" not in run("ls disk2").replace("box", ""), "the old folder name is gone", "")
+    out = run("mv disk2/box/o.bin disk2/box/tree/a.txt")
+    check("renamed in place" not in out, "moving onto an existing exFAT name falls back to the copy path", out)
+
 
 def main():
     with tempfile.TemporaryDirectory() as tmp:

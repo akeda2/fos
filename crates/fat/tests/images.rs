@@ -570,3 +570,36 @@ fn two_streams_at_once_on_exfat() {
     make_image(&path, 128, &["mkfs.exfat"]);
     two_writers(&path, &["fsck.exfat", "-n"]);
 }
+
+/// Renaming an exFAT file in place (same and different name-entry count) and moving it between folders keeps its data and
+/// leaves `fsck.exfat` quiet.
+#[test]
+fn exfat_rename_and_move() {
+    if !tool("mkfs.exfat") {
+        return;
+    }
+    let path = scratch("rename-exfat.img");
+    let _cleanup = Cleanup(path.clone());
+    make_image(&path, 64, &["mkfs.exfat"]);
+    let data = pattern(3, 70_000);
+    let mut fs = open(&path);
+    put(&mut fs, b"a.bin", &data);
+    put(&mut fs, b"taken.bin", b"x");
+    fs.mkdir(b"box").unwrap();
+    assert!(fs.rename(b"a.bin", b"b.bin").unwrap());
+    assert!(!fs.rename(b"b.bin", b"taken.bin").unwrap());
+    assert!(fs.rename(b"b.bin", b"a-much-longer-file-name.bin").unwrap());
+    assert!(fs.find(b"a.bin").unwrap().is_none() && fs.find(b"b.bin").unwrap().is_none());
+    let (mut here, mut inside) = (open(&path), open(&path));
+    inside.enter(b"box").unwrap();
+    assert!(here.move_to(b"a-much-longer-file-name.bin", &mut inside, b"moved.bin").unwrap());
+    assert!(!here.move_to(b"taken.bin", &mut inside, b"moved.bin").unwrap());
+    let mut check = open(&path);
+    assert!(check.find(b"a-much-longer-file-name.bin").unwrap().is_none());
+    check.enter(b"box").unwrap();
+    let file = check.find(b"moved.bin").unwrap().unwrap();
+    let mut back = vec![0u8; data.len()];
+    assert_eq!(check.read(&file, 0, &mut back).unwrap(), data.len());
+    assert!(back == data);
+    fsck(&path, &["fsck.exfat", "-n"]);
+}

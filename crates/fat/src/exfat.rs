@@ -300,26 +300,38 @@ impl<D: Device> Fs<D> {
     /// Writes a complete entry set for `name` at (`lba`, `offset`): attributes `attributes` (0x20 archive, 0x10 directory),
     /// stream flags, first cluster and data length (valid length is the same), stamped with the current time.
     fn exfat_write_set(&mut self, lba: u64, offset: usize, name: &[u8], attributes: u16, flags: u8, first_cluster: u32, length: u64) -> Result<(), Error> {
-        let entries = 2 + name.len().div_ceil(15);
         let (date, time) = self.time.dos();
         let stamp = (u32::from(date) << 16) | u32::from(time);
+        let mut head = [0u8; 64];
+        head[0] = 0x85;
+        head[4..6].copy_from_slice(&attributes.to_le_bytes());
+        for field in [8usize, 12, 16] {
+            head[field..field + 4].copy_from_slice(&stamp.to_le_bytes());
+        }
+        head[32] = 0xc0;
+        head[33] = flags;
+        head[40..48].copy_from_slice(&length.to_le_bytes());
+        head[52..56].copy_from_slice(&first_cluster.to_le_bytes());
+        head[56..64].copy_from_slice(&length.to_le_bytes());
+        self.exfat_put_set(lba, offset, &head, name)
+    }
+
+    /// Writes an entry set at (`lba`, `offset`) from `head` (the file entry and the stream extension, 64 bytes) and the
+    /// name entries for `name`: the entry count, name length, hash and checksum are filled in here. The set must lie
+    /// inside the sector (what `exfat_free_entries` and a set found by `exfat_walk` both guarantee for our names).
+    fn exfat_put_set(&mut self, lba: u64, offset: usize, head: &[u8; 64], name: &[u8]) -> Result<(), Error> {
+        let entries = 2 + name.len().div_ceil(15);
+        if offset + entries * 32 > SECTOR {
+            return Err(Error::Unsupported);
+        }
         let mut sector = [0u8; SECTOR];
         self.device.read(lba, &mut sector)?;
         let set = &mut sector[offset..offset + entries * 32];
         set.fill(0);
-        set[0] = 0x85;
+        set[..64].copy_from_slice(head);
         set[1] = (entries - 1) as u8;
-        set[4..6].copy_from_slice(&attributes.to_le_bytes());
-        for field in [8usize, 12, 16] {
-            set[field..field + 4].copy_from_slice(&stamp.to_le_bytes());
-        }
-        set[32] = 0xc0;
-        set[33] = flags;
         set[35] = name.len() as u8;
         set[36..38].copy_from_slice(&name::exfat_hash(name).to_le_bytes());
-        set[40..48].copy_from_slice(&length.to_le_bytes());
-        set[52..56].copy_from_slice(&first_cluster.to_le_bytes());
-        set[56..64].copy_from_slice(&length.to_le_bytes());
         for (index, chunk) in name.chunks(15).enumerate() {
             let at = 64 + index * 32;
             set[at] = 0xc1;
@@ -479,5 +491,65 @@ impl<D: Device> Fs<D> {
             }
         }
         self.mark_deleted(file.set_lba, file.set_offset, file.set_entries)
+    }
+
+    /// The file and stream-extension entries of a set (everything but the name), for moving it.
+    fn exfat_head(&mut self, entry: &Entry) -> Result<[u8; 64], Error> {
+        if entry.set_offset + entry.set_entries * 32 > SECTOR {
+            return Err(Error::Unsupported);
+        }
+        let mut sector = [0u8; SECTOR];
+        self.device.read(entry.set_lba, &mut sector)?;
+        let mut head = [0u8; 64];
+        head.copy_from_slice(&sector[entry.set_offset..entry.set_offset + 64]);
+        Ok(head)
+    }
+
+    /// Renames `from` to `to` in the current directory. The same number of name entries rewrites the set in one sector
+    /// write (a power cut leaves the old name or the new); otherwise the new set is written first and the old one
+    /// deleted after, and a cut between leaves both names on one chain, which `fsck.exfat` tidies up. False when `to`
+    /// is taken by another entry.
+    pub(crate) fn exfat_rename(&mut self, from: &[u8], to: &[u8]) -> Result<bool, Error> {
+        name::validate(to)?;
+        let old = self.entry(from)?.ok_or(Error::NotFound)?;
+        if self.entry(to)?.is_some_and(|other| (other.set_lba, other.set_offset) != (old.set_lba, old.set_offset)) {
+            return Ok(false);
+        }
+        let head = self.exfat_head(&old)?;
+        if 2 + to.len().div_ceil(15) == old.set_entries {
+            self.exfat_put_set(old.set_lba, old.set_offset, &head, to)?;
+        } else {
+            let (lba, offset) = self.exfat_free_entries(2 + to.len().div_ceil(15))?;
+            self.exfat_put_set(lba, offset, &head, to)?;
+            self.mark_deleted(old.set_lba, old.set_offset, old.set_entries)?;
+        }
+        Ok(true)
+    }
+
+    /// The entry set of `name` for `exfat_put`, which writes it into another directory.
+    pub(crate) fn exfat_park(&mut self, name: &[u8]) -> Result<Option<[u8; 64]>, Error> {
+        match self.entry(name)? {
+            Some(entry) => self.exfat_head(&entry).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Writes a parked entry set into the current directory as `name`; false if the name is taken.
+    pub(crate) fn exfat_put(&mut self, head: &[u8; 64], name: &[u8]) -> Result<bool, Error> {
+        name::validate(name)?;
+        if self.entry(name)?.is_some() {
+            return Ok(false);
+        }
+        let (lba, offset) = self.exfat_free_entries(2 + name.len().div_ceil(15))?;
+        self.exfat_put_set(lba, offset, head, name)?;
+        Ok(true)
+    }
+
+    /// Deletes the entry set of `name` but keeps its clusters (they now belong to the set `exfat_put` wrote).
+    pub(crate) fn exfat_forget(&mut self, name: &[u8]) -> Result<bool, Error> {
+        match self.entry(name)? {
+            Some(entry) => self.mark_deleted(entry.set_lba, entry.set_offset, entry.set_entries).map(|()| true),
+            None => Ok(false),
+        }
     }
 }
