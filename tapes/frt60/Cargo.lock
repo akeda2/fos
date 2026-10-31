@@ -43,6 +43,7 @@ dependencies = [
  "audio-screen",
  "dsp",
  "gfx",
+ "instrument-rt",
  "rt60",
  "tape-rt",
 ]
@@ -52,6 +53,16 @@ name = "gfx"
 version = "0.1.0"
 dependencies = [
  "dsp",
+]
+
+[[package]]
+name = "instrument-rt"
+version = "0.1.0"
+dependencies = [
+ "audio-sample",
+ "audio-screen",
+ "gfx",
+ "tape-rt",
 ]
 
 [[package]]

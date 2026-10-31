@@ -11,7 +11,7 @@ mod touch;
 
 pub use keys::{FIRST_KEY, KEYS, Keyboard, Rect, WHITE_KEYS, note_for_char};
 pub use output::{CHUNK, MAX_FRAME_BYTES, Output, SCOPE_LEN, pack, pack_wide};
-pub use touch::{TouchTarget, Touches, TypedKeys};
+pub use touch::{Pointer, TouchTarget, Touches, TypedKeys};
 
 use audio_screen::Screen;
 

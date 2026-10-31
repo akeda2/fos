@@ -374,7 +374,6 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let mut decoder = KeyDecoder::new();
     let mut touches = graphics.as_ref().map(|(layout, _)| Touches::new(layout.width, layout.height, screen_number));
     let mut message = Line::<64>::new();
-    let mut cursor = None::<(i32, i32)>;
     let mut next_animation = 0u64;
     let mut clipped = 0u32;
     loop {
@@ -411,10 +410,6 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             let mut target = PhonoTouch { layout, setup: &mut setup, save: &mut save_requested, action: &mut action };
             while let Some(event) = tape_rt::touch_event() {
                 let Some(extent) = tape_rt::touch_extent(event.panel) else { continue };
-                if event.is_mouse() && (event.screen < 0 || event.screen == screen_number as i32) {
-                    cursor = Some((event.x * layout.width / extent.0.max(1), event.y * layout.height / extent.1.max(1)));
-                    changed = true;
-                }
                 changed |= touches.handle(&event, extent, &mut target);
             }
         }
@@ -467,7 +462,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                 draw_header(&mut canvas, layout, &setup, &output, width, status.as_str(), message.as_str());
                 draw_plot(&mut canvas, layout, &setup, &eq);
                 draw_controls(&mut canvas, layout, &setup, &archive);
-                if let Some((x, y)) = cursor {
+                if let Some((x, y)) = touches.as_ref().and_then(|touches| touches.pointer()) {
                     canvas.cursor(x, y, layout.scale as u32 + 1, INK, BACKGROUND);
                 }
             }

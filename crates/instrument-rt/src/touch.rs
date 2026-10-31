@@ -15,28 +15,64 @@ pub trait TouchTarget {
 
 const FINGERS: usize = 8;
 
-/// Up to eight fingers, each holding at most one widget from the moment it lands until it lifts.
-pub struct Touches<G: Copy> {
-    grabs: [Option<(i32, G)>; FINGERS],
+/// Maps a panel's coordinates onto a tape screen's pixels and follows the mouse or touchpad (the kernel already applies
+/// the `mouse-speed` setting and the acceleration curve), so every tape draws its cursor the same way.
+#[derive(Clone, Copy)]
+pub struct Pointer {
     width: i32,
     height: i32,
     screen: u32,
+    at: Option<(i32, i32)>,
+}
+
+impl Pointer {
+    /// For a tape picture of `width` x `height` pixels on tape screen `screen`.
+    pub fn new(width: i32, height: i32, screen: u32) -> Self {
+        Pointer { width, height, screen, at: None }
+    }
+
+    /// The event's position in the tape's pixels (panel measuring `extent`); `None` for a panel on another screen.
+    pub fn locate(&self, event: &TouchEvent, extent: (i32, i32)) -> Option<(i32, i32)> {
+        if event.screen >= 0 && event.screen != self.screen as i32 {
+            return None;
+        }
+        Some((event.x * self.width / extent.0.max(1), event.y * self.height / extent.1.max(1)))
+    }
+
+    /// Notes where the mouse is when `event` is a mouse event on this screen; true if the cursor moved.
+    pub fn track(&mut self, event: &TouchEvent, extent: (i32, i32)) -> bool {
+        match self.locate(event, extent) {
+            Some(at) if event.is_mouse() && self.at != Some(at) => {
+                self.at = Some(at);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Where the mouse last was; `None` until one has moved on this screen.
+    pub fn at(&self) -> Option<(i32, i32)> {
+        self.at
+    }
+}
+
+/// Up to eight fingers, each holding at most one widget from the moment it lands until it lifts.
+pub struct Touches<G: Copy> {
+    grabs: [Option<(i32, G)>; FINGERS],
+    pointer: Pointer,
 }
 
 impl<G: Copy> Touches<G> {
     /// For a tape picture of `width` x `height` pixels on tape screen `screen`.
     pub fn new(width: i32, height: i32, screen: u32) -> Self {
-        Touches { grabs: [None; FINGERS], width, height, screen }
+        Touches { grabs: [None; FINGERS], pointer: Pointer::new(width, height, screen) }
     }
 
     /// Handles one finger event whose panel measures `extent` (the panel's own units). False when it was ignored: a panel
     /// on another screen. True when the instrument may look different afterwards.
     pub fn handle<T: TouchTarget<Grab = G>>(&mut self, event: &TouchEvent, extent: (i32, i32), target: &mut T) -> bool {
-        if event.screen >= 0 && event.screen != self.screen as i32 {
-            return false;
-        }
-        let x = event.x * self.width / extent.0.max(1);
-        let y = event.y * self.height / extent.1.max(1);
+        let Some((x, y)) = self.pointer.locate(event, extent) else { return false };
+        self.pointer.track(event, extent);
         let held = self.grabs.iter().position(|g| g.is_some_and(|(id, _)| id == event.id));
         match (event.down, held) {
             (true, None) => {
@@ -60,6 +96,11 @@ impl<G: Copy> Touches<G> {
             (false, None) => {}
         }
         true
+    }
+
+    /// Where the mouse (or touchpad) last was, in the tape's pixels; `None` until one has moved on this screen.
+    pub fn pointer(&self) -> Option<(i32, i32)> {
+        self.pointer.at()
     }
 
     /// Drains the touch queue into `target`; true when anything on this screen happened.

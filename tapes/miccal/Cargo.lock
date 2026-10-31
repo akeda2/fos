@@ -44,6 +44,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "instrument-rt"
+version = "0.1.0"
+dependencies = [
+ "audio-sample",
+ "audio-screen",
+ "gfx",
+ "tape-rt",
+]
+
+[[package]]
 name = "ltas"
 version = "0.1.0"
 dependencies = [
@@ -64,6 +74,7 @@ dependencies = [
  "audio-screen",
  "dsp",
  "gfx",
+ "instrument-rt",
  "ltas",
  "miccal",
  "noise",

@@ -9,6 +9,7 @@ mod view;
 use core::fmt::Write;
 use audio_screen::{Input, Playback, Screen, poll_keys};
 use gfx::theme::theme;
+use instrument_rt::Pointer;
 use ltas::{Analyzer, Config, Mode};
 use miccal::{Header, Inputs, MAX_POINTS, Method, Outcome};
 use noise::{Generator, Kind as NoiseKind};
@@ -645,7 +646,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let (levels, block, samples) = unsafe { (&mut *(&raw mut LEVELS), &mut *(&raw mut BLOCK_BYTES), &mut *(&raw mut SAMPLES)) };
     let mut decoder = KeyDecoder::new();
     let mut fingers = Fingers { held: [None; 8] };
-    let mut cursor = None::<(i32, i32)>;
+    let mut pointer = Pointer::new(width as i32, height as i32, started.screen as u32);
     let mut quit = false;
     while !quit {
         let mut actions = [None::<Action>; 8];
@@ -682,12 +683,8 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         }
         while let Some(event) = tape_rt::touch_event() {
             let Some(extent) = tape_rt::touch_extent(event.panel) else { continue };
-            if event.screen >= 0 && event.screen != started.screen as i32 {
-                continue;
-            }
-            let (x, y) = (event.x * width as i32 / extent.0.max(1), event.y * height as i32 / extent.1.max(1));
-            if event.is_mouse() {
-                cursor = Some((x, y));
+            let Some((x, y)) = pointer.locate(&event, extent) else { continue };
+            if pointer.track(&event, extent) {
                 screen.mark_dirty();
             }
             if fingers.pressed(&event) {
@@ -728,7 +725,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             worked |= playback.pump(api, &app.input, |mono| generator.fill(mono));
         }
         if screen.due() {
-            draw(&mut screen, &layout, &app, cursor);
+            draw(&mut screen, &layout, &app, pointer.at());
         }
         if !worked {
             tape_rt::idle();

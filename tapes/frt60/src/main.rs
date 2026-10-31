@@ -12,6 +12,7 @@ use audio_screen::{Input, Playback, Screen, poll_keys};
 use dsp::fft::Plan;
 use dsp::math::{exp64, log10};
 use gfx::theme::theme;
+use instrument_rt::Pointer;
 use rt60::files::{Header, wav_header, write_csv};
 use rt60::{Band, Capture, MAX_BANDS, Report, Sweep, Waterfall, direct_sound, measure, waterfall_span};
 use tape_rt::{Key, KeyDecoder, Line, TapeApi, TouchEvent, alloc_zeroed, arg_value as value, parse_f32, println, save};
@@ -814,7 +815,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let (block, samples) = unsafe { (&mut *(&raw mut BLOCK_BYTES), &mut *(&raw mut SAMPLES)) };
     let mut decoder = KeyDecoder::new();
     let mut fingers = Fingers { held: [None; 8] };
-    let mut cursor = None::<(i32, i32)>;
+    let mut pointer = Pointer::new(width as i32, height as i32, started.screen as u32);
     let mut quit = false;
     while !quit {
         let mut actions = [None::<Action>; 8];
@@ -851,12 +852,8 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         }
         while let Some(event) = tape_rt::touch_event() {
             let Some(extent) = tape_rt::touch_extent(event.panel) else { continue };
-            if event.screen >= 0 && event.screen != started.screen as i32 {
-                continue;
-            }
-            let (x, y) = (event.x * width as i32 / extent.0.max(1), event.y * height as i32 / extent.1.max(1));
-            if event.is_mouse() {
-                cursor = Some((x, y));
+            let Some((x, y)) = pointer.locate(&event, extent) else { continue };
+            if pointer.track(&event, extent) {
                 screen.mark_dirty();
             }
             if fingers.pressed(&event) {
@@ -937,7 +934,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             app.ensure_curve();
         }
         if screen.due() {
-            draw(&mut screen, &layout, &app, cursor, false);
+            draw(&mut screen, &layout, &app, pointer.at(), false);
         }
         if !worked {
             tape_rt::idle();

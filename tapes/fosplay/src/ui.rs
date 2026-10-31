@@ -576,7 +576,7 @@ impl Ui {
         }
         let scroll = self.scroll[slot(page)];
         {
-            let (layout, view, seek) = (&self.layouts[slot(page)], &self.view, self.seek);
+            let (layout, view, seek, pointer) = (&self.layouts[slot(page)], &self.view, self.seek, self.touches.pointer());
             let mut canvas = self.screen.frame();
             canvas.clear(BACKGROUND);
             draw_header(&mut canvas, layout, view);
@@ -600,6 +600,9 @@ impl Ui {
                     button(&mut canvas, layout, Hit::Done, "Done", false, true);
                     draw_settings(&mut canvas, layout, view);
                 }
+            }
+            if let Some((x, y)) = pointer {
+                canvas.cursor(x, y, layout.scale as u32 + 1, INK, BACKGROUND);
             }
         }
         blit_banded(&self.screen, || {});
