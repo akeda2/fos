@@ -1416,6 +1416,30 @@ pub(crate) fn help_extra() {
     crate::println!("Remote: term net, and tools/term_net.py, devloop.py, foscopy.py from a PC.");
 }
 
+/// Usage and summary of the x86 commands `execute` handles itself, for `help NAME`.
+const BUILTIN_HELP: &[(&str, &str, &str)] = &[
+    ("help", "help [NAME]", "lists the commands; with a name: its usage, or a tape's help screen."),
+    ("tape", "tape load NAME|net | run [ARGS] | save NAME | status", "loads a tape into memory, runs it, saves it, or shows what is loaded."),
+    ("install", "install diskN [LABEL] [bare] [force]   (then: install diskN confirm)", "copies the boot disk (ESP, kernel, files, folders) onto another disk."),
+    ("bootcode", "bootcode [diskN] | bootcode update [diskN]   (then: ... confirm)", "shows or replaces the BIOS boot code and the UEFI loader from files on disk1."),
+    ("videomodes", "videomodes", "the screen modes the BIOS video BIOS offered, and what the monitor told."),
+    ("hda", "hda", "describes the Intel HD Audio controllers and their codecs."),
+    ("gpu", "gpu", "reads (never writes) what the firmware left running on an Intel display engine."),
+    ("midi", "midi | midi monitor | midi send [#N] HEX HEX [HEX]", "USB-MIDI devices: list them, watch what they send, send a message."),
+    ("touch", "touch | touch monitor", "USB touch panels: list them, or watch finger events."),
+    ("power", "power [N] | power hwp [performance|balanced|power]", "how much the CPU slept in hlt; HWP frequency scaling."),
+    ("cpufreq", "cpufreq", "temperature, speed and power now; the same as plain `power`."),
+    ("temp", "temp", "temperature, speed and power now; the same as plain `power`."),
+];
+
+/// `help NAME` for the commands in `BUILTIN_HELP`; false for any other name.
+pub(crate) fn builtin_help(topic: &str) -> bool {
+    let Some((_, usage, summary)) = BUILTIN_HELP.iter().find(|(name, _, _)| *name == topic) else { return false };
+    crate::println!("{usage}");
+    crate::println!("  {summary}");
+    true
+}
+
 fn parse_number(word: &str) -> Option<u64> {
     match word.strip_prefix("0x") {
         Some(hex) => u64::from_str_radix(hex, 16).ok(),

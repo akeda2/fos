@@ -107,6 +107,10 @@ pub trait Host {
     fn run_tape(&mut self, line: &str);
     /// Extra `help` lines for commands a port implements outside the tables (printed after the table's names).
     fn help_extra(&mut self) {}
+    /// Prints the usage of a command the port implements outside the tables; false if it is none.
+    fn builtin_help(&mut self, _topic: &str) -> bool {
+        false
+    }
     /// Prints the help screen of the tape file `reference` (without running it); false if it has none.
     fn tape_help(&mut self, _reference: &str) -> bool {
         false
@@ -230,7 +234,7 @@ fn help(host: &mut dyn Host, tables: &[&[Command]], topic: &str) {
     } else if let Some(command) = find(tables, topic) {
         sayln!(host, "{}", command.usage);
         sayln!(host, "  {}", command.summary);
-    } else if !host.tape_help(topic) {
+    } else if !host.builtin_help(topic) && !host.tape_help(topic) {
         sayln!(host, "help: {topic} has no help screen (and is no command).");
     }
 }

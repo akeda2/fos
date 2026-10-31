@@ -131,6 +131,16 @@ impl Host for KernelHost {
         crate::term::help_extra();
     }
 
+    fn builtin_help(&mut self, topic: &str) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        return crate::term::builtin_help(topic);
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = topic;
+            false
+        }
+    }
+
     fn tape_help(&mut self, reference: &str) -> bool {
         const SIZE: usize = 512 * 1024;
         let mut shown = false;

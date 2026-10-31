@@ -151,6 +151,9 @@ fn exfat_label(number: usize, name: Option<&str>) {
         };
     };
     let wanted = if name == "-" { "" } else { name };
+    if wanted.starts_with('@') {
+        return crate::println!("label: write the label without the leading @ (`label disk{number} {}`); @ only names it.", &wanted[1..]);
+    }
     if !wanted.is_empty() {
         let other = crate::storage::volume_labelled(wanted.as_bytes()).map(|(other, _)| other).or_else(|| crate::tape_fs::fat_labelled(wanted.as_bytes()).map(|(other, _)| other));
         if let Some(other) = other.filter(|&other| other != number) {

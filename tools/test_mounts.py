@@ -66,6 +66,10 @@ def scenario(run):
     check("deep" in run("cat rec/sub/b.txt"), "and the new one does", "")
     bad, long = run("label disk3 a/b"), run("label disk3 waytoolonglabel")
     check("up to 11 printable" in bad and "up to 11 printable" in long and "@Config1 (exFAT)" in run("label disk3"), "a bad or too long exFAT label is refused", bad + long)
+    at = run("label disk3 @oops")
+    check("without the leading @" in at and "@Config1 (exFAT)" in run("label disk3"), "a leading @ in an exFAT label is refused", at)
+    helps = {n: run("help " + n) for n in ("install", "bootcode", "videomodes", "nic", "usb", "tape", "midi", "touch", "power", "hda", "gpu", "label", "help")}
+    check(all("has no help screen" not in h and "Usage" not in h[:0] for h in helps.values()), "help NAME works for the x86-only commands too", str(helps))
     check("label cleared" in run("label disk3 -") and "no label, exFAT" in run("label disk3"), "label - clears it", "")
     check("is now @stick" in run("label disk3 stick"), "and one can be set again", "")
 
