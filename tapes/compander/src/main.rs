@@ -9,7 +9,7 @@ use compander::Mode;
 use core::fmt::Write;
 use compander::tapeeq::{Speed, Standard};
 use dsp::math::log10;
-use compander_tape::{BUTTONS, EqState, GLYPH_H, Hit, Kind, Layout, Source, Style, TONE_MAX_DB, TONE_MIN_DB, Tone, Unit, eq_state, eq_text, label, lit, mode_from_name, mode_name, press};
+use compander_tape::{BUTTONS, EqState, GLYPH_H, Hit, Kind, Layout, Source, Style, TONE_MAX_DB, TONE_MIN_DB, Tone, Unit, eq_state, eq_text, label, lit, mode_from_name, mode_name, press, settings};
 use gfx::meter::{Scale, draw_bar, draw_bipolar, draw_scale};
 use gfx::theme::theme;
 use gfx::{Canvas, text_width};
@@ -22,7 +22,7 @@ tape_rt::tape_help!(
     [machine=nab|iec|120|70] [tape=nab|iec|120|70] [trim=DB]
     [tone=off|100|1k|10k|pink] [level=DB] [view=spectrum] [style=bars|plot]
     [source=in|out] [device=N|loopN] [outdev=N|loopN] [screen=N] [rate=HZ]
-    [latency=MS] [in=N] [out=N] [theme=dark|classic|light]
+    [latency=MS] [in=N] [out=N] [theme=dark|classic|light] [@NAME]
 A stereo dbx noise-reduction compander as a stand-alone box: whatever comes in
 on the audio device is encoded (2:1 compression, for recording to tape) or
 decoded (1:2 expansion, for playback) and goes out again. Both types are one
@@ -45,9 +45,11 @@ third octaves: play pink noise through a machine and a flat machine reads flat.
 The plot is every FFT bin, unsmoothed, for overtones and hum. Hold freezes it.
 latency=MS is the audio kept queued (10-200, default 40); in=N / out=N choose
 the left channel of the pair (1-based).
+The w key (Save button) writes the settings to compander.cfg, or to the @NAME
+file given; the next run starts from them (command-line words win).
 Keys: b Bypass, e Encode, d Decode, 1 Type I, 2 Type II, t other type, s speed,
 m machine, r tape standard, o tone, Left/Right tone level, Up/Down trim,
-f spectrum, p bars/plot, i source, h hold; Escape quits. The corner
+f spectrum, p bars/plot, i source, h hold, w save; Escape quits. The corner
 frequencies are from published sources and provisional (docs/compander.md).
 "#
 );
@@ -216,7 +218,7 @@ fn draw_strip(canvas: &mut Canvas, layout: &Layout, unit: &Unit, index: usize) {
     canvas.text_centered(strip.x + strip.w / 2, gain_y + 12 * scale + 28, text.as_str(), theme().text);
 }
 
-fn draw(screen: &mut Screen, layout: &Layout, unit: &Unit, analyzers: &mut Analyzers, cursor: Option<(i32, i32)>) {
+fn draw(screen: &mut Screen, layout: &Layout, unit: &Unit, analyzers: &mut Analyzers, cursor: Option<(i32, i32)>, message: &str) {
     let mut canvas = screen.frame();
     canvas.clear(theme().background);
     let header = layout.header;
@@ -227,6 +229,10 @@ fn draw(screen: &mut Screen, layout: &Layout, unit: &Unit, analyzers: &mut Analy
     let tint = if unit.mode() == Mode::Bypass { theme().dim } else { theme().green };
     let width = text_width(status.as_str()) as i32 * layout.scale;
     canvas.text_scaled(header.w - layout.margin - width, header.y + (header.h - GLYPH_H * layout.scale) / 2, status.as_str(), layout.scale as u32, tint);
+    if !message.is_empty() {
+        let width = text_width(message) as i32 * layout.scale;
+        canvas.text_scaled((header.w - width) / 2, header.y + (header.h - GLYPH_H * layout.scale) / 2, message, layout.scale as u32, theme().green);
+    }
     let eq = layout.eq;
     let (eq_colour, eq_fill) = match eq_state(unit) {
         EqState::Active => (theme().green, theme().grid_major),
@@ -258,7 +264,7 @@ fn draw(screen: &mut Screen, layout: &Layout, unit: &Unit, analyzers: &mut Analy
         let on = lit(unit, hit);
         canvas.fill_rect(rect.x, rect.y, rect.w as u32, rect.h as u32, if on { theme().grid_major } else { theme().grid });
         canvas.rect(rect.x, rect.y, rect.w as u32, rect.h as u32, if on { theme().green } else { theme().dim });
-        center(&mut canvas, *rect, label(unit, hit).as_str(), layout.scale, theme().text);
+        center(&mut canvas, *rect, label(unit, hit).as_str(), (layout.scale / 2).max(1), theme().text);
     }
     if let Some((x, y)) = cursor {
         canvas.cursor(x, y, layout.scale as u32 + 1, theme().text, theme().background);
@@ -269,6 +275,7 @@ struct DbxTouch<'a> {
     layout: &'a Layout,
     unit: &'a mut Unit,
     quit: &'a mut bool,
+    save: &'a mut bool,
 }
 
 impl TouchTarget for DbxTouch<'_> {
@@ -278,6 +285,9 @@ impl TouchTarget for DbxTouch<'_> {
         let hit = self.layout.hit(x, y)?;
         if !press(self.unit, hit) {
             *self.quit = true;
+        }
+        if hit == Hit::Save {
+            *self.save = true;
         }
         Some(hit)
     }
@@ -298,64 +308,69 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             return println!("compander: {reason}.");
         }
     };
-    if let Some(name) = tape_rt::arg_value(start.arguments, "theme") {
+    let config = match tape_rt::config::Config::load(api, "compander", start.arguments) {
+        Ok(config) => config,
+        Err(reason) => return println!("compander: {reason}."),
+    };
+    let arguments = config.text();
+    if let Some(name) = tape_rt::arg_value(arguments, "theme") {
         if !gfx::theme::set_by_name(name) {
             return println!("compander: theme= takes dark, classic or light.");
         }
     }
-    let kind = match tape_rt::arg_value(start.arguments, "type") {
+    let kind = match tape_rt::arg_value(arguments, "type") {
         None => Kind::II,
         Some(name) => match Kind::from_name(name) {
             Some(kind) => kind,
             None => return println!("compander: type= takes 1 or 2."),
         },
     };
-    let mode = match tape_rt::arg_value(start.arguments, "mode") {
+    let mode = match tape_rt::arg_value(arguments, "mode") {
         None => Mode::Bypass,
         Some(name) => match mode_from_name(name) {
             Some(mode) => mode,
             None => return println!("compander: mode= takes bypass, encode or decode."),
         },
     };
-    let speed = match tape_rt::arg_value(start.arguments, "speed") {
+    let speed = match tape_rt::arg_value(arguments, "speed") {
         None => Speed::Ips15,
         Some(name) => match Speed::from_name(name) {
             Some(speed) => speed,
             None => return println!("compander: speed= takes 1.875 (cassette), 3.75, 7.5, 15 or 30."),
         },
     };
-    let standard = |key: &str| match tape_rt::arg_value(start.arguments, key) {
+    let standard = |key: &str| match tape_rt::arg_value(arguments, key) {
         None => Ok(Standard::Nab),
         Some(name) => Standard::from_name(name).ok_or(()),
     };
     let (Ok(machine), Ok(tape)) = (standard("machine"), standard("tape")) else {
         return println!("compander: machine= and tape= take nab, iec (ccir), 120 or 70.");
     };
-    let tone = match tape_rt::arg_value(start.arguments, "tone") {
+    let tone = match tape_rt::arg_value(arguments, "tone") {
         None => Tone::Off,
         Some(name) => match Tone::from_name(name) {
             Some(tone) => tone,
             None => return println!("compander: tone= takes off, 100, 1k, 10k or pink."),
         },
     };
-    let source = match tape_rt::arg_value(start.arguments, "source") {
+    let source = match tape_rt::arg_value(arguments, "source") {
         None | Some("in") => Source::Input,
         Some("out") => Source::Output,
         Some(_) => return println!("compander: source= takes in or out."),
     };
-    let view = match tape_rt::arg_value(start.arguments, "view") {
+    let view = match tape_rt::arg_value(arguments, "view") {
         None | Some("meters") => false,
         Some("spectrum") => true,
         Some(_) => return println!("compander: view= takes meters or spectrum."),
     };
-    let style = match tape_rt::arg_value(start.arguments, "style") {
+    let style = match tape_rt::arg_value(arguments, "style") {
         None | Some("bars") => Style::Bands,
         Some("plot") => Style::Fine,
         Some(_) => return println!("compander: style= takes bars or plot."),
     };
-    let trim = tape_rt::arg_value(start.arguments, "trim").and_then(tape_rt::parse_f32);
-    let tone_db = tape_rt::arg_value(start.arguments, "level").and_then(tape_rt::parse_f32);
-    let mut output = match Output::start_duplex(api, start.arguments) {
+    let trim = tape_rt::arg_value(arguments, "trim").and_then(tape_rt::parse_f32);
+    let tone_db = tape_rt::arg_value(arguments, "level").and_then(tape_rt::parse_f32);
+    let mut output = match Output::start_duplex(api, arguments) {
         Ok(output) => output,
         Err(reason) => return println!("compander: {}.", reason.as_str()),
     };
@@ -394,6 +409,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let mut decoder = KeyDecoder::new();
     let mut touches = Touches::new(layout.width, layout.height, start.screen);
     let mut quit = false;
+    let mut save_requested = false;
+    let mut message = Line::<64>::new();
+    let mut message_until = 0u64;
     let mut next_animation = 0u64;
     while !quit {
         let mut changed = false;
@@ -410,6 +428,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                 Key::Char(b'i') => Hit::Source,
                 Key::Char(b'p') => Hit::Style,
                 Key::Char(b'h') => Hit::Hold,
+                Key::Char(b'w') => Hit::Save,
                 Key::Char(b's') => Hit::Speed,
                 Key::Char(b'm') => Hit::Machine,
                 Key::Char(b'r') => Hit::Tape,
@@ -420,12 +439,31 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                 _ => return,
             };
             press(&mut unit, hit);
+            save_requested |= hit == Hit::Save;
             changed = true;
         });
         if !keep_going {
             break;
         }
-        changed |= touches.poll(&mut DbxTouch { layout: &layout, unit: &mut unit, quit: &mut quit });
+        changed |= touches.poll(&mut DbxTouch { layout: &layout, unit: &mut unit, quit: &mut quit, save: &mut save_requested });
+
+        if save_requested {
+            save_requested = false;
+            message.clear();
+            match config.save(api, settings(&unit).as_str()) {
+                Ok(name) => {
+                    let _ = write!(message, "saved {name}");
+                }
+                Err(reason) => {
+                    let _ = write!(message, "save: {reason}");
+                }
+            }
+            message_until = tape_rt::micros() + 4_000_000;
+        }
+        if message_until != 0 && tape_rt::micros() >= message_until {
+            message_until = 0;
+            message.clear();
+        }
 
         let now_watching = (unit.spectrum(), unit.source(), unit.style());
         if now_watching != watched {
@@ -446,7 +484,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             screen.mark_dirty();
         }
         if screen.due() {
-            draw(&mut screen, &layout, &unit, &mut analyzers, touches.pointer());
+            draw(&mut screen, &layout, &unit, &mut analyzers, touches.pointer(), message.as_str());
             blit_banded(&screen, || {
                 output.pump_duplex(|frames| run(&mut unit, &mut analyzers, frames));
             });

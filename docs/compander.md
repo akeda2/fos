@@ -53,7 +53,8 @@ exponential average, 20 Hz-20 kHz, left green and right amber; bands below the F
 return) or the output (`i`, `source=in|out`). Play pink noise through the machine and look at the return: a flat reading is a flat
 machine. The meters' detector level is RMS re 1.0 (a full-scale sine reads -3 dB there), so it differs by 3 dB from the tone scale.
 The spectrum has two styles (`p`, `style=bars|plot`): third-octave bars, or a line plot of every FFT bin (5.9 Hz, no smoothing between bins; log axis 20 Hz-20 kHz, 110 dB) for spotting overtones. Hold (`h`) freezes the display ("HELD").
-Keys: o, f, i, p, h, Left/Right, Up/Down, s, m, r.
+Save (`w`, the Save button) writes the settings (type, mode, speed, machine, tape, tone, level, trim, source, view, style) to `compander.cfg` (or the `@NAME` file the tape was started with), and the next run starts from it; command-line words win (`tape-rt::config`). The buttons are two rows of ten.
+Keys: o, f, i, p, h, w, Left/Right, Up/Down, s, m, r.
 
 ## Not done
 

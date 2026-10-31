@@ -52,11 +52,25 @@ def main():
                 guest.process.stdin.flush()
                 guest.pump(0.3)
             guest.pump(1)
+            guest.process.stdin.write(b"w")
+            guest.process.stdin.flush()
+            guest.pump(1)
             guest.process.stdin.write(b"\x1b")
             guest.process.stdin.flush()
             guest.wait_for("compander: stopped", 10, mark)
             text = guest.text()[mark:]
             check("overrun" not in text.lower(), "no errors while it ran", text[-500:])
+            mark = guest.send("cat compander.cfg")
+            guest.wait_for("fos> ", 10, mark)
+            text = guest.text()[mark:]
+            check("type=2" in text and "mode=encode" in text and "speed=30" in text and "view=meters" in text and "style=bars" in text, "Save wrote compander.cfg with the settings", text[-300:])
+            mark = guest.send("run compander")
+            guest.wait_for("Escape quits.", 30, mark)
+            text = guest.text()[mark:]
+            check("Type II" in text, "the next run starts from compander.cfg", text[-300:])
+            guest.process.stdin.write(b"\x1b")
+            guest.process.stdin.flush()
+            guest.wait_for("compander: stopped", 10, mark)
         finally:
             guest.stop()
     print("compander: all checks passed")

@@ -428,17 +428,18 @@ pub enum Hit {
     Style,
     /// Freeze the spectrum.
     Hold,
+    /// Write the settings to the configuration file.
+    Save,
     Quit,
 }
 
-pub const BUTTON_COLUMNS: usize = 6;
-pub const BUTTONS: [Hit; 18] = [
+pub const BUTTON_COLUMNS: usize = 10;
+pub const BUTTONS: [Hit; 19] = [
     Hit::Mode(Mode::Bypass),
     Hit::Mode(Mode::Encode),
     Hit::Mode(Mode::Decode),
     Hit::Kind(Kind::I),
     Hit::Kind(Kind::II),
-    Hit::Quit,
     Hit::Speed,
     Hit::Machine,
     Hit::Tape,
@@ -451,6 +452,8 @@ pub const BUTTONS: [Hit; 18] = [
     Hit::Spectrum,
     Hit::Style,
     Hit::Hold,
+    Hit::Save,
+    Hit::Quit,
 ];
 
 /// The text on a button (at most 11 characters, so it fits at the large scale on a 1280-wide screen).
@@ -471,6 +474,7 @@ pub fn label(unit: &Unit, hit: Hit) -> Line<16> {
         Hit::Source => write!(line, "Src {}", unit.source().name()),
         Hit::Style => write!(line, "View {}", unit.style().name()),
         Hit::Hold => line.write_str("Hold"),
+        Hit::Save => line.write_str("Save"),
         Hit::Quit => line.write_str("Quit"),
     };
     line
@@ -542,7 +546,7 @@ pub struct Layout {
     /// The two channel strips, left and right.
     pub strips: [Rect; 2],
     pub eq: Rect,
-    pub buttons: [Rect; 18],
+    pub buttons: [Rect; BUTTONS.len()],
 }
 
 impl Layout {
@@ -550,8 +554,8 @@ impl Layout {
         let scale = if width >= 1200 { 2 } else { 1 };
         let margin = 6 * scale;
         let header_h = GLYPH_H * scale * 2 + margin * 2;
-        let button_h = GLYPH_H * scale * 2 + margin * 2;
-        let rows = (BUTTONS.len() / BUTTON_COLUMNS) as i32;
+        let button_h = (GLYPH_H * scale * 2 + margin * 2) * 2 / 3;
+        let rows = BUTTONS.len().div_ceil(BUTTON_COLUMNS) as i32;
         let buttons_y = height - rows * (button_h + margin);
         let eq_h = GLYPH_H * scale + margin * 2;
         let eq = Rect { x: margin, y: header_h + margin, w: width - 2 * margin, h: eq_h };
@@ -588,9 +592,34 @@ pub fn press(unit: &mut Unit, hit: Hit) -> bool {
         Hit::Source => unit.set_source(unit.source().other()),
         Hit::Style => unit.set_style(unit.style().other()),
         Hit::Hold => unit.set_hold(!unit.hold()),
+        Hit::Save => {}
         Hit::Quit => return false,
     }
     true
+}
+
+/// The settings as `key=value` lines: the words the command line takes, so a saved file starts the tape the way it was left.
+pub fn settings(unit: &Unit) -> tape_rt::config::Settings<256> {
+    let mut body = tape_rt::config::Settings::<256>::new();
+    body.put("type", format_args!("{}", if unit.kind() == Kind::I { 1 } else { 2 }));
+    body.put("mode", format_args!("{}", match unit.mode() { Mode::Bypass => "bypass", Mode::Encode => "encode", Mode::Decode => "decode" }));
+    body.put("speed", format_args!("{}", unit.speed().name()));
+    body.put("machine", format_args!("{}", standard_name(unit.machine())));
+    body.put("tape", format_args!("{}", standard_name(unit.tape())));
+    body.put("tone", format_args!("{}", unit.tone().name()));
+    body.put("level", format_args!("{}", unit.tone_db()));
+    body.put("trim", format_args!("{}", unit.trim_db()));
+    body.put("source", format_args!("{}", unit.source().name()));
+    body.put("view", format_args!("{}", if unit.spectrum() { "spectrum" } else { "meters" }));
+    body.put("style", format_args!("{}", unit.style().name()));
+    body
+}
+
+fn standard_name(standard: Standard) -> &'static str {
+    match standard {
+        Standard::Nab => "nab",
+        Standard::Iec => "iec",
+    }
 }
 
 #[cfg(test)]
@@ -783,6 +812,21 @@ mod tests {
         assert!(unit.style() == Style::Fine && unit.hold());
         press(&mut unit, Hit::Style);
         assert!(unit.style() == Style::Bands);
+    }
+
+    #[test]
+    fn the_settings_name_what_the_command_line_takes() {
+        let mut unit = Unit::new(48_000, Kind::I, Mode::Decode);
+        press(&mut unit, Hit::Speed);
+        press(&mut unit, Hit::Machine);
+        press(&mut unit, Hit::Style);
+        let text = settings(&unit);
+        let words = text.as_str().replace('\n', " ");
+        assert_eq!(tape_rt::arg_value(&words, "type"), Some("1"));
+        assert_eq!(tape_rt::arg_value(&words, "mode"), Some("decode"));
+        assert_eq!(tape_rt::arg_value(&words, "speed").and_then(Speed::from_name), Some(unit.speed()));
+        assert_eq!(tape_rt::arg_value(&words, "machine").and_then(Standard::from_name), Some(Standard::Iec));
+        assert_eq!(tape_rt::arg_value(&words, "style"), Some("plot"));
     }
 
     #[test]
