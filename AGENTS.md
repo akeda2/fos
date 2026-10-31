@@ -42,7 +42,7 @@ plan and status are in `docs/shared-codebase.md`. The v2 prefix is gone from bui
 | `tapes/` | One crate per tape (library and binary together) (the shared libraries they use are in `crates/`). `tapes/tape.ld` is the shared linker script, `tapes/.cargo/config.toml` the shared target setup. |
 | `tools/` | Image builder (`build_image.py`), host tools (`devloop.py`, `term_net.py`, `send_tape.py`, `send_kernel_update.py`, `foscopy.py`, `peers.py`, `send_frame.py`), and the end-to-end test scripts (`test_*.py`). |
 | `targets/` | Rust target specs. `x86_64-fos-tape.json` (soft-float) is what tapes really build with. |
-| `docs/` | `shared-codebase.md` (the unification plan and its status), `design.md` (the design and milestone log), `recorder.md`, `nettest.md`, `rust-tapes-for-dummies.md`, `history/` (append-only write-ups). |
+| `docs/` | `shared-codebase.md` (the unification plan and its status), `design.md` (the design and milestone log), `recorder.md`, `compander.md` (dbx engine and tape), `nettest.md`, `rust-tapes-for-dummies.md`, `history/` (append-only write-ups). |
 
 Also read on demand: `docs/config.md` (every `settings`, `debug`, `start` and `synckey` option), `NETWORKING.md`, `AUDIO.md`, `DEFERRED.md` (things put aside),
 `README.md`.

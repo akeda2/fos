@@ -1,0 +1,29 @@
+[package]
+name = "dbx-tape"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "dbx_tape"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dbx"
+path = "src/main.rs"
+
+[dependencies]
+audio-screen = { path = "../../crates/audio-screen" }
+compander = { path = "../../crates/compander" }
+dsp = { path = "../../crates/dsp" }
+gfx = { path = "../../crates/gfx" }
+instrument-rt = { path = "../../crates/instrument-rt" }
+ltas = { path = "../../crates/ltas" }
+noise = { path = "../../crates/noise" }
+tape-rt = { path = "../../crates/tape-rt" }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = 2
+strip = "symbols"

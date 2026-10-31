@@ -1356,6 +1356,13 @@ tape's range. MIDI: controllers 20-31 are the twelve sliders, 64 Freeze (held), 
 use `TapeEcho` alone, or just `Spring`. `make test-tape-echo` uses QEMU's HD Audio duplex codec (silence in) and checks start, picture, keys
 and a clean stop; latency, feedback, the sound, touch and MIDI need real hardware.
 
+### dbx compander (crates/compander, tapes/dbx)
+
+A stereo dbx Type I / II box on one duplex device: the engine is `crates/compander` (a Blackmer-style quadrature true-RMS detector,
+2:1 / 1:2 gain linear in dB, 60 dB/s recovery, pre/de-emphasis, Type II's band-limited detector), the tape `tapes/dbx` runs two of
+them with meters and touch buttons. Details, sources and the parameters that are still provisional are in `docs/compander.md`.
+`compander::tapeeq` converts between NAB and IEC tape curves (4 speeds, record and playback) around the compander, and the tape adds an alignment tone (sine or pink noise), a third-octave spectrum view (`crates/ltas`) of the input or output for calibrating a machine against pink noise, and an output trim (`docs/compander.md`). `make test-dbx` checks start, arguments, picture, keys and a clean stop; the sound needs real hardware.
+
 ### Phono equaliser (crates/phono, tapes/phono)
 
 A record-playback equaliser for a flat (unequalised) input: `Phono` runs per-channel biquads in f64 state over f32 audio. A curve is
