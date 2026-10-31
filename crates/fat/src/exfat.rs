@@ -552,4 +552,50 @@ impl<D: Device> Fs<D> {
             None => Ok(false),
         }
     }
+
+    /// Sets (or, with an empty `label`, removes) the volume label: the 0x83 entry of the root directory, up to 11 characters.
+    /// It reuses the existing label entry (or a cleared one, type 0x03) and otherwise takes a free slot, so a change is
+    /// one sector write. The root is entered for the change and the current directory restored.
+    pub(crate) fn exfat_set_label(&mut self, label: &[u8]) -> Result<(), Error> {
+        if label.len() > 11 || !label.iter().all(|&byte| (0x20..0x7f).contains(&byte) && !b"\"*/:<>?\\|".contains(&byte)) {
+            return Err(Error::BadName);
+        }
+        let saved = (self.dir, self.dir_contiguous, self.dir_clusters, self.dir_set);
+        self.enter_root();
+        let outcome = self.exfat_write_label(label);
+        (self.dir, self.dir_contiguous, self.dir_clusters, self.dir_set) = saved;
+        outcome
+    }
+
+    fn exfat_write_label(&mut self, label: &[u8]) -> Result<(), Error> {
+        let existing = self.root_sectors(|lba, sector| {
+            for slot in 0..SECTOR / 32 {
+                match sector[slot * 32] {
+                    0 => return Visit::Done(None),
+                    0x83 | 0x03 => return Visit::Done(Some((lba, slot * 32))),
+                    _ => {}
+                }
+            }
+            Visit::Continue
+        })?;
+        let (lba, offset) = match existing.flatten() {
+            Some(place) => place,
+            None if label.is_empty() => return Ok(()),
+            None => self.exfat_free_entries(1)?,
+        };
+        let mut sector = [0u8; SECTOR];
+        self.device.read(lba, &mut sector)?;
+        let entry = &mut sector[offset..offset + 32];
+        entry.fill(0);
+        if label.is_empty() {
+            entry[0] = 0x03;
+        } else {
+            entry[0] = 0x83;
+            entry[1] = label.len() as u8;
+            for (index, &byte) in label.iter().enumerate() {
+                entry[2 + index * 2..4 + index * 2].copy_from_slice(&u16::from(byte).to_le_bytes());
+            }
+        }
+        self.device.write(lba, &sector)
+    }
 }

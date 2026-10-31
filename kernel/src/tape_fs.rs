@@ -122,6 +122,18 @@ fn enter_path<'a>(fs: &mut crate::fatvol::Fs, path: &'a [u8]) -> &'a [u8] {
     rest
 }
 
+/// The label of the exFAT volume on disk `number` (`Some(None)`: an exFAT volume with no label; `None`: no such volume).
+pub fn fat_label_of(number: usize) -> Option<Option<([u8; 11], usize)>> {
+    let mut fs = fat_disk(number)?;
+    (fs.kind() == fat::Kind::ExFat).then(|| fs.label().ok().flatten())
+}
+
+/// Sets (empty clears) the label of the exFAT volume on disk `number`.
+pub fn set_fat_label(number: usize, label: &[u8]) -> Result<(), fat::Error> {
+    let mut fs = fat_disk(number).ok_or(fat::Error::NotFound)?;
+    fs.set_label(label)
+}
+
 /// The exFAT volume labelled `label` (any case), on a disk that has no FOSFS volume.
 pub fn fat_labelled(label: &[u8]) -> Option<(usize, crate::fatvol::Fs)> {
     (1..=crate::block::count()).find_map(|number| {

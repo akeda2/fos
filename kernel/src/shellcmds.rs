@@ -50,7 +50,7 @@ pub static COMMANDS: &[Command] = &[
     Command::new("grow", "grow diskN", "makes the disk's FOSFS volume fill the disk (files are kept).", |_, rest| grow(rest)),
     Command::new("mount", "mount [PATH @LABEL | fstab]", "shows the mount table, mounts the volume @LABEL at the folder PATH of the boot volume, or reloads fstab.", |_, rest| mount(rest)),
     Command::new("umount", "umount PATH", "removes a mount; PATH is then the boot volume's own folder again.", |_, rest| umount(rest)),
-    Command::new("label", "label [diskN|@LABEL [NAME|-]]", "shows or sets a FOSFS volume's label (@LABEL names a volume).", |_, rest| label(rest)),
+    Command::new("label", "label [diskN|@LABEL [NAME|-]]", "shows or sets a volume's label (FOSFS or exFAT; @LABEL names a volume).", |_, rest| label(rest)),
     Command::new("format", "format diskN [NAME] [force] | format diskN exfat [LABEL]", "erases a disk's FOSFS volume, or makes it one exFAT volume for PCs; asks first (then `format diskN confirm`).", |_, rest| crate::formatshell::command(rest)),
     Command::new("debug", "debug [status|slots|crash|hang|video ...]", "kernel-update setting and the A/B slots; `crash` and `hang` test the crash record and the watchdog; `video` (x86 BIOS boots) the video mode.", |_, rest| debug(rest)),
     Command::new("gpio", "gpio [@HOST] [list|read N|set N 0|1|mode N in|out 0|1|altK|pull N none|up|down]", "the Raspberry Pi's GPIO pins, here or on another machine (needs the synckey file for @HOST).", |_, rest| crate::gpio_shell::command(rest)),
@@ -87,7 +87,11 @@ fn label(rest: &str) {
                     Ok(_) => crate::println!("disk{number}: (no label)"),
                     Err(error) => crate::println!("disk{number}: {error:?}"),
                 },
-                Err(crate::storage::VolumeError::NoPartition) | Err(crate::storage::VolumeError::NotFormatted) => crate::println!("disk{number}: (no FOSFS volume)"),
+                Err(crate::storage::VolumeError::NoPartition) | Err(crate::storage::VolumeError::NotFormatted) => match crate::tape_fs::fat_label_of(number) {
+                    Some(Some((bytes, length))) if length > 0 => crate::println!("disk{number}: @{} (exFAT)", core::str::from_utf8(&bytes[..length]).unwrap_or("?")),
+                    Some(_) => crate::println!("disk{number}: (no label, exFAT)"),
+                    None => crate::println!("disk{number}: (no FOSFS volume)"),
+                },
                 Err(error) => crate::println!("disk{number}: {error}"),
             }
         }
@@ -96,12 +100,20 @@ fn label(rest: &str) {
     let (number, volume) = if let Some(label) = target.strip_prefix('@') {
         match crate::storage::volume_labelled(label.as_bytes()) {
             Some(found) => found,
-            None => return crate::println!("@{label}: no volume carries that label."),
+            None => match crate::tape_fs::fat_labelled(label.as_bytes()) {
+                Some((number, _)) => return exfat_label(number, words.next()),
+                None => return crate::println!("@{label}: no volume carries that label."),
+            },
         }
     } else if let Some(number) = target.strip_prefix("disk").and_then(|number| number.parse::<usize>().ok()) {
         match crate::storage::volume_on(number) {
             Ok(volume) => (number, volume),
-            Err(error) => return crate::println!("disk{number}: {error}."),
+            Err(error) => {
+                if crate::tape_fs::fat_label_of(number).is_some() {
+                    return exfat_label(number, words.next());
+                }
+                return crate::println!("disk{number}: {error}.");
+            }
         }
     } else {
         return crate::println!("Usage: label [diskN|@LABEL [NAME|-]]");
@@ -126,6 +138,29 @@ fn label(rest: &str) {
     match volume.set_label(wanted.as_bytes()) {
         Ok(()) if wanted.is_empty() => crate::println!("disk{number}: label cleared."),
         Ok(()) => crate::println!("disk{number} is now @{wanted}."),
+        Err(error) => crate::println!("label: {error:?}"),
+    }
+}
+
+/// `label` for an exFAT volume: up to 11 characters of any case (it is matched ignoring case), `-` clears it.
+fn exfat_label(number: usize, name: Option<&str>) {
+    let Some(name) = name else {
+        return match crate::tape_fs::fat_label_of(number) {
+            Some(Some((bytes, length))) if length > 0 => crate::println!("disk{number}: @{} (exFAT)", core::str::from_utf8(&bytes[..length]).unwrap_or("?")),
+            _ => crate::println!("disk{number}: (no label, exFAT)"),
+        };
+    };
+    let wanted = if name == "-" { "" } else { name };
+    if !wanted.is_empty() {
+        let other = crate::storage::volume_labelled(wanted.as_bytes()).map(|(other, _)| other).or_else(|| crate::tape_fs::fat_labelled(wanted.as_bytes()).map(|(other, _)| other));
+        if let Some(other) = other.filter(|&other| other != number) {
+            return crate::println!("label: disk{other} already carries @{wanted}.");
+        }
+    }
+    match crate::tape_fs::set_fat_label(number, wanted.as_bytes()) {
+        Ok(()) if wanted.is_empty() => crate::println!("disk{number}: label cleared."),
+        Ok(()) => crate::println!("disk{number} is now @{wanted}."),
+        Err(fat::Error::BadName) => crate::println!("label: an exFAT label is up to 11 printable characters (no / : * ? and the like)."),
         Err(error) => crate::println!("label: {error:?}"),
     }
 }

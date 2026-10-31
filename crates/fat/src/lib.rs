@@ -191,7 +191,20 @@ pub struct Fs<D: Device> {
 impl<D: Device> Fs<D> {
     /// The volume's label (exFAT only: FAT32 volumes here have none that is read); `None` when there is none.
     pub fn label(&mut self) -> Result<Option<([u8; 11], usize)>, Error> {
-        if self.kind == Kind::ExFat { self.exfat_label() } else { Ok(None) }
+        if self.kind != Kind::ExFat {
+            return Ok(None);
+        }
+        // The label entry is in the root directory, wherever `enter` has gone.
+        let saved = (self.dir, self.dir_contiguous, self.dir_clusters, self.dir_set);
+        self.enter_root();
+        let label = self.exfat_label();
+        (self.dir, self.dir_contiguous, self.dir_clusters, self.dir_set) = saved;
+        label
+    }
+
+    /// Sets the volume label (exFAT only; up to 11 characters; empty removes it).
+    pub fn set_label(&mut self, label: &[u8]) -> Result<(), Error> {
+        if self.kind == Kind::ExFat { self.exfat_set_label(label) } else { Err(Error::Unsupported) }
     }
 
     pub fn mount(mut device: D) -> Result<Fs<D>, Error> {

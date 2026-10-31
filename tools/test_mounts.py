@@ -57,6 +57,17 @@ def scenario(run):
     check("hello" in run("cat copy.txt"), "cp reads from it", "")
     run("rm rec/a.txt")
     check("a.txt" not in run("ls rec"), "rm removes from it", "")
+    # `label` on exFAT: show, change (the mount follows the new name), refuse a clash, clear
+    check("disk3: @STICK (exFAT)" in run("label disk3") and "@STICK (exFAT)" in run("label"), "label shows an exFAT volume's label", "")
+    out = run("label disk3 Config1")
+    check("disk3 is now @Config1" in out and "disk3: @Config1 (exFAT)" in run("label @config1"), "label renames an exFAT volume, matched by label in any case", out)
+    check("not present" in run("mount") and "deep" not in run("cat rec/sub/b.txt"), "the old label no longer finds it", "")
+    run("mount rec @config1")
+    check("deep" in run("cat rec/sub/b.txt"), "and the new one does", "")
+    bad, long = run("label disk3 a/b"), run("label disk3 waytoolonglabel")
+    check("up to 11 printable" in bad and "up to 11 printable" in long and "@Config1 (exFAT)" in run("label disk3"), "a bad or too long exFAT label is refused", bad + long)
+    check("label cleared" in run("label disk3 -") and "no label, exFAT" in run("label disk3"), "label - clears it", "")
+    check("is now @stick" in run("label disk3 stick"), "and one can be set again", "")
 
 
 def main():

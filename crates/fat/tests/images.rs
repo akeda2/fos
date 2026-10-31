@@ -603,3 +603,31 @@ fn exfat_rename_and_move() {
     assert!(back == data);
     fsck(&path, &["fsck.exfat", "-n"]);
 }
+
+/// Setting, changing and clearing an exFAT volume label keeps the files and leaves `fsck.exfat` quiet.
+#[test]
+fn exfat_label_can_be_set() {
+    if !tool("mkfs.exfat") {
+        return;
+    }
+    let path = scratch("label-exfat.img");
+    let _cleanup = Cleanup(path.clone());
+    make_image(&path, 64, &["mkfs.exfat"]);
+    let mut fs = open(&path);
+    put(&mut fs, b"keep.bin", b"data");
+    fs.mkdir(b"box").unwrap();
+    fs.enter(b"box").unwrap();
+    fs.set_label(b"Config1").unwrap();
+    let text = |fs: &mut Fs<FileDevice>| fs.label().unwrap().map(|(bytes, length)| bytes[..length].to_vec());
+    assert_eq!(text(&mut fs).as_deref(), Some(&b"Config1"[..]));
+    fs.set_label(b"other").unwrap();
+    assert_eq!(text(&mut open(&path)).as_deref(), Some(&b"other"[..]));
+    assert!(fs.set_label(b"way-too-long-label").is_err() && fs.set_label(b"a/b").is_err());
+    fs.set_label(b"").unwrap();
+    assert!(text(&mut open(&path)).is_none());
+    fs.set_label(b"again").unwrap();
+    let mut check = open(&path);
+    assert_eq!(text(&mut check).as_deref(), Some(&b"again"[..]));
+    assert!(check.find(b"keep.bin").unwrap().is_some());
+    fsck(&path, &["fsck.exfat", "-n"]);
+}
