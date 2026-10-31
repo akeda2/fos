@@ -15,6 +15,10 @@
 //! correction levels off below it. The values are the commonly published ones (NAB 3180 us with 50 us at 7.5 and 15 ips, 90 us at
 //! 3.75, 17.5 us at 30; IEC 90 us at 3.75, 70 us at 7.5, 35 us at 15, 17.5 us at 30); check them against the standards for
 //! critical work.
+//!
+//! Compact cassettes (1.875 ips) have no NAB/IEC choice but a pair of equalisations, 120 us (ferric, Type I) and 70 us (chrome and
+//! metal, Type II and IV), both with T1 = 3180 us. They reuse the two `Standard`s: `Nab` stands for 120 us and `Iec` for 70 us at that speed
+//! (`Standard::label` says which), so converting plays a tape of one kind on a machine set for the other.
 
 use crate::First;
 use dsp::math;
@@ -37,6 +41,24 @@ impl Standard {
         }
     }
 
+    /// The name at `speed`: NAB/IEC for reels, 120 us / 70 us for cassettes.
+    pub fn label(self, speed: Speed) -> &'static str {
+        match (speed, self) {
+            (Speed::Ips1_875, Standard::Nab) => "120us",
+            (Speed::Ips1_875, Standard::Iec) => "70us",
+            _ => self.name(),
+        }
+    }
+
+    /// Parses NAB/IEC (also CCIR, DIN) and the cassette names 120 and 70 (with or without `us`).
+    pub fn from_name(name: &str) -> Option<Standard> {
+        match name {
+            "nab" | "NAB" | "120" | "120us" => Some(Standard::Nab),
+            "iec" | "IEC" | "ccir" | "CCIR" | "din" | "DIN" | "70" | "70us" => Some(Standard::Iec),
+            _ => None,
+        }
+    }
+
     pub fn other(self) -> Standard {
         match self {
             Standard::Nab => Standard::Iec,
@@ -48,6 +70,8 @@ impl Standard {
 /// Tape speed in inches per second.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Speed {
+    /// The compact cassette, 4.76 cm/s.
+    Ips1_875,
     Ips3_75,
     Ips7_5,
     Ips15,
@@ -57,6 +81,7 @@ pub enum Speed {
 impl Speed {
     pub fn name(self) -> &'static str {
         match self {
+            Speed::Ips1_875 => "1.875",
             Speed::Ips3_75 => "3.75",
             Speed::Ips7_5 => "7.5",
             Speed::Ips15 => "15",
@@ -66,20 +91,24 @@ impl Speed {
 
     pub fn next(self) -> Speed {
         match self {
+            Speed::Ips1_875 => Speed::Ips3_75,
             Speed::Ips3_75 => Speed::Ips7_5,
             Speed::Ips7_5 => Speed::Ips15,
             Speed::Ips15 => Speed::Ips30,
-            Speed::Ips30 => Speed::Ips3_75,
+            Speed::Ips30 => Speed::Ips1_875,
         }
     }
 
     pub fn from_name(name: &str) -> Option<Speed> {
-        [Speed::Ips3_75, Speed::Ips7_5, Speed::Ips15, Speed::Ips30].into_iter().find(|s| s.name() == name)
+        [Speed::Ips1_875, Speed::Ips3_75, Speed::Ips7_5, Speed::Ips15, Speed::Ips30].into_iter().find(|s| s.name() == name)
     }
 }
 
 /// (T1, T2) in microseconds; `None` is an infinite T1.
 pub fn time_constants(standard: Standard, speed: Speed) -> (Option<f32>, f32) {
+    if speed == Speed::Ips1_875 {
+        return (Some(3180.0), if standard == Standard::Nab { 120.0 } else { 70.0 });
+    }
     let t2 = match (standard, speed) {
         (Standard::Nab, Speed::Ips3_75) | (Standard::Iec, Speed::Ips3_75) => 90.0,
         (Standard::Nab, Speed::Ips7_5) => 50.0,
@@ -87,6 +116,7 @@ pub fn time_constants(standard: Standard, speed: Speed) -> (Option<f32>, f32) {
         (Standard::Iec, Speed::Ips7_5) => 70.0,
         (Standard::Iec, Speed::Ips15) => 35.0,
         (_, Speed::Ips30) => 17.5,
+        (_, Speed::Ips1_875) => unreachable!(),
     };
     (if standard == Standard::Nab { Some(3180.0) } else { None }, t2)
 }
@@ -206,6 +236,19 @@ mod tests {
             let back = playback_response_db(Standard::Nab, Standard::Iec, Speed::Ips7_5, hz);
             assert!((there + back).abs() < 1e-3, "{hz} Hz");
         }
+    }
+
+    #[test]
+    fn cassette_120_and_70_us_differ_by_the_high_frequency_corner() {
+        let (t1, t2) = time_constants(Standard::Nab, Speed::Ips1_875);
+        assert_eq!((t1, t2), (Some(3180.0), 120.0));
+        assert_eq!(time_constants(Standard::Iec, Speed::Ips1_875), (Some(3180.0), 70.0));
+        assert_eq!(Standard::Iec.label(Speed::Ips1_875), "70us");
+        assert_eq!(Standard::from_name("120"), Some(Standard::Nab));
+        // A 70 us tape on a 120 us machine plays dull (the machine cuts more treble than the tape was boosted): the correction lifts it.
+        let top = playback_response_db(Standard::Nab, Standard::Iec, Speed::Ips1_875, 10_000.0);
+        let flat = playback_response_db(Standard::Nab, Standard::Iec, Speed::Ips1_875, 100.0);
+        assert!(flat.abs() < 0.1 && top > 3.0, "{flat} {top}");
     }
 
     #[test]

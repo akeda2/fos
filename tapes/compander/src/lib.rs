@@ -1,4 +1,4 @@
-//! The `dbx` tape's logic without a screen: the stereo compander unit (two `compander::Compander`s, meters, mode and type
+//! The `compander` tape's logic without a screen: the stereo compander unit (two `compander::Compander`s, meters, mode and type
 //! switching) and the touch layout. `main.rs` draws and runs it; this part is testable on the host.
 #![cfg_attr(not(test), no_std)]
 
@@ -131,6 +131,27 @@ impl Source {
     }
 }
 
+/// How the spectrum view draws: third-octave bars (smoothed, for levels and response) or every FFT bin as a line (unsmoothed, for
+/// spotting overtones and hum).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Style {
+    Bands,
+    Fine,
+}
+
+impl Style {
+    pub fn name(self) -> &'static str {
+        match self {
+            Style::Bands => "bars",
+            Style::Fine => "plot",
+        }
+    }
+
+    pub fn other(self) -> Style {
+        if self == Style::Bands { Style::Fine } else { Style::Bands }
+    }
+}
+
 pub const TONE_MIN_DB: f32 = -40.0;
 pub const TONE_MAX_DB: f32 = 0.0;
 pub const TRIM_LIMIT_DB: f32 = 12.0;
@@ -156,6 +177,8 @@ pub struct Unit {
     tone_phase: f32,
     noise: Generator,
     spectrum: bool,
+    style: Style,
+    hold: bool,
     source: Source,
     trim_db: f32,
     trim_gain: f32,
@@ -184,6 +207,8 @@ impl Unit {
             tone_phase: 0.0,
             noise: Generator::new(),
             spectrum: false,
+            style: Style::Bands,
+            hold: false,
             source: Source::Input,
             trim_db: 0.0,
             trim_gain: 1.0,
@@ -279,6 +304,23 @@ impl Unit {
 
     pub fn source(&self) -> Source {
         self.source
+    }
+
+    pub fn style(&self) -> Style {
+        self.style
+    }
+
+    pub fn set_style(&mut self, style: Style) {
+        self.style = style;
+    }
+
+    /// Whether the spectrum is frozen.
+    pub fn hold(&self) -> bool {
+        self.hold
+    }
+
+    pub fn set_hold(&mut self, on: bool) {
+        self.hold = on;
     }
 
     pub fn set_spectrum(&mut self, on: bool) {
@@ -382,27 +424,33 @@ pub enum Hit {
     Spectrum,
     /// Analyse the input or the output.
     Source,
+    /// Bars (third octave) or plot (every FFT bin).
+    Style,
+    /// Freeze the spectrum.
+    Hold,
     Quit,
 }
 
-pub const BUTTON_COLUMNS: usize = 8;
-pub const BUTTONS: [Hit; 16] = [
+pub const BUTTON_COLUMNS: usize = 6;
+pub const BUTTONS: [Hit; 18] = [
     Hit::Mode(Mode::Bypass),
     Hit::Mode(Mode::Encode),
     Hit::Mode(Mode::Decode),
     Hit::Kind(Kind::I),
     Hit::Kind(Kind::II),
-    Hit::Trim(-1),
-    Hit::Trim(1),
-    Hit::Spectrum,
-    Hit::Tone,
-    Hit::ToneLevel(-1),
-    Hit::ToneLevel(1),
+    Hit::Quit,
     Hit::Speed,
     Hit::Machine,
     Hit::Tape,
+    Hit::Trim(-1),
+    Hit::Trim(1),
     Hit::Source,
-    Hit::Quit,
+    Hit::Tone,
+    Hit::ToneLevel(-1),
+    Hit::ToneLevel(1),
+    Hit::Spectrum,
+    Hit::Style,
+    Hit::Hold,
 ];
 
 /// The text on a button (at most 11 characters, so it fits at the large scale on a 1280-wide screen).
@@ -417,10 +465,12 @@ pub fn label(unit: &Unit, hit: Hit) -> Line<16> {
         Hit::Tone => write!(line, "Tone {}", unit.tone().name()),
         Hit::ToneLevel(step) => write!(line, "Tone {}", if step < 0 { "-" } else { "+" }),
         Hit::Speed => write!(line, "{} ips", unit.speed().name()),
-        Hit::Machine => write!(line, "Mach {}", unit.machine().name()),
-        Hit::Tape => write!(line, "Tape {}", unit.tape().name()),
+        Hit::Machine => write!(line, "Mach {}", unit.machine().label(unit.speed())),
+        Hit::Tape => write!(line, "Tape {}", unit.tape().label(unit.speed())),
         Hit::Spectrum => line.write_str("Spectrum"),
         Hit::Source => write!(line, "Src {}", unit.source().name()),
+        Hit::Style => write!(line, "View {}", unit.style().name()),
+        Hit::Hold => line.write_str("Hold"),
         Hit::Quit => line.write_str("Quit"),
     };
     line
@@ -434,8 +484,53 @@ pub fn lit(unit: &Unit, hit: Hit) -> bool {
         Hit::Tone => unit.tone() != Tone::Off,
         Hit::Tape => unit.converting(),
         Hit::Spectrum => unit.spectrum(),
+        Hit::Hold => unit.hold(),
         _ => false,
     }
+}
+
+/// What the tape equalisation is doing, for the bar that says so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EqState {
+    /// Tape and machine share a standard: nothing to correct.
+    Flat,
+    /// Correcting (Decode: playback, Encode: recording).
+    Active,
+    /// The standards differ but Bypass does not apply the correction.
+    Bypassed,
+}
+
+pub fn eq_state(unit: &Unit) -> EqState {
+    if unit.machine() == unit.tape() {
+        EqState::Flat
+    } else if unit.mode() == Mode::Bypass {
+        EqState::Bypassed
+    } else {
+        EqState::Active
+    }
+}
+
+/// The tape equalisation in words: the tape's standard, the machine's, the speed and the correction at 50 Hz and 10 kHz.
+pub fn eq_text(unit: &Unit) -> Line<120> {
+    let (speed, tape, machine) = (unit.speed(), unit.tape(), unit.machine());
+    let mut line = Line::<120>::new();
+    let _ = write!(line, "TAPE EQ  {} ips  tape {}  machine {}  ", speed.name(), tape.label(speed), machine.label(speed));
+    match eq_state(unit) {
+        EqState::Flat => {
+            let _ = line.write_str("same standard, no correction");
+        }
+        EqState::Bypassed => {
+            let _ = line.write_str("differs, but Bypass applies none");
+        }
+        EqState::Active => {
+            // Recording applies exactly the inverse of the playback correction.
+            let sign = if unit.mode() == Mode::Encode { -1.0 } else { 1.0 };
+            let low = sign * compander::tapeeq::playback_response_db(machine, tape, speed, 50.0);
+            let high = sign * compander::tapeeq::playback_response_db(machine, tape, speed, 10_000.0);
+            let _ = write!(line, "{}: {:+.1} dB at 50 Hz, {:+.1} dB at 10 kHz", if unit.mode() == Mode::Encode { "record" } else { "playback" }, low, high);
+        }
+    }
+    line
 }
 
 pub struct Layout {
@@ -446,7 +541,8 @@ pub struct Layout {
     pub header: Rect,
     /// The two channel strips, left and right.
     pub strips: [Rect; 2],
-    pub buttons: [Rect; 16],
+    pub eq: Rect,
+    pub buttons: [Rect; 18],
 }
 
 impl Layout {
@@ -457,7 +553,9 @@ impl Layout {
         let button_h = GLYPH_H * scale * 2 + margin * 2;
         let rows = (BUTTONS.len() / BUTTON_COLUMNS) as i32;
         let buttons_y = height - rows * (button_h + margin);
-        let top = header_h + margin;
+        let eq_h = GLYPH_H * scale + margin * 2;
+        let eq = Rect { x: margin, y: header_h + margin, w: width - 2 * margin, h: eq_h };
+        let top = eq.y + eq_h + margin;
         let strip_w = (width - 3 * margin) / 2;
         let strip_h = buttons_y - margin - top;
         let strips = [0, 1].map(|i| Rect { x: margin + i * (strip_w + margin), y: top, w: strip_w, h: strip_h });
@@ -467,7 +565,7 @@ impl Layout {
             let (row, column) = ((i / BUTTON_COLUMNS) as i32, (i % BUTTON_COLUMNS) as i32);
             Rect { x: margin + column * (button_w + margin), y: buttons_y + row * (button_h + margin), w: button_w, h: button_h }
         });
-        Layout { width, height, scale, margin, header: Rect { x: 0, y: 0, w: width, h: header_h }, strips, buttons }
+        Layout { width, height, scale, margin, header: Rect { x: 0, y: 0, w: width, h: header_h }, eq, strips, buttons }
     }
 
     pub fn hit(&self, x: i32, y: i32) -> Option<Hit> {
@@ -488,6 +586,8 @@ pub fn press(unit: &mut Unit, hit: Hit) -> bool {
         Hit::Tape => unit.set_tape(unit.tape().other()),
         Hit::Spectrum => unit.set_spectrum(!unit.spectrum()),
         Hit::Source => unit.set_source(unit.source().other()),
+        Hit::Style => unit.set_style(unit.style().other()),
+        Hit::Hold => unit.set_hold(!unit.hold()),
         Hit::Quit => return false,
     }
     true
@@ -654,6 +754,35 @@ mod tests {
             }
         }
         assert!(checked >= 18);
+    }
+
+    #[test]
+    fn the_eq_bar_says_when_the_correction_is_applied_and_names_cassette_standards() {
+        let mut unit = Unit::new(48_000, Kind::II, Mode::Decode);
+        assert_eq!(eq_state(&unit), EqState::Flat);
+        press(&mut unit, Hit::Speed);
+        press(&mut unit, Hit::Speed);
+        assert_eq!(unit.speed(), Speed::Ips1_875);
+        press(&mut unit, Hit::Tape);
+        assert_eq!(eq_state(&unit), EqState::Active);
+        let text = eq_text(&unit);
+        assert!(text.as_str().contains("1.875 ips") && text.as_str().contains("tape 70us") && text.as_str().contains("machine 120us"), "{}", text.as_str());
+        assert!(text.as_str().contains("playback"), "{}", text.as_str());
+        assert!(label(&unit, Hit::Tape).as_str().contains("70us"));
+        press(&mut unit, Hit::Mode(Mode::Encode));
+        assert!(eq_text(&unit).as_str().contains("record"));
+        press(&mut unit, Hit::Mode(Mode::Bypass));
+        assert_eq!(eq_state(&unit), EqState::Bypassed);
+    }
+
+    #[test]
+    fn the_spectrum_style_and_hold_toggle() {
+        let mut unit = Unit::new(48_000, Kind::I, Mode::Bypass);
+        press(&mut unit, Hit::Style);
+        press(&mut unit, Hit::Hold);
+        assert!(unit.style() == Style::Fine && unit.hold());
+        press(&mut unit, Hit::Style);
+        assert!(unit.style() == Style::Bands);
     }
 
     #[test]

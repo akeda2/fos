@@ -1,14 +1,14 @@
 [package]
-name = "dbx-tape"
+name = "compander-tape"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "dbx_tape"
+name = "compander_tape"
 path = "src/lib.rs"
 
 [[bin]]
-name = "dbx"
+name = "compander"
 path = "src/main.rs"
 
 [dependencies]
