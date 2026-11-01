@@ -209,6 +209,7 @@ class Host:
         self.serial: Serial | None = None
         # Tapes that live only in bin/ (FOSFS v4); a bare name that is in the root is the root's, as `run` takes it.
         self.in_bin: set[str] = set()
+        self.has_bin = False      # a FOSFS v4 volume with a bin/ folder: new tapes belong there
 
     def placed(self, name: str) -> str:
         return "bin/" + name if name in self.in_bin else name
@@ -283,6 +284,7 @@ def listing(host: Host, text: str) -> dict[str, int]:
     root = parse_ls(text[:marker.start()] if marker else text)
     folder = parse_ls(text[marker.end():]) if marker else {}
     host.in_bin = {name for name in folder if name not in root}
+    host.has_bin = re.search(r"^bin\s+<dir>", text, re.M) is not None
     return {**folder, **root}
 
 
@@ -554,8 +556,11 @@ def deploy_host(iface: str, args, plan, parallel: bool) -> int:
         if state is None:
             print("  tapes: host does not answer; skipped")
             return failed + 1
+        new_names = {name for name in tape_list if name not in state[2]} if host.has_bin else set()
         for name in tape_list:
             if host.serial:
+                if name in new_names:
+                    host.in_bin.add(name)
                 try:
                     host.serial.send(f"recv disk1/{host.placed(name)}".encode(), (tape_dir / name).read_bytes())
                     ok = True
@@ -565,6 +570,14 @@ def deploy_host(iface: str, args, plan, parallel: bool) -> int:
             else:
                 ok = subprocess.run([sys.executable, str(TOOLS / "foscopy.py"), "--iface", iface, "--mac", mac,
                                      str(tape_dir / name), f":disk1/{name}"], capture_output=True, text=True).returncode == 0
+            if ok and name in new_names and not host.serial:
+                # NETFS puts a bare name in the root unless the tape already lives in bin/; a new tape is moved there.
+                moved = ask_host(iface, host, [f"mv {name} bin/{name}"])
+                ok = "Moved " in moved
+                if ok:
+                    host.in_bin.add(name)
+                else:
+                    print(f"  tape {name}: copied to the root, but `mv` to bin/ failed: {moved.strip()[-120:]}")
             print(f"  tape {name}: {'ok' if ok else 'FAILED'}")
             failed += not ok
         states = content_states(iface, host, tape_dir, tape_list)
