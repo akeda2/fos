@@ -589,8 +589,20 @@ use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limi
 
 ## Open after httpd and web
 
-- TLS (https) for both; POST, keep-alive, Range requests and `If-Modified-Since` in httpd; forms, cookies, images and a mouse in the browser; a gfx-canvas browser.
+- **https in `web` (plan, not started):** the HTTP side barely changes; the work is a `no_std` TLS client.
+  - TLS 1.3 only: vendor a small client crate (`embedded-tls` style) or write a minimal one (handshake, HKDF, AES-GCM or ChaCha20-Poly1305, X25519, SHA-256/384); check it builds for the soft-float tape target and aarch64.
+  - Entropy: RDRAND/RDSEED on x86 (`micros()` jitter as fallback); the Pi 4 hardware RNG needs a new append-only ABI call (version 31).
+  - Clock: certificate validity needs the date; the wall clock is only right after `ptp` or `settime`.
+  - Certificates: X.509 chain check (RSA, ECDSA) against a bundled root-CA file (~200 KB on a volume); first step can be `insecure` or pinned certificates.
+  - Plumbing: a TLS stream wrapping `tape_ip::tcp::Socket` with the same `send`/`recv`/`close`; `parse_url` accepts https (port 443, SNI); TLS records need up to 16 KB buffers each way.
+  - Tests: host `ssl` or `openssl s_server` with a self-signed cert on slirp, a test CA for validation, known-answer vectors on the host.
+  - Size: encrypted but unverified a few days; verified with a trust store a week or more; TLS in `httpd` (keys, certificate) is a larger separate step.
+- TLS (https) for httpd; POST, keep-alive, Range requests and `If-Modified-Since` in httpd; forms, cookies, images and a mouse in the browser; a gfx-canvas browser.
 - httpd does not renew its DHCP lease (give it `ip=` for a long run) and a service owns its NIC, so a one-NIC machine cannot run httpd and the browser together.
 - httpd looks a file up by listing its folder (O(n) per request, O(n²) for a listing); fine for small folders. A FAT32 subfolder lists the root in the kernel, so a missing FAT32 subfolder looks like a folder.
 - The browser reads a page whole (1 MiB at most), does not decode `Transfer-Encoding: chunked` (it asks with HTTP/1.0), and treats non-UTF-8 pages as Latin-1.
 - `web` could save a page to a file (`-o`), and `tape-http`'s MIME list is short.
+
+## Planned: a second, larger kernel (SMP, preemption, VM)
+
+- Idea and staged plan in `docs/big-kernel.md`: same tape ABI, one source tree with a shared `kernel-core` and two cores; nothing built yet.

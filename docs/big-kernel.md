@@ -1,0 +1,95 @@
+# A second, larger kernel (idea, not started)
+
+Question: can fos have two kernels, the current small one for embedded machines and a larger one (SMP, preemptive multitasking,
+real memory management) that supports everything the small one does? Yes. This file is the plan and the trade-offs; nothing is built.
+
+## Why it is feasible
+
+- **The tape ABI is the contract.** Tapes only see `TapeApi` (`abi/src/tape.rs`, append-only). A kernel that fills in the same table runs
+  every tape unchanged; "supports everything the embedded kernel supports" means implementing that table and the shell commands.
+- **The loader already hands over a neutral `BootInfo`** (UEFI and BIOS, version 5), and the A/B slot machinery loads whichever ELF is in
+  the slot. A second kernel is a second image, not a second boot path.
+- **Services (`run NAME &N`) are already a concurrency concept**: a tape that keeps running while the shell is usable. A scheduler
+  generalises that.
+
+## What is hard (the embedded kernel's assumptions)
+
+| Assumption today | What the big kernel needs |
+| --- | --- |
+| One CPU, drivers use `static mut` with no locks | Locks (spinlocks, IRQ-safe), per-CPU data, TLB shootdown, memory ordering reviewed in every driver |
+| Polling loops with bounded waits, `idle()` in tapes | Blocking waits and wake-ups; `idle()` becomes a yield; interrupt-driven completion in the drivers |
+| Identity-mapped RAM, tapes run in the kernel's address space | Per-process address spaces and, eventually, ring 3 with a syscall layer behind the `TapeApi` function pointers (pointer validation, copy in/out) |
+| One physical allocator, `alloc` bump-style for tapes | A VM subsystem: page tables per process, demand paging optional, a kernel heap with free, guard pages, NX everywhere |
+| `tape.rs` runs one tape in the foreground (plus services) | A scheduler with threads, timer tick, kernel stacks, a process table, `kill` that really kills |
+| Boot CPU only (ACPI MADT is parsed, APs are not started) | INIT-SIPI-SIPI trampoline in low memory (not over `0x5000`, the crash record), per-AP stacks, GDT/IDT/APIC per CPU |
+| Hardware access straight from tapes (`gfx` framebuffer, MMIO helpers, port I/O) | Either keep those tapes in ring 0 or give them mapped, checked windows |
+
+## Structure options
+
+1. **One source tree, two configurations (recommended start).** Split `kernel/` into a `kernel-core` library (drivers, FOSFS/FAT, net
+   frames, tape ABI glue, shell commands) behind a small "OS services" trait (DMA memory, MMIO mapping, IRQ registration, time, wait/wake),
+   plus two thin cores: `fos-embedded` (today's behaviour: no locks beyond IRQ masking, polling) and `fos-smp` (locks, scheduler, VM).
+   Drivers are written once against the services trait; the embedded core makes locks no-ops. Cargo features can express the same
+   thing at lower cost if the split is too big a first step.
+2. **Two independent kernels.** Simplest to start, but every driver fix and every new tape-ABI call lands twice; they drift. Only
+   worth it if the big kernel's driver model ends up fundamentally different (async, user-space drivers).
+3. **Grow the existing kernel with features.** Add `smp`/`sched`/`vm` features; the embedded build compiles them out. Cheapest, but
+   the features touch everything (locking in every driver), so it ends up as option 1 anyway.
+
+## Cross-cutting points
+
+- **Flavour marker.** The slot metadata or the kernel ELF should say which flavour it is (a note section like `.fos_help`) so KUP,
+  `fosadm` and the A/B loader never put the embedded kernel on a host chosen for the big one or the reverse. `fosadm` needs a
+  per-host flavour (and `status` must compare against the matching build); `make image` builds both, e.g. `build/fosfor-smp/`.
+- **ABI.** Behaviour that changes meaning needs new calls, never new meanings for old ones (the append-only rule): e.g. a tape that
+  blocks in `idle()` must still behave. Anything that only makes sense with threads (`thread_spawn`, futex-like waits) is a new call that
+  the embedded kernel answers with "not supported" (check `version` and a capability bit).
+- **aarch64.** The Pi 4 port is a third axis (arch x flavour). SMP on the Pi 4 means PSCI CPU_ON and GIC per-CPU setup; plan the
+  services trait so it does not assume x86.
+- **Tapes with timing rules** (audio-net, nettest: no printing between `audio_start` and the loop) rely on being the only thing on the
+  CPU. On the big kernel they want a pinned, non-preempted thread (CPU affinity or an isolated core).
+- **Tests.** QEMU `-smp N` for everything; races need stress tests with repeated runs, not single green runs. The existing `test-*`
+  suite is the compatibility check: every test must pass on both flavours.
+
+## A staged path (each stage is shippable)
+
+1. Extract the drivers and FOSFS into `kernel-core` behind an OS-services trait; embedded kernel unchanged and all tests green.
+2. Lock audit: replace `static mut` driver state by explicit per-device state behind IRQ-safe locks (no-ops on the embedded core).
+3. SMP bring-up: start the APs, per-CPU GDT/IDT/APIC, APs idle; one CPU still runs everything.
+4. Kernel threads and a scheduler (timer preemption, blocking waits); the shell and each tape become threads in the kernel
+   address space (still ring 0). Interrupt-driven drivers replace polling one class at a time (NIC, disk, USB).
+5. A real kernel heap and VM (free, per-process page tables); tapes get their own address space but stay ring 0.
+6. Ring 3 for tapes with a syscall shim behind `TapeApi`; the shim validates every pointer. Tapes that need raw hardware stay privileged.
+7. Optional extras: NUMA-aware allocation, CPU affinity for realtime tapes, a proper process/IPC model, `tapesync` flavour awareness.
+
+## Cost and risk
+
+- Stage 1-2 are the bulk of the risk: they touch every driver and have to keep the real-hardware machines working (e1000, xHCI,
+  HDA, RTL8168 all have known timing quirks; `docs/history/` has the write-ups).
+- A realistic order of magnitude: stage 1-3 weeks of focused work, stage 4 a few more, stages 5-6 several weeks (VM and user mode are
+  where hobby kernels stall). Only real hardware shows interrupt and SMP bugs that QEMU hides; QEMU accepts orderings real chips do not.
+
+## Answers (2026-11-01) and what they change
+
+- **"Larger system" is a role, not a size**: a machine that runs a file, web or print server, or a batch queue. 1 to 36 cores (2 x 18
+  sockets); `rack` or `skylake` is the first candidate. So the target is server workloads on up to two sockets: NUMA-aware allocation
+  moves from "optional extra" to a real stage-5 item, and the scheduler must scale to 36 CPUs (per-CPU run queues, no global lock).
+- **Isolation is required.** Ring 3 and per-process address spaces (stages 5-6) are mandatory, not optional: tapes on the big kernel
+  run unprivileged behind the syscall shim, with pointer validation, resource limits (memory, open files, CPU time) and a kill that
+  always works. Tapes that need raw hardware (`gfx`, MMIO, port I/O) either get a checked, mapped window or stay on the embedded kernel.
+  Network and storage services should be separate processes talking through the kernel, so a crashed httpd cannot take the machine down.
+- **Latency-sensitive tapes stay on the embedded kernel** (audio-net, recorder, nettest, anything with the no-printing-in-the-loop
+  rule). On the big kernel only non-latency tapes are supported; core pinning is an option for them, not a promise of realtime.
+  Consequence: the big kernel does not have to meet the audio timing rules, which removes the hardest realtime requirement.
+- **First applications**: file server (NETFS/SMB-style over the existing FOSFS/FAT drivers), web server (`httpd` as a real
+  multi-connection process: keep-alive, many clients, TLS later), print server, and a **shared batch queue for transcoding jobs**.
+  The batch queue needs: a job table and spool on disk, worker processes (one per core or a limit), CPU-bound scheduling with priorities
+  or nice levels, per-thread FP/SIMD state (tapes are hard-float: the kernel enables SSE/AVX2 per `fp_level`, so context switches save
+  and restore XSAVE state), progress and cancel from the shell, and restart of jobs after a reboot. `opus-codec` and the APE decoder
+  are the first transcoding workloads already in the tree.
+- **Order of work this suggests**: stages 1-4 as planned, then VM and ring 3 (5-6) *before* any server role, since isolation is a
+  requirement; a first useful milestone is "httpd as an unprivileged process on a multi-core `skylake`", then the batch queue.
+- **Still open**: file-server protocol (extend NETFS, or SMB/NFS for other hosts?); print server details (which printers, which
+  protocol, e.g. raw port 9100 or IPP); whether the batch queue is a shell feature or a tape/service; authentication for network
+  services (none exists today; `deny-term-net` and `password` are the only controls); how the big kernel is installed (a stick, KUP
+  with the flavour marker).
