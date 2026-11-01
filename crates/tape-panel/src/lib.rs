@@ -110,7 +110,12 @@ impl<const N: usize> Text<N> {
         result
     }
     pub fn as_str(&self) -> &str {
-        core::str::from_utf8(&self.bytes[..self.length]).unwrap_or("")
+        // A cut in the middle of a UTF-8 character drops that character instead of the whole text.
+        let bytes = &self.bytes[..self.length];
+        match core::str::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(error) => core::str::from_utf8(&bytes[..error.valid_up_to()]).unwrap_or(""),
+        }
     }
     pub fn push(&mut self, byte: u8) {
         if self.length < N {

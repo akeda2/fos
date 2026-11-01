@@ -132,7 +132,7 @@ impl<'a> Canvas<'a> {
     /// Text in the console font, left edge at `x`; returns the x after the last glyph.
     pub fn text(&mut self, x: i32, y: i32, text: &str, rgb: u32) -> i32 {
         let mut at = x;
-        for byte in text.bytes() {
+        for byte in text.chars().map(latin9) {
             self.glyph(at, y, byte, rgb);
             at += GLYPH_WIDTH as i32;
         }
@@ -144,7 +144,7 @@ impl<'a> Canvas<'a> {
     pub fn text_scaled(&mut self, x: i32, y: i32, text: &str, scale: u32, rgb: u32) -> i32 {
         let scale = scale.max(1) as i32;
         let mut at = x;
-        for byte in text.bytes() {
+        for byte in text.chars().map(latin9) {
             for (row, bits) in font::FONT[byte as usize].iter().enumerate() {
                 for column in 0..GLYPH_WIDTH as i32 {
                     if bits & (0x80 >> column) != 0 {
@@ -168,8 +168,31 @@ impl<'a> Canvas<'a> {
     }
 }
 
+/// Width of `text` in pixels: one glyph per character (UTF-8 is drawn as Latin-9, see `latin9`).
 pub fn text_width(text: &str) -> u32 {
-    text.len() as u32 * GLYPH_WIDTH
+    text.chars().count() as u32 * GLYPH_WIDTH
+}
+
+/// The glyph of the console font (ISO 8859-15) for a character, `?` when it has none: Nordic letters and the other Latin-1
+/// letters draw, so UTF-8 file names and tags show right.
+pub fn latin9(c: char) -> u8 {
+    match c as u32 {
+        0x20..=0x7e => c as u8,
+        0xa0 => b' ',
+        0x2018 | 0x2019 => b'\'',
+        0x201c | 0x201d => b'"',
+        0x2013 | 0x2014 => b'-',
+        code @ 0xa1..=0xff if !matches!(code, 0xa4 | 0xa6 | 0xa8 | 0xb4 | 0xb8 | 0xbc..=0xbe) => code as u8,
+        0x20ac => 0xa4,
+        0x0160 => 0xa6,
+        0x0161 => 0xa8,
+        0x017d => 0xb4,
+        0x017e => 0xb8,
+        0x0152 => 0xbc,
+        0x0153 => 0xbd,
+        0x0178 => 0xbe,
+        _ => b'?',
+    }
 }
 
 /// Formats `value` with `decimals` places into `out` (no allocation), returns the text. `out` should hold 16 bytes or more.
@@ -254,6 +277,18 @@ mod tests {
         assert_eq!(end, 16);
         assert!(canvas.pixels.iter().any(|&p| p == 5));
         assert!(canvas.pixels.iter().all(|&p| p == 0 || p == 5));
+    }
+
+    #[test]
+    fn utf8_text_is_one_glyph_per_character() {
+        assert_eq!(latin9('å'), 0xe5);
+        assert_eq!(latin9('Ö'), 0xd6);
+        assert_eq!(latin9('€'), 0xa4);
+        assert_eq!(latin9('日'), b'?');
+        assert_eq!(text_width("Sjöfärd"), 7 * GLYPH_WIDTH);
+        let mut buffer = [0u32; 32 * 16];
+        let mut canvas = Canvas::new(&mut buffer, 32, 16).unwrap();
+        assert_eq!(canvas.text(0, 0, "åä", 5), 2 * GLYPH_WIDTH as i32);
     }
 
     #[test]
