@@ -27,7 +27,7 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering, fence};
 
 use crate::e1000::{Delivery, ISR, MAX_INTERFACES};
-use crate::{apic, cpu, memory, pci, timer};
+use crate::{cpu, memory, pci, timer};
 
 pub const VENDOR_REALTEK: u16 = 0x10ec;
 pub const DEVICE_IDS: &[u16] = &[0x8168, 0x8161];
@@ -330,7 +330,7 @@ impl Rtl8168 {
         let mut reason = "no interrupt path passed its self-test";
         if device.find_capability(0x05).is_some() {
             match crate::msi::allocate(isr, self.index) {
-                Some(vector) if device.enable_msi(vector, apic::id()) => {
+                Some(vector) if device.enable_msi(vector, crate::hal::interrupt_target()) => {
                     if self.self_test(|| crate::msi::count(vector)) {
                         return Ok(self.finish_interrupts(Delivery::Msi(vector)));
                     }
@@ -347,7 +347,7 @@ impl Rtl8168 {
         }
         // Legacy INTx: the firmware's interrupt line (a hint) and the PCI pins an Intel/QEMU
         // chipset routes to the I/O APIC (GSI 16-23).
-        let (first, end) = crate::ioapic::gsi_range();
+        let (first, end) = crate::hal::gsi_range();
         let candidates = crate::msi::intx_candidates(device.interrupt_line());
         for (position, &gsi) in candidates.iter().enumerate() {
             if gsi == u32::MAX || gsi == 0 || gsi < first || gsi >= end || candidates[..position].contains(&gsi) {

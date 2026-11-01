@@ -51,7 +51,7 @@
 //! and teardown. **Everything beyond what QEMU's synthetic codecs exercise is unverified on real hardware.**
 
 use crate::audio::PcmRing;
-use crate::{apic, cpu, memory, msi, paging, pci, timer};
+use crate::{cpu, memory, msi, paging, pci, timer};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub const MAX_CONTROLLERS: usize = 4;
@@ -1250,7 +1250,7 @@ impl Hda {
         let mut reason = "no interrupt path passed its self-test";
         if device.find_capability(0x05).is_some() {
             match msi::allocate(isr, index) {
-                Some(vector) if device.enable_msi(vector, apic::id()) => {
+                Some(vector) if device.enable_msi(vector, crate::hal::interrupt_target()) => {
                     if self.self_test(|| msi::count(vector)) {
                         return Ok(Delivery::Msi(vector));
                     }
@@ -1266,7 +1266,7 @@ impl Hda {
         }
         // Legacy INTx: the firmware's line (a hint on APIC systems) and the pins an Intel or QEMU chipset
         // routes to the I/O APIC (GSI 16-23), probed because the ACPI routing table is not read.
-        let (first, end) = crate::ioapic::gsi_range();
+        let (first, end) = crate::hal::gsi_range();
         let candidates = crate::msi::intx_candidates(device.interrupt_line());
         for (position, &gsi) in candidates.iter().enumerate() {
             if gsi == u32::MAX || gsi == 0 || gsi < first || gsi >= end || candidates[..position].contains(&gsi) {

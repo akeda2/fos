@@ -29,9 +29,10 @@ macro_rules! println {
 include!("main_x86_64.rs");
 #[cfg(target_arch = "aarch64")]
 include!("main_aarch64.rs");
+// The platform services every driver may use (`hal.rs`); `tools/check_hal.py` keeps drivers off the arch-private modules.
+mod hal;
+pub use hal::{cpu, msi, paging, pci_config, timer};
 #[cfg(target_arch = "aarch64")]
-pub use arch::aarch64::timer;
-#[cfg(target_arch = "aarch64")]
-pub use arch::aarch64::{cpu, gic, msi, paging, pci_config};
+pub use arch::aarch64::gic;
 #[cfg(target_arch = "aarch64")]
 use usb_kbd as usb_hid;

@@ -1267,7 +1267,7 @@ impl E1000 {
 
         if prefer_msix && device.id == 0x10d3 && device.find_capability(0x11).is_some() {
             if let Some(vector) = crate::msi::allocate(isr, self.index) {
-                if device.enable_msix(vector, crate::apic::id()) {
+                if device.enable_msix(vector, crate::hal::interrupt_target()) {
                     // 82574 MSI-X: IVAR maps receive queue 0, transmit queue 0 and "other" causes
                     // to vector 0 (each field: vector in the low bits, a valid bit above it).
                     write(self.registers, REG_IVAR, 0x8000_0000 | 0x8 | (0x8 << 8) | (0x8 << 16));
@@ -1286,7 +1286,7 @@ impl E1000 {
 
         if device.find_capability(0x05).is_some() {
             match crate::msi::allocate(isr, self.index) {
-                Some(vector) if device.enable_msi(vector, crate::apic::id()) => {
+                Some(vector) if device.enable_msi(vector, crate::hal::interrupt_target()) => {
                     if self.self_test(false, || crate::msi::count(vector)) {
                         self.delivery_set(Delivery::Msi(vector));
                         return Ok(Delivery::Msi(vector));
@@ -1303,7 +1303,7 @@ impl E1000 {
 
         // Legacy INTx: the PCI pins an Intel/QEMU chipset routes to the I/O APIC (GSI 16-23), then the firmware's
         // interrupt line (a hint).
-        let (first, end) = crate::ioapic::gsi_range();
+        let (first, end) = crate::hal::gsi_range();
         let candidates = crate::msi::intx_candidates(device.interrupt_line());
         for (position, &gsi) in candidates.iter().enumerate() {
             if gsi == u32::MAX || gsi == 0 || gsi < first || gsi >= end || candidates[..position].contains(&gsi) {
