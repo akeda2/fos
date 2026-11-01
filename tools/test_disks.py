@@ -122,10 +122,11 @@ def main():
             check("Removed disk2/slashw" in run("rm disk2/slashw"), "`rm disk2/NAME` removes it", "")
             check("no such file" in run("cat disk1/missing"), "a missing file in disk1/NAME is reported", "")
             check("no FOSFS data partition" in run("cat @nothere/x"), "an unknown label in @LABEL/NAME is reported", "")
-            big = run("ls")
+            big = run("ls bin")
             size = [line.split()[1] for line in big.splitlines() if line.startswith("router")][0]
             check(int(size) > 65536, "(the router tape is larger than the shell's 64 KiB file buffer)", big)
-            check("Copied router" in run("copy disk1 router @backup"), "a file larger than 64 KiB copies too", "")
+            copied = run("copy disk1/bin/router @backup/router")
+            check("Copied bin/router" in copied, "a file larger than 64 KiB copies too", copied)
             check(f"router" in run("ls @backup") and size in run("ls @backup"), "and arrives with the same length", "")
             wire.send(guest, TAG_DATA, b"shutdown\n")
         finally:

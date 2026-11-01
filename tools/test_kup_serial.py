@@ -116,7 +116,7 @@ def main():
                 mark = len(text())
                 write(b"\r")
                 try:
-                    sender.push(read, write, b"x", log=lambda message: None, shell_command=b"recv BAD")
+                    sender.push(read, write, b"x", log=lambda message: None, shell_command=b"recv " + b"x" * 60)
                     check(False, "an invalid file name is refused")
                 except SystemExit as refusal:
                     check("could not be written" in str(refusal), "an invalid file name is refused by the machine", str(refusal))

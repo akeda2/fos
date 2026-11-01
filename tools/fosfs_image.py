@@ -1,5 +1,5 @@
 """Host-side access to the FOSFS volume of a disk image, for tests that stage files before boot or read them back
-after. Handles v3 (flat) and v4 (folders; paths come back as `dir/name`). Files are added to the root."""
+after. Handles v3 (flat) and v4 (folders; paths come back as `dir/name`). Files are added to the root (v4: `settings` and `debug` into its settings/ folder)."""
 
 import struct
 import zlib
@@ -90,6 +90,16 @@ def add(image, new_files: dict) -> None:
             struct.pack_into("<QQQ", data, slot + 4, end, len(body), sectors)
             data[slot + 28:slot + 28 + len(name)] = name.encode()
             continue
+        # A v4 volume keeps `settings` and `debug` in its settings/ folder, which wins over a bare root name (and a root file
+        # `settings` would collide with the folder): stage them there, replacing the image's own copy.
+        parent = 0
+        if name in ("settings", "debug"):
+            folder = next((number for number, at in _v4_entries(data, first) if data[at] == 2 and bytes(data[at + 40:at + 40 + data[at + 1]]) == b"settings"), None)
+            if folder is not None:
+                parent = folder + 1
+                for _, at in _v4_entries(data, first):
+                    if data[at] in (1, 2) and struct.unpack_from("<I", data, at + 24)[0] == parent and bytes(data[at + 40:at + 40 + data[at + 1]]) == name.encode():
+                        data[at:at + 128] = bytes(128)
         end, slot = struct.unpack_from("<Q", data, first * SECTOR + 20)[0], None
         for _, at in _v4_entries(data, first):
             if data[at] in (1, 2):
@@ -102,6 +112,7 @@ def add(image, new_files: dict) -> None:
         entry = bytearray(128)
         entry[0], entry[1], entry[2] = 1, len(name), 1 if sectors else 0
         struct.pack_into("<QQ", entry, 8, len(body), sectors)
+        struct.pack_into("<I", entry, 24, parent)
         entry[40:40 + len(name)] = name.encode()
         if sectors:
             struct.pack_into("<QI", entry, 88, end, sectors)

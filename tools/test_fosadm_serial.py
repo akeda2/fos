@@ -102,7 +102,7 @@ def main() -> None:
             check("tape hello: ok" in out and "verified by content" in out, "deploy: a changed tape goes over `recv`", out)
             out = fosadm(port, "deploy", "--from", str(source), "--force-kernel", "-y")
             check("kernel: running" in out and "FELL BACK" not in out, "deploy: the kernel goes over `kup serial` and runs", out)
-            out = fosadm(port, "run", "serial", "ls")
+            out = fosadm(port, "run", "serial", "ls bin")
             check(f"hello" in out and str(len(wanted)) in out, "the new tape survived the reboot", out)
 
             # --content: a rebuild of the same size is seen by its SHA-256 (the kernel's `sha256` command), not by sizes
