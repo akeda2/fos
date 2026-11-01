@@ -578,3 +578,11 @@ use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limi
 
 - In `docs/fosfs-v4.md`; built: v4 on disk (`format diskN v4`, `build_image.py --fosfs 4`), real folders, per-entry CRC, backup superblock, mtime, 3-extent files. Mount table built (`kernel/src/mounts.rs`, `fstab`, `mount`; FOSFS and exFAT volumes, exFAT matched by its root label entry, any case, `Fs::label`); exFAT subfolders built (`Fs::enter/mkdir/remove_dir`). v4 is now the default (`make image`, `format`), tapes in `bin/`, settings in `settings/`, bare names kept as fallbacks. Settings overlay and the bounded boot wait for a mounted config volume are built. `install` copies v4 with its folders. The aarch64 image is v4 and loads `fstab` at boot. Wildcards in `ls`/`cp`/`mv`/`rm` are built (`test-wildcards`); `mv` renames in place on v4 and inside one exFAT volume (`Fs::rename`/`move_to`, `test-wildcards`, host `exfat_rename_and_move` with `fsck.exfat`); `cp -r` is built; `mv` of a folder across volumes copies, verifies and removes file by file. exFAT mounts and `@LABEL/path` work for reads, writes, `ls`, `rm`, `mkdir` (`test-mounts`), and a `settings` mount is read at boot (`test-v4-boot`); `label` sets exFAT labels (`Fs::set_label`); `mv` between an exFAT mount and another volume copies.
 - Put aside until timing on a real 16 GB stick says they matter: an allocation bitmap or mount-time free-space cache (each write rescans the directory), and 4 KiB allocation units. v4 has not run on real hardware yet.
+
+## Open after ebb (editor tape)
+
+- A gfx-canvas renderer for ebb (proportional or bigger font, real colours) beside the console one.
+- A scroll wheel in the tape ABI (the mouse events carry position and button only).
+- Find/replace, syntax colours, multiple files, files larger than RAM headroom (the whole file is read and written at once), ebba's piece tree.
+- Shift/Ctrl+arrow from the local keyboard (selection uses Ctrl-T select mode there); a config file for key bindings and tab width.
+- The dedicated hex editor (ebba's hex view was skipped on purpose).

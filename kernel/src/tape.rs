@@ -717,6 +717,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         );
     }
     crate::gpio::tape_ended();
+    crate::framebuffer::reset_attributes();
     crate::framebuffer::gfx_close(); // a tape that ended (or was aborted) without closing gives the screen back
     if crate::tasks::count() == 0 {
         clear_fp_level();

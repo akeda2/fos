@@ -48,6 +48,7 @@ their own.
 | --- | --- |
 | `hello`, `calc`, `memtest` | The smallest example; an RPN calculator; a RAM tester and soak test. |
 | `ed` | A line editor with cursor keys; saves to FOSFS, FAT32 or exFAT. |
+| `ebb` | A full-screen text editor (`tape run ebb NAME`): selection, undo, clipboard, mouse, colours via the console SGR support; `crates/edit-core` is its engine. |
 | `net-chat`, `ip-chat`, `telnet` | Raw-Ethernet chat, IPv4/UDP chat, a Telnet client. |
 | `fterm` | Serial terminal on COM2-COM4 (`run fterm list`, `run fterm 1 115200 8n1`); Ctrl-A x exits (an fterm inside another one: Ctrl-A a x leaves the inner, or give it `prefix=b` so Ctrl-B is its command key). `run fterm telnet IP|NAME [PORT] [dns IP]` (names go through DNS; the Telnet window is the real console size) and `run fterm net NAME\|MAC` do Telnet and `term net` with the same keys. A bare `run fterm` opens a settings panel (P picks a machine from the announced ones, C connects, W saves `fterm.cfg`, `run fterm @fterm.cfg` repeats it). USB serial adapters (the Moxa UPort 1110, which needs `moxa-1110.fw` on a FOSFS volume and a `usb rescan`, and Prolific PL2303 cables) appear as `USB1`... after the UARTs. |
 | `fscheck` | Reads a byte range of a file with ABI 29 `fs_read_at` (`tape run fscheck NAME OFFSET LENGTH`; `make test-fs-read-at`). |

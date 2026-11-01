@@ -1,0 +1,9 @@
+[package]
+name = "edit-core"
+version = "0.1.0"
+edition = "2024"
+description = "The text engine of the ebb editor: gap buffer, undo log, wrapped layout, selection; no allocation, no tape ABI"
+
+[lib]
+name = "edit_core"
+path = "src/lib.rs"

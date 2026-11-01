@@ -897,6 +897,7 @@ pub fn run_many(tapes: &[(u64, &str)]) -> Result<(), &'static str> {
     unsafe { fos_task_switch(&mut state.main_sp, state.sp[0]) };
     unsafe { RUNNING = false };
     state.active = false;
+    crate::framebuffer::reset_attributes();
     crate::framebuffer::gfx_close();
     close_extra_screens();
     crate::gpio::tape_ended();

@@ -1,0 +1,23 @@
+[package]
+name = "ebb-tape"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "ebb_tape"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ebb"
+path = "src/main.rs"
+
+[dependencies]
+edit-core = { path = "../../crates/edit-core" }
+tape-rt = { path = "../../crates/tape-rt" }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = 2
+strip = "symbols"
