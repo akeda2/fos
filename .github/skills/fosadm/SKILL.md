@@ -21,6 +21,7 @@ python3 tools/fosadm.py --iface IFACE hosts                 # discover (forgets 
 python3 tools/fosadm.py --iface IFACE status [-v] [--sizes] [HOST...] # kernel slot, tapes vs build (SHA-256; --sizes: sizes only)
 python3 tools/fosadm.py --iface IFACE deploy [HOST...]      # plan, then kernel (KUP) + changed tapes
 ```
+`deploy` handles the hosts in parallel over Ethernet (lines are tagged `[host]`; `--one-by-one` restores the old order).
 `deploy` options: `--dry-run` (plan only), `-y` (no prompt), `--tapes-only`, `--kernel-only`,
 `--sizes` (plan by size, not SHA-256; deploy compares content by default), `--force-kernel` (size matches but push anyway), `--add-missing`, `--from DIR` (a release folder).
 Also: `run HOST cmd...`, `put HOST FILE [NAME] [--disk N]`, `shell HOST`, `bootcode HOST [--update]`.
