@@ -220,11 +220,11 @@ extern "C" fn api_wait_for_event() {
         spun(Spin::SerialOut, begin);
         return;
     }
-    if crate::uart::any_open() {
+    if crate::serialports::any_open() {
         // A polled UART: its 16-byte FIFO overflows in 1.4 ms at 115200 baud, a tick later would be too late.
         let until = begin + 100;
         while timer::micros() < until {
-            crate::uart::poll();
+            crate::serialports::poll();
             core::hint::spin_loop();
         }
         spun(Spin::Uart, begin);
@@ -451,36 +451,36 @@ extern "C" fn api_console_size() -> u32 {
     crate::framebuffer::size().map_or(0, |(columns, rows)| ((columns as u32) << 16) | rows as u32 & 0xffff)
 }
 extern "C" fn api_serial_count() -> usize {
-    crate::uart::count()
+    crate::serialports::count()
 }
 extern "C" fn api_serial_info(number: usize, out: *mut fosfor_abi::tape::SerialInfo) -> u32 {
     let mut info = fosfor_abi::tape::SerialInfo::default();
-    let found = crate::uart::info(number, &mut info);
+    let found = crate::serialports::info(number, &mut info);
     if found && !out.is_null() {
         unsafe { out.write(info) };
     }
     u32::from(found)
 }
 extern "C" fn api_serial_open(number: usize, baud: u32, format: u32) -> i32 {
-    crate::uart::open(number, baud, format)
+    crate::serialports::open(number, baud, format)
 }
 extern "C" fn api_serial_close(number: usize) {
-    crate::uart::close(number);
+    crate::serialports::close(number);
 }
 extern "C" fn api_serial_read(number: usize, buffer: *mut u8, capacity: usize) -> usize {
-    crate::uart::read(number, unsafe { core::slice::from_raw_parts_mut(buffer, capacity) })
+    crate::serialports::read(number, unsafe { core::slice::from_raw_parts_mut(buffer, capacity) })
 }
 extern "C" fn api_serial_write(number: usize, data: *const u8, length: usize) -> usize {
-    crate::uart::write(number, unsafe { core::slice::from_raw_parts(data, length) })
+    crate::serialports::write(number, unsafe { core::slice::from_raw_parts(data, length) })
 }
 extern "C" fn api_serial_lines(number: usize) -> u32 {
-    crate::uart::lines(number)
+    crate::serialports::lines(number)
 }
 extern "C" fn api_serial_set_lines(number: usize, lines: u32) {
-    crate::uart::set_lines(number, lines);
+    crate::serialports::set_lines(number, lines);
 }
 extern "C" fn api_serial_break(number: usize, on: u32) {
-    crate::uart::set_break(number, on != 0);
+    crate::serialports::set_break(number, on != 0);
 }
 extern "C" fn api_audio_set_capture_ring(bytes: u64) {
     crate::usb_audio::set_capture_ring(bytes); // the capture ring belongs to whichever device starts next
@@ -723,7 +723,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         clear_fp_level();
     }
     crate::debug::set_tape_running(false);
-    crate::uart::close_all();
+    crate::serialports::close_all();
     crate::audio::stop_for_tape(); // a tape that returns (or was aborted) must not leave an audio stream running
     term::set_tape_mode(false);
     term::nic_multicast_clear_all();

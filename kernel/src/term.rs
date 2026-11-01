@@ -550,7 +550,7 @@ fn tape_service() {
         tape_input_push(TAPE_ABORT);
     }
     drain_nics_to_fifo();
-    crate::uart::poll();
+    crate::serialports::poll();
     crate::netfs::announce();
     flush();
     crate::serial::pump();

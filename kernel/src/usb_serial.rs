@@ -1,6 +1,6 @@
 //! USB serial adapters: the generic layer. A *chip driver* (`usb_serial_ti.rs` so far) knows one family of
 //! adapter chips; this file knows how to talk to a device over either host controller (EHCI or xHCI), keeps the
-//! receive ring and the statistics, and presents the ports to `uart.rs`, which numbers them after the built-in
+//! receive ring and the statistics, and presents the ports to `serialports.rs`, which numbers them after the built-in
 //! 16550 UARTs so that `serial_*` calls, `fterm` and friends work on them unchanged.
 //!
 //! What a chip driver has to supply (the `Chip` trait): whether it claims a vendor/product, which configuration
@@ -8,7 +8,7 @@
 //! set the modem lines and break. Bytes on the bulk endpoints are taken to be raw serial data (true for the TI
 //! TUSB3410 and for FTDI-style chips that frame nothing; a chip that frames its data would filter in `rx`).
 //!
-//! Receiving is polled: `poll()` (called wherever `uart::poll` is) does one bulk IN transfer per open port. These
+//! Receiving is polled: `poll()` (called by `serialports::poll`, wherever the UARTs are polled) does one bulk IN transfer per open port. These
 //! are blocking transfers; the chip must therefore make an idle IN end quickly with a short packet (the TI chip's
 //! timeout mode does), otherwise an empty IN costs the host controller's transfer timeout.
 

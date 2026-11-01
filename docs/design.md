@@ -1164,7 +1164,7 @@ unless a reset is wanted.
 `Chip` trait (claims a vendor/product, picks the configuration, runs a one-time `attach` such as a firmware download, then `open`, `close`,
 `set_lines`, `set_break`); the generic layer finds the bulk endpoints, owns the DMA bounce page, the receive ring and the statistics, and
 works on **EHCI** (blocking bulk OUT; bulk IN polled with a 10 ms limit, a timeout meaning "no data") and **xHCI** (blocking bulk OUT; one
-IN TRB kept queued, completions arriving in `background_event`, like `usb_midi`). `uart.rs` numbers the USB ports after the 16550s
+IN TRB kept queued, completions arriving in `background_event`, like `usb_midi`). `serialports.rs` numbers the USB ports after the 16550s
 (`SERIAL_KIND_USB`, name `USB1`...), so `serial_*`, `fterm list` and `fterm N 115200 8n1` work unchanged. No shell on a USB port yet
 (`serial-shell` ignores them). Another simple chip (FTDI, CP210x, CH341, PL2303, CDC-ACM) is one more `impl Chip` and an entry in `CHIPS`.
 
