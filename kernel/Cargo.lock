@@ -11,6 +11,10 @@ name = "fosfor-fat"
 version = "0.1.0"
 
 [[package]]
+name = "fosfor-hal"
+version = "0.1.0"
+
+[[package]]
 name = "fosfor-hid"
 version = "0.1.0"
 
@@ -20,9 +24,18 @@ version = "0.1.0"
 dependencies = [
  "fosfor-abi",
  "fosfor-fat",
+ "fosfor-hal",
  "fosfor-hid",
+ "fosfor-kernel-core",
  "fosfor-shell",
  "fosfor-tape-sync",
+]
+
+[[package]]
+name = "fosfor-kernel-core"
+version = "0.1.0"
+dependencies = [
+ "fosfor-hal",
 ]
 
 [[package]]

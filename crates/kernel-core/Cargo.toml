@@ -1,0 +1,14 @@
+[package]
+name = "fosfor-kernel-core"
+version = "0.1.0"
+edition = "2024"
+
+# The part of the kernel that does not care which core it runs in (docs/big-kernel.md, stage 1b): filesystems first, then the
+# disk layout code, NIC and storage drivers. It reaches the machine only through `fos-hal`'s `Platform`, so it builds for the
+# embedded kernel, for the large one and for the host, where its unit tests run it against a RAM disk. `no_std`, no allocation.
+[lib]
+name = "kernel_core"
+path = "src/lib.rs"
+
+[dependencies]
+fosfor-hal = { path = "../fos-hal" }

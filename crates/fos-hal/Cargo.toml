@@ -1,0 +1,11 @@
+[package]
+name = "fosfor-hal"
+version = "0.1.0"
+edition = "2024"
+
+# What the shared kernel code (`crates/kernel-core`) may ask of the machine it runs on: block devices, the wall clock and
+# the console. A core (the embedded `fosfor-kernel`, later the large one) installs one `Platform` at boot; host unit tests
+# install a mock. `no_std`, no allocation. docs/big-kernel.md, stage 1b.
+[lib]
+name = "fos_hal"
+path = "src/lib.rs"

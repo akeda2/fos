@@ -17,7 +17,7 @@ mod clock;
 mod crash;
 mod fatvol;
 mod formatshell;
-mod fosfs;
+mod platform;
 mod framebuffer;
 mod gpt;
 mod lineedit;
@@ -119,6 +119,7 @@ const PI4_PL011: u64 = 0xfe20_1000;
 /// The loader jumps here (through `_start`, arch/aarch64/mod.rs) with the BootInfo pointer.
 #[unsafe(no_mangle)]
 pub extern "C" fn kmain(info: *const BootInfo) -> ! {
+    platform::install();
     let info = unsafe { &*info };
     let screen = &info.framebuffer;
     arch::aarch64::early::init(screen.base, screen.stride, screen.width, screen.height);

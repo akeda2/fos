@@ -22,7 +22,7 @@ mod ohci;
 mod fatvol;
 mod formatshell;
 mod fault;
-mod fosfs;
+mod platform;
 mod font_data;
 mod gpt;
 mod hda;
@@ -132,6 +132,7 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
 
 #[unsafe(no_mangle)]
 pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
+    platform::install();
     serial::init();
     println!();
     println!("Fosfor OS kernel (milestone M4): running in 64-bit long mode.");
