@@ -22,6 +22,8 @@ macro_rules! println {
     ($($argument:tt)*) => { $crate::print(format_args!("{}\n", format_args!($($argument)*))) };
 }
 pub use hal::print;
+// Shared code (crates/kernel-core): modules that need nothing but `fos_hal`; they keep their `crate::fosfs` paths.
+pub use kernel_core::fosfs;
 
 // One crate root, two entry files: each is spliced in here, so `crate::println!`, `crate::print` and the module paths
 // look the same to every driver. The x86-64 file is the whole kernel as it was; the aarch64 one is the Raspberry Pi

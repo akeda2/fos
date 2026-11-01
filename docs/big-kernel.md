@@ -158,3 +158,12 @@ Done, one commit each, all with the x86 and aarch64 kernels building and the mat
 Left for 1b: `netfs` -> `fosfs`/`tape_fs`/`config`/`netservice` and `nicshell` -> `netfs` are core-side code and move with the shell;
 the USB attach path; turning `hal` into a trait with the embedded core as its implementation; the library crate itself. Not covered
 by any test: USB serial adapters, the Pi 4 console and GIC paths (hardware only).
+
+## Stage 1b status (branch `kernel-core-1b`)
+
+- `crates/fos-hal`: the `Platform` trait (block read/write, wall clock, console print), installed once by `kernel/src/platform.rs`
+  at the start of `kmain`. Slow paths only; port I/O and `micros` stay inline in the platform.
+- `crates/kernel-core`: modules that need nothing but `fos_hal`. First slice: `fosfs` (moved unchanged; the kernel re-exports it
+  as `crate::fosfs`). Host tests run it on a RAM disk (`make test`).
+- Size: x86 kernel 1,167,120 -> 1,168,008 bytes. Verified: `make test`, `test-fosfs4`, `test-v4-boot`, `test-mounts`, aarch64 build.
+- Next: `gpt`, `fatvol`, `mounts`, `lineedit` (need a timer hook), then NICs, storage, USB, audio.

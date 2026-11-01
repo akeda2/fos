@@ -269,6 +269,7 @@ test: image
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-rec/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/tape-net/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/tape-http/Cargo.toml
+	cargo +nightly-2026-09-13 test --manifest-path crates/kernel-core/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/smb/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-decode/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-wire/Cargo.toml

@@ -18,6 +18,8 @@ fosfor-fat = { path = "../crates/fat" }
 fosfor-tape-sync = { path = "../crates/tape-sync" }
 fosfor-shell = { path = "../crates/shell" }
 fosfor-hid = { path = "../crates/hid" }
+fosfor-hal = { path = "../crates/fos-hal" }
+fosfor-kernel-core = { path = "../crates/kernel-core" }
 
 # Deliberate-fault builds for the exception tests (make test-faults): each one
 # provokes one kind of fault right after boot so the report can be checked.
