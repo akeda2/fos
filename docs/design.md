@@ -1560,7 +1560,7 @@ reads. `make test-loopback` plays a WAV through `loop0` and records it with `rec
 
 ## Media player: `fosplay` (tapes/fosplay, crates/smb, crates/audio-decode, crates/tape-ip)
 
-`fosplay` plays FLAC, MP3, Ogg Opus (`.opus`: Ogg pages and seeking in `audio-decode`, libopus through `opus-codec`; 48 kHz out, pre-skip and end trim, OpusTags, bisection seek with 80 ms pre-roll; no chained streams, no output gain) and WAV (PCM 8-32 bit and float, LIST/INFO tags, exact seek) from a guest SMB share or from FOSFS files, hard-float, x86 and Pi 4.
+`fosplay` plays FLAC, MP3, Ogg Opus (`.opus`: Ogg pages and seeking in `audio-decode`, libopus through `opus-codec`; 48 kHz out, pre-skip and end trim, OpusTags, bisection seek with 80 ms pre-roll; no chained streams, no output gain) WAV (PCM 8-32 bit and float, LIST/INFO tags, exact seek) and Monkey's Audio (`.ape`: `audio-decode/src/ape.rs`, below) from a guest SMB share or from FOSFS files, hard-float, x86 and Pi 4.
 
 - **TCP** (`crates/tape-ip/src/tcp.rs`, `tape_net::Socket`): active open with an MSS option, in-order receive only, a
   retransmit timer and `reopen`; `make test-tcp`.
@@ -1576,6 +1576,8 @@ reads. `make test-loopback` plays a WAV through `loop0` and records it with `rec
 - **Playlists**: `play //HOST/SHARE[/FILE|DIR]` (a directory plays its `.flac`/`.mp3`, sorted, dot-names skipped) or
   `play NAME...`. The device stays open across tracks with the same first-choice rate. Keys: `n` next, `p` previous, space
   pause, `f`/`b` jump 10 s forward/back, `q`/Escape stop. `make test-fosplay` (loop0 + `record`).
+
+`.ape` (Monkey's Audio, format versions 3990-3999 as written by every encoder since 2004; levels fast to insane; mono/stereo, 8/16/24 bit; 24-bit untested on a real file) is decoded natively in `crates/audio-decode/src/ape.rs`, no allocation, written from the format and checked sample for sample against ffmpeg on a 3.99 "high" file (CRC clean; seeking compared too). Frames are independent (filters and predictor reset), so a seek decodes only the target's frame (<= 1.7 s of audio) from the seek table. The 32-bit-word byte order means a frame may start mid-word: `start_frame` aligns down and skips. A frame whose CRC fails is counted in `crc_errors`, not fatal. Tags from the APEv2 footer. Cost grows with level (the insane filters are 1280 taps): about 100x real time at "high" on a 2020s host, so the slow machines are untested at levels 4000/5000. Not supported: files older than 3.99, more than two channels. Test: `cargo test --lib ape` in `crates/audio-decode` (a 14 KB cut of a real file plus ffmpeg's PCM CRCs).
 - **Tags and seeking**: `Decode::tags()` gives title/artist/album (Vorbis comments; ID3v2.2-2.4 with an ID3v1 fallback) and
   the tape prints them per track. `Decode::seek(sample)` lands on a block start: FLAC starts from the nearest SEEKTABLE
   point (or the current position when going forward), then decodes up to the block, so it is exact to a block; MP3 jumps to

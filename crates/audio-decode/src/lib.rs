@@ -5,6 +5,7 @@
 //! final scaling to `f32`; MP3 (`mp3`), through the `nanomp3-core` crate, and Ogg Opus (`opus`: the Ogg side only, the codec is the tape's). All implement `Decode`.
 #![cfg_attr(not(test), no_std)]
 
+pub mod ape;
 pub mod flac;
 pub mod mp3;
 pub mod opus;

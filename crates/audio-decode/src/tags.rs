@@ -99,7 +99,11 @@ impl Tags {
     /// Stores a Vorbis comment `NAME=value` (the name in any case).
     pub fn set_vorbis(&mut self, comment: &[u8]) {
         let Some(equals) = comment.iter().position(|&b| b == b'=') else { return };
-        let (name, value) = (&comment[..equals], &comment[equals + 1..]);
+        self.set_named(&comment[..equals], &comment[equals + 1..]);
+    }
+
+    /// Stores UTF-8 `value` when `name` (in any case) is title, artist or album: Vorbis comments and APEv2 items.
+    pub fn set_named(&mut self, name: &[u8], value: &[u8]) {
         let field = if name.eq_ignore_ascii_case(b"title") {
             &mut self.title
         } else if name.eq_ignore_ascii_case(b"artist") {
