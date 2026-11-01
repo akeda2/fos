@@ -63,8 +63,7 @@ pub fn release_port(controller: &mut Controller, port: u8, route: Option<u32>) {
             *buffer = report;
         }
     }
-    crate::usb_midi::release(controller, port, route);
-    crate::usb_pointer::release(controller, port, route);
+    crate::usb_class::release_all(controller, port, route);
     // The slots go first: the controller must stop writing reports before their buffer is handed back.
     match route {
         Some(route) => controller.release_route_slots(port, route),
@@ -175,7 +174,7 @@ fn probe_all_once() -> usize {
                 if controller.port_status(port) & 1 != 0 && !controller.port_connect_changed(port) {
                     continue;
                 }
-                crate::usb_serial::xhci_departed(index, port);
+                crate::usb_class::xhci_departed_all(index, port);
                 usb_storage::mark_xhci_port_stale(index, port); // before the slots go: nothing may use them again (a hub's children too)
                 crate::usb_hub::forget_hubs_on_port(index, port); // the hub, and any hub behind it, is gone with its port
                 release_port(controller, port, None);
@@ -429,7 +428,7 @@ pub fn background_event(controller: &mut Controller, event: &Trb) {
     {
         return;
     }
-    if crate::usb_midi::background_event(controller, event) || crate::usb_pointer::background_event(controller, event) || crate::usb_serial::background_event(controller, event) {
+    if crate::usb_class::background_event(controller, event) {
         return;
     }
     let keyboards = unsafe { &mut *core::ptr::addr_of_mut!(KEYBOARDS) };
@@ -513,12 +512,11 @@ fn probe_all_ehci() -> usize {
                 // The root port itself changed: a hub on it is gone with everything behind it.
                 if let Some(hub_address) = controller.hub_address_on_port(port) {
                     usb_storage::mark_ehci_hub_stale(index, hub_address, 0);
-                    crate::usb_audio::ehci_departed(index, hub_address, 0);
-                    crate::usb_serial::ehci_departed(index, hub_address, 0);
+                    crate::usb_class::ehci_departed_all(index, hub_address, 0);
                     controller.forget_hub(port);
                 } else {
-                    crate::usb_audio::ehci_departed(index, 0, 0);
-                    crate::usb_serial::ehci_root_departed(index, port);
+                    crate::usb_class::ehci_departed_all(index, 0, 0);
+                    crate::usb_class::ehci_root_departed_all(index, port);
                 }
                 // It was unplugged, or unplugged and plugged back in (a bumped cable, a stick moved to another machine and
                 // returned). Forget the claim and look at the port afresh; a disk that comes back is recognised in
@@ -605,8 +603,7 @@ fn rescan_ehci_hub(controller_index: usize, controller: &mut ehci::Controller, p
         crate::println!("USB: EHCI {:02x}:{:02x}.{} hub port {port}.{hub_port}: its device was unplugged or replugged; looking at the port again.",
             controller.pci.bus, controller.pci.device, controller.pci.function);
         usb_storage::mark_ehci_hub_stale(controller_index, hub_address, hub_port);
-        crate::usb_audio::ehci_departed(controller_index, hub_address, hub_port);
-        crate::usb_serial::ehci_departed(controller_index, hub_address, hub_port);
+        crate::usb_class::ehci_departed_all(controller_index, hub_address, hub_port);
         let removed = controller.remove_keyboards_behind(hub_address, hub_port);
         drop_ehci_keyboard_entries(controller_index, removed);
     }

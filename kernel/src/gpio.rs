@@ -93,7 +93,6 @@ fn state() -> &'static mut State {
 
 #[cfg(target_arch = "aarch64")]
 const PI4_GPIO: u64 = 0xfe20_0000;
-#[cfg(target_arch = "aarch64")]
 
 /// Finds the bank on first use (the page tables must exist by then).
 fn bank() -> &'static mut State {
