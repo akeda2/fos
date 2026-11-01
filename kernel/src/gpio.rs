@@ -94,7 +94,6 @@ fn state() -> &'static mut State {
 #[cfg(target_arch = "aarch64")]
 const PI4_GPIO: u64 = 0xfe20_0000;
 #[cfg(target_arch = "aarch64")]
-const PI4_GIC_DISTRIBUTOR: u64 = 0xff84_1000;
 
 /// Finds the bank on first use (the page tables must exist by then).
 fn bank() -> &'static mut State {
@@ -103,7 +102,7 @@ fn bank() -> &'static mut State {
         state.started = true;
         state.bank = Bank::None;
         #[cfg(target_arch = "aarch64")]
-        if crate::arch::aarch64::gic::bases().0 == PI4_GIC_DISTRIBUTOR {
+        if crate::hal::is_pi4() {
             crate::paging::map_device(PI4_GPIO, 0x1000);
             state.bank = Bank::Pi;
         }

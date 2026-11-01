@@ -35,3 +35,21 @@ pub fn interrupt_target() -> u32 {
 pub fn gsi_range() -> (u32, u32) {
     crate::ioapic::gsi_range()
 }
+
+/// True on a Raspberry Pi 4, recognised by its GIC-400 distributor address (aarch64).
+#[cfg(target_arch = "aarch64")]
+pub fn is_pi4() -> bool {
+    crate::arch::aarch64::gic::bases().0 == 0xff84_1000
+}
+
+/// Routes interrupt `intid` to `handler` (level or edge triggered) on the boot CPU (aarch64).
+#[cfg(target_arch = "aarch64")]
+pub fn register_irq(intid: u32, level: bool, handler: fn(u32)) {
+    crate::arch::aarch64::gic::register(intid, level, handler)
+}
+
+/// Interrupts taken so far, for drivers that wait for one (aarch64).
+#[cfg(target_arch = "aarch64")]
+pub fn irq_ticks() -> u64 {
+    crate::arch::aarch64::gic::irq_ticks()
+}

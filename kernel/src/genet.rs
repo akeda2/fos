@@ -313,7 +313,7 @@ fn dma_enable(on: bool) {
 
 /// Starts the Pi 4's Ethernet; returns true when a MAC is up (the link may still be down: see `status`).
 pub fn init() -> bool {
-    if crate::gic::bases().0 != 0xff84_1000 {
+    if !crate::hal::is_pi4() {
         return false;
     }
     crate::paging::map_device(BASE, SIZE);
@@ -430,7 +430,7 @@ pub fn init() -> bool {
     // `receive` in the foreground.
     write(INTRL2_MASK_SET, 0xffff_ffff);
     write(INTRL2_CLEAR, 0xffff_ffff);
-    crate::gic::register(IRQ_INTID, true, interrupt);
+    crate::hal::register_irq(IRQ_INTID, true, interrupt);
     write(INTRL2_MASK_CLEAR, IRQ_RXDMA);
     true
 }
@@ -446,7 +446,7 @@ fn interrupt(_intid: u32) {
     use core::sync::atomic::Ordering::Relaxed;
     static TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     static BURST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    let now = crate::gic::irq_ticks();
+    let now = crate::hal::irq_ticks();
     if TICK.swap(now, Relaxed) != now {
         BURST.store(0, Relaxed);
     }
