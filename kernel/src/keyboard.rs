@@ -157,6 +157,14 @@ pub fn init_ps2() -> Ps2 {
 static mut PACKET: [u8; 3] = [0; 3];
 static mut PACKET_LEN: usize = 0;
 
+/// Where decoded mouse movement goes (dx, dy with screen-down positive, left button down): the core's pointer layer
+/// registers it with `set_mouse_sink`, so this driver does not know who consumes the packets. 0 until set.
+static MOUSE_SINK: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_mouse_sink(sink: fn(i32, i32, bool)) {
+    MOUSE_SINK.store(sink as usize, Ordering::Relaxed);
+}
+
 /// Mouse byte from port 0x60: a packet is flags (buttons, signs, overflow), dx, dy (up is positive, the screen's Y goes down).
 fn mouse_byte(byte: u8) {
     unsafe {
@@ -176,7 +184,11 @@ fn mouse_byte(byte: u8) {
         }
         let dx = i32::from(packet[1]) - if flags & 0x10 != 0 { 256 } else { 0 };
         let dy = i32::from(packet[2]) - if flags & 0x20 != 0 { 256 } else { 0 };
-        crate::usb_pointer::mouse_input(dx, -dy, flags & 1 != 0);
+        let sink = MOUSE_SINK.load(Ordering::Relaxed);
+        if sink != 0 {
+            let sink: fn(i32, i32, bool) = core::mem::transmute(sink);
+            sink(dx, -dy, flags & 1 != 0);
+        }
     }
 }
 

@@ -265,6 +265,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
             if serial::enable_interrupt() {
                 println!("COM1: receive interrupt on IRQ 4 -> vector {:#x} (input is buffered; a pasted line is not lost).", serial::VECTOR);
             }
+            keyboard::set_mouse_sink(usb_pointer::mouse_input);
             match keyboard::init_ps2() {
                 keyboard::Ps2::Ready { gsi } => println!("PS/2 keyboard: 8042 ready, scancode set 1, IRQ 1 on GSI {gsi} -> vector {:#x}.", keyboard::KEYBOARD_VECTOR),
                 keyboard::Ps2::NoInterrupt => println!("PS/2 keyboard: controller present but its interrupt could not be routed; no PS/2 input."),
