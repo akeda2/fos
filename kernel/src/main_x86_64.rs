@@ -56,6 +56,7 @@ mod uart;
 mod term;
 mod termsession;
 mod usb_audio;
+mod usb_class;
 mod usb_hid;
 mod usb_pointer;
 mod usbshell;

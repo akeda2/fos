@@ -109,7 +109,7 @@ pub fn probe_all() -> usize {
                 if controller.port_status(port) & 1 != 0 && !controller.port_connect_changed(port) {
                     continue;
                 }
-                crate::usb_serial::xhci_departed(index, port);
+                crate::usb_class::xhci_departed_all(index, port);
                 crate::usb_storage::mark_xhci_port_stale(index, port);
                 crate::usb_hub::forget_hubs_on_port(index, port);
                 release_port(controller, port, None);
@@ -153,8 +153,7 @@ pub fn release_port(controller: &mut Controller, port: u8, route: Option<u32>) {
             *freed = keyboard.buffer;
         }
     }
-    crate::usb_midi::release(controller, port, route);
-    crate::usb_pointer::release(controller, port, route);
+    crate::usb_class::release_all(controller, port, route);
     match route {
         Some(route) => controller.release_route_slots(port, route),
         None => controller.release_port_slots(port),
@@ -292,7 +291,7 @@ fn find_boot_keyboard(descriptors: &[u8]) -> Option<(u8, u8, u16, u8)> {
 
 /// Handles an event nobody was waiting for: a keyboard's report completing (called by xhci.rs's wait loops and `poll`).
 pub fn background_event(controller: &mut Controller, event: &Trb) {
-    if !event.is_transfer() || crate::usb_midi::background_event(controller, event) || crate::usb_pointer::background_event(controller, event) || crate::usb_serial::background_event(controller, event) {
+    if !event.is_transfer() || crate::usb_class::background_event(controller, event) {
         return;
     }
     let keyboards = unsafe { &mut *core::ptr::addr_of_mut!(KEYBOARDS) };

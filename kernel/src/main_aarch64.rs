@@ -57,6 +57,7 @@ mod usb_hub;
 mod usb_audio;
 mod usb_midi;
 mod midishell;
+mod usb_class;
 mod usb_kbd;
 mod usb_pointer;
 mod usbshell;
