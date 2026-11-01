@@ -1,0 +1,10 @@
+[package]
+name = "tape-http"
+version = "0.1.0"
+edition = "2024"
+description = "HTTP/1.0 pieces for the httpd and web tapes: request and response heads, URLs, path safety, MIME types, HTML to text"
+license = "MIT"
+
+[lib]
+name = "tape_http"
+path = "src/lib.rs"

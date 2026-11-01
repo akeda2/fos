@@ -1772,3 +1772,31 @@ attribute is reset when a tape ends. VGA text mode (BIOS) maps them to attribute
 Verified: host tests, `make test-ebb` (QEMU/UEFI: reverse-video status bar seen in a screendump, edit/save/undo/two-step quit, colours back to
 normal after exit), x86 and aarch64 builds, and a scratch tape showing red text and a blue background. **Not verified:** VGA text mode (BIOS),
 Pi 4, a real mouse or touchpad in ebb, and non-ASCII typing (`sendkey` cannot type å/ä/ö; the decoder and layout have unit tests).
+
+## httpd and web: a small web server and browser
+
+`crates/tape-http` is the shared HTTP piece (host tests): request parsing, path cleaning (percent-decoding; `..`, `//`, NUL and control
+characters refused), the blocked-name list, MIME types, response heads, HTML directory listings, and on the client side URL and head
+parsing, link resolution and `Page`, an HTML-to-text renderer (links are marked `LINK_START`/`LINK_END` in the text, scripts and styles
+skipped, entities including å ä ö decoded). `tape-ip::tcp::Server` is the server half of the TCP socket: N slots, each a `TcpConnection`
+in listen-any mode (`tape-net` `reopen_listen`/`accept_from`), replies go to the MAC the frames came from, 3 s for half-open and
+closing connections and 10 s idle.
+
+`httpd` (`tapes/httpd`) answers GET and HEAD with HTTP/1.0 and closes after each answer, so nothing is kept between requests. The files
+come from `root=` (`www` by default; `diskN/...`, `@LABEL/...` and a bare volume work, so a USB stick is a web root). The head is placed in
+the same buffer just before the body so both leave in the same segments (a separate small head segment meets the peer's 40 ms delayed
+ACK). A folder without a slash gets a 301 to the slash; with a slash it serves `index=` (default `index.html`), else a listing when
+`listing=on`, else 404. `settings`, `start`, `hostname`, `debug`, `fstab`, `synckey`, `password` and `config/` are 404 whatever `root` is,
+because the web root may be the whole boot volume. Quiet unless `log`. As a service (`run httpd root=www &2`) it owns that NIC, so a
+machine with one NIC cannot run the browser at the same time; DHCP leases are not renewed while it runs.
+
+`web` (`tapes/web`): `-c` modes print and exit; the text screen uses the console escapes of the ebb section, a changed-cells renderer
+and a wrapped line table over `Page`. The first link on the screen starts selected (as in lynx), the selected link's address is on the
+status line, and Back keeps the scroll position. Keys are Ctrl+letter or plain only (Nordic keyboards). A lone Escape quits (or cancels
+the address prompt). Pages are read whole (1 MiB at most; longer is cut off and says so).
+
+Verified: host tests (`tape-http` 10, `tape-net` listen-any), `make test-httpd` (files, index, redirect, listing, 404/405, HEAD, blocked
+names, `..`, a multi-megabyte file with a matching SHA-256, a second labelled volume, shell usable while it runs) and `make test-web`
+(all `-c` modes, redirects, a refused connection, the text screen with link selection, follow, back and typed address) on QEMU/UEFI
+with slirp, and x86 and aarch64 builds. **Not verified:** real hardware and real browsers or servers (`curl` and Firefox against `httpd`
+on a real NIC), DNS names (QEMU's resolver is not reliable enough for a test), the Pi 4, BIOS text mode.

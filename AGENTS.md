@@ -248,3 +248,5 @@ maintainer's memory notes, not in this repository.
   commit or push unless asked.
 - Console escapes a tape may use: cursor `ESC[H`/`ESC[r;cH`, `ESC[nC/D`, `ESC[K`, `ESC[2J`, SGR colours/reverse/bold, `ESC[?25l/h`
   (`docs/design.md` "ebb"). `tapes/ebb` + `crates/edit-core` is the editor; `make test-ebb`.
+- Web: `httpd` (static GET/HEAD server, `root=` on any volume, run as a service) and `web` (curl-like `-c` and lynx-style text mode) share
+  `crates/tape-http`; `tape-ip::tcp::Server` is the listening socket (`docs/design.md` "httpd and web"); `make test-httpd test-web`.
