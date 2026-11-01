@@ -26,6 +26,21 @@ impl Platform for Embedded {
         crate::clock::unix_seconds()
     }
 
+    fn block_sectors(&self, disk: usize) -> Option<u64> {
+        crate::block::get(disk).map(|disk| disk.sectors)
+    }
+
+    fn timer_counter(&self) -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        return unsafe { core::arch::x86_64::_rdtsc() };
+        #[cfg(target_arch = "aarch64")]
+        crate::timer::counter()
+    }
+
+    fn timer_ticks(&self) -> u64 {
+        crate::timer::ticks()
+    }
+
     fn print(&self, arguments: core::fmt::Arguments) {
         crate::print(arguments);
     }

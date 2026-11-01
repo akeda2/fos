@@ -107,9 +107,6 @@ fn crc32(data: &[u8]) -> u32 {
 /// so this mixes the time-stamp counter, the tick count and the caller's salt through a
 /// splitmix64 generator: not secret, only meant to make two disks formatted here differ.
 fn random_guid(salt: u64) -> [u8; 16] {
-    #[cfg(target_arch = "x86_64")]
-    let entropy = unsafe { core::arch::x86_64::_rdtsc() };
-    #[cfg(target_arch = "aarch64")]
     let entropy = crate::timer::counter();
     let mut state = entropy ^ salt.rotate_left(32) ^ crate::timer::ticks().wrapping_mul(0x9e37_79b9_7f4a_7c15);
     let mut bytes = [0u8; 16];
@@ -151,7 +148,7 @@ pub const ESP_TYPE_GUID: [u8; 16] = fosfor_abi::guid_bytes(0xc12a7328, 0xf81f, 0
 /// Nothing else on the disk is touched; the order is backup copy first, primary header last, so an interrupted write never
 /// leaves a valid-looking table that is half new.
 pub fn write_table(disk: usize, specs: &[(&[u8; 16], &str, Option<u64>)], made: &mut [Partition]) -> Result<(), block::Error> {
-    let total = block::get(disk).ok_or(block::Error::NoSuchDisk)?.sectors;
+    let total = block::sectors(disk).ok_or(block::Error::NoSuchDisk)?;
     if total < 8192 || specs.len() > made.len() || specs.len() > 8 {
         return Err(block::Error::OutOfRange);
     }
@@ -236,7 +233,7 @@ pub enum GrowError {
 /// primary entries and header, and the old backup (now inside the partition) is cleared last, so an interruption leaves a
 /// table that is valid either as it was or as it will be. Returns the partition as it now is.
 pub fn grow_last_partition(disk: usize, type_guid: &[u8; 16]) -> Result<Partition, GrowError> {
-    let total = block::get(disk).ok_or(GrowError::Disk)?.sectors;
+    let total = block::sectors(disk).ok_or(GrowError::Disk)?;
     let mut header = [0u8; 512];
     block::read(disk, 1, &mut header).map_err(|_| GrowError::Disk)?;
     if &header[0..8] != b"EFI PART" {
