@@ -3,7 +3,8 @@
 
   fosadm.py hosts                  discover machines (forgets stale peers first)
   fosadm.py status [HOST...]       kernel slot and tapes against the build (SHA-256; --sizes: sizes only)
-  fosadm.py deploy [HOST...]       push the kernel (KUP) and tapes that differ (by SHA-256), after showing a plan
+  fosadm.py deploy [HOST...]       push the kernel (KUP) and tapes that differ (by SHA-256), after showing a plan;
+                                   hosts are handled side by side over Ethernet (--one-by-one: in turn), lines tagged [host]
   fosadm.py run|put|shell|bootcode HOST ...   one command, a file, a terminal, the boot code
 
 With `--serial PORT` (e.g. /dev/ttyUSB0) there is one machine, on that console serial line, and no Ethernet is used:
@@ -23,6 +24,7 @@ Raw Ethernet needs CAP_NET_RAW; if it is missing the tool says how to grant it
 to a dedicated Python copy (it never does so silently).
 """
 import argparse
+import concurrent.futures
 import math
 import os
 import re
@@ -30,6 +32,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 TOOLS = Path(__file__).resolve().parent
@@ -466,33 +469,130 @@ def probe_quiet(iface: str, host: Host) -> tuple[int, int] | None:
     return None
 
 
-def cmd_deploy(args, iface: str) -> int:
+PRINT_LOCK = threading.Lock()
+
+
+def say(host: Host, text: str, parallel: bool) -> None:
+    """One line of output; when hosts run side by side each line carries the host name so the streams can be told apart."""
+    with PRINT_LOCK:
+        print(f"[{host.name}] {text.lstrip()}" if parallel else text, flush=True)
+
+
+def run_hosts(function, items: list, parallel: bool) -> list:
+    """`function(item)` for every item, side by side (one thread each; the work is waiting for the machines and for
+    subprocesses) or one after the other; results in the order of `items`. Serial links are always one at a time."""
+    if not parallel or len(items) < 2:
+        return [function(item) for item in items]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(items)) as pool:
+        return list(pool.map(function, items))
+
+
+def plan_host(iface: str, args, host: Host, parallel: bool):
+    """The deploy plan for one host: `(host, new_kernel, tapes, stopped, arch)`, or None when it is skipped."""
     do_tapes = not args.kernel_only
-    hosts = pick(find_hosts(args, iface), args.hosts)
-    plans = []
-    for host in hosts:
-        if host_setting(host, "skip", False):
-            print(f"{host.name}: skipped (skip = true in hosts.toml)")
-            continue
-        state = probe(iface, host)
-        if state is None:
-            print(f"{host.name}: no answer, skipped")
-            continue
-        arch, have, files, stopped = state
-        kernel, tape_dir, tapes = source_files(Path(args.source) if args.source else None, arch)
-        do_kernel = kernel is not None and not args.tapes_only
-        want = kernel_sectors(kernel)
-        new_kernel = do_kernel and (args.force_kernel or have != want)
-        states = content_states(iface, host, tape_dir, sorted(n for n in tapes if n in files)) if do_tapes and args.content else {}
-        if states and set(states.values()) == {"unsupported"}:
-            print(f"{host.name}: this kernel has no `sha256` command yet; planning by size")
-            states = {}
-        if states:
-            changed = sorted(n for n, state in states.items() if state != "same")
+    if host_setting(host, "skip", False):
+        say(host, f"{host.name}: skipped (skip = true in hosts.toml)", parallel)
+        return None
+    state = probe(iface, host)
+    if state is None:
+        say(host, f"{host.name}: no answer, skipped", parallel)
+        return None
+    arch, have, files, stopped = state
+    kernel, tape_dir, tapes = source_files(Path(args.source) if args.source else None, arch)
+    do_kernel = kernel is not None and not args.tapes_only
+    want = kernel_sectors(kernel)
+    new_kernel = do_kernel and (args.force_kernel or have != want)
+    states = content_states(iface, host, tape_dir, sorted(n for n in tapes if n in files)) if do_tapes and args.content else {}
+    if states and set(states.values()) == {"unsupported"}:
+        say(host, f"{host.name}: this kernel has no `sha256` command yet; planning by size", parallel)
+        states = {}
+    if states:
+        changed = sorted(n for n, state in states.items() if state != "same")
+    else:
+        changed = sorted(n for n, s in tapes.items() if do_tapes and n in files and files[n] != s)
+    tape_list = changed + (sorted(n for n in tapes if do_tapes and n not in files) if args.add_missing else [])
+    return host, new_kernel, tape_list, stopped, arch
+
+
+def deploy_host(iface: str, args, plan, parallel: bool) -> int:
+    """Carries out one host's plan; returns the number of failures."""
+    host, new_kernel, tape_list, stopped, arch = plan
+    failed = 0
+
+    def print(text: str) -> None:
+        say(host, text, parallel)
+
+    mac = "" if host.serial else send_tape.format_mac(host.mac)
+    kernel, tape_dir, tapes = source_files(Path(args.source) if args.source else None, arch)
+    want = kernel_sectors(kernel)
+    print(f"== {host.name}")
+    if new_kernel:
+        if host.serial:
+            try:
+                host.serial.send(b"kup serial", kernel.read_bytes())
+            except SystemExit as refusal:
+                print(f"  kernel: not accepted ({refusal}); skipped")
+                return failed + 1
         else:
-            changed = sorted(n for n, s in tapes.items() if do_tapes and n in files and files[n] != s)
-        tape_list = changed + (sorted(n for n in tapes if do_tapes and n not in files) if args.add_missing else [])
-        plans.append((host, new_kernel, tape_list, stopped, arch))
+            result = subprocess.run([sys.executable, str(TOOLS / "send_kernel_update.py"), "--iface", iface, "--mac", mac,
+                                     str(kernel)], capture_output=True, text=True)
+            if "ACK" not in result.stdout:
+                print(f"  kernel: not accepted ({(result.stdout + result.stderr).strip().splitlines()[-1:]}); skipped")
+                return failed + 1
+        print("  kernel: accepted, waiting for the reboot...")
+        after = wait_up(iface, host)
+        if after is None:
+            print("  kernel: the host did not come back in time; check it by hand")
+            return failed + 1
+        if after[1] != want:
+            print(f"  kernel: FELL BACK to the old kernel (slot {after[0]}, {after[1]} sectors); tapes not touched")
+            return failed + 1
+        print(f"  kernel: running (slot {after[0]}, {after[1]} sectors)")
+    if tape_list:
+        state = probe(iface, host)
+        stopped = stopped or (state is not None and state[3])
+        if state is None:
+            print("  tapes: host does not answer; skipped")
+            return failed + 1
+        for name in tape_list:
+            if host.serial:
+                try:
+                    host.serial.send(f"recv disk1/{host.placed(name)}".encode(), (tape_dir / name).read_bytes())
+                    ok = True
+                except SystemExit as refusal:
+                    print(f"  tape {name}: {refusal}")
+                    ok = False
+            else:
+                ok = subprocess.run([sys.executable, str(TOOLS / "foscopy.py"), "--iface", iface, "--mac", mac,
+                                     str(tape_dir / name), f":disk1/{name}"], capture_output=True, text=True).returncode == 0
+            print(f"  tape {name}: {'ok' if ok else 'FAILED'}")
+            failed += not ok
+        states = content_states(iface, host, tape_dir, tape_list)
+        if set(states.values()) == {"unsupported"}:
+            files = listing(host, ask_host(iface, host, ["ls", "ls bin"]))
+            bad = [n for n in tape_list if files.get(n) != tapes[n]]
+            print("  verified by size (no `sha256` command on this kernel)" if not bad else f"  size mismatch after copy: {' '.join(bad)}")
+        else:
+            bad = [n for n, state in states.items() if state != "same"]
+            print("  verified by content (SHA-256)" if not bad else f"  not identical to the build after copy: {' '.join(bad)}")
+        failed += bool(bad)
+    restart = host_setting(host, "restart")
+    if stopped and restart and host.serial:
+        host.serial.ask([restart])
+        print(f"  a running tape was stopped; ran `{restart}` to bring it back (hosts.toml).")
+    elif stopped and restart:
+        subprocess.run([sys.executable, str(TOOLS / "term_net.py"), "--iface", iface, "--mac", mac,
+                        "--command-timeout", "8", restart], capture_output=True, timeout=60)
+        print(f"  a running tape was stopped; ran `{restart}` to bring it back (hosts.toml).")
+    elif stopped:
+        print("  a running tape was stopped; run `start` on the host (or reboot it) to bring it back.")
+    return failed
+
+
+def cmd_deploy(args, iface: str) -> int:
+    hosts = pick(find_hosts(args, iface), args.hosts)
+    parallel = not args.serial and not args.one_by_one
+    plans = [p for p in run_hosts(lambda host: plan_host(iface, args, host, parallel), hosts, parallel) if p]
     print("Plan:")
     for host, new_kernel, tape_list, _, arch in plans:
         what = (["kernel"] if new_kernel else []) + [f"{len(tape_list)} tape(s): {' '.join(tape_list)}"] * bool(tape_list)
@@ -505,77 +605,7 @@ def cmd_deploy(args, iface: str) -> int:
     if not args.yes and input("Go ahead? [y/N] ").strip().lower() != "y":
         print("nothing was changed.")
         return 1
-    failed = 0
-    for host, new_kernel, tape_list, stopped, arch in todo:
-        mac = "" if host.serial else send_tape.format_mac(host.mac)
-        kernel, tape_dir, tapes = source_files(Path(args.source) if args.source else None, arch)
-        want = kernel_sectors(kernel)
-        print(f"== {host.name}")
-        if new_kernel:
-            if host.serial:
-                try:
-                    host.serial.send(b"kup serial", kernel.read_bytes())
-                except SystemExit as refusal:
-                    print(f"  kernel: not accepted ({refusal}); skipped")
-                    failed += 1
-                    continue
-            else:
-                result = subprocess.run([sys.executable, str(TOOLS / "send_kernel_update.py"), "--iface", iface, "--mac", mac,
-                                         str(kernel)], capture_output=True, text=True)
-                if "ACK" not in result.stdout:
-                    print(f"  kernel: not accepted ({(result.stdout + result.stderr).strip().splitlines()[-1:]}); skipped")
-                    failed += 1
-                    continue
-            print("  kernel: accepted, waiting for the reboot...")
-            after = wait_up(iface, host)
-            if after is None:
-                print("  kernel: the host did not come back in time; check it by hand")
-                failed += 1
-                continue
-            if after[1] != want:
-                print(f"  kernel: FELL BACK to the old kernel (slot {after[0]}, {after[1]} sectors); tapes not touched")
-                failed += 1
-                continue
-            print(f"  kernel: running (slot {after[0]}, {after[1]} sectors)")
-        if tape_list:
-            state = probe(iface, host)
-            stopped = stopped or (state is not None and state[3])
-            if state is None:
-                print("  tapes: host does not answer; skipped")
-                failed += 1
-                continue
-            for name in tape_list:
-                if host.serial:
-                    try:
-                        host.serial.send(f"recv disk1/{host.placed(name)}".encode(), (tape_dir / name).read_bytes())
-                        ok = True
-                    except SystemExit as refusal:
-                        print(f"  tape {name}: {refusal}")
-                        ok = False
-                else:
-                    ok = subprocess.run([sys.executable, str(TOOLS / "foscopy.py"), "--iface", iface, "--mac", mac,
-                                         str(tape_dir / name), f":disk1/{name}"], capture_output=True, text=True).returncode == 0
-                print(f"  tape {name}: {'ok' if ok else 'FAILED'}")
-                failed += not ok
-            states = content_states(iface, host, tape_dir, tape_list)
-            if set(states.values()) == {"unsupported"}:
-                files = listing(host, ask_host(iface, host, ["ls", "ls bin"]))
-                bad = [n for n in tape_list if files.get(n) != tapes[n]]
-                print("  verified by size (no `sha256` command on this kernel)" if not bad else f"  size mismatch after copy: {' '.join(bad)}")
-            else:
-                bad = [n for n, state in states.items() if state != "same"]
-                print("  verified by content (SHA-256)" if not bad else f"  not identical to the build after copy: {' '.join(bad)}")
-            failed += bool(bad)
-        restart = host_setting(host, "restart")
-        if stopped and restart and host.serial:
-            host.serial.ask([restart])
-            print(f"  a running tape was stopped; ran `{restart}` to bring it back (hosts.toml).")
-        elif stopped and restart:
-            subprocess.run([sys.executable, str(TOOLS / "term_net.py"), "--iface", iface, "--mac", mac,
-                            "--command-timeout", "8", restart], capture_output=True, timeout=60)
-            print(f"  a running tape was stopped; ran `{restart}` to bring it back (hosts.toml).")
-        elif stopped:
-            print("  a running tape was stopped; run `start` on the host (or reboot it) to bring it back.")
+    failed = sum(run_hosts(lambda plan: deploy_host(iface, args, plan, parallel), todo, parallel))
     return 1 if failed else 0
 
 
@@ -656,6 +686,7 @@ def main() -> int:
     deploy.add_argument("--tapes-only", action="store_true")
     deploy.add_argument("--force-kernel", action="store_true", help="push the kernel even if the size matches")
     deploy.add_argument("--add-missing", action="store_true", help="also install tapes the host does not have")
+    deploy.add_argument("--one-by-one", action="store_true", help="handle the hosts one after the other (default: all at once over Ethernet)")
     deploy.add_argument("--dry-run", action="store_true", help="show the plan and stop")
     deploy.add_argument("-y", "--yes", action="store_true", help="do not ask before acting")
     for name, text in (("run", "run one shell command on a host"), ("put", "copy a file to a host's boot volume"),
