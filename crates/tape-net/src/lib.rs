@@ -1911,6 +1911,25 @@ impl<const RX: usize> TcpConnection<RX> {
         self.stream_active = false;
     }
 
+    /// Makes this a listener again that takes a connection from any peer on `local_port` (see `accept_from`).
+    pub fn reopen_listen(&mut self, local_ip: Ipv4Address, local_port: u16, initial_sequence: u32, retransmit_ticks: u32) {
+        self.reopen(local_ip, local_port, Ipv4Address([0; 4]), 0, initial_sequence, retransmit_ticks);
+        self.state = TcpState::Listen;
+    }
+
+    /// For a listener of any peer: the address the next SYN came from (the IP header says; the TCP segment does not).
+    /// Call it before `on_segment` with that SYN. Replies are addressed to it.
+    pub fn accept_from(&mut self, remote_ip: Ipv4Address) {
+        if self.state == TcpState::Listen && self.remote_port == 0 {
+            self.remote_ip = remote_ip;
+        }
+    }
+
+    /// The peer's address and port (zero until a listener has taken a SYN).
+    pub fn remote(&self) -> (Ipv4Address, u16) {
+        (self.remote_ip, self.remote_port)
+    }
+
     pub fn state(&self) -> TcpState {
         self.state
     }
@@ -1944,8 +1963,13 @@ impl<const RX: usize> TcpConnection<RX> {
         now: u32,
         output: &mut [u8],
     ) -> Result<Option<usize>> {
-        if segment.source_port != self.remote_port || segment.destination_port != self.local_port {
+        // A listener made with remote port 0 takes a SYN from anyone (`accept_from` says which address it came from).
+        let any_peer = self.state == TcpState::Listen && self.remote_port == 0;
+        if (!any_peer && segment.source_port != self.remote_port) || segment.destination_port != self.local_port {
             return Err(Error::Unexpected);
+        }
+        if any_peer && segment.flags & TCP_RST != 0 {
+            return Ok(None);
         }
         if segment.flags & TCP_RST != 0 {
             self.state = TcpState::Closed;
@@ -1957,6 +1981,9 @@ impl<const RX: usize> TcpConnection<RX> {
             TcpState::Listen => {
                 if segment.flags & TCP_SYN == 0 {
                     return Ok(None);
+                }
+                if any_peer {
+                    self.remote_port = segment.source_port;
                 }
                 self.receive_next = segment.sequence.wrapping_add(1);
                 let sequence = self.send_next;
@@ -2793,5 +2820,28 @@ mod tests {
         let ack = TcpSegment::parse(&ack_bytes[..ack_len], IP_A, IP_B, true).unwrap();
         server.on_segment(&ack, 2, &mut out).unwrap();
         assert_eq!(server.state(), TcpState::Established);
+    }
+
+    #[test]
+    fn tcp_listener_of_any_peer_adopts_the_first_syn() {
+        let mut server = TcpConnection::<16>::listen(IP_B, 2000, Ipv4Address([0; 4]), 0, 90, 4);
+        let mut out = [0u8; 64];
+        let (stray, stray_len) = segment(1000, 2000, 7, 0, TCP_RST, &[]);
+        let stray = TcpSegment::parse(&stray[..stray_len], IP_A, IP_B, true).unwrap();
+        assert_eq!(server.on_segment(&stray, 1, &mut out), Ok(None));
+        assert_eq!(server.state(), TcpState::Listen);
+        let (syn_bytes, syn_len) = segment(4321, 2000, 7, 0, TCP_SYN, &[]);
+        let syn = TcpSegment::parse(&syn_bytes[..syn_len], IP_A, IP_B, true).unwrap();
+        server.accept_from(IP_A);
+        let length = server.on_segment(&syn, 1, &mut out).unwrap().unwrap();
+        assert_eq!(server.remote(), (IP_A, 4321));
+        let reply = TcpSegment::parse(&out[..length], IP_B, IP_A, true).unwrap();
+        assert_eq!((reply.source_port, reply.destination_port, reply.flags), (2000, 4321, TCP_SYN | TCP_ACK));
+        // From now on only that peer's port is accepted.
+        let (other, other_len) = segment(9999, 2000, 8, 91, TCP_ACK, &[]);
+        let other = TcpSegment::parse(&other[..other_len], IP_A, IP_B, true).unwrap();
+        assert!(server.on_segment(&other, 2, &mut out).is_err());
+        server.reopen_listen(IP_B, 2000, 5, 4);
+        assert_eq!((server.state(), server.remote().1), (TcpState::Listen, 0));
     }
 }

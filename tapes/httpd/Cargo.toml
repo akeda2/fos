@@ -1,0 +1,21 @@
+[package]
+name = "httpd-tape"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "httpd"
+path = "src/main.rs"
+
+[dependencies]
+tape-http = { path = "../../crates/tape-http" }
+tape-ip = { path = "../../crates/tape-ip" }
+tape-net = { path = "../../crates/tape-net" }
+tape-rt = { path = "../../crates/tape-rt" }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "z"
+strip = "symbols"

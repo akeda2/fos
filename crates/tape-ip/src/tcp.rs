@@ -9,7 +9,7 @@
 //! with `Socket::new()` and (re)open it with `connect`.
 
 use crate::net::{self, MAX_FRAME, NetConfig};
-use tape_net::{ArpCache, ETHERTYPE_IPV4, EthernetFrame, Ipv4Address, Ipv4Packet, MacAddress, TcpConnection, TcpSegment, TcpState};
+use tape_net::{ArpCache, ETHERTYPE_IPV4, EthernetFrame, TCP_SYN, Ipv4Address, Ipv4Packet, MacAddress, TcpConnection, TcpSegment, TcpState};
 use tape_rt::TapeApi;
 
 /// How long an unacknowledged segment waits before it is sent again.
@@ -164,6 +164,237 @@ impl<const RX: usize> Socket<RX> {
     /// Sends the TCP segment in `self.segment[..length]` as an Ethernet frame to the peer.
     fn transmit(&mut self, api: &TapeApi, length: usize) {
         if let Some(total) = net::build_ip_frame(&mut self.tx, &self.config, self.peer_mac, self.peer, 6, &self.segment[..length]) {
+            net::send_frame(api, self.nic, &self.tx[..total]);
+        }
+    }
+}
+
+/// How long a connection may sit without a segment before its slot is taken back: one still being set up or closed (a
+/// lost handshake, a peer that vanished mid-close), and an established one that has gone quiet.
+const HALF_OPEN_MICROS: u64 = 3_000_000;
+const IDLE_MICROS: u64 = 10_000_000;
+/// The most unacknowledged bytes `Server::send` keeps in flight (the peer's window may be larger).
+const FLIGHT: usize = 16 * SEND_CHUNK;
+
+struct Slot<const RX: usize> {
+    connection: TcpConnection<RX>,
+    peer_mac: MacAddress,
+    last: u64,
+}
+
+/// A TCP server for tapes: `N` connections at once on one port, each with an `RX`-byte receive buffer (also its window).
+/// Like `Socket` it is blocking where data goes out (`send` waits for the peer's acknowledgements, serving the other slots
+/// meanwhile) and polled where it comes in: call `poll` in the tape's loop, then look at the slots. A slot is `Listen`
+/// until a SYN takes it; `recycle` (or an idle timeout, or a reset) gives it back. Replies go to the MAC the peer's
+/// frames came from, so no ARP exchange is needed to answer. Keep one in a `static`: it is large.
+pub struct Server<const RX: usize, const N: usize> {
+    slots: [Slot<RX>; N],
+    arp: ArpCache<8>,
+    nic: usize,
+    config: NetConfig,
+    port: u16,
+    sequence: u32,
+    rx: [u8; MAX_FRAME],
+    segment: [u8; MAX_FRAME],
+    tx: [u8; MAX_FRAME],
+}
+
+impl<const RX: usize, const N: usize> Server<RX, N> {
+    pub const fn new() -> Self {
+        const NO_ADDRESS: Ipv4Address = Ipv4Address([0; 4]);
+        Server {
+            slots: [const { Slot { connection: TcpConnection::listen(NO_ADDRESS, 0, NO_ADDRESS, 0, 0, RETRANSMIT_MICROS), peer_mac: MacAddress([0; 6]), last: 0 } }; N],
+            arp: ArpCache::new(),
+            nic: 0,
+            config: NetConfig { mac: MacAddress([0; 6]), ip: NO_ADDRESS, netmask: NO_ADDRESS, gateway: NO_ADDRESS },
+            port: 0,
+            sequence: 0,
+            rx: [0; MAX_FRAME],
+            segment: [0; MAX_FRAME],
+            tx: [0; MAX_FRAME],
+        }
+    }
+
+    /// Starts listening on `port` through `nic` with the address `config` gives.
+    pub fn start(&mut self, nic: usize, config: &NetConfig, port: u16) {
+        self.nic = nic;
+        self.config = *config;
+        self.port = port;
+        self.sequence = (tape_rt::micros() as u32) ^ u32::from_be_bytes([config.mac.0[2], config.mac.0[3], config.mac.0[4], config.mac.0[5]]);
+        for index in 0..N {
+            self.recycle(index);
+        }
+    }
+
+    pub fn state(&self, slot: usize) -> TcpState {
+        self.slots[slot].connection.state()
+    }
+
+    /// The peer's address and port of a connected slot.
+    pub fn peer(&self, slot: usize) -> (Ipv4Address, u16) {
+        self.slots[slot].connection.remote()
+    }
+
+    /// What the peer has sent so far and not been taken yet.
+    pub fn received(&self, slot: usize) -> &[u8] {
+        self.slots[slot].connection.received()
+    }
+
+    pub fn take(&mut self, slot: usize, out: &mut [u8]) -> usize {
+        self.slots[slot].connection.take_received(out)
+    }
+
+    /// True while the peer can still be answered (the connection is established, perhaps half-closed by the peer).
+    pub fn is_open(&self, slot: usize) -> bool {
+        matches!(self.slots[slot].connection.state(), TcpState::Established | TcpState::CloseWait)
+    }
+
+    /// Gives the slot back: it listens for a new connection.
+    pub fn recycle(&mut self, slot: usize) {
+        self.sequence = self.sequence.wrapping_add(64_000);
+        let (ip, port, sequence) = (self.config.ip, self.port, self.sequence);
+        self.slots[slot].connection.reopen_listen(ip, port, sequence, RETRANSMIT_MICROS);
+        self.slots[slot].last = tape_rt::micros();
+    }
+
+    /// Handles the frames waiting (up to `budget` of them), resends what is due, takes back dead slots. Returns whether
+    /// any frame arrived, so a tape can idle when nothing did.
+    pub fn poll(&mut self, api: &TapeApi, budget: usize) -> bool {
+        let mut any = false;
+        for _ in 0..budget {
+            let length = (api.nic_receive)(self.nic, self.rx.as_mut_ptr(), self.rx.len());
+            if length == 0 {
+                break;
+            }
+            any = true;
+            self.handle(api, length);
+        }
+        self.housekeeping(api);
+        any
+    }
+
+    fn handle(&mut self, api: &TapeApi, length: usize) {
+        let now = tape_rt::micros();
+        let Ok(ethernet) = EthernetFrame::parse(&self.rx[..length]) else { return };
+        if ethernet.ethertype != ETHERTYPE_IPV4 {
+            let _ = net::inbound(api, self.nic, &self.config, &mut self.arp, &self.rx[..length], 0..=0, now as u32);
+            return;
+        }
+        let source_mac = ethernet.source;
+        let Ok(packet) = Ipv4Packet::parse(ethernet.payload, true) else { return };
+        if packet.header.protocol != 6 || packet.header.destination != self.config.ip {
+            return;
+        }
+        let peer = packet.header.source;
+        let Ok(segment) = TcpSegment::parse(packet.payload, peer, self.config.ip, true) else { return };
+        if segment.destination_port != self.port {
+            return;
+        }
+        let existing = (0..N).find(|&i| {
+            let (ip, port) = self.slots[i].connection.remote();
+            self.slots[i].connection.state() != TcpState::Listen && ip == peer && port == segment.source_port
+        });
+        let index = match existing {
+            Some(index) => index,
+            None if segment.flags & TCP_SYN != 0 => match (0..N).find(|&i| self.slots[i].connection.state() == TcpState::Listen) {
+                Some(index) => {
+                    self.slots[index].connection.accept_from(peer);
+                    self.slots[index].peer_mac = source_mac;
+                    index
+                }
+                None => return,
+            },
+            None => return,
+        };
+        self.slots[index].last = now;
+        if let Ok(Some(reply)) = self.slots[index].connection.on_segment(&segment, now as u32, &mut self.segment) {
+            self.transmit(api, index, reply);
+        }
+    }
+
+    fn housekeeping(&mut self, api: &TapeApi) {
+        let now = tape_rt::micros();
+        for index in 0..N {
+            let state = self.slots[index].connection.state();
+            let quiet = now.saturating_sub(self.slots[index].last);
+            let dead = match state {
+                TcpState::Listen => false,
+                TcpState::Closed => self.slots[index].connection.received().is_empty(),
+                TcpState::Established | TcpState::CloseWait => quiet > IDLE_MICROS,
+                _ => quiet > HALF_OPEN_MICROS,
+            };
+            if dead {
+                self.recycle(index);
+                continue;
+            }
+            if state != TcpState::Listen {
+                if let Ok(Some(resend)) = self.slots[index].connection.retransmit(now as u32, &mut self.segment) {
+                    self.transmit(api, index, resend);
+                }
+            }
+        }
+    }
+
+    /// Sends all of `data` and returns once the peer has acknowledged it (several segments in flight at a time).
+    /// `timeout_micros` is how long the peer may go without acknowledging anything new.
+    pub fn send(&mut self, api: &TapeApi, slot: usize, data: &[u8], timeout_micros: u64) -> Result<(), &'static str> {
+        let mut sent = 0;
+        let mut progress = tape_rt::micros();
+        while sent < data.len() || self.slots[slot].connection.stream_in_flight() > 0 {
+            if !self.is_open(slot) {
+                return Err("the connection was closed");
+            }
+            let in_flight = self.slots[slot].connection.stream_in_flight();
+            let window = self.slots[slot].connection.peer_window().min(FLIGHT).max(1);
+            if sent < data.len() && in_flight < window {
+                let chunk = (data.len() - sent).min(SEND_CHUNK).min(RX).min(window - in_flight);
+                let now = tape_rt::micros() as u32;
+                let length = self.slots[slot].connection.stream_send(&data[sent..sent + chunk], now, &mut self.segment).map_err(|_| "the connection is not open")?;
+                self.transmit(api, slot, length);
+                sent += chunk;
+                progress = tape_rt::micros();
+                self.poll(api, 4);
+                continue;
+            }
+            if !self.poll(api, 8) {
+                tape_rt::idle();
+            }
+            let now = tape_rt::micros();
+            let remaining = self.slots[slot].connection.stream_in_flight();
+            if remaining < in_flight {
+                progress = now;
+            }
+            if remaining > 0 {
+                let unacknowledged = &data[sent - remaining..sent];
+                if let Ok(Some(resend)) = self.slots[slot].connection.stream_retransmit(unacknowledged, now as u32, &mut self.segment) {
+                    self.transmit(api, slot, resend);
+                }
+            }
+            if now > progress + timeout_micros {
+                return Err("the peer did not acknowledge");
+            }
+        }
+        self.slots[slot].last = tape_rt::micros();
+        Ok(())
+    }
+
+    /// Says goodbye (FIN) and waits a moment for the acknowledgement; the slot is taken back once the peer has closed too
+    /// (or by the idle timeout).
+    pub fn close(&mut self, api: &TapeApi, slot: usize) {
+        if let Ok(length) = self.slots[slot].connection.close(tape_rt::micros() as u32, &mut self.segment) {
+            self.transmit(api, slot, length);
+            let deadline = tape_rt::micros() + 500_000;
+            while self.slots[slot].connection.retransmission_deadline().is_some() && tape_rt::micros() < deadline {
+                if !self.poll(api, 8) {
+                    tape_rt::idle();
+                }
+            }
+        }
+    }
+
+    fn transmit(&mut self, api: &TapeApi, slot: usize, length: usize) {
+        let (peer, _) = self.slots[slot].connection.remote();
+        if let Some(total) = net::build_ip_frame(&mut self.tx, &self.config, self.slots[slot].peer_mac, peer, 6, &self.segment[..length]) {
             net::send_frame(api, self.nic, &self.tx[..total]);
         }
     }

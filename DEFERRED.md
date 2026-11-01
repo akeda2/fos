@@ -586,3 +586,11 @@ use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limi
 - Find/replace, syntax colours, multiple files, files larger than RAM headroom (the whole file is read and written at once), ebba's piece tree.
 - Shift/Ctrl+arrow from the local keyboard (selection uses Ctrl-T select mode there); a config file for key bindings and tab width.
 - The dedicated hex editor (ebba's hex view was skipped on purpose).
+
+## Open after httpd and web
+
+- TLS (https) for both; POST, keep-alive, Range requests and `If-Modified-Since` in httpd; forms, cookies, images and a mouse in the browser; a gfx-canvas browser.
+- httpd does not renew its DHCP lease (give it `ip=` for a long run) and a service owns its NIC, so a one-NIC machine cannot run httpd and the browser together.
+- httpd looks a file up by listing its folder (O(n) per request, O(n²) for a listing); fine for small folders. A FAT32 subfolder lists the root in the kernel, so a missing FAT32 subfolder looks like a folder.
+- The browser reads a page whole (1 MiB at most), does not decode `Transfer-Encoding: chunked` (it asks with HTTP/1.0), and treats non-UTF-8 pages as Latin-1.
+- `web` could save a page to a file (`-o`), and `tape-http`'s MIME list is short.
