@@ -141,3 +141,20 @@ leave the kernel crate. `tape.rs`, `tasks.rs`, `term.rs`, `shell*.rs` are core-s
 **Risks.** Path moves hide from text search (split spellings); every step needs the aarch64 build and, at the end of 1b, a full
 `make test-all` on landsbro. Real-hardware checks for anything that touches IRQ routing or DMA (`skylake`, `amd1`, laptop, `piano`).
 Rough size: 1a about a week of focused work, 1b about two.
+
+## Stage 1a status (2026-11-01, branch `kernel-core`)
+
+Done, one commit each, all with the x86 and aarch64 kernels building and the matching `make test-NAME` green:
+- `kernel/src/hal.rs`: the platform surface. Re-exports `cpu`, `paging`, `timer`, `msi`, `pci_config`; adds `interrupt_target`,
+  `gsi_range` (x86), `is_pi4`, `register_irq`, `irq_ticks` (aarch64) and `print`. `tools/check_hal.py` (run by `make test`) fails
+  when a driver names an arch-private module (`apic`, `ioapic`, `gic`, `serial`, `pl011`, ...); its allow-list is empty.
+- Logging: `println!` -> `hal::print` -> the entry file's `CONSOLE_SINKS` (the core decides where text goes).
+- `usb_class.rs`: one table of USB class drivers (release, background event, departed hooks); `usb_hid`/`usb_kbd` no longer name them.
+  Attaching a new device still names each class in the enumerators (descriptor handling differs per class).
+- `serialports.rs`: the UART and USB-serial numbering mux; `uart` no longer calls `usb_serial`.
+- `keyboard` -> `usb_pointer`: a registered mouse sink (`keyboard::set_mouse_sink`).
+- Size: x86 kernel 1,161,480 -> 1,167,120 bytes (+0.5%) against the pre-stage tree.
+
+Left for 1b: `netfs` -> `fosfs`/`tape_fs`/`config`/`netservice` and `nicshell` -> `netfs` are core-side code and move with the shell;
+the USB attach path; turning `hal` into a trait with the embedded core as its implementation; the library crate itself. Not covered
+by any test: USB serial adapters, the Pi 4 console and GIC paths (hardware only).
