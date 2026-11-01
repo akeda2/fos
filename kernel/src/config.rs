@@ -199,7 +199,7 @@ pub fn load() {
                     let mut words = line.split_whitespace().skip(1);
                     let number = words.next().and_then(|word| word.parse().ok()).unwrap_or(1);
                     let baud = words.next().and_then(|word| word.parse().ok()).unwrap_or(115_200);
-                    match crate::uart::open_shell(number, baud) {
+                    match crate::serialports::open_shell(number, baud) {
                         0 => crate::println!("settings: serial-shell -- the shell is also on serial port {number} at {baud} baud (8n1)."),
                         _ => crate::println!("settings: `{line}` ignored (no such serial port, or bad baud rate; `run fterm list` shows them)."),
                     }

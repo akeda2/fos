@@ -52,6 +52,7 @@ mod tapesync;
 mod gpio;
 mod gpio_remote;
 mod gpio_shell;
+mod serialports;
 mod uart;
 mod term;
 mod termsession;
@@ -465,7 +466,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
             // The shell's UART has no interrupt and a 16-byte FIFO: keep polling it instead of sleeping a whole tick.
             let begin = timer::micros();
             while timer::micros() < begin + 100 {
-                uart::poll();
+                serialports::poll();
                 core::hint::spin_loop();
             }
             cpu::spun(cpu::Spin::Uart, begin);
