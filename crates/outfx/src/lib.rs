@@ -5,6 +5,7 @@
 //! effects spells them the same way.
 #![cfg_attr(not(test), no_std)]
 
+pub mod crossfeed;
 pub mod logic;
 pub mod phase;
 pub mod qs;
@@ -13,6 +14,7 @@ pub mod surround;
 pub mod upmix;
 
 pub use phono::BassBoost;
+pub use crossfeed::{Crossfeed, CrossfeedSettings};
 pub use logic::{Logic, Preset};
 pub use phase::Quadrature;
 pub use qs::QsDecoder;
@@ -28,13 +30,16 @@ pub struct Options {
     /// 2 to 5.1 (`upmix=on`).
     pub upmix: bool,
     pub surround: UpmixSettings,
+    /// Headphone cross-feed (`crossfeed=on`).
+    pub crossfeed: bool,
+    pub feed: CrossfeedSettings,
 }
 
 impl Options {
-    pub const OFF: Options = Options { bass: BassBoost::OFF, upmix: false, surround: UpmixSettings::DEFAULT };
+    pub const OFF: Options = Options { bass: BassBoost::OFF, upmix: false, surround: UpmixSettings::DEFAULT, crossfeed: false, feed: CrossfeedSettings::DEFAULT };
 
     /// Takes one `key=value` word: `bass=DB` (0-12), `bassfreq=HZ` (60-150), `bassq=Q` (0.3-3), `upmix=on|off`, `center=on|off`,
-    /// `width=0..1`, `lfe=HZ` (40-200), `delay=MS` (0-40), `layout=5.1|4.1|4.0|2.1` (choosing 2.1 turns bass management on), `bassmgmt=on|off`. `Ok(false)` when the key is not
+    /// `width=0..1`, `lfe=HZ` (40-200), `delay=MS` (0-40), `layout=5.1|4.1|4.0|2.1` (choosing 2.1 turns bass management on), `bassmgmt=on|off`, `crossfeed=on|off`, `feed=DB` (1-20 dB below the direct channel), `feedfreq=HZ` (200-2000), `feeddelay=US` (0-1000). `Ok(false)` when the key is not
     /// one of ours (the caller may know it), `Err` says what was wrong with the value.
     pub fn set(&mut self, key: &str, value: &str, parse: impl Fn(&str) -> Option<f32>) -> Result<bool, &'static str> {
         let number = |min: f32, max: f32| parse(value).filter(|v| *v >= min && *v <= max);
@@ -56,13 +61,17 @@ impl Options {
                 self.surround.layout = layout;
             }
             "bassmgmt" => self.surround.bass_mgmt = switch(value).ok_or("bassmgmt= needs on or off")?,
+            "crossfeed" => self.crossfeed = switch(value).ok_or("crossfeed= needs on or off")?,
+            "feed" => self.feed.level_db = number(1.0, 20.0).ok_or("feed= needs the feed level in dB below the direct channel, 1 to 20")?,
+            "feedfreq" => self.feed.hz = number(200.0, 2000.0).ok_or("feedfreq= needs a frequency, 200 to 2000 Hz")?,
+            "feeddelay" => self.feed.delay_us = number(0.0, 1000.0).ok_or("feeddelay= needs a delay in microseconds, 0 to 1000")?,
             _ => return Ok(false),
         }
         Ok(true)
     }
 
     pub fn is_off(&self) -> bool {
-        self.bass.gain_db <= 0.0 && !self.upmix
+        self.bass.gain_db <= 0.0 && !self.upmix && !self.crossfeed
     }
 }
 
@@ -131,6 +140,13 @@ mod tests {
         assert!(o.set("bass", "13", parse).is_err());
         assert!(o.set("bassq", "x", parse).is_err());
         assert_eq!((o.bass.gain_db, o.bass.hz, o.is_off()), (6.0, 80.0, false));
+        assert_eq!(o.set("crossfeed", "on", parse), Ok(true));
+        assert_eq!(o.set("feed", "4.5", parse), Ok(true));
+        assert_eq!(o.set("feeddelay", "300", parse), Ok(true));
+        assert!(o.set("feed", "0", parse).is_err());
+        assert!(o.set("feedfreq", "5000", parse).is_err());
+        assert!(o.set("crossfeed", "light", parse).is_err());
+        assert_eq!((o.crossfeed, o.feed.level_db, o.feed.delay_us), (true, 4.5, 300.0));
     }
 
     #[test]

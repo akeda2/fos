@@ -5,6 +5,7 @@ hardware or network needed. Run with `make test-fosplay`."""
 
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -124,6 +125,7 @@ def main():
         check(len(loud) > 5 * got // 2, f"the playlist recording holds both tracks ({len(loud)} loud samples)", "")
     jump_test()
     bass_test()
+    crossfeed_test()
     ui_test()
     config_test()
     browse_test()
@@ -202,6 +204,50 @@ def bass_test():
             level[name] = (sum(x * x for x in middle) / len(middle)) ** 0.5
         ratio = level["b100.flac"] / level["b1k.flac"]
         check(2.2 < ratio < 3.4, f"bass=9 makes 100 Hz {20 * __import__('math').log10(ratio):.1f} dB above 1 kHz (wanted 9)", str(level))
+
+
+def channel_rms(blob):
+    """(left, right) RMS over the middle second of a 2-channel 32-bit float WAV take."""
+    samples, got = float_wav(blob)   # checks the header; channel 0 only
+    at = blob.index(b"data") + 8
+    body = blob[at:at + struct.unpack_from("<I", blob, at - 4)[0]]
+    both = struct.unpack(f"<{len(body) // 4}f", body[:len(body) // 4 * 4])
+    frames = len(both) // 2
+    middle = both[2 * (frames // 2 - got // 2):2 * (frames // 2 + got // 2)]
+    return tuple((sum(x * x for x in middle[c::2]) / (len(middle) // 2)) ** 0.5 for c in (0, 1))
+
+
+def crossfeed_test():
+    """`crossfeed=medium` (6 dB, 700 Hz, 250 us) on a 100 Hz tone in the left channel only: left drops to half and the right
+    ear gets the other half, against the same file played without it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "left.flac"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=100:sample_rate=48000:duration=12",
+                        "-af", "volume=0.5,pan=stereo|c0=c0|c1=0*c0", "-sample_fmt", "s16", str(path)], check=True)
+        guest = Guest(tmp, "cross", MAC, files={"left.flac": path.read_bytes()})
+        try:
+            guest.wait_for("M3 complete")
+            guest.wait_for("fos> ")
+            for take, option in (("cf-off", ""), ("cf-med", "crossfeed=medium")):
+                start_service(guest, f"run record device=loop0 {take} 4 &0")
+                guest.pump(2)
+                guest.send(f"run fosplay device=loop0 gfx=off {option} play left.flac &0")
+                deadline = time.monotonic() + 60
+                while time.monotonic() < deadline:
+                    if not listed(guest, "record", "fosplay"):
+                        break
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline and listed(guest, "fosplay", "record"):
+                guest.pump(1)
+        finally:
+            guest.stop()
+        out = fosfs_files(Path(tmp) / "cross.img")
+        for take in ("cf-off", "cf-med"):
+            check(out.get(take + ".wav") is not None, f"{take}: the take was written", str(sorted(out)))
+        plain, fed = channel_rms(out["cf-off.wav"]), channel_rms(out["cf-med.wav"])
+        check(plain[1] < 0.01 * plain[0], f"without the feed the right channel is silent ({plain})", "")
+        check(0.4 < fed[0] / plain[0] < 0.6, f"crossfeed=medium takes the left to {fed[0] / plain[0]:.2f} of its level (wanted 0.5)", str(fed))
+        check(0.4 < fed[1] / plain[0] < 0.6, f"and feeds the right with {fed[1] / plain[0]:.2f} of it (wanted 0.5)", str(fed))
 
 
 def screenshot(monitor_path, tmp, name):
