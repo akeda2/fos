@@ -81,21 +81,17 @@ use fosfor_abi::{BootInfo, PIXEL_RGB};
 pub use arch::x86_64::{acpi, apic, cpupower, gdt, idt, ioapic, serial};
 
 
-/// `println!` goes to the serial port, the boot log and, once it exists, the framebuffer.
-pub fn print(arguments: core::fmt::Arguments) {
-    struct Both;
-    impl Write for Both {
-        fn write_str(&mut self, text: &str) -> core::fmt::Result {
-            let _ = serial::Serial.write_str(text);
-            log::push(text);
-            framebuffer::write_str(text);
-            term::relay(text);
-            uart::shell_write(text);
-            Ok(())
-        }
-    }
-    let _ = Both.write_fmt(arguments);
-}
+/// Where `println!` text goes, in order (`hal::print` walks this list): the serial port, the boot log, the framebuffer, the
+/// network terminal and a shell on a serial port.
+pub static CONSOLE_SINKS: [fn(&str); 5] = [
+    |text| {
+        let _ = serial::Serial.write_str(text);
+    },
+    log::push,
+    framebuffer::write_str,
+    term::relay,
+    uart::shell_write,
+];
 
 static BREAKPOINTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
