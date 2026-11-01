@@ -422,7 +422,7 @@ impl ThreeCom {
     /// Switches from polling to legacy interrupts through the I/O APIC, keeping a pin only if the self-test interrupt arrives.
     pub fn enable_interrupts(&mut self, device: &pci::Device) -> Result<Delivery, &'static str> {
         let mut reason = "no I/O APIC pin delivered the self-test interrupt";
-        let (first, end) = crate::ioapic::gsi_range();
+        let (first, end) = crate::hal::gsi_range();
         let candidates = crate::msi::intx_candidates(device.interrupt_line());
         for (position, &gsi) in candidates.iter().enumerate() {
             if gsi == u32::MAX || gsi == 0 || gsi < first || gsi >= end || candidates[..position].contains(&gsi) {

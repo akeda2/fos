@@ -93,3 +93,51 @@ real memory management) that supports everything the small one does? Yes. This f
   protocol, e.g. raw port 9100 or IPP); whether the batch queue is a shell feature or a tape/service; authentication for network
   services (none exists today; `deny-term-net` and `password` are the only controls); how the big kernel is installed (a stick, KUP
   with the flavour marker).
+
+## Stage 1 survey (2026-11-01, branch `kernel-core`)
+
+Measured on `main` at `2396171`; no code moved.
+
+**Shape today.** `kernel/` is one `no_std` binary crate: 90 modules, about 40,000 lines. `main.rs` splices in one entry file per
+architecture with `include!` (`main_x86_64.rs`, `main_aarch64.rs`), which declares the modules and re-exports the arch layer at the
+crate root, so every driver says `crate::cpu`, `crate::paging`, `crate::memory`, `crate::timer`, `crate::msi`, `crate::println!`.
+Hardware-free logic is already in crates with host tests: `fat`, `shell`, `hid`, `tape-sync`.
+
+**The services surface is small and already exists as module paths.** Counting calls from drivers:
+- memory: `free` 70, `allocate_contiguous` 61, `allocate` 6, `dma_pool`, `reserve`, `stats`.
+- paging: `map_device` 34, `is_mapped` 8, `map_framebuffer`, `map_uncached`, `set_executable`.
+- time: `timer::ticks` 119, `micros` 83, `wait_ticks` 40, `busy_wait_ms` 25.
+- CPU: port I/O (`inb/outb/inl/outl/inw/outw`, about 80), `interrupts_save_and_disable`/`restore` (14 each), MSRs, `cpuid`.
+- interrupts: `msi::allocate`, `msi::attach_intx`, `msi::claim`, `msi::release`, and a few `ioapic` routing calls.
+That is about 30 functions: the OS-services trait is mostly a matter of naming what is already there.
+
+**Concurrency today.** `tasks.rs` is cooperative (one CPU; a context yields only inside a tape call), so "the kernel needs no locks".
+Driver state shared with interrupt handlers uses atomics and `interrupts_save_and_disable`. There are about 150 `static mut` items,
+concentrated in `term` (28), `framebuffer` (19), `tape` and `tape_aarch64` (11 each), `netfs` (11), `debug` (10), `xhci` and `usb_hid` (8).
+This is the stage-2 lock audit's workload; NIC drivers (e1000 23 atomics) are already closest to lock-free.
+
+**Groups (lines).** USB stack about 6,500 (xhci 1474, ehci 1212, ohci 577, usb_audio 1635, usb_hid 828, others); audio about 4,000
+(hda 1742, usb_audio, audio 609); NICs about 3,700 (e1000 1328, rtl8168 671, 3com 624, genet 600, rtl8139 510); storage about 2,000
+(ahci, nvme, usb_storage, sdhci, virtio_blk, block); filesystems about 2,700 (fosfs 1241, fatvol, gpt, mounts, tape_fs); shell, tape
+glue and terminal about 7,000 (term 1851, tape 1041, tape_aarch64 910, shellcmds, shell); Pi-only about 2,500 (i2c, gpio, i2s_pi, mailbox).
+
+**What blocks a clean split (drivers reaching upward).** Nearly every driver calls `println!` (a services item: a `log` sink).
+Real upward couplings: `usb_hid`/`usb_kbd`/`usb_serial`/`usb_audio`/`usb_midi`/`usb_pointer` reference each other and `netfs`,
+`midishell`, `framebuffer`; `uart` -> `usb_serial`; `keyboard` -> `usb_pointer`; `nicshell` -> `netfs`; `netfs` -> `fosfs`,
+`tape_fs`, `config`, `netservice`. The USB class drivers need an explicit "device appeared / class driver" interface before they can
+leave the kernel crate. `tape.rs`, `tasks.rs`, `term.rs`, `shell*.rs` are core-specific (the MF core replaces the tape glue with a syscall shim).
+
+**Recommended shape for stage 1.**
+- 1a, in place, one crate: add a `hal` module (the ~30 functions plus a log sink) and make drivers use only `crate::hal::...` for
+  arch, memory, time, interrupts and logging. Mechanical, a few commits, each building and testing on x86 and aarch64, no behaviour change.
+  Cut the upward couplings listed above with small interfaces (a registry for USB class drivers; `netfs` and shell commands call
+  down, drivers do not call up).
+- 1b, lift into a library crate `kernel-core` (drivers, fosfs, fatvol, gpt, net frames) depending on a `fos-hal` crate; the `hal` module
+  becomes a trait implemented by the embedded core (`fosfor-kernel`, unchanged name and outputs). Dispatch is a `&'static dyn Platform`
+  set at boot for slow-path calls; hot ones (port I/O, `micros`) stay inline via generic or `#[inline]` functions in the platform crate.
+  Move order: filesystems (host-testable) -> NICs -> storage -> USB -> audio. Shell, tape glue, `term`, `tasks` stay in the core.
+- Size and speed: kernel is `opt-level = "z"` with LTO, so indirection is checked by comparing image size before and after.
+
+**Risks.** Path moves hide from text search (split spellings); every step needs the aarch64 build and, at the end of 1b, a full
+`make test-all` on landsbro. Real-hardware checks for anything that touches IRQ routing or DMA (`skylake`, `amd1`, laptop, `piano`).
+Rough size: 1a about a week of focused work, 1b about two.

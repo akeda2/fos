@@ -1050,7 +1050,7 @@ impl Controller {
             if self.irq_failed {
                 return false;
             }
-            let (first, end) = crate::ioapic::gsi_range();
+            let (first, end) = crate::hal::gsi_range();
             let candidates = crate::msi::intx_candidates(self.pci.interrupt_line());
             for (position, &gsi) in candidates.iter().enumerate() {
                 if gsi == u32::MAX || gsi == 0 || gsi < first || gsi >= end || candidates[..position].contains(&gsi) {

@@ -328,7 +328,7 @@ impl Rtl8139 {
     /// RTL8168 and 3C905 drivers do since the ACPI routing table is not read, and keeping one only if the self-test arrives.
     pub fn enable_interrupts(&mut self, device: &pci::Device) -> Result<Delivery, &'static str> {
         let mut reason = "no I/O APIC pin delivered the self-test interrupt";
-        let (first, end) = crate::ioapic::gsi_range();
+        let (first, end) = crate::hal::gsi_range();
         let candidates = crate::msi::intx_candidates(device.interrupt_line());
         for (position, &gsi) in candidates.iter().enumerate() {
             if gsi == u32::MAX || gsi == 0 || gsi < first || gsi >= end || candidates[..position].contains(&gsi) {
