@@ -12,7 +12,7 @@
 
 mod ui;
 
-use outfx::{Bass, Layout, Options, Upmix};
+use outfx::{Bass, Crossfeed, CrossfeedSettings, Layout, Options, Upmix};
 use ui::{Action, Page, Ui};
 use audio_decode::{Decode, Source, SourceError, ape, flac, mp3, opus, resample::Resampler, wav};
 use smb::{Client, Error, Handle, Transport};
@@ -244,6 +244,10 @@ fn set_option(key: &str, value: &str) -> Result<(), &'static str> {
                 SAVED_SHARE.clear();
                 let _ = core::fmt::Write::write_str(&mut SAVED_SHARE, value);
             }
+            "crossfeed" if CROSSFEED_PRESETS.iter().any(|(name, _)| *name == value) => {
+                EFFECTS.crossfeed = true;
+                EFFECTS.feed = CROSSFEED_PRESETS.iter().find(|(name, _)| *name == value).unwrap().1;
+            }
             "gfx" => match value {
                 "on" => GFX = true,
                 "off" => GFX = false,
@@ -400,6 +404,8 @@ struct Output {
     command: Option<Outcome>,
     /// The bass boost, when asked for.
     bass: Option<Bass>,
+    /// The headphone cross-feed, when asked for (stereo output only: the upmix has its own idea of the channels).
+    cross: Option<Crossfeed>,
     /// `UPMIX` feeds the first channels of the layout (5.1: L R C LFE Ls Rs); the device has that many.
     upmix: bool,
     rate: u32,
@@ -455,6 +461,22 @@ fn effects() -> &'static mut Options {
     unsafe { &mut *core::ptr::addr_of_mut!(EFFECTS) }
 }
 
+/// The cross-feed presets, gentlest first: the feed's level below the direct channel (as Linkwitz's 4.5 dB, Chu Moy's 6 dB),
+/// all with the usual 700 Hz corner and the 250 us the extra path round a head takes.
+const CROSSFEED_PRESETS: [(&str, CrossfeedSettings); 3] = [
+    ("light", CrossfeedSettings { level_db: 9.0, hz: 700.0, delay_us: 250.0 }),
+    ("medium", CrossfeedSettings { level_db: 6.0, hz: 700.0, delay_us: 250.0 }),
+    ("strong", CrossfeedSettings { level_db: 4.5, hz: 700.0, delay_us: 250.0 }),
+];
+
+/// Which preset the settings are exactly; `None` for off or a hand-set feed.
+fn crossfeed_preset(effects: &Options) -> Option<usize> {
+    if !effects.crossfeed {
+        return None;
+    }
+    CROSSFEED_PRESETS.iter().position(|(_, settings)| *settings == effects.feed)
+}
+
 /// Applies a settings action (a slider, a switch) to what is remembered; the sound follows via `Output::sync_effects`.
 fn change_setting(action: Action, device_channels: usize) {
     let effects = effects();
@@ -469,6 +491,21 @@ fn change_setting(action: Action, device_channels: usize) {
         Action::Delay(ms) => effects.surround.delay_ms = ms.clamp(ui::DELAY_RANGE.0, ui::DELAY_RANGE.1),
         Action::Center => effects.surround.center = !effects.surround.center,
         Action::Upmix => effects.upmix = !effects.upmix,
+        Action::Crossfeed => {
+            // off -> light -> medium -> strong -> off; a hand-set feed counts as past strong.
+            let next = match crossfeed_preset(effects) {
+                None if !effects.crossfeed => Some(0),
+                Some(index) if index + 1 < CROSSFEED_PRESETS.len() => Some(index + 1),
+                _ => None,
+            };
+            match next {
+                Some(index) => {
+                    effects.crossfeed = true;
+                    effects.feed = CROSSFEED_PRESETS[index].1;
+                }
+                None => effects.crossfeed = false,
+            }
+        }
         Action::Layout => {
             // The next layout the device has the outputs for.
             let all = Layout::ALL;
@@ -501,6 +538,11 @@ fn show_settings(view: &mut ui::View, device_channels: usize) {
     view.center = effects.surround.center;
     view.layout = layout.name();
     view.has_center = layout.has_center();
+    view.crossfeed = match (effects.crossfeed, crossfeed_preset(&effects)) {
+        (false, _) => "off",
+        (true, Some(index)) => CROSSFEED_PRESETS[index].0,
+        (true, None) => "custom",
+    };
     view.upmix_ok = layout.channels() <= device_channels;
     view.upmix = effects.upmix && view.upmix_ok;
 }
@@ -561,6 +603,7 @@ fn save_settings(api: &TapeApi) {
     let _ = write!(body, "upmix={}\ncenter={}\nwidth={:.2}\nlfe={:.0}\ndelay={:.0}\nlayout={}\n", if effects.upmix { "on" } else { "off" }, if effects.surround.center { "on" } else { "off" },
                    effects.surround.width, effects.surround.lfe_hz, effects.surround.delay_ms, effects.surround.layout.name());
     let _ = write!(body, "bassmgmt={}\n", if effects.surround.bass_mgmt { "on" } else { "off" });
+    let _ = write!(body, "feed={:.1}\nfeedfreq={:.0}\nfeeddelay={:.0}\ncrossfeed={}\n", effects.feed.level_db, effects.feed.hz, effects.feed.delay_us, if effects.crossfeed { "on" } else { "off" });
     #[allow(static_mut_refs)]
     let share = unsafe { SAVED_SHARE.as_str() };
     if !share.is_empty() {
@@ -710,6 +753,11 @@ fn take_pick() -> Option<usize> {
 
 impl Output {
     fn frame(&mut self, mut frame: [f32; 2]) {
+        if !self.upmix {
+            if let Some(cross) = self.cross.as_mut() {
+                frame = cross.process(frame);
+            }
+        }
         if let Some(bass) = self.bass.as_mut() {
             frame = bass.process(frame);
         }
@@ -739,6 +787,9 @@ impl Output {
     fn reset_effects(&mut self) {
         if let Some(bass) = self.bass.as_mut() {
             bass.reset();
+        }
+        if let Some(cross) = self.cross.as_mut() {
+            cross.reset();
         }
         if self.upmix {
             #[allow(static_mut_refs)]
@@ -778,6 +829,11 @@ impl Output {
         match self.bass.as_mut() {
             Some(bass) if effects.bass.gain_db > 0.0 => bass.set(effects.bass),
             _ => self.bass = Bass::new(self.rate, effects.bass),
+        }
+        match (effects.crossfeed, self.cross.as_mut()) {
+            (true, Some(cross)) => cross.set(effects.feed),
+            (true, None) => self.cross = Some(Crossfeed::new(self.rate, effects.feed)),
+            (false, _) => self.cross = None,
         }
         let fits = effects.surround.layout.channels() <= self.channels;
         #[allow(static_mut_refs)]
@@ -1436,6 +1492,7 @@ fn play_track(session: &mut Session, path: &str, index: usize, total: usize) -> 
             paused: false,
             command: None,
             bass: Bass::new(session.out_rate, unsafe { EFFECTS }.bass),
+            cross: unsafe { EFFECTS }.crossfeed.then(|| Crossfeed::new(session.out_rate, unsafe { EFFECTS }.feed)),
             upmix,
             rate: session.out_rate,
             gain: volume_gain(unsafe { VOLUME }),
@@ -1621,4 +1678,10 @@ tape_rt::tape_help!(br#"fosplay: play audio from an SMB share (guest access).
     center=off    leave the centre silent, fronts untouched (default on)
     width=0..1    surround level (0.7), lfe=HZ crossover 40-200 (100),
     delay=MS      surround delay 0-40 (15)
+    crossfeed=light|medium|strong|on|off
+                  headphone cross-feed: some of each channel, low-passed and
+                  delayed, goes to the other ear (9, 6 or 4.5 dB down; the
+                  Settings page button steps through them; stereo output only)
+    feed=DB       the feed level, 1-20 dB below the direct channel (6)
+    feedfreq=HZ   its low-pass corner 200-2000 (700); feeddelay=US 0-1000 (250)
 "#);

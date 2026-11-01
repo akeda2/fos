@@ -69,6 +69,7 @@ pub enum Hit {
     Upmix,
     Center,
     Layout,
+    Crossfeed,
     ToBrowse,
     ToSettings,
     ToPlayer,
@@ -101,6 +102,7 @@ pub enum Action {
     Upmix,
     Center,
     Layout,
+    Crossfeed,
     Open(usize),
     Parent,
     PlayAll,
@@ -136,6 +138,8 @@ pub struct View {
     pub upmix: bool,
     /// The device has the outputs the layout needs, so the upmix can be switched on.
     pub upmix_ok: bool,
+    /// The cross-feed's setting for the button: off, a preset's name or custom.
+    pub crossfeed: &'static str,
     pub center: bool,
     pub layout: &'static str,
     /// The layout has a centre channel (so the Centre switch means something).
@@ -174,6 +178,7 @@ impl View {
             delay_ms: 15.0,
             upmix: false,
             upmix_ok: false,
+            crossfeed: "off",
             center: true,
             layout: "5.1",
             has_center: true,
@@ -246,7 +251,7 @@ impl Layout {
             let column = (width - 3 * margin) / 2;
             let cell_h = (body_h - 5 * gap) / 6;
             let rows = [(Hit::Bass, Some(Hit::Volume)), (Hit::BassHz, Some(Hit::Upmix)), (Hit::BassQ, Some(Hit::Layout)), (Hit::Width, Some(Hit::Center)),
-                        (Hit::Lfe, Some(Hit::BassMgmt)), (Hit::Delay, None)];
+                        (Hit::Lfe, Some(Hit::BassMgmt)), (Hit::Delay, Some(Hit::Crossfeed))];
             for (index, (left, right)) in rows.into_iter().enumerate() {
                 let cell_y = y + index as i32 * (cell_h + gap);
                 layout.add(Rect { x: margin, y: cell_y, w: column, h: cell_h }, left);
@@ -383,6 +388,7 @@ impl TouchTarget for Target<'_> {
             Hit::Center => self.actions.push(Action::Center),
             Hit::BassMgmt => self.actions.push(Action::BassMgmt),
             Hit::Layout => self.actions.push(Action::Layout),
+            Hit::Crossfeed => self.actions.push(Action::Crossfeed),
             Hit::Parent => self.actions.push(Action::Parent),
             Hit::PlayAll => self.actions.push(Action::PlayAll),
             Hit::Quit => self.actions.push(Action::Quit),
@@ -788,4 +794,7 @@ fn draw_settings(canvas: &mut Canvas, layout: &Layout, view: &View) {
     button(canvas, layout, Hit::Layout, text.as_str(), false, true);
     button(canvas, layout, Hit::Center, "Centre", view.center && view.has_center, ok && view.has_center);
     button(canvas, layout, Hit::BassMgmt, "Fronts to sub", view.bass_mgmt && view.has_lfe, ok && view.has_lfe);
+    text.clear();
+    let _ = write!(text, "Crossfeed: {}", if view.upmix { "(stereo only)" } else { view.crossfeed });
+    button(canvas, layout, Hit::Crossfeed, text.as_str(), view.crossfeed != "off" && !view.upmix, !view.upmix);
 }
