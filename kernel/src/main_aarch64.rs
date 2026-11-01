@@ -97,28 +97,21 @@ pub fn replay_early_log() {
     }
 }
 
-/// `println!` goes to the PL011 and, once it exists, the framebuffer; the boot log joins as its module is ported.
-pub fn print(arguments: core::fmt::Arguments) {
-    struct Both;
-    impl Write for Both {
-        fn write_str(&mut self, text: &str) -> core::fmt::Result {
-            let _ = arch::aarch64::pl011::Serial.write_str(text);
-            unsafe {
-                {
-                    let len = *core::ptr::addr_of!(EARLY_LEN);
-                    let room = 16384 - len;
-                    let take = text.len().min(room);
-                    core::ptr::copy_nonoverlapping(text.as_ptr(), (core::ptr::addr_of_mut!(EARLY_LOG) as *mut u8).add(len), take);
-                    *core::ptr::addr_of_mut!(EARLY_LEN) = len + take;
-                }
-            }
-            framebuffer::write_str(text);
-            termsession::relay(text);
-            Ok(())
-        }
-    }
-    let _ = Both.write_fmt(arguments);
-}
+/// Where `println!` text goes, in order (`hal::print` walks this list): the PL011, the early log, and, once it exists, the
+/// framebuffer; the boot log joins as its module is ported.
+pub static CONSOLE_SINKS: [fn(&str); 4] = [
+    |text| {
+        let _ = arch::aarch64::pl011::Serial.write_str(text);
+    },
+    |text| unsafe {
+        let len = *core::ptr::addr_of!(EARLY_LEN);
+        let take = text.len().min(16384 - len);
+        core::ptr::copy_nonoverlapping(text.as_ptr(), (core::ptr::addr_of_mut!(EARLY_LOG) as *mut u8).add(len), take);
+        *core::ptr::addr_of_mut!(EARLY_LEN) = len + take;
+    },
+    framebuffer::write_str,
+    termsession::relay,
+];
 
 const PI4_GIC_DISTRIBUTOR: u64 = 0xff84_1000;
 const PI4_PL011: u64 = 0xfe20_1000;

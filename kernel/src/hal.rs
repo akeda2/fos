@@ -53,3 +53,19 @@ pub fn register_irq(intid: u32, level: bool, handler: fn(u32)) {
 pub fn irq_ticks() -> u64 {
     crate::arch::aarch64::gic::irq_ticks()
 }
+
+/// `println!`: formats the text and hands each piece to every console sink the core listed in `CONSOLE_SINKS` (entry
+/// file), in order. Drivers only ever call this (through `println!`); they never know where the text ends up.
+pub fn print(arguments: core::fmt::Arguments) {
+    use core::fmt::Write;
+    struct Sinks;
+    impl Write for Sinks {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            for sink in crate::CONSOLE_SINKS.iter() {
+                sink(text);
+            }
+            Ok(())
+        }
+    }
+    let _ = Sinks.write_fmt(arguments);
+}

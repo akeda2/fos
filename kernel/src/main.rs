@@ -15,12 +15,13 @@
 #![no_std]
 #![no_main]
 
-// `println!` goes to `print` (defined by the entry file of each architecture).
+// `println!` goes to `hal::print`, which writes to the core's `CONSOLE_SINKS` (defined by the entry file of each architecture).
 #[macro_export]
 macro_rules! println {
     () => { $crate::print(format_args!("\n")) };
     ($($argument:tt)*) => { $crate::print(format_args!("{}\n", format_args!($($argument)*))) };
 }
+pub use hal::print;
 
 // One crate root, two entry files: each is spliced in here, so `crate::println!`, `crate::print` and the module paths
 // look the same to every driver. The x86-64 file is the whole kernel as it was; the aarch64 one is the Raspberry Pi
