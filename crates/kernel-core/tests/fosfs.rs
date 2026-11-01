@@ -29,6 +29,18 @@ impl Platform for RamDisks {
         1_700_000_000
     }
 
+    fn block_sectors(&self, disk: usize) -> Option<u64> {
+        self.0.lock().unwrap().get(&disk).map(|data| data.len() as u64 / 512)
+    }
+
+    fn timer_counter(&self) -> u64 {
+        0x1234_5678_9abc
+    }
+
+    fn timer_ticks(&self) -> u64 {
+        42
+    }
+
     fn print(&self, _: core::fmt::Arguments) {}
 }
 
@@ -87,4 +99,16 @@ fn a_damaged_directory_entry_is_reported() {
 fn no_platform_disk_is_an_error_not_a_crash() {
     disk(4);
     assert!(Volume::mount(99, 0, SECTORS).is_err());
+}
+
+#[test]
+fn a_partition_table_is_written_found_and_grown() {
+    use kernel_core::gpt;
+    let number = disk(5);
+    assert!(matches!(gpt::inspect(number), Some(gpt::Summary::Blank)));
+    let made = gpt::write_single_fosfs_partition(number).unwrap();
+    let guid = fosfor_abi::FOSFS_TYPE_GUID;
+    let found = gpt::find(number, &guid, |_| true).unwrap();
+    assert_eq!((found.start, found.sectors), (made.start, made.sectors));
+    assert!(matches!(gpt::inspect(number), Some(gpt::Summary::Gpt { fosfs: Some(_), other: 0 })));
 }

@@ -19,8 +19,7 @@ mod fatvol;
 mod formatshell;
 mod platform;
 mod framebuffer;
-mod gpt;
-mod lineedit;
+
 mod mailbox;
 mod pipower;
 mod i2s_pi;

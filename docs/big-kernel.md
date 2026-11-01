@@ -166,4 +166,7 @@ by any test: USB serial adapters, the Pi 4 console and GIC paths (hardware only)
 - `crates/kernel-core`: modules that need nothing but `fos_hal`. First slice: `fosfs` (moved unchanged; the kernel re-exports it
   as `crate::fosfs`). Host tests run it on a RAM disk (`make test`).
 - Size: x86 kernel 1,167,120 -> 1,168,008 bytes. Verified: `make test`, `test-fosfs4`, `test-v4-boot`, `test-mounts`, aarch64 build.
-- Next: `gpt`, `fatvol`, `mounts`, `lineedit` (need a timer hook), then NICs, storage, USB, audio.
+- Second slice: `gpt` and `lineedit` (the `Platform` gained `block_sectors`, `timer_counter`, `timer_ticks`; `gpt` has a host test).
+  x86 kernel 1,168,328 bytes. Verified: `make test`, `test-format`, `test-grow`, `test-install`, `test-fosfs4`, `test-v4-boot`,
+  `test-serial-shell` (line editor), aarch64 build.
+- Next: `fatvol`, `mounts` (need `storage`, `tape_fs` hooks), then NICs, storage, USB, audio.

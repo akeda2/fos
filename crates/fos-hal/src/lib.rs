@@ -27,6 +27,12 @@ pub trait Platform: Sync {
     fn block_write(&self, disk: usize, lba: u64, buffer: &[u8]) -> Result<(), BlockError>;
     /// The wall clock as Unix seconds (local reading taken as UTC), 0 when it was never set.
     fn unix_seconds(&self) -> u64;
+    /// The size of disk `disk` in 512-byte sectors, `None` when there is no such disk.
+    fn block_sectors(&self, disk: usize) -> Option<u64>;
+    /// A free-running hardware counter (TSC or the generic timer's count); only its low bits are meant as noise.
+    fn timer_counter(&self) -> u64;
+    /// Timer interrupt ticks since boot.
+    fn timer_ticks(&self) -> u64;
     /// Console text, as `println!` produces it.
     fn print(&self, arguments: fmt::Arguments);
 }
@@ -54,6 +60,21 @@ pub mod block {
 
     pub fn write(disk: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
         platform().ok_or(BlockError::NoSuchDisk)?.block_write(disk, lba, buffer)
+    }
+
+    /// Size of the disk in sectors.
+    pub fn sectors(disk: usize) -> Option<u64> {
+        platform()?.block_sectors(disk)
+    }
+}
+
+pub mod timer {
+    pub fn counter() -> u64 {
+        super::platform().map_or(0, |platform| platform.timer_counter())
+    }
+
+    pub fn ticks() -> u64 {
+        super::platform().map_or(0, |platform| platform.timer_ticks())
     }
 }
 

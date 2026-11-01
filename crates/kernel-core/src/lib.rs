@@ -3,6 +3,8 @@
 
 #![no_std]
 
-pub use fos_hal::{block, clock, println};
+pub use fos_hal::{block, clock, print, println, timer};
 
 pub mod fosfs;
+pub mod gpt;
+pub mod lineedit;
