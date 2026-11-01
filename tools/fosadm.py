@@ -204,8 +204,11 @@ class Host:
         self.name = name
         self.nics: dict[int, bytes] = {}
         self.serial: Serial | None = None
-        # "bin/" on a FOSFS v4 machine, whose tapes live in a folder; "" on v3 and FAT, where they are in the root.
-        self.prefix = ""
+        # Tapes that live only in bin/ (FOSFS v4); a bare name that is in the root is the root's, as `run` takes it.
+        self.in_bin: set[str] = set()
+
+    def placed(self, name: str) -> str:
+        return "bin/" + name if name in self.in_bin else name
 
     @property
     def mac(self) -> bytes:
@@ -270,9 +273,14 @@ def ask_host(iface: str, host: Host, commands: list[str], timeout: float = 60) -
     return result.stdout
 
 
-def tape_prefix(text: str) -> str:
-    """"bin/" when the `ls` in `text` shows a bin folder (FOSFS v4), else ""."""
-    return "bin/" if re.search(r"^bin\s+<dir>", text, re.M) else ""
+def listing(host: Host, text: str) -> dict[str, int]:
+    """Name -> size from the answers to `ls` and `ls bin`. A name in both is the root's (`run` takes the root's first);
+    `host.in_bin` is the names that only bin/ has."""
+    marker = re.search(r"^.*\bls bin\s*$", text, re.M)
+    root = parse_ls(text[:marker.start()] if marker else text)
+    folder = parse_ls(text[marker.end():]) if marker else {}
+    host.in_bin = {name for name in folder if name not in root}
+    return {**folder, **root}
 
 
 def parse_ls(text: str) -> dict[str, int]:
@@ -319,14 +327,13 @@ def cmd_status(args, iface: str) -> int:
     hosts = pick(find_hosts(args, iface), args.hosts)
     for host in hosts:
         out = ask_host(iface, host, ["debug slots", "ls", "ls bin", "about"])
-        host.prefix = tape_prefix(out)
         print(f"{host.name} ({host.label()})")
         arch = arch_of(out)
         kernel, tape_dir, tapes = source_files(Path(args.source) if args.source else None, arch)
         want_sectors = kernel_sectors(kernel)
         booted = re.search(r"booted slot: (\d+)", out)
         sizes = re.search(r"slot sizes \(sectors\): (\d+) / (\d+)", out)
-        files = parse_ls(out)
+        files = listing(host, out)
         if not booted or not sizes:
             print("  no usable answer (is a tape running? try again or stop it first)")
             continue
@@ -394,8 +401,8 @@ def content_states(iface: str, host: Host, tape_dir: Path, names: list[str]) -> 
     rest = [name for name in names if name not in states]   # not stamped tapes there (or no manifest): ask the shell
     for start in range(0, len(rest), 6):
         batch = rest[start:start + 6]
-        out = ask_host(iface, host, ["sha256 " + " ".join(host.prefix + name for name in batch)], 60)
-        found = {name.removeprefix(host.prefix): digest for name, digest in parse_sha256(out).items()}
+        out = ask_host(iface, host, ["sha256 " + " ".join(host.placed(name) for name in batch)], 60)
+        found = {name.removeprefix("bin/") if name.removeprefix("bin/") in host.in_bin else name: digest for name, digest in parse_sha256(out).items()}
         if not found and "not found" not in out:
             break
         for name in batch:
@@ -430,8 +437,7 @@ def probe(iface: str, host: Host) -> tuple[str, int, dict[str, int], bool] | Non
         booted = re.search(r"booted slot: (\d+)", out)
         sizes = re.search(r"slot sizes \(sectors\): (\d+) / (\d+)", out)
         if booted and sizes:
-            host.prefix = tape_prefix(out)
-            return arch_of(out), int(sizes.group(1 + int(booted.group(1)))), parse_ls(out), stopped
+            return arch_of(out), int(sizes.group(1 + int(booted.group(1)))), listing(host, out), stopped
         if attempt == 0:
             stop_running_tape(iface, host)
             stopped = True
@@ -541,19 +547,19 @@ def cmd_deploy(args, iface: str) -> int:
             for name in tape_list:
                 if host.serial:
                     try:
-                        host.serial.send(f"recv disk1/{host.prefix}{name}".encode(), (tape_dir / name).read_bytes())
+                        host.serial.send(f"recv disk1/{host.placed(name)}".encode(), (tape_dir / name).read_bytes())
                         ok = True
                     except SystemExit as refusal:
                         print(f"  tape {name}: {refusal}")
                         ok = False
                 else:
                     ok = subprocess.run([sys.executable, str(TOOLS / "foscopy.py"), "--iface", iface, "--mac", mac,
-                                         str(tape_dir / name), f":disk1/{host.prefix}{name}"], capture_output=True, text=True).returncode == 0
+                                         str(tape_dir / name), f":disk1/{name}"], capture_output=True, text=True).returncode == 0
                 print(f"  tape {name}: {'ok' if ok else 'FAILED'}")
                 failed += not ok
             states = content_states(iface, host, tape_dir, tape_list)
             if set(states.values()) == {"unsupported"}:
-                files = parse_ls(ask_host(iface, host, ["ls", "ls bin"]))
+                files = listing(host, ask_host(iface, host, ["ls", "ls bin"]))
                 bad = [n for n in tape_list if files.get(n) != tapes[n]]
                 print("  verified by size (no `sha256` command on this kernel)" if not bad else f"  size mismatch after copy: {' '.join(bad)}")
             else:
