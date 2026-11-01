@@ -49,6 +49,24 @@ static mut CELLS: [u8; MAX_CELLS] = [b' '; MAX_CELLS];
 /// What is currently drawn on screen, cell by cell.
 static mut PAINTED: [u8; MAX_CELLS] = [b' '; MAX_CELLS];
 
+/// The text attribute of each cell (SGR: colours and reverse video) and of what is drawn. 0 is the console's own colours.
+/// Bits 0-4: foreground (0 = default, else ANSI colour 0-15 plus one), bits 5-9: background likewise, bit 10: reverse.
+static mut ATTRS: [u16; MAX_CELLS] = [0; MAX_CELLS];
+static mut PAINTED_ATTRS: [u16; MAX_CELLS] = [0; MAX_CELLS];
+/// The attribute new characters get, the numbers of the CSI in progress (for `ESC [ ... m`) and its private marker.
+static mut ATTR: u16 = 0;
+static mut SGR: [u16; 8] = [0; 8];
+static mut SGR_COUNT: usize = 0;
+static mut CSI_MARK: u8 = 0;
+/// `ESC [ ? 25 l` hides the caret, `ESC [ ? 25 h` shows it again (an editor draws its own).
+static mut CARET_HIDDEN: bool = false;
+
+/// The sixteen ANSI colours as RGB (the VGA palette).
+const ANSI: [(u8, u8, u8); 16] = [
+    (0, 0, 0), (170, 0, 0), (0, 170, 0), (170, 85, 0), (0, 0, 170), (170, 0, 170), (0, 170, 170), (192, 192, 192),
+    (85, 85, 85), (255, 85, 85), (85, 255, 85), (255, 255, 85), (85, 85, 255), (255, 85, 255), (85, 255, 255), (255, 255, 255),
+];
+
 /// The cell index the pixel console's caret is drawn in (`usize::MAX`: none yet).
 static mut CARET_AT: usize = usize::MAX;
 
@@ -76,13 +94,27 @@ impl Console {
         }
     }
 
-    fn draw_glyph(&mut self, character: u8, column: usize, row: usize) {
+    /// The pixel colours (foreground, background) an attribute stands for.
+    fn colors(&self, attr: u16) -> (u32, u32) {
+        let pick = |code: u16, default: u32| match code {
+            0 => default,
+            n => {
+                let (r, g, b) = ANSI[usize::from(n - 1) & 15];
+                self.pixel(r, g, b)
+            }
+        };
+        let (fg, bg) = (pick(attr & 31, self.foreground), pick(attr >> 5 & 31, self.background));
+        if attr & 1 << 10 != 0 { (bg, fg) } else { (fg, bg) }
+    }
+
+    fn draw_glyph(&mut self, character: u8, attr: u16, column: usize, row: usize) {
+        let (foreground, background) = self.colors(attr);
         let glyph = &FONT[usize::from(character)];
         let (x0, y0) = (column * FONT_WIDTH, row * FONT_HEIGHT);
         for (line, bits) in glyph.iter().enumerate() {
             for bit in 0..FONT_WIDTH {
                 let on = bits & (0x80 >> bit) != 0;
-                let value = if on { self.foreground } else { self.background };
+                let value = if on { foreground } else { background };
                 self.set_pixel(x0 + bit, y0 + line, value);
             }
         }
@@ -94,6 +126,9 @@ impl Console {
         let cells = unsafe { &mut *core::ptr::addr_of_mut!(CELLS) };
         cells.copy_within(columns..self.rows * columns, 0);
         cells[(self.rows - 1) * columns..self.rows * columns].fill(b' ');
+        let attrs = unsafe { &mut *core::ptr::addr_of_mut!(ATTRS) };
+        attrs.copy_within(columns..self.rows * columns, 0);
+        attrs[(self.rows - 1) * columns..self.rows * columns].fill(0);
     }
 
     fn newline(&mut self) {
@@ -117,10 +152,10 @@ impl Console {
         for row in 0..self.rows {
             for column in 0..columns {
                 let index = row * columns + column;
-                let wanted = unsafe { CELLS[index] };
-                if wanted != unsafe { PAINTED[index] } {
-                    self.draw_glyph(wanted, column, row);
-                    unsafe { PAINTED[index] = wanted };
+                let (wanted, attr) = unsafe { (CELLS[index], ATTRS[index]) };
+                if wanted != unsafe { PAINTED[index] } || attr != unsafe { PAINTED_ATTRS[index] } {
+                    self.draw_glyph(wanted, attr, column, row);
+                    unsafe { (PAINTED[index], PAINTED_ATTRS[index]) = (wanted, attr) };
                 }
             }
         }
@@ -128,11 +163,16 @@ impl Console {
         // it, and a cell the caret left must be restored, so the old cell is redrawn and the caret drawn afresh each time.
         let at = self.row.min(self.rows - 1) * columns + self.column.min(columns - 1);
         let old = unsafe { CARET_AT };
-        if old != at && old < self.rows * columns {
-            self.draw_glyph(unsafe { CELLS[old] }, old % columns, old / columns);
+        let hidden = unsafe { CARET_HIDDEN };
+        if (old != at || hidden) && old < self.rows * columns {
+            self.draw_glyph(unsafe { CELLS[old] }, unsafe { ATTRS[old] }, old % columns, old / columns);
+        }
+        if hidden {
+            unsafe { CARET_AT = usize::MAX };
+            return;
         }
         let (x, y) = ((at % columns) * FONT_WIDTH, (at / columns) * FONT_HEIGHT);
-        let value = self.foreground;
+        let value = self.colors(unsafe { ATTRS[at] }).0;
         self.fill(x, y + FONT_HEIGHT - 2, FONT_WIDTH, 2, value);
         unsafe { CARET_AT = at };
     }
@@ -146,16 +186,20 @@ impl Console {
         for row in 0..self.rows {
             for column in 0..columns {
                 let index = row * columns + column;
-                let wanted = unsafe { CELLS[index] };
-                if wanted != unsafe { PAINTED[index] } {
-                    unsafe { self.base.cast::<u16>().add(index).write_volatile(u16::from(TEXT_ATTRIBUTE) << 8 | u16::from(wanted)) };
-                    unsafe { PAINTED[index] = wanted };
+                let (wanted, attr) = unsafe { (CELLS[index], ATTRS[index]) };
+                if wanted != unsafe { PAINTED[index] } || attr != unsafe { PAINTED_ATTRS[index] } {
+                    let byte = u16::from(vga_attribute(attr));
+                    unsafe { self.base.cast::<u16>().add(index).write_volatile(byte << 8 | u16::from(wanted)) };
+                    unsafe { (PAINTED[index], PAINTED_ATTRS[index]) = (wanted, attr) };
                 }
             }
         }
         let cell = (self.row.min(self.rows - 1) * columns + self.column.min(columns - 1)) as u16;
         #[cfg(target_arch = "x86_64")]
         {
+            // CRTC register 0x0A bit 5 switches the hardware cursor off.
+            crate::cpu::outb(0x3d4, 0x0a);
+            crate::cpu::outb(0x3d5, if unsafe { CARET_HIDDEN } { 0x20 } else { 13 });
             crate::cpu::outb(0x3d4, 0x0e);
             crate::cpu::outb(0x3d5, (cell >> 8) as u8);
             crate::cpu::outb(0x3d4, 0x0f);
@@ -168,7 +212,8 @@ impl Console {
     /// The few ANSI sequences a tape's screen editor sends: `ESC [ n C` / `ESC [ n D` (cursor
     /// right/left, stopping at the row's ends), `ESC [ H` / `ESC [ row ; column H` (cursor position,
     /// so a tape can redraw a panel in place), `ESC [ K` (erase to the end of the row) and
-    /// `ESC [ 2 J` (clear the screen, cursor home). Anything else is swallowed. A serial or
+    /// `ESC [ 2 J` (clear the screen, cursor home), `ESC [ n ; ... m` (SGR: see `sgr`) and `ESC [ ? 25 l/h` (hide/show the
+    /// caret). Anything else is swallowed. A serial or
     /// `term net` terminal gets the same bytes and does these itself.
     fn control_sequence(&mut self, last: u8) {
         let count = self.parameter.max(1);
@@ -179,7 +224,10 @@ impl Console {
                 let start = self.row * self.columns + self.column.min(self.columns - 1);
                 let end = (self.row + 1) * self.columns;
                 unsafe { (&mut *core::ptr::addr_of_mut!(CELLS))[start..end].fill(b' ') };
+                // Erased cells take the current colours, so a tape can paint a whole bar with `ESC [ 7 m ESC [ K`.
+                unsafe { (&mut *core::ptr::addr_of_mut!(ATTRS))[start..end].fill(ATTR) };
             }
+            b'm' => sgr(),
             // `ESC [ H` and `ESC [ row ; column H` (1-based): move the cursor, so a tape can redraw a panel in place.
             b'H' | b'f' => {
                 let (row, column) = if self.has_first { (self.first_parameter, self.parameter) } else { (self.parameter, 1) };
@@ -188,6 +236,7 @@ impl Console {
             }
             b'J' if self.parameter == 2 => {
                 unsafe { (&mut *core::ptr::addr_of_mut!(CELLS))[..self.rows * self.columns].fill(b' ') };
+                unsafe { (&mut *core::ptr::addr_of_mut!(ATTRS))[..self.rows * self.columns].fill(ATTR) };
                 self.row = 0;
                 self.column = 0;
             }
@@ -201,6 +250,7 @@ impl Console {
                 self.parameter = 0;
                 self.has_first = false;
                 self.csi_private = false;
+                unsafe { (SGR_COUNT, CSI_MARK) = (0, 0) };
                 self.escape = match character {
                     b'[' => 2,
                     // OSC (window title, shell integration), DCS, SOS, PM, APC: a string up to BEL or ESC \.
@@ -217,15 +267,22 @@ impl Console {
                     b'0'..=b'9' => self.parameter = self.parameter.saturating_mul(10).saturating_add(usize::from(character - b'0')),
                     b';' => {
                         (self.first_parameter, self.has_first) = (self.parameter, true);
+                        push_sgr(self.parameter);
                         self.parameter = 0;
                     }
-                    b':'..=b'?' => self.csi_private = true,
+                    b':'..=b'?' => {
+                        self.csi_private = true;
+                        unsafe { CSI_MARK = character };
+                    }
                     0x20..=0x2f | 0x00..=0x1a | 0x1c..=0x1f => {}
                     0x1b => self.escape = 1,
                     last => {
                         self.escape = 0;
+                        push_sgr(self.parameter);
                         if !self.csi_private {
                             self.control_sequence(last);
+                        } else if unsafe { CSI_MARK } == b'?' && self.parameter == 25 && matches!(last, b'h' | b'l') {
+                            unsafe { CARET_HIDDEN = last == b'l' };
                         }
                     }
                 }
@@ -327,9 +384,79 @@ impl Console {
         if self.column >= self.columns {
             self.newline();
         }
-        unsafe { CELLS[self.row * self.columns + self.column] = cell };
+        let index = self.row * self.columns + self.column;
+        unsafe { (CELLS[index], ATTRS[index]) = (cell, ATTR) };
         self.column += 1;
     }
+}
+
+fn push_sgr(value: usize) {
+    unsafe {
+        if SGR_COUNT < 8 {
+            SGR[SGR_COUNT] = value.min(65535) as u16;
+            SGR_COUNT += 1;
+        }
+    }
+}
+
+/// `ESC [ n ; ... m`: 0 reset, 1 bold (bright foreground), 22 normal, 7/27 reverse on/off, 30-37 and 90-97 foreground,
+/// 39 default foreground, 40-47 and 100-107 background, 49 default background, and `38;5;n` / `48;5;n` for the sixteen
+/// colours n < 16. Anything else is ignored. No numbers at all means 0.
+fn sgr() {
+    let (list, count) = unsafe { (SGR, SGR_COUNT) };
+    let mut attr = unsafe { ATTR };
+    let mut i = 0;
+    while i < count.max(1) {
+        let code = if count == 0 { 0 } else { list[i] };
+        match code {
+            0 => attr = 0,
+            1 => {
+                let fg = attr & 31;
+                if (1..=8).contains(&fg) {
+                    attr = attr & !31 | (fg + 8);
+                } else if fg == 0 {
+                    attr = attr & !31 | 16; // bold default colour: bright white
+                }
+            }
+            22 => {
+                let fg = attr & 31;
+                if (9..=16).contains(&fg) {
+                    attr = attr & !31 | (fg - 8);
+                }
+            }
+            7 => attr |= 1 << 10,
+            27 => attr &= !(1 << 10),
+            30..=37 => attr = attr & !31 | (code - 30 + 1),
+            90..=97 => attr = attr & !31 | (code - 90 + 9),
+            39 => attr &= !31,
+            40..=47 => attr = attr & !(31 << 5) | (code - 40 + 1) << 5,
+            100..=107 => attr = attr & !(31 << 5) | (code - 100 + 9) << 5,
+            49 => attr &= !(31 << 5),
+            38 | 48 if i + 2 < count.max(1) && list[i + 1] == 5 => {
+                let n = list[i + 2];
+                if n < 16 {
+                    attr = if code == 38 { attr & !31 | (n + 1) } else { attr & !(31 << 5) | (n + 1) << 5 };
+                }
+                i += 2;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    unsafe { ATTR = attr };
+}
+
+/// The VGA text attribute byte (background in the high nibble, foreground in the low) for an attribute. ANSI orders
+/// red/green/blue as bits 0-2 where VGA has blue/green/red, so bits 0 and 2 swap. The background's bit 7 would blink, so
+/// only three bits of it are used.
+fn vga_attribute(attr: u16) -> u8 {
+    let swap = |c: u8| (c & 0x0a) | (c & 1) << 2 | (c >> 2 & 1);
+    let code = |n: u16, default: u8| if n == 0 { default } else { swap((n - 1) as u8) };
+    let (mut fg, mut bg) = (code(attr & 31, 7), code(attr >> 5 & 31, 0));
+    if attr & 1 << 10 != 0 {
+        (fg, bg) = (bg, fg);
+    }
+    (bg & 7) << 4 | fg
 }
 
 /// Code page 437 position of a Unicode letter or symbol, for VGA text mode.
@@ -392,6 +519,10 @@ pub fn init(framebuffer: &Framebuffer) -> bool {
     unsafe {
         (*core::ptr::addr_of_mut!(CELLS)).fill(b' ');
         (*core::ptr::addr_of_mut!(PAINTED)).fill(b' ');
+        (*core::ptr::addr_of_mut!(ATTRS)).fill(0);
+        (*core::ptr::addr_of_mut!(PAINTED_ATTRS)).fill(0);
+        ATTR = 0;
+        CARET_HIDDEN = false;
         CARET_AT = usize::MAX; // a console started again (the Pi's DSI one) must not erase the old caret on the new screen
         *core::ptr::addr_of_mut!(CONSOLE) = Some(console);
     }
@@ -434,6 +565,10 @@ pub fn init_text() -> bool {
         }
         (*core::ptr::addr_of_mut!(CELLS)).fill(b' ');
         (*core::ptr::addr_of_mut!(PAINTED)).fill(b' ');
+        (*core::ptr::addr_of_mut!(ATTRS)).fill(0);
+        (*core::ptr::addr_of_mut!(PAINTED_ATTRS)).fill(0);
+        ATTR = 0;
+        CARET_HIDDEN = false;
         *core::ptr::addr_of_mut!(CONSOLE) = Some(console);
     }
     // CRTC register 0x0A: bit 5 turns the cursor off; clear it, and give the cursor a block-ish shape (scan lines 13-15).
@@ -501,7 +636,10 @@ pub fn set_colors(foreground: Option<&str>, background: Option<&str>) -> bool {
     }
     let (width, height, background) = (console.width, console.height, console.background);
     console.fill(0, 0, width, height, background);
-    unsafe { (*core::ptr::addr_of_mut!(PAINTED)).fill(b' ') };
+    unsafe {
+        (*core::ptr::addr_of_mut!(PAINTED)).fill(b' ');
+        (*core::ptr::addr_of_mut!(PAINTED_ATTRS)).fill(0);
+    }
     console.repaint();
     true
 }
@@ -638,6 +776,15 @@ pub fn gfx_open() -> bool {
 }
 
 /// Takes the screen back (also done when a tape ends): clears it and draws the whole text grid again.
+/// Back to the console's own colours and a visible caret: a tape that ended (or was aborted) mid-attribute must not leave
+/// the shell in reverse video.
+pub fn reset_attributes() {
+    unsafe {
+        ATTR = 0;
+        CARET_HIDDEN = false;
+    }
+}
+
 pub fn gfx_close() {
     if !unsafe { GFX_OPEN } {
         return;
@@ -648,6 +795,7 @@ pub fn gfx_close() {
     console.fill(0, 0, width, height, background);
     unsafe {
         (*core::ptr::addr_of_mut!(PAINTED)).fill(b' ');
+        (*core::ptr::addr_of_mut!(PAINTED_ATTRS)).fill(0);
         CARET_AT = usize::MAX;
     }
     console.repaint();

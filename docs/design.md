@@ -1753,3 +1753,22 @@ streams at full audio rate on a USB stick.
 
 **Not verified (`fs_read_at`):** a file of several FOSFS extents (v4 holds up to three) is only covered by code reading; QEMU's fresh volumes give one extent.
 Not on real hardware. phono's decode reads its raw take with it.
+
+## ebb: the full-screen editor, and console SGR
+
+`tape run ebb NAME [tab=N]` (`tapes/ebb`) is an embedded cousin of the user's `ebba` editor. The text engine is `crates/edit-core`
+(`no_std`, no allocator: a gap buffer, an undo log, wrapped-row layout and a `Doc` with selection, word moves, auto-indent, indent/unindent and a
+line clipboard; every buffer is a caller-provided slice, so 12 host tests run without the kernel). `tapes/ebb/src/lib.rs` holds the whole editor
+(key decoder, `Editor::handle`, `render` into a cell `Grid`); `main.rs` only loads the file whole into RAM (CRLF files are kept CRLF), diffs the
+grid against what is on screen and sends changed cells, and turns touch/mouse events into clicks, drag selection and a drawn pointer.
+Keys (Nordic-safe, Ctrl+letter): S save, Q quit (twice when modified; Esc likewise), Z/Y undo/redo, C/X/V clipboard (a whole line with no
+selection), A select all, T select mode (cursor keys select), E/R word moves, G help. A remote terminal's Shift/Ctrl+arrow sequences work too; the
+local keyboard sends none. The piece tree of ebba, hex view, find/replace and large files are not ported (`DEFERRED.md`).
+
+**Console SGR.** The kernel console (`framebuffer.rs`) now keeps an attribute per cell: `ESC[0m`, `1`, `22`, `7`/`27`, `30-37`, `90-97`, `39`,
+`40-47`, `100-107`, `49`, `38;5;n`/`48;5;n` (n < 16) and `ESC[?25l`/`h` (caret). `ESC[K` and `ESC[2J` erase with the current attribute; the
+attribute is reset when a tape ends. VGA text mode (BIOS) maps them to attribute bytes.
+
+Verified: host tests, `make test-ebb` (QEMU/UEFI: reverse-video status bar seen in a screendump, edit/save/undo/two-step quit, colours back to
+normal after exit), x86 and aarch64 builds, and a scratch tape showing red text and a blue background. **Not verified:** VGA text mode (BIOS),
+Pi 4, a real mouse or touchpad in ebb, and non-ASCII typing (`sendkey` cannot type å/ä/ö; the decoder and layout have unit tests).

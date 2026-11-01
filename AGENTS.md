@@ -233,7 +233,7 @@ maintainer's memory notes, not in this repository.
 
 - A tape with arguments carries its usage as `tape_rt::tape_help!(br#"..."#);` (lines of at most 79 columns): the text
   goes into the `.fos_help` section of its ELF, and the kernel prints it for `help NAME`, `NAME help` and `NAME --help` without
-  running the tape (`tape.rs` `show_help`, `abi::elf::section`). Tapes done so far: ptp, audio-net, record, recorder, play, router,
+  running the tape (`tape.rs` `show_help`, `abi::elf::section`). Tapes done so far: ebb, ptp, audio-net, record, recorder, play, router,
   bridge, nettest, ip-chat, telnet, net-chat, memtest, fterm. A new tape gets one; `ed`, `calc` and `hello` have none yet.
 - Every shell command's output fits an 80-column text grid; keep each print line to at
   most 79 columns and split long messages rather than relying on wrapping.
@@ -246,3 +246,5 @@ maintainer's memory notes, not in this repository.
   raw/AVTP/RTP, Opus send and `serve`.
 - Commit messages say what was verified and what only real hardware can verify. Do not
   commit or push unless asked.
+- Console escapes a tape may use: cursor `ESC[H`/`ESC[r;cH`, `ESC[nC/D`, `ESC[K`, `ESC[2J`, SGR colours/reverse/bold, `ESC[?25l/h`
+  (`docs/design.md` "ebb"). `tapes/ebb` + `crates/edit-core` is the editor; `make test-ebb`.
