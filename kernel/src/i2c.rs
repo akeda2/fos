@@ -21,7 +21,6 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use crate::timer;
 
-const PI4_GIC_DISTRIBUTOR: u64 = 0xff84_1000;
 /// BSC1's GIC interrupt: VideoCore interrupt 21 (shared by the BSC units) is SPI 96 + 21.
 const INTID: u32 = 32 + 117;
 /// The two buses: the 40-pin header's (BSC1, GPIO2/3 alt0) and the one on the DSI/CSI camera-display connectors, where
@@ -117,7 +116,7 @@ pub fn interrupt_count() -> u64 {
 }
 
 pub fn available() -> bool {
-    crate::gic::bases().0 == PI4_GIC_DISTRIBUTOR && crate::gpio::available()
+    crate::hal::is_pi4() && crate::gpio::available()
 }
 
 /// The core clock in Hz, from the firmware.
@@ -138,7 +137,7 @@ fn start() -> Result<(), Error> {
     }
     let bus = usize::from(BUS.load(Ordering::Relaxed));
     if !STARTED.swap(true, Ordering::AcqRel) {
-        crate::gic::register(INTID, true, interrupt);
+        crate::hal::register_irq(INTID, true, interrupt);
     }
     if !MAPPED[bus].swap(true, Ordering::AcqRel) {
         crate::paging::map_device(BASES[bus], 0x1000);

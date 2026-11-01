@@ -24,7 +24,6 @@ const MAX_DRIVES: usize = 2;
 const CHUNK_BLOCKS: usize = 128;
 /// The Raspberry Pi 4's EMMC2 and its GIC distributor, by which we know we run on one.
 const PI4_EMMC2: u64 = 0xfe34_0000;
-const PI4_GIC_DISTRIBUTOR: u64 = 0xff84_1000;
 /// The EMMC2 clock the firmware leaves, in MHz; its capabilities register does not give one.
 const PI4_BASE_MHZ: u32 = 100;
 /// EMMC2's GIC interrupt (SPI 126).
@@ -366,7 +365,7 @@ fn bring_up(base: u64, slot: usize, pi4: bool) -> Option<Drive> {
             unsafe { (*core::ptr::addr_of_mut!(CONTROLLERS))[slot] = Some(controller) };
             if pi4 {
                 WAKE_BASE.store(base, core::sync::atomic::Ordering::Relaxed);
-                crate::gic::register(PI4_INTID, true, interrupt);
+                crate::hal::register_irq(PI4_INTID, true, interrupt);
             }
             Some(Drive { index: slot, sectors })
         }
@@ -380,7 +379,7 @@ fn bring_up(base: u64, slot: usize, pi4: bool) -> Option<Drive> {
 /// Finds the SD host controllers (the Pi 4's EMMC2, PCI class 0x0805 devices) and calls `register` for each card.
 pub fn init_all(mut register: impl FnMut(Drive, usize)) {
     let mut slot = 0;
-    if crate::gic::bases().0 == PI4_GIC_DISTRIBUTOR {
+    if crate::hal::is_pi4() {
         if let Some(drive) = bring_up(PI4_EMMC2, slot, true) {
             register(drive, slot);
             slot += 1;

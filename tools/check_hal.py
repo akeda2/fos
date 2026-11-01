@@ -16,9 +16,8 @@ PATTERN = re.compile(r"\b" + PRIVATE + r"::[A-Za-z_]+")
 SKIP = {"main.rs", "main_x86_64.rs", "main_aarch64.rs", "hal.rs", "term.rs", "shell.rs", "shellcmds.rs",
         "kupshell.rs", "tape.rs", "tape_aarch64.rs", "diag.rs", "crash.rs", "config.rs", "power.rs",
         "nicshell.rs", "netfs.rs", "netservice.rs", "keyboard.rs"}
-# Pi drivers that still call the GIC directly; move them behind hal::msi and remove them here.
-ALLOWED = {"sdhci.rs", "i2c.rs",
-           "gpio.rs", "genet.rs"}
+# Files that still reach past hal; the list may only shrink.
+ALLOWED: set[str] = set()
 
 
 def main() -> int:
