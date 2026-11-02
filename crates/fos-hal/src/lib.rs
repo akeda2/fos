@@ -109,6 +109,10 @@ pub trait Platform: Sync {
     fn task_service_owns_nic(&self, _index: usize) -> bool {
         false
     }
+    /// Whether the service running now owns NIC `index` (0-based).
+    fn task_current_owns_nic(&self, _index: usize) -> bool {
+        false
+    }
 
     /// Message-signalled and legacy interrupts: claim a vector for `handler(context)`, and so on.
     fn msi_allocate(&self, handler: fn(usize), context: usize) -> Option<u8>;
@@ -309,6 +313,10 @@ pub mod tasks {
 
     pub fn service_owns(index: usize) -> bool {
         super::platform().is_some_and(|platform| platform.task_service_owns_nic(index))
+    }
+
+    pub fn current_owns(index: usize) -> bool {
+        super::platform().is_some_and(|platform| platform.task_current_owns_nic(index))
     }
 }
 

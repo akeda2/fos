@@ -31,6 +31,7 @@ static mut RUNTIME_SERVICES: u64 = 0;
 /// Adds a network interface; returns its zero-based index.
 pub fn install(nic: Nic, runtime_services: u64) -> Option<usize> {
     unsafe { RUNTIME_SERVICES = runtime_services };
+    crate::nicctl::set_frame_handler(handle_frame);
     crate::nic::install(nic)
 }
 
@@ -360,53 +361,6 @@ pub fn set_tape_mode(on: bool) {
 /// Drains whatever a running tape's loop must keep draining (input, the network, USB events).
 pub fn tape_poll() {
     tape_service();
-}
-
-/// Moves every frame waiting in a NIC's hardware ring into the per-interface FIFO (the terminal's own frames are
-/// handled on the way). The part of `tape_service` a receive-heavy tape needs on every call; the rest runs on a timer.
-fn drain_nics_to_fifo() {
-    for index in 0..nic_count() {
-        drain_nic_to_fifo(index);
-    }
-}
-
-fn drain_nic_to_fifo(index: usize) {
-    let mut buffer = [0u8; 1600];
-    // At most one ring's worth per call: under a line-rate flood the ring never stays empty, and an
-    // unbounded loop here would starve the tape that is supposed to consume (and send) the traffic.
-    for _ in 0..256 {
-        let Some(length) = nic_at(index).and_then(|nic| nic.receive(&mut buffer)) else { break };
-        let stamp = nic_at(index).map_or(0, |nic| nic.take_stamp());
-        if handle_frame(index, &buffer[..length]) {
-            continue;
-        }
-        queue_frame(index, &buffer[..length], stamp);
-    }
-}
-
-/// Moves the frames waiting on the NICs that services own into their queues (a service's own `nic_receive` does this
-/// too; the shell's `poll` and a foreground tape's service loop keep the rings from overrunning meanwhile).
-pub fn service_poll() {
-    if crate::tasks::count() == 0 {
-        return;
-    }
-    for index in 0..nic_count() {
-        if crate::tasks::service_owns(index) {
-            drain_nic_to_fifo(index);
-        }
-    }
-}
-
-/// A service's `nic_receive`: only on its own NIC.
-pub fn service_receive(index: usize, out: &mut [u8]) -> usize {
-    if !crate::tasks::current_owns(index) {
-        return 0;
-    }
-    if frame_pending(index) {
-        return pop_frame(index, out);
-    }
-    drain_nic_to_fifo(index);
-    pop_frame(index, out)
 }
 
 /// True while a foreground tape owns the keys and the screen.

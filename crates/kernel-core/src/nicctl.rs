@@ -88,6 +88,63 @@ pub fn last_rx_stamp(index: usize) -> u64 {
     if index >= MAX_NICS { 0 } else { unsafe { LAST_STAMP[index] } }
 }
 
+/// The terminal's (or a server's) own frame handling: true when it consumed the frame, so it is not queued for a tape.
+static mut FRAME_HANDLER: fn(usize, &[u8]) -> bool = |_, _| false;
+
+pub fn set_frame_handler(handler: fn(usize, &[u8]) -> bool) {
+    unsafe { FRAME_HANDLER = handler };
+}
+
+/// Hands one received frame to the registered handler.
+pub fn handle_frame(index: usize, frame: &[u8]) -> bool {
+    let handler = unsafe { FRAME_HANDLER };
+    handler(index, frame)
+}
+
+/// Moves every frame waiting in every NIC's hardware ring into the per-interface FIFO (the handler's own frames are
+/// dealt with on the way). The part of the tape service a receive-heavy tape needs on every call.
+pub fn drain_nics_to_fifo() {
+    for index in 0..nic::count() {
+        drain_nic_to_fifo(index);
+    }
+}
+
+pub fn drain_nic_to_fifo(index: usize) {
+    let mut buffer = [0u8; 1600];
+    // At most one ring's worth per call: under a line-rate flood the ring never stays empty, and an
+    // unbounded loop here would starve the tape that is supposed to consume (and send) the traffic.
+    for _ in 0..256 {
+        let Some(length) = nic::at(index).and_then(|nic| nic.receive(&mut buffer)) else { break };
+        let stamp = nic::at(index).map_or(0, |nic| nic.take_stamp());
+        if handle_frame(index, &buffer[..length]) {
+            continue;
+        }
+        queue_frame(index, &buffer[..length], stamp);
+    }
+}
+
+/// Moves the frames waiting on the NICs that services own into their queues (a service's own `nic_receive` does this
+/// too; the shell's `poll` and a foreground tape's service loop keep the rings from overrunning meanwhile).
+pub fn service_poll() {
+    for index in 0..nic::count() {
+        if crate::tasks::service_owns(index) {
+            drain_nic_to_fifo(index);
+        }
+    }
+}
+
+/// A service's `nic_receive`: only on its own NIC.
+pub fn service_receive(index: usize, out: &mut [u8]) -> usize {
+    if !crate::tasks::current_owns(index) {
+        return 0;
+    }
+    if frame_pending(index) {
+        return pop_frame(index, out);
+    }
+    drain_nic_to_fifo(index);
+    pop_frame(index, out)
+}
+
 /// A service ended: its NIC goes back to the state a tape leaves it in.
 pub fn nic_release(index: usize) {
     if let Some(nic) = nic::at(index) {

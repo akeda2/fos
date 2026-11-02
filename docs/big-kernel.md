@@ -226,5 +226,8 @@ by any test: USB serial adapters, the Pi 4 console and GIC paths (hardware only)
   (`queue_frame`, `pop_frame`, drop counts, `last_rx_stamp`) and the `nic_*` calls the tape ABI forwards (timestamps,
   multicast, VLAN, offload, counters); `term` re-exports them. `Platform::task_service_owns_nic` (new, default false)
   tells core whether a service owns a NIC.
-- Next: `handle_frame`/`announce_service` out of `term` (then `nicshell`), then the server kernel's own `Platform`.
+- Slice 10g, the receive path: `nicctl::drain_nic_to_fifo`, `service_poll` and `service_receive` are in core; the terminal
+  registers its `handle_frame` with `nicctl::set_frame_handler` (a server kernel registers its own), and
+  `Platform::task_current_owns_nic` is new. `handle_frame`, KUP and the shell stay in `term`: they need the console.
+- Next: `nicshell`, then the server kernel's own `Platform`.
   The server kernel needs all of them; only the real-time guarantees (interrupt-context audio refills) differ.
