@@ -99,9 +99,14 @@ pub type Fs = fat::Fs<Partition>;
 
 /// The local time, or None while the clock is unset (files then get the fixed date).
 fn now() -> Option<fat::Time> {
-    const UNIX_OFFSET: u64 = 946_684_800; // Unix epoch to 2000-01-01
     let seconds = crate::clock::unix_seconds();
-    (seconds != 0).then(|| fat::Time::from_seconds_since_2000(seconds.saturating_sub(UNIX_OFFSET)))
+    (seconds != 0).then(|| time_at_unix(seconds))
+}
+
+/// The date and time of a stored non-zero Unix reading (before 2000 shows as 2000-01-01 00:00:00).
+pub fn time_at_unix(seconds: u64) -> fat::Time {
+    const UNIX_OFFSET: u64 = 946_684_800; // Unix epoch to 2000-01-01
+    fat::Time::from_seconds_since_2000(seconds.saturating_sub(UNIX_OFFSET))
 }
 
 /// Gives `fs` the current local time for the files it creates or writes (a fixed date if the clock was never set).

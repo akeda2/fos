@@ -7,7 +7,8 @@
 use fosfor_abi::tape::*;
 
 use crate::fosfs::{Entry, Error, Volume};
-use crate::storage;
+use crate::block;
+use crate::volumes as storage;
 
 /// A file a tape is streaming into: on FOSFS its volume and reserved entry, on a FAT32/exFAT volume the mounted volume,
 /// the stream and the file's name (for `finish`). Every open stream has its own mount of its volume: the only state
@@ -67,7 +68,7 @@ pub fn resolve_file(reference: &[u8], reading: bool) -> Result<(Volume, &[u8]), 
 /// `bin/NAME` for a bare NAME, in a buffer that outlives the call (file calls are synchronous and the caller uses the
 /// name at once). A tape is found in `bin/` when its bare name is not there: `run NAME`, and a tape that loads another
 /// one, need not know whether the volume keeps its tapes in a folder.
-pub(crate) fn bin_path(name: &[u8]) -> Option<&'static [u8]> {
+pub fn bin_path(name: &[u8]) -> Option<&'static [u8]> {
     if name.contains(&b'/') || name.len() > crate::fosfs::MAX_NAME {
         return None;
     }
@@ -136,7 +137,7 @@ pub fn set_fat_label(number: usize, label: &[u8]) -> Result<(), fat::Error> {
 
 /// The exFAT volume labelled `label` (any case), on a disk that has no FOSFS volume.
 pub fn fat_labelled(label: &[u8]) -> Option<(usize, crate::fatvol::Fs)> {
-    (1..=crate::block::count()).find_map(|number| {
+    (1..=block::count()).find_map(|number| {
         let mut fs = fat_disk(number)?;
         let (bytes, length) = fs.label().ok()??;
         bytes[..length].eq_ignore_ascii_case(label).then_some((number, fs))
@@ -289,7 +290,7 @@ pub fn write(reference: &[u8], data: &[u8]) -> isize {
 /// Where a pushed file (NETFS put: `foscopy`, `tapesync`) of bare `name` goes: a tape that lives only in `bin/` is
 /// replaced there, so an update is not shadowed by a new copy in the root. Not used by the shell's `write` or a tape's
 /// own writes, where a bare name means the root even when `bin/` has the same name.
-pub(crate) fn replace_target<'a>(volume: &Volume, name: &'a [u8]) -> &'a [u8] {
+pub fn replace_target<'a>(volume: &Volume, name: &'a [u8]) -> &'a [u8] {
     if matches!(volume.file_length(name), Ok(Some(_))) {
         return name;
     }
@@ -433,7 +434,7 @@ pub fn each_entry(reference: &[u8], each: &mut dyn FnMut(&[u8], u64, bool, Optio
         }
     }
     volume
-        .for_each_in(folder, |entry| each(entry.name(), entry.length, entry.is_dir, (entry.modified != 0).then(|| crate::clock::time_at_unix(entry.modified))))
+        .for_each_in(folder, |entry| each(entry.name(), entry.length, entry.is_dir, (entry.modified != 0).then(|| crate::fatvol::time_at_unix(entry.modified))))
         .map(|()| "FOSFS")
         .map_err(|error| if error == Error::NoDirectory { FS_NOT_FOUND } else { FS_ERROR })
 }
@@ -479,8 +480,8 @@ pub fn length(reference: &[u8]) -> isize {
 
 /// `disk_info`: what disk `number` (one-based) holds, for a tape that lets the user pick where to save.
 pub fn disk_info(number: usize, out: &mut DiskInfo) -> u32 {
-    let Some(disk) = number.checked_sub(1).and_then(crate::block::get) else { return 0 };
-    let mut info = DiskInfo { sectors: disk.sectors, boot: u32::from(storage::boot_disk() == Some(number - 1)), ..Default::default() };
+    let Some(disk) = number.checked_sub(1).and_then(block::info) else { return 0 };
+    let mut info = DiskInfo { sectors: disk.sectors, boot: u32::from(block::boot_disk() == Some(number - 1)), ..Default::default() };
     info.model.copy_from_slice(&disk.model);
     info.kind = match storage::volume_on(number) {
         Ok(volume) => {
