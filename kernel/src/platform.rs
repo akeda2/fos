@@ -57,6 +57,10 @@ impl Platform for Embedded {
         crate::memory::allocate_contiguous(count, below)
     }
 
+    fn free_frames(&self, address: u64, count: u64) {
+        crate::memory::free(address, count);
+    }
+
     fn map_device(&self, address: u64, length: u64) {
         crate::paging::map_device(address, length);
     }
@@ -123,6 +127,10 @@ impl Platform for Embedded {
         crate::cpu::interrupts_restore(was_enabled);
     }
 
+    #[cfg(target_arch = "x86_64")]
+    fn watchdog_pet(&self) {
+        crate::debug::pet();
+    }
     #[cfg(target_arch = "x86_64")]
     fn msi_claim(&self) {
         crate::msi::claim();

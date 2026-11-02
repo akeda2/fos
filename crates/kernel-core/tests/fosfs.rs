@@ -58,6 +58,7 @@ impl Platform for RamDisks {
         None
     }
     fn map_device(&self, _: u64, _: u64) {}
+    fn free_frames(&self, _: u64, _: u64) {}
     fn wait_ticks(&self, _: u64) {}
     fn pci_read32(&self, _: u8, _: u8, _: u8, _: u8) -> u32 {
         u32::MAX

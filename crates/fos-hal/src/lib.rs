@@ -54,6 +54,8 @@ pub trait Platform: Sync {
 
     /// `count` zeroed physically contiguous 4 KiB frames, entirely below `below` when given; the physical address.
     fn allocate_contiguous(&self, count: u64, below: Option<u64>) -> Option<u64>;
+    /// Gives back frames from `allocate_contiguous`.
+    fn free_frames(&self, address: u64, count: u64);
     /// Maps `length` bytes of device registers at physical `address` (identity, uncached, never executable).
     fn map_device(&self, address: u64, length: u64);
     fn wait_ticks(&self, count: u64);
@@ -83,6 +85,8 @@ pub trait Platform: Sync {
         false
     }
     fn interrupts_restore(&self, _was_enabled: bool) {}
+    /// The foreground made progress (the watchdog's "pet"); wait loops call it.
+    fn watchdog_pet(&self) {}
 
     /// Message-signalled and legacy interrupts: claim a vector for `handler(context)`, and so on.
     fn msi_allocate(&self, handler: fn(usize), context: usize) -> Option<u8>;
@@ -174,6 +178,12 @@ pub mod memory {
     pub fn allocate_contiguous(count: u64, below: Option<u64>) -> Option<u64> {
         super::platform()?.allocate_contiguous(count, below)
     }
+
+    pub fn free(address: u64, count: u64) {
+        if let Some(platform) = super::platform() {
+            platform.free_frames(address, count);
+        }
+    }
 }
 
 pub mod paging {
@@ -233,6 +243,15 @@ pub mod cpu {
     pub fn interrupts_restore(was_enabled: bool) {
         if let Some(platform) = super::platform() {
             platform.interrupts_restore(was_enabled);
+        }
+    }
+}
+
+/// Crash and watchdog support.
+pub mod debug {
+    pub fn pet() {
+        if let Some(platform) = super::platform() {
+            platform.watchdog_pet();
         }
     }
 }
