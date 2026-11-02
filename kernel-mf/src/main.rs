@@ -8,8 +8,10 @@ extern crate alloc;
 
 #[macro_use]
 mod serial;
+mod fpu;
 mod process;
 mod sched;
+mod tapeapi;
 mod user_test;
 mod fb;
 mod config;
@@ -158,6 +160,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     idt::build();
     idt::load();
     process::init_cpu();
+    fpu::init_cpu();
     let before = trap::BREAKPOINTS.load(core::sync::atomic::Ordering::Relaxed);
     unsafe { core::arch::asm!("int3") };
     assert_eq!(trap::BREAKPOINTS.load(core::sync::atomic::Ordering::Relaxed), before + 1);

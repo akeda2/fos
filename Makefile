@@ -185,7 +185,7 @@ kernel:
 
 # The server kernel (kernel-mf/, docs/big-kernel.md): same loaders, same image layout, its own crate.
 KERNEL_MF_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel-mf
-.PHONY: kernel-mf image-mf test-mf-boot test-mf-net
+.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-tape
 kernel-mf:
 	cd kernel-mf && cargo +nightly-2026-09-13 build --release
 
@@ -194,6 +194,13 @@ image-mf: loader kernel-mf $(BIOS_STAGES)
 	mkdir -p $(BUILD)/fosfor-mf
 	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_MF_ELF) --output $(BUILD)/fosfor-mf/fosfor.img \
 		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin
+
+# Real, unmodified tapes (hello, fpcheck, gfxcheck) run as ring 3 processes on the server kernel, started from its shell.
+test-mf-tape: image-mf image
+	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_MF_ELF) --output $(BUILD)/fosfor-mf/fosfor-tapes.img \
+		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin \
+		--file hello=$(BUILD)/fosfor/tapes/hello --file fpcheck=$(BUILD)/fosfor/tapes/fpcheck --file gfxcheck=$(BUILD)/fosfor/tapes/gfxcheck
+	python3 tools/test_mf_tape.py
 
 # The server kernel boots through UEFI and BIOS (SMP 1, 2 and 8), validates BootInfo, narrates over COM1 and says what it is.
 test-mf-boot: image-mf $(BIOS_OUT)/shim/qemu-system-x86_64

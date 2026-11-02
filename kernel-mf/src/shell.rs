@@ -55,6 +55,7 @@ fn run(line: &str) {
     match command {
         "help" => {
             println!("help version cpus mem pci disks nic uptime slots threads echo TEXT reboot");
+            println!("tape NAME [ARGS]  run a tape (a ring 3 process)   kill PID");
         }
         "version" => println!("Fosfor OS server kernel (mf), slice 8."),
         "cpus" => println!("{} CPU(s); boot CPU has taken {} timer ticks.", percpu::count(), percpu::ticks_of(0)),
@@ -90,6 +91,15 @@ fn run(line: &str) {
             Some(m) => println!("booted slot {}, active {}, pending {:?}, crash count {}", slots::boot_slot(), m.active_slot, m.pending_slot, m.crash_count),
             None => println!("slot metadata unreadable"),
         },
+        "tape" => {
+            let Some(name) = words.next() else { return println!("usage: tape NAME [ARGS]") };
+            let args = line.trim_start()[command.len()..].trim_start()[name.len()..].trim_start();
+            run_tape(name, args);
+        }
+        "kill" => match words.next().and_then(|word| word.parse::<u64>().ok()) {
+            Some(pid) => sched::kill(pid),
+            None => println!("usage: kill PID (the number `tape` printed)"),
+        },
         "echo" => println!("{}", line[command.len()..].trim_start()),
         "reboot" => {
             println!("Restarting.");
@@ -97,5 +107,24 @@ fn run(line: &str) {
             power::reset();
         }
         _ => println!("Unknown command `{command}`; try `help`."),
+    }
+}
+
+/// Loads the ELF tape `name` from the boot volume (or whichever volume holds it) and starts it as a process.
+fn run_tape(name: &str, args: &str) {
+    let Some(volume) = kernel_core::volumes::volume_with_file(name.as_bytes()) else {
+        return println!("tape: no file `{name}`.");
+    };
+    let length = match volume.find(name.as_bytes()) {
+        Ok(Some(entry)) if !entry.is_dir => entry.length as usize,
+        _ => return println!("tape: cannot find `{name}`."),
+    };
+    let mut image = alloc::vec![0u8; length];
+    if !matches!(volume.read(name.as_bytes(), &mut image), Ok(Some(_))) {
+        return println!("tape: cannot read `{name}`.");
+    }
+    match crate::process::spawn_elf(name, &image, args.as_bytes()) {
+        Ok(pid) => println!("tape: `{name}` is process {pid}."),
+        Err(error) => println!("tape: `{name}` cannot start: {error:?}."),
     }
 }

@@ -56,6 +56,12 @@ pub struct Thread {
     killed: bool,
     /// Bytes the process has written to the console (for the self-test).
     written: u64,
+    /// Unique process number (thread ids are reused), 0 for a kernel thread.
+    pid: u64,
+    /// Next free address of the process's `alloc` heap (0 until the first allocation).
+    heap_next: u64,
+    /// Floating point state, saved while a process thread is switched out.
+    fpu: Option<crate::fpu::Area>,
 }
 
 struct Sched {
@@ -116,7 +122,7 @@ fn this_cpu() -> usize {
 
 /// Makes the calling (boot) context thread 0. Call once, on the boot CPU, before spawning.
 pub fn init() {
-    let boot = Box::new(Thread { id: 0, name: *b"idle0\0\0\0\0\0\0\0\0\0\0\0", state: State::Running, rsp: 0, slot: None, key: 0, wake_at: 0, pinned: Some(0), on_cpu: true, root: 0, kstack_top: 0, killed: false, written: 0 });
+    let boot = Box::new(Thread { id: 0, name: *b"idle0\0\0\0\0\0\0\0\0\0\0\0", state: State::Running, rsp: 0, slot: None, key: 0, wake_at: 0, pinned: Some(0), on_cpu: true, root: 0, kstack_top: 0, killed: false, written: 0, pid: 0, heap_next: 0, fpu: None });
     let mut sched = Sched { threads: Vec::new(), queue: VecDeque::new(), free_slots: Vec::new(), next_slot: 0, current: [NO_THREAD; MAX_CPUS], previous: [NO_THREAD; MAX_CPUS], idle: [NO_THREAD; MAX_CPUS], switches: 0 };
     sched.threads.push(Some(boot));
     sched.current[0] = 0;
@@ -138,7 +144,7 @@ pub fn attach_cpu() {
     let mut name = *b"idle\0\0\0\0\0\0\0\0\0\0\0\0";
     name[4] = b'0' + (cpu_index % 10) as u8;
     let id = sched.threads.iter().position(Option::is_none).unwrap_or(sched.threads.len());
-    let thread = Box::new(Thread { id, name, state: State::Running, rsp: 0, slot: None, key: 0, wake_at: 0, pinned: Some(cpu_index), on_cpu: true, root: 0, kstack_top: 0, killed: false, written: 0 });
+    let thread = Box::new(Thread { id, name, state: State::Running, rsp: 0, slot: None, key: 0, wake_at: 0, pinned: Some(cpu_index), on_cpu: true, root: 0, kstack_top: 0, killed: false, written: 0, pid: 0, heap_next: 0, fpu: None });
     if id == sched.threads.len() {
         sched.threads.push(Some(thread));
     } else {
@@ -193,7 +199,7 @@ fn spawn_on(name: &str, entry: extern "C" fn(usize), argument: usize, pinned: Op
             sched.threads.len() - 1
         }
     };
-    sched.threads[id] = Some(Box::new(Thread { id, name: bytes, state: State::Ready, rsp: start, slot: Some((slot, frames)), key: 0, wake_at: 0, pinned, on_cpu: false, root, kstack_top: top, killed: false, written: 0 }));
+    sched.threads[id] = Some(Box::new(Thread { id, name: bytes, state: State::Ready, rsp: start, slot: Some((slot, frames)), key: 0, wake_at: 0, pinned, on_cpu: false, root, kstack_top: top, killed: false, written: 0, pid: 0, heap_next: 0, fpu: if root != 0 { crate::fpu::Area::new() } else { None } }));
     sched.queue.push_back(id);
     Some(id)
 }
@@ -241,6 +247,9 @@ fn switch_away(requeue: bool) {
                 }
             }
         };
+        if let Some(area) = sched.threads[current].as_ref().and_then(|t| t.fpu.as_ref()) {
+            area.save();
+        }
         let old_pointer = {
             let thread = sched.threads[current].as_mut().unwrap();
             if thread.state == State::Running {
@@ -306,6 +315,11 @@ fn load_context(cpu_index: usize) {
     if top != 0 {
         crate::percpu::set_kernel_stack(top);
     }
+    let guard = SCHED.lock();
+    if let Some(area) = guard.as_ref().and_then(|s| s.threads.get(s.current[cpu_index])).and_then(|t| t.as_ref()).and_then(|t| t.fpu.as_ref()) {
+        area.restore();
+    }
+    drop(guard);
     let wanted = if root == 0 { vm::root() } else { root };
     if cpu::read_cr3() != wanted {
         cpu::write_cr3(wanted);
@@ -336,12 +350,34 @@ pub fn detach_root() -> u64 {
     root
 }
 
-/// Asks a process thread to end: it does so the next time it is in the kernel (at the latest on its next timer tick).
-pub fn kill(id: usize) {
+/// Asks a process to end: it does so the next time it is in the kernel (at the latest on its next timer tick).
+pub fn kill(pid: u64) {
     let mut guard = SCHED.lock();
-    if let Some(Some(thread)) = guard.as_mut().map(|s| s.threads.get_mut(id)).flatten() {
-        thread.killed = true;
+    if let Some(sched) = guard.as_mut() {
+        for thread in sched.threads.iter_mut().flatten() {
+            if thread.pid == pid {
+                thread.killed = true;
+            }
+        }
     }
+}
+
+/// Gives the calling thread its process number.
+pub fn set_pid(pid: u64) {
+    with_current(|t| t.pid = pid);
+}
+
+/// The process heap's next free address (0 before the first allocation) and a way to move it.
+pub fn heap_next() -> u64 {
+    with_current(|t| t.heap_next).unwrap_or(0)
+}
+
+pub fn set_heap_next(address: u64) {
+    with_current(|t| t.heap_next = address);
+}
+
+pub fn current_pid() -> u64 {
+    with_current(|t| t.pid).unwrap_or(0)
 }
 
 pub fn current_killed() -> bool {

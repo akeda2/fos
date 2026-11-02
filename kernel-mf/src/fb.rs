@@ -6,6 +6,8 @@
 
 use fosfor_abi::{Framebuffer, PIXEL_NONE, PIXEL_RGB};
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::vm;
 
 #[path = "../../kernel/src/font_data.rs"]
@@ -24,6 +26,7 @@ struct Console {
     row: usize,
     foreground: u32,
     background: u32,
+    format: u32,
 }
 
 static mut CONSOLE: Option<Console> = None;
@@ -55,6 +58,7 @@ pub fn init(framebuffer: &Framebuffer) -> Option<(usize, usize)> {
         row: 0,
         foreground: pixel(framebuffer.format, 0xc0, 0xc0, 0xc0),
         background: pixel(framebuffer.format, 0, 0, 0),
+        format: framebuffer.format,
     };
     let background = console.background;
     console.fill(0, console.height, background);
@@ -121,9 +125,91 @@ impl Console {
 
 /// Called by the console for every piece of text, with the serial lock held; a no-op until `init` succeeded.
 pub fn write_str(text: &str) {
+    if GFX_OPEN.load(Ordering::Relaxed) {
+        return;
+    }
     if let Some(console) = unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() } {
         for byte in text.bytes() {
             console.put(byte);
         }
     }
+}
+
+/// Graphics for tapes (`TapeApi::gfx_*`): while a process has the screen open the text console stops drawing (serial and the
+/// network terminal go on); `gfx_close` clears the screen and the text starts again at the top. One screen, no rotation.
+static GFX_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// Width and height of the pixel screen, or None without one.
+pub fn gfx_info() -> Option<(u32, u32)> {
+    let console = unsafe { (*core::ptr::addr_of!(CONSOLE)).as_ref() }?;
+    Some((console.width as u32, console.height as u32))
+}
+
+pub fn gfx_open() -> bool {
+    let Some(console) = (unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }) else { return false };
+    let background = console.background;
+    console.fill(0, console.height, background);
+    GFX_OPEN.store(true, Ordering::Relaxed);
+    true
+}
+
+/// Gives the screen back: cleared, text from the top left.
+pub fn gfx_close() {
+    if !GFX_OPEN.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let Some(console) = (unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }) else { return };
+    let background = console.background;
+    console.fill(0, console.height, background);
+    console.column = 0;
+    console.row = 0;
+}
+
+pub fn gfx_is_open() -> bool {
+    GFX_OPEN.load(Ordering::Relaxed)
+}
+
+/// 0x00RRGGBB to this framebuffer's pixel format.
+fn from_rgb(console: &Console, rgb: u32) -> u32 {
+    pixel(console.format, (rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
+}
+
+/// A filled rectangle clipped to the screen; false when the screen is not open.
+pub fn gfx_fill(x: u32, y: u32, width: u32, height: u32, rgb: u32) -> bool {
+    let Some(console) = (unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }).filter(|_| GFX_OPEN.load(Ordering::Relaxed)) else { return false };
+    let value = from_rgb(console, rgb);
+    let (x, y) = (x as usize, y as usize);
+    if x >= console.width || y >= console.height {
+        return true;
+    }
+    let columns = (width as usize).min(console.width - x);
+    let rows = (height as usize).min(console.height - y);
+    for row in 0..rows {
+        for column in 0..columns {
+            unsafe { console.base.add((y + row) * console.stride + x + column).write_volatile(value) };
+        }
+    }
+    true
+}
+
+/// Copies `height` rows of `width` 0x00RRGGBB pixels (`stride` pixels apart) to (x, y), clipped on the right and bottom.
+///
+/// # Safety
+/// `source` must be readable for `(height - 1) * stride + width` pixels.
+pub unsafe fn gfx_blit(x: u32, y: u32, width: u32, height: u32, source: *const u32, stride: u32) -> bool {
+    let Some(console) = (unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }).filter(|_| GFX_OPEN.load(Ordering::Relaxed)) else { return false };
+    let (x, y, width, height, stride) = (x as usize, y as usize, width as usize, height as usize, stride as usize);
+    if source.is_null() || stride < width || x >= console.width || y >= console.height {
+        return false;
+    }
+    let columns = width.min(console.width - x);
+    let rows = height.min(console.height - y);
+    for row in 0..rows {
+        for column in 0..columns {
+            let rgb = unsafe { source.add(row * stride + column).read_unaligned() };
+            let value = from_rgb(console, rgb);
+            unsafe { console.base.add((y + row) * console.stride + x + column).write_volatile(value) };
+        }
+    }
+    true
 }

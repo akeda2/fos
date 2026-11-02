@@ -411,6 +411,24 @@ fn user_entry(root: u64, address: u64) -> Option<u64> {
     }
 }
 
+/// Removes the user page at `address` and returns its frame (the caller frees it); None if nothing was mapped. The process's
+/// root must be the one loaded on this CPU (the single thread of a process runs only here), so `invlpg` is enough.
+pub fn unmap_user_page(root: u64, address: u64) -> Option<u64> {
+    user_entry(root, address)?;
+    unsafe {
+        let read = |table: u64, index: u64| (direct(table & ADDRESS_MASK) as *const u64).add(index as usize).read();
+        let pml4 = read(root, (address >> 39) & 511);
+        let pdpt = read(pml4, (address >> 30) & 511);
+        let directory = read(pdpt, (address >> 21) & 511);
+        let leaves = direct(directory & ADDRESS_MASK) as *mut u64;
+        let slot = leaves.add(((address >> 12) & 511) as usize);
+        let frame = *slot & ADDRESS_MASK;
+        *slot = 0;
+        core::arch::asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
+        Some(frame)
+    }
+}
+
 /// Can the kernel read (or, with `write`, write) `[address, address + length)` of the process with root `root` through its
 /// user mappings? A syscall checks every pointer it is given with this before touching it.
 pub fn user_range_ok(root: u64, address: u64, length: u64, write: bool) -> bool {
