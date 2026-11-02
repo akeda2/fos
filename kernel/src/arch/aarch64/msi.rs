@@ -136,7 +136,7 @@ pub fn count(vector: u8) -> u64 {
 }
 
 /// The (address, data) a device must write to raise `vector`.
-fn message(vector: u8) -> (u64, u32) {
+pub(crate) fn message(vector: u8) -> (u64, u32) {
     match backend() {
         Backend::V2m => (V2M_BASE + V2M_SETSPI, V2M_FIRST.load(Ordering::Relaxed) + u32::from(vector)),
         _ => (BRCM_TARGET, BRCM_DATA_MATCH | u32::from(vector)),

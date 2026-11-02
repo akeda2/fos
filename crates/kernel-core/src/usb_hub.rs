@@ -21,12 +21,9 @@
 
 use crate::xhci::{self, Controller, Device};
 
-// The module that probes a device handed to it and releases a port's slots: the full USB host code on x86, the keyboard-only
-// one on aarch64 (both offer `set_step`, `step`, `release_port` and `probe_device`).
-#[cfg(target_arch = "x86_64")]
-use crate::usb_hid as host;
-#[cfg(target_arch = "aarch64")]
-use crate::usb_kbd as host;
+// The device enumerator the kernel registered (`usb_class::set_host`): probes a device handed to it and releases a port's
+// slots; it offers `set_step`, `step`, `release_port` and `probe_device`.
+use crate::usb_class as host;
 
 pub const MAX_HUBS: usize = 8;
 

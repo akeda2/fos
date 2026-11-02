@@ -191,4 +191,12 @@ by any test: USB serial adapters, the Pi 4 console and GIC paths (hardware only)
 - Seventh slice: `ahci` and `nvme`. The `Platform` gained `free_frames` and `watchdog_pet` (the drivers' wait loops pet the
   watchdog). x86 kernel 1,172,144 bytes. Verified: `make test`, `test-disks`, `test-usb-boot`, `test-v4-boot`, `test-format`,
   `test-grow`, `test-mounts`, `test-debug-mode`, aarch64 build. Real controller timing on hardware only.
-- Next: USB, audio.
+- Eighth slice: the USB host side: `xhci`, `ehci` (x86; aarch64 keeps the stub), `usb_hub`, `usb_storage` and `usb_class`. The
+  controllers know no class driver by name: `usb_class` is now a registry (`register`, `set_host`) and the embedded kernel
+  installs audio, MIDI, pointer, serial and the enumerator (`usb_hid`, or `usb_kbd` on the Pi) from `kernel/src/usb_register.rs`.
+  A server kernel registers none and still gets controllers, hubs and disks. The `Platform` gained `msi_message` (core programs
+  the device's MSI/MSI-X capability itself) and `block_register_usb`/`block_usb_disk`. x86 kernel 1,177,776 bytes (the
+  hook tables and calls across the crate boundary cost ~5 KiB). Verified: `make test`, `test-hub`, `test-midi`, `test-usb-audio`,
+  `test-usb-boot`, `test-usb-kbd-replug`, `test-usb-pointer`, `test-usb-replug`, `test-xhci-abort`, `test-disks`,
+  `test-serial-shell`, `test-aarch64-boot`. Real controllers (MSI, hub unplug, audio timing) only on hardware.
+- Next: the class drivers' leaf pieces and audio; `ohci` and `usb_hid` stay with the embedded kernel.

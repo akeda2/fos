@@ -38,6 +38,10 @@ pub trait Platform: Sync {
     fn block_info(&self, disk: usize) -> Option<BlockInfo>;
     /// How many disks there are.
     fn block_count(&self) -> usize;
+    /// Registers the USB mass-storage device in `usb_storage`'s table slot `slot` as a disk; its disk number.
+    fn block_register_usb(&self, slot: usize, sectors: u64, model: [u8; 40], origin: &str) -> Option<usize>;
+    /// The disk number of that USB device (the slot is the stable identity; disk numbers move).
+    fn block_usb_disk(&self, slot: usize) -> Option<usize>;
     /// The disk the system booted from, if known.
     fn boot_disk(&self) -> Option<usize>;
     /// Microseconds on a monotonic clock.
@@ -92,6 +96,8 @@ pub trait Platform: Sync {
     fn msi_allocate(&self, handler: fn(usize), context: usize) -> Option<u8>;
     fn msi_release(&self, vector: u8);
     fn msi_count(&self, vector: u8) -> u64;
+    /// The (address, data) message a device writes to raise `vector` on this machine.
+    fn msi_message(&self, vector: u8) -> (u64, u32);
     fn msi_claim(&self);
     fn msi_intx_candidates(&self, interrupt_line: u8) -> [u32; 9];
     fn msi_attach_intx(&self, gsi: u32, handler: fn(usize), context: usize) -> Option<u8>;
@@ -137,6 +143,14 @@ pub mod block {
 
     pub fn count() -> usize {
         platform().map_or(0, |platform| platform.block_count())
+    }
+
+    pub fn register_usb(slot: usize, sectors: u64, model: [u8; 40], origin: &str) -> Option<usize> {
+        platform()?.block_register_usb(slot, sectors, model, origin)
+    }
+
+    pub fn usb_disk(slot: usize) -> Option<usize> {
+        platform()?.block_usb_disk(slot)
     }
 
     pub fn boot_disk() -> Option<usize> {
@@ -268,6 +282,10 @@ pub mod msi {
     }
     pub fn count(vector: u8) -> u64 {
         super::platform().map_or(0, |platform| platform.msi_count(vector))
+    }
+    /// The (address, data) a device writes to raise `vector`.
+    pub fn message(vector: u8) -> (u64, u32) {
+        super::platform().map_or((0, 0), |platform| platform.msi_message(vector))
     }
     pub fn claim() {
         if let Some(platform) = super::platform() {

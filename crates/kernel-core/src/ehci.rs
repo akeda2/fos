@@ -257,7 +257,7 @@ fn isr(context: usize) {
         controller.fault = Some((status, command, controller.frame_now()));
     }
     if status & (STS_USBINT | STS_USBERRINT) != 0 {
-        crate::usb_audio::ehci_event(context, controller.frame_now());
+        crate::usb_class::ehci_event(context, controller.frame_now());
     }
 }
 

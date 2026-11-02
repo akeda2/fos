@@ -454,7 +454,7 @@ fn drain(index: usize) {
             state.cycle = !state.cycle;
         }
         consumed = true;
-        if crate::usb_audio::irq_event(index, &trb) {
+        if crate::usb_class::irq_event(index, &trb) {
             continue;
         }
         if trb.kind() == TRB_PORT_STATUS_EVENT {
@@ -820,7 +820,7 @@ impl Controller {
                 if wanted(&event) {
                     return Ok(event);
                 }
-                crate::usb_hid::background_event(self, &event);
+                crate::usb_class::host_background_event(self, &event);
             }
             if timer::ticks().wrapping_sub(start) >= ticks {
                 return Err(Error::Timeout);
@@ -878,7 +878,7 @@ impl Controller {
         let start = timer::ticks();
         while timer::ticks().wrapping_sub(start) < 3 {
             while let Some(event) = self.next_event() {
-                crate::usb_hid::background_event(self, &event);
+                crate::usb_class::host_background_event(self, &event);
             }
         }
         crate::println!("USB: xHCI {:02x}:{:02x}.{}: a command timed out; the command ring was aborted and restarted.", self.pci.bus, self.pci.device, self.pci.function);
