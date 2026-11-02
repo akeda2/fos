@@ -15,6 +15,11 @@
 #![no_std]
 #![no_main]
 
+/// Which kernel this is, read from the ELF section table by KUP, `fosadm` and the tests (the server kernel says "mf").
+#[used]
+#[unsafe(link_section = ".fos_flavour")]
+static FLAVOUR: [u8; 8] = *b"embedded";
+
 // `println!` goes to `hal::print`, which writes to the core's `CONSOLE_SINKS` (defined by the entry file of each architecture).
 #[macro_export]
 macro_rules! println {

@@ -285,3 +285,10 @@ link `kernel/`: the embedded kernel's `term`, `tape`, shells and `static mut` st
 
 **Open.** Where the server shell lives (a `kernel-mf` module, or a shared crate once the console seam is clear), how the
 flavour marker reaches `fosadm status`, and whether the batch queue needs the scheduler before ring 3.
+
+**Status.**
+- Slice 1 (skeleton) is built: `kernel-mf/` (own crate and `Cargo.lock`, shares `kernel/linker.ld` and the kernel target),
+  `make kernel-mf image-mf` (`build/fosfor-mf/fosfor.img`, no tapes), `make test-mf-boot` (UEFI and BIOS, `-smp 1,2,8`: valid
+  `BootInfo`, serial narration, memory map summary). The `.fos_flavour` ELF section says `mf` (the embedded kernel now says
+  `embedded`); nothing reads it yet (KUP, `fosadm`, the loader come with slice 6). It has no IDT yet, so a CPU exception resets
+  the guest; slice 3 adds one.

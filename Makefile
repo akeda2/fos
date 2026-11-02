@@ -183,6 +183,23 @@ loader:
 kernel:
 	cd kernel && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 
+# The server kernel (kernel-mf/, docs/big-kernel.md): same loaders, same image layout, its own crate.
+KERNEL_MF_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel-mf
+.PHONY: kernel-mf image-mf test-mf-boot
+kernel-mf:
+	cd kernel-mf && cargo +nightly-2026-09-13 build --release
+
+# A bootable image with the server kernel in slot 0 (no tapes yet: the server kernel has no tape loader).
+image-mf: loader kernel-mf $(BIOS_STAGES)
+	mkdir -p $(BUILD)/fosfor-mf
+	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_MF_ELF) --output $(BUILD)/fosfor-mf/fosfor.img \
+		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin
+
+# The server kernel boots through UEFI and BIOS (SMP 1, 2 and 8), validates BootInfo, narrates over COM1 and says what it is.
+test-mf-boot: image-mf $(BIOS_OUT)/shim/qemu-system-x86_64
+	python3 tools/test_mf_boot.py
+	PATH=$(abspath $(BIOS_SHIM)):$$PATH FOS_FIRMWARE=bios python3 tools/test_mf_boot.py
+
 # Every v2 tape (ELF64 PIE executables for the 64-bit tape ABI).
 .PHONY: tapes
 tapes: $(OPUS_LIB)
