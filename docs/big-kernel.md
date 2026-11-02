@@ -382,3 +382,13 @@ flavour marker reaches `fosadm status`, and whether the batch queue needs the sc
   of dead threads are no longer reused (another CPU's stale TLB entry made a new thread run on zeroed memory; needs a shootdown IPI).
   Not yet: ELF loading, FP/SSE/XSAVE state (user SSE gives #UD), SMAP, a user stack guard page, the tape API. Only real hardware
   shows ring transitions, SYSCALL MSRs, SMEP and swapgs on silicon.
+- **Slice 8c: real tapes in ring 3** (`kernel-mf/src/{tapeapi,fpu}.rs`, `abi::elf::load_for/segments`). `process::spawn_elf` loads a
+  PIE tape at `CODE_BASE` (written at its physical address, relocated for its user address), maps per-page permissions, and enters
+  through a per-process shim page. Per-thread FP state: `fpu.rs` enables SSE/AVX (XCR0) per CPU and `sched` saves and restores an
+  XSAVE (or FXSAVE) area on every switch of a user thread; the kernel itself never touches XMM. TapeApi (version 30, 104 slots)
+  is a read-only table of stubs `mov eax,0x100+slot; syscall`; `tapeapi::call` serves console, time, memory (`alloc`/`free`, a
+  per-process heap), `gfx_*` (screen 0), `fp_level`; `fs_*` return "no volume"; everything else returns 0. Shell: `tape NAME [ARGS]`,
+  `kill PID`. `make test-mf-tape` runs hello, fpcheck and gfxcheck at `-smp` 1/2/8 (SSE2 and AVX2).
+  Gaps: no input (`read_key` returns none; stop a tape with `kill`), no file access from tapes (the drivers are CPU-0 only and
+  unlocked, so an FS service is needed), no NIC/audio/MIDI/touch/GPIO calls, `alloc` gives virtual addresses (no DMA tapes), no SMAP,
+  no stack guard page, no TLB shootdown, no wake IPI. Only hardware shows XSAVE/AVX on silicon, SYSCALL/swapgs/SMEP and the pixel path.

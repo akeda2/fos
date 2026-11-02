@@ -114,6 +114,15 @@ pub fn span(image: &[u8]) -> Result<usize, Error> {
 /// # Safety
 /// `base` must point to at least `span(image)` bytes the caller owns.
 pub unsafe fn load(image: &[u8], base: u64) -> Result<u64, Error> {
+    unsafe { load_for(image, base, base) }
+}
+
+/// Like `load`, but the image is written at `base` and relocated as if it will run at `run_base` (another address space).
+/// Returns the entry point as `run_base` sees it.
+///
+/// # Safety
+/// `base` must point to at least `span(image)` bytes the caller owns.
+pub unsafe fn load_for(image: &[u8], base: u64, run_base: u64) -> Result<u64, Error> {
     let headers = headers(image)?;
     let mut dynamic = None;
     for index in 0..headers.count {
@@ -138,16 +147,28 @@ pub unsafe fn load(image: &[u8], base: u64) -> Result<u64, Error> {
         }
     }
     if let Some(dynamic) = dynamic {
-        unsafe { apply_relocations(base, dynamic)? };
+        unsafe { apply_relocations(base, run_base, dynamic)? };
     }
-    Ok(base + read_u64(image, 24))
+    Ok(run_base + read_u64(image, 24))
+}
+
+/// Calls `visit(virtual_address, memory_size, flags)` for every `PT_LOAD` segment (flags: 1 execute, 2 write, 4 read).
+pub fn segments(image: &[u8], mut visit: impl FnMut(u64, u64, u32)) -> Result<(), Error> {
+    let headers = headers(image)?;
+    for index in 0..headers.count {
+        let at = headers.at(index);
+        if read_u32(image, at) == PT_LOAD {
+            visit(read_u64(image, at + 16), read_u64(image, at + 40), read_u32(image, at + 4));
+        }
+    }
+    Ok(())
 }
 
 /// Walks the loaded `.dynamic` section for the relocation table (`DT_RELA`, `DT_RELASZ`)
 /// and applies every RELATIVE entry: the word at `base + offset` becomes
 /// `base + addend`. Those are the only relocations a statically linked
 /// position-independent executable needs.
-unsafe fn apply_relocations(base: u64, dynamic: u64) -> Result<(), Error> {
+unsafe fn apply_relocations(base: u64, run_base: u64, dynamic: u64) -> Result<(), Error> {
     const DT_NULL: u64 = 0;
     const DT_RELA: u64 = 7;
     const DT_RELASZ: u64 = 8;
@@ -169,7 +190,7 @@ unsafe fn apply_relocations(base: u64, dynamic: u64) -> Result<(), Error> {
         if info as u32 != HOST.1 {
             return Err(Error::UnsupportedRelocation(info as u32));
         }
-        unsafe { ((base + offset) as *mut u64).write(base + addend) };
+        unsafe { ((base + offset) as *mut u64).write(run_base + addend) };
     }
     Ok(())
 }
