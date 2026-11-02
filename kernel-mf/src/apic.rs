@@ -105,6 +105,7 @@ pub fn tick() {
         micros();
     }
     end_of_interrupt();
+    crate::sched::tick();
 }
 
 /// Reads the PM timer, masked to its width.

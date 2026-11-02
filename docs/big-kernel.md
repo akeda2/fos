@@ -348,3 +348,15 @@ flavour marker reaches `fosadm status`, and whether the batch queue needs the sc
   screen; the mapping is uncached (write-combining through the PAT is still to do, so scrolling is slow) and a BIOS text-mode
   or headless machine stays serial/network only; `test-mf-net` checks a QEMU screendump. Not yet: NETFS/tapesync/`foscopy` serving, crash records, `reboot-on-crash`, the watchdog; NICs and their interrupts
   work on the boot CPU only. Only real hardware shows NIC DMA and interrupts, a real reset and the A/B fallback on silicon.
+- Slice 7 (scheduler, kernel threads) is built: `sched.rs`. A thread is a 32 KiB stack in `vm::STACK_REGION` (a guard page below
+  each) and a saved `rsp`; `switch_context` pushes the callee-saved registers and swaps stacks (kernel code has no SSE, so no FP
+  state; tapes get theirs with ring 3, slice 8). `spawn` (pinned to CPU 0, where the unlocked `kernel-core` drivers and the
+  shell/net statics live) and `spawn_any`, `yield_now`, `exit` (the next thread on that CPU frees the dead stack), `sleep_ticks`,
+  `wait_while`/`wake_all` (condition checked under the scheduler lock, so no lost wakeup) and `SleepMutex`. The 100 Hz tick
+  preempts (10 ms slice); interrupt gates and `SpinLock` guards keep IF off, so a thread is only preempted while it holds no
+  lock. Every CPU schedules from one run queue; an application processor's boot context is its idle thread (never queued),
+  and other CPUs skip a thread while `on_cpu` (until the CPU that left it has saved its `rsp`). The service loop (net poll,
+  serial, KUP, slots) is a CPU-0 thread; the boot thread is idle0. Shell: `threads`. `test-mf-boot` checks interleaving and stack
+  return, preemption of threads that never yield, sleep, the mutex and, at `-smp` 2 and 8, unpinned threads running on every
+  CPU. Not yet: a wake IPI (an idle AP looks at each tick, so up to 10 ms latency), priorities, per-CPU queues, thread
+  migration cost awareness. Only real hardware shows real APIC timing and cross-CPU behaviour under load.

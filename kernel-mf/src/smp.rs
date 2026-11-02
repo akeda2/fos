@@ -114,9 +114,7 @@ extern "sysv64" fn ap_main(index: u64) -> ! {
     cpu.apic_id = apic::id();
     cpu.online.store(true, Ordering::Release);
     cpu::interrupts_enable();
-    loop {
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
-    }
+    crate::sched::idle_loop()
 }
 
 pub struct Report {

@@ -280,6 +280,31 @@ pub fn identity_unmap_page(address: u64) {
     }
 }
 
+/// Where kernel thread stacks live: far above the direct map, 4 KiB pages, each slot one unmapped guard page then the stack.
+pub const STACK_REGION: u64 = 0xffff_c000_0000_0000;
+
+static STACK_LOCK: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
+
+/// Maps `pages` frames starting at physical `frames` as the stack of slot `slot` (a guard page sits below it, left unmapped
+/// so an overflow faults at once). Returns the stack's top (the initial stack pointer).
+pub fn map_stack(slot: u64, pages: u64, frames: u64) -> u64 {
+    let _guard = STACK_LOCK.lock();
+    let base = STACK_REGION + slot * (pages + 1) * PAGE + PAGE;
+    for page in 0..pages {
+        map_page(root(), base + page * PAGE, frames + page * PAGE, WRITABLE | NO_EXECUTE);
+    }
+    base + pages * PAGE
+}
+
+/// Unmaps what `map_stack` mapped (the caller frees the frames). Other CPUs may keep stale TLB entries, which nothing uses.
+pub fn unmap_stack(slot: u64, pages: u64) {
+    let _guard = STACK_LOCK.lock();
+    let base = STACK_REGION + slot * (pages + 1) * PAGE + PAGE;
+    for page in 0..pages {
+        identity_unmap_page(base + page * PAGE);
+    }
+}
+
 /// What a faulting address is, for the exception report.
 pub fn describe(address: u64) -> &'static str {
     let l = layout();
@@ -295,6 +320,8 @@ pub fn describe(address: u64) -> &'static str {
         "kernel read-only data"
     } else if (l.image.0..l.image.1).contains(&address) {
         "kernel data"
+    } else if address >= STACK_REGION {
+        "a kernel thread stack region (an unmapped page there is a guard page: stack overflow)"
     } else if address >= DIRECT_BASE {
         "the direct map (physical memory)"
     } else {
