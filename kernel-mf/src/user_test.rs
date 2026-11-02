@@ -276,6 +276,13 @@ pub fn run() {
         && avx.is_none_or(|id| matches!(find(id), Some(o) if o.how == How::Exited(0)));
     let spin_ok = matches!(find(spin), Some(o) if o.how == How::Killed);
     // Fresh stack slots can need a new page-table page (128 KiB stacks: one per ~15 threads); tables are kept for reuse, not leaked.
+    // A dead thread's stack is released by the CPU that switches away from it, which may be a moment after the outcome was seen.
+    for _ in 0..50 {
+        if free_before.saturating_sub(pmm::stats().free) <= 2 {
+            break;
+        }
+        sched::sleep_ticks(1);
+    }
     let leaked = free_before.saturating_sub(pmm::stats().free).saturating_sub(2);
     let ok = |b: bool| if b { "ok" } else { "FAILED" };
     println!(
