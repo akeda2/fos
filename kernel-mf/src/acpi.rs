@@ -120,12 +120,20 @@ pub struct Srat {
     /// Distinct proximity domains seen (CPUs and memory together).
     pub nodes: usize,
     pub cpu_affinities: usize,
+    /// (APIC id, node) per processor entry; `cpu_affinities` of them are valid (up to `MAX_CPUS`).
+    pub cpu_nodes: [(u32, u32); MAX_CPUS],
+}
+
+impl Srat {
+    pub fn node_of_cpu(&self, apic_id: u32) -> u32 {
+        self.cpu_nodes[..self.cpu_affinities.min(MAX_CPUS)].iter().find(|entry| entry.0 == apic_id).map_or(0, |entry| entry.1)
+    }
 }
 
 pub fn srat(tables: &Tables) -> Option<Srat> {
     let table = tables.find(b"SRAT")?;
     let length = u64::from(read::<u32>(table + 4));
-    let mut result = Srat { memory: [(0, 0, 0); MAX_RANGES], memory_count: 0, nodes: 0, cpu_affinities: 0 };
+    let mut result = Srat { memory: [(0, 0, 0); MAX_RANGES], memory_count: 0, nodes: 0, cpu_affinities: 0, cpu_nodes: [(0, 0); MAX_CPUS] };
     let mut seen = [u32::MAX; 64];
     let mut note = |node: u32, result: &mut Srat| {
         if !seen[..result.nodes].contains(&node) && result.nodes < seen.len() {
@@ -144,6 +152,9 @@ pub fn srat(tables: &Tables) -> Option<Srat> {
             0 if read::<u32>(at + 4) & 1 != 0 => {
                 let node = u32::from(read::<u8>(at + 2)) | (read::<u8>(at + 9) as u32) << 8 | (read::<u8>(at + 10) as u32) << 16 | (read::<u8>(at + 11) as u32) << 24;
                 note(node, &mut result);
+                if result.cpu_affinities < MAX_CPUS {
+                    result.cpu_nodes[result.cpu_affinities] = (u32::from(read::<u8>(at + 3)), node);
+                }
                 result.cpu_affinities += 1;
             }
             // Memory affinity: domain at +2, base at +8, length at +16, flags at +28 (bit 0 enabled).
@@ -158,6 +169,9 @@ pub fn srat(tables: &Tables) -> Option<Srat> {
             // Processor x2APIC affinity: domain at +4, flags at +12.
             2 if read::<u32>(at + 12) & 1 != 0 => {
                 note(read::<u32>(at + 4), &mut result);
+                if result.cpu_affinities < MAX_CPUS {
+                    result.cpu_nodes[result.cpu_affinities] = (read::<u32>(at + 8), read::<u32>(at + 4));
+                }
                 result.cpu_affinities += 1;
             }
             _ => {}

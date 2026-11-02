@@ -227,6 +227,25 @@ pub fn map_device(physical: u64, length: u64) {
     }
 }
 
+/// Maps the 4 KiB page at `address` onto itself, executable and writable, in the kernel's tables: the AP trampoline runs
+/// here with paging switched on before it can jump to kernel code. Boot CPU only, while the APs are being started.
+pub fn identity_map_page(address: u64) {
+    map_page(root(), address, address, WRITABLE);
+    unsafe { core::arch::asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags)) };
+}
+
+/// Removes that mapping again. Another CPU may keep a stale TLB entry for it; nothing executes there any more.
+pub fn identity_unmap_page(address: u64) {
+    unsafe {
+        let entry = directory_entry(root(), address);
+        if *entry & PRESENT != 0 && *entry & LARGE == 0 {
+            let table = direct(*entry & ADDRESS_MASK) as *mut u64;
+            *table.add(((address >> 12) & 511) as usize) = 0;
+        }
+        core::arch::asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
+    }
+}
+
 /// What a faulting address is, for the exception report.
 pub fn describe(address: u64) -> &'static str {
     let l = layout();
@@ -252,7 +271,7 @@ pub fn describe(address: u64) -> &'static str {
 /// Builds the tables and switches to them. After this, only what the module comment lists is reachable.
 pub fn init(machine: &Machine) -> u64 {
     let layout = layout();
-    let root = new_table() as u64;
+    let root = pmm::allocate(1, Some(1 << 32)).expect("a page-table root below 4 GiB") as u64; // APs load a 32-bit CR3
     let data = WRITABLE | NO_EXECUTE;
 
     let mut highest = 0;

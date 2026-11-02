@@ -12,12 +12,13 @@ mod acpi;
 mod apic;
 mod boot;
 mod cpu;
-#[path = "../../kernel/src/arch/x86_64/gdt.rs"]
 mod gdt;
 mod heap;
-#[path = "../../kernel/src/arch/x86_64/idt.rs"]
 mod idt;
+mod percpu;
 mod pmm;
+mod smp;
+mod sync;
 mod trap;
 mod vm;
 
@@ -65,7 +66,7 @@ fn mib(bytes: u64) -> u64 {
 pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     serial::init();
     println!();
-    println!("Fosfor OS server kernel (mf, slice 3): running in 64-bit long mode.");
+    println!("Fosfor OS server kernel (mf, slice 4): running in 64-bit long mode.");
 
     let info = unsafe { &*info };
     if !info.is_valid() {
@@ -124,12 +125,13 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     println!("Heap: self-test passed, {} KiB in the heap, {} KiB free.", heap.total / 1024, heap.free / 1024);
 
     // ---- interrupts ----
-    gdt::load(&raw const __ist_top as u64);
+    percpu::activate(0, &raw const __ist_top as u64);
+    idt::build();
     idt::load();
     let before = trap::BREAKPOINTS.load(core::sync::atomic::Ordering::Relaxed);
     unsafe { core::arch::asm!("int3") };
     assert_eq!(trap::BREAKPOINTS.load(core::sync::atomic::Ordering::Relaxed), before + 1);
-    println!("Interrupts: GDT, TSS (double-fault stack) and IDT loaded; a breakpoint came back through the IDT.");
+    println!("Interrupts: per-CPU GDT and TSS (double-fault stack), the IDT and the GS base are set; a breakpoint came back through the IDT.");
 
     // ---- ACPI, APICs, timer ----
     let Some(tables) = acpi::open(machine.acpi_rsdp) else {
@@ -141,8 +143,21 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
         halt();
     };
     println!("ACPI: revision {}, local APIC at {:#x}, {} CPU(s), {} I/O APIC(s), PM timer port {:#x}.", tables.revision, madt.local_apic_address, madt.cpu_count, madt.io_apics, fadt.pm_timer_port);
-    match acpi::srat(&tables) {
-        Some(srat) => println!("SRAT: {} NUMA node(s), {} memory range(s), {} CPU affinity entries.", srat.nodes, srat.memory_count, srat.cpu_affinities),
+    let srat = acpi::srat(&tables);
+    match &srat {
+        Some(srat) => {
+            println!("SRAT: {} NUMA node(s), {} memory range(s), {} CPU affinity entries.", srat.nodes, srat.memory_count, srat.cpu_affinities);
+            for node in 0..srat.nodes as u32 {
+                let (mut total, mut free) = (0, 0);
+                for &(start, length, owner) in &srat.memory[..srat.memory_count] {
+                    if owner == node {
+                        total += length;
+                        free += pmm::free_in(start, length) * pmm::FRAME;
+                    }
+                }
+                println!("NUMA node {node}: {} MiB of memory, {} MiB free.", mib(total), mib(free));
+            }
+        }
         None => println!("SRAT: none (one NUMA node)."),
     }
     let Some(timer) = apic::start_timer(&fadt, madt.local_apic_address) else {
@@ -154,13 +169,22 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
         Some(pins) => println!("I/O APIC: {pins} pins, all masked."),
         None => println!("I/O APIC: none."),
     }
+    let smp = smp::start_all(&machine, &madt, srat.as_ref());
+    println!("SMP: {} CPU(s) online ({} application processor(s) started, {} failed).", 1 + smp.started, smp.started, smp.failed);
+    for index in 0..percpu::count() {
+        let cpu = percpu::get(index);
+        println!("CPU {index}: APIC id {}, NUMA node {}, {}.", cpu.apic_id, cpu.node, if index == 0 { "boot processor" } else { "application processor" });
+    }
     cpu::interrupts_enable();
     let start = apic::ticks();
     apic::busy_wait_ms(200);
     let ticks = apic::ticks() - start;
     println!("APIC timer: {} Hz tick, {ticks} ticks in 200 ms of PM-timer time.", apic::TICK_HZ);
     cpu::interrupts_disable();
-    println!("kernel-mf: slice 3 reached the end of boot; halting.");
+    for index in 1..percpu::count() {
+        println!("CPU {index}: {} timer ticks since it came up.", percpu::ticks_of(index));
+    }
+    println!("kernel-mf: slice 4 reached the end of boot; halting.");
     halt();
 }
 
@@ -207,6 +231,7 @@ fn heap_self_test() {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    serial::break_lock();
     println!("\nFosfor OS server kernel PANIC: {info}");
     halt()
 }

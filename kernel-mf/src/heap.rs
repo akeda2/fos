@@ -1,8 +1,7 @@
 //! The kernel heap: a first-fit free list over memory taken from the frame allocator through the direct map.
 //!
 //! Free blocks are address-ordered and coalesce on free. When no block fits, the heap takes another chunk of contiguous
-//! frames (at least `CHUNK`) and carries on, so it grows with use; it never shrinks. There is no lock yet: one CPU runs the
-//! kernel until slice 4, which adds the spinlock before the first AP starts.
+//! frames (at least `CHUNK`) and carries on, so it grows with use; it never shrinks. A ticket spinlock guards it.
 
 use crate::{pmm, vm};
 use core::alloc::{GlobalAlloc, Layout};
@@ -23,6 +22,8 @@ struct Heap {
 }
 
 static mut HEAP: Heap = Heap { head: core::ptr::null_mut(), total: 0, free: 0 };
+/// Guards `HEAP`: every entry point below takes it. It is taken before the frame allocator's lock, never after.
+static LOCK: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
 
 fn heap() -> &'static mut Heap {
     unsafe { &mut *core::ptr::addr_of_mut!(HEAP) }
@@ -123,6 +124,7 @@ pub struct Allocator;
 unsafe impl GlobalAlloc for Allocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let (size, align) = (rounded(&layout), layout.align().max(MIN_BLOCK));
+        let _guard = LOCK.lock();
         let heap = heap();
         unsafe {
             if let Some(at) = heap.take(size, align) {
@@ -136,6 +138,7 @@ unsafe impl GlobalAlloc for Allocator {
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        let _guard = LOCK.lock();
         let heap = heap();
         let size = rounded(&layout);
         heap.free += size;
@@ -148,6 +151,7 @@ static ALLOCATOR: Allocator = Allocator;
 
 /// Gives the heap its first chunk.
 pub fn init() -> bool {
+    let _guard = LOCK.lock();
     unsafe { heap().grow(CHUNK as usize) }
 }
 
@@ -157,6 +161,7 @@ pub struct Stats {
 }
 
 pub fn stats() -> Stats {
+    let _guard = LOCK.lock();
     let h = heap();
     Stats { total: h.total, free: h.free }
 }

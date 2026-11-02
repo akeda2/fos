@@ -308,3 +308,16 @@ flavour marker reaches `fosadm status`, and whether the batch queue needs the sc
   CPU takes an `int3` and the timer tick. `test-mf-boot` checks the CPU count against `-smp`, the tick rate, and a two-node
   `-numa` boot (SRAT). Not yet: the `Platform` trait (slice 5, when `kernel-core` is linked), per-NUMA frame lists (slice 4),
   APs (slice 4). Real hardware shows the x2APIC path, firmware that hands over a different APIC mode, and real SRATs.
+- Slice 4 (SMP) is built: `sync.rs` (ticket `SpinLock`, interrupts off while held, `force_unlock` for crash paths) now guards
+  the frame allocator, the heap and the serial line (`println!` holds the lock for a whole line; `fatal` and the panic handler
+  break it first). `gdt.rs`/`idt.rs` are the kernel's own now: one GDT, TSS and double-fault stack per CPU (`percpu.rs`, `Cpu`
+  at `gs:0`, GS base set after the segment reload), one shared IDT. `smp.rs`: a real -> protected -> long mode trampoline
+  assembled for the fixed page `0x8000` (checked against the loader's map; clear of the crash-record page `0x5000`), copied
+  there and identity-mapped in the kernel root only while APs start; the root is allocated below 4 GiB because the AP loads a
+  32-bit CR3. The boot CPU starts APs one at a time (INIT, 10 ms, SIPI twice, wait up to 200 ms for the AP's online flag); an
+  AP loads its GDT/IDT, enables its APIC like the boot CPU's (xAPIC or x2APIC) and starts its own 100 Hz timer from the boot
+  CPU's calibration. AP stacks (32 KiB, plus 8 KiB for the double fault) come from the AP's own NUMA node
+  (`pmm::allocate_near`, SRAT CPU entries); `test-mf-boot` checks every CPU online and ticking at `-smp` 1, 2, 8 and the
+  `-numa` placement. Not yet: guard pages under AP stacks (the direct map uses 2 MiB pages; guarded stacks come with the
+  scheduler, slice 7), locks on the page tables (only the boot CPU edits them so far), APs taking part in work. Only real
+  hardware shows AP startup timing on slow firmware, x2APIC AP mode, and real NUMA machines.
