@@ -210,3 +210,33 @@ pub fn free(address: u64, count: u64) {
         }
     }
 }
+
+/// The longest run of free frames, in frames: the biggest single DMA buffer the drivers could still get.
+pub fn largest_free_run() -> u64 {
+    let _guard = LOCK.lock();
+    let s = state();
+    let (mut best, mut run) = (0u64, 0u64);
+    let mut frame = 0;
+    while frame < s.frames {
+        let word = unsafe { s.word(frame).read() };
+        // Whole words of used or free frames at a time.
+        if frame % 64 == 0 && frame + 64 <= s.frames && (word == u64::MAX || word == 0) {
+            if word == 0 {
+                run += 64;
+                best = best.max(run);
+            } else {
+                run = 0;
+            }
+            frame += 64;
+            continue;
+        }
+        if word & (1 << (frame % 64)) == 0 {
+            run += 1;
+            best = best.max(run);
+        } else {
+            run = 0;
+        }
+        frame += 1;
+    }
+    best
+}

@@ -72,6 +72,8 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
         v if (u64::from(apic::LEGACY_PIC_BASE)..u64::from(apic::LEGACY_PIC_BASE) + 16).contains(&v) => {
             LEGACY_PIC.fetch_add(1, Ordering::Relaxed); // all lines are masked, so this is a spurious one: no EOI
         }
+        v if crate::msi::handles(v) => crate::msi::dispatch(v),
+        v if crate::msi::handles_intx(v) => crate::msi::dispatch_intx(v),
         v if v < 32 => fatal(frame),
         v => println!("Unexpected interrupt vector {v}."),
     }
