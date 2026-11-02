@@ -173,6 +173,9 @@ pub mod block {
 }
 
 pub mod timer {
+    /// Ticks per second of `ticks()`; both architectures run it at 100 Hz.
+    pub const TICK_HZ: u64 = 100;
+
     pub fn busy_wait_ms(milliseconds: u64) {
         if let Some(platform) = super::platform() {
             platform.busy_wait_ms(milliseconds);

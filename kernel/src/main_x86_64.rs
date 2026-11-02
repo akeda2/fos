@@ -10,7 +10,6 @@ mod kupshell;
 mod diag;
 mod netfs;
 mod nicshell;
-mod nicpark;
 mod formatshell;
 mod fault;
 mod platform;

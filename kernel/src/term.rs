@@ -24,39 +24,24 @@ const KUP_TOO_LARGE: u8 = 1;
 const KUP_CHECKSUM_MISMATCH: u8 = 2;
 const KUP_DISK_ERROR: u8 = 3;
 const KUP_BUSY: u8 = 4;
-pub const MAX_NICS: usize = 8;
-static mut NICS: [Option<Nic>; MAX_NICS] = [const { None }; MAX_NICS];
-static mut NIC_COUNT: usize = 0;
+pub use crate::nic::MAX_NICS;
 static mut RUNTIME_SERVICES: u64 = 0;
 
 
 /// Adds a network interface; returns its zero-based index.
 pub fn install(nic: Nic, runtime_services: u64) -> Option<usize> {
-    unsafe {
-        RUNTIME_SERVICES = runtime_services;
-        if NIC_COUNT == MAX_NICS {
-            return None;
-        }
-        (*core::ptr::addr_of_mut!(NICS))[NIC_COUNT] = Some(nic);
-        NIC_COUNT += 1;
-        Some(NIC_COUNT - 1)
-    }
+    unsafe { RUNTIME_SERVICES = runtime_services };
+    crate::nic::install(nic)
 }
 
-/// True when every interface delivers interrupts (MSI), so a frame wakes the CPU and a
-/// tape may sleep in `hlt` instead of polling. One polled NIC is enough to say no: its
-/// frames would only be noticed at the next timer tick.
-pub fn all_interrupt_driven() -> bool {
-    let count = nic_count();
-    count > 0 && (0..count).all(|index| nic_at(index).is_some_and(|nic| nic.delivery() != crate::e1000::Delivery::Polled))
-}
+pub use crate::nic::all_interrupt_driven;
 
 pub fn nic_count() -> usize {
-    unsafe { NIC_COUNT }
+    crate::nic::count()
 }
 
 pub fn nic_at(index: usize) -> Option<&'static mut Nic> {
-    unsafe { (*core::ptr::addr_of_mut!(NICS)).get_mut(index)?.as_mut() }
+    crate::nic::at(index)
 }
 
 /// Set while a shell command that runs until Escape is in charge of the input.

@@ -9,7 +9,7 @@
 //! `IDLE_SECONDS`. Only drivers that can reach the PHY take part (e1000 classic and I350, RTL8139, RTL8168); a NIC with a
 //! link is never parked. QEMU models none of the power savings, so only real hardware shows the effect.
 
-use crate::{nic::Nic, term, timer};
+use crate::{nic::{self, Nic, MAX_NICS}, timer};
 
 const POWER_DOWN: u16 = 1 << 11;
 const AUTONEG_ENABLE: u16 = 1 << 12;
@@ -30,7 +30,7 @@ struct Slot {
     parks: u32,
 }
 
-static mut SLOTS: [Slot; term::MAX_NICS] = [Slot { parked: false, down_since: 0, next_wake: 0, wake_until: 0, parks: 0 }; term::MAX_NICS];
+static mut SLOTS: [Slot; MAX_NICS] = [Slot { parked: false, down_since: 0, next_wake: 0, wake_until: 0, parks: 0 }; MAX_NICS];
 static mut AUTO: bool = false;
 
 fn slot(index: usize) -> &'static mut Slot {
@@ -43,7 +43,7 @@ pub fn set_automatic() {
 }
 
 pub fn is_parked(index: usize) -> bool {
-    index < term::MAX_NICS && slot(index).parked
+    index < MAX_NICS && slot(index).parked
 }
 
 fn power_down(nic: &mut Nic, down: bool) -> bool {
@@ -54,7 +54,7 @@ fn power_down(nic: &mut Nic, down: bool) -> bool {
 
 /// Parks NIC `index` (zero-based). The error says why not.
 pub fn park(index: usize) -> Result<(), &'static str> {
-    let nic = term::nic_at(index).ok_or("no such interface")?;
+    let nic = nic::at(index).ok_or("no such interface")?;
     if nic.phy_control().is_none() {
         return Err("this driver cannot reach the PHY");
     }
@@ -73,7 +73,7 @@ pub fn park(index: usize) -> Result<(), &'static str> {
 }
 
 pub fn unpark(index: usize) -> Result<(), &'static str> {
-    let nic = term::nic_at(index).ok_or("no such interface")?;
+    let nic = nic::at(index).ok_or("no such interface")?;
     if !slot(index).parked {
         return Err("it is not parked");
     }
@@ -87,8 +87,8 @@ pub fn unpark(index: usize) -> Result<(), &'static str> {
 /// Called from the periodic service loops: parks idle NICs (automatic mode) and runs the wake-up checks of parked ones.
 pub fn service() {
     let now = timer::ticks();
-    for index in 0..term::nic_count() {
-        let Some(nic) = term::nic_at(index) else { continue };
+    for index in 0..nic::count() {
+        let Some(nic) = nic::at(index) else { continue };
         let state = slot(index);
         if state.parked {
             if state.wake_until != 0 {

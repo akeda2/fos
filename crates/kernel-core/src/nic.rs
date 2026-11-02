@@ -223,3 +223,35 @@ impl Nic {
     }
 
 }
+
+/// How many interfaces the machine can have in use at once.
+pub const MAX_NICS: usize = 8;
+static mut NICS: [Option<Nic>; MAX_NICS] = [const { None }; MAX_NICS];
+static mut NIC_COUNT: usize = 0;
+
+/// Adds a network interface; returns its zero-based index (`None` when the table is full).
+pub fn install(nic: Nic) -> Option<usize> {
+    unsafe {
+        if NIC_COUNT == MAX_NICS {
+            return None;
+        }
+        (*core::ptr::addr_of_mut!(NICS))[NIC_COUNT] = Some(nic);
+        NIC_COUNT += 1;
+        Some(NIC_COUNT - 1)
+    }
+}
+
+pub fn count() -> usize {
+    unsafe { NIC_COUNT }
+}
+
+pub fn at(index: usize) -> Option<&'static mut Nic> {
+    unsafe { (*core::ptr::addr_of_mut!(NICS)).get_mut(index)?.as_mut() }
+}
+
+/// True when every interface delivers interrupts (MSI), so a frame wakes the CPU and a tape may sleep in `hlt` instead of
+/// polling. One polled NIC is enough to say no: its frames would only be noticed at the next timer tick.
+pub fn all_interrupt_driven() -> bool {
+    let count = count();
+    count > 0 && (0..count).all(|index| at(index).is_some_and(|nic| nic.delivery() != Delivery::Polled))
+}
