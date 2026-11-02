@@ -49,9 +49,20 @@ fn put(byte: u8) {
     outb(COM1, byte);
 }
 
+/// One line at a time: CPUs print whole lines, never interleaved characters.
+static LOCK: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
+
+pub fn print(arguments: fmt::Arguments) {
+    let _guard = LOCK.lock();
+    let _ = Serial.write_fmt(arguments);
+}
+
+/// For the fault and panic paths: the CPU that was printing may be the one that crashed.
+pub fn break_lock() {
+    unsafe { LOCK.force_unlock() };
+}
+
 macro_rules! println {
-    ($($argument:tt)*) => {{
-        use core::fmt::Write as _;
-        let _ = writeln!($crate::serial::Serial, $($argument)*);
-    }};
+    () => { $crate::serial::print(format_args!("\n")) };
+    ($($argument:tt)*) => { $crate::serial::print(format_args!("{}\n", format_args!($($argument)*))) };
 }

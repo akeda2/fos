@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Boots the server kernel image (build/fosfor-mf/fosfor.img, `make image-mf`) under QEMU and checks slices 1 and 2 of
+"""Boots the server kernel image (build/fosfor-mf/fosfor.img, `make image-mf`) under QEMU and checks slices 1-4 of
 docs/big-kernel.md: the loader hands over a valid BootInfo, the kernel narrates over COM1, reports a sane memory map,
-builds its frame allocator, page tables (direct map, W^X image) and heap and reaches the end of boot, with 1, 2 and 8 CPUs. It also checks the flavour marker in the ELF (`.fos_flavour` says "mf") and
+builds its frame allocator, page tables (direct map, W^X image) and heap, brings up the interrupts and APIC timer, starts every
+other CPU (slice 4) on a stack from its own NUMA node and reaches the end of boot, with 1, 2 and 8 CPUs. It also checks the flavour marker in the ELF (`.fos_flavour` says "mf") and
 that the embedded kernel's ELF says "embedded". `make test-mf-boot` runs it through UEFI and, with FOS_FIRMWARE=bios and the
 qemu shim, through BIOS."""
 
@@ -24,7 +25,7 @@ CODE_CANDIDATES = ["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_CODE
 VARS_CANDIDATES = ["/usr/share/OVMF/OVMF_VARS_4M.fd", "/usr/share/OVMF/OVMF_VARS.fd",
                    "/usr/share/edk2/ovmf/OVMF_VARS.fd", "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd"]
 BIOS = os.environ.get("FOS_FIRMWARE") == "bios"
-FINAL = "slice 3 reached the end of boot"
+FINAL = "slice 4 reached the end of boot"
 
 
 def find(variable, candidates):
@@ -89,7 +90,7 @@ def main():
         raise SystemExit(f"{IMAGE} missing; run `make image-mf` first")
     for cpus in (1, 2, 8):
         text = boot(cpus)
-        check("Fosfor OS server kernel (mf, slice 3)" in text, f"-smp {cpus}: the server kernel announces itself", text)
+        check("Fosfor OS server kernel (mf, slice 4)" in text, f"-smp {cpus}: the server kernel announces itself", text)
         check("BootInfo: version" in text and "is not valid" not in text, f"-smp {cpus}: the loader's BootInfo is valid", text)
         match = re.search(r"Memory map: (\d+) regions, (\d+) MiB of RAM-like memory, (\d+) MiB conventional", text)
         check(match is not None and int(match.group(2)) >= 400 and int(match.group(3)) >= 100,
@@ -109,10 +110,19 @@ def main():
         check(re.search(r"I/O APIC: \d+ pins, all masked", text) is not None, f"-smp {cpus}: the I/O APIC is found and masked", text)
         ticks = re.search(r"APIC timer: 100 Hz tick, (\d+) ticks in 200 ms", text)
         check(ticks is not None and 15 <= int(ticks.group(1)) <= 25, f"-smp {cpus}: the calibrated APIC timer ticks at 100 Hz", text)
+        check(f"SMP: {cpus} CPU(s) online" in text and "did not start" not in text, f"-smp {cpus}: every processor starts and comes online", text)
+        check(len(re.findall(r"^CPU \d+: APIC id \d+, NUMA node \d+", text, re.M)) == cpus, f"-smp {cpus}: one line per CPU", text)
+        for line in re.findall(r"^CPU (\d+): (\d+) timer ticks since it came up", text, re.M):
+            check(10 <= int(line[1]) <= 80, f"-smp {cpus}: CPU {line[0]}'s own timer ticks at about 100 Hz ({line[1]} ticks)", text)
         check("PANIC" not in text, f"-smp {cpus}: no panic", text)
     text = boot(4, numa=True)
     check(re.search(r"SRAT: 2 NUMA node\(s\), \d+ memory range\(s\), 4 CPU affinity", text) is not None, "-numa: the SRAT shows two nodes and four CPUs", text)
     check("PANIC" not in text and "CPU exception" not in text, "-numa: no panic", text)
+    check("SMP: 4 CPU(s) online" in text, "-numa: all four processors start", text)
+    nodes = {int(a): int(b) for a, b in re.findall(r"^CPU (\d+): APIC id \d+, NUMA node (\d+)", text, re.M)}
+    check(nodes == {0: 0, 1: 0, 2: 1, 3: 1}, f"-numa: CPUs are placed on their SRAT nodes ({nodes})", text)
+    memory = re.findall(r"^NUMA node (\d+): (\d+) MiB of memory, (\d+) MiB free", text, re.M)
+    check(len(memory) == 2 and all(int(m[1]) >= 200 and int(m[2]) >= 100 for m in memory), "-numa: per-node memory and free counts are reported", text)
     flavour = section(TARGET / "fosfor-kernel-mf", ".fos_flavour")
     check(flavour == b"mf", f"the server kernel's ELF says mf (got {flavour!r})")
     embedded = section(TARGET / "fosfor-kernel", ".fos_flavour")

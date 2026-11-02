@@ -7,7 +7,7 @@
 //! count is kept so an AP can start its own timer without calibrating again.
 
 use crate::{acpi, cpu, vm};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 
 const REG_ID: u32 = 0x20;
 const REG_EOI: u32 = 0xb0;
@@ -28,7 +28,6 @@ const APIC_BASE_ENABLE: u64 = 1 << 11;
 const APIC_BASE_X2APIC: u64 = 1 << 10;
 const PM_TIMER_HZ: u64 = 3_579_545;
 
-static TICKS: AtomicU64 = AtomicU64::new(0);
 static mut BASE: u64 = 0;
 static mut X2APIC: bool = false;
 static mut PER_TICK: u32 = 0;
@@ -64,13 +63,14 @@ pub fn end_of_interrupt() {
     write(REG_EOI, 0);
 }
 
+/// Ticks counted by the boot CPU's timer: the kernel's clock.
 pub fn ticks() -> u64 {
-    TICKS.load(Ordering::Relaxed)
+    crate::percpu::ticks_of(0)
 }
 
-/// Called from the timer interrupt.
+/// Called from the timer interrupt of whichever CPU it is: each counts its own.
 pub fn tick() {
-    TICKS.fetch_add(1, Ordering::Relaxed);
+    crate::percpu::this().ticks.fetch_add(1, Ordering::Relaxed);
     end_of_interrupt();
 }
 
@@ -162,6 +162,41 @@ pub fn start_timer(fadt: &acpi::Fadt, madt_address: u64) -> Option<Report> {
     unsafe { PER_TICK = per_tick as u32 };
     write(REG_TIMER_INITIAL, per_tick as u32);
     Some(Report { x2apic, base, timer_hz: counted * 100 * 16 })
+}
+
+/// Sends an inter-processor interrupt: `low` is the ICR's low word (delivery mode, vector, level). xAPIC: destination in
+/// ICR high (0x310), then the low write sends it and delivery status (bit 12) clears when the target has accepted it.
+/// x2APIC: one 64-bit MSR write (0x830), no status to wait for.
+pub fn send_ipi(apic_id: u32, low: u32) {
+    unsafe {
+        if X2APIC {
+            cpu::write_msr(0x830, u64::from(apic_id) << 32 | u64::from(low));
+        } else {
+            write(0x310, apic_id << 24);
+            write(0x300, low);
+            for _ in 0..1_000_000 {
+                if read(0x300) & (1 << 12) == 0 {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
+/// Enables the calling CPU's own local APIC the way the boot CPU's was (same mode, same spurious vector). An AP starts with
+/// its APIC in xAPIC mode, enabled; when the boot CPU runs x2APIC, the AP is switched over too.
+pub fn enable_this_cpu() {
+    let msr = cpu::read_msr(MSR_APIC_BASE) | APIC_BASE_ENABLE;
+    cpu::write_msr(MSR_APIC_BASE, if unsafe { X2APIC } { msr | APIC_BASE_X2APIC } else { msr });
+    write(REG_SPURIOUS, 0x100 | u32::from(SPURIOUS_VECTOR));
+}
+
+/// Starts the calling CPU's periodic tick with the boot CPU's calibrated count (every core runs from the same bus clock).
+pub fn start_local_timer() {
+    write(REG_TIMER_DIVIDE, 0x3);
+    write(REG_LVT_TIMER, 1 << 17 | u32::from(TIMER_VECTOR));
+    write(REG_TIMER_INITIAL, unsafe { PER_TICK });
 }
 
 /// The first I/O APIC, with every pin masked. Pins are routed by the drivers that own them (slice 5). Registers are an

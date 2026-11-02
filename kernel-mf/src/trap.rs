@@ -78,6 +78,7 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
 }
 
 fn fatal(frame: &Frame) -> ! {
+    crate::serial::break_lock();
     println!();
     println!("*** CPU exception {}: {} (error code {:#x}) ***", frame.vector, exception_name(frame.vector), frame.error);
     println!("At rip {:#x}, cs {:#x}, rflags {:#x}, rsp {:#x}, ss {:#x}.", frame.rip, frame.cs, frame.rflags, frame.rsp, frame.ss);
