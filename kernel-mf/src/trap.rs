@@ -73,6 +73,7 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
             println!("Breakpoint exception at {:#x}: handled, execution continues.", frame.rip);
         }
         v if v == u64::from(apic::TIMER_VECTOR) => apic::tick(),
+        v if v == u64::from(crate::tlb::TLB_VECTOR) => crate::tlb::handle(),
         v if v == u64::from(apic::SPURIOUS_VECTOR) => {} // a spurious interrupt needs no EOI
         v if (u64::from(apic::LEGACY_PIC_BASE)..u64::from(apic::LEGACY_PIC_BASE) + 16).contains(&v) => {
             LEGACY_PIC.fetch_add(1, Ordering::Relaxed); // all lines are masked, so this is a spurious one: no EOI

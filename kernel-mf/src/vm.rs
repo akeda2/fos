@@ -263,7 +263,13 @@ pub fn map_stack(slot: u64, pages: u64, frames: u64) -> u64 {
     base + pages * PAGE
 }
 
-/// Unmaps what `map_stack` mapped (the caller frees the frames). Other CPUs may keep stale TLB entries, which nothing uses.
+/// The lowest stack page of `slot`.
+pub fn stack_base(slot: u64, pages: u64) -> u64 {
+    STACK_REGION + slot * (pages + 1) * PAGE + PAGE
+}
+
+/// Unmaps what `map_stack` mapped (the caller frees the frames). Other CPUs may keep stale TLB entries: the caller must run
+/// `tlb::shootdown` over the range before the frames or the slot are reused.
 pub fn unmap_stack(slot: u64, pages: u64) {
     let _guard = STACK_LOCK.lock();
     let base = STACK_REGION + slot * (pages + 1) * PAGE + PAGE;

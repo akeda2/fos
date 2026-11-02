@@ -123,6 +123,8 @@ def main():
         check(re.search(r"FOSFS: mounted on disk1 \(\d+ MiB, \d+ file", text) is not None, f"-smp {cpus}: FOSFS mounts on the boot disk", text)
         sched = re.search(r"Scheduler: 3 kernel threads took 15 interleaved steps in (\d+) context switches; 1 thread\(s\) left, 0 stack frame", text)
         check(sched is not None and int(sched.group(1)) >= 15 and "self-test FAILED" not in text, f"-smp {cpus}: kernel threads interleave, exit and give their stacks back", text)
+        tlb = re.search(r"TLB: (\d+) shootdown\(s\) so far .* all (\d+) CPU", text)
+        check(tlb is not None and int(tlb.group(1)) >= 3 and int(tlb.group(2)) == cpus, f"-smp {cpus}: exited threads' stacks are flushed from every CPU's TLB before reuse", text)
         pre = re.search(r"Scheduler: preemption ok \(\d+ and \d+ spins.*\), sleep ok \(\d+ ticks for 20\), mutex ok \(50 of 50 increments\)", text)
         check(pre is not None, f"-smp {cpus}: the tick preempts threads that never yield; sleep and the sleeping mutex work", text)
         smp_run = re.search(r"Scheduler: SMP ok \((\d+) unpinned threads ran on (\d+) of (\d+) CPU\(s\)\)", text)
