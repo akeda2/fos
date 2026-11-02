@@ -30,6 +30,7 @@ pub struct Serial;
 impl Write for Serial {
     fn write_str(&mut self, text: &str) -> fmt::Result {
         crate::net::relay(text);
+        crate::fb::write_str(text);
         for byte in text.bytes() {
             if byte == b'\n' {
                 put(b'\r');

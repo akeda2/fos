@@ -22,13 +22,38 @@ base.KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fosfor-kernel
 READY = "entering the service loop"
 
 
+def check_screen(machine, path):
+    """The framebuffer console: a screendump shows the boot narration (text rows, and the prompt's row at the bottom of it)."""
+    import socket
+    time.sleep(0.5)
+    monitor = socket.socket(socket.AF_UNIX)
+    monitor.connect(str(machine.monitor))
+    monitor.settimeout(5)
+    monitor.recv(4096)
+    monitor.send(f"screendump {path}\n".encode())
+    for _ in range(50):
+        machine.pump(0.1)
+        if path.exists() and path.stat().st_size > 1000:
+            break
+    monitor.close()
+    data = path.read_bytes()
+    width, height = (int(v) for v in data.split(b"\n", 2)[1].split())
+    pixels = data[len(f"P6\n{width} {height}\n255\n"):]
+    lit = [any(pixels[y * width * 3:(y + 1) * width * 3]) for y in range(height)]
+    check(sum(lit) > 100, f"the framebuffer console draws the boot narration ({sum(lit)} lit pixel rows of {height})", "")
+    check("Framebuffer console:" in machine.text() and "characters" in machine.text(), "and says so on the serial console", machine.text()[-1500:])
+
+
 def main():
     kernel = base.KERNEL.read_bytes()
     with tempfile.TemporaryDirectory() as tmp:
         machine = base.Machine(tmp, {"debug": "kernel-update\n"})
+        machine.monitor = Path(tmp) / "monitor"
+        machine.extra = ["-vga", "std"]
         machine.start()
         try:
             machine.wait_for(READY)
+            check_screen(machine, Path(tmp) / "screen.ppm")
             check("debug: kernel-update" in machine.text(), "the debug file is read from the boot volume", machine.text()[-1500:])
             check("interrupts: Intx" in machine.text(), "the e1000 came up and proved its interrupt", machine.text()[-1500:])
 
