@@ -85,6 +85,8 @@ def run(cpu, smp):
             if not ok:
                 failures.append("ed could not save and reload a file:\n" + log[-600:].decode("utf8", "replace"))
         text = log.decode("utf8", "replace")
+        if (cpu == "max") != ("SMAP: the kernel reaches user memory" in text):
+            failures.append("SMAP should be on exactly when the CPU model has it (max yes, qemu64 no)")
         if "CPU exception" in text or "PANIC" in text:
             failures.append("kernel fault:\n" + text[-1500:])
     finally:

@@ -391,5 +391,5 @@ fn blit(x: u32, y: u32, width: u32, height: u32, pixels: u64, stride: u64) -> u6
     if pixels % 4 != 0 || !vm::user_range_ok(sched::current_root(), pixels, bytes, false) {
         return 0;
     }
-    u64::from(unsafe { fb::gfx_blit(x, y, width, height, pixels as *const u32, stride) })
+    u64::from(process::user_access(|| unsafe { fb::gfx_blit(x, y, width, height, pixels as *const u32, stride) }))
 }
