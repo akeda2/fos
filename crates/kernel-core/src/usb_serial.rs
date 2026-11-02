@@ -455,7 +455,7 @@ pub fn poll() {
         }
     }
     if xhci_open {
-        crate::usb_hid::poll(); // delivers the IN completions to `background_event`
+        crate::usb_class::poll(); // delivers the IN completions to `background_event`
     }
 }
 

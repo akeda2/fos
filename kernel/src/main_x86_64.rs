@@ -42,11 +42,7 @@ mod termsession;
 mod usb_hid;
 mod usb_pointer;
 mod usbshell;
-mod usb_midi;
 mod midishell;
-mod usb_serial;
-mod usb_serial_pl2303;
-mod usb_serial_ti;
 mod usb_register;
 
 use core::fmt::Write;

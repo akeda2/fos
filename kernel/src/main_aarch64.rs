@@ -43,14 +43,10 @@ mod kup_serial;
 mod kupshell;
 mod slots;
 mod sdhci;
-mod usb_midi;
 mod midishell;
 mod usb_kbd;
 mod usb_pointer;
 mod usbshell;
-mod usb_serial;
-mod usb_serial_pl2303;
-mod usb_serial_ti;
 mod usb_register;
 mod virtio_blk;
 
