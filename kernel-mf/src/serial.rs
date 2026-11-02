@@ -29,6 +29,7 @@ pub struct Serial;
 
 impl Write for Serial {
     fn write_str(&mut self, text: &str) -> fmt::Result {
+        crate::net::relay(text);
         for byte in text.bytes() {
             if byte == b'\n' {
                 put(b'\r');
@@ -49,6 +50,11 @@ fn put(byte: u8) {
     outb(COM1, byte);
 }
 
+/// The next received byte, if the UART has one (LSR bit 0).
+pub fn read_byte() -> Option<u8> {
+    (inb(COM1 + 5) & 1 != 0).then(|| inb(COM1))
+}
+
 /// One line at a time: CPUs print whole lines, never interleaved characters.
 static LOCK: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
 
@@ -65,4 +71,8 @@ pub fn break_lock() {
 macro_rules! println {
     () => { $crate::serial::print(format_args!("\n")) };
     ($($argument:tt)*) => { $crate::serial::print(format_args!("{}\n", format_args!($($argument)*))) };
+}
+
+macro_rules! print {
+    ($($argument:tt)*) => { $crate::serial::print(format_args!($($argument)*)) };
 }

@@ -8,6 +8,11 @@ extern crate alloc;
 
 #[macro_use]
 mod serial;
+mod config;
+mod net;
+mod power;
+mod shell;
+mod slots;
 mod acpi;
 mod apic;
 mod boot;
@@ -77,7 +82,7 @@ fn mib(bytes: u64) -> u64 {
 pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     serial::init();
     println!();
-    println!("Fosfor OS server kernel (mf, slice 5): running in 64-bit long mode.");
+    println!("Fosfor OS server kernel (mf, slice 6): running in 64-bit long mode.");
 
     let info = unsafe { &*info };
     if !info.is_valid() {
@@ -154,6 +159,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
         halt();
     };
     println!("ACPI: revision {}, local APIC at {:#x}, {} CPU(s), {} I/O APIC(s), PM timer port {:#x}.", tables.revision, madt.local_apic_address, madt.cpu_count, madt.io_apics, fadt.pm_timer_port);
+    power::set_acpi_reset(fadt.reset);
     let srat = acpi::srat(&tables);
     match &srat {
         Some(srat) => {
@@ -204,9 +210,24 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
         println!("  {:02x}:{:02x}.{} {:04x}:{:04x} {}", device.bus, device.device, device.function, device.vendor, device.id, pci::class_name(device.class, device.subclass));
     }
     storage::init(info);
-    cpu::interrupts_disable();
-    println!("kernel-mf: slice 5 reached the end of boot; halting.");
-    halt();
+    if let Some(disk) = storage::boot_disk() {
+        slots::init(info, disk);
+    }
+    config::load();
+    slots::confirm_boot();
+    net::init();
+    println!("kernel-mf: slice 6 reached the end of boot; entering the service loop.");
+    shell::prompt();
+    loop {
+        net::poll();
+        while let Some(byte) = serial::read_byte() {
+            shell::feed(byte);
+        }
+        net::housekeeping();
+        slots::housekeeping();
+        // Interrupts are on: the next tick (or NIC interrupt) wakes the loop.
+        unsafe { core::arch::asm!("sti", "hlt", options(nomem, nostack)) };
+    }
 }
 
 /// Exercises the heap the way the kernel will: boxes, growing vectors, strings, a map, an over-aligned block, and growth

@@ -25,7 +25,7 @@ CODE_CANDIDATES = ["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_CODE
 VARS_CANDIDATES = ["/usr/share/OVMF/OVMF_VARS_4M.fd", "/usr/share/OVMF/OVMF_VARS.fd",
                    "/usr/share/edk2/ovmf/OVMF_VARS.fd", "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd"]
 BIOS = os.environ.get("FOS_FIRMWARE") == "bios"
-FINAL = "slice 5 reached the end of boot"
+FINAL = "slice 6 reached the end of boot"
 
 
 def find(variable, candidates):
@@ -90,7 +90,7 @@ def main():
         raise SystemExit(f"{IMAGE} missing; run `make image-mf` first")
     for cpus in (1, 2, 8):
         text = boot(cpus)
-        check("Fosfor OS server kernel (mf, slice 5)" in text, f"-smp {cpus}: the server kernel announces itself", text)
+        check("Fosfor OS server kernel (mf, slice 6)" in text, f"-smp {cpus}: the server kernel announces itself", text)
         check("BootInfo: version" in text and "is not valid" not in text, f"-smp {cpus}: the loader's BootInfo is valid", text)
         match = re.search(r"Memory map: (\d+) regions, (\d+) MiB of RAM-like memory, (\d+) MiB conventional", text)
         check(match is not None and int(match.group(2)) >= 400 and int(match.group(3)) >= 100,

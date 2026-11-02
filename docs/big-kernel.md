@@ -332,3 +332,16 @@ flavour marker reaches `fosadm status`, and whether the batch queue needs the sc
   boot disk and the FOSFS mount at every `-smp`. Known gaps: no RTC (`unix_seconds` is 0), the `kernel-core` statics are unlocked
   so drivers run on the boot CPU only (APs idle), no USB or NIC bring-up yet, no NVMe disk in the test. Only real hardware shows
   real AHCI/NVMe, MSI/INTx routing and an invariant TSC.
+- Slice 6 (consoles, partly) is built: `net.rs` starts the `kernel-core` NIC drivers (e1000 family, RTL8168/8139, 3c905) and
+  speaks the embedded kernel's wire formats, so `term_net.py`, `peers.py`, `devloop.py` and `fosadm` work unchanged: discovery
+  and the periodic name announce (`hostname` file + NIC number, else `fos-` + last 3 MAC bytes), the `term net` session
+  (HELLO/DATA/BYE; console output is queued by `println!` into a relay ring and sent by the service loop, never from inside the
+  console lock) and KUP (an 8 MiB staging area from the frame allocator, checksum checked before anything is written, the
+  inactive slot written and made pending, reset a second after the ACK). `slots.rs` is the slot-metadata side (`confirm_boot`
+  promotes a pending kernel, clean-stop marker, unclean-boot streak cleared after 5 good minutes), `power.rs` the reset (ACPI
+  reset register, 0xCF9, 8042, triple fault), `config.rs` reads `hostname`, `settings` (`deny-term-net`) and `debug`
+  (`kernel-update`), `shell.rs` is a small shell (`help version cpus mem pci disks nic uptime slots echo reboot`) fed from
+  COM1 and the network. `kmain` ends in a service loop on the boot CPU. `make test-mf-net` covers discovery, a session, a bad
+  and a good KUP with the loader promoting slot 1, and the `kernel-update`/`deny-term-net` gates. Not yet: the framebuffer
+  console (slice 6d), NETFS/tapesync/`foscopy` serving, crash records, `reboot-on-crash`, the watchdog; NICs and their interrupts
+  work on the boot CPU only. Only real hardware shows NIC DMA and interrupts, a real reset and the A/B fallback on silicon.
