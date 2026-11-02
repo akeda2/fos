@@ -19,8 +19,8 @@ use crate::percpu::MAX_CPUS;
 use crate::sync::SpinLock;
 use crate::{cpu, pmm, vm};
 
-/// Pages per kernel thread stack (32 KiB).
-const STACK_PAGES: u64 = 8;
+/// Pages per kernel thread stack (128 KiB: a tape's audio call runs the shared drivers on it, which keep large buffers on the stack).
+const STACK_PAGES: u64 = 32;
 const NO_THREAD: usize = usize::MAX;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -450,6 +450,28 @@ pub fn idle_loop() -> ! {
     loop {
         yield_now();
         unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)) };
+    }
+}
+
+/// Pins the calling thread to CPU `cpu` and moves it there: the unlocked `kernel-core` drivers (USB, audio) share state with
+/// their interrupt handlers, which run on the boot CPU, so a tape that uses them must run there too. Not for the idle thread.
+pub fn pin_current(cpu: usize) {
+    let flags = cpu::interrupts_save_and_disable();
+    let already = {
+        let mut guard = SCHED.lock();
+        let sched = guard.as_mut().unwrap();
+        let current = sched.current[this_cpu()];
+        let thread = sched.threads[current].as_mut().unwrap();
+        let already = thread.pinned == Some(cpu);
+        thread.pinned = Some(cpu);
+        already
+    };
+    cpu::interrupts_restore(flags);
+    if !already {
+        // Asleep it is queued and only `cpu` may take it, so it wakes there.
+        while this_cpu() != cpu {
+            sleep_ticks(1);
+        }
     }
 }
 

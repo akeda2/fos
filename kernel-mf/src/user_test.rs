@@ -264,7 +264,8 @@ pub fn run() {
     let fp_ok = fp_ids.iter().all(|&id| matches!(find(id), Some(o) if o.how == How::Exited(0)))
         && avx.is_none_or(|id| matches!(find(id), Some(o) if o.how == How::Exited(0)));
     let spin_ok = matches!(find(spin), Some(o) if o.how == How::Killed);
-    let leaked = free_before.saturating_sub(pmm::stats().free);
+    // Fresh stack slots can need a new page-table page (128 KiB stacks: one per ~15 threads); tables are kept for reuse, not leaked.
+    let leaked = free_before.saturating_sub(pmm::stats().free).saturating_sub(2);
     let ok = |b: bool| if b { "ok" } else { "FAILED" };
     println!(
         "Ring 3: hello {}, bad pointer {}, page fault {}, #GP {}, preempted spinner {}, ELF {}, SSE{} state {}, {} frames not returned.",

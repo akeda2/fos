@@ -10,15 +10,15 @@
 //! What a call is worth today: console (`putc`, `puts`), time (`ticks`, `micros`), memory (`alloc`/`free` map zeroed pages into
 //! the process; the address is virtual, not physical), `args`, `should_abort` (the process was killed), `fp_level`, `free_pages`,
 //! `console_size` and the pixel screen (`gfx_*`). Everything else answers 0 ("none", "failed"), which the tapes read as "this
-//! machine has no such device"; the `fs_*` calls go to `tapefs.rs`, the `nic_*` calls to `tapenet.rs`. Input, files and NICs are served; audio, MIDI, touch and GPIO come in
-//! later slices (the drivers are unlocked and CPU-0 only; see docs/big-kernel.md). Processes are single-threaded.
+//! machine has no such device"; the `fs_*` calls go to `tapefs.rs`, the `nic_*` calls to `tapenet.rs`. Input, files, NICs, USB MIDI/touch and audio (`tapeaudio.rs`: HD Audio; USB audio later) are served; GPIO comes in
+//! a later slice (the drivers are unlocked and CPU-0 only; see docs/big-kernel.md). Processes are single-threaded.
 
 use core::mem::{offset_of, size_of};
 
 use fosfor_abi::tape::{KEY_BASE, KEY_NONE, TAPE_API_VERSION, TapeApi};
 
 use crate::trap::Frame;
-use crate::{apic, fb, fpu, pmm, process, sched, tapefs, tapenet, vm};
+use crate::{apic, fb, fpu, pmm, process, sched, tapeaudio, tapefs, tapenet, vm};
 
 pub const SHIM_BASE: u64 = vm::USER_BASE + 0x200_0000;
 pub const TABLE_BASE: u64 = SHIM_BASE + 0x1000;
@@ -108,6 +108,19 @@ const TOUCH_READ: u64 = slot(offset_of!(TapeApi, touch_read));
 const MIDI_READ: u64 = slot(offset_of!(TapeApi, midi_read));
 const MIDI_SEND: u64 = slot(offset_of!(TapeApi, midi_send));
 const MIDI_DEVICES: u64 = slot(offset_of!(TapeApi, midi_devices));
+const AUDIO_INFO: u64 = slot(offset_of!(TapeApi, audio_info));
+const AUDIO_START: u64 = slot(offset_of!(TapeApi, audio_start));
+const AUDIO_STOP: u64 = slot(offset_of!(TapeApi, audio_stop));
+const AUDIO_READ: u64 = slot(offset_of!(TapeApi, audio_read));
+const AUDIO_WRITE: u64 = slot(offset_of!(TapeApi, audio_write));
+const AUDIO_STATS: u64 = slot(offset_of!(TapeApi, audio_stats));
+const AUDIO_SELECT: u64 = slot(offset_of!(TapeApi, audio_select));
+const AUDIO_BUFFER: u64 = slot(offset_of!(TapeApi, audio_buffer));
+const AUDIO_SET_CAPTURE_RING: u64 = slot(offset_of!(TapeApi, audio_set_capture_ring));
+const AUDIO_DEVICES: u64 = slot(offset_of!(TapeApi, audio_devices));
+const AUDIO_USE_DEVICE: u64 = slot(offset_of!(TapeApi, audio_use_device));
+const AUDIO_USE_OUTPUT: u64 = slot(offset_of!(TapeApi, audio_use_output));
+const AUDIO_FLOAT: u64 = slot(offset_of!(TapeApi, audio_float));
 const FS_STREAM_OPEN: u64 = slot(offset_of!(TapeApi, fs_stream_open));
 const FS_STREAM_WRITE: u64 = slot(offset_of!(TapeApi, fs_stream_write));
 const FS_STREAM_CLOSE: u64 = slot(offset_of!(TapeApi, fs_stream_close));
@@ -133,7 +146,6 @@ const GFX_OPEN_ON: u64 = slot(offset_of!(TapeApi, gfx_open_on));
 const GFX_CLOSE_ON: u64 = slot(offset_of!(TapeApi, gfx_close_on));
 const GFX_FILL_ON: u64 = slot(offset_of!(TapeApi, gfx_fill_on));
 const GFX_BLIT_ON: u64 = slot(offset_of!(TapeApi, gfx_blit_on));
-const AUDIO_FLOAT: u64 = slot(offset_of!(TapeApi, audio_float));
 
 /// The table slots that hold data, not a function.
 fn is_data(slot: u64) -> bool {
@@ -287,6 +299,31 @@ pub fn call(frame: &mut Frame) {
         MIDI_READ => crate::usb::midi_read(a) as u64,
         MIDI_SEND => crate::usb::midi_send(a, b, c) as u64,
         MIDI_DEVICES => crate::usb::midi_devices(),
+        AUDIO_INFO => tapeaudio::info(a),
+        AUDIO_START => tapeaudio::start(a, b, c) as u64,
+        AUDIO_STOP => {
+            tapeaudio::stop();
+            0
+        }
+        AUDIO_READ => tapeaudio::read(a, b),
+        AUDIO_WRITE => tapeaudio::write(a, b),
+        AUDIO_STATS => {
+            tapeaudio::stats(a);
+            0
+        }
+        AUDIO_SELECT => tapeaudio::select(a, b) as u64,
+        AUDIO_BUFFER => {
+            tapeaudio::buffer(a);
+            0
+        }
+        AUDIO_SET_CAPTURE_RING => {
+            tapeaudio::set_capture_ring(a);
+            0
+        }
+        AUDIO_DEVICES => tapeaudio::devices(a, b),
+        AUDIO_USE_DEVICE => tapeaudio::use_device(a) as u64,
+        AUDIO_USE_OUTPUT => tapeaudio::use_output(a) as u64,
+        AUDIO_FLOAT => tapeaudio::float(),
         FS_READ => tapefs::read(a, b, c, d) as u64,
         FS_READ_AT => tapefs::read_range(a, b, c, d, e) as u64,
         FS_WRITE => tapefs::write(a, b, c, d) as u64,
@@ -300,7 +337,6 @@ pub fn call(frame: &mut Frame) {
         FS_STREAM_CLOSE2 => tapefs::stream_close2(a, b) as u64,
         CONSOLE_SIZE => 0,
         FP_LEVEL => u64::from(fpu::level()),
-        AUDIO_FLOAT => 0,
         GFX_INFO | GFX_INFO_ON if number == GFX_INFO || a == 0 => fb::gfx_info().map_or(0, |(w, h)| u64::from(w) << 32 | u64::from(h)),
         GFX_SCREENS => u64::from(fb::gfx_info().is_some()),
         GFX_OPEN | GFX_OPEN_ON if number == GFX_OPEN || a == 0 => {
