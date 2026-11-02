@@ -7,7 +7,7 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 use fosfor_abi::keymap::Layout;
 use kernel_core::usb_class::{self, Class, Host, NONE};
-use kernel_core::{ehci, ohci, usb_hid, usb_midi, usb_pointer, usb_serial, xhci};
+use kernel_core::{ehci, ohci, usb_audio, usb_hid, usb_midi, usb_pointer, usb_serial, xhci};
 
 use crate::sync::SpinLock;
 
@@ -19,13 +19,26 @@ pub struct UsbGuard {
     taken: bool,
 }
 
+/// The lock for a tape call. The drivers and their interrupt handlers are CPU-0 oriented, so the tape moves there first.
+fn tape_lock() -> UsbGuard {
+    crate::sched::pin_current(0);
+    lock()
+}
+
 pub fn lock() -> UsbGuard {
     let me = crate::sched::current_id() + 1;
     if OWNER.load(Ordering::Acquire) == me {
         return UsbGuard { taken: false };
     }
     while OWNER.compare_exchange(0, me, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        // A tape's system call arrives with interrupts off, and the holder may be a thread this CPU preempted: let the timer
+        // tick through the wait, or the holder never runs again.
+        let was_on = crate::cpu::interrupts_save_and_disable();
+        crate::cpu::interrupts_enable();
         core::hint::spin_loop();
+        if !was_on {
+            crate::cpu::interrupts_disable();
+        }
     }
     UsbGuard { taken: true }
 }
@@ -62,10 +75,10 @@ static HOST: Host = Host {
     release_port: usb_hid::release_port,
     probe_device: |index, controller, device| usb_hid::probe_device(index, controller, device),
     background_event: usb_hid::background_event,
-    poll: poll,
+    poll: poll_nowait,
 };
 
-// Audio is not served to tapes yet, so its class is not registered: an audio device is only described and released.
+static AUDIO: Class = Class { ehci_departed: Some(usb_audio::ehci_departed), irq_event: Some(usb_audio::irq_event), ehci_event: Some(usb_audio::ehci_event), ..NONE };
 static MIDI: Class = Class { release: Some(usb_midi::release), background_event: Some(usb_midi::background_event), ..NONE };
 static POINTER: Class = Class { release: Some(usb_pointer::release), background_event: Some(usb_pointer::background_event), ..NONE };
 static SERIAL: Class = Class {
@@ -79,7 +92,7 @@ static SERIAL: Class = Class {
 pub fn init() {
     kernel_core::usb_env::set(&ENV);
     usb_class::set_host(&HOST);
-    for class in [&MIDI, &POINTER, &SERIAL] {
+    for class in [&AUDIO, &MIDI, &POINTER, &SERIAL] {
         usb_class::register(class);
     }
     let _usb = lock();
@@ -91,7 +104,23 @@ pub fn init() {
         return;
     }
     let devices = usb_hid::probe_all();
-    println!("USB: {x} xHCI, {e} EHCI and {o} OHCI controller(s), {devices} usable device(s) (keyboards, MIDI, touch; polled, no USB disks yet).");
+    // Events by MSI like the embedded kernel (isochronous audio refills need them); no-msi in settings keeps them polled.
+    xhci::enable_interrupts_all(crate::config::no_msi());
+    println!("USB: {x} xHCI, {e} EHCI and {o} OHCI controller(s), {devices} usable device(s) (keyboards, MIDI, touch; no USB disks yet).");
+}
+
+/// The host's `poll` hook, which kernel-core also calls from interrupt handlers: waiting for the lock there could spin forever
+/// (the holder is a thread this CPU cannot resume), so a busy lock means someone is polling already and this pass is skipped.
+fn poll_nowait() {
+    let me = crate::sched::current_id() + 1;
+    let reentrant = OWNER.load(Ordering::Acquire) == me;
+    if !reentrant && OWNER.compare_exchange(0, me, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        return;
+    }
+    usb_hid::poll();
+    if !reentrant {
+        OWNER.store(0, Ordering::Release);
+    }
 }
 
 /// One pass over the controllers' rings, then typed bytes to the shell (the service thread calls this).
@@ -118,7 +147,7 @@ pub fn poll() {
 // ---- tape calls (ABI 24-26): the kernel-core implementations, on kernel buffers, under the lock ----
 
 pub fn midi_devices() -> u64 {
-    let _usb = lock();
+    let _usb = tape_lock();
     u64::from(usb_midi::api_midi_devices())
 }
 
@@ -126,7 +155,7 @@ pub fn midi_devices() -> u64 {
 pub fn midi_read(out: u64) -> i64 {
     let mut packet = [0u8; 6];
     let got = {
-        let _usb = lock();
+        let _usb = tape_lock();
         usb_midi::api_midi_read(packet.as_mut_ptr())
     };
     if got > 0 && !crate::process::copy_to_user(out, &packet) {
@@ -140,12 +169,12 @@ pub fn midi_send(device: u64, message: u64, length: u64) -> i64 {
         return -1;
     }
     let Some(bytes) = crate::process::user_bytes_up_to(message, length, 3) else { return -1 };
-    let _usb = lock();
+    let _usb = tape_lock();
     i64::from(usb_midi::api_midi_send(device as u32, bytes.as_ptr(), length as u32))
 }
 
 pub fn touch_info(panel: u64) -> u64 {
-    let _usb = lock();
+    let _usb = tape_lock();
     usb_pointer::api_touch_info(panel as u32)
 }
 
@@ -153,7 +182,7 @@ pub fn touch_info(panel: u64) -> u64 {
 pub fn touch_read(out: u64) -> i64 {
     let mut event = [0i32; 6];
     let got = {
-        let _usb = lock();
+        let _usb = tape_lock();
         usb_pointer::api_touch_read(event.as_mut_ptr())
     };
     if got > 0 {
