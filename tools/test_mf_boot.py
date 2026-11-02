@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Boots the server kernel image (build/fosfor-mf/fosfor.img, `make image-mf`) under QEMU and checks slice 1 of
-docs/big-kernel.md: the loader hands over a valid BootInfo, the kernel narrates over COM1, reports a sane memory map and
-reaches the end of boot, with 1, 2 and 8 CPUs. It also checks the flavour marker in the ELF (`.fos_flavour` says "mf") and
+"""Boots the server kernel image (build/fosfor-mf/fosfor.img, `make image-mf`) under QEMU and checks slices 1 and 2 of
+docs/big-kernel.md: the loader hands over a valid BootInfo, the kernel narrates over COM1, reports a sane memory map,
+builds its frame allocator, page tables (direct map, W^X image) and heap and reaches the end of boot, with 1, 2 and 8 CPUs. It also checks the flavour marker in the ELF (`.fos_flavour` says "mf") and
 that the embedded kernel's ELF says "embedded". `make test-mf-boot` runs it through UEFI and, with FOS_FIRMWARE=bios and the
 qemu shim, through BIOS."""
 
@@ -24,7 +24,7 @@ CODE_CANDIDATES = ["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_CODE
 VARS_CANDIDATES = ["/usr/share/OVMF/OVMF_VARS_4M.fd", "/usr/share/OVMF/OVMF_VARS.fd",
                    "/usr/share/edk2/ovmf/OVMF_VARS.fd", "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd"]
 BIOS = os.environ.get("FOS_FIRMWARE") == "bios"
-FINAL = "skeleton reached the end of boot"
+FINAL = "slice 2 reached the end of boot"
 
 
 def find(variable, candidates):
@@ -85,11 +85,20 @@ def main():
         raise SystemExit(f"{IMAGE} missing; run `make image-mf` first")
     for cpus in (1, 2, 8):
         text = boot(cpus)
-        check("Fosfor OS server kernel (mf, slice 1)" in text, f"-smp {cpus}: the server kernel announces itself", text)
+        check("Fosfor OS server kernel (mf, slice 2)" in text, f"-smp {cpus}: the server kernel announces itself", text)
         check("BootInfo: version" in text and "is not valid" not in text, f"-smp {cpus}: the loader's BootInfo is valid", text)
         match = re.search(r"Memory map: (\d+) regions, (\d+) MiB of RAM-like memory, (\d+) MiB conventional", text)
         check(match is not None and int(match.group(2)) >= 400 and int(match.group(3)) >= 100,
               f"-smp {cpus}: the memory map shows the guest's RAM", text)
+        frames = re.search(r"Physical memory: (\d+) MiB managed in (\d+) frames, (\d+) MiB free", text)
+        check(frames is not None and int(frames.group(1)) >= 300 and int(frames.group(3)) >= 300
+              and int(frames.group(2)) >= int(frames.group(1)) * 256 - 1,
+              f"-smp {cpus}: the frame allocator manages the guest's RAM", text)
+        direct = re.search(r"direct map of (\d+) MiB at 0xffff800000000000", text)
+        check(direct is not None and int(direct.group(1)) >= 400, f"-smp {cpus}: the direct map covers RAM in the upper half", text)
+        check("W^X holds" in text, f"-smp {cpus}: the kernel image is W^X with unmapped guards and page 0", text)
+        check("written and read back at 0xffff8000" in text, f"-smp {cpus}: a frame is reachable through the direct map", text)
+        check("Heap: self-test passed" in text, f"-smp {cpus}: the heap passes its self-test (including growth)", text)
         check("PANIC" not in text, f"-smp {cpus}: no panic", text)
     flavour = section(TARGET / "fosfor-kernel-mf", ".fos_flavour")
     check(flavour == b"mf", f"the server kernel's ELF says mf (got {flavour!r})")

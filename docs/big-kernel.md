@@ -292,3 +292,11 @@ flavour marker reaches `fosadm status`, and whether the batch queue needs the sc
   `BootInfo`, serial narration, memory map summary). The `.fos_flavour` ELF section says `mf` (the embedded kernel now says
   `embedded`); nothing reads it yet (KUP, `fosadm`, the loader come with slice 6). It has no IDT yet, so a CPU exception resets
   the guest; slice 3 adds one.
+- Slice 2 (memory) is built: `pmm.rs` (bitmap frame allocator over the `BootInfo` map, reached through `vm::direct` so it
+  survives the page-table switch; no NUMA lists or lock yet), `vm.rs` (own page tables: every RAM-like region at
+  `0xffff_8000_0000_0000 + physical`, NX, 2 MiB pages; the kernel image keeps its identity mapping with W^X per section and
+  unmapped guard pages and page 0; framebuffer or VGA text uncached; the lower half is otherwise empty), `heap.rs` (first-fit
+  free list, `#[global_allocator]`, grows by 2 MiB chunks, no lock yet), `boot.rs` (`Machine`: what the kernel needs from loader
+  memory, copied out before the switch). `test-mf-boot` checks the frame count, the direct map, W^X, a frame round trip and a
+  heap self-test with growth. UEFI runtime services and device registers are not mapped yet. Only hardware shows how the
+  framebuffer's uncached mapping behaves (write-combining via the PAT comes with the framebuffer console, slice 6).
