@@ -120,7 +120,7 @@ fn write_register(pipe: &mut Pipe, register: u32, mask: u8, value: u8) -> bool {
 /// (little-endian) and the sum of the rest, which is what the ROM checks.
 fn download(pipe: &mut Pipe) -> Result<(), &'static str> {
     let image = unsafe { &mut *core::ptr::addr_of_mut!(IMAGE) };
-    let Some(volume) = crate::storage::volume_with_file(FIRMWARE) else {
+    let Some(volume) = crate::volumes::volume_with_file(FIRMWARE) else {
         return Err("needs the firmware file moxa-1110.fw on a FOSFS volume (foscopy.py FILE :disk1/moxa-1110.fw)");
     };
     let size = match volume.read(FIRMWARE, &mut image[..FIRMWARE_MAX]) {

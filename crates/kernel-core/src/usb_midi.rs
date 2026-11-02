@@ -302,7 +302,7 @@ pub fn describe_devices(print: impl Fn(core::fmt::Arguments)) {
 /// Tape ABI 25 `midi_read`: `out` points at six bytes (device, cable, count, three data bytes).
 pub extern "C" fn api_midi_read(out: *mut u8) -> i32 {
     // The USB event rings are only drained when something polls; a tape's loop does not, so do it here.
-    crate::midishell::poll_usb();
+    crate::usb_class::poll();
     match take() {
         Some((device, cable, bytes, count)) => {
             let packet = [device as u8, cable, count as u8, bytes[0], bytes[1], bytes[2]];
@@ -315,7 +315,7 @@ pub extern "C" fn api_midi_read(out: *mut u8) -> i32 {
 
 /// Tape ABI 26 `midi_devices`.
 pub extern "C" fn api_midi_devices() -> u32 {
-    crate::midishell::poll_usb();
+    crate::usb_class::poll();
     count() as u32
 }
 

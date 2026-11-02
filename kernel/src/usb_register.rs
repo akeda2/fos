@@ -15,6 +15,7 @@ static HOST: Host = Host {
     release_port: enumerator::release_port,
     probe_device: |index, controller, device| enumerator::probe_device(index, controller, device),
     background_event: enumerator::background_event,
+    poll: enumerator::poll,
 };
 
 static AUDIO: Class = Class {

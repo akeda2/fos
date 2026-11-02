@@ -17,6 +17,8 @@ pub struct Host {
     pub probe_device: fn(usize, &mut Controller, crate::xhci::Device) -> Result<bool, crate::xhci::Error>,
     /// An xHCI event nobody waited for (keyboard reports, port changes, class driver traffic).
     pub background_event: fn(&mut Controller, &Trb),
+    /// One pass over the controllers' event rings (what a loop that waits for USB traffic calls).
+    pub poll: fn(),
 }
 
 static mut HOST: Option<&'static Host> = None;
@@ -55,6 +57,13 @@ pub fn probe_device(controller_index: usize, controller: &mut Controller, device
 pub fn host_background_event(controller: &mut Controller, event: &Trb) {
     if let Some(host) = host() {
         (host.background_event)(controller, event);
+    }
+}
+
+/// Drains the controllers' event rings once, which delivers completions to the class drivers' `background_event`.
+pub fn poll() {
+    if let Some(host) = host() {
+        (host.poll)();
     }
 }
 

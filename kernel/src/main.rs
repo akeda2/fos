@@ -26,7 +26,7 @@ pub use hal::print;
 pub use kernel_core::{audio, fatvol, fosfs, gpt, hda, lineedit, loopback, pci, tape_fs, usb_audio};
 #[cfg(target_arch = "x86_64")]
 pub use kernel_core::{ahci, e1000, nic, nvme, rtl8139, rtl8168, threecom};
-pub use kernel_core::{ehci, usb_class, usb_hub, usb_storage, xhci};
+pub use kernel_core::{ehci, usb_class, usb_hub, usb_midi, usb_serial, usb_serial_pl2303, usb_serial_ti, usb_storage, xhci};
 
 // One crate root, two entry files: each is spliced in here, so `crate::println!`, `crate::print` and the module paths
 // look the same to every driver. The x86-64 file is the whole kernel as it was; the aarch64 one is the Raspberry Pi
