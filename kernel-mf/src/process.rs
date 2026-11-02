@@ -259,6 +259,7 @@ pub fn terminate(how: How) -> ! {
         How::Fault(vector, address) => println!("Process {thread} killed by exception {vector} (address {address:#x})."),
         How::Killed => println!("Process {thread} killed."),
     }
+    crate::shell::end_foreground(thread);
     sched::exit()
 }
 

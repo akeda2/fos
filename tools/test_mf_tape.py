@@ -53,6 +53,16 @@ def run(cpu, smp):
                 if not done or "exited with code 0." not in new:
                     failures.append(f"`tape {command}` did not finish cleanly:\n{new}")
                     break
+        if not failures:
+            # Escape reaches the foreground tape: gfxcheck would hold its picture for 10 s.
+            mark = len(log)
+            qemu.stdin.write(b"tape gfxcheck\n")
+            qemu.stdin.flush()
+            wait_for("gfxcheck: drawn", 10, mark)
+            qemu.stdin.write(b"\x1b")
+            qemu.stdin.flush()
+            if not wait_for("fos> ", 5, mark + 40):
+                failures.append("Escape did not end the foreground tape:\n" + log[mark:].decode("utf8", "replace"))
         text = log.decode("utf8", "replace")
         if "CPU exception" in text or "PANIC" in text:
             failures.append("kernel fault:\n" + text[-1500:])

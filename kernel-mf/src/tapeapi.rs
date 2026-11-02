@@ -15,7 +15,7 @@
 
 use core::mem::{offset_of, size_of};
 
-use fosfor_abi::tape::{FS_NO_VOLUME, KEY_NONE, TAPE_API_VERSION, TapeApi};
+use fosfor_abi::tape::{FS_NO_VOLUME, KEY_BASE, KEY_NONE, TAPE_API_VERSION, TapeApi};
 
 use crate::trap::Frame;
 use crate::{apic, fb, fpu, pmm, process, sched, vm};
@@ -215,7 +215,10 @@ pub fn call(frame: &mut Frame) {
             0
         }
         SHOULD_ABORT => u64::from(sched::current_killed()),
-        READ_KEY => u64::from(KEY_NONE),
+        READ_KEY => match crate::shell::take_key(sched::current_pid()) {
+            Some(byte) => u64::from(KEY_BASE + u32::from(byte)),
+            None => u64::from(KEY_NONE),
+        },
         SET_INPUT_MODE => 0,
         WAIT_FOR_EVENT => {
             sched::sleep_ticks(1);
