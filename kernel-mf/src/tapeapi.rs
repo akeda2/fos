@@ -10,8 +10,7 @@
 //! What a call is worth today: console (`putc`, `puts`), time (`ticks`, `micros`), memory (`alloc`/`free` map zeroed pages into
 //! the process; the address is virtual, not physical), `args`, `should_abort` (the process was killed), `fp_level`, `free_pages`,
 //! `console_size` and the pixel screen (`gfx_*`). Everything else answers 0 ("none", "failed"), which the tapes read as "this
-//! machine has no such device"; the `fs_*` calls go to `tapefs.rs`, the `nic_*` calls to `tapenet.rs`. Input, files, NICs, USB MIDI/touch and audio (`tapeaudio.rs`: HD Audio; USB audio later) are served; GPIO comes in
-//! a later slice (the drivers are unlocked and CPU-0 only; see docs/big-kernel.md). Processes are single-threaded.
+//! machine has no such device"; the `fs_*` calls go to `tapefs.rs`, the `nic_*` calls to `tapenet.rs`. Input, files, NICs, USB MIDI/touch and audio (`tapeaudio.rs`) are served; GPIO and I2C answer "no pins" (Pi 4 only) (the drivers are unlocked and CPU-0 only; see docs/big-kernel.md). Processes are single-threaded.
 
 use core::mem::{offset_of, size_of};
 
@@ -103,6 +102,15 @@ const NIC_MULTICAST_JOIN: u64 = slot(offset_of!(TapeApi, nic_multicast_join));
 const NIC_VLAN_FILTER: u64 = slot(offset_of!(TapeApi, nic_vlan_filter));
 const NIC_TX_OFFLOAD: u64 = slot(offset_of!(TapeApi, nic_tx_offload));
 const NIC_COUNTERS: u64 = slot(offset_of!(TapeApi, nic_counters));
+const GPIO_PINS: u64 = slot(offset_of!(TapeApi, gpio_pins));
+const GPIO_READ: u64 = slot(offset_of!(TapeApi, gpio_read));
+const GPIO_WRITE: u64 = slot(offset_of!(TapeApi, gpio_write));
+const GPIO_MODE: u64 = slot(offset_of!(TapeApi, gpio_mode));
+const GPIO_PULL: u64 = slot(offset_of!(TapeApi, gpio_pull));
+const GPIO_FUNCTION: u64 = slot(offset_of!(TapeApi, gpio_function));
+const GPIO_PULL_GET: u64 = slot(offset_of!(TapeApi, gpio_pull_get));
+const I2C_SPEED: u64 = slot(offset_of!(TapeApi, i2c_speed));
+const I2C_TRANSFER: u64 = slot(offset_of!(TapeApi, i2c_transfer));
 const TOUCH_INFO: u64 = slot(offset_of!(TapeApi, touch_info));
 const TOUCH_READ: u64 = slot(offset_of!(TapeApi, touch_read));
 const MIDI_READ: u64 = slot(offset_of!(TapeApi, midi_read));
@@ -336,6 +344,13 @@ pub fn call(frame: &mut Frame) {
         FS_STREAM_WRITE2 => tapefs::stream_write2(a, b, c, d, e) as u64,
         FS_STREAM_CLOSE2 => tapefs::stream_close2(a, b) as u64,
         CONSOLE_SIZE => 0,
+        // This machine has no GPIO pins or I2C header (the Raspberry Pi 4 has): the answers of the embedded x86 kernel without
+        // pins, so a tape can tell. Reads show nothing, every write is refused, mode/pull say "no GPIO", I2C says "no bus".
+        GPIO_PINS | GPIO_READ => 0,
+        GPIO_WRITE => a,
+        GPIO_MODE | GPIO_PULL => (-3i64) as u64,
+        GPIO_FUNCTION | GPIO_PULL_GET => (-2i64) as u64,
+        I2C_SPEED | I2C_TRANSFER => (-4i64) as u64,
         FP_LEVEL => u64::from(fpu::level()),
         GFX_INFO | GFX_INFO_ON if number == GFX_INFO || a == 0 => fb::gfx_info().map_or(0, |(w, h)| u64::from(w) << 32 | u64::from(h)),
         GFX_SCREENS => u64::from(fb::gfx_info().is_some()),
