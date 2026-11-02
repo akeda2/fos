@@ -290,14 +290,18 @@ fn finish_switch() {
         if previous != NO_THREAD && sched.threads[previous].as_ref().is_some_and(|t| t.state == State::Dead) {
             let thread = sched.threads[previous].take().unwrap();
             if let Some((slot, frames)) = thread.slot {
-                // Not reused: another CPU may still cache the old mapping and there is no TLB shootdown IPI yet.
                 released = Some((slot, frames));
             }
         }
     }
     if let Some((slot, frames)) = released {
+        // Another CPU may still cache the old mapping: flush it everywhere before the frames or the slot are reused.
         vm::unmap_stack(slot, STACK_PAGES);
+        crate::tlb::shootdown(vm::stack_base(slot, STACK_PAGES), STACK_PAGES);
         pmm::free(frames, STACK_PAGES);
+        if let Some(sched) = SCHED.lock().as_mut() {
+            sched.free_slots.push(slot);
+        }
     }
     load_context(cpu_index);
 }

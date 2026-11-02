@@ -38,6 +38,7 @@ mod pmm;
 mod smp;
 mod storage;
 mod sync;
+mod tlb;
 mod trap;
 mod vm;
 
@@ -447,6 +448,7 @@ fn sched_selftest() {
     let steps = SELFTEST_STEPS.load(core::sync::atomic::Ordering::Relaxed);
     let leaked = free_before - pmm::stats().free;
     println!("Scheduler: 3 kernel threads took {steps} interleaved steps in {} context switches; {left} thread(s) left, {leaked} stack frame(s) not returned.", sched::switches());
+    println!("TLB: {} shootdown(s) so far (every exited thread's stack is flushed on all {} CPU(s) before its slot is reused).", tlb::SHOOTDOWNS.load(core::sync::atomic::Ordering::Relaxed), percpu::count());
     if steps != 15 || left != 1 || leaked != 0 {
         println!("Scheduler self-test FAILED.");
     }
