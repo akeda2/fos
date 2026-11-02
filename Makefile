@@ -185,7 +185,7 @@ kernel:
 
 # The server kernel (kernel-mf/, docs/big-kernel.md): same loaders, same image layout, its own crate.
 KERNEL_MF_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel-mf
-.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-tape
+.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-tape test-mf-usb
 kernel-mf:
 	cd kernel-mf && cargo +nightly-2026-09-13 build --release
 
@@ -202,6 +202,9 @@ test-mf-tape: image-mf image
 		--file hello=$(BUILD)/fosfor/tapes/hello --file fpcheck=$(BUILD)/fosfor/tapes/fpcheck --file gfxcheck=$(BUILD)/fosfor/tapes/gfxcheck \
 		--file fscheck=$(BUILD)/fosfor/tapes/fscheck --file ed=$(BUILD)/fosfor/tapes/ed --file netcheck=$(BUILD)/fosfor/tapes/netcheck --file note.txt=tools/test_mf_note.txt
 	python3 tools/test_mf_tape.py
+
+test-mf-usb: image-mf
+	python3 tools/test_mf_usb.py
 
 # The server kernel boots through UEFI and BIOS (SMP 1, 2 and 8), validates BootInfo, narrates over COM1 and says what it is.
 test-mf-boot: image-mf $(BIOS_OUT)/shim/qemu-system-x86_64

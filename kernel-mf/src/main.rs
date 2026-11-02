@@ -14,6 +14,7 @@ mod sched;
 mod tapeapi;
 mod tapefs;
 mod tapenet;
+mod usb;
 mod user_test;
 mod fb;
 mod config;
@@ -235,6 +236,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     config::load();
     slots::confirm_boot();
     net::init();
+    usb::init();
     sched_selftest();
     sched::spawn("service", service_thread, 0).expect("the service thread");
     println!("kernel-mf: slice 8 reached the end of boot; entering the service loop.");
@@ -299,6 +301,7 @@ fn panic(info: &PanicInfo) -> ! {
 extern "C" fn service_thread(_: usize) {
     loop {
         net::poll();
+        usb::poll();
         while let Some(byte) = serial::read_byte() {
             shell::feed(byte);
         }
