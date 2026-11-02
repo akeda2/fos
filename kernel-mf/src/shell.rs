@@ -2,7 +2,7 @@
 //! inspection commands. Output goes through `println!`, which reaches every console (serial and, while a session is open,
 //! the network). Runs on the boot CPU from the service loop.
 
-use crate::{apic, block, net, percpu, pmm, power, slots};
+use crate::{apic, block, net, percpu, pmm, power, sched, slots};
 use kernel_core::netdump::Mac;
 use kernel_core::{nic, pci};
 
@@ -54,9 +54,9 @@ fn run(line: &str) {
     let Some(command) = words.next() else { return };
     match command {
         "help" => {
-            println!("help version cpus mem pci disks nic uptime slots echo TEXT reboot");
+            println!("help version cpus mem pci disks nic uptime slots threads echo TEXT reboot");
         }
-        "version" => println!("Fosfor OS server kernel (mf), slice 6."),
+        "version" => println!("Fosfor OS server kernel (mf), slice 7."),
         "cpus" => println!("{} CPU(s); boot CPU has taken {} timer ticks.", percpu::count(), percpu::ticks_of(0)),
         "mem" => {
             let stats = pmm::stats();
@@ -80,6 +80,10 @@ fn run(line: &str) {
                     println!("nic{}: {} link {}", index + 1, Mac(&mac), if net::link_up(index) { "up" } else { "down" });
                 }
             }
+        }
+        "threads" => {
+            sched::for_each(|id, name, state| println!("{id:3} {name:<16} {state:?}"));
+            println!("{} context switches.", sched::switches());
         }
         "uptime" => println!("{} s", apic::ticks() / apic::TICK_HZ),
         "slots" => match slots::read_metadata() {
