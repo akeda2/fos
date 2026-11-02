@@ -216,5 +216,9 @@ by any test: USB serial adapters, the Pi 4 console and GIC paths (hardware only)
 - Slice 10c, the enumerators: `usb_hid` (x86), `usb_kbd` (Pi) and `ohci` are in core. What they needed from the console side
   is `usb_env::set` (queue a key, the active keymap, whether the boot disk is known, which `DiskNumber` prints); the Pi's key
   queue and layout stay in `kernel/src/usb_kbd.rs`, which re-exports the core enumerator. `describe_xhci` moved to `usb_hub`.
-- Next: `usbshell` and the remaining leaf drivers; then stage 1b is done and the server kernel's own `Platform` can start.
+- Slice 10d, the leaf drivers: `netdump`, `uart` (x86 COM2-COM4, port I/O through `cpu::inb/outb`), `serialports`, `gpu` and
+  `virtio_blk` (Pi/QEMU aarch64) are in core. Left in the kernel on purpose: `nicpark` (needs the `term` NIC table), the Pi
+  SoC drivers (`genet`, `sdhci`, `gpio`, `i2c`, `i2s_pi`, `mailbox`, `pipower`: they sit on the aarch64 HAL and only matter
+  on a Pi), the PS/2 `keyboard` and the shells.
+- Next: a NIC registry out of `term` (so `nicpark` and the NIC shell can move), then the server kernel's own `Platform`.
   The server kernel needs all of them; only the real-time guarantees (interrupt-context audio refills) differ.

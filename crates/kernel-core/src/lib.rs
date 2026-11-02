@@ -56,6 +56,15 @@ pub mod usb_env;
 pub mod usb_storage;
 pub mod volumes;
 pub mod xhci;
+pub mod netdump;
+#[cfg(target_arch = "x86_64")]
+pub mod gpu;
+#[cfg(target_arch = "x86_64")]
+pub mod serialports;
+#[cfg(target_arch = "x86_64")]
+pub mod uart;
+#[cfg(target_arch = "aarch64")]
+pub mod virtio_blk;
 #[cfg(target_arch = "x86_64")]
 pub mod ohci;
 #[cfg(target_arch = "x86_64")]
