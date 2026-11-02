@@ -71,16 +71,16 @@ impl Drive {
     /// One request: `kind` 0 = read, 1 = write.
     fn transfer(&self, kind: u32, lba: u64, data: *mut u8, length: usize) -> Result<(), Error> {
         let queue = unsafe { (*core::ptr::addr_of_mut!(QUEUES))[self.index].as_mut().ok_or(Error::Device)? };
-        let header = queue.request as *mut u32;
-        let status = (queue.request + 16) as *mut u8;
+        let header = memory::phys_to_virt(queue.request) as *mut u32;
+        let status = memory::phys_to_virt(queue.request + 16) as *mut u8;
         unsafe {
             header.write_volatile(kind);
             header.add(1).write_volatile(0);
-            (queue.request as *mut u64).add(1).write_volatile(lba);
+            (memory::phys_to_virt(queue.request) as *mut u64).add(1).write_volatile(lba);
             status.write_volatile(0xff);
         }
         let descriptor = |slot: u64, address: u64, length: u32, flags: u16, next: u16| unsafe {
-            let entry = (queue.page + slot * 16) as *mut u64;
+            let entry = memory::phys_to_virt(queue.page + slot * 16) as *mut u64;
             entry.write_volatile(address);
             ((entry as u64 + 8) as *mut u32).write_volatile(length);
             ((entry as u64 + 12) as *mut u16).write_volatile(flags);
@@ -89,20 +89,20 @@ impl Drive {
         const NEXT: u16 = 1;
         const WRITE: u16 = 2; // the device writes this buffer
         descriptor(0, queue.request, 16, NEXT, 1);
-        descriptor(1, data as u64, length as u32, NEXT | if kind == 0 { WRITE } else { 0 }, 2);
+        descriptor(1, memory::virt_to_phys(data as u64), length as u32, NEXT | if kind == 0 { WRITE } else { 0 }, 2);
         descriptor(2, queue.request + 16, 1, WRITE, 0);
 
         let available = queue.page + 256;
         unsafe {
-            let ring = (available + 4) as *mut u16;
+            let ring = memory::phys_to_virt(available + 4) as *mut u16;
             ring.add((queue.next_available % QUEUE_SIZE) as usize).write_volatile(0);
             queue.next_available = queue.next_available.wrapping_add(1);
             core::arch::asm!("dsb sy", options(nostack));
-            ((available + 2) as *mut u16).write_volatile(queue.next_available);
+            (memory::phys_to_virt(available + 2) as *mut u16).write_volatile(queue.next_available);
             core::arch::asm!("dsb sy", options(nostack));
-            (queue.notify as *mut u16).write_volatile(0);
+            (memory::phys_to_virt(queue.notify) as *mut u16).write_volatile(0);
         }
-        let used_index = (queue.page + 512 + 2) as *const u16;
+        let used_index = memory::phys_to_virt(queue.page + 512 + 2) as *const u16;
         let start = timer::micros();
         while unsafe { used_index.read_volatile() } == queue.last_used {
             if timer::micros() - start > 5_000_000 {
@@ -166,6 +166,7 @@ fn bring_up(device: &pci::Device, slot: usize) -> Option<Drive> {
     let notify_base = bars[notify_bar as usize] + u64::from(notify_at);
     let config = bars[device_bar as usize] + u64::from(device_at);
 
+    let common = memory::phys_to_virt(common);
     let r8 = |offset: u64| unsafe { ((common + offset) as *const u8).read_volatile() };
     let w8 = |offset: u64, value: u8| unsafe { ((common + offset) as *mut u8).write_volatile(value) };
     let r16 = |offset: u64| unsafe { ((common + offset) as *const u16).read_volatile() };
@@ -204,7 +205,7 @@ fn bring_up(device: &pci::Device, slot: usize) -> Option<Drive> {
     w16(28, 1);
     w8(20, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
 
-    let sectors = unsafe { (config as *const u64).read_volatile() };
+    let sectors = unsafe { (memory::phys_to_virt(config) as *const u64).read_volatile() };
     unsafe { (*core::ptr::addr_of_mut!(QUEUES))[slot] = Some(Queue { notify, page, request, next_available: 0, last_used: 0 }) };
     Some(Drive { index: slot, sectors })
 }

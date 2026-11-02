@@ -257,7 +257,7 @@ pub fn background_event(controller: &mut Controller, event: &Trb) {
     };
     match event.completion() {
         xhci::COMPLETION_SUCCESS | xhci::COMPLETION_SHORT => {
-            let report: [u8; 8] = unsafe { core::ptr::read_volatile(keyboard.buffer as *const [u8; 8]) };
+            let report: [u8; 8] = unsafe { core::ptr::read_volatile(memory::phys_to_virt(keyboard.buffer) as *const [u8; 8]) };
             decode(keyboard, &report);
         }
         _ => controller.reset_stalled_endpoint(keyboard.slot, keyboard.dci),

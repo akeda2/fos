@@ -170,7 +170,7 @@ fn write32(base: u16, register: u16, value: u32) {
 }
 
 fn field(ring: u64, index: usize, dword: usize) -> *mut u32 {
-    (ring as usize + index * DESCRIPTOR_BYTES + dword * 4) as *mut u32
+    memory::phys_to_virt(ring + (index * DESCRIPTOR_BYTES + dword * 4) as u64) as *mut u32
 }
 
 fn read_opts1(ring: u64, index: usize) -> u32 {
@@ -577,11 +577,11 @@ impl Rtl8168 {
         }
         self.tx_next = (index + 1) % TX_COUNT;
         let buffer = self.tx_buffers + (index * BUFFER_BYTES) as u64;
-        let destination = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, BUFFER_BYTES) };
+        let destination = unsafe { core::slice::from_raw_parts_mut(memory::phys_to_virt(buffer) as *mut u8, BUFFER_BYTES) };
         destination[..frame.len()].copy_from_slice(frame);
         let length = frame.len().max(MIN_FRAME);
         destination[frame.len()..length].fill(0);
-        let flags = if self.tx_offload { Self::offload_flags(frame, buffer as *mut u8) } else { None };
+        let flags = if self.tx_offload { Self::offload_flags(frame, memory::phys_to_virt(buffer) as *mut u8) } else { None };
         let eor = if index == TX_COUNT - 1 { DESC_EOR } else { 0 };
         write_descriptor(ring, index, DESC_OWN | eor | DESC_FS | DESC_LS | length as u32, buffer, flags.unwrap_or(0));
         write8(self.io_base, REG_TPPOLL, TPPOLL_NPQ); // doorbell: look at the normal-priority queue
@@ -618,7 +618,7 @@ impl Rtl8168 {
         let buffer = self.rx_buffers + (index * BUFFER_BYTES) as u64;
         let copied = good.then(|| {
             let count = (length - 4).min(out.len());
-            unsafe { core::ptr::copy_nonoverlapping(buffer as *const u8, out.as_mut_ptr(), count) };
+            unsafe { core::ptr::copy_nonoverlapping(memory::phys_to_virt(buffer) as *const u8, out.as_mut_ptr(), count) };
             count
         });
         // Hand the descriptor back whether or not the frame was good.

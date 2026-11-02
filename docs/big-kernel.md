@@ -252,7 +252,7 @@ link `kernel/`: the embedded kernel's `term`, `tape`, shells and `static mut` st
   per-CPU areas, stacks with guard pages); NX and W^X everywhere. The `kernel-core` drivers, however, use physical
   addresses (BARs, DMA buffers) directly as pointers. Until they call a HAL `phys_to_virt()` (a no-op on the embedded kernel),
   the server kernel keeps a temporary **identity alias** of RAM and mapped MMIO in the lower half (NX, W^X kept for the image).
-  The conversion and the alias's removal come before user space takes the lower half (slice 7).
+  The conversion and the alias's removal come before user space takes the lower half (done in slice 8a: see the status entry).
 - A kernel heap (slab per size class over the frame allocator) so `alloc` exists in the server kernel. The embedded kernel stays
   `alloc`-free.
 - Per-process address spaces arrive in stage 5/6 of the staged path; the kernel address space layout leaves the lower half
@@ -360,3 +360,14 @@ flavour marker reaches `fosadm status`, and whether the batch queue needs the sc
   return, preemption of threads that never yield, sleep, the mutex and, at `-smp` 2 and 8, unpinned threads running on every
   CPU. Not yet: a wake IPI (an idle AP looks at each tick, so up to 10 ms latency), priorities, per-CPU queues, thread
   migration cost awareness. Only real hardware shows real APIC timing and cross-CPU behaviour under load.
+- Slice 8a (the identity alias is gone) is built: `fos_hal::memory::phys_to_virt`/`virt_to_phys` (an offset set once by the platform: 0 on the
+  embedded kernel and the Pi 4 core, `DIRECT_BASE` on `kernel-mf`) and every `kernel-core` driver dereferences BARs, rings and DMA
+  frames through it (about 370 sites in xhci, ehci, ohci, hda, e1000, rtl8168/8139, 3c905, ahci, nvme, virtio-blk, usb_*); addresses
+  written to devices stay physical. `Platform::map_device` now maps registers uncached at `DIRECT_BASE + physical`, `vm::init` no
+  longer builds the lower-half alias (only the kernel image is mapped there, W^X) and `kmain` reads `BootInfo` through the direct map.
+  `ohci.rs` returns virtual pointers for its ED/TD helpers and converts back with `virt_to_phys` where the controller is told;
+  `virtio_blk` (Pi/aarch64 only) turns a caller buffer into a descriptor address with `virt_to_phys`, which only holds for direct-map
+  buffers (not thread stacks): bounce it before the server kernel gets virtio. `test-mf-boot` checks the lower half is empty and the
+  AHCI/e1000 paths still work; the embedded kernel was re-run through `make test`, `test-nic`, `test-rtl8139`, `test-hda`,
+  `test-usb-audio`, `test-xhci-abort`, `test-usb-kbd-replug` (offset 0, nothing should change). Only real hardware shows xHCI/EHCI/OHCI, HDA
+  and RTL8168 behind the direct map (64-bit BARs above the RAM top are mapped on demand).

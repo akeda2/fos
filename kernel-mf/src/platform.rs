@@ -1,5 +1,5 @@
 //! kernel-mf's answer to `fos_hal::Platform`: what the shared drivers in `kernel-core` need from the machine. Same contract
-//! as the embedded kernel's `platform.rs`. Differences: device memory is mapped through the identity alias (`vm`), all device
+//! as the embedded kernel's `platform.rs`. Differences: device memory is mapped through the direct map (`vm`) and the drivers reach it with `memory::phys_to_virt`, all device
 //! interrupts go to the boot CPU, and there are no tasks yet (the defaults stand in until the scheduler, slice 7).
 
 use fos_hal::{BlockError, BlockInfo, Platform};
@@ -76,7 +76,7 @@ impl Platform for Mf {
         crate::pmm::free(address, count);
     }
     fn map_device(&self, address: u64, length: u64) {
-        crate::vm::map_device_identity(address, length);
+        crate::vm::map_device(address, length);
     }
     fn pci_read32(&self, bus: u8, device: u8, function: u8, offset: u8) -> u32 {
         crate::pci_config::read32(bus, device, function, offset)
@@ -145,5 +145,6 @@ impl Platform for Mf {
 static MF: Mf = Mf;
 
 pub fn install() {
+    fos_hal::memory::set_phys_offset(crate::vm::DIRECT_BASE);
     fos_hal::set_platform(&MF);
 }

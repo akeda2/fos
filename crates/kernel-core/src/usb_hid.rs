@@ -442,7 +442,7 @@ pub fn background_event(controller: &mut Controller, event: &Trb) {
     let Source::Xhci { slot, dci, buffer, .. } = keyboard.source else { return };
     match event.completion() {
         xhci::COMPLETION_SUCCESS | xhci::COMPLETION_SHORT => {
-            let report: [u8; 8] = unsafe { core::ptr::read_volatile(buffer as *const [u8; 8]) };
+            let report: [u8; 8] = unsafe { core::ptr::read_volatile(memory::phys_to_virt(buffer) as *const [u8; 8]) };
             keyboard.reports += 1;
             decode(keyboard, &report);
         }

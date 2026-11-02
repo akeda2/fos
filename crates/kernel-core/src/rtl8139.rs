@@ -422,7 +422,7 @@ impl Rtl8139 {
         let buffer = self.tx_buffers + (slot * 4096) as u64;
         let padded = frame.len().max(MIN_FRAME);
         unsafe {
-            let destination = core::slice::from_raw_parts_mut(buffer as *mut u8, MAX_FRAME);
+            let destination = core::slice::from_raw_parts_mut(memory::phys_to_virt(buffer) as *mut u8, MAX_FRAME);
             destination[..frame.len()].copy_from_slice(frame);
             destination[frame.len()..padded].fill(0);
         }
@@ -441,7 +441,7 @@ impl Rtl8139 {
             return None;
         }
         let offset = self.rx_offset;
-        let header = unsafe { core::ptr::read_unaligned((self.rx_buffer + u64::from(offset)) as *const u32) };
+        let header = unsafe { core::ptr::read_unaligned(memory::phys_to_virt(self.rx_buffer + u64::from(offset)) as *const u32) };
         let status = header & 0xffff;
         let frame_len = header >> 16; // includes the 4-byte CRC
         if frame_len < 4 || frame_len > RX_BUF_LEN {
@@ -462,7 +462,7 @@ impl Rtl8139 {
             return None;
         }
         let length = (frame_len as usize - 4).min(out.len()).min(MAX_FRAME);
-        let source = unsafe { core::slice::from_raw_parts((self.rx_buffer + u64::from(offset) + 4) as *const u8, length) };
+        let source = unsafe { core::slice::from_raw_parts(memory::phys_to_virt(self.rx_buffer + u64::from(offset) + 4) as *const u8, length) };
         out[..length].copy_from_slice(source);
         self.frames_received += 1;
         Some(length)

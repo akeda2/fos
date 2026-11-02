@@ -101,7 +101,7 @@ impl Pipe {
         if length == 0 || self.out_ep == 0 {
             return Ok(0);
         }
-        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), self.bounce as *mut u8, length) };
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), memory::phys_to_virt(self.bounce) as *mut u8, length) };
         self.bulk(false, length)
     }
 
@@ -363,7 +363,7 @@ pub fn describe() {
 }
 
 fn push_received(port: &mut Port, count: usize) {
-    let data = (port.pipe.bounce + IN_OFFSET) as *const u8;
+    let data = memory::phys_to_virt(port.pipe.bounce + IN_OFFSET) as *const u8;
     for offset in 0..count {
         let byte = unsafe { data.add(offset).read() };
         let next = (port.head + 1) % RING;

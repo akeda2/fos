@@ -9,7 +9,7 @@ const PIPE_NAMES: [&str; 3] = ["A", "B", "C"];
 const DDI_NAMES: [&str; 5] = ["A", "B", "C", "D", "E"];
 
 fn read(base: u64, offset: u64) -> u32 {
-    unsafe { core::ptr::read_volatile((base + offset) as *const u32) }
+    unsafe { core::ptr::read_volatile(crate::memory::phys_to_virt(base + offset) as *const u32) }
 }
 
 pub fn command() {

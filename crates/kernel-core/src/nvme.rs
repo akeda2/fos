@@ -63,10 +63,10 @@ pub enum Error {
 }
 
 fn read32(address: usize) -> u32 {
-    unsafe { (address as *const u32).read_volatile() }
+    unsafe { (memory::phys_to_virt(address as u64) as *const u32).read_volatile() }
 }
 fn write32(address: usize, value: u32) {
-    unsafe { (address as *mut u32).write_volatile(value) }
+    unsafe { (memory::phys_to_virt(address as u64) as *mut u32).write_volatile(value) }
 }
 fn read64(address: usize) -> u64 {
     u64::from(read32(address)) | u64::from(read32(address + 4)) << 32
@@ -116,7 +116,7 @@ impl Queue {
     /// is always ours.
     fn execute(&mut self, mut command: [u32; 16], timeout_ticks: u64) -> Result<(), Error> {
         command[0] = (command[0] & 0xffff) | (self.tail as u32) << 16;
-        let slot = (self.submission + self.tail * 64) as *mut u32;
+        let slot = memory::phys_to_virt((self.submission + self.tail * 64) as u64) as *mut u32;
         for (index, word) in command.iter().enumerate() {
             unsafe { slot.add(index).write_volatile(*word) };
         }
@@ -124,7 +124,7 @@ impl Queue {
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         write32(self.submission_doorbell, self.tail as u32);
 
-        let entry = (self.completion + self.head * 16) as *const u32;
+        let entry = memory::phys_to_virt((self.completion + self.head * 16) as u64) as *const u32;
         let phase = self.phase;
         let arrived = wait_until(timeout_ticks, || unsafe { (entry.add(3).read_volatile() >> 16) & 1 == phase });
         if !arrived {
@@ -202,7 +202,7 @@ impl Drive {
         let sectors = self.check(lba, buffer.len())?;
         self.transfer(IO_READ, lba, sectors)?;
         let bounce = self.controller().frame + OFFSET_BOUNCE;
-        unsafe { core::ptr::copy_nonoverlapping(bounce as *const u8, buffer.as_mut_ptr(), buffer.len()) };
+        unsafe { core::ptr::copy_nonoverlapping(memory::phys_to_virt(bounce as u64) as *const u8, buffer.as_mut_ptr(), buffer.len()) };
         Ok(())
     }
 
@@ -210,7 +210,7 @@ impl Drive {
     pub fn write(&self, lba: u64, buffer: &[u8]) -> Result<(), Error> {
         let sectors = self.check(lba, buffer.len())?;
         let bounce = self.controller().frame + OFFSET_BOUNCE;
-        unsafe { core::ptr::copy_nonoverlapping(buffer.as_ptr(), bounce as *mut u8, buffer.len()) };
+        unsafe { core::ptr::copy_nonoverlapping(buffer.as_ptr(), memory::phys_to_virt(bounce as u64) as *mut u8, buffer.len()) };
         self.transfer(IO_WRITE, lba, sectors)?;
         let controller = self.controller();
         let mut flush = [0u32; 16];
@@ -290,19 +290,19 @@ fn init_controller(device: &pci::Device, index: usize) -> Option<Drive> {
         command[6] = bounce as u32;
         command[7] = (bounce as u64 >> 32) as u32;
         command[10] = what; // CNS: 1 = controller, 0 = namespace
-        unsafe { core::ptr::write_bytes(bounce as *mut u8, 0, PAGE) };
+        unsafe { core::ptr::write_bytes(memory::phys_to_virt(bounce as u64) as *mut u8, 0, PAGE) };
         admin.execute(command, timeout_ticks)
     };
 
     let result = (|| {
         identify(&mut admin, 0, 1).ok()?;
         let mut model = [b' '; 40];
-        unsafe { core::ptr::copy_nonoverlapping((bounce + 24) as *const u8, model.as_mut_ptr(), 40) }; // MN: bytes 24..64
+        unsafe { core::ptr::copy_nonoverlapping(memory::phys_to_virt((bounce + 24) as u64) as *const u8, model.as_mut_ptr(), 40) }; // MN: bytes 24..64
 
         identify(&mut admin, 1, 0).ok()?;
-        let sectors = unsafe { ((bounce) as *const u64).read_volatile() }; // NSZE
-        let format = unsafe { *((bounce + 26) as *const u8) } & 0xf; // FLBAS: the active LBA format
-        let lba_format = unsafe { ((bounce + 128 + 4 * usize::from(format)) as *const u32).read_volatile() };
+        let sectors = unsafe { (memory::phys_to_virt(bounce as u64) as *const u64).read_volatile() }; // NSZE
+        let format = unsafe { *(memory::phys_to_virt((bounce + 26) as u64) as *const u8) } & 0xf; // FLBAS: the active LBA format
+        let lba_format = unsafe { (memory::phys_to_virt((bounce + 128 + 4 * usize::from(format)) as u64) as *const u32).read_volatile() };
         // LBAF: bits 15:0 metadata size, 23:16 log2 of the data size. Only plain 512-byte blocks.
         if sectors == 0 || (lba_format >> 16) & 0xff != 9 || lba_format & 0xffff != 0 {
             return None;

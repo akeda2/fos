@@ -75,10 +75,10 @@ pub enum Error {
 }
 
 fn read32(address: usize) -> u32 {
-    unsafe { (address as *const u32).read_volatile() }
+    unsafe { (memory::phys_to_virt(address as u64) as *const u32).read_volatile() }
 }
 fn write32(address: usize, value: u32) {
-    unsafe { (address as *mut u32).write_volatile(value) }
+    unsafe { (memory::phys_to_virt(address as u64) as *mut u32).write_volatile(value) }
 }
 
 fn wait_until(ticks: u64, mut condition: impl FnMut() -> bool) -> bool {
@@ -111,7 +111,7 @@ impl Drive {
         let list = self.frame + OFFSET_COMMAND_LIST;
         let table = self.frame + OFFSET_COMMAND_TABLE;
         unsafe {
-            core::ptr::write_bytes(table as *mut u8, 0, 0x90);
+            core::ptr::write_bytes(memory::phys_to_virt(table as u64) as *mut u8, 0, 0x90);
             // 28-bit commands carry LBA bits 27:24 in the device register; 48-bit ones
             // carry bits 47:24 in the second LBA byte group.
             let ext = matches!(command, ATA_READ_DMA_EXT | ATA_WRITE_DMA_EXT | ATA_FLUSH_CACHE_EXT);
@@ -131,16 +131,16 @@ impl Drive {
                 count as u8,
                 (count >> 8) as u8,
             ];
-            core::ptr::copy_nonoverlapping(fis.as_ptr(), table as *mut u8, fis.len());
+            core::ptr::copy_nonoverlapping(fis.as_ptr(), memory::phys_to_virt(table as u64) as *mut u8, fis.len());
             if bytes != 0 {
                 // One PRDT entry: the bounce buffer; DBC is the byte count minus one.
-                let entry = (table + 0x80) as *mut u32;
+                let entry = memory::phys_to_virt((table + 0x80) as u64) as *mut u32;
                 entry.write_volatile((self.frame + OFFSET_BOUNCE) as u32);
                 entry.add(1).write_volatile(0);
                 entry.add(2).write_volatile(0);
                 entry.add(3).write_volatile(bytes - 1);
             }
-            let header = list as *mut u32;
+            let header = memory::phys_to_virt(list as u64) as *mut u32;
             header.write_volatile(5 | (u32::from(write) << 6) | (u32::from(bytes != 0) << 16)); // 5 FIS dwords, direction, PRDT length
             header.add(1).write_volatile(0);
             header.add(2).write_volatile(table as u32);
@@ -199,7 +199,7 @@ impl Drive {
     pub fn read(&self, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
         let sectors = self.check(lba, buffer.len())?;
         self.command(if self.lba48 { ATA_READ_DMA_EXT } else { ATA_READ_DMA }, lba, sectors, false, buffer.len() as u32)?;
-        unsafe { core::ptr::copy_nonoverlapping((self.frame + OFFSET_BOUNCE) as *const u8, buffer.as_mut_ptr(), buffer.len()) };
+        unsafe { core::ptr::copy_nonoverlapping(memory::phys_to_virt((self.frame + OFFSET_BOUNCE) as u64) as *const u8, buffer.as_mut_ptr(), buffer.len()) };
         Ok(())
     }
 
@@ -207,7 +207,7 @@ impl Drive {
     /// the platters.
     pub fn write(&self, lba: u64, buffer: &[u8]) -> Result<(), Error> {
         let sectors = self.check(lba, buffer.len())?;
-        unsafe { core::ptr::copy_nonoverlapping(buffer.as_ptr(), (self.frame + OFFSET_BOUNCE) as *mut u8, buffer.len()) };
+        unsafe { core::ptr::copy_nonoverlapping(buffer.as_ptr(), memory::phys_to_virt((self.frame + OFFSET_BOUNCE) as u64) as *mut u8, buffer.len()) };
         self.command(if self.lba48 { ATA_WRITE_DMA_EXT } else { ATA_WRITE_DMA }, lba, sectors, true, buffer.len() as u32)?;
         self.command(if self.lba48 { ATA_FLUSH_CACHE_EXT } else { ATA_FLUSH_CACHE }, 0, 0, false, 0)
     }
@@ -291,7 +291,7 @@ fn init_port(registers: usize) -> Option<Drive> {
     let mut drive = Drive { registers, frame, sectors: 0, lba48: false, model: [b' '; 40] };
     drive.command(ATA_IDENTIFY, 0, 0, false, 512).ok()?;
     // IDENTIFY DEVICE data: 256 little-endian words in the bounce buffer.
-    let words = (frame + OFFSET_BOUNCE) as *const u16;
+    let words = memory::phys_to_virt((frame + OFFSET_BOUNCE) as u64) as *const u16;
     let word = |index: usize| unsafe { words.add(index).read_volatile() };
     for index in 0..20 {
         let value = word(27 + index); // model: two characters per word, high byte first

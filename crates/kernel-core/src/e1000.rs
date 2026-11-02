@@ -420,10 +420,10 @@ pub enum Error {
 }
 
 fn read(registers: usize, offset: usize) -> u32 {
-    unsafe { read_volatile((registers + offset) as *const u32) }
+    unsafe { read_volatile(memory::phys_to_virt((registers + offset) as u64) as *const u32) }
 }
 fn write(registers: usize, offset: usize, value: u32) {
-    unsafe { write_volatile((registers + offset) as *mut u32, value) }
+    unsafe { write_volatile(memory::phys_to_virt((registers + offset) as u64) as *mut u32, value) }
 }
 
 fn short_wait(ticks: u64) {
@@ -580,12 +580,12 @@ impl E1000 {
 
         for index in 0..RX_COUNT {
             let descriptor = Descriptor { address: rx_buffers + (index * BUFFER_SIZE) as u64, length: 0, word: 0, status: 0, errors_or_css: 0, special: 0 };
-            unsafe { write_volatile((rx_ring as *mut Descriptor).add(index), descriptor) };
+            unsafe { write_volatile((memory::phys_to_virt(rx_ring) as *mut Descriptor).add(index), descriptor) };
         }
         for index in 0..TX_COUNT {
             // status = DD: "this transmit descriptor is free"
             let descriptor = Descriptor { address: tx_buffers + (index * BUFFER_SIZE) as u64, length: 0, word: 0, status: DESCRIPTOR_DONE, errors_or_css: 0, special: 0 };
-            unsafe { write_volatile((tx_ring as *mut Descriptor).add(index), descriptor) };
+            unsafe { write_volatile((memory::phys_to_virt(tx_ring) as *mut Descriptor).add(index), descriptor) };
         }
 
         write(registers, r.rdbal, rx_ring as u32);
@@ -892,8 +892,8 @@ impl E1000 {
             if !self.claim_tx_slot(self.tx_next) {
                 return (false, 0);
             }
-            let descriptor = unsafe { (self.tx_ring as *mut Descriptor).add(self.tx_next) };
-            let buffer = (self.tx_buffers + (self.tx_next * BUFFER_SIZE) as u64) as *mut u8;
+            let descriptor = unsafe { (memory::phys_to_virt(self.tx_ring) as *mut Descriptor).add(self.tx_next) };
+            let buffer = memory::phys_to_virt(self.tx_buffers + (self.tx_next * BUFFER_SIZE) as u64) as *mut u8;
             let length = frame.len().max(60);
             unsafe {
                 core::ptr::write_bytes(buffer, 0, length);
@@ -917,8 +917,8 @@ impl E1000 {
         if !self.claim_tx_slot(self.tx_next) {
             return (false, 0);
         }
-        let descriptor = unsafe { (self.tx_ring as *mut Descriptor).add(self.tx_next) };
-        let buffer = (self.tx_buffers + (self.tx_next * BUFFER_SIZE) as u64) as *mut u8;
+        let descriptor = unsafe { (memory::phys_to_virt(self.tx_ring) as *mut Descriptor).add(self.tx_next) };
+        let buffer = memory::phys_to_virt(self.tx_buffers + (self.tx_next * BUFFER_SIZE) as u64) as *mut u8;
         let length = frame.len().max(60);
         unsafe {
             core::ptr::write_bytes(buffer, 0, length);
@@ -1039,8 +1039,8 @@ impl E1000 {
     pub fn receive(&mut self, out: &mut [u8]) -> Option<usize> {
         let advanced = self.variant == Variant::I350;
         loop {
-            let descriptor = unsafe { (self.rx_ring as *mut Descriptor).add(self.rx_next) };
-            let buffer = (self.rx_buffers + (self.rx_next * BUFFER_SIZE) as u64) as *const u8;
+            let descriptor = unsafe { (memory::phys_to_virt(self.rx_ring) as *mut Descriptor).add(self.rx_next) };
+            let buffer = memory::phys_to_virt(self.rx_buffers + (self.rx_next * BUFFER_SIZE) as u64) as *const u8;
             let (done, end_of_packet, length, stamped) = if advanced {
                 // Write-back format: status dword at offset 8, length at 12.
                 let words = descriptor as *const u8;
@@ -1068,7 +1068,7 @@ impl E1000 {
             // Hand the buffer back. The advanced write-back overwrote the buffer address, so it is written again.
             if advanced {
                 unsafe {
-                    write_volatile(descriptor as *mut u64, buffer as u64);
+                    write_volatile(descriptor as *mut u64, self.rx_buffers + (self.rx_next * BUFFER_SIZE) as u64);
                     write_volatile((descriptor as *mut u64).add(1), 0);
                 }
             } else {
@@ -1108,7 +1108,7 @@ impl E1000 {
     /// was overwritten by the context and is put back here.
     fn claim_tx_slot(&mut self, slot: usize) -> bool {
         let watched = if self.tx_ctx[slot] { (slot + 1) % TX_COUNT } else { slot };
-        let descriptor = unsafe { (self.tx_ring as *mut Descriptor).add(watched) };
+        let descriptor = unsafe { (memory::phys_to_virt(self.tx_ring) as *mut Descriptor).add(watched) };
         let mut waited = 0u32;
         while unsafe { read_volatile(core::ptr::addr_of!((*descriptor).status)) } & DESCRIPTOR_DONE == 0 {
             waited += 1;
@@ -1118,7 +1118,7 @@ impl E1000 {
             core::hint::spin_loop();
         }
         if self.tx_ctx[slot] {
-            let own = unsafe { (self.tx_ring as *mut Descriptor).add(slot) };
+            let own = unsafe { (memory::phys_to_virt(self.tx_ring) as *mut Descriptor).add(slot) };
             let free = Descriptor { address: self.tx_buffers + (slot * BUFFER_SIZE) as u64, length: 0, word: 0, status: DESCRIPTOR_DONE, errors_or_css: 0, special: 0 };
             unsafe { write_volatile(own, free) };
             self.tx_ctx[slot] = false;
@@ -1164,16 +1164,16 @@ impl E1000 {
             sum = (sum & 0xffff) + (sum >> 16);
         }
         let length = (14 + total).max(60);
-        let buffer = (self.tx_buffers + (data * BUFFER_SIZE) as u64) as *mut u8;
+        let buffer = memory::phys_to_virt(self.tx_buffers + (data * BUFFER_SIZE) as u64) as *mut u8;
         unsafe {
             core::ptr::write_bytes(buffer, 0, length);
             core::ptr::copy_nonoverlapping(frame.as_ptr(), buffer, 14 + total);
             *buffer.add(checksum_at) = (sum >> 8) as u8;
             *buffer.add(checksum_at + 1) = sum as u8;
-            let words = (self.tx_ring as *mut Descriptor).add(data) as *mut u32;
+            let words = (memory::phys_to_virt(self.tx_ring) as *mut Descriptor).add(data) as *mut u32;
             write_volatile(words.add(2), ADV_TX_DATA | length as u32);
             write_volatile(words.add(3), (length as u32) << 14 | ADV_TXSM); // PAYLEN, POPTS; DD (status) clear
-            let words = (self.tx_ring as *mut Descriptor).add(context) as *mut u32;
+            let words = (memory::phys_to_virt(self.tx_ring) as *mut Descriptor).add(context) as *mut u32;
             write_volatile(words, 14 << 9 | ip_length as u32); // MACLEN, IPLEN
             write_volatile(words.add(1), 0);
             write_volatile(words.add(2), ADV_CTXT | tucmd);
@@ -1212,8 +1212,8 @@ impl E1000 {
         if !self.claim_tx_slot(self.tx_next) {
             return false;
         }
-        let descriptor = unsafe { (self.tx_ring as *mut Descriptor).add(self.tx_next) };
-        let buffer = (self.tx_buffers + (self.tx_next * BUFFER_SIZE) as u64) as *mut u8;
+        let descriptor = unsafe { (memory::phys_to_virt(self.tx_ring) as *mut Descriptor).add(self.tx_next) };
+        let buffer = memory::phys_to_virt(self.tx_buffers + (self.tx_next * BUFFER_SIZE) as u64) as *mut u8;
         let length = frame.len().max(60);
         unsafe {
             core::ptr::write_bytes(buffer, 0, length);

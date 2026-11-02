@@ -219,6 +219,30 @@ pub mod clock {
 pub mod memory {
     pub const FRAME: u64 = 4096;
 
+    /// Added to a physical address to get the address the CPU uses (device registers and DMA memory alike). 0 where RAM and
+    /// MMIO are identity-mapped (the embedded kernel, the Pi 4 core); the server kernel sets its direct-map base.
+    static OFFSET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+    /// Platform start-up, once, before any driver runs.
+    pub fn set_phys_offset(offset: u64) {
+        OFFSET.store(offset, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The CPU address for physical `physical`: what a driver dereferences. Device-visible addresses (descriptors, BARs
+    /// written to registers) stay physical.
+    #[inline(always)]
+    pub fn phys_to_virt(physical: u64) -> u64 {
+        physical.wrapping_add(OFFSET.load(core::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The physical address behind a direct-map address (an allocation from `allocate_contiguous`, a heap buffer); an address
+    /// below the offset is already physical.
+    #[inline(always)]
+    pub fn virt_to_phys(address: u64) -> u64 {
+        let offset = OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+        if offset != 0 && address >= offset { address - offset } else { address }
+    }
+
     pub fn allocate_contiguous(count: u64, below: Option<u64>) -> Option<u64> {
         super::platform()?.allocate_contiguous(count, below)
     }

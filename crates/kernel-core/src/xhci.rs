@@ -149,7 +149,7 @@ fn frame() -> Option<u64> {
 
 fn write_trb(address: u64, trb: &Trb) {
     unsafe {
-        let pointer = address as *mut u32;
+        let pointer = memory::phys_to_virt(address) as *mut u32;
         pointer.write_volatile(trb.parameter as u32);
         pointer.add(1).write_volatile((trb.parameter >> 32) as u32);
         pointer.add(2).write_volatile(trb.status);
@@ -162,7 +162,7 @@ fn write_trb(address: u64, trb: &Trb) {
 
 fn read_trb(address: u64) -> Trb {
     unsafe {
-        let pointer = address as *const u32;
+        let pointer = memory::phys_to_virt(address) as *const u32;
         let control = pointer.add(3).read_volatile();
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         Trb { parameter: u64::from(pointer.read_volatile()) | u64::from(pointer.add(1).read_volatile()) << 32, status: pointer.add(2).read_volatile(), control }
@@ -205,10 +205,10 @@ impl Ring {
 }
 
 fn read32(address: usize) -> u32 {
-    unsafe { (address as *const u32).read_volatile() }
+    unsafe { (memory::phys_to_virt(address as u64) as *const u32).read_volatile() }
 }
 fn write32(address: usize, value: u32) {
-    unsafe { (address as *mut u32).write_volatile(value) }
+    unsafe { (memory::phys_to_virt(address as u64) as *mut u32).write_volatile(value) }
 }
 /// 64-bit registers are written as two 32-bit accesses, low half first: not every
 /// controller accepts a 64-bit MMIO write.
@@ -603,7 +603,7 @@ impl Controller {
         let (base, size) = device.memory_bar(0).ok_or(Error::NoDevice)?;
         paging::map_device(base, size);
         let mmio = base as usize;
-        let cap_length = unsafe { (mmio as *const u8).read_volatile() } as usize;
+        let cap_length = unsafe { (memory::phys_to_virt(mmio as u64) as *const u8).read_volatile() } as usize;
         let hcsparams1 = read32(mmio + CAP_HCSPARAMS1);
         let hcsparams2 = read32(mmio + CAP_HCSPARAMS2);
         let hccparams1 = read32(mmio + CAP_HCCPARAMS1);
@@ -645,9 +645,9 @@ impl Controller {
             let array = memory::allocate_contiguous((u64::from(scratchpads) * 8).div_ceil(memory::FRAME), Some(1 << 32)).ok_or(Error::NoMemory)?;
             for index in 0..u64::from(scratchpads) {
                 let page = frame().ok_or(Error::NoMemory)?;
-                unsafe { (array as *mut u64).add(index as usize).write_volatile(page) };
+                unsafe { (memory::phys_to_virt(array) as *mut u64).add(index as usize).write_volatile(page) };
             }
-            unsafe { (dcbaa as *mut u64).write_volatile(array) };
+            unsafe { (memory::phys_to_virt(dcbaa) as *mut u64).write_volatile(array) };
         }
         write64(operational + OP_DCBAAP, dcbaa);
 
@@ -659,7 +659,7 @@ impl Controller {
         let event_ring = memory::allocate_contiguous((EVENT_TRBS * TRB_BYTES as usize / 4096) as u64, Some(1 << 32)).ok_or(Error::NoMemory)?;
         let segment_table = frame().ok_or(Error::NoMemory)?;
         unsafe {
-            let entry = segment_table as *mut u32;
+            let entry = memory::phys_to_virt(segment_table) as *mut u32;
             entry.write_volatile(event_ring as u32);
             entry.add(1).write_volatile((event_ring >> 32) as u32);
             entry.add(2).write_volatile(EVENT_TRBS as u32);
@@ -909,7 +909,7 @@ impl Controller {
     /// Diagnostics: an endpoint's state in the controller's output context (0 disabled, 1 running, 2 halted, 3 stopped, 4 error),
     /// the dequeue pointer it has reached and the address where the next TRB would be queued.
     pub fn endpoint_debug(&self, slot: u8, dci: u32) -> (u32, u64, u64) {
-        let context = (self.slots[usize::from(slot)].output + self.context_bytes * u64::from(dci)) as *const u32; // no control context here
+        let context = memory::phys_to_virt(self.slots[usize::from(slot)].output + self.context_bytes * u64::from(dci)) as *const u32; // no control context here
         unsafe {
             let state = context.read_volatile() & 7;
             let dequeue = u64::from(context.add(2).read_volatile()) | (u64::from(context.add(3).read_volatile()) << 32);
@@ -1037,10 +1037,10 @@ impl Controller {
     pub fn configure_hub(&mut self, device: &Device, ports: u8, think_time: u8) -> Result<(), Error> {
         let (input, output) = (self.slots[usize::from(device.slot)].input, self.slots[usize::from(device.slot)].output);
         unsafe {
-            core::ptr::write_bytes(input as *mut u8, 0, memory::FRAME as usize);
-            (input as *mut u32).add(1).write_volatile(1); // A0: the slot context
-            core::ptr::copy_nonoverlapping(output as *const u8, self.context_slot(input) as *mut u8, 32);
-            let slot_context = self.context_slot(input) as *mut u32;
+            core::ptr::write_bytes(memory::phys_to_virt(input) as *mut u8, 0, memory::FRAME as usize);
+            (memory::phys_to_virt(input) as *mut u32).add(1).write_volatile(1); // A0: the slot context
+            core::ptr::copy_nonoverlapping(memory::phys_to_virt(output) as *const u8, memory::phys_to_virt(self.context_slot(input)) as *mut u8, 32);
+            let slot_context = memory::phys_to_virt(self.context_slot(input)) as *mut u32;
             slot_context.write_volatile(slot_context.read_volatile() | (1 << 26)); // Hub
             let word1 = slot_context.add(1).read_volatile() & 0x00ff_ffff;
             slot_context.add(1).write_volatile(word1 | u32::from(ports) << 24); // number of ports
@@ -1068,17 +1068,17 @@ impl Controller {
         entry.input = input;
         entry.output = output;
         entry.rings[1] = control_ring;
-        unsafe { (self.dcbaa as *mut u64).add(usize::from(slot)).write_volatile(output) };
+        unsafe { (memory::phys_to_virt(self.dcbaa) as *mut u64).add(usize::from(slot)).write_volatile(output) };
         unsafe {
             // Input context: add the slot context (A0) and the default pipe (A1).
-            (input as *mut u32).add(1).write_volatile(0b11);
-            let slot_context = self.context_slot(input) as *mut u32;
+            (memory::phys_to_virt(input) as *mut u32).add(1).write_volatile(0b11);
+            let slot_context = memory::phys_to_virt(self.context_slot(input)) as *mut u32;
             slot_context.write_volatile((1 << 27) | (u32::from(speed) << 20) | route); // one context entry, speed, route string
             slot_context.add(1).write_volatile(u32::from(port) << 16); // root hub port number
             if let Some((hub_slot, hub_port)) = tt {
                 slot_context.add(2).write_volatile(u32::from(hub_slot) | u32::from(hub_port) << 8); // transaction translator
             }
-            let endpoint = self.context_endpoint(input, 1) as *mut u32;
+            let endpoint = memory::phys_to_virt(self.context_endpoint(input, 1)) as *mut u32;
             endpoint.add(1).write_volatile((3 << 1) | (4 << 3) | (u32::from(max_packet) << 16)); // CErr 3, control, max packet
             endpoint.add(2).write_volatile(control_ring.base as u32 | 1); // dequeue pointer + cycle state
             endpoint.add(3).write_volatile((control_ring.base >> 32) as u32);
@@ -1123,7 +1123,7 @@ impl Controller {
             }
             memory::free(entry.input, 1);
             memory::free(entry.output, 1);
-            unsafe { (self.dcbaa as *mut u64).add(usize::from(slot)).write_volatile(0) };
+            unsafe { (memory::phys_to_virt(self.dcbaa) as *mut u64).add(usize::from(slot)).write_volatile(0) };
         }
         *entry = EMPTY_SLOT;
     }
@@ -1136,9 +1136,9 @@ impl Controller {
         }
         let input = self.slots[usize::from(device.slot)].input;
         unsafe {
-            core::ptr::write_bytes(input as *mut u8, 0, memory::FRAME as usize);
-            (input as *mut u32).add(1).write_volatile(0b10); // A1: the default pipe only
-            let endpoint = self.context_endpoint(input, 1) as *mut u32;
+            core::ptr::write_bytes(memory::phys_to_virt(input) as *mut u8, 0, memory::FRAME as usize);
+            (memory::phys_to_virt(input) as *mut u32).add(1).write_volatile(0b10); // A1: the default pipe only
+            let endpoint = memory::phys_to_virt(self.context_endpoint(input, 1)) as *mut u32;
             endpoint.add(1).write_volatile((3 << 1) | (4 << 3) | (u32::from(max_packet) << 16));
         }
         self.command(input, 0, (TRB_EVALUATE_CONTEXT << 10) | (u32::from(device.slot) << 24))?;
@@ -1167,7 +1167,7 @@ impl Controller {
     fn control_transfer_inner(&mut self, device: &Device, request_type: u8, request: u8, value: u16, index: u16, data: &mut [u8], data_in: bool, bounce: u64) -> Result<usize, Error> {
         let length = data.len() as u32;
         if !data_in && length != 0 {
-            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), bounce as *mut u8, data.len()) };
+            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), memory::phys_to_virt(bounce) as *mut u8, data.len()) };
         }
         let setup = u64::from(request_type) | u64::from(request) << 8 | u64::from(value) << 16 | u64::from(index) << 32 | u64::from(length) << 48;
         let transfer_type: u32 = match (length, data_in) {
@@ -1202,7 +1202,7 @@ impl Controller {
         let transferred = (length - residual_bytes) as usize;
         if data_in && length != 0 {
             let copy = transferred.min(data.len());
-            unsafe { core::ptr::copy_nonoverlapping(bounce as *const u8, data.as_mut_ptr(), copy) };
+            unsafe { core::ptr::copy_nonoverlapping(memory::phys_to_virt(bounce) as *const u8, data.as_mut_ptr(), copy) };
         }
         Ok(transferred)
     }
@@ -1250,15 +1250,15 @@ impl Controller {
             (u32::from(interval.max(1)) * 8).ilog2().clamp(3, 10)
         };
         unsafe {
-            core::ptr::write_bytes(input as *mut u8, 0, memory::FRAME as usize);
-            (input as *mut u32).add(1).write_volatile(1 | (1 << dci)); // add: slot context + this endpoint
+            core::ptr::write_bytes(memory::phys_to_virt(input) as *mut u8, 0, memory::FRAME as usize);
+            (memory::phys_to_virt(input) as *mut u32).add(1).write_volatile(1 | (1 << dci)); // add: slot context + this endpoint
             // The slot context is the controller's current one, with "context entries"
             // raised to cover this endpoint.
-            core::ptr::copy_nonoverlapping(output as *const u8, self.context_slot(input) as *mut u8, 32);
-            let slot_context = self.context_slot(input) as *mut u32;
+            core::ptr::copy_nonoverlapping(memory::phys_to_virt(output) as *const u8, memory::phys_to_virt(self.context_slot(input)) as *mut u8, 32);
+            let slot_context = memory::phys_to_virt(self.context_slot(input)) as *mut u32;
             let word0 = slot_context.read_volatile() & !(0x1f << 27);
             slot_context.write_volatile(word0 | (dci << 27));
-            let context = self.context_endpoint(input, dci) as *mut u32;
+            let context = memory::phys_to_virt(self.context_endpoint(input, dci)) as *mut u32;
             context.write_volatile(exponent << 16); // interval
             context.add(1).write_volatile((3 << 1) | (7 << 3) | (u32::from(max_packet) << 16)); // CErr 3, interrupt IN
             context.add(2).write_volatile(ring.base as u32 | 1);
@@ -1295,14 +1295,14 @@ impl Controller {
         // frames are 1 ms = 8 microframes, so (bInterval-1) + 3.
         let exponent = if device.speed >= 3 { u32::from(interval.clamp(1, 16)) - 1 } else { u32::from(interval.clamp(1, 16)) - 1 + 3 };
         unsafe {
-            core::ptr::write_bytes(input as *mut u8, 0, memory::FRAME as usize);
-            (input as *mut u32).add(1).write_volatile(1 | (1 << dci));
-            core::ptr::copy_nonoverlapping(output as *const u8, self.context_slot(input) as *mut u8, 32);
-            let slot_context = self.context_slot(input) as *mut u32;
+            core::ptr::write_bytes(memory::phys_to_virt(input) as *mut u8, 0, memory::FRAME as usize);
+            (memory::phys_to_virt(input) as *mut u32).add(1).write_volatile(1 | (1 << dci));
+            core::ptr::copy_nonoverlapping(memory::phys_to_virt(output) as *const u8, memory::phys_to_virt(self.context_slot(input)) as *mut u8, 32);
+            let slot_context = memory::phys_to_virt(self.context_slot(input)) as *mut u32;
             let word0 = slot_context.read_volatile();
             let entries = ((word0 >> 27) & 0x1f).max(dci);
             slot_context.write_volatile((word0 & !(0x1f << 27)) | (entries << 27));
-            let context = self.context_endpoint(input, dci) as *mut u32;
+            let context = memory::phys_to_virt(self.context_endpoint(input, dci)) as *mut u32;
             context.write_volatile(exponent << 16);
             // CErr 0 (isochronous transfers are never retried), endpoint type 5 (isoc IN) or 1 (isoc OUT).
             context.add(1).write_volatile(((if input_endpoint { 5 } else { 1 }) << 3) | (u32::from(max_packet) << 16));
@@ -1325,10 +1325,10 @@ impl Controller {
         let slot = usize::from(device.slot);
         let input = self.slots[slot].input;
         unsafe {
-            core::ptr::write_bytes(input as *mut u8, 0, memory::FRAME as usize);
-            (input as *mut u32).write_volatile(1 << dci); // drop flags (D)
-            (input as *mut u32).add(1).write_volatile(1); // A0: the slot context
-            core::ptr::copy_nonoverlapping(self.slots[slot].output as *const u8, self.context_slot(input) as *mut u8, 32);
+            core::ptr::write_bytes(memory::phys_to_virt(input) as *mut u8, 0, memory::FRAME as usize);
+            (memory::phys_to_virt(input) as *mut u32).write_volatile(1 << dci); // drop flags (D)
+            (memory::phys_to_virt(input) as *mut u32).add(1).write_volatile(1); // A0: the slot context
+            core::ptr::copy_nonoverlapping(memory::phys_to_virt(self.slots[slot].output) as *const u8, memory::phys_to_virt(self.context_slot(input)) as *mut u8, 32);
         }
         let _ = self.command(input, 0, (TRB_CONFIGURE_ENDPOINT << 10) | (u32::from(device.slot) << 24));
     }
@@ -1348,11 +1348,11 @@ impl Controller {
         let out_ring = if out_dci != 0 { Ring::allocate().ok_or(Error::NoMemory)? } else { NO_RING };
         let (input, output) = (self.slots[slot].input, self.slots[slot].output);
         unsafe {
-            core::ptr::write_bytes(input as *mut u8, 0, memory::FRAME as usize);
+            core::ptr::write_bytes(memory::phys_to_virt(input) as *mut u8, 0, memory::FRAME as usize);
             let added = (u32::from(in_dci != 0) << in_dci) | (u32::from(out_dci != 0) << out_dci);
-            (input as *mut u32).add(1).write_volatile(1 | added); // add the slot context and the endpoints
-            core::ptr::copy_nonoverlapping(output as *const u8, self.context_slot(input) as *mut u8, 32);
-            let slot_context = self.context_slot(input) as *mut u32;
+            (memory::phys_to_virt(input) as *mut u32).add(1).write_volatile(1 | added); // add the slot context and the endpoints
+            core::ptr::copy_nonoverlapping(memory::phys_to_virt(output) as *const u8, memory::phys_to_virt(self.context_slot(input)) as *mut u8, 32);
+            let slot_context = memory::phys_to_virt(self.context_slot(input)) as *mut u32;
             let word0 = slot_context.read_volatile();
             let entries = ((word0 >> 27) & 0x1f).max(in_dci.max(out_dci)); // keep what an earlier endpoint (audio) already needs
             slot_context.write_volatile((word0 & !(0x1f << 27)) | (entries << 27));
@@ -1360,7 +1360,7 @@ impl Controller {
                 if dci == 0 {
                     continue;
                 }
-                let context = self.context_endpoint(input, dci) as *mut u32;
+                let context = memory::phys_to_virt(self.context_endpoint(input, dci)) as *mut u32;
                 context.add(1).write_volatile((3 << 1) | (endpoint_type << 3) | (u32::from(burst) << 8) | (u32::from(max_packet) << 16));
                 context.add(2).write_volatile(ring.base as u32 | 1);
                 context.add(3).write_volatile((ring.base >> 32) as u32);

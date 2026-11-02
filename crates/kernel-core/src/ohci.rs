@@ -160,11 +160,11 @@ pub fn controller(index: usize) -> Option<&'static mut Controller> {
 }
 
 fn read32(address: usize) -> u32 {
-    unsafe { (address as *const u32).read_volatile() }
+    unsafe { (memory::phys_to_virt(address as u64) as *const u32).read_volatile() }
 }
 
 fn write32(address: usize, value: u32) {
-    unsafe { (address as *mut u32).write_volatile(value) }
+    unsafe { (memory::phys_to_virt(address as u64) as *mut u32).write_volatile(value) }
 }
 
 fn wait_until(ticks: u64, mut condition: impl FnMut() -> bool) -> bool {
@@ -231,12 +231,12 @@ impl Controller {
         let frame = memory::allocate_contiguous(1, Some(1 << 32)).ok_or(Error::NoMemory)? as usize;
         let buffers = memory::allocate_contiguous(1, Some(1 << 32)).ok_or(Error::NoMemory)? as usize;
         unsafe {
-            core::ptr::write_bytes(frame as *mut u8, 0, 4096);
-            core::ptr::write_bytes(buffers as *mut u8, 0, 4096);
+            core::ptr::write_bytes(memory::phys_to_virt(frame as u64) as *mut u8, 0, 4096);
+            core::ptr::write_bytes(memory::phys_to_virt(buffers as u64) as *mut u8, 0, 4096);
         }
         // The control ED starts empty (HeadP == TailP == the first ring TD) and skipped until the first transfer.
         let tail = frame + OFFSET_CONTROL_TDS;
-        let control_ed = (frame + OFFSET_CONTROL_ED) as *mut u32;
+        let control_ed = memory::phys_to_virt((frame + OFFSET_CONTROL_ED) as u64) as *mut u32;
         unsafe {
             control_ed.write_volatile(1 << 14);
             control_ed.add(1).write_volatile(tail as u32);
@@ -295,7 +295,7 @@ impl Controller {
     // ---- control transfers ----
 
     fn control_td(&self, index: usize) -> *mut u32 {
-        (self.frame + OFFSET_CONTROL_TDS + 16 * (index % CONTROL_TD_COUNT)) as *mut u32
+        memory::phys_to_virt((self.frame + OFFSET_CONTROL_TDS + 16 * (index % CONTROL_TD_COUNT)) as u64) as *mut u32
     }
 
     fn fill_td(td: *mut u32, control: u32, buffer: usize, length: usize, next: usize) {
@@ -316,10 +316,10 @@ impl Controller {
         let data_in = request_type & 0x80 != 0;
         let setup = self.buffers + BUFFER_SETUP;
         let packet = [request_type, request, value as u8, (value >> 8) as u8, index as u8, (index >> 8) as u8, data.len() as u8, (data.len() >> 8) as u8];
-        unsafe { core::ptr::copy_nonoverlapping(packet.as_ptr(), setup as *mut u8, 8) };
+        unsafe { core::ptr::copy_nonoverlapping(packet.as_ptr(), memory::phys_to_virt(setup as u64) as *mut u8, 8) };
         let buffer = self.buffers + BUFFER_DATA;
         if !data_in && !data.is_empty() {
-            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), buffer as *mut u8, data.len()) };
+            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), memory::phys_to_virt(buffer as u64) as *mut u8, data.len()) };
         }
 
         // Fill the TDs starting at the dummy tail of the ring, then a fresh dummy after them.
@@ -339,7 +339,7 @@ impl Controller {
         unsafe { self.control_td(dummy).write_bytes(0, 4) };
 
         // The ED: this device's address, speed and packet size (skip bit set while it changes), then the new tail.
-        let ed = (self.frame + OFFSET_CONTROL_ED) as *mut u32;
+        let ed = memory::phys_to_virt((self.frame + OFFSET_CONTROL_ED) as u64) as *mut u32;
         let flags = u32::from(target.address) | (u32::from(target.low_speed) << 13) | (u32::from(target.max_packet0) << 16);
         unsafe {
             ed.write_volatile(flags | (1 << 14));
@@ -384,7 +384,7 @@ impl Controller {
             // CurrentBufferPointer is 0 when the whole buffer was filled, or points at the first byte not written.
             let cbp = unsafe { self.control_td(first + 1).add(1).read_volatile() } as usize;
             let moved = if cbp == 0 { data.len() } else { cbp - buffer };
-            unsafe { core::ptr::copy_nonoverlapping(buffer as *const u8, data.as_mut_ptr(), moved.min(data.len())) };
+            unsafe { core::ptr::copy_nonoverlapping(memory::phys_to_virt(buffer as u64) as *const u8, data.as_mut_ptr(), moved.min(data.len())) };
             moved
         } else {
             data.len()
@@ -460,11 +460,11 @@ impl Controller {
     // ---- keyboards ----
 
     fn keyboard_ed(&self, index: usize) -> *mut u32 {
-        (self.frame + OFFSET_KEYBOARD_ED + 0x10 * index) as *mut u32
+        memory::phys_to_virt((self.frame + OFFSET_KEYBOARD_ED + 0x10 * index) as u64) as *mut u32
     }
 
     fn keyboard_td(&self, index: usize, which: usize) -> *mut u32 {
-        (self.frame + OFFSET_KEYBOARD_TDS + 0x20 * index + 0x10 * (which & 1)) as *mut u32
+        memory::phys_to_virt((self.frame + OFFSET_KEYBOARD_TDS + 0x20 * index + 0x10 * (which & 1)) as u64) as *mut u32
     }
 
     fn keyboard_buffer(&self, index: usize) -> usize {
@@ -484,14 +484,14 @@ impl Controller {
                 let ed = self.keyboard_ed(index);
                 unsafe { ed.add(3).write_volatile(0) };
                 match previous {
-                    Some(before) => unsafe { before.add(3).write_volatile(ed as u32) },
-                    None => first = ed as u32,
+                    Some(before) => unsafe { before.add(3).write_volatile(memory::virt_to_phys(ed as u64) as u32) },
+                    None => first = memory::virt_to_phys(ed as u64) as u32,
                 }
                 previous = Some(ed);
             }
         }
         for slot in (0..32).step_by(8) {
-            unsafe { (self.frame as *mut u32).add(slot).write_volatile(first) };
+            unsafe { (memory::phys_to_virt(self.frame as u64) as *mut u32).add(slot).write_volatile(first) };
         }
         write32(self.mmio + HC_CONTROL, control | CONTROL_PERIODIC_ENABLE);
     }
@@ -503,10 +503,10 @@ impl Controller {
         let dummy = self.keyboard_td(index, which + 1);
         unsafe { dummy.write_bytes(0, 4) };
         // Toggle from the ED's carry bit (T = 0): the controller keeps DATA0/DATA1 across the keyboard's reports.
-        Self::fill_td(td, TD_IN | TD_ROUNDING | TD_NO_INTERRUPT, self.keyboard_buffer(index), usize::from(pipe.max_packet.min(8)), dummy as usize);
+        Self::fill_td(td, TD_IN | TD_ROUNDING | TD_NO_INTERRUPT, self.keyboard_buffer(index), usize::from(pipe.max_packet.min(8)), memory::virt_to_phys(dummy as u64) as usize);
         let ed = self.keyboard_ed(index);
         fence(Ordering::SeqCst);
-        unsafe { ed.add(1).write_volatile(dummy as u32) };
+        unsafe { ed.add(1).write_volatile(memory::virt_to_phys(dummy as u64) as u32) };
         if let Some(entry) = self.keyboards[index].as_mut() {
             entry.armed = which;
         }
@@ -520,8 +520,8 @@ impl Controller {
         let flags = u32::from(target.address) | (u32::from(endpoint & 0xf) << 7) | (u32::from(target.low_speed) << 13) | (u32::from(max_packet.min(8)) << 16);
         unsafe {
             ed.write_volatile(flags | (1 << 14)); // skipped until it is armed and linked
-            ed.add(1).write_volatile(td as u32);
-            ed.add(2).write_volatile(td as u32);
+            ed.add(1).write_volatile(memory::virt_to_phys(td as u64) as u32);
+            ed.add(2).write_volatile(memory::virt_to_phys(td as u64) as u32);
             ed.add(3).write_volatile(0);
         }
         self.keyboards[index] = Some(KeyboardPipe { target, endpoint, max_packet, armed: 0, root_port });
@@ -558,7 +558,7 @@ impl Controller {
             return None;
         }
         let report = if code == CC_NO_ERROR {
-            Some(unsafe { core::ptr::read_volatile(self.keyboard_buffer(index) as *const [u8; 8]) })
+            Some(unsafe { core::ptr::read_volatile(memory::phys_to_virt(self.keyboard_buffer(index) as u64) as *const [u8; 8]) })
         } else {
             // An error halts the ED (bit 0 of HeadP): clear the halt, the failed TD is already retired.
             let head = unsafe { self.keyboard_ed(index).add(2).read_volatile() };
