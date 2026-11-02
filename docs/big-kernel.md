@@ -342,6 +342,9 @@ flavour marker reaches `fosadm status`, and whether the batch queue needs the sc
   reset register, 0xCF9, 8042, triple fault), `config.rs` reads `hostname`, `settings` (`deny-term-net`) and `debug`
   (`kernel-update`), `shell.rs` is a small shell (`help version cpus mem pci disks nic uptime slots echo reboot`) fed from
   COM1 and the network. `kmain` ends in a service loop on the boot CPU. `make test-mf-net` covers discovery, a session, a bad
-  and a good KUP with the loader promoting slot 1, and the `kernel-update`/`deny-term-net` gates. Not yet: the framebuffer
-  console (slice 6d), NETFS/tapesync/`foscopy` serving, crash records, `reboot-on-crash`, the watchdog; NICs and their interrupts
+  and a good KUP with the loader promoting slot 1, and the `kernel-update`/`deny-term-net` gates. Slice 6d: `fb.rs` draws the console on the loader's
+  linear framebuffer (8x16 shared font, light grey on black, `\n \r` backspace and scrolling, no ANSI), fed from the same
+  `serial::write_str` hook as the network relay, started right after the page tables so the whole kernel narration is on
+  screen; the mapping is uncached (write-combining through the PAT is still to do, so scrolling is slow) and a BIOS text-mode
+  or headless machine stays serial/network only; `test-mf-net` checks a QEMU screendump. Not yet: NETFS/tapesync/`foscopy` serving, crash records, `reboot-on-crash`, the watchdog; NICs and their interrupts
   work on the boot CPU only. Only real hardware shows NIC DMA and interrupts, a real reset and the A/B fallback on silicon.

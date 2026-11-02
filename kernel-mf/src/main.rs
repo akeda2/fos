@@ -8,6 +8,7 @@ extern crate alloc;
 
 #[macro_use]
 mod serial;
+mod fb;
 mod config;
 mod net;
 mod power;
@@ -130,6 +131,10 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     assert_eq!(unsafe { through_direct.read_volatile() }, 0xf05f_05f0_f05f_05f0);
     assert_eq!(vm::translate(vm::direct(frame)).map(|m| m.physical), Some(frame));
     pmm::free(frame, 1);
+    match fb::init(&info.framebuffer) {
+        Some((columns, rows)) => println!("Framebuffer console: {}x{} pixels, {columns}x{rows} characters (also on COM1 and the network).", info.framebuffer.width, info.framebuffer.height),
+        None => println!("Framebuffer console: no pixel screen (serial and network only)."),
+    }
     println!("Direct map: frame {frame:#x} written and read back at {:#x}.", vm::direct(frame));
 
     if !heap::init() {
