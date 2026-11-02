@@ -188,4 +188,7 @@ by any test: USB serial adapters, the Pi 4 console and GIC paths (hardware only)
   packet path stays MMIO. aarch64 keeps `genet` and gets stubs for the INTx calls. x86 kernel 1,172,088 bytes. Verified:
   `make test`, `test-nic`, `test-rtl8139`, `test-hda`, `test-xhci-abort`, `test-mounts`, `test-fosfs4`, aarch64 build.
   Real queue, DMA and interrupt behaviour on silicon only shows on hardware.
-- Next: storage (`ahci`, `nvme`), USB, audio.
+- Seventh slice: `ahci` and `nvme`. The `Platform` gained `free_frames` and `watchdog_pet` (the drivers' wait loops pet the
+  watchdog). x86 kernel 1,172,144 bytes. Verified: `make test`, `test-disks`, `test-usb-boot`, `test-v4-boot`, `test-format`,
+  `test-grow`, `test-mounts`, `test-debug-mode`, aarch64 build. Real controller timing on hardware only.
+- Next: USB, audio.
