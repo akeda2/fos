@@ -5,6 +5,7 @@
 
 pub use fos_hal::{block, clock, print, println, timer};
 
+pub mod fatvol;
 pub mod fosfs;
 pub mod gpt;
 pub mod lineedit;

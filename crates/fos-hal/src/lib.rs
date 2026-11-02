@@ -29,6 +29,10 @@ pub trait Platform: Sync {
     fn unix_seconds(&self) -> u64;
     /// The size of disk `disk` in 512-byte sectors, `None` when there is no such disk.
     fn block_sectors(&self, disk: usize) -> Option<u64>;
+    /// The disk the system booted from, if known.
+    fn boot_disk(&self) -> Option<usize>;
+    /// Microseconds on a monotonic clock.
+    fn timer_micros(&self) -> u64;
     /// A free-running hardware counter (TSC or the generic timer's count); only its low bits are meant as noise.
     fn timer_counter(&self) -> u64;
     /// Timer interrupt ticks since boot.
@@ -66,9 +70,17 @@ pub mod block {
     pub fn sectors(disk: usize) -> Option<u64> {
         platform()?.block_sectors(disk)
     }
+
+    pub fn boot_disk() -> Option<usize> {
+        platform()?.boot_disk()
+    }
 }
 
 pub mod timer {
+    pub fn micros() -> u64 {
+        super::platform().map_or(0, |platform| platform.timer_micros())
+    }
+
     pub fn counter() -> u64 {
         super::platform().map_or(0, |platform| platform.timer_counter())
     }

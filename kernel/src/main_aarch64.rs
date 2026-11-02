@@ -15,7 +15,6 @@ mod bootcode;
 mod font_data;
 mod clock;
 mod crash;
-mod fatvol;
 mod formatshell;
 mod platform;
 mod framebuffer;
