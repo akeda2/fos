@@ -174,4 +174,8 @@ by any test: USB serial adapters, the Pi 4 console and GIC paths (hardware only)
   run one at a time because the kernel code keeps scratch tables in statics. x86 kernel 1,169,456 bytes. Verified: `make test`,
   `test-clock`, `test-config-fat`, `test-fat-shell`, `test-format-exfat`, `test-format`, `test-fosfs4`, `test-mounts`,
   `test-v4-boot`, aarch64 build.
-- Next: `mounts` (needs `storage` and `tape_fs` lookups behind the platform), then NICs, storage, USB, audio.
+- Fourth slice: `mounts` (the table, `lookup`, `fstab` parsing). The two kernel-only questions stay in a thin
+  `kernel/src/mounts.rs`: `load()` passes the boot volume to `load_from`, `absent()` passes a "is it present" test to
+  `absent_with`. Host test parses an `fstab` and checks longest-mount-point lookup. x86 kernel 1,169,584 bytes. Verified:
+  `make test`, `test-mounts`, `test-v4-boot`, `test-config`, `test-config-fat`, `test-fosfs4`, aarch64 build.
+- Next: `storage`/`tape_fs` need the volume registry (a block-device list in the platform), then NICs, USB, audio.
