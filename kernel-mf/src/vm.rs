@@ -28,6 +28,7 @@ const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
 const WRITE_THROUGH: u64 = 1 << 3;
 const CACHE_DISABLE: u64 = 1 << 4;
+const USER: u64 = 1 << 2;
 const LARGE: u64 = 1 << 7;
 const NO_EXECUTE: u64 = 1 << 63;
 const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
@@ -310,6 +311,11 @@ pub fn init(machine: &Machine) -> u64 {
         }
     }
     map_image(root, &layout);
+    // Every upper-half PML4 slot gets its (empty) PDPT now, so the copies in each process's root keep pointing at the same
+    // kernel tables when the kernel maps something new later (a thread stack, a device).
+    for slot in 256..512 {
+        unsafe { next_level((direct(root) as *mut u64).add(slot)) };
+    }
     let fb = &machine.framebuffer;
     if fb.base != 0 {
         map_direct(root, fb.base, fb.base + fb.size, data | CACHE_DISABLE | WRITE_THROUGH);
@@ -335,4 +341,135 @@ pub fn init(machine: &Machine) -> u64 {
         OFFSET = DIRECT_BASE;
     }
     highest
+}
+
+/// User space: PML4 slots 1..255 (from 512 GiB up), so it never meets slot 0, where the kernel image keeps its identity
+/// mapping (supervisor pages, W^X). Each process has its own root; slot 0 and the upper half are shared with the kernel.
+pub const USER_BASE: u64 = 1 << 39;
+pub const USER_END: u64 = 1 << 47;
+
+/// A new root for a process: the kernel's mappings, an empty user half. `None` when out of frames.
+pub fn create_user_space() -> Option<u64> {
+    let root = pmm::allocate(1, None)?;
+    unsafe {
+        let new = direct(root) as *mut u64;
+        let kernel = direct(self::root()) as *const u64;
+        for slot in (0..1).chain(256..512) {
+            *new.add(slot) = *kernel.add(slot);
+        }
+    }
+    Some(root)
+}
+
+/// Maps the 4 KiB frame `physical` at user address `address` in `root`. The user half only; false outside it.
+pub fn map_user_page(root: u64, address: u64, physical: u64, writable: bool, executable: bool) -> bool {
+    if address < USER_BASE || address >= USER_END {
+        return false;
+    }
+    unsafe {
+        let pml4 = (direct(root) as *mut u64).add(((address >> 39) & 511) as usize);
+        let pdpt = next_level_user(pml4);
+        let directory = next_level_user(pdpt.add(((address >> 30) & 511) as usize));
+        let table = next_level_user(directory.add(((address >> 21) & 511) as usize));
+        let flags = USER | PRESENT | if writable { WRITABLE } else { 0 } | if executable { 0 } else { NO_EXECUTE };
+        *table.add(((address >> 12) & 511) as usize) = physical | flags;
+    }
+    true
+}
+
+unsafe fn next_level_user(entry: *mut u64) -> *mut u64 {
+    unsafe {
+        if *entry & PRESENT == 0 {
+            let table = new_table() as u64 - direct(0);
+            *entry = table | PRESENT | WRITABLE | USER;
+        }
+        direct(*entry & ADDRESS_MASK) as *mut u64
+    }
+}
+
+/// The leaf entry for user `address` in `root`, if the whole walk is present.
+fn user_entry(root: u64, address: u64) -> Option<u64> {
+    if address < USER_BASE || address >= USER_END {
+        return None;
+    }
+    unsafe {
+        let read = |table: u64, index: u64| (direct(table & ADDRESS_MASK) as *const u64).add(index as usize).read();
+        let pml4 = read(root, (address >> 39) & 511);
+        if pml4 & PRESENT == 0 {
+            return None;
+        }
+        let pdpt = read(pml4, (address >> 30) & 511);
+        if pdpt & PRESENT == 0 {
+            return None;
+        }
+        let directory = read(pdpt, (address >> 21) & 511);
+        if directory & PRESENT == 0 || directory & LARGE != 0 {
+            return None;
+        }
+        let leaf = read(directory, (address >> 12) & 511);
+        (leaf & PRESENT != 0).then_some(leaf)
+    }
+}
+
+/// Can the kernel read (or, with `write`, write) `[address, address + length)` of the process with root `root` through its
+/// user mappings? A syscall checks every pointer it is given with this before touching it.
+pub fn user_range_ok(root: u64, address: u64, length: u64, write: bool) -> bool {
+    let Some(end) = address.checked_add(length) else { return false };
+    if length == 0 {
+        return true;
+    }
+    let mut page = address & !(PAGE - 1);
+    while page < end {
+        match user_entry(root, page) {
+            Some(leaf) if leaf & USER != 0 && (!write || leaf & WRITABLE != 0) => {}
+            _ => return false,
+        }
+        page += PAGE;
+    }
+    true
+}
+
+/// Frees a process's user half: every mapped frame and every table below slots 1..255, then the root. Returns the frames freed.
+/// The root must not be loaded on any CPU.
+pub fn destroy_user_space(root: u64) -> u64 {
+    let mut freed = 0;
+    unsafe {
+        let top = direct(root) as *mut u64;
+        for slot in 1..256 {
+            let pml4 = *top.add(slot);
+            if pml4 & PRESENT == 0 {
+                continue;
+            }
+            let pdpt = direct(pml4 & ADDRESS_MASK) as *mut u64;
+            for i in 0..512 {
+                let entry = *pdpt.add(i);
+                if entry & PRESENT == 0 {
+                    continue;
+                }
+                let directory = direct(entry & ADDRESS_MASK) as *mut u64;
+                for j in 0..512 {
+                    let entry = *directory.add(j);
+                    if entry & PRESENT == 0 {
+                        continue;
+                    }
+                    let leaves = direct(entry & ADDRESS_MASK) as *mut u64;
+                    for k in 0..512 {
+                        let leaf = *leaves.add(k);
+                        if leaf & PRESENT != 0 {
+                            pmm::free(leaf & ADDRESS_MASK, 1);
+                            freed += 1;
+                        }
+                    }
+                    pmm::free(entry & ADDRESS_MASK, 1);
+                    freed += 1;
+                }
+                pmm::free(entry & ADDRESS_MASK, 1);
+                freed += 1;
+            }
+            pmm::free(pml4 & ADDRESS_MASK, 1);
+            freed += 1;
+        }
+    }
+    pmm::free(root, 1);
+    freed + 1
 }

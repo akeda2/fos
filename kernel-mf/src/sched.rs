@@ -48,6 +48,14 @@ pub struct Thread {
     pinned: Option<usize>,
     /// Still on a CPU's stack, or being switched away from: nobody else may pick it yet.
     on_cpu: bool,
+    /// The page-table root of the process this thread runs (its user half), 0 for a plain kernel thread.
+    root: u64,
+    /// Top of this thread's kernel stack, where interrupts and `syscall` from ring 3 arrive; 0 for the boot contexts.
+    kstack_top: u64,
+    /// Set by `kill`: a process thread ends itself the next time it is in the kernel.
+    killed: bool,
+    /// Bytes the process has written to the console (for the self-test).
+    written: u64,
 }
 
 struct Sched {
@@ -108,7 +116,7 @@ fn this_cpu() -> usize {
 
 /// Makes the calling (boot) context thread 0. Call once, on the boot CPU, before spawning.
 pub fn init() {
-    let boot = Box::new(Thread { id: 0, name: *b"idle0\0\0\0\0\0\0\0\0\0\0\0", state: State::Running, rsp: 0, slot: None, key: 0, wake_at: 0, pinned: Some(0), on_cpu: true });
+    let boot = Box::new(Thread { id: 0, name: *b"idle0\0\0\0\0\0\0\0\0\0\0\0", state: State::Running, rsp: 0, slot: None, key: 0, wake_at: 0, pinned: Some(0), on_cpu: true, root: 0, kstack_top: 0, killed: false, written: 0 });
     let mut sched = Sched { threads: Vec::new(), queue: VecDeque::new(), free_slots: Vec::new(), next_slot: 0, current: [NO_THREAD; MAX_CPUS], previous: [NO_THREAD; MAX_CPUS], idle: [NO_THREAD; MAX_CPUS], switches: 0 };
     sched.threads.push(Some(boot));
     sched.current[0] = 0;
@@ -130,7 +138,7 @@ pub fn attach_cpu() {
     let mut name = *b"idle\0\0\0\0\0\0\0\0\0\0\0\0";
     name[4] = b'0' + (cpu_index % 10) as u8;
     let id = sched.threads.iter().position(Option::is_none).unwrap_or(sched.threads.len());
-    let thread = Box::new(Thread { id, name, state: State::Running, rsp: 0, slot: None, key: 0, wake_at: 0, pinned: Some(cpu_index), on_cpu: true });
+    let thread = Box::new(Thread { id, name, state: State::Running, rsp: 0, slot: None, key: 0, wake_at: 0, pinned: Some(cpu_index), on_cpu: true, root: 0, kstack_top: 0, killed: false, written: 0 });
     if id == sched.threads.len() {
         sched.threads.push(Some(thread));
     } else {
@@ -142,15 +150,21 @@ pub fn attach_cpu() {
 
 /// Starts a thread on CPU 0 running `entry(argument)`; it is queued, not run yet. Returns its id.
 pub fn spawn(name: &str, entry: extern "C" fn(usize), argument: usize) -> Option<usize> {
-    spawn_on(name, entry, argument, Some(0))
+    spawn_on(name, entry, argument, Some(0), 0)
+}
+
+/// Starts a thread that runs a process: `root` is its address space (`vm::create_user_space`), loaded whenever the thread runs.
+/// Any CPU may run it; its entry function ends in `process::enter_user`.
+pub fn spawn_user(name: &str, entry: extern "C" fn(usize), argument: usize, root: u64) -> Option<usize> {
+    spawn_on(name, entry, argument, None, root)
 }
 
 /// Like `spawn`, but any CPU may run the thread: it must not touch the unlocked boot-CPU drivers.
 pub fn spawn_any(name: &str, entry: extern "C" fn(usize), argument: usize) -> Option<usize> {
-    spawn_on(name, entry, argument, None)
+    spawn_on(name, entry, argument, None, 0)
 }
 
-fn spawn_on(name: &str, entry: extern "C" fn(usize), argument: usize, pinned: Option<usize>) -> Option<usize> {
+fn spawn_on(name: &str, entry: extern "C" fn(usize), argument: usize, pinned: Option<usize>, root: u64) -> Option<usize> {
     let mut guard = SCHED.lock();
     let sched = guard.as_mut()?;
     let slot = sched.free_slots.pop().unwrap_or_else(|| {
@@ -179,7 +193,7 @@ fn spawn_on(name: &str, entry: extern "C" fn(usize), argument: usize, pinned: Op
             sched.threads.len() - 1
         }
     };
-    sched.threads[id] = Some(Box::new(Thread { id, name: bytes, state: State::Ready, rsp: start, slot: Some((slot, frames)), key: 0, wake_at: 0, pinned, on_cpu: false }));
+    sched.threads[id] = Some(Box::new(Thread { id, name: bytes, state: State::Ready, rsp: start, slot: Some((slot, frames)), key: 0, wake_at: 0, pinned, on_cpu: false, root, kstack_top: top, killed: false, written: 0 }));
     sched.queue.push_back(id);
     Some(id)
 }
@@ -267,7 +281,7 @@ fn finish_switch() {
         if previous != NO_THREAD && sched.threads[previous].as_ref().is_some_and(|t| t.state == State::Dead) {
             let thread = sched.threads[previous].take().unwrap();
             if let Some((slot, frames)) = thread.slot {
-                sched.free_slots.push(slot);
+                // Not reused: another CPU may still cache the old mapping and there is no TLB shootdown IPI yet.
                 released = Some((slot, frames));
             }
         }
@@ -276,6 +290,71 @@ fn finish_switch() {
         vm::unmap_stack(slot, STACK_PAGES);
         pmm::free(frames, STACK_PAGES);
     }
+    load_context(cpu_index);
+}
+
+/// Makes this CPU's address space and kernel stack (for ring 3 entries) those of the thread it now runs.
+fn load_context(cpu_index: usize) {
+    let (root, top) = {
+        let guard = SCHED.lock();
+        let Some(sched) = guard.as_ref() else { return };
+        match sched.threads.get(sched.current[cpu_index]).and_then(|t| t.as_ref()) {
+            Some(thread) => (thread.root, thread.kstack_top),
+            None => return,
+        }
+    };
+    if top != 0 {
+        crate::percpu::set_kernel_stack(top);
+    }
+    let wanted = if root == 0 { vm::root() } else { root };
+    if cpu::read_cr3() != wanted {
+        cpu::write_cr3(wanted);
+    }
+}
+
+/// The calling thread's process root (0 for a kernel thread).
+pub fn current_root() -> u64 {
+    let flags = cpu::interrupts_save_and_disable();
+    let root = with_current(|t| t.root).unwrap_or(0);
+    cpu::interrupts_restore(flags);
+    root
+}
+
+fn with_current<R>(f: impl FnOnce(&mut Thread) -> R) -> Option<R> {
+    let mut guard = SCHED.lock();
+    let sched = guard.as_mut()?;
+    let current = sched.current[this_cpu()];
+    sched.threads.get_mut(current)?.as_mut().map(|t| f(t))
+}
+
+/// The calling thread stops using its process's address space (back on the kernel's) and returns the root, to be destroyed.
+pub fn detach_root() -> u64 {
+    let flags = cpu::interrupts_save_and_disable();
+    let root = with_current(|t| core::mem::replace(&mut t.root, 0)).unwrap_or(0);
+    cpu::write_cr3(vm::root());
+    cpu::interrupts_restore(flags);
+    root
+}
+
+/// Asks a process thread to end: it does so the next time it is in the kernel (at the latest on its next timer tick).
+pub fn kill(id: usize) {
+    let mut guard = SCHED.lock();
+    if let Some(Some(thread)) = guard.as_mut().map(|s| s.threads.get_mut(id)).flatten() {
+        thread.killed = true;
+    }
+}
+
+pub fn current_killed() -> bool {
+    with_current(|t| t.killed).unwrap_or(false)
+}
+
+/// Counts console bytes a process wrote; returns the running total.
+pub fn add_written(bytes: u64) -> u64 {
+    with_current(|t| {
+        t.written += bytes;
+        t.written
+    })
+    .unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]

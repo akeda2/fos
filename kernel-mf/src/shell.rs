@@ -56,7 +56,7 @@ fn run(line: &str) {
         "help" => {
             println!("help version cpus mem pci disks nic uptime slots threads echo TEXT reboot");
         }
-        "version" => println!("Fosfor OS server kernel (mf), slice 7."),
+        "version" => println!("Fosfor OS server kernel (mf), slice 8."),
         "cpus" => println!("{} CPU(s); boot CPU has taken {} timer ticks.", percpu::count(), percpu::ticks_of(0)),
         "mem" => {
             let stats = pmm::stats();

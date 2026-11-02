@@ -57,6 +57,10 @@ pub fn read_cr3() -> u64 {
     value
 }
 
+pub fn write_cr3(value: u64) {
+    unsafe { core::arch::asm!("mov cr3, {}", in(reg) value, options(nostack, preserves_flags)) };
+}
+
 pub fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
     let r = core::arch::x86_64::__cpuid_count(leaf, subleaf);
     (r.eax, r.ebx, r.ecx, r.edx)

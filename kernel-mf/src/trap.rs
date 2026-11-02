@@ -62,7 +62,12 @@ static LEGACY_PIC: AtomicU64 = AtomicU64::new(0);
 
 #[unsafe(no_mangle)]
 extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
+    let from_user = frame.cs & 3 == 3;
+    if from_user && frame.vector < 32 {
+        crate::process::fault(frame);
+    }
     match frame.vector {
+        crate::process::SYSCALL_VECTOR => crate::process::syscall(frame),
         3 => {
             BREAKPOINTS.fetch_add(1, Ordering::Relaxed);
             println!("Breakpoint exception at {:#x}: handled, execution continues.", frame.rip);
@@ -76,6 +81,9 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
         v if crate::msi::handles_intx(v) => crate::msi::dispatch_intx(v),
         v if v < 32 => fatal(frame),
         v => println!("Unexpected interrupt vector {v}."),
+    }
+    if from_user {
+        crate::process::check_killed();
     }
 }
 
