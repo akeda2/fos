@@ -126,6 +126,10 @@ impl Platform for Embedded {
         crate::tasks::service_owns(index)
     }
 
+    fn task_current_owns_nic(&self, index: usize) -> bool {
+        crate::tasks::current_owns(index)
+    }
+
     #[cfg(target_arch = "x86_64")]
     fn msi_message(&self, vector: u8) -> (u64, u32) {
         // Physical destination mode, fixed delivery, to the boot CPU's local APIC.
