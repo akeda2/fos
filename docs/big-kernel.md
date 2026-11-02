@@ -389,6 +389,6 @@ flavour marker reaches `fosadm status`, and whether the batch queue needs the sc
   is a read-only table of stubs `mov eax,0x100+slot; syscall`; `tapeapi::call` serves console, time, memory (`alloc`/`free`, a
   per-process heap), `gfx_*` (screen 0), `fp_level`; `fs_*` return "no volume"; everything else returns 0. Shell: `tape NAME [ARGS]`,
   `kill PID`. `make test-mf-tape` runs hello, fpcheck and gfxcheck at `-smp` 1/2/8 (SSE2 and AVX2).
-  Gaps: no input (`read_key` returns none; stop a tape with `kill`), no file access from tapes (the drivers are CPU-0 only and
+  Input: the started tape is the foreground one; typed bytes (serial or `term net`) reach it through `read_key` (64-byte queue), Escape kills it and the shell prompt returns when it ends. Gaps: no file access from tapes (the drivers are CPU-0 only and
   unlocked, so an FS service is needed), no NIC/audio/MIDI/touch/GPIO calls, `alloc` gives virtual addresses (no DMA tapes), no SMAP,
   no stack guard page, no TLB shootdown, no wake IPI. Only hardware shows XSAVE/AVX on silicon, SYSCALL/swapgs/SMEP and the pixel path.

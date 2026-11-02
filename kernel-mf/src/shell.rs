@@ -7,6 +7,70 @@ use kernel_core::netdump::Mac;
 use kernel_core::{nic, pci};
 
 const PROMPT: &str = "fos> ";
+const ESCAPE: u8 = 0x1b;
+
+/// Input state of the foreground tape: while a tape runs, typed bytes go to it (`read_key`) instead of the line editor;
+/// Escape kills it, as on the embedded kernel.
+struct Keys {
+    pid: u64,
+    buffer: [u8; 64],
+    head: usize,
+    count: usize,
+}
+static KEYS: crate::sync::SpinLock<Keys> = crate::sync::SpinLock::new(Keys { pid: 0, buffer: [0; 64], head: 0, count: 0 });
+
+/// Makes `pid` the tape that receives typed bytes. Gives up at once if it already ended.
+pub fn set_foreground(pid: u64) {
+    if crate::process::outcomes().iter().any(|outcome| outcome.pid == pid) {
+        return;
+    }
+    let mut keys = KEYS.lock();
+    keys.pid = pid;
+    keys.head = 0;
+    keys.count = 0;
+}
+
+/// The tape `pid` ended: the shell takes the keyboard back (and says so with a fresh prompt).
+pub fn end_foreground(pid: u64) {
+    let mut keys = KEYS.lock();
+    if keys.pid == pid {
+        keys.pid = 0;
+        drop(keys);
+        prompt();
+    }
+}
+
+/// `read_key` for process `pid`: the next typed byte, if it is the foreground tape.
+pub fn take_key(pid: u64) -> Option<u8> {
+    let mut keys = KEYS.lock();
+    if keys.pid != pid || keys.count == 0 {
+        return None;
+    }
+    let byte = keys.buffer[keys.head];
+    keys.head = (keys.head + 1) % keys.buffer.len();
+    keys.count -= 1;
+    Some(byte)
+}
+
+/// Routes a byte to the foreground tape; false when there is none.
+fn feed_foreground(byte: u8) -> bool {
+    let mut keys = KEYS.lock();
+    let pid = keys.pid;
+    if pid == 0 {
+        return false;
+    }
+    if byte == ESCAPE {
+        drop(keys);
+        sched::kill(pid);
+        return true;
+    }
+    if keys.count < keys.buffer.len() {
+        let tail = (keys.head + keys.count) % keys.buffer.len();
+        keys.buffer[tail] = byte;
+        keys.count += 1;
+    }
+    true
+}
 static mut LINE: [u8; 128] = [0; 128];
 static mut LENGTH: usize = 0;
 
@@ -21,6 +85,9 @@ pub fn reset() {
 
 /// One input byte: printable characters are echoed, Backspace edits, Enter runs the line.
 pub fn feed(byte: u8) {
+    if feed_foreground(byte) {
+        return;
+    }
     unsafe {
         let line = &mut *core::ptr::addr_of_mut!(LINE);
         match byte {
@@ -31,7 +98,9 @@ pub fn feed(byte: u8) {
                 if let Ok(text) = core::str::from_utf8(&line[..length]) {
                     run(text.trim());
                 }
-                prompt();
+                if KEYS.lock().pid == 0 {
+                    prompt();
+                }
             }
             0x08 | 0x7f => {
                 if LENGTH > 0 {
@@ -124,7 +193,10 @@ fn run_tape(name: &str, args: &str) {
         return println!("tape: cannot read `{name}`.");
     }
     match crate::process::spawn_elf(name, &image, args.as_bytes()) {
-        Ok(pid) => println!("tape: `{name}` is process {pid}."),
+        Ok(pid) => {
+            println!("tape: `{name}` is process {pid}; Escape stops it.");
+            set_foreground(pid);
+        }
         Err(error) => println!("tape: `{name}` cannot start: {error:?}."),
     }
 }
