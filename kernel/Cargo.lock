@@ -38,6 +38,7 @@ dependencies = [
  "fosfor-abi",
  "fosfor-fat",
  "fosfor-hal",
+ "fosfor-hid",
 ]
 
 [[package]]

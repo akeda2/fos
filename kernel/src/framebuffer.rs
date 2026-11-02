@@ -672,48 +672,7 @@ pub fn gfx_info() -> Option<(u32, u32)> {
     })
 }
 
-/// Which way the monitor is turned (a portrait mount): tapes draw on an upright logical screen and the kernel rotates it
-/// onto the framebuffer. The text console is not rotated.
-#[derive(Clone, Copy, PartialEq)]
-pub enum Rotate {
-    /// Clockwise: the logical top-left corner lands at the top right of the framebuffer.
-    Right,
-    /// Anti-clockwise: the logical top-left corner lands at the bottom left.
-    Left,
-    /// Upside down (180 degrees): the logical top-left corner lands at the bottom right; width and height stay.
-    Flip,
-}
-
-impl Rotate {
-    /// `r`/`right` or `l`/`left`.
-    pub fn parse(word: &str) -> Option<Rotate> {
-        match word {
-            "r" | "right" => Some(Rotate::Right),
-            "l" | "left" => Some(Rotate::Left),
-            "f" | "flip" | "180" => Some(Rotate::Flip),
-            _ => None,
-        }
-    }
-
-    /// A quarter turn swaps the logical screen's width and height.
-    pub fn swaps(self) -> bool {
-        self != Rotate::Flip
-    }
-
-    /// The framebuffer pixel (of a `screen_width` x `screen_height` one) under logical pixel (x, y).
-    fn map(self, screen_width: usize, screen_height: usize, x: usize, y: usize) -> (usize, usize) {
-        match self {
-            Rotate::Right => (screen_width - 1 - y, x),
-            Rotate::Left => (y, screen_height - 1 - x),
-            Rotate::Flip => (screen_width - 1 - x, screen_height - 1 - y),
-        }
-    }
-
-    /// The logical screen's size on a `screen_width` x `screen_height` framebuffer.
-    fn logical(self, screen_width: usize, screen_height: usize) -> (usize, usize) {
-        if self.swaps() { (screen_height, screen_width) } else { (screen_width, screen_height) }
-    }
-}
+pub use kernel_core::screen::Rotate;
 
 /// Rotation per physical screen (0: the console, 1: the Pi's second HDMI output).
 static mut ROTATE_DEFAULT: [Option<Rotate>; 2] = [None; 2];
