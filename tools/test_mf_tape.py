@@ -22,6 +22,7 @@ CASES = [
     ("fscheck note.txt 100 5", ["fscheck: 0 bytes []"]),
     ("fscheck streams s1.bin s2.bin", ["streams 0: 20000 bytes, 0 wrong", "streams 1: 19900 bytes, 0 wrong"]),
     ("netcheck", ["lease: address", "4/4 replies."]),
+    ("gpiopanel", ["gpiopanel: this machine has no GPIO pins"]),
     ("hello", ["first file: ", "files on the boot volume: "]),
 ]
 
