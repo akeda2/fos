@@ -32,6 +32,8 @@ SECTIONS
   .hash     : { *(.hash) }
   .dynstr   : { *(.dynstr) }
   .rela.dyn : { *(.rela.dyn) }
+  /* Which kernel this is ("embedded" or "mf"): KUP, fosadm and tests read it from the ELF section table. */
+  .fos_flavour : { KEEP(*(.fos_flavour)) }
   .rodata   : { *(.rodata .rodata.*) }
   . = ALIGN(4096);
   __rodata_end = .;
