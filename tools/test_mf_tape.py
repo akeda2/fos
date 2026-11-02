@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Runs real tapes on the server kernel (`make test-mf-tape`): build/fosfor-mf/fosfor-tapes.img has hello, fpcheck, gfxcheck, fscheck (files: ranges, two streams), ed (keyboard + fs_read/fs_write) and a text file on
+"""Runs real tapes on the server kernel (`make test-mf-tape`): build/fosfor-mf/fosfor-tapes.img has hello, fpcheck, gfxcheck, netcheck (DHCP + ping on QEMU user networking), fscheck (files: ranges, two streams), ed (keyboard + fs_read/fs_write) and a text file on
 FOSFS; the serial shell starts each with `tape NAME`, and the test checks their output and that the process exits 0, with 1, 2 and 8 CPUs.
 Hard-float (AVX2) is checked under `-cpu max`, SSE2 under qemu64."""
 
@@ -21,6 +21,7 @@ CASES = [
     ("fscheck note.txt 10 5", ["fscheck: 5 bytes [abcde]"]),
     ("fscheck note.txt 100 5", ["fscheck: 0 bytes []"]),
     ("fscheck streams s1.bin s2.bin", ["streams 0: 20000 bytes, 0 wrong", "streams 1: 19900 bytes, 0 wrong"]),
+    ("netcheck", ["lease: address", "4/4 replies."]),
     ("hello", ["first file: ", "files on the boot volume: "]),
 ]
 
@@ -28,7 +29,7 @@ CASES = [
 def run(cpu, smp):
     qemu = subprocess.Popen(
         ["qemu-system-x86_64", "-cpu", cpu, "-machine", "q35", "-m", "512", "-smp", str(smp), "-display", "none",
-         "-serial", "stdio", "-monitor", "none", "-no-reboot",
+         "-nic", "user,model=e1000", "-serial", "stdio", "-monitor", "none", "-no-reboot",
          "-drive", f"if=pflash,format=raw,readonly=on,file={CODE}", "-drive", f"format=raw,file={IMAGE},snapshot=on"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     log = b""
@@ -52,7 +53,7 @@ def run(cpu, smp):
                 mark = len(log)
                 qemu.stdin.write((f"tape {command}\n").encode())
                 qemu.stdin.flush()
-                done = wait_for("exited with code 0.", 30, mark) and all(wait_for(e, 5, mark) for e in expected)
+                done = wait_for("exited with code 0.", 40, mark) and all(wait_for(e, 5, mark) for e in expected)
                 new = log[mark:].decode("utf8", "replace")
                 if not done or "exited with code 0." not in new:
                     failures.append(f"`tape {command}` did not finish cleanly:\n{new}")

@@ -13,6 +13,7 @@ mod process;
 mod sched;
 mod tapeapi;
 mod tapefs;
+mod tapenet;
 mod user_test;
 mod fb;
 mod config;

@@ -260,6 +260,7 @@ pub fn terminate(how: How) -> ! {
         How::Killed => println!("Process {thread} killed."),
     }
     crate::tapefs::process_ended(thread);
+    crate::tapenet::process_ended(thread);
     crate::shell::end_foreground(thread);
     sched::exit()
 }
