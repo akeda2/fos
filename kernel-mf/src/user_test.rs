@@ -42,6 +42,12 @@ user_fault_start:
     mov byte ptr [rax], 1
 user_fault_end:
 
+    .global user_overflow_start, user_overflow_end
+user_overflow_start:                   # pushes until the stack runs into the guard page below it
+1:  push rax
+    jmp 1b
+user_overflow_end:
+
     .global user_gp_start, user_gp_end
 user_gp_start:
     hlt
@@ -157,6 +163,8 @@ unsafe extern "C" {
     static user_badptr_end: u8;
     static user_fault_start: u8;
     static user_fault_end: u8;
+    static user_overflow_start: u8;
+    static user_overflow_end: u8;
     static user_gp_start: u8;
     static user_gp_end: u8;
     static user_elf_start: u8;
@@ -227,6 +235,7 @@ pub fn run() {
     let hello = process::spawn("hello", blob(unsafe { &user_hello_start }, unsafe { &user_hello_end })).expect("hello");
     let badptr = process::spawn("badptr", blob(unsafe { &user_badptr_start }, unsafe { &user_badptr_end })).expect("badptr");
     let fault = process::spawn("fault", blob(unsafe { &user_fault_start }, unsafe { &user_fault_end })).expect("fault");
+    let overflow = process::spawn("overflow", blob(unsafe { &user_overflow_start }, unsafe { &user_overflow_end })).expect("overflow");
     let gp = process::spawn("gp", blob(unsafe { &user_gp_start }, unsafe { &user_gp_end })).expect("gp");
     let spin = process::spawn("spin", blob(unsafe { &user_spin_start }, unsafe { &user_spin_end })).expect("spin");
     let elf = process::spawn_elf("elf", &build_elf(), b"").expect("elf");
@@ -238,7 +247,7 @@ pub fn run() {
     }
     let avx = (fpu::level() == fosfor_abi::tape::FP_AVX2)
         .then(|| process::spawn("avx", blob(unsafe { &user_avx_start }, unsafe { &user_avx_end })).expect("avx process"));
-    let expected = 6 + fp_ids.len() + usize::from(avx.is_some());
+    let expected = 7 + fp_ids.len() + usize::from(avx.is_some());
     let start = apic::ticks();
     while apic::ticks() - start < 4 {
         halt_a_tick();
@@ -259,6 +268,8 @@ pub fn run() {
     let hello_ok = matches!(find(hello), Some(o) if o.how == How::Exited(7) && o.written == 38);
     let badptr_ok = matches!(find(badptr), Some(o) if o.how == How::Exited(-1));
     let fault_ok = matches!(find(fault), Some(o) if matches!(o.how, How::Fault(14, 0xffff_8000_0000_0000)));
+    let guard = process::STACK_TOP - process::STACK_BYTES;
+    let overflow_ok = matches!(find(overflow), Some(o) if matches!(o.how, How::Fault(14, address) if (guard - 8..guard).contains(&address)));
     let gp_ok = matches!(find(gp), Some(o) if matches!(o.how, How::Fault(13, _)));
     let elf_ok = matches!(find(elf), Some(o) if o.how == How::Exited(0) && o.written == 19);
     let fp_ok = fp_ids.iter().all(|&id| matches!(find(id), Some(o) if o.how == How::Exited(0)))
@@ -268,7 +279,7 @@ pub fn run() {
     let leaked = free_before.saturating_sub(pmm::stats().free).saturating_sub(2);
     let ok = |b: bool| if b { "ok" } else { "FAILED" };
     println!(
-        "Ring 3: hello {}, bad pointer {}, page fault {}, #GP {}, preempted spinner {}, ELF {}, SSE{} state {}, {} frames not returned.",
-        ok(hello_ok), ok(badptr_ok), ok(fault_ok), ok(gp_ok), ok(spin_ok), ok(elf_ok), if avx.is_some() { "+AVX" } else { "" }, ok(fp_ok), leaked
+        "Ring 3: hello {}, bad pointer {}, page fault {}, stack guard {}, #GP {}, preempted spinner {}, ELF {}, SSE{} state {}, {} frames not returned.",
+        ok(hello_ok), ok(badptr_ok), ok(fault_ok), ok(overflow_ok), ok(gp_ok), ok(spin_ok), ok(elf_ok), if avx.is_some() { "+AVX" } else { "" }, ok(fp_ok), leaked
     );
 }

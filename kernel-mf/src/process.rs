@@ -13,9 +13,10 @@
 //!
 //! What protects the kernel: user pages carry the U bit and live in PML4 slots 1..255 only; everything else is supervisor
 //! (the kernel image's identity map in slot 0, the direct map and stacks in the upper half); SMEP stops the kernel from
-//! executing user pages; a syscall pointer is checked page by page (`vm::user_range_ok`) before the kernel reads through it.
-//! Not yet: SMAP, FP/SSE state (user code that uses SSE faults with #UD, as the kernel never enables it), a stack guard page
-//! below the user stack.
+//! executing user pages and SMAP from touching them except in the `user_access` windows (the three places that copy to or from a
+//! process); a syscall pointer is checked page by page (`vm::user_range_ok`) before the kernel reads through it.
+//! Not yet: FP/SSE state (user code that uses SSE faults with #UD, as the kernel never enables it), the guard page below
+//! the user stack is implicit (nothing maps there; `make test-mf-boot` overflows it).
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -36,6 +37,9 @@ pub const SYSCALL_VECTOR: u64 = 0x1000;
 pub const CODE_BASE: u64 = vm::USER_BASE;
 pub const STACK_TOP: u64 = vm::USER_BASE + 0x100_0000;
 const STACK_PAGES: u64 = 4;
+/// The stack's size; the page below it is never mapped (the code is at the bottom of the address space, the heap a gigabyte above
+/// it), so running off the end is a page fault that kills only the process.
+pub const STACK_BYTES: u64 = STACK_PAGES * 4096;
 const WRITE_LIMIT: u64 = 4096;
 
 core::arch::global_asm!(
@@ -97,13 +101,36 @@ pub fn init_cpu() {
     cpu::write_msr(MSR_STAR, u64::from(0x10u16) << 48 | u64::from(gdt::KERNEL_CODE) << 32);
     cpu::write_msr(MSR_LSTAR, syscall_entry as usize as u64);
     cpu::write_msr(MSR_SFMASK, 0x200 | 0x100 | 0x400 | 0x4_0000); // IF, TF, DF, AC
-    if cpu::cpuid(7, 0).1 & (1 << 7) != 0 {
+    let features = cpu::cpuid(7, 0).1;
+    // CR4 bit 20 SMEP (no execution of user pages), bit 21 SMAP (no access to them unless RFLAGS.AC is set: `user_access`).
+    let wanted = (features & (1 << 7) != 0) as u64 * (1 << 20) | (features & (1 << 20) != 0) as u64 * (1 << 21);
+    if wanted != 0 {
         unsafe {
             let cr4: u64;
             core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
-            core::arch::asm!("mov cr4, {}", in(reg) cr4 | 1 << 20, options(nomem, nostack, preserves_flags));
+            core::arch::asm!("mov cr4, {}", in(reg) cr4 | wanted, options(nomem, nostack, preserves_flags));
         }
     }
+    if features & (1 << 20) != 0 && !SMAP_ON.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        println!("SMAP: the kernel reaches user memory only through stac/clac windows (copy_to_user, user_bytes, gfx_blit).");
+    }
+}
+
+/// Set once the CPUs run with CR4.SMAP (they all have the same features); `stac`/`clac` are #UD without it.
+static SMAP_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Runs `f`, which touches user memory, with SMAP's check lifted (RFLAGS.AC set) for exactly that long. Callers check the range
+/// first (`vm::user_range_ok`). An interrupt clears AC on entry and `iretq` restores it, so a preemption inside is safe.
+pub fn user_access<R>(f: impl FnOnce() -> R) -> R {
+    let on = SMAP_ON.load(core::sync::atomic::Ordering::Relaxed);
+    if on {
+        unsafe { core::arch::asm!("stac", options(nostack)) };
+    }
+    let result = f();
+    if on {
+        unsafe { core::arch::asm!("clac", options(nostack)) };
+    }
+    result
 }
 
 /// How a process ended.
@@ -290,7 +317,7 @@ pub fn user_bytes_up_to(address: u64, length: u64, limit: u64) -> Option<Vec<u8>
     }
     let mut buffer = alloc::vec![0u8; length as usize];
     // The process's address space is loaded, and the range was just checked present and user-readable.
-    unsafe { core::ptr::copy_nonoverlapping(address as *const u8, buffer.as_mut_ptr(), length as usize) };
+    user_access(|| unsafe { core::ptr::copy_nonoverlapping(address as *const u8, buffer.as_mut_ptr(), length as usize) });
     Some(buffer)
 }
 
@@ -300,7 +327,7 @@ pub fn copy_to_user(address: u64, data: &[u8]) -> bool {
         return false;
     }
     // The process's address space is loaded, and the range was just checked present and user-writable.
-    unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), address as *mut u8, data.len()) };
+    user_access(|| unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), address as *mut u8, data.len()) });
     true
 }
 

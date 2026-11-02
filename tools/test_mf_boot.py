@@ -128,8 +128,8 @@ def main():
         smp_run = re.search(r"Scheduler: SMP ok \((\d+) unpinned threads ran on (\d+) of (\d+) CPU\(s\)\)", text)
         check(smp_run is not None and int(smp_run.group(2)) == cpus == int(smp_run.group(3)), f"-smp {cpus}: unpinned threads run on every CPU", text)
         check("Hello from ring 3!" in text, f"-smp {cpus}: a ring 3 process makes system calls", text)
-        check(re.search(r"Ring 3: hello ok, bad pointer ok, page fault ok, #GP ok, preempted spinner ok, ELF ok, SSE(\+AVX)? state ok, 0 frames not returned\.", text) is not None,
-              f"-smp {cpus}: ring 3 processes: syscalls, pointer checks, faults kill only the process, user code is preempted, an ELF is loaded and relocated, SSE/AVX state survives switches, memory returns", text)
+        check(re.search(r"Ring 3: hello ok, bad pointer ok, page fault ok, stack guard ok, #GP ok, preempted spinner ok, ELF ok, SSE(\+AVX)? state ok, 0 frames not returned\.", text) is not None,
+              f"-smp {cpus}: ring 3 processes: syscalls, pointer checks, faults and stack overflows kill only the process, user code is preempted, an ELF is loaded and relocated, SSE/AVX state survives switches, memory returns", text)
         micros = re.search(r"Clock: .* \(microseconds (\d+)\)", text)
         check(micros is not None and int(micros.group(1)) > 150_000, f"-smp {cpus}: the monotonic microsecond clock runs", text)
         check("PANIC" not in text and "CPU exception" not in text, f"-smp {cpus}: no panic", text)
