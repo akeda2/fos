@@ -208,5 +208,10 @@ by any test: USB serial adapters, the Pi 4 console and GIC paths (hardware only)
   has both). x86 kernel 1,177,400 bytes. Verified: `make test`, `test-hda`, `test-usb-audio`, `test-loopback`,
   `test-audio-services`, `test-record`, `test-recorder`, `test-audio-net`, `test-release-loops`, `test-fosplay`,
   `test-xhci-abort`, `test-aarch64-boot`. The Pi interrupt masking and I2S paths only show on a Pi 4.
-- Next: the input side (`usb_hid`, `usb_pointer`, `usb_midi`, `usb_serial*`), then `ohci`.
+- Slice 10a, the input side's leaves: `usb_midi`, `usb_serial`, `usb_serial_pl2303`, `usb_serial_ti` and `usb_pointer` are in core.
+  `usb_class::Host` gained `poll` (one pass over the event rings), which replaces the calls into `midishell`/`usb_hid`.
+  The pointer code reaches the screen through `screen::set` (logical size, rotation, and on the Pi the DSI touch chip, whose
+  driver stays in the kernel with the I2C bus); `Rotate` and `line::Line` moved to core. The `touch monitor` loop needs the
+  console and NETFS, so `kernel/src/usb_pointer.rs` is now a shim that re-exports core and adds `command`.
+- Next: the enumerators (`usb_hid`, `usb_kbd`) with `usbshell`, then `ohci`.
   The server kernel needs all of them; only the real-time guarantees (interrupt-context audio refills) differ.

@@ -14,3 +14,4 @@ path = "src/lib.rs"
 fosfor-hal = { path = "../fos-hal" }
 fosfor-abi = { path = "../../abi" }
 fosfor-fat = { path = "../fat" }
+fosfor-hid = { path = "../hid" }

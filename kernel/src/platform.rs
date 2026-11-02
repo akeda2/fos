@@ -224,9 +224,28 @@ static EMBEDDED: Embedded = Embedded;
 pub fn install() {
     fos_hal::set_platform(&EMBEDDED);
     crate::usb_register::install();
+    kernel_core::screen::set(&SCREEN);
     #[cfg(target_arch = "aarch64")]
     kernel_core::i2s::set(&I2S);
 }
+
+#[cfg(target_arch = "aarch64")]
+static DSI: kernel_core::screen::Dsi = kernel_core::screen::Dsi {
+    width: crate::dsitouch::WIDTH,
+    height: crate::dsitouch::HEIGHT,
+    present: crate::dsitouch::present,
+    poll: crate::dsitouch::poll,
+    reports: crate::dsitouch::reports,
+};
+
+static SCREEN: kernel_core::screen::Screen = kernel_core::screen::Screen {
+    gfx_info: crate::framebuffer::gfx_info,
+    rotation: crate::framebuffer::rotation,
+    #[cfg(target_arch = "aarch64")]
+    dsi: Some(&DSI),
+    #[cfg(not(target_arch = "aarch64"))]
+    dsi: None,
+};
 
 #[cfg(target_arch = "aarch64")]
 static I2S: kernel_core::i2s::Ops = kernel_core::i2s::Ops {
