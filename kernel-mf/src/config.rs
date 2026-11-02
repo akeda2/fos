@@ -10,6 +10,12 @@ static mut HOSTNAME: [u8; 15] = [0; 15];
 static mut HOSTNAME_LENGTH: usize = 0;
 static mut DENY_TERM_NET: bool = false;
 static mut KERNEL_UPDATE: bool = false;
+static mut SWEDISH: bool = false;
+
+/// `keymap sv` (or `se`, `fi`) in `settings`: what USB keyboards type. US otherwise.
+pub fn swedish() -> bool {
+    unsafe { SWEDISH }
+}
 
 /// The base name from the `hostname` file, if there is one.
 pub fn hostname() -> Option<&'static str> {
@@ -59,6 +65,11 @@ pub fn load() {
     }
     if let Some(text) = read("settings") {
         for line in lines(text) {
+            let mut words = line.split_whitespace();
+            if words.next() == Some("keymap") && matches!(words.next(), Some("sv" | "se" | "fi")) {
+                unsafe { SWEDISH = true };
+                println!("settings: keymap sv -- USB keyboards type the Swedish/Finnish layout.");
+            }
             if line.split_whitespace().next() == Some("deny-term-net") {
                 unsafe { DENY_TERM_NET = true };
                 println!("settings: deny-term-net -- the network terminal is closed.");
