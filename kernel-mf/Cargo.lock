@@ -7,8 +7,32 @@ name = "fosfor-abi"
 version = "0.1.0"
 
 [[package]]
+name = "fosfor-fat"
+version = "0.1.0"
+
+[[package]]
+name = "fosfor-hal"
+version = "0.1.0"
+
+[[package]]
+name = "fosfor-hid"
+version = "0.1.0"
+
+[[package]]
+name = "fosfor-kernel-core"
+version = "0.1.0"
+dependencies = [
+ "fosfor-abi",
+ "fosfor-fat",
+ "fosfor-hal",
+ "fosfor-hid",
+]
+
+[[package]]
 name = "fosfor-kernel-mf"
 version = "0.1.0"
 dependencies = [
  "fosfor-abi",
+ "fosfor-hal",
+ "fosfor-kernel-core",
 ]

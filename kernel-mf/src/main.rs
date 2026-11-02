@@ -15,12 +15,23 @@ mod cpu;
 mod gdt;
 mod heap;
 mod idt;
+mod block;
 mod percpu;
+mod pci_config;
+mod platform;
 mod pmm;
 mod smp;
+mod storage;
 mod sync;
 mod trap;
 mod vm;
+
+// The embedded kernel's interrupt-routing file, included as it is so the two kernels cannot drift. It names `crate::apic`,
+// `crate::ioapic` and `crate::pci`, which are provided here.
+#[path = "../../kernel/src/arch/x86_64/msi.rs"]
+mod msi;
+use apic::ioapic;
+use kernel_core::pci;
 
 use alloc::{boxed::Box, collections::BTreeMap, string::String, vec::Vec};
 use core::panic::PanicInfo;
@@ -66,7 +77,7 @@ fn mib(bytes: u64) -> u64 {
 pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     serial::init();
     println!();
-    println!("Fosfor OS server kernel (mf, slice 4): running in 64-bit long mode.");
+    println!("Fosfor OS server kernel (mf, slice 5): running in 64-bit long mode.");
 
     let info = unsafe { &*info };
     if !info.is_valid() {
@@ -180,11 +191,21 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     apic::busy_wait_ms(200);
     let ticks = apic::ticks() - start;
     println!("APIC timer: {} Hz tick, {ticks} ticks in 200 ms of PM-timer time.", apic::TICK_HZ);
-    cpu::interrupts_disable();
     for index in 1..percpu::count() {
         println!("CPU {index}: {} timer ticks since it came up.", percpu::ticks_of(index));
     }
-    println!("kernel-mf: slice 4 reached the end of boot; halting.");
+    println!("Clock: {} (microseconds {}).", apic::micros_source(), apic::micros());
+
+    // Device drivers: `kernel-core` reaches the machine through the platform below. Interrupts stay on, as the drivers wait on ticks.
+    platform::install();
+    let devices = pci::scan();
+    println!("PCI: {devices} function(s) found.");
+    for device in pci::devices() {
+        println!("  {:02x}:{:02x}.{} {:04x}:{:04x} {}", device.bus, device.device, device.function, device.vendor, device.id, pci::class_name(device.class, device.subclass));
+    }
+    storage::init(info);
+    cpu::interrupts_disable();
+    println!("kernel-mf: slice 5 reached the end of boot; halting.");
     halt();
 }
 

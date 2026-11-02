@@ -33,6 +33,35 @@ static mut X2APIC: bool = false;
 static mut PER_TICK: u32 = 0;
 static mut PM_PORT: u16 = 0;
 static mut PM_32_BIT: bool = false;
+/// The invariant TSC's rate in kHz (0 when the CPU has none) and its value when the kernel's clock started.
+static mut TSC_KHZ: u64 = 0;
+static mut TSC_ORIGIN: u64 = 0;
+/// Without an invariant TSC the clock runs on the PM timer: (last raw reading, ticks accumulated). `tick` on the boot CPU
+/// samples it often enough that the 24-bit counter (4.7 s per wrap) is never missed.
+static PM_CLOCK: crate::sync::SpinLock<(u64, u64)> = crate::sync::SpinLock::new((0, 0));
+
+/// Microseconds on a monotonic clock that is the same on every CPU (unlike the per-CPU timer counts).
+pub fn micros() -> u64 {
+    unsafe {
+        if TSC_KHZ != 0 {
+            return ((cpu::rdtsc().wrapping_sub(TSC_ORIGIN) as u128 * 1000) / TSC_KHZ as u128) as u64;
+        }
+        if PM_PORT == 0 {
+            return ticks() * 1_000_000 / TICK_HZ;
+        }
+    }
+    let mut clock = PM_CLOCK.lock();
+    let now = pm_read();
+    let mask = if unsafe { PM_32_BIT } { 0xffff_ffff } else { 0x00ff_ffff };
+    clock.1 += now.wrapping_sub(clock.0) & mask;
+    clock.0 = now;
+    clock.1 * 1_000_000 / PM_TIMER_HZ
+}
+
+/// Where the clock comes from, for the boot narration.
+pub fn micros_source() -> &'static str {
+    if unsafe { TSC_KHZ } != 0 { "invariant TSC" } else { "ACPI PM timer" }
+}
 
 fn read(register: u32) -> u32 {
     unsafe {
@@ -70,7 +99,11 @@ pub fn ticks() -> u64 {
 
 /// Called from the timer interrupt of whichever CPU it is: each counts its own.
 pub fn tick() {
-    crate::percpu::this().ticks.fetch_add(1, Ordering::Relaxed);
+    let cpu = crate::percpu::this();
+    cpu.ticks.fetch_add(1, Ordering::Relaxed);
+    if cpu.index == 0 && unsafe { TSC_KHZ == 0 && PM_PORT != 0 } {
+        micros();
+    }
     end_of_interrupt();
 }
 
@@ -153,9 +186,19 @@ pub fn start_timer(fadt: &acpi::Fadt, madt_address: u64) -> Option<Report> {
     write(REG_TIMER_DIVIDE, 0x3); // bus clock / 16
     write(REG_LVT_TIMER, 1 << 16 | u32::from(TIMER_VECTOR)); // masked, one-shot
     write(REG_TIMER_INITIAL, 0xffff_ffff);
+    *PM_CLOCK.lock() = (pm_read(), 0);
     let start = pm_read();
+    let tsc_start = cpu::rdtsc();
     while pm_elapsed(start) < PM_TIMER_HZ / 100 {}
+    let tsc_counted = cpu::rdtsc() - tsc_start;
     let counted = 0xffff_ffffu64 - u64::from(read(REG_TIMER_CURRENT));
+    // An invariant TSC (CPUID 0x80000007 EDX bit 8) ticks at one rate on every core whatever the power state: the clock.
+    if cpu::cpuid(0x8000_0000, 0).0 >= 0x8000_0007 && cpu::cpuid(0x8000_0007, 0).3 & (1 << 8) != 0 {
+        unsafe {
+            TSC_KHZ = tsc_counted * 100 / 1000;
+            TSC_ORIGIN = tsc_start;
+        }
+    }
     write(REG_TIMER_INITIAL, 0);
     let per_tick = counted * 100 / TICK_HZ;
     write(REG_LVT_TIMER, 1 << 17 | u32::from(TIMER_VECTOR)); // periodic, unmasked
@@ -231,6 +274,53 @@ pub mod ioapic {
         for pin in 0..pins {
             write(0x10 + 2 * pin, 1 << 16);
         }
+        unsafe {
+            GSI_BASE = madt.io_apic_gsi_base;
+            PINS = pins;
+        }
         Some(pins)
+    }
+
+    static mut GSI_BASE: u32 = 0;
+    static mut PINS: u32 = 0;
+    /// Pin changes are an index/data pair, so two CPUs must not interleave them.
+    static LOCK: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
+
+    /// Routes `gsi` to `vector` on the boot CPU (all device interrupts land there for now), with the given trigger mode
+    /// and polarity (PCI interrupts are level, active low). False if no pin serves that GSI.
+    pub fn route_gsi(gsi: u32, vector: u8, level: bool, active_low: bool) -> bool {
+        let _guard = LOCK.lock();
+        unsafe {
+            if BASE == 0 || gsi < GSI_BASE || gsi >= GSI_BASE + PINS {
+                return false;
+            }
+            let pin = gsi - GSI_BASE;
+            let mut low = u32::from(vector);
+            if active_low {
+                low |= 1 << 13;
+            }
+            if level {
+                low |= 1 << 15;
+            }
+            write(0x10 + 2 * pin + 1, crate::percpu::get(0).apic_id << 24);
+            write(0x10 + 2 * pin, low);
+        }
+        true
+    }
+
+    /// Masks the pin of `gsi` (an interrupt storm, or a failed probe).
+    pub fn mask_gsi(gsi: u32) {
+        let _guard = LOCK.lock();
+        unsafe {
+            if BASE != 0 && gsi >= GSI_BASE && gsi < GSI_BASE + PINS {
+                let pin = gsi - GSI_BASE;
+                write(0x10 + 2 * pin, read(0x10 + 2 * pin) | (1 << 16));
+            }
+        }
+    }
+
+    /// First GSI served and one past the last (for probing candidates).
+    pub fn gsi_range() -> (u32, u32) {
+        unsafe { (GSI_BASE, GSI_BASE + PINS) }
     }
 }

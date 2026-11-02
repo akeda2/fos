@@ -249,9 +249,10 @@ link `kernel/`: the embedded kernel's `term`, `tape`, shells and `static mut` st
 - Physical: a frame allocator over the `BootInfo` memory map with per-node free lists (SRAT is read from ACPI for NUMA; one node
   when absent), "below 4 GiB" runs for 32-bit DMA devices, and `allocate_contiguous` for drivers.
 - Virtual: the kernel gets its own higher-half address space (direct map of RAM at a fixed offset, kernel image, MMIO window,
-  per-CPU areas, stacks with guard pages); NX and W^X everywhere. Drivers keep seeing physical addresses through
-  `Platform::map_device` and DMA calls, so `kernel-core` needs no change; any `kernel-core` code that assumes identity mapping
-  (it should not, since it went through `memory::*`) is a bug to fix there.
+  per-CPU areas, stacks with guard pages); NX and W^X everywhere. The `kernel-core` drivers, however, use physical
+  addresses (BARs, DMA buffers) directly as pointers. Until they call a HAL `phys_to_virt()` (a no-op on the embedded kernel),
+  the server kernel keeps a temporary **identity alias** of RAM and mapped MMIO in the lower half (NX, W^X kept for the image).
+  The conversion and the alias's removal come before user space takes the lower half (slice 7).
 - A kernel heap (slab per size class over the frame allocator) so `alloc` exists in the server kernel. The embedded kernel stays
   `alloc`-free.
 - Per-process address spaces arrive in stage 5/6 of the staged path; the kernel address space layout leaves the lower half
@@ -321,3 +322,13 @@ flavour marker reaches `fosadm status`, and whether the batch queue needs the sc
   `-numa` placement. Not yet: guard pages under AP stacks (the direct map uses 2 MiB pages; guarded stacks come with the
   scheduler, slice 7), locks on the page tables (only the boot CPU edits them so far), APs taking part in work. Only real
   hardware shows AP startup timing on slow firmware, x2APIC AP mode, and real NUMA machines.
+- Slice 5 (devices) is built: `platform.rs` implements `fos_hal::Platform` for `kernel-core`; `vm.rs` gained the identity alias
+  (2 MiB pages where clear of the image, 4 KiB in the first 2 MiB, page 0 and the image left to `map_image`) and
+  `map_device_identity` (uncached, NX). `pci_config.rs` locks the 0xCF8/0xCFC pair. `msi.rs` is the embedded kernel's file
+  included with `#[path]` (so MSI and shared INTx cannot drift), with `trap.rs` dispatching both ranges; `apic::ioapic` has
+  `route_gsi`/`mask_gsi`/`gsi_range` (locked). All device interrupts go to the boot CPU. `apic::micros` is one monotonic clock for
+  every CPU: the invariant TSC if CPUID says so, else the ACPI PM timer. `block.rs`/`storage.rs` register SATA and NVMe disks,
+  find the boot disk by the payload partition GUID and mount its FOSFS. `test-mf-boot` checks the PCI scan, the AHCI disk, the
+  boot disk and the FOSFS mount at every `-smp`. Known gaps: no RTC (`unix_seconds` is 0), the `kernel-core` statics are unlocked
+  so drivers run on the boot CPU only (APs idle), no USB or NIC bring-up yet, no NVMe disk in the test. Only real hardware shows
+  real AHCI/NVMe, MSI/INTx routing and an invariant TSC.

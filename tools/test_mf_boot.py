@@ -25,7 +25,7 @@ CODE_CANDIDATES = ["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_CODE
 VARS_CANDIDATES = ["/usr/share/OVMF/OVMF_VARS_4M.fd", "/usr/share/OVMF/OVMF_VARS.fd",
                    "/usr/share/edk2/ovmf/OVMF_VARS.fd", "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd"]
 BIOS = os.environ.get("FOS_FIRMWARE") == "bios"
-FINAL = "slice 4 reached the end of boot"
+FINAL = "slice 5 reached the end of boot"
 
 
 def find(variable, candidates):
@@ -90,7 +90,7 @@ def main():
         raise SystemExit(f"{IMAGE} missing; run `make image-mf` first")
     for cpus in (1, 2, 8):
         text = boot(cpus)
-        check("Fosfor OS server kernel (mf, slice 4)" in text, f"-smp {cpus}: the server kernel announces itself", text)
+        check("Fosfor OS server kernel (mf, slice 5)" in text, f"-smp {cpus}: the server kernel announces itself", text)
         check("BootInfo: version" in text and "is not valid" not in text, f"-smp {cpus}: the loader's BootInfo is valid", text)
         match = re.search(r"Memory map: (\d+) regions, (\d+) MiB of RAM-like memory, (\d+) MiB conventional", text)
         check(match is not None and int(match.group(2)) >= 400 and int(match.group(3)) >= 100,
@@ -114,7 +114,15 @@ def main():
         check(len(re.findall(r"^CPU \d+: APIC id \d+, NUMA node \d+", text, re.M)) == cpus, f"-smp {cpus}: one line per CPU", text)
         for line in re.findall(r"^CPU (\d+): (\d+) timer ticks since it came up", text, re.M):
             check(10 <= int(line[1]) <= 80, f"-smp {cpus}: CPU {line[0]}'s own timer ticks at about 100 Hz ({line[1]} ticks)", text)
-        check("PANIC" not in text, f"-smp {cpus}: no panic", text)
+        pci = re.search(r"PCI: (\d+) function\(s\) found", text)
+        check(pci is not None and int(pci.group(1)) >= 4 and re.search(r"^  00:1f\.2 8086:2922 SATA controller", text, re.M) is not None,
+              f"-smp {cpus}: the PCI scan finds the machine's devices, the SATA controller among them", text)
+        check(re.search(r"^disk1: \d+ MiB, .* \(SATA 0:0\)", text, re.M) is not None, f"-smp {cpus}: kernel-core's AHCI driver finds the boot disk", text)
+        check("Boot disk: disk1" in text, f"-smp {cpus}: the payload partition is read through the block layer and the boot disk identified", text)
+        check(re.search(r"FOSFS: mounted on disk1 \(\d+ MiB, \d+ file", text) is not None, f"-smp {cpus}: FOSFS mounts on the boot disk", text)
+        micros = re.search(r"Clock: .* \(microseconds (\d+)\)", text)
+        check(micros is not None and int(micros.group(1)) > 150_000, f"-smp {cpus}: the monotonic microsecond clock runs", text)
+        check("PANIC" not in text and "CPU exception" not in text, f"-smp {cpus}: no panic", text)
     text = boot(4, numa=True)
     check(re.search(r"SRAT: 2 NUMA node\(s\), \d+ memory range\(s\), 4 CPU affinity", text) is not None, "-numa: the SRAT shows two nodes and four CPUs", text)
     check("PANIC" not in text and "CPU exception" not in text, "-numa: no panic", text)

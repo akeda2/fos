@@ -10,6 +10,26 @@ pub fn inl(port: u16) -> u32 {
     value
 }
 
+pub fn inb(port: u16) -> u8 {
+    let value: u8;
+    unsafe { core::arch::asm!("in al, dx", in("dx") port, out("al") value, options(nomem, nostack)) };
+    value
+}
+
+pub fn inw(port: u16) -> u16 {
+    let value: u16;
+    unsafe { core::arch::asm!("in ax, dx", in("dx") port, out("ax") value, options(nomem, nostack)) };
+    value
+}
+
+pub fn outw(port: u16, value: u16) {
+    unsafe { core::arch::asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack)) };
+}
+
+pub fn outl(port: u16, value: u32) {
+    unsafe { core::arch::asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack)) };
+}
+
 /// A write to the unused POST-code port 0x80: about a microsecond, which the 8259's initialisation sequence needs between bytes.
 pub fn io_wait() {
     outb(0x80, 0);
@@ -48,4 +68,21 @@ pub fn interrupts_enable() {
 
 pub fn interrupts_disable() {
     unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+}
+
+/// Turns interrupts off and says whether they were on, for `interrupts_restore`.
+pub fn interrupts_save_and_disable() -> bool {
+    let flags: u64;
+    unsafe { core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags, options(nomem, preserves_flags)) };
+    flags & (1 << 9) != 0
+}
+
+pub fn interrupts_restore(was_enabled: bool) {
+    if was_enabled {
+        interrupts_enable();
+    }
+}
+
+pub fn rdtsc() -> u64 {
+    unsafe { core::arch::x86_64::_rdtsc() }
 }
