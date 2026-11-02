@@ -300,3 +300,11 @@ flavour marker reaches `fosadm status`, and whether the batch queue needs the sc
   memory, copied out before the switch). `test-mf-boot` checks the frame count, the direct map, W^X, a frame round trip and a
   heap self-test with growth. UEFI runtime services and device registers are not mapped yet. Only hardware shows how the
   framebuffer's uncached mapping behaves (write-combining via the PAT comes with the framebuffer console, slice 6).
+- Slice 3 (interrupts, ACPI, APIC) is built: `gdt.rs`, `idt.rs` and `isr_stubs.S` are the embedded kernel's files, included
+  with `#[path]` (slice 4 replaces the GDT/TSS with per-CPU ones); `trap.rs` (`interrupt_dispatch`, a legible exception report
+  with the faulting address described by `vm::describe`), `acpi.rs` (RSDP/XSDT, FADT, MADT with the CPU list, SRAT with nodes
+  and memory ranges; tables the map does not describe are mapped on demand through `vm::map_device`), `apic.rs` (8259s
+  retired, local APIC enabled, timer calibrated on the PM timer, 100 Hz tick; the I/O APIC found and all pins masked). The boot
+  CPU takes an `int3` and the timer tick. `test-mf-boot` checks the CPU count against `-smp`, the tick rate, and a two-node
+  `-numa` boot (SRAT). Not yet: the `Platform` trait (slice 5, when `kernel-core` is linked), per-NUMA frame lists (slice 4),
+  APs (slice 4). Real hardware shows the x2APIC path, firmware that hands over a different APIC mode, and real SRATs.

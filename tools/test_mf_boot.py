@@ -24,7 +24,7 @@ CODE_CANDIDATES = ["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_CODE
 VARS_CANDIDATES = ["/usr/share/OVMF/OVMF_VARS_4M.fd", "/usr/share/OVMF/OVMF_VARS.fd",
                    "/usr/share/edk2/ovmf/OVMF_VARS.fd", "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd"]
 BIOS = os.environ.get("FOS_FIRMWARE") == "bios"
-FINAL = "slice 2 reached the end of boot"
+FINAL = "slice 3 reached the end of boot"
 
 
 def find(variable, candidates):
@@ -50,7 +50,7 @@ def section(path: Path, name: str):
     return from_abi.stdout if from_abi.returncode == 0 else None
 
 
-def boot(cpus: int) -> str:
+def boot(cpus: int, numa: bool = False) -> str:
     code, variables = find("FOS_OVMF_CODE", CODE_CANDIDATES), find("FOS_OVMF_VARS", VARS_CANDIDATES)
     with tempfile.TemporaryDirectory() as tmp:
         vars_copy = Path(tmp) / "vars.fd"
@@ -60,6 +60,10 @@ def boot(cpus: int) -> str:
                    "-drive", f"if=pflash,format=raw,readonly=on,file={code}",
                    "-drive", f"if=pflash,format=raw,file={vars_copy}",
                    "-drive", f"format=raw,file={IMAGE},snapshot=on"]
+        if numa:
+            half = cpus // 2
+            command += ["-object", "memory-backend-ram,id=m0,size=256M", "-object", "memory-backend-ram,id=m1,size=256M",
+                        "-numa", f"node,nodeid=0,cpus=0-{half - 1},memdev=m0", "-numa", f"node,nodeid=1,cpus={half}-{cpus - 1},memdev=m1"]
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         raw = bytearray()
         deadline = time.monotonic() + 90
@@ -85,7 +89,7 @@ def main():
         raise SystemExit(f"{IMAGE} missing; run `make image-mf` first")
     for cpus in (1, 2, 8):
         text = boot(cpus)
-        check("Fosfor OS server kernel (mf, slice 2)" in text, f"-smp {cpus}: the server kernel announces itself", text)
+        check("Fosfor OS server kernel (mf, slice 3)" in text, f"-smp {cpus}: the server kernel announces itself", text)
         check("BootInfo: version" in text and "is not valid" not in text, f"-smp {cpus}: the loader's BootInfo is valid", text)
         match = re.search(r"Memory map: (\d+) regions, (\d+) MiB of RAM-like memory, (\d+) MiB conventional", text)
         check(match is not None and int(match.group(2)) >= 400 and int(match.group(3)) >= 100,
@@ -99,7 +103,16 @@ def main():
         check("W^X holds" in text, f"-smp {cpus}: the kernel image is W^X with unmapped guards and page 0", text)
         check("written and read back at 0xffff8000" in text, f"-smp {cpus}: a frame is reachable through the direct map", text)
         check("Heap: self-test passed" in text, f"-smp {cpus}: the heap passes its self-test (including growth)", text)
+        check("a breakpoint came back through the IDT" in text, f"-smp {cpus}: the GDT/TSS/IDT work (int3 handled and resumed)", text)
+        acpi = re.search(r"ACPI: revision \d, local APIC at 0x[0-9a-f]+, (\d+) CPU\(s\), (\d+) I/O APIC", text)
+        check(acpi is not None and int(acpi.group(1)) == cpus and int(acpi.group(2)) >= 1, f"-smp {cpus}: the MADT lists {cpus} CPU(s)", text)
+        check(re.search(r"I/O APIC: \d+ pins, all masked", text) is not None, f"-smp {cpus}: the I/O APIC is found and masked", text)
+        ticks = re.search(r"APIC timer: 100 Hz tick, (\d+) ticks in 200 ms", text)
+        check(ticks is not None and 15 <= int(ticks.group(1)) <= 25, f"-smp {cpus}: the calibrated APIC timer ticks at 100 Hz", text)
         check("PANIC" not in text, f"-smp {cpus}: no panic", text)
+    text = boot(4, numa=True)
+    check(re.search(r"SRAT: 2 NUMA node\(s\), \d+ memory range\(s\), 4 CPU affinity", text) is not None, "-numa: the SRAT shows two nodes and four CPUs", text)
+    check("PANIC" not in text and "CPU exception" not in text, "-numa: no panic", text)
     flavour = section(TARGET / "fosfor-kernel-mf", ".fos_flavour")
     check(flavour == b"mf", f"the server kernel's ELF says mf (got {flavour!r})")
     embedded = section(TARGET / "fosfor-kernel", ".fos_flavour")

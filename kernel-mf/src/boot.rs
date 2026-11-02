@@ -11,6 +11,7 @@ const MAX_DESCRIPTORS: usize = 1024;
 pub struct Machine {
     pub kernel_base: u64,
     pub kernel_size: u64,
+    pub acpi_rsdp: u64,
     pub framebuffer: Framebuffer,
     /// 0 on a BIOS boot (the loader has no firmware services to leave behind).
     pub runtime_services: u64,
@@ -28,6 +29,7 @@ impl Machine {
         let mut machine = Machine {
             kernel_base: info.kernel_base,
             kernel_size: info.kernel_size,
+            acpi_rsdp: info.acpi_rsdp,
             framebuffer: info.framebuffer,
             runtime_services: info.runtime_services,
             info_page: info as *const BootInfo as u64,
