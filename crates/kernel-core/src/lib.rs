@@ -37,6 +37,8 @@ pub mod lineedit;
 pub mod loopback;
 pub mod mounts;
 pub mod nic;
+#[cfg(target_arch = "x86_64")]
+pub mod nicpark;
 pub mod nvme;
 pub mod pci;
 pub mod rtl8139;

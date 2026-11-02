@@ -220,5 +220,7 @@ by any test: USB serial adapters, the Pi 4 console and GIC paths (hardware only)
   `virtio_blk` (Pi/QEMU aarch64) are in core. Left in the kernel on purpose: `nicpark` (needs the `term` NIC table), the Pi
   SoC drivers (`genet`, `sdhci`, `gpio`, `i2c`, `i2s_pi`, `mailbox`, `pipower`: they sit on the aarch64 HAL and only matter
   on a Pi), the PS/2 `keyboard` and the shells.
-- Next: a NIC registry out of `term` (so `nicpark` and the NIC shell can move), then the server kernel's own `Platform`.
+- Slice 10e, the NIC table: `nic::install/count/at/all_interrupt_driven` and `MAX_NICS` live in core (`term` keeps thin
+  wrappers and the frame FIFOs), so `nicpark` moved too. `fos_hal::timer::TICK_HZ` (100 on both arches) is new.
+- Next: the frame FIFOs and `nic_*` wrappers out of `term` (then `nicshell`), then the server kernel's own `Platform`.
   The server kernel needs all of them; only the real-time guarantees (interrupt-context audio refills) differ.
