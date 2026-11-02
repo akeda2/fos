@@ -203,6 +203,7 @@ fn is_ptp_event(frame: &[u8]) -> bool {
     }
     false
 }
+#[allow(dead_code)] // register map, kept complete
 const REG_RDLEN: usize = 0x2808;
 #[allow(dead_code)]
 const REG_RDH: usize = 0x2810;

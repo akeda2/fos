@@ -53,6 +53,38 @@ impl Platform for RamDisks {
         42
     }
 
+    // No hardware on the host: the storage tests never reach these.
+    fn allocate_contiguous(&self, _: u64, _: Option<u64>) -> Option<u64> {
+        None
+    }
+    fn map_device(&self, _: u64, _: u64) {}
+    fn wait_ticks(&self, _: u64) {}
+    fn pci_read32(&self, _: u8, _: u8, _: u8, _: u8) -> u32 {
+        u32::MAX
+    }
+    fn pci_write32(&self, _: u8, _: u8, _: u8, _: u8, _: u32) {}
+    fn msi_allocate(&self, _: fn(usize), _: usize) -> Option<u8> {
+        None
+    }
+    fn msi_release(&self, _: u8) {}
+    fn msi_count(&self, _: u8) -> u64 {
+        0
+    }
+    fn msi_claim(&self) {}
+    fn msi_intx_candidates(&self, _: u8) -> [u32; 9] {
+        [u32::MAX; 9]
+    }
+    fn msi_attach_intx(&self, _: u32, _: fn(usize), _: usize) -> Option<u8> {
+        None
+    }
+    fn msi_detach_intx(&self, _: u8, _: usize) {}
+    fn interrupt_target(&self) -> u32 {
+        0
+    }
+    fn gsi_range(&self) -> (u32, u32) {
+        (0, 0)
+    }
+
     fn print(&self, _: core::fmt::Arguments) {}
 }
 

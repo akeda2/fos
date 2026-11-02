@@ -48,6 +48,53 @@ pub trait Platform: Sync {
     fn timer_ticks(&self) -> u64;
     /// Console text, as `println!` produces it.
     fn print(&self, arguments: fmt::Arguments);
+
+    // The machine: what drivers in `kernel-core` ask of the core underneath. One indirect call each; a port access or a
+    // PCI config cycle costs far more than that, and nothing on a packet's hot path uses them.
+
+    /// `count` zeroed physically contiguous 4 KiB frames, entirely below `below` when given; the physical address.
+    fn allocate_contiguous(&self, count: u64, below: Option<u64>) -> Option<u64>;
+    /// Maps `length` bytes of device registers at physical `address` (identity, uncached, never executable).
+    fn map_device(&self, address: u64, length: u64);
+    fn wait_ticks(&self, count: u64);
+
+    fn pci_read32(&self, bus: u8, device: u8, function: u8, offset: u8) -> u32;
+    fn pci_write32(&self, bus: u8, device: u8, function: u8, offset: u8, value: u32);
+    /// The CPU address of a PCI memory address (identity unless a bridge translates).
+    fn pci_cpu_address(&self, pci: u64) -> u64 {
+        pci
+    }
+
+    /// Legacy port I/O (x86 only; other cores read all ones and ignore writes).
+    fn port_in8(&self, _port: u16) -> u8 {
+        0xff
+    }
+    fn port_in16(&self, _port: u16) -> u16 {
+        0xffff
+    }
+    fn port_in32(&self, _port: u16) -> u32 {
+        0xffff_ffff
+    }
+    fn port_out8(&self, _port: u16, _value: u8) {}
+    fn port_out16(&self, _port: u16, _value: u16) {}
+    fn port_out32(&self, _port: u16, _value: u32) {}
+    /// Disables interrupts and says whether they were on; `interrupts_restore` undoes it.
+    fn interrupts_save_and_disable(&self) -> bool {
+        false
+    }
+    fn interrupts_restore(&self, _was_enabled: bool) {}
+
+    /// Message-signalled and legacy interrupts: claim a vector for `handler(context)`, and so on.
+    fn msi_allocate(&self, handler: fn(usize), context: usize) -> Option<u8>;
+    fn msi_release(&self, vector: u8);
+    fn msi_count(&self, vector: u8) -> u64;
+    fn msi_claim(&self);
+    fn msi_intx_candidates(&self, interrupt_line: u8) -> [u32; 9];
+    fn msi_attach_intx(&self, gsi: u32, handler: fn(usize), context: usize) -> Option<u8>;
+    fn msi_detach_intx(&self, vector: u8, context: usize);
+    /// The interrupt controller id MSI messages are addressed to, and the range of GSIs the I/O APIC serves.
+    fn interrupt_target(&self) -> u32;
+    fn gsi_range(&self) -> (u32, u32);
 }
 
 static mut PLATFORM: Option<&'static dyn Platform> = None;
@@ -94,6 +141,12 @@ pub mod block {
 }
 
 pub mod timer {
+    pub fn wait_ticks(count: u64) {
+        if let Some(platform) = super::platform() {
+            platform.wait_ticks(count);
+        }
+    }
+
     pub fn micros() -> u64 {
         super::platform().map_or(0, |platform| platform.timer_micros())
     }
@@ -112,6 +165,115 @@ pub mod clock {
     pub fn unix_seconds() -> u64 {
         super::platform().map_or(0, |platform| platform.unix_seconds())
     }
+}
+
+/// Physical memory.
+pub mod memory {
+    pub const FRAME: u64 = 4096;
+
+    pub fn allocate_contiguous(count: u64, below: Option<u64>) -> Option<u64> {
+        super::platform()?.allocate_contiguous(count, below)
+    }
+}
+
+pub mod paging {
+    pub fn map_device(address: u64, length: u64) {
+        if let Some(platform) = super::platform() {
+            platform.map_device(address, length);
+        }
+    }
+}
+
+/// PCI configuration space, by bus/device/function/offset.
+pub mod pci_config {
+    pub fn read32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+        super::platform().map_or(0xffff_ffff, |platform| platform.pci_read32(bus, device, function, offset))
+    }
+
+    pub fn write32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
+        if let Some(platform) = super::platform() {
+            platform.pci_write32(bus, device, function, offset, value);
+        }
+    }
+
+    pub fn cpu_address(pci: u64) -> u64 {
+        super::platform().map_or(pci, |platform| platform.pci_cpu_address(pci))
+    }
+}
+
+/// Port I/O and the interrupt flag (x86).
+pub mod cpu {
+    pub fn inb(port: u16) -> u8 {
+        super::platform().map_or(0xff, |platform| platform.port_in8(port))
+    }
+    pub fn inw(port: u16) -> u16 {
+        super::platform().map_or(0xffff, |platform| platform.port_in16(port))
+    }
+    pub fn inl(port: u16) -> u32 {
+        super::platform().map_or(0xffff_ffff, |platform| platform.port_in32(port))
+    }
+    pub fn outb(port: u16, value: u8) {
+        if let Some(platform) = super::platform() {
+            platform.port_out8(port, value);
+        }
+    }
+    pub fn outw(port: u16, value: u16) {
+        if let Some(platform) = super::platform() {
+            platform.port_out16(port, value);
+        }
+    }
+    pub fn outl(port: u16, value: u32) {
+        if let Some(platform) = super::platform() {
+            platform.port_out32(port, value);
+        }
+    }
+    pub fn interrupts_save_and_disable() -> bool {
+        super::platform().is_some_and(|platform| platform.interrupts_save_and_disable())
+    }
+    pub fn interrupts_restore(was_enabled: bool) {
+        if let Some(platform) = super::platform() {
+            platform.interrupts_restore(was_enabled);
+        }
+    }
+}
+
+/// Interrupt vectors for devices.
+pub mod msi {
+    pub fn allocate(handler: fn(usize), context: usize) -> Option<u8> {
+        super::platform()?.msi_allocate(handler, context)
+    }
+    pub fn release(vector: u8) {
+        if let Some(platform) = super::platform() {
+            platform.msi_release(vector);
+        }
+    }
+    pub fn count(vector: u8) -> u64 {
+        super::platform().map_or(0, |platform| platform.msi_count(vector))
+    }
+    pub fn claim() {
+        if let Some(platform) = super::platform() {
+            platform.msi_claim();
+        }
+    }
+    pub fn intx_candidates(interrupt_line: u8) -> [u32; 9] {
+        super::platform().map_or([u32::MAX; 9], |platform| platform.msi_intx_candidates(interrupt_line))
+    }
+    pub fn attach_intx(gsi: u32, handler: fn(usize), context: usize) -> Option<u8> {
+        super::platform()?.msi_attach_intx(gsi, handler, context)
+    }
+    pub fn detach_intx(vector: u8, context: usize) {
+        if let Some(platform) = super::platform() {
+            platform.msi_detach_intx(vector, context);
+        }
+    }
+}
+
+pub fn interrupt_target() -> u32 {
+    platform().map_or(0, |platform| platform.interrupt_target())
+}
+
+pub fn gsi_range() -> (u32, u32) {
+    platform().map_or((0, 0), |platform| platform.gsi_range())
 }
 
 /// `println!` for shared code: formats and hands the text to the platform's console.
