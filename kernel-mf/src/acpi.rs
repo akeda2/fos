@@ -54,11 +54,16 @@ pub struct Fadt {
     /// I/O port of the PM timer (3.579545 MHz), 0 if the chipset has none.
     pub pm_timer_port: u16,
     pub pm_timer_32_bit: bool,
+    /// The reset register as (I/O port, value), when the FADT has one and it lives in I/O space.
+    pub reset: Option<(u16, u8)>,
 }
 
 pub fn fadt(tables: &Tables) -> Option<Fadt> {
     let table = tables.find(b"FACP")?;
-    Some(Fadt { pm_timer_port: read::<u32>(table + 76) as u16, pm_timer_32_bit: read::<u32>(table + 112) & (1 << 8) != 0 })
+    let flags = read::<u32>(table + 112);
+    // RESET_REG is a 12-byte generic address at 116 (space id, width, offset, size, 64-bit address); the value is at 128.
+    let reset = (flags & (1 << 10) != 0 && read::<u8>(table + 116) == 1).then(|| (read::<u64>(table + 120) as u16, read::<u8>(table + 128)));
+    Some(Fadt { pm_timer_port: read::<u32>(table + 76) as u16, pm_timer_32_bit: flags & (1 << 8) != 0, reset })
 }
 
 pub const MAX_CPUS: usize = 256;

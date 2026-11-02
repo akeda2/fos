@@ -185,7 +185,7 @@ kernel:
 
 # The server kernel (kernel-mf/, docs/big-kernel.md): same loaders, same image layout, its own crate.
 KERNEL_MF_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel-mf
-.PHONY: kernel-mf image-mf test-mf-boot
+.PHONY: kernel-mf image-mf test-mf-boot test-mf-net
 kernel-mf:
 	cd kernel-mf && cargo +nightly-2026-09-13 build --release
 
@@ -199,6 +199,10 @@ image-mf: loader kernel-mf $(BIOS_STAGES)
 test-mf-boot: image-mf $(BIOS_OUT)/shim/qemu-system-x86_64
 	python3 tools/test_mf_boot.py
 	PATH=$(abspath $(BIOS_SHIM)):$$PATH FOS_FIRMWARE=bios python3 tools/test_mf_boot.py
+
+# The server kernel's network console, discovery and KUP with the loader's A/B promotion (the harness is test_debug_mode's).
+test-mf-net: image-mf
+	python3 tools/test_mf_net.py
 
 # Every v2 tape (ELF64 PIE executables for the 64-bit tape ABI).
 .PHONY: tapes
