@@ -371,3 +371,14 @@ flavour marker reaches `fosadm status`, and whether the batch queue needs the sc
   AHCI/e1000 paths still work; the embedded kernel was re-run through `make test`, `test-nic`, `test-rtl8139`, `test-hda`,
   `test-usb-audio`, `test-xhci-abort`, `test-usb-kbd-replug` (offset 0, nothing should change). Only real hardware shows xHCI/EHCI/OHCI, HDA
   and RTL8168 behind the direct map (64-bit BARs above the RAM top are mapped on demand).
+- Slice 8b (ring 3) is built: `process.rs`, `syscall` path, per-process page tables. A process is a kernel thread plus a root page
+  table (`vm::create_user_space`): PML4 slot 0 (kernel image) and 256..511 (direct map, stacks; pre-populated so copies stay valid)
+  are shared, user pages (U bit, slots 1..255, from 512 GiB) are private and freed with the process (`vm::destroy_user_space`). The
+  scheduler loads CR3 and the TSS rsp0/`Cpu::kernel_rsp` at every switch. The GDT has user data/code (0x1b/0x23); interrupt stubs
+  `swapgs` when they come from ring 3 (`gen_isr_stubs.py --swapgs`); `syscall` (STAR/LSTAR/SFMASK, SMEP on when present) builds an
+  interrupt-style frame and shares the `iretq` return. Calls: write, exit, yield, sleep, ticks; pointers are checked page by page
+  (`vm::user_range_ok`). A ring 3 exception kills only the process; `sched::kill` ends a spinner at its next tick. `user_test.rs`
+  runs five hand-assembled processes and checks frames come back; `test-mf-boot` at `-smp` 1/2/8. Found on the way: stack slots
+  of dead threads are no longer reused (another CPU's stale TLB entry made a new thread run on zeroed memory; needs a shootdown IPI).
+  Not yet: ELF loading, FP/SSE/XSAVE state (user SSE gives #UD), SMAP, a user stack guard page, the tape API. Only real hardware
+  shows ring transitions, SYSCALL MSRs, SMEP and swapgs on silicon.

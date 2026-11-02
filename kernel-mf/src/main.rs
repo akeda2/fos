@@ -8,7 +8,9 @@ extern crate alloc;
 
 #[macro_use]
 mod serial;
+mod process;
 mod sched;
+mod user_test;
 mod fb;
 mod config;
 mod net;
@@ -44,7 +46,7 @@ use alloc::{boxed::Box, collections::BTreeMap, string::String, vec::Vec};
 use core::panic::PanicInfo;
 use fosfor_abi::{BootInfo, TYPE_CONVENTIONAL};
 
-core::arch::global_asm!(include_str!("../../kernel/src/arch/x86_64/isr_stubs.S"));
+core::arch::global_asm!(include_str!("isr_stubs.S"));
 
 unsafe extern "C" {
     static __ist_top: u8;
@@ -84,7 +86,7 @@ fn mib(bytes: u64) -> u64 {
 pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     serial::init();
     println!();
-    println!("Fosfor OS server kernel (mf, slice 7): running in 64-bit long mode.");
+    println!("Fosfor OS server kernel (mf, slice 8): running in 64-bit long mode.");
 
     let info = unsafe { &*info };
     if !info.is_valid() {
@@ -155,6 +157,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     percpu::activate(0, &raw const __ist_top as u64);
     idt::build();
     idt::load();
+    process::init_cpu();
     let before = trap::BREAKPOINTS.load(core::sync::atomic::Ordering::Relaxed);
     unsafe { core::arch::asm!("int3") };
     assert_eq!(trap::BREAKPOINTS.load(core::sync::atomic::Ordering::Relaxed), before + 1);
@@ -229,7 +232,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     net::init();
     sched_selftest();
     sched::spawn("service", service_thread, 0).expect("the service thread");
-    println!("kernel-mf: slice 7 reached the end of boot; entering the service loop.");
+    println!("kernel-mf: slice 8 reached the end of boot; entering the service loop.");
     shell::prompt();
     // The boot context is the idle thread: it runs when nothing else is ready and sleeps until the next interrupt.
     loop {
@@ -439,4 +442,5 @@ fn sched_selftest() {
     }
     sched_preempt_selftest();
     sched_smp_selftest();
+    user_test::run();
 }

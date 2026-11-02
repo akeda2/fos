@@ -109,6 +109,7 @@ extern "sysv64" fn ap_main(index: u64) -> ! {
     let cpu = percpu::get(index as usize);
     percpu::activate(index as usize, cpu.ist_top);
     idt::load();
+    crate::process::init_cpu();
     apic::enable_this_cpu();
     apic::start_local_timer();
     cpu.apic_id = apic::id();

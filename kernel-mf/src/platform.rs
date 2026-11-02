@@ -1,6 +1,6 @@
 //! kernel-mf's answer to `fos_hal::Platform`: what the shared drivers in `kernel-core` need from the machine. Same contract
 //! as the embedded kernel's `platform.rs`. Differences: device memory is mapped through the direct map (`vm`) and the drivers reach it with `memory::phys_to_virt`, all device
-//! interrupts go to the boot CPU, and there are no tasks yet (the defaults stand in until the scheduler, slice 7).
+//! interrupts go to the boot CPU, and there are no tasks yet (the defaults stand in until the scheduler, slice 8).
 
 use fos_hal::{BlockError, BlockInfo, Platform};
 

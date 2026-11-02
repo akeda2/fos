@@ -25,7 +25,7 @@ CODE_CANDIDATES = ["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_CODE
 VARS_CANDIDATES = ["/usr/share/OVMF/OVMF_VARS_4M.fd", "/usr/share/OVMF/OVMF_VARS.fd",
                    "/usr/share/edk2/ovmf/OVMF_VARS.fd", "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd"]
 BIOS = os.environ.get("FOS_FIRMWARE") == "bios"
-FINAL = "slice 7 reached the end of boot"
+FINAL = "slice 8 reached the end of boot"
 
 
 def find(variable, candidates):
@@ -90,7 +90,7 @@ def main():
         raise SystemExit(f"{IMAGE} missing; run `make image-mf` first")
     for cpus in (1, 2, 8):
         text = boot(cpus)
-        check("Fosfor OS server kernel (mf, slice 7)" in text, f"-smp {cpus}: the server kernel announces itself", text)
+        check("Fosfor OS server kernel (mf, slice 8)" in text, f"-smp {cpus}: the server kernel announces itself", text)
         check("BootInfo: version" in text and "is not valid" not in text, f"-smp {cpus}: the loader's BootInfo is valid", text)
         match = re.search(r"Memory map: (\d+) regions, (\d+) MiB of RAM-like memory, (\d+) MiB conventional", text)
         check(match is not None and int(match.group(2)) >= 400 and int(match.group(3)) >= 100,
@@ -127,6 +127,9 @@ def main():
         check(pre is not None, f"-smp {cpus}: the tick preempts threads that never yield; sleep and the sleeping mutex work", text)
         smp_run = re.search(r"Scheduler: SMP ok \((\d+) unpinned threads ran on (\d+) of (\d+) CPU\(s\)\)", text)
         check(smp_run is not None and int(smp_run.group(2)) == cpus == int(smp_run.group(3)), f"-smp {cpus}: unpinned threads run on every CPU", text)
+        check("Hello from ring 3!" in text, f"-smp {cpus}: a ring 3 process makes system calls", text)
+        check(re.search(r"Ring 3: hello ok, bad pointer ok, page fault ok, #GP ok, preempted spinner ok, 0 frames not returned\.", text) is not None,
+              f"-smp {cpus}: ring 3 processes: syscalls, pointer checks, faults kill only the process, user code is preempted, memory returns", text)
         micros = re.search(r"Clock: .* \(microseconds (\d+)\)", text)
         check(micros is not None and int(micros.group(1)) > 150_000, f"-smp {cpus}: the monotonic microsecond clock runs", text)
         check("PANIC" not in text and "CPU exception" not in text, f"-smp {cpus}: no panic", text)
