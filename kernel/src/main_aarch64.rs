@@ -17,7 +17,6 @@ mod mailbox;
 mod pipower;
 mod i2s_pi;
 mod diag;
-mod netdump;
 mod netfs;
 mod nicshell;
 mod netservice;
@@ -48,7 +47,6 @@ mod usb_kbd;
 mod usb_pointer;
 mod usbshell;
 mod usb_register;
-mod virtio_blk;
 
 /// Everything printed since boot (`dmesg`), also replayed onto the screen once the framebuffer console exists (a Pi shows
 /// nothing on a silent serial port otherwise). Bytes beyond the buffer are dropped.

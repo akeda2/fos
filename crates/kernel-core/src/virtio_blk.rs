@@ -195,8 +195,8 @@ fn bring_up(device: &pci::Device, slot: usize) -> Option<Drive> {
         return None;
     }
     w16(24, QUEUE_SIZE);
-    let page = memory::allocate()?;
-    let request = memory::allocate()?;
+    let page = memory::allocate_contiguous(1, None)?;
+    let request = memory::allocate_contiguous(1, None)?;
     w64(32, page);
     w64(40, page + 256);
     w64(48, page + 512);

@@ -8,7 +8,7 @@ impl core::fmt::Display for Mac<'_> {
     }
 }
 
-pub use kernel_core::line::Line;
+pub use crate::line::Line;
 
 /// One line about a frame: the addresses, the type and what is inside, as far as the common protocols go.
 pub fn describe_frame(frame: &[u8], line: &mut Line) {

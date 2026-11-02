@@ -8,11 +8,9 @@ mod debug;
 mod kup_serial;
 mod kupshell;
 mod diag;
-mod netdump;
 mod netfs;
 mod nicshell;
 mod nicpark;
-mod gpu;
 mod formatshell;
 mod fault;
 mod platform;
@@ -34,8 +32,7 @@ mod tapesync;
 mod gpio;
 mod gpio_remote;
 mod gpio_shell;
-mod serialports;
-mod uart;
+
 mod term;
 mod termsession;
 

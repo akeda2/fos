@@ -45,15 +45,7 @@ struct Port {
 static mut PORTS: [Option<Port>; 3] = [const { None }, const { None }, const { None }];
 static mut PROBED: bool = false;
 
-fn outb(port: u16, value: u8) {
-    unsafe { core::arch::asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack)) };
-}
-
-fn inb(port: u16) -> u8 {
-    let value: u8;
-    unsafe { core::arch::asm!("in al, dx", in("dx") port, out("al") value, options(nomem, nostack)) };
-    value
-}
+use crate::cpu::{inb, outb};
 
 /// True if a 16550 answers at `base`: the scratch register keeps two different patterns, and the line status is not 0xff.
 fn present(base: u16) -> bool {
