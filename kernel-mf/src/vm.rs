@@ -212,6 +212,43 @@ pub fn check_image() -> bool {
     ok
 }
 
+/// Makes sure `[physical, physical + length)` is reachable through the direct map, mapping any missing 4 KiB page uncached
+/// and no-execute: for firmware tables the memory map does not describe, and for device registers (the APICs, later PCI BARs).
+/// A page that is already mapped (RAM) is left as it is.
+pub fn map_device(physical: u64, length: u64) {
+    let root = root();
+    let mut page = physical & !(PAGE - 1);
+    while page < physical + length.max(1) {
+        if translate(direct(page)).is_none() {
+            map_page(root, DIRECT_BASE + page, page, WRITABLE | NO_EXECUTE | CACHE_DISABLE | WRITE_THROUGH);
+            unsafe { core::arch::asm!("invlpg [{}]", in(reg) DIRECT_BASE + page, options(nostack, preserves_flags)) };
+        }
+        page += PAGE;
+    }
+}
+
+/// What a faulting address is, for the exception report.
+pub fn describe(address: u64) -> &'static str {
+    let l = layout();
+    if address < PAGE {
+        "the null page (a null pointer was used)"
+    } else if (l.stack_guard..l.stack_bottom).contains(&address) {
+        "the kernel stack guard page (stack overflow)"
+    } else if (l.ist_guard..l.ist_guard + PAGE).contains(&address) {
+        "the double-fault stack guard page"
+    } else if (l.text.0..l.text.1).contains(&address) {
+        "kernel code (read-only)"
+    } else if (l.rodata.0..l.rodata.1).contains(&address) {
+        "kernel read-only data"
+    } else if (l.image.0..l.image.1).contains(&address) {
+        "kernel data"
+    } else if address >= DIRECT_BASE {
+        "the direct map (physical memory)"
+    } else {
+        "unmapped memory"
+    }
+}
+
 /// Builds the tables and switches to them. After this, only what the module comment lists is reachable.
 pub fn init(machine: &Machine) -> u64 {
     let layout = layout();

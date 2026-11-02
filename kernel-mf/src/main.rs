@@ -8,14 +8,28 @@ extern crate alloc;
 
 #[macro_use]
 mod serial;
+mod acpi;
+mod apic;
 mod boot;
+mod cpu;
+#[path = "../../kernel/src/arch/x86_64/gdt.rs"]
+mod gdt;
 mod heap;
+#[path = "../../kernel/src/arch/x86_64/idt.rs"]
+mod idt;
 mod pmm;
+mod trap;
 mod vm;
 
 use alloc::{boxed::Box, collections::BTreeMap, string::String, vec::Vec};
 use core::panic::PanicInfo;
 use fosfor_abi::{BootInfo, TYPE_CONVENTIONAL};
+
+core::arch::global_asm!(include_str!("../../kernel/src/arch/x86_64/isr_stubs.S"));
+
+unsafe extern "C" {
+    static __ist_top: u8;
+}
 
 /// Read by KUP, `fosadm` and the tests from the ELF section table, so the two kernels are never mixed up.
 #[used]
@@ -51,7 +65,7 @@ fn mib(bytes: u64) -> u64 {
 pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     serial::init();
     println!();
-    println!("Fosfor OS server kernel (mf, slice 2): running in 64-bit long mode.");
+    println!("Fosfor OS server kernel (mf, slice 3): running in 64-bit long mode.");
 
     let info = unsafe { &*info };
     if !info.is_valid() {
@@ -108,7 +122,45 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     heap_self_test();
     let heap = heap::stats();
     println!("Heap: self-test passed, {} KiB in the heap, {} KiB free.", heap.total / 1024, heap.free / 1024);
-    println!("kernel-mf: slice 2 reached the end of boot; halting.");
+
+    // ---- interrupts ----
+    gdt::load(&raw const __ist_top as u64);
+    idt::load();
+    let before = trap::BREAKPOINTS.load(core::sync::atomic::Ordering::Relaxed);
+    unsafe { core::arch::asm!("int3") };
+    assert_eq!(trap::BREAKPOINTS.load(core::sync::atomic::Ordering::Relaxed), before + 1);
+    println!("Interrupts: GDT, TSS (double-fault stack) and IDT loaded; a breakpoint came back through the IDT.");
+
+    // ---- ACPI, APICs, timer ----
+    let Some(tables) = acpi::open(machine.acpi_rsdp) else {
+        println!("ACPI: no valid RSDP: stopping.");
+        halt();
+    };
+    let (Some(fadt), Some(madt)) = (acpi::fadt(&tables), acpi::madt(&tables)) else {
+        println!("ACPI: FADT or MADT missing: stopping.");
+        halt();
+    };
+    println!("ACPI: revision {}, local APIC at {:#x}, {} CPU(s), {} I/O APIC(s), PM timer port {:#x}.", tables.revision, madt.local_apic_address, madt.cpu_count, madt.io_apics, fadt.pm_timer_port);
+    match acpi::srat(&tables) {
+        Some(srat) => println!("SRAT: {} NUMA node(s), {} memory range(s), {} CPU affinity entries.", srat.nodes, srat.memory_count, srat.cpu_affinities),
+        None => println!("SRAT: none (one NUMA node)."),
+    }
+    let Some(timer) = apic::start_timer(&fadt, madt.local_apic_address) else {
+        println!("APIC: no local APIC or PM timer: stopping.");
+        halt();
+    };
+    println!("Local APIC: id {}, {} at {:#x}, timer {} kHz.", apic::id(), if timer.x2apic { "x2APIC" } else { "xAPIC" }, timer.base, timer.timer_hz / 1000);
+    match apic::ioapic::init(&madt) {
+        Some(pins) => println!("I/O APIC: {pins} pins, all masked."),
+        None => println!("I/O APIC: none."),
+    }
+    cpu::interrupts_enable();
+    let start = apic::ticks();
+    apic::busy_wait_ms(200);
+    let ticks = apic::ticks() - start;
+    println!("APIC timer: {} Hz tick, {ticks} ticks in 200 ms of PM-timer time.", apic::TICK_HZ);
+    cpu::interrupts_disable();
+    println!("kernel-mf: slice 3 reached the end of boot; halting.");
     halt();
 }
 
