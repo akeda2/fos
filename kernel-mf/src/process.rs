@@ -261,6 +261,7 @@ pub fn terminate(how: How) -> ! {
     }
     crate::tapefs::process_ended(thread);
     crate::tapenet::process_ended(thread);
+    crate::tapeaudio::process_ended(thread);
     crate::shell::end_foreground(thread);
     sched::exit()
 }
