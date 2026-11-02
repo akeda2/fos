@@ -29,7 +29,6 @@ mod nicshell;
 mod netservice;
 mod termsession;
 mod memory;
-mod pci;
 mod service_host;
 mod shell;
 mod shellcmds;

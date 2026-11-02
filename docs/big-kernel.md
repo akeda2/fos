@@ -183,4 +183,9 @@ by any test: USB serial adapters, the Pi 4 console and GIC paths (hardware only)
   `block_info` (size and model) and `block_count`. Host test finds volumes by label. x86 kernel 1,169,944 bytes. Verified:
   `make test`, `test-mounts`, `test-fat-shell`, `test-fs-read-at`, `test-recorder-fat`, `test-config-fat`, `test-format-exfat`,
   `test-fosfs4`, `test-v4-boot`, `test-grow`, aarch64 build.
-- Next: NICs (the first driver slice), then storage, USB, audio.
+- Sixth slice: `pci` and the x86 NIC drivers (`e1000`, `rtl8168`, `rtl8139`, `threecom`, `nic`). The `Platform` gained physical
+  memory, device mapping, PCI config, MSI/INTx, port I/O, interrupt masking and APIC routing calls; all are setup paths, the
+  packet path stays MMIO. aarch64 keeps `genet` and gets stubs for the INTx calls. x86 kernel 1,172,088 bytes. Verified:
+  `make test`, `test-nic`, `test-rtl8139`, `test-hda`, `test-xhci-abort`, `test-mounts`, `test-fosfs4`, aarch64 build.
+  Real queue, DMA and interrupt behaviour on silicon only shows on hardware.
+- Next: storage (`ahci`, `nvme`), USB, audio.
