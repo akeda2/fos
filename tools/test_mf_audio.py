@@ -24,8 +24,8 @@ CODE = next(p for p in ["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF
                         "/usr/share/edk2/ovmf/OVMF_CODE.fd"] if Path(p).exists())
 
 
-def run(smp, tmp):
-    wav_in, wav_out = tmp / "a.wav", tmp / f"out{smp}.wav"
+def run(smp, tmp, usb=False):
+    wav_in, wav_out = tmp / "a.wav", tmp / f"out{smp}{"u" if usb else ""}.wav"
     write_wav(wav_in, 48_000, 2, 2, 440, 1.5)
     image = tmp / f"audio{smp}.img"
     subprocess.run([sys.executable, str(ROOT / "tools/build_image.py"), "--loader", str(LOADER), "--kernel", str(KERNEL), "--output", str(image),
@@ -33,7 +33,7 @@ def run(smp, tmp):
                     "--file", f"play={TAPES / 'play'}", "--file", f"record={TAPES / 'record'}", "--file", f"a.wav={wav_in}"], check=True, capture_output=True)
     qemu = subprocess.Popen(
         ["qemu-system-x86_64", "-cpu", "max", "-machine", "q35", "-m", "512", "-smp", str(smp), "-display", "none", "-serial", "stdio",
-         "-monitor", "none", "-no-reboot", "-audiodev", f"wav,id=snd,path={wav_out}", "-device", "intel-hda", "-device", "hda-duplex,audiodev=snd",
+         "-monitor", "none", "-no-reboot", "-audiodev", f"wav,id=snd,path={wav_out}", *(["-device", "qemu-xhci", "-device", "usb-audio,audiodev=snd"] if usb else ["-device", "intel-hda", "-device", "hda-duplex,audiodev=snd"]),
          "-drive", f"if=pflash,format=raw,readonly=on,file={CODE}", "-drive", f"format=raw,file={image},snapshot=on"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     log = b""
@@ -58,8 +58,8 @@ def run(smp, tmp):
     try:
         if not wait_for("fos> ", 150):
             return "no shell prompt:\n" + log[-800:].decode("utf8", "replace")
-        if not wait_for("HD Audio", 1):
-            return "no HD Audio controller found:\n" + log[-1500:].decode("utf8", "replace")
+        if not wait_for("USB" if usb else "HD Audio", 1):
+            return "no audio controller found:\n" + log[-1500:].decode("utf8", "replace")
         problem = tape("play a.wav", ["Playing a.wav: 48000 Hz, 2 channel(s), 16-bit", "Finished"])
         if problem:
             return problem
@@ -91,9 +91,9 @@ def run(smp, tmp):
 
 failed = False
 with tempfile.TemporaryDirectory() as tmp:
-    for smp in (1, 2, 8):
-        problem = run(smp, Path(tmp))
-        print(f"-smp {smp}: {'ok' if problem is None else 'FAIL'}")
+    for smp, usb in ((1, False), (2, False), (8, False), (1, True), (2, True), (8, True)):
+        problem = run(smp, Path(tmp), usb)
+        print(f"-smp {smp} {'USB audio' if usb else 'HD Audio'}: {'ok' if problem is None else 'FAIL'}")
         if problem:
             print(problem)
             failed = True

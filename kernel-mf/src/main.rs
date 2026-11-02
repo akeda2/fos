@@ -235,7 +235,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
         slots::init(info, disk);
     }
     config::load();
-    kernel_core::hda::init_all(false);
+    kernel_core::hda::init_all(config::no_msi());
     slots::confirm_boot();
     net::init();
     usb::init();

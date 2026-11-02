@@ -11,10 +11,16 @@ static mut HOSTNAME_LENGTH: usize = 0;
 static mut DENY_TERM_NET: bool = false;
 static mut KERNEL_UPDATE: bool = false;
 static mut SWEDISH: bool = false;
+static mut NO_MSI: bool = false;
 
 /// `keymap sv` (or `se`, `fi`) in `settings`: what USB keyboards type. US otherwise.
 pub fn swedish() -> bool {
     unsafe { SWEDISH }
+}
+
+/// `no-msi` in `settings`: devices keep polling instead of taking message-signalled interrupts.
+pub fn no_msi() -> bool {
+    unsafe { NO_MSI }
 }
 
 /// The base name from the `hostname` file, if there is one.
@@ -69,6 +75,10 @@ pub fn load() {
             if words.next() == Some("keymap") && matches!(words.next(), Some("sv" | "se" | "fi")) {
                 unsafe { SWEDISH = true };
                 println!("settings: keymap sv -- USB keyboards type the Swedish/Finnish layout.");
+            }
+            if line.split_whitespace().next() == Some("no-msi") {
+                unsafe { NO_MSI = true };
+                println!("settings: no-msi -- devices are polled.");
             }
             if line.split_whitespace().next() == Some("deny-term-net") {
                 unsafe { DENY_TERM_NET = true };
