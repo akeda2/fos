@@ -10,7 +10,7 @@
 //! What a call is worth today: console (`putc`, `puts`), time (`ticks`, `micros`), memory (`alloc`/`free` map zeroed pages into
 //! the process; the address is virtual, not physical), `args`, `should_abort` (the process was killed), `fp_level`, `free_pages`,
 //! `console_size` and the pixel screen (`gfx_*`). Everything else answers 0 ("none", "failed"), which the tapes read as "this
-//! machine has no such device"; the `fs_*` calls go to `tapefs.rs`. Input, files, NICs, audio, MIDI, touch and GPIO come in
+//! machine has no such device"; the `fs_*` calls go to `tapefs.rs`, the `nic_*` calls to `tapenet.rs`. Input, files and NICs are served; audio, MIDI, touch and GPIO come in
 //! later slices (the drivers are unlocked and CPU-0 only; see docs/big-kernel.md). Processes are single-threaded.
 
 use core::mem::{offset_of, size_of};
@@ -18,7 +18,7 @@ use core::mem::{offset_of, size_of};
 use fosfor_abi::tape::{KEY_BASE, KEY_NONE, TAPE_API_VERSION, TapeApi};
 
 use crate::trap::Frame;
-use crate::{apic, fb, fpu, pmm, process, sched, tapefs, vm};
+use crate::{apic, fb, fpu, pmm, process, sched, tapefs, tapenet, vm};
 
 pub const SHIM_BASE: u64 = vm::USER_BASE + 0x200_0000;
 pub const TABLE_BASE: u64 = SHIM_BASE + 0x1000;
@@ -83,6 +83,26 @@ const FS_READ: u64 = slot(offset_of!(TapeApi, fs_read));
 const FS_WRITE: u64 = slot(offset_of!(TapeApi, fs_write));
 const FS_REMOVE: u64 = slot(offset_of!(TapeApi, fs_remove));
 const FS_LIST: u64 = slot(offset_of!(TapeApi, fs_list));
+const NIC_COUNT: u64 = slot(offset_of!(TapeApi, nic_count));
+const NIC_MAC: u64 = slot(offset_of!(TapeApi, nic_mac));
+const NIC_SEND: u64 = slot(offset_of!(TapeApi, nic_send));
+const NIC_RECEIVE: u64 = slot(offset_of!(TapeApi, nic_receive));
+const NIC_MAX_FRAME_LEN: u64 = slot(offset_of!(TapeApi, nic_max_frame_len));
+const NIC_SET_PROMISCUOUS: u64 = slot(offset_of!(TapeApi, nic_set_promiscuous));
+const NIC_SET_MULTICAST: u64 = slot(offset_of!(TapeApi, nic_set_multicast));
+const NIC_ACTIVE: u64 = slot(offset_of!(TapeApi, nic_active));
+const NIC_OWNED: u64 = slot(offset_of!(TapeApi, nic_owned));
+const NIC_TS_ENABLE: u64 = slot(offset_of!(TapeApi, nic_ts_enable));
+const NIC_TS_CLOCK: u64 = slot(offset_of!(TapeApi, nic_ts_clock));
+const NIC_TS_RX: u64 = slot(offset_of!(TapeApi, nic_ts_rx));
+const NIC_SEND_STAMPED: u64 = slot(offset_of!(TapeApi, nic_send_stamped));
+const NIC_TS_ADJUST: u64 = slot(offset_of!(TapeApi, nic_ts_adjust));
+const NIC_TS_STEP: u64 = slot(offset_of!(TapeApi, nic_ts_step));
+const NIC_TS_ALL: u64 = slot(offset_of!(TapeApi, nic_ts_all));
+const NIC_MULTICAST_JOIN: u64 = slot(offset_of!(TapeApi, nic_multicast_join));
+const NIC_VLAN_FILTER: u64 = slot(offset_of!(TapeApi, nic_vlan_filter));
+const NIC_TX_OFFLOAD: u64 = slot(offset_of!(TapeApi, nic_tx_offload));
+const NIC_COUNTERS: u64 = slot(offset_of!(TapeApi, nic_counters));
 const FS_STREAM_OPEN: u64 = slot(offset_of!(TapeApi, fs_stream_open));
 const FS_STREAM_WRITE: u64 = slot(offset_of!(TapeApi, fs_stream_write));
 const FS_STREAM_CLOSE: u64 = slot(offset_of!(TapeApi, fs_stream_close));
@@ -237,6 +257,26 @@ pub fn call(frame: &mut Frame) {
             0
         }
         FREE_PAGES => pmm::stats().free,
+        NIC_COUNT => tapenet::count(),
+        NIC_MAC => tapenet::mac(a, b),
+        NIC_SEND => tapenet::send(a, b, c),
+        NIC_RECEIVE => tapenet::receive(a, b, c),
+        NIC_MAX_FRAME_LEN => tapenet::MAX_FRAME,
+        NIC_ACTIVE => 0,
+        NIC_OWNED => tapenet::owned(a),
+        NIC_SET_PROMISCUOUS => tapenet::setting(a, b, kernel_core::nicctl::nic_set_promiscuous),
+        NIC_SET_MULTICAST => tapenet::setting(a, b, kernel_core::nicctl::nic_set_multicast),
+        NIC_TS_ENABLE => tapenet::setting(a, 1, |index, _| kernel_core::nicctl::nic_ts_enable(index)),
+        NIC_TS_ALL => tapenet::setting(a, b, kernel_core::nicctl::nic_ts_all),
+        NIC_TX_OFFLOAD => tapenet::setting(a, b, kernel_core::nicctl::nic_tx_offload),
+        NIC_TS_CLOCK => tapenet::ts_clock(a),
+        NIC_TS_RX => tapenet::ts_rx(a),
+        NIC_TS_ADJUST => tapenet::ts_adjust(a, b),
+        NIC_TS_STEP => tapenet::ts_step(a, b),
+        NIC_SEND_STAMPED => tapenet::send_stamped(a, b, c, d),
+        NIC_MULTICAST_JOIN => tapenet::multicast_join(a, b, c),
+        NIC_VLAN_FILTER => tapenet::vlan_filter(a, b, c),
+        NIC_COUNTERS => tapenet::counters(a, b, c),
         FS_READ => tapefs::read(a, b, c, d) as u64,
         FS_READ_AT => tapefs::read_range(a, b, c, d, e) as u64,
         FS_WRITE => tapefs::write(a, b, c, d) as u64,

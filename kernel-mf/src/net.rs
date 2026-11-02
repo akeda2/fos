@@ -14,6 +14,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use kernel_core::nic::{self, Nic};
+use kernel_core::nicctl;
 use kernel_core::{e1000, netdump::Mac, pci, rtl8139, rtl8168, threecom};
 
 use crate::apic::{self, TICK_HZ};
@@ -54,6 +55,7 @@ fn report(delivery: Result<impl core::fmt::Debug, &str>) {
 
 /// Starts every NIC the drivers know and puts it in the table. Needs interrupts on (the drivers prove their interrupt path).
 pub fn init() {
+    nicctl::set_frame_handler(frame_hook);
     let mut interfaces = 0;
     for device in pci::devices().filter(|d| d.vendor == e1000::VENDOR_INTEL && e1000::DEVICE_IDS.contains(&d.id)) {
         match e1000::E1000::init(&device, interfaces) {
@@ -108,6 +110,37 @@ pub fn init() {
     }
 }
 
+// ---- the NIC lock ----
+
+/// Serialises every access to the NIC table and the tapes' receive FIFOs (statics in `kernel-core`): the service thread's polling
+/// and the tape calls run on any CPU. Re-entrant on one CPU, because the frame handler sends replies while the poll holds it.
+static NICS: SpinLock<()> = SpinLock::new(());
+/// The CPU (index + 1) that holds `NICS`, 0 for none.
+static NICS_OWNER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+pub struct NicGuard {
+    // The ticket lock's guard (None for a nested call); dropped after the owner mark is cleared.
+    guard: Option<crate::sync::Guard<'static, ()>>,
+}
+
+pub fn lock_nics() -> NicGuard {
+    let me = crate::percpu::this().index + 1;
+    if NICS_OWNER.load(Ordering::Acquire) == me {
+        return NicGuard { guard: None };
+    }
+    let guard = NICS.lock();
+    NICS_OWNER.store(me, Ordering::Release);
+    NicGuard { guard: Some(guard) }
+}
+
+impl Drop for NicGuard {
+    fn drop(&mut self) {
+        if self.guard.is_some() {
+            NICS_OWNER.store(0, Ordering::Release);
+        }
+    }
+}
+
 // ---- frames out ----
 
 pub fn mac(index: usize) -> Option<[u8; 6]> {
@@ -120,6 +153,7 @@ pub fn link_up(index: usize) -> bool {
 
 /// Builds and sends one fos frame (ethertype 0x88b6, tag, payload) out of interface `index`.
 fn send(index: usize, destination: &[u8; 6], tag: u8, payload: &[u8]) -> bool {
+    let _nics = lock_nics();
     let mut frame = [0u8; 1514];
     let Some(nic) = nic::at(index) else { return false };
     if payload.len() > 1514 - 15 {
@@ -403,10 +437,16 @@ fn kup_finish(kup: &Kup, staging: &mut [u8]) -> Result<u8, u8> {
 // ---- the receive loop ----
 
 /// Handles one received frame if it is the terminal's, a discovery probe's or KUP's business.
-fn handle_frame(index: usize, frame: &[u8]) {
+/// The frame handler `nicctl` calls for every received frame: true for the kernel's own (ethertype 0x88b6), which never reach a tape.
+fn frame_hook(index: usize, frame: &[u8]) -> bool {
     if frame.len() < 15 || frame[12..14] != ETHERTYPE {
-        return;
+        return false;
     }
+    handle_frame(index, frame);
+    true
+}
+
+fn handle_frame(index: usize, frame: &[u8]) {
     let source: [u8; 6] = frame[6..12].try_into().unwrap();
     let (tag, payload) = (frame[14], &frame[15..]);
     match tag {
@@ -426,12 +466,9 @@ fn handle_frame(index: usize, frame: &[u8]) {
 
 /// Handles whatever the NICs have received, announces the name and sends queued console output. Call from the service loop.
 pub fn poll() {
-    let mut buffer = [0u8; 1600];
-    for index in 0..nic::count() {
-        for _ in 0..256 {
-            let Some(length) = nic::at(index).and_then(|nic| nic.receive(&mut buffer)) else { break };
-            handle_frame(index, &buffer[..length]);
-        }
+    {
+        let _nics = lock_nics();
+        nicctl::drain_nics_to_fifo();
     }
     announce();
     if session_open() {

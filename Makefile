@@ -200,7 +200,7 @@ test-mf-tape: image-mf image
 	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_MF_ELF) --output $(BUILD)/fosfor-mf/fosfor-tapes.img \
 		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin \
 		--file hello=$(BUILD)/fosfor/tapes/hello --file fpcheck=$(BUILD)/fosfor/tapes/fpcheck --file gfxcheck=$(BUILD)/fosfor/tapes/gfxcheck \
-		--file fscheck=$(BUILD)/fosfor/tapes/fscheck --file ed=$(BUILD)/fosfor/tapes/ed --file note.txt=tools/test_mf_note.txt
+		--file fscheck=$(BUILD)/fosfor/tapes/fscheck --file ed=$(BUILD)/fosfor/tapes/ed --file netcheck=$(BUILD)/fosfor/tapes/netcheck --file note.txt=tools/test_mf_note.txt
 	python3 tools/test_mf_tape.py
 
 # The server kernel boots through UEFI and BIOS (SMP 1, 2 and 8), validates BootInfo, narrates over COM1 and says what it is.
