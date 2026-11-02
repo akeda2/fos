@@ -1,6 +1,6 @@
 //! The embedded kernel's USB class drivers, handed to the controller code in `kernel-core` (`usb_class`, docs/big-kernel.md
 //! stage 1b). Order is the order the calls were made in before the registry: audio, MIDI, pointer, then serial for events
-//! and releases. A kernel without these drivers (the server one) registers none and still runs the controllers, hubs and disks.
+//! and releases. Each kernel registers the drivers it links; the server kernel is a superset and will register the same ones.
 
 use crate::usb_class::{self, Class, Host, NONE};
 

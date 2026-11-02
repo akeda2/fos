@@ -19,13 +19,8 @@
 //! interrupt handler and the foreground share, so `audio_write` returns how much fitted and `audio_read` what has
 //! arrived, whichever device is behind them.
 
-use crate::{hda, loopback, usb_audio as usb};
-#[cfg(not(target_arch = "aarch64"))]
+use crate::{hda, i2s, loopback, usb_audio as usb};
 pub use crate::usb_audio::PcmRing;
-#[cfg(target_arch = "aarch64")]
-use crate::i2s_pi as i2s;
-#[cfg(not(target_arch = "aarch64"))]
-use crate::i2s_none as i2s;
 use fosfor_abi::tape::{AudioDevice, AudioInfo, AudioStats, AUDIO_KIND_HDA, AUDIO_KIND_I2S, AUDIO_KIND_LOOP, AUDIO_KIND_USB, AUDIO_BUSY, AUDIO_NO_DEVICE};
 
 #[derive(Clone, Copy, PartialEq, Eq)]

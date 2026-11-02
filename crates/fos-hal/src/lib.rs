@@ -58,6 +58,12 @@ pub trait Platform: Sync {
 
     /// `count` zeroed physically contiguous 4 KiB frames, entirely below `below` when given; the physical address.
     fn allocate_contiguous(&self, count: u64, below: Option<u64>) -> Option<u64>;
+    /// The same without zeroing (a caller that overwrites every byte, such as an audio ring).
+    fn allocate_contiguous_uncleared(&self, count: u64, below: Option<u64>) -> Option<u64>;
+    /// The longest run of free frames, to size a ring to what is there.
+    fn largest_free_run(&self) -> u64;
+    /// Waits `milliseconds` by spinning (register settle times before the scheduler matters).
+    fn busy_wait_ms(&self, milliseconds: u64);
     /// Gives back frames from `allocate_contiguous`.
     fn free_frames(&self, address: u64, count: u64);
     /// Maps `length` bytes of device registers at physical `address` (identity, uncached, never executable).
@@ -91,6 +97,14 @@ pub trait Platform: Sync {
     fn interrupts_restore(&self, _was_enabled: bool) {}
     /// The foreground made progress (the watchdog's "pet"); wait loops call it.
     fn watchdog_pet(&self) {}
+    /// Which context runs: 0 is the shell or foreground tape, `n` is service `n - 1`.
+    fn task_context(&self) -> usize {
+        0
+    }
+    /// Whether context `context` (1-based service number) is a running service.
+    fn task_context_live(&self, _context: usize) -> bool {
+        false
+    }
 
     /// Message-signalled and legacy interrupts: claim a vector for `handler(context)`, and so on.
     fn msi_allocate(&self, handler: fn(usize), context: usize) -> Option<u8>;
@@ -159,6 +173,11 @@ pub mod block {
 }
 
 pub mod timer {
+    pub fn busy_wait_ms(milliseconds: u64) {
+        if let Some(platform) = super::platform() {
+            platform.busy_wait_ms(milliseconds);
+        }
+    }
     pub fn wait_ticks(count: u64) {
         if let Some(platform) = super::platform() {
             platform.wait_ticks(count);
@@ -191,6 +210,14 @@ pub mod memory {
 
     pub fn allocate_contiguous(count: u64, below: Option<u64>) -> Option<u64> {
         super::platform()?.allocate_contiguous(count, below)
+    }
+
+    pub fn allocate_contiguous_uncleared(count: u64, below: Option<u64>) -> Option<u64> {
+        super::platform()?.allocate_contiguous_uncleared(count, below)
+    }
+
+    pub fn largest_free_run() -> u64 {
+        super::platform().map_or(0, |platform| platform.largest_free_run())
     }
 
     pub fn free(address: u64, count: u64) {
@@ -258,6 +285,19 @@ pub mod cpu {
         if let Some(platform) = super::platform() {
             platform.interrupts_restore(was_enabled);
         }
+    }
+}
+
+/// The kernel's background services ("contexts"), as far as drivers need to tell who is calling.
+pub mod tasks {
+    pub const MAX_SERVICES: usize = 8;
+
+    pub fn context() -> usize {
+        super::platform().map_or(0, |platform| platform.task_context())
+    }
+
+    pub fn context_live(context: usize) -> bool {
+        super::platform().is_some_and(|platform| platform.task_context_live(context))
     }
 }
 

@@ -3,11 +3,7 @@ use core::panic::PanicInfo;
 use fosfor_abi::{BootInfo, BOOT_INFO_MAGIC, BOOT_INFO_VERSION};
 
 mod arch;
-mod audio;
-mod loopback;
 mod audioshell;
-#[path = "hda_none.rs"]
-mod hda;
 mod block;
 mod bootcode;
 mod font_data;
@@ -47,7 +43,6 @@ mod kup_serial;
 mod kupshell;
 mod slots;
 mod sdhci;
-mod usb_audio;
 mod usb_midi;
 mod midishell;
 mod usb_kbd;

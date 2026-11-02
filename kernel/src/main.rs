@@ -23,7 +23,7 @@ macro_rules! println {
 }
 pub use hal::print;
 // Shared code (crates/kernel-core): modules that need nothing but `fos_hal`; they keep their `crate::fosfs` paths.
-pub use kernel_core::{fatvol, fosfs, gpt, lineedit, pci, tape_fs};
+pub use kernel_core::{audio, fatvol, fosfs, gpt, hda, lineedit, loopback, pci, tape_fs, usb_audio};
 #[cfg(target_arch = "x86_64")]
 pub use kernel_core::{ahci, e1000, nic, nvme, rtl8139, rtl8168, threecom};
 pub use kernel_core::{ehci, usb_class, usb_hub, usb_storage, xhci};

@@ -2,7 +2,7 @@
 //! when a device goes away or an event nobody waited for arrives.
 //!
 //! The controllers and hubs live in this crate and know no class driver by name. The kernel registers what it wants at start
-//! (`register`: audio, MIDI, pointer, serial on the embedded kernel; a server kernel registers none) and the one device
+//! (`register`: audio, MIDI, pointer, serial on the embedded kernel today) and the one device
 //! enumerator (`set_host`: it probes a device the controller addressed). Order of registration is the order of the calls.
 //! Attaching a new device is done by the enumerator (the descriptors differ per class); `docs/big-kernel.md`, stage 1b.
 
