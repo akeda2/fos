@@ -13,7 +13,6 @@ mod netfs;
 mod nicshell;
 mod nicpark;
 mod gpu;
-mod ohci;
 mod formatshell;
 mod fault;
 mod platform;
@@ -39,7 +38,7 @@ mod serialports;
 mod uart;
 mod term;
 mod termsession;
-mod usb_hid;
+
 mod usb_pointer;
 mod usbshell;
 mod midishell;

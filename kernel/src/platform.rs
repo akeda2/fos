@@ -225,9 +225,22 @@ pub fn install() {
     fos_hal::set_platform(&EMBEDDED);
     crate::usb_register::install();
     kernel_core::screen::set(&SCREEN);
+    kernel_core::usb_env::set(&USB_ENV);
     #[cfg(target_arch = "aarch64")]
     kernel_core::i2s::set(&I2S);
 }
+
+static USB_ENV: kernel_core::usb_env::Env = kernel_core::usb_env::Env {
+    #[cfg(target_arch = "x86_64")]
+    key_push: crate::keyboard::push,
+    #[cfg(target_arch = "x86_64")]
+    key_layout: crate::keyboard::layout,
+    #[cfg(target_arch = "aarch64")]
+    key_push: crate::usb_kbd::push,
+    #[cfg(target_arch = "aarch64")]
+    key_layout: crate::usb_kbd::layout,
+    boot_disk_known: || crate::storage::boot_disk().is_some(),
+};
 
 #[cfg(target_arch = "aarch64")]
 static DSI: kernel_core::screen::Dsi = kernel_core::screen::Dsi {

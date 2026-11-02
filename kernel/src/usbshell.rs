@@ -28,29 +28,7 @@ fn list() {
     crate::println!("{}", imp::keyboards());
 }
 
-/// Every xHCI controller: its ports with something plugged in, and the hubs below them.
-pub fn describe_xhci(print: &impl Fn(core::fmt::Arguments)) {
-    for index in 0..xhci::count() {
-        let Some(controller) = xhci::controller(index) else { continue };
-        print(format_args!("xHCI {:02x}:{:02x}.{}: {} ports, events by {}", controller.pci.bus, controller.pci.device, controller.pci.function, controller.ports, if !controller.interrupt_driven { "polling" } else if controller.uses_msix { "MSI-X" } else { "MSI" }));
-        for port in 1..=controller.ports {
-            let status = controller.port_status(port);
-            if status & 1 != 0 {
-                let speed = ((status >> 10) & 0xf) as u8;
-                let in_use = if controller.slot_in_use_for_port(port) { ", in use" } else { "" };
-                if xhci::debug() {
-                    print(format_args!("  port {port}: device connected ({}), PORTSC {status:#x}{in_use}", xhci::speed_name(speed)));
-                } else {
-                    print(format_args!("  port {port}: device connected ({}){in_use}", xhci::speed_name(speed)));
-                }
-            }
-        }
-        if xhci::debug() {
-            xhci::port_event_summary(index, print);
-        }
-        usb_hub::describe(index, controller, print);
-    }
-}
+pub use crate::usb_hub::describe_xhci;
 
 /// The closing line of the list, printable without allocating.
 pub struct Keyboards {

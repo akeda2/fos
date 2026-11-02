@@ -14,7 +14,7 @@ use fosfor_abi::keymap::hid_key;
 
 use crate::xhci::{self, Controller, Trb};
 use crate::{ehci, ohci, usb_storage};
-use crate::{keyboard, memory};
+use crate::memory;
 
 const MAX_KEYBOARDS: usize = 4;
 
@@ -299,7 +299,7 @@ pub fn probe_device(controller_index: usize, controller: &mut Controller, mut de
             controller.set_configuration(&device, configuration[5])?;
             return Ok(match usb_storage::attach_xhci(controller_index, controller, device, endpoints) {
                 Some(disk) => {
-                    crate::println!("USB storage {vendor:04x}:{product:04x} on port {port} of xHCI {:02x}:{:02x}.{} ({}): {}.", controller.pci.bus, controller.pci.device, controller.pci.function, xhci::speed_name(device.speed), crate::storage::DiskNumber(disk));
+                    crate::println!("USB storage {vendor:04x}:{product:04x} on port {port} of xHCI {:02x}:{:02x}.{} ({}): {}.", controller.pci.bus, controller.pci.device, controller.pci.function, xhci::speed_name(device.speed), crate::usb_env::DiskNumber(disk));
                     true
                 }
                 None => {
@@ -460,8 +460,8 @@ fn decode(keyboard: &mut Keyboard, report: &[u8; 8]) {
         }
         if usage == 0x39 {
             keyboard.caps = !keyboard.caps;
-        } else if let Some(byte) = hid_key(usage, modifiers, keyboard.caps, keyboard::layout()) {
-            keyboard::push(byte);
+        } else if let Some(byte) = hid_key(usage, modifiers, keyboard.caps, crate::usb_env::layout()) {
+            crate::usb_env::push(byte);
         }
     }
     keyboard.previous = *report;
@@ -732,7 +732,7 @@ fn setup_ehci_keyboard(controller_index: usize, controller: &mut ehci::Controlle
         if let Some(endpoints) = usb_storage::find_endpoints(&configuration[..total]) {
             controller.set_configuration(&target, configuration[5])?;
             if let Some(disk) = usb_storage::attach_ehci(controller_index, target, root_port, endpoints) {
-                crate::println!("USB storage {vendor:04x}:{product:04x} on EHCI {:02x}:{:02x}.{}: {}.", controller.pci.bus, controller.pci.device, controller.pci.function, crate::storage::DiskNumber(disk));
+                crate::println!("USB storage {vendor:04x}:{product:04x} on EHCI {:02x}:{:02x}.{}: {}.", controller.pci.bus, controller.pci.device, controller.pci.function, crate::usb_env::DiskNumber(disk));
                 return Ok(true);
             }
         }
@@ -795,7 +795,7 @@ fn setup_ehci_keyboard(controller_index: usize, controller: &mut ehci::Controlle
 }
 
 pub fn describe_devices(print: impl Fn(core::fmt::Arguments)) {
-    crate::usbshell::describe_xhci(&print);
+    crate::usb_hub::describe_xhci(&print);
     describe_other_controllers(&print);
     print(format_args!("{} USB keyboard(s), {} reports so far", keyboard_count(), reports_seen()));
 }

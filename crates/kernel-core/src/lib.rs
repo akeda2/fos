@@ -52,9 +52,16 @@ pub mod usb_serial_pl2303;
 pub mod usb_serial_ti;
 pub mod usb_audio;
 pub mod usb_hub;
+pub mod usb_env;
 pub mod usb_storage;
 pub mod volumes;
 pub mod xhci;
+#[cfg(target_arch = "x86_64")]
+pub mod ohci;
+#[cfg(target_arch = "x86_64")]
+pub mod usb_hid;
+#[cfg(target_arch = "aarch64")]
+pub mod usb_kbd;
 #[cfg(target_arch = "x86_64")]
 pub mod ehci;
 #[cfg(target_arch = "x86_64")]
