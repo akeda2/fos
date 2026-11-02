@@ -26,8 +26,12 @@ impl Platform for Embedded {
         crate::clock::unix_seconds()
     }
 
-    fn block_sectors(&self, disk: usize) -> Option<u64> {
-        crate::block::get(disk).map(|disk| disk.sectors)
+    fn block_info(&self, disk: usize) -> Option<fos_hal::BlockInfo> {
+        crate::block::get(disk).map(|disk| fos_hal::BlockInfo { sectors: disk.sectors, model: disk.model })
+    }
+
+    fn block_count(&self) -> usize {
+        crate::block::count()
     }
 
     fn boot_disk(&self) -> Option<usize> {

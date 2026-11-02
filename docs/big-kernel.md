@@ -178,4 +178,9 @@ by any test: USB serial adapters, the Pi 4 console and GIC paths (hardware only)
   `kernel/src/mounts.rs`: `load()` passes the boot volume to `load_from`, `absent()` passes a "is it present" test to
   `absent_with`. Host test parses an `fstab` and checks longest-mount-point lookup. x86 kernel 1,169,584 bytes. Verified:
   `make test`, `test-mounts`, `test-v4-boot`, `test-config`, `test-config-fat`, `test-fosfs4`, aarch64 build.
-- Next: `storage`/`tape_fs` need the volume registry (a block-device list in the platform), then NICs, USB, audio.
+- Fifth slice: the volume registry (`volumes`: boot volume, `volume_on`, `volume_labelled`, `volume_with_file`) and `tape_fs`
+  (the tape file-system calls). `storage.rs` keeps the driver bring-up and re-exports the registry; `Platform` gained
+  `block_info` (size and model) and `block_count`. Host test finds volumes by label. x86 kernel 1,169,944 bytes. Verified:
+  `make test`, `test-mounts`, `test-fat-shell`, `test-fs-read-at`, `test-recorder-fat`, `test-config-fat`, `test-format-exfat`,
+  `test-fosfs4`, `test-v4-boot`, `test-grow`, aarch64 build.
+- Next: NICs (the first driver slice), then storage, USB, audio.

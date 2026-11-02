@@ -19,6 +19,13 @@ pub enum BlockError {
     Device,
 }
 
+/// What a platform knows of a disk.
+#[derive(Debug, Clone, Copy)]
+pub struct BlockInfo {
+    pub sectors: u64,
+    pub model: [u8; 40],
+}
+
 /// What a core provides. Every method is cheap to implement by forwarding to the core's own modules.
 pub trait Platform: Sync {
     /// Reads whole 512-byte sectors (`buffer.len()` a multiple of 512) of disk `disk` starting at `lba`.
@@ -27,8 +34,10 @@ pub trait Platform: Sync {
     fn block_write(&self, disk: usize, lba: u64, buffer: &[u8]) -> Result<(), BlockError>;
     /// The wall clock as Unix seconds (local reading taken as UTC), 0 when it was never set.
     fn unix_seconds(&self) -> u64;
-    /// The size of disk `disk` in 512-byte sectors, `None` when there is no such disk.
-    fn block_sectors(&self, disk: usize) -> Option<u64>;
+    /// Size and model of disk `disk` (0-based), `None` when there is no such disk.
+    fn block_info(&self, disk: usize) -> Option<BlockInfo>;
+    /// How many disks there are.
+    fn block_count(&self) -> usize;
     /// The disk the system booted from, if known.
     fn boot_disk(&self) -> Option<usize>;
     /// Microseconds on a monotonic clock.
@@ -68,7 +77,15 @@ pub mod block {
 
     /// Size of the disk in sectors.
     pub fn sectors(disk: usize) -> Option<u64> {
-        platform()?.block_sectors(disk)
+        info(disk).map(|info| info.sectors)
+    }
+
+    pub fn info(disk: usize) -> Option<super::BlockInfo> {
+        platform()?.block_info(disk)
+    }
+
+    pub fn count() -> usize {
+        platform().map_or(0, |platform| platform.block_count())
     }
 
     pub fn boot_disk() -> Option<usize> {

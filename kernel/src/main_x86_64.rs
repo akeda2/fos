@@ -44,7 +44,6 @@ mod tasks;
 mod shellcmds;
 mod shellhost;
 mod mounts;
-mod tape_fs;
 mod tapesync;
 mod gpio;
 mod gpio_remote;

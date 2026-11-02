@@ -29,8 +29,12 @@ impl Platform for RamDisks {
         1_700_000_000
     }
 
-    fn block_sectors(&self, disk: usize) -> Option<u64> {
-        self.0.lock().unwrap().get(&disk).map(|data| data.len() as u64 / 512)
+    fn block_info(&self, disk: usize) -> Option<fos_hal::BlockInfo> {
+        self.0.lock().unwrap().get(&disk).map(|data| fos_hal::BlockInfo { sectors: data.len() as u64 / 512, model: [b' '; 40] })
+    }
+
+    fn block_count(&self) -> usize {
+        self.0.lock().unwrap().keys().max().map_or(0, |last| last + 1)
     }
 
     fn boot_disk(&self) -> Option<usize> {
@@ -165,4 +169,24 @@ fn fstab_fills_the_mount_table_and_the_longest_mount_point_wins() {
     assert!(mounts::lookup(b"config").is_none() && mounts::lookup_dir(b"config").is_some());
     assert_eq!(mounts::absent_with(|label| label == b"cfgstick"), 1);
     mounts::clear();
+}
+
+#[test]
+fn volumes_are_found_by_label_and_the_boot_volume_is_remembered() {
+    use kernel_core::volumes;
+    let number = disk(8);
+    let table = gpt_fosfs(number);
+    assert!(table);
+    let (found, _) = volumes::volume_labelled(b"findme").unwrap();
+    assert_eq!(found, number + 1);
+    assert!(volumes::volume_labelled(b"nobody").is_none());
+    assert!(matches!(volumes::volume_on(0), Err(volumes::VolumeError::NoSuchDisk)));
+    volumes::set_boot_volume(volumes::volume_on(number + 1).unwrap());
+    assert!(volumes::boot_volume().is_some());
+}
+
+/// Puts a GPT with one FOSFS partition and a labelled volume on the disk.
+fn gpt_fosfs(number: usize) -> bool {
+    let partition = kernel_core::gpt::write_single_fosfs_partition(number).unwrap();
+    Volume::format_version(number, partition.start, partition.sectors, b"findme", 4).is_ok()
 }

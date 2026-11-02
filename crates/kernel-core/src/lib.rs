@@ -10,3 +10,5 @@ pub mod fosfs;
 pub mod gpt;
 pub mod lineedit;
 pub mod mounts;
+pub mod tape_fs;
+pub mod volumes;
