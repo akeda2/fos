@@ -105,6 +105,10 @@ pub trait Platform: Sync {
     fn task_context_live(&self, _context: usize) -> bool {
         false
     }
+    /// Whether a running service owns NIC `index` (0-based); its frames are the service's, not the shell's.
+    fn task_service_owns_nic(&self, _index: usize) -> bool {
+        false
+    }
 
     /// Message-signalled and legacy interrupts: claim a vector for `handler(context)`, and so on.
     fn msi_allocate(&self, handler: fn(usize), context: usize) -> Option<u8>;
@@ -301,6 +305,10 @@ pub mod tasks {
 
     pub fn context_live(context: usize) -> bool {
         super::platform().is_some_and(|platform| platform.task_context_live(context))
+    }
+
+    pub fn service_owns(index: usize) -> bool {
+        super::platform().is_some_and(|platform| platform.task_service_owns_nic(index))
     }
 }
 

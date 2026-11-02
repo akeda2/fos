@@ -222,5 +222,9 @@ by any test: USB serial adapters, the Pi 4 console and GIC paths (hardware only)
   on a Pi), the PS/2 `keyboard` and the shells.
 - Slice 10e, the NIC table: `nic::install/count/at/all_interrupt_driven` and `MAX_NICS` live in core (`term` keeps thin
   wrappers and the frame FIFOs), so `nicpark` moved too. `fos_hal::timer::TICK_HZ` (100 on both arches) is new.
-- Next: the frame FIFOs and `nic_*` wrappers out of `term` (then `nicshell`), then the server kernel's own `Platform`.
+- Slice 10f, the tape receive FIFOs and NIC control calls: new core `nicctl` holds the per-interface frame FIFOs
+  (`queue_frame`, `pop_frame`, drop counts, `last_rx_stamp`) and the `nic_*` calls the tape ABI forwards (timestamps,
+  multicast, VLAN, offload, counters); `term` re-exports them. `Platform::task_service_owns_nic` (new, default false)
+  tells core whether a service owns a NIC.
+- Next: `handle_frame`/`announce_service` out of `term` (then `nicshell`), then the server kernel's own `Platform`.
   The server kernel needs all of them; only the real-time guarantees (interrupt-context audio refills) differ.
