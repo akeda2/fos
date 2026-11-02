@@ -168,7 +168,7 @@ pub fn background_event(controller: &mut Controller, event: &Trb) -> bool {
     match event.completion() {
         xhci::COMPLETION_SUCCESS | xhci::COMPLETION_SHORT => {
             let got = length.saturating_sub(event.residual()).min(64) as usize;
-            let packet: [u8; 64] = unsafe { core::ptr::read_volatile(buffer as *const [u8; 64]) };
+            let packet: [u8; 64] = unsafe { core::ptr::read_volatile(memory::phys_to_virt(buffer) as *const [u8; 64]) };
             for event in packet[..got].chunks_exact(4) {
                 let count = packet_length(event[0]);
                 if count > 0 {
@@ -232,7 +232,7 @@ pub fn send(index: usize, message: &[u8]) -> Result<(), &'static str> {
     let Some(midi) = entries.get_mut(index).and_then(|entry| entry.as_mut()) else { return Err("no such MIDI device") };
     let packet = midi.buffer + 64;
     unsafe {
-        let bytes = packet as *mut u8;
+        let bytes = memory::phys_to_virt(packet) as *mut u8;
         bytes.write_volatile(cin);
         for slot in 1..4 {
             bytes.add(slot).write_volatile(*message.get(slot - 1).unwrap_or(&0));

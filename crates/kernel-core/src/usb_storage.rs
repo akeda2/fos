@@ -226,7 +226,7 @@ impl Msc {
         cbw[12] = if data_in { 0x80 } else { 0 };
         cbw[14] = cdb.len() as u8;
         cbw[15..15 + cdb.len()].copy_from_slice(cdb);
-        unsafe { core::ptr::copy_nonoverlapping(cbw.as_ptr(), command as *mut u8, CBW_LEN) };
+        unsafe { core::ptr::copy_nonoverlapping(cbw.as_ptr(), memory::phys_to_virt(command) as *mut u8, CBW_LEN) };
         if self.bulk(false, command, CBW_LEN).is_err() {
             self.recover();
             return Err(Error::Transport);
@@ -234,7 +234,7 @@ impl Msc {
         let mut moved = 0;
         if !data.is_empty() {
             if !data_in {
-                unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), data_frame as *mut u8, data.len()) };
+                unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), memory::phys_to_virt(data_frame) as *mut u8, data.len()) };
             }
             match self.bulk(data_in, data_frame, data.len()) {
                 Ok(length) => moved = length,
@@ -244,14 +244,14 @@ impl Msc {
                 }
             }
             if data_in {
-                unsafe { core::ptr::copy_nonoverlapping(data_frame as *const u8, data.as_mut_ptr(), moved.min(data.len())) };
+                unsafe { core::ptr::copy_nonoverlapping(memory::phys_to_virt(data_frame) as *const u8, data.as_mut_ptr(), moved.min(data.len())) };
             }
         }
         if self.bulk(true, command + 64, CSW_LEN).is_err() {
             self.recover();
             return Err(Error::Transport);
         }
-        let csw = unsafe { core::ptr::read_volatile((command + 64) as *const [u8; CSW_LEN]) };
+        let csw = unsafe { core::ptr::read_volatile(memory::phys_to_virt(command + 64) as *const [u8; CSW_LEN]) };
         if u32::from_le_bytes([csw[0], csw[1], csw[2], csw[3]]) != 0x5342_5355 || u32::from_le_bytes([csw[4], csw[5], csw[6], csw[7]]) != tag {
             self.recover();
             return Err(Error::Phase);

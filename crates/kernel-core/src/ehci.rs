@@ -286,10 +286,10 @@ fn interrupt_capabilities(target: &Target) -> u32 {
 }
 
 fn read32(address: usize) -> u32 {
-    unsafe { (address as *const u32).read_volatile() }
+    unsafe { (memory::phys_to_virt(address as u64) as *const u32).read_volatile() }
 }
 fn write32(address: usize, value: u32) {
-    unsafe { (address as *mut u32).write_volatile(value) }
+    unsafe { (memory::phys_to_virt(address as u64) as *mut u32).write_volatile(value) }
 }
 
 fn wait_until(ticks: u64, mut condition: impl FnMut() -> bool) -> bool {
@@ -434,7 +434,7 @@ impl Controller {
         let (base, size) = device.memory_bar(0).ok_or(Error::NoDevice)?;
         paging::map_device(base, size);
         let mmio = base as usize;
-        let cap_length = unsafe { (mmio as *const u8).read_volatile() } as usize;
+        let cap_length = unsafe { (memory::phys_to_virt(mmio as u64) as *const u8).read_volatile() } as usize;
         let hcsparams = read32(mmio + CAP_HCSPARAMS);
         let hccparams = read32(mmio + CAP_HCCPARAMS);
         let operational = mmio + cap_length;
@@ -462,7 +462,7 @@ impl Controller {
         let frame = memory::allocate_contiguous(1, Some(256 << 20)).ok_or(Error::NoMemory)? as usize;
         let periodic = memory::allocate_contiguous(1, Some(256 << 20)).ok_or(Error::NoMemory)? as usize;
         for entry in 0..PERIODIC_ENTRIES {
-            unsafe { (periodic as *mut u32).add(entry).write_volatile(TERMINATE) };
+            unsafe { (memory::phys_to_virt(periodic as u64) as *mut u32).add(entry).write_volatile(TERMINATE) };
         }
         if hccparams & 1 != 0 {
             write32(operational + OP_CTRLDSSEGMENT, 0); // 64-bit capable: all our DMA memory is below 4 GiB
@@ -472,7 +472,7 @@ impl Controller {
         // (`relink`), so the controller never walks an empty one; real silicon is stricter than QEMU.
         let qh_at = |index: usize| (frame + if index == 0 { OFFSET_CONTROL_QH } else { OFFSET_KEYBOARD_QH + (index - 1) * 0x40 }) as u32;
         for index in 0..=MAX_KEYBOARDS {
-            let words = qh_at(index) as *mut u32;
+            let words = memory::phys_to_virt(qh_at(index) as u64) as *mut u32;
             unsafe {
                 // Keyboard queue heads live on the periodic list, not the async one: a split interrupt endpoint
                 // on the async list halted the Sandy Bridge PCH with a host system error.
@@ -547,7 +547,7 @@ impl Controller {
     fn write_qtd(address: u32, qtd: &Qtd, next: u32, alternate: u32, interrupt: bool) {
         let token = (u32::from(qtd.toggle) << 31) | (qtd.bytes << 16) | (u32::from(interrupt) << 15) | (3 << 10) | (qtd.pid << 8) | TOKEN_ACTIVE;
         unsafe {
-            let words = address as *mut u32;
+            let words = memory::phys_to_virt(address as u64) as *mut u32;
             words.write_volatile(next);
             words.add(1).write_volatile(alternate);
             words.add(2).write_volatile(token);
@@ -571,7 +571,7 @@ impl Controller {
             Self::write_qtd(self.qtd_address(index), qtd, next, alternate, index + 1 == qtds.len());
         }
         unsafe {
-            let words = (self.frame + OFFSET_CONTROL_QH) as *mut u32;
+            let words = memory::phys_to_virt((self.frame + OFFSET_CONTROL_QH) as u64) as *mut u32;
             words.add(1).write_volatile(qh_characteristics(target, endpoint, max_packet, true, control));
             words.add(2).write_volatile(qh_capabilities(target));
             words.add(3).write_volatile(0);
@@ -593,7 +593,7 @@ impl Controller {
             let mut remaining = [0u32; MAX_QTDS];
             let mut finished = true;
             for index in 0..qtds.len() {
-                let token = unsafe { ((self.qtd_address(index) + 8) as *const u32).read_volatile() };
+                let token = unsafe { (memory::phys_to_virt((self.qtd_address(index) + 8) as u64) as *const u32).read_volatile() };
                 remaining[index] = (token >> 16) & 0x7fff;
                 if token & TOKEN_HALTED != 0 {
                     return Err(Error::Transfer((token & 0xff) as u8));
@@ -630,9 +630,9 @@ impl Controller {
         let (setup, bounce) = ((self.frame + OFFSET_SETUP) as u32, (self.frame + OFFSET_BOUNCE) as u32);
         unsafe {
             let fields = [request_type, request, value as u8, (value >> 8) as u8, index as u8, (index >> 8) as u8, data.len() as u8, (data.len() >> 8) as u8];
-            core::ptr::copy_nonoverlapping(fields.as_ptr(), setup as *mut u8, 8);
+            core::ptr::copy_nonoverlapping(fields.as_ptr(), memory::phys_to_virt(setup as u64) as *mut u8, 8);
             if !data_in && !data.is_empty() {
-                core::ptr::copy_nonoverlapping(data.as_ptr(), bounce as *mut u8, data.len());
+                core::ptr::copy_nonoverlapping(data.as_ptr(), memory::phys_to_virt(bounce as u64) as *mut u8, data.len());
             }
         }
         let blank = Qtd { pid: 0, toggle: false, bytes: 0, buffer: 0, alternate: None };
@@ -650,7 +650,7 @@ impl Controller {
         let remaining = self.run(target, 0, target.max_packet0, true, &qtds[..count])?;
         let moved = if data_stage { data.len() - remaining[1] as usize } else { 0 };
         if data_in && moved != 0 {
-            unsafe { core::ptr::copy_nonoverlapping(bounce as *const u8, data.as_mut_ptr(), moved) };
+            unsafe { core::ptr::copy_nonoverlapping(memory::phys_to_virt(bounce as u64) as *const u8, data.as_mut_ptr(), moved) };
         }
         Ok(moved)
     }
@@ -995,7 +995,7 @@ impl Controller {
         for index in (0..MAX_KEYBOARDS).rev() {
             if self.keyboards[index].is_some() {
                 let qh = self.keyboard_qh(index);
-                unsafe { (qh as *mut u32).write_volatile(head) };
+                unsafe { (memory::phys_to_virt(qh as u64) as *mut u32).write_volatile(head) };
                 head = qh as u32 | LINK_QH;
             }
         }
@@ -1011,7 +1011,7 @@ impl Controller {
             }
         }
         for entry in 0..PERIODIC_ENTRIES {
-            unsafe { (self.periodic as *mut u32).add(entry).write_volatile(chain[entry % ISO_RING]) };
+            unsafe { (memory::phys_to_virt(self.periodic as u64) as *mut u32).add(entry).write_volatile(chain[entry % ISO_RING]) };
         }
         if head != TERMINATE || self.iso.iter().any(Option::is_some) {
             self.set_periodic(true);
@@ -1110,7 +1110,7 @@ impl Controller {
         self.keyboards[index] = Some(KeyboardPipe { target, endpoint, max_packet, toggle: false, root_port });
         self.relink();
         unsafe {
-            let words = self.keyboard_qh(index) as *mut u32;
+            let words = memory::phys_to_virt(self.keyboard_qh(index) as u64) as *mut u32;
             words.add(1).write_volatile(qh_characteristics(&target, endpoint, max_packet, false, false));
             words.add(2).write_volatile(interrupt_capabilities(&target));
         }
@@ -1158,7 +1158,7 @@ impl Controller {
         let qtd = Qtd { pid: PID_IN, toggle: pipe.toggle, bytes: 8, buffer: self.keyboard_buffer(index) as u32, alternate: None };
         Self::write_qtd(self.keyboard_qtd(index) as u32, &qtd, TERMINATE, TERMINATE, true);
         unsafe {
-            let words = self.keyboard_qh(index) as *mut u32;
+            let words = memory::phys_to_virt(self.keyboard_qh(index) as u64) as *mut u32;
             words.add(4).write_volatile(self.keyboard_qtd(index) as u32); // overlay: next qTD
             words.add(5).write_volatile(TERMINATE);
             for word in 6..12 {
@@ -1178,14 +1178,14 @@ impl Controller {
         if let Some((status, command, frame)) = self.fault {
             print(format_args!("    HOST SYSTEM ERROR seen: USBSTS {status:#x} USBCMD {command:#x} in frame {frame}"));
         }
-        let control = unsafe { core::slice::from_raw_parts((self.frame + OFFSET_CONTROL_QH) as *const u32, 12) };
+        let control = unsafe { core::slice::from_raw_parts(memory::phys_to_virt((self.frame + OFFSET_CONTROL_QH) as u64) as *const u32, 12) };
         print(format_args!("    control QH {:#x}: {:x?}", self.frame + OFFSET_CONTROL_QH, control));
         for index in 0..MAX_KEYBOARDS {
             if self.keyboards[index].is_none() {
                 continue;
             }
-            let token = unsafe { ((self.keyboard_qtd(index) + 8) as *const u32).read_volatile() };
-            let qh = unsafe { core::slice::from_raw_parts(self.keyboard_qh(index) as *const u32, 12) };
+            let token = unsafe { (memory::phys_to_virt((self.keyboard_qtd(index) + 8) as u64) as *const u32).read_volatile() };
+            let qh = unsafe { core::slice::from_raw_parts(memory::phys_to_virt(self.keyboard_qh(index) as u64) as *const u32, 12) };
             print(format_args!("    keyboard {index}: qTD token {token:#x}, QH {:#x}: {:x?}", self.keyboard_qh(index), qh));
         }
     }
@@ -1194,12 +1194,12 @@ impl Controller {
     /// report and re-arms; a halted one (stall/error) is re-armed after a pause.
     pub fn poll_keyboard(&mut self, index: usize) -> Option<[u8; 8]> {
         let pipe = self.keyboards[index]?;
-        let token = unsafe { ((self.keyboard_qtd(index) + 8) as *const u32).read_volatile() };
+        let token = unsafe { (memory::phys_to_virt((self.keyboard_qtd(index) + 8) as u64) as *const u32).read_volatile() };
         if token & TOKEN_ACTIVE != 0 {
             return None;
         }
         let report = if token & TOKEN_HALTED == 0 {
-            let report = unsafe { core::ptr::read_volatile(self.keyboard_buffer(index) as *const [u8; 8]) };
+            let report = unsafe { core::ptr::read_volatile(memory::phys_to_virt(self.keyboard_buffer(index) as u64) as *const [u8; 8]) };
             self.keyboards[index] = Some(KeyboardPipe { toggle: !pipe.toggle, ..pipe });
             Some(report)
         } else {

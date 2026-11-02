@@ -118,6 +118,8 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     println!("Physical memory: {} MiB managed in {} frames, {} MiB free.", mib(frames.managed * 4096), frames.managed, mib(frames.free * 4096));
 
     let mapped = vm::init(&machine);
+    // The loader's page is no longer reachable at its own address: use it through the direct map from here on.
+    let info = unsafe { &*(vm::direct(machine.info_page) as *const BootInfo) };
     println!("Page tables: root {:#x}; direct map of {} MiB at {:#x}, no-execute; the kernel image keeps its own mapping.", vm::root(), mib(mapped), vm::DIRECT_BASE);
     if !vm::check_image() {
         println!("Page tables: the kernel image does not have the W^X layout: stopping.");
@@ -131,12 +133,15 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     unsafe { through_direct.write_volatile(0xf05f_05f0_f05f_05f0) };
     assert_eq!(unsafe { through_direct.read_volatile() }, 0xf05f_05f0_f05f_05f0);
     assert_eq!(vm::translate(vm::direct(frame)).map(|m| m.physical), Some(frame));
+    // No identity alias any more: the frame's own address (outside the kernel image) is not mapped in the lower half.
+    let alias_gone = vm::translate(frame).is_none();
     pmm::free(frame, 1);
     match fb::init(&info.framebuffer) {
         Some((columns, rows)) => println!("Framebuffer console: {}x{} pixels, {columns}x{rows} characters (also on COM1 and the network).", info.framebuffer.width, info.framebuffer.height),
         None => println!("Framebuffer console: no pixel screen (serial and network only)."),
     }
     println!("Direct map: frame {frame:#x} written and read back at {:#x}.", vm::direct(frame));
+    println!("Lower half: {} (drivers reach RAM and device registers through the direct map).", if alias_gone { "empty apart from the kernel image, no identity alias" } else { "STILL ALIASED" });
 
     if !heap::init() {
         println!("The kernel heap could not be created: stopping.");

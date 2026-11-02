@@ -144,7 +144,7 @@ fn wait_command(base: u16) -> Result<(), Error> {
 }
 
 fn descriptor(base: u64, index: usize) -> *mut Descriptor {
-    (base as usize + index * 16) as *mut Descriptor
+    memory::phys_to_virt(base + (index * 16) as u64) as *mut Descriptor
 }
 
 /// Per-interface state the interrupt handler needs.
@@ -574,7 +574,7 @@ impl ThreeCom {
         }
         let padded = frame.len().max(MIN_FRAME);
         unsafe {
-            let buffer = core::slice::from_raw_parts_mut(self.tx_buffer as *mut u8, MAX_FRAME);
+            let buffer = core::slice::from_raw_parts_mut(memory::phys_to_virt(self.tx_buffer) as *mut u8, MAX_FRAME);
             buffer[..frame.len()].copy_from_slice(frame);
             buffer[frame.len()..padded].fill(0);
             // B/C cards use the B-revision frame start: ask for a completion indication, no length rounding.
@@ -608,7 +608,7 @@ impl ThreeCom {
         let count = length.min(out.len()).min(MAX_FRAME);
         // Copy before handing the descriptor back: once it is free a new frame may overwrite the buffer.
         if valid {
-            let source = unsafe { core::slice::from_raw_parts(self.rx_buffer(index) as *const u8, count) };
+            let source = unsafe { core::slice::from_raw_parts(memory::phys_to_virt(self.rx_buffer(index)) as *const u8, count) };
             out[..count].copy_from_slice(source);
         }
         unsafe { write_volatile(&mut (*slot).status, 0) };

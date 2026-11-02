@@ -442,22 +442,22 @@ pub fn count() -> usize {
 // ---- register access ----
 
 fn read8(base: u64, offset: u64) -> u8 {
-    unsafe { ((base + offset) as *const u8).read_volatile() }
+    unsafe { (memory::phys_to_virt(base + offset) as *const u8).read_volatile() }
 }
 fn read16(base: u64, offset: u64) -> u16 {
-    unsafe { ((base + offset) as *const u16).read_volatile() }
+    unsafe { (memory::phys_to_virt(base + offset) as *const u16).read_volatile() }
 }
 fn read32(base: u64, offset: u64) -> u32 {
-    unsafe { ((base + offset) as *const u32).read_volatile() }
+    unsafe { (memory::phys_to_virt(base + offset) as *const u32).read_volatile() }
 }
 fn write8(base: u64, offset: u64, value: u8) {
-    unsafe { ((base + offset) as *mut u8).write_volatile(value) }
+    unsafe { (memory::phys_to_virt(base + offset) as *mut u8).write_volatile(value) }
 }
 fn write16(base: u64, offset: u64, value: u16) {
-    unsafe { ((base + offset) as *mut u16).write_volatile(value) }
+    unsafe { (memory::phys_to_virt(base + offset) as *mut u16).write_volatile(value) }
 }
 fn write32(base: u64, offset: u64, value: u32) {
-    unsafe { ((base + offset) as *mut u32).write_volatile(value) }
+    unsafe { (memory::phys_to_virt(base + offset) as *mut u32).write_volatile(value) }
 }
 
 /// Polls `condition` for up to `microseconds`. Bounded by the clock and, in case the clock is not running, by an
@@ -508,14 +508,14 @@ impl Hda {
     fn command(&mut self, word: u32) -> Option<u32> {
         let regs = self.regs;
         let write_pointer = (read16(regs, REG_CORBWP) + 1) % self.corb_entries;
-        unsafe { ((self.corb + 4 * u64::from(write_pointer)) as *mut u32).write_volatile(word) };
+        unsafe { (memory::phys_to_virt(self.corb + 4 * u64::from(write_pointer)) as *mut u32).write_volatile(word) };
         write16(regs, REG_CORBWP, write_pointer);
         let mut answer = None;
         let entries = self.rirb_entries;
         wait_until(5000, || {
             while self.rirb_rp != read16(regs, REG_RIRBWP) % entries {
                 self.rirb_rp = (self.rirb_rp + 1) % entries;
-                let entry = (self.rirb + 8 * u64::from(self.rirb_rp)) as *const u32;
+                let entry = memory::phys_to_virt(self.rirb + 8 * u64::from(self.rirb_rp)) as *const u32;
                 let (response, extended) = unsafe { (entry.read_volatile(), entry.add(1).read_volatile()) };
                 if extended & (1 << 4) == 0 {
                     answer = Some(response);
@@ -1052,12 +1052,12 @@ impl Hda {
             // Not left as the zeros the allocator gives: a controller that never writes the buffer (a broken DMA
             // path, a stream tag that matches nothing) would otherwise look exactly like a quiet input. A recognisable
             // pattern shows up as loud noise in a level meter instead; a working one overwrites it before it is read.
-            unsafe { core::ptr::write_bytes(buffer as *mut u8, 0x55, buffer_bytes) };
+            unsafe { core::ptr::write_bytes(memory::phys_to_virt(buffer) as *mut u8, 0x55, buffer_bytes) };
         }
         // The buffer descriptor list: one 16-byte entry per period: 64-bit address, length, and bit 0 = interrupt on
         // completion.
         for period in 0..PERIODS {
-            let entry = (bdl + 16 * period as u64) as *mut u64;
+            let entry = memory::phys_to_virt(bdl + 16 * period as u64) as *mut u64;
             unsafe {
                 entry.write_volatile(buffer + (period * period_bytes) as u64);
                 (entry.add(1) as *mut u32).write_volatile(period_bytes as u32);
@@ -1143,7 +1143,7 @@ impl Hda {
     fn position(&self, index: u8) -> usize {
         let lpib = read32(self.stream_registers(index), SD_LPIB);
         if self.position_buffer_works {
-            let entry = (self.position_buffer + 8 * u64::from(index)) as *const u32;
+            let entry = memory::phys_to_virt(self.position_buffer + 8 * u64::from(index)) as *const u32;
             let value = unsafe { entry.read_volatile() };
             if value != 0 || lpib == 0 {
                 return value as usize;
@@ -1176,7 +1176,7 @@ impl Hda {
             // Every period from `next` up to (not including) the one the hardware is in has been completed.
             let mut guard = 0;
             while stream.next != current && guard < PERIODS {
-                let period = (stream.buffer + (stream.next * stream.period_bytes) as u64) as *mut u8;
+                let period = memory::phys_to_virt(stream.buffer + (stream.next * stream.period_bytes) as u64) as *mut u8;
                 let area = unsafe { core::slice::from_raw_parts_mut(period, stream.period_bytes) };
                 if capture {
                     // The whole period or none of it, so a full ring never leaves the channels shifted.
@@ -1580,7 +1580,7 @@ pub fn status(index: usize) {
             // The hardware's view, for a stream that makes no progress: control (RUN is bit 1), status, link position
             // (LPIB), the position buffer's entry, and the controller's interrupt control and status.
             let registers = hda.stream_registers(stream.index);
-            let entry = if hda.position_buffer == 0 { 0 } else { unsafe { ((hda.position_buffer + 8 * u64::from(stream.index)) as *const u32).read_volatile() } };
+            let entry = if hda.position_buffer == 0 { 0 } else { unsafe { (memory::phys_to_virt(hda.position_buffer + 8 * u64::from(stream.index)) as *const u32).read_volatile() } };
             crate::println!(
                 "    SD{} ctl {:#08x} sts {:#04x} lpib {} dpib {} | intctl {:#010x} intsts {:#010x}",
                 stream.index,

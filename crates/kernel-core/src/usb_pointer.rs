@@ -222,7 +222,7 @@ pub fn background_event(controller: &mut Controller, event: &Trb) -> bool {
     match event.completion() {
         xhci::COMPLETION_SUCCESS | xhci::COMPLETION_SHORT => {
             let got = panel.length.saturating_sub(event.residual()).min(4096) as usize;
-            let report = unsafe { core::slice::from_raw_parts(panel.buffer as *const u8, got) };
+            let report = unsafe { core::slice::from_raw_parts(memory::phys_to_virt(panel.buffer) as *const u8, got) };
             let mut touches = [hid::Touch::default(); hid::MAX_CONTACTS];
             let count = panel.pointer.decode(report, &mut touches);
             panel.reports += 1;

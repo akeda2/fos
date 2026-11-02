@@ -129,7 +129,7 @@ impl Device {
         crate::paging::map_device(base, size);
         // Enable + function-mask first, so nothing fires while entry 0 is half written.
         self.write32(capability, (header & 0xffff) | (u32::from(control | (1 << 15) | (1 << 14)) << 16));
-        let entry = (base + offset) as *mut u32;
+        let entry = crate::memory::phys_to_virt(base + offset) as *mut u32;
         unsafe {
             entry.write_volatile(address as u32); // message address low
             entry.add(1).write_volatile((address >> 32) as u32); // address high

@@ -103,6 +103,7 @@ def main():
         check(direct is not None and int(direct.group(1)) >= 400, f"-smp {cpus}: the direct map covers RAM in the upper half", text)
         check("W^X holds" in text, f"-smp {cpus}: the kernel image is W^X with unmapped guards and page 0", text)
         check("written and read back at 0xffff8000" in text, f"-smp {cpus}: a frame is reachable through the direct map", text)
+        check("Lower half: empty apart from the kernel image, no identity alias" in text, f"-smp {cpus}: the identity alias is gone (drivers use the direct map)", text)
         check("Heap: self-test passed" in text, f"-smp {cpus}: the heap passes its self-test (including growth)", text)
         check("a breakpoint came back through the IDT" in text, f"-smp {cpus}: the GDT/TSS/IDT work (int3 handled and resumed)", text)
         acpi = re.search(r"ACPI: revision \d, local APIC at 0x[0-9a-f]+, (\d+) CPU\(s\), (\d+) I/O APIC", text)

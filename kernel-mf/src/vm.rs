@@ -10,7 +10,7 @@
 //!   and the guard pages under the stacks are unmapped, so a null pointer or a stack overflow faults at once;
 //! * the framebuffer (or the BIOS text screen), uncached and no-execute, through the direct map.
 //!
-//! Everything else in the lower half stays empty: it is for per-process address spaces (slice 7). Not mapped on purpose: UEFI
+//! Everything else in the lower half stays empty: it is for per-process address spaces (slice 8). Not mapped on purpose: UEFI
 //! runtime services (this kernel does not call the firmware yet), loader data (copied out by `boot::Machine`), device
 //! registers (mapped on demand by their drivers, later).
 
@@ -133,40 +133,6 @@ fn map_direct(root: u64, start: u64, end: u64, flags: u64) {
             map_page(root, DIRECT_BASE + address, address, flags);
             address += PAGE;
         }
-    }
-}
-
-/// Maps physical `[start, end)` onto itself in the lower half: the compatibility alias for `kernel-core`'s drivers, which use
-/// physical addresses (BARs, DMA buffers) as pointers. Temporary by design (docs/big-kernel.md, "Identity alias"): it goes
-/// when the drivers call the HAL's address conversion, before user space takes the lower half. The kernel image is left to
-/// `map_image` (W^X), page 0 stays unmapped, and the first 2 MiB is in 4 KiB pages.
-fn map_identity(root: u64, start: u64, end: u64, flags: u64, image: (u64, u64)) {
-    let mut address = start & !(PAGE - 1);
-    while address < end {
-        let clear_of_image = image.1 <= address || image.0 >= address + HUGE;
-        if address % HUGE == 0 && address >= HUGE && address + HUGE <= end && clear_of_image {
-            map_huge(root, address, address, flags);
-            address += HUGE;
-        } else {
-            if address >= PAGE && !(image.0..image.1).contains(&address) {
-                map_page(root, address, address, flags);
-            }
-            address += PAGE;
-        }
-    }
-}
-
-/// Makes device registers at physical `[physical, physical + length)` reachable at their own address (uncached, never
-/// executable): what `Platform::map_device` promises `kernel-core`. Pages that are already mapped are left alone.
-pub fn map_device_identity(physical: u64, length: u64) {
-    let root = root();
-    let mut page = physical & !(PAGE - 1);
-    while page < physical + length.max(1) {
-        if translate(page).is_none() {
-            map_page(root, page, page, WRITABLE | NO_EXECUTE | CACHE_DISABLE | WRITE_THROUGH);
-            unsafe { core::arch::asm!("invlpg [{}]", in(reg) page, options(nostack, preserves_flags)) };
-        }
-        page += PAGE;
     }
 }
 
@@ -340,7 +306,6 @@ pub fn init(machine: &Machine) -> u64 {
         if RAM_LIKE_TYPES.contains(&d.kind) {
             let end = d.physical_start + d.pages * PAGE;
             map_direct(root, d.physical_start, end, data);
-            map_identity(root, d.physical_start, end, data, layout.image);
             highest = highest.max(end);
         }
     }

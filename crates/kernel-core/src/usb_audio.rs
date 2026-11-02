@@ -391,7 +391,7 @@ impl PcmRing {
         let mut highest = 0u64;
         for &(base, length) in &self.segments[..self.count] {
             for offset in [0, length - 8] {
-                let at = (base as usize + offset) as *mut u64;
+                let at = memory::phys_to_virt((base as usize + offset) as u64) as *mut u64;
                 unsafe {
                     at.write_volatile(0x5a5a_a5a5_0f0f_f0f0 ^ offset as u64);
                     ok &= at.read_volatile() == 0x5a5a_a5a5_0f0f_f0f0 ^ offset as u64;
@@ -438,7 +438,7 @@ impl PcmRing {
         while done < count {
             let (address, run) = self.locate(head.wrapping_add(done));
             let chunk = run.min(count - done);
-            unsafe { core::ptr::copy_nonoverlapping(data[done..].as_ptr(), address as *mut u8, chunk) };
+            unsafe { core::ptr::copy_nonoverlapping(data[done..].as_ptr(), memory::phys_to_virt(address as u64) as *mut u8, chunk) };
             done += chunk;
         }
         self.head.store(head.wrapping_add(count), Ordering::Release);
@@ -454,7 +454,7 @@ impl PcmRing {
         while done < count {
             let (address, run) = self.locate(tail.wrapping_add(done));
             let chunk = run.min(count - done);
-            unsafe { core::ptr::copy_nonoverlapping(address as *const u8, out[done..].as_mut_ptr(), chunk) };
+            unsafe { core::ptr::copy_nonoverlapping(memory::phys_to_virt(address as u64) as *const u8, out[done..].as_mut_ptr(), chunk) };
             done += chunk;
         }
         self.tail.store(tail.wrapping_add(count), Ordering::Release);
@@ -968,7 +968,7 @@ fn fill_playback_packet(stream: &mut Stream, address: u64) -> usize {
     stream.accumulator_q16 = (total & 0xffff) as u32;
     let frame_bytes = usize::from(stream.alt.channels) * usize::from(stream.alt.subslot_bytes);
     let wanted = (frames as usize * frame_bytes).min(usize::from(stream.alt.max_packet));
-    let buffer = unsafe { core::slice::from_raw_parts_mut(address as *mut u8, wanted) };
+    let buffer = unsafe { core::slice::from_raw_parts_mut(memory::phys_to_virt(address) as *mut u8, wanted) };
     let got = stream.pcm.pop(buffer);
     if got < wanted {
         buffer[got..].fill(0);
@@ -993,7 +993,7 @@ fn feedback_event(stream: &mut Stream, event: &xhci::Trb, high_speed: bool) -> b
     let length = usize::from(feedback.packet).saturating_sub(event.residual() as usize);
     let mut new_step = None;
     if matches!(event.completion(), xhci::COMPLETION_SUCCESS | xhci::COMPLETION_SHORT) && (length == 3 || length == 4) {
-        let bytes = unsafe { core::slice::from_raw_parts((feedback.buffers + (slot * 16) as u64) as *const u8, length) };
+        let bytes = unsafe { core::slice::from_raw_parts(memory::phys_to_virt(feedback.buffers + (slot * 16) as u64) as *const u8, length) };
         let mut value = 0u64;
         for (index, &byte) in bytes.iter().enumerate() {
             value |= u64::from(byte) << (8 * index);
@@ -1057,7 +1057,7 @@ fn unit_irq_event(unit: usize, index: usize, event: &xhci::Trb) -> bool {
         if stream.capture && ok {
             let address = stream.buffers + (slot * usize::from(stream.alt.max_packet)) as u64;
             let length = usize::from(stream.alt.max_packet).saturating_sub(event.residual() as usize);
-            let data = unsafe { core::slice::from_raw_parts(address as *const u8, length) };
+            let data = unsafe { core::slice::from_raw_parts(memory::phys_to_virt(address) as *const u8, length) };
             stream.bytes.fetch_add(length as u64, Ordering::Relaxed);
             stream.pcm.push_whole(data);
         }
@@ -1278,7 +1278,7 @@ fn ehci_service(stream: &mut Stream, frame: usize) {
                 } else if length > 0 && stream.monitor {
                     stream.mon_frames += (length / (usize::from(stream.alt.channels) * usize::from(stream.alt.subslot_bytes)).max(1)) as u64;
                 } else if length > 0 {
-                    let data = unsafe { core::slice::from_raw_parts((region + (j * usize::from(stream.alt.max_packet)) as u64) as *const u8, length) };
+                    let data = unsafe { core::slice::from_raw_parts(memory::phys_to_virt(region + (j * usize::from(stream.alt.max_packet)) as u64) as *const u8, length) };
                     stream.bytes.fetch_add(length as u64, Ordering::Relaxed);
                     ISO_LEN[pipe.next].fetch_add(length as u64, Ordering::Relaxed);
                     ISO_NONZERO[pipe.next].fetch_add(data.iter().filter(|&&b| b != 0).count() as u64, Ordering::Relaxed);
@@ -1433,16 +1433,16 @@ fn stop_stream(host: &mut Host, mut stream: Stream) {
                     stream.errors.load(Ordering::Relaxed),
                     pipe.next,
                     controller.frame_now(),
-                    unsafe { core::ptr::read_volatile(pipe.itds as *const u32) },
-                    unsafe { core::ptr::read_volatile((pipe.itds + 4) as *const u32) },
+                    unsafe { core::ptr::read_volatile(memory::phys_to_virt(pipe.itds) as *const u32) },
+                    unsafe { core::ptr::read_volatile(memory::phys_to_virt(pipe.itds + 4) as *const u32) },
                     controller.status_word()
                 );
                 if stream.capture {
                     for k in [0usize, 1, 14, 15] {
                         let itd = pipe.itds + (k * ehci::ITD_BYTES) as u64;
-                        let word = |n: usize| unsafe { core::ptr::read_volatile((itd as usize + 4 * n) as *const u32) };
+                        let word = |n: usize| unsafe { core::ptr::read_volatile(memory::phys_to_virt((itd as usize + 4 * n) as u64) as *const u32) };
                         let buffer = stream.buffers + (k * pipe.region) as u64;
-                        let head = unsafe { core::ptr::read_volatile(buffer as *const u64) };
+                        let head = unsafe { core::ptr::read_volatile(memory::phys_to_virt(buffer) as *const u64) };
                         crate::println!("  itd{k} @{itd:#x}: w9 {:08x} w10 {:08x} w11 {:08x} w12 {:08x}, buffer {buffer:#x} starts {head:016x}", word(9), word(10), word(11), word(12));
                     }
                     for k in 0..ehci::ISO_RING {
