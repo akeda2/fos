@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Runs real tapes on the server kernel (`make test-mf-tape`): build/fosfor-mf/fosfor-tapes.img has hello, fpcheck and gfxcheck on
+"""Runs real tapes on the server kernel (`make test-mf-tape`): build/fosfor-mf/fosfor-tapes.img has hello, fpcheck, gfxcheck, fscheck (files: ranges, two streams), ed (keyboard + fs_read/fs_write) and a text file on
 FOSFS; the serial shell starts each with `tape NAME`, and the test checks their output and that the process exits 0, with 1, 2 and 8 CPUs.
 Hard-float (AVX2) is checked under `-cpu max`, SSE2 under qemu64."""
 
@@ -18,6 +18,10 @@ CASES = [
     ("hello x y", ["arguments: [x y]", "primes up to 100000: 9592"]),
     ("fpcheck", ["fpcheck: ok"]),
     ("gfxcheck secs=1", ["gfxcheck: drawn"]),
+    ("fscheck note.txt 10 5", ["fscheck: 5 bytes [abcde]"]),
+    ("fscheck note.txt 100 5", ["fscheck: 0 bytes []"]),
+    ("fscheck streams s1.bin s2.bin", ["streams 0: 20000 bytes, 0 wrong", "streams 1: 19900 bytes, 0 wrong"]),
+    ("hello", ["first file: ", "files on the boot volume: "]),
 ]
 
 
@@ -63,6 +67,21 @@ def run(cpu, smp):
             qemu.stdin.flush()
             if not wait_for("fos> ", 5, mark + 40):
                 failures.append("Escape did not end the foreground tape:\n" + log[mark:].decode("utf8", "replace"))
+        if not failures:
+            # Keyboard input and fs_read/fs_write together: append a line with ed, save, and read it back in a second session.
+            def type_to_ed(lines, expect):
+                mark = len(log)
+                qemu.stdin.write(lines.encode())
+                qemu.stdin.flush()
+                return wait_for(expect, 10, mark)
+            ok = type_to_ed("tape ed note.txt\n", "ed> ")
+            ok = ok and type_to_ed("a\nhello\n.\nw\n", "written note.txt")
+            ok = ok and type_to_ed("q\n", "exited with code 0.")
+            ok = ok and type_to_ed("tape ed note.txt\n", "ed> ")
+            ok = ok and type_to_ed("p\n", "2: hello")
+            type_to_ed("q\n", "exited with code 0.")
+            if not ok:
+                failures.append("ed could not save and reload a file:\n" + log[-600:].decode("utf8", "replace"))
         text = log.decode("utf8", "replace")
         if "CPU exception" in text or "PANIC" in text:
             failures.append("kernel fault:\n" + text[-1500:])

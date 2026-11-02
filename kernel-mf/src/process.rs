@@ -259,6 +259,7 @@ pub fn terminate(how: How) -> ! {
         How::Fault(vector, address) => println!("Process {thread} killed by exception {vector} (address {address:#x})."),
         How::Killed => println!("Process {thread} killed."),
     }
+    crate::tapefs::process_ended(thread);
     crate::shell::end_foreground(thread);
     sched::exit()
 }
@@ -277,13 +278,28 @@ pub fn check_killed() {
 }
 
 pub fn user_bytes(address: u64, length: u64) -> Option<Vec<u8>> {
-    if length > WRITE_LIMIT || !vm::user_range_ok(sched::current_root(), address, length, false) {
+    user_bytes_up_to(address, length, WRITE_LIMIT)
+}
+
+/// As `user_bytes`, with the caller's own size limit (file data is larger than a console line).
+pub fn user_bytes_up_to(address: u64, length: u64, limit: u64) -> Option<Vec<u8>> {
+    if length > limit || !vm::user_range_ok(sched::current_root(), address, length, false) {
         return None;
     }
     let mut buffer = alloc::vec![0u8; length as usize];
     // The process's address space is loaded, and the range was just checked present and user-readable.
     unsafe { core::ptr::copy_nonoverlapping(address as *const u8, buffer.as_mut_ptr(), length as usize) };
     Some(buffer)
+}
+
+/// Copies `data` to the calling process's memory at `address`; false if the range is not user-writable.
+pub fn copy_to_user(address: u64, data: &[u8]) -> bool {
+    if !vm::user_range_ok(sched::current_root(), address, data.len() as u64, true) {
+        return false;
+    }
+    // The process's address space is loaded, and the range was just checked present and user-writable.
+    unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), address as *mut u8, data.len()) };
+    true
 }
 
 /// Console output from a process: UTF-8 is passed through, anything else is shown lossily.

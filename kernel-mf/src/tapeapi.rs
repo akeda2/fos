@@ -10,15 +10,15 @@
 //! What a call is worth today: console (`putc`, `puts`), time (`ticks`, `micros`), memory (`alloc`/`free` map zeroed pages into
 //! the process; the address is virtual, not physical), `args`, `should_abort` (the process was killed), `fp_level`, `free_pages`,
 //! `console_size` and the pixel screen (`gfx_*`). Everything else answers 0 ("none", "failed"), which the tapes read as "this
-//! machine has no such device"; the `fs_*` calls answer `FS_NO_VOLUME`. Input, files, NICs, audio, MIDI, touch and GPIO come in
+//! machine has no such device"; the `fs_*` calls go to `tapefs.rs`. Input, files, NICs, audio, MIDI, touch and GPIO come in
 //! later slices (the drivers are unlocked and CPU-0 only; see docs/big-kernel.md). Processes are single-threaded.
 
 use core::mem::{offset_of, size_of};
 
-use fosfor_abi::tape::{FS_NO_VOLUME, KEY_BASE, KEY_NONE, TAPE_API_VERSION, TapeApi};
+use fosfor_abi::tape::{KEY_BASE, KEY_NONE, TAPE_API_VERSION, TapeApi};
 
 use crate::trap::Frame;
-use crate::{apic, fb, fpu, pmm, process, sched, vm};
+use crate::{apic, fb, fpu, pmm, process, sched, tapefs, vm};
 
 pub const SHIM_BASE: u64 = vm::USER_BASE + 0x200_0000;
 pub const TABLE_BASE: u64 = SHIM_BASE + 0x1000;
@@ -83,6 +83,12 @@ const FS_READ: u64 = slot(offset_of!(TapeApi, fs_read));
 const FS_WRITE: u64 = slot(offset_of!(TapeApi, fs_write));
 const FS_REMOVE: u64 = slot(offset_of!(TapeApi, fs_remove));
 const FS_LIST: u64 = slot(offset_of!(TapeApi, fs_list));
+const FS_STREAM_OPEN: u64 = slot(offset_of!(TapeApi, fs_stream_open));
+const FS_STREAM_WRITE: u64 = slot(offset_of!(TapeApi, fs_stream_write));
+const FS_STREAM_CLOSE: u64 = slot(offset_of!(TapeApi, fs_stream_close));
+const FS_STREAM_OPEN2: u64 = slot(offset_of!(TapeApi, fs_stream_open2));
+const FS_STREAM_WRITE2: u64 = slot(offset_of!(TapeApi, fs_stream_write2));
+const FS_STREAM_CLOSE2: u64 = slot(offset_of!(TapeApi, fs_stream_close2));
 const FS_READ_AT: u64 = slot(offset_of!(TapeApi, fs_read_at));
 const MEMORY_MAP: u64 = slot(offset_of!(TapeApi, memory_map));
 const MEMORY_MAP_COUNT: u64 = slot(offset_of!(TapeApi, memory_map_count));
@@ -200,7 +206,6 @@ fn free_pages_at(address: u64, bytes: u64) {
 pub fn call(frame: &mut Frame) {
     let number = frame.rax - CALL_BASE;
     let (a, b, c, d, e) = (frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8);
-    let _ = (c, d, e);
     frame.rax = match number {
         PUTC => {
             if a < 0x80 {
@@ -232,7 +237,17 @@ pub fn call(frame: &mut Frame) {
             0
         }
         FREE_PAGES => pmm::stats().free,
-        FS_READ | FS_WRITE | FS_REMOVE | FS_LIST | FS_READ_AT => FS_NO_VOLUME as u64,
+        FS_READ => tapefs::read(a, b, c, d) as u64,
+        FS_READ_AT => tapefs::read_range(a, b, c, d, e) as u64,
+        FS_WRITE => tapefs::write(a, b, c, d) as u64,
+        FS_REMOVE => tapefs::remove(a, b) as u64,
+        FS_LIST => tapefs::list(a, b, c, d) as u64,
+        FS_STREAM_OPEN => tapefs::stream_open(a, b, c) as u64,
+        FS_STREAM_WRITE => tapefs::stream_write(a, b, c, d) as u64,
+        FS_STREAM_CLOSE => tapefs::stream_close(a) as u64,
+        FS_STREAM_OPEN2 => tapefs::stream_open2(a, b, c, d) as u64,
+        FS_STREAM_WRITE2 => tapefs::stream_write2(a, b, c, d, e) as u64,
+        FS_STREAM_CLOSE2 => tapefs::stream_close2(a, b) as u64,
         CONSOLE_SIZE => 0,
         FP_LEVEL => u64::from(fpu::level()),
         AUDIO_FLOAT => 0,
