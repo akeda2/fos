@@ -229,5 +229,59 @@ by any test: USB serial adapters, the Pi 4 console and GIC paths (hardware only)
 - Slice 10g, the receive path: `nicctl::drain_nic_to_fifo`, `service_poll` and `service_receive` are in core; the terminal
   registers its `handle_frame` with `nicctl::set_frame_handler` (a server kernel registers its own), and
   `Platform::task_current_owns_nic` is new. `handle_frame`, KUP and the shell stay in `term`: they need the console.
-- Next: `nicshell`, then the server kernel's own `Platform`.
+- Stage 1b is at its natural end: what remains in `kernel/` is bound to the console and shells (`term`, `netfs`, `nicshell`,
+  `shellcmds`, the PS/2 `keyboard`) or to Pi SoC hardware. Moving those needs a "shell host" trait for little gain; the server
+  kernel will have its own console and shell and share only the core crates.
+- Next: the server kernel's own `Platform` (design below).
   The server kernel needs all of them; only the real-time guarantees (interrupt-context audio refills) differ.
+
+## Stage 2 design: the server kernel `kernel-mf` (2026-11-02, decided with the maintainer)
+
+Decisions: (1) real VM from the start, no identity-mapped interim; (2) bring up SMP, per-core APIC timers and MSI/MSI-X, all of
+them; (3) consoles: serial, framebuffer and network; (4) the same UEFI/BIOS loaders and `BootInfo` (version 5), the same A/B slots.
+
+**Shape.** A new crate `kernel-mf/` (target `x86_64-fos-kernel`, same linker setup) that depends on `fos-hal`, `kernel-core`,
+`fosfor-abi`, `fat` and the other shared crates, and implements `Platform` itself (`kernel-mf/src/platform.rs`). It does not
+link `kernel/`: the embedded kernel's `term`, `tape`, shells and `static mut` state stay there. A flavour note section
+(`.fos_flavour`: `embedded` | `mf`) is added first so KUP, `fosadm` and the loader never cross the two.
+
+**Memory (stage 2a).**
+- Physical: a frame allocator over the `BootInfo` memory map with per-node free lists (SRAT is read from ACPI for NUMA; one node
+  when absent), "below 4 GiB" runs for 32-bit DMA devices, and `allocate_contiguous` for drivers.
+- Virtual: the kernel gets its own higher-half address space (direct map of RAM at a fixed offset, kernel image, MMIO window,
+  per-CPU areas, stacks with guard pages); NX and W^X everywhere. Drivers keep seeing physical addresses through
+  `Platform::map_device` and DMA calls, so `kernel-core` needs no change; any `kernel-core` code that assumes identity mapping
+  (it should not, since it went through `memory::*`) is a bug to fix there.
+- A kernel heap (slab per size class over the frame allocator) so `alloc` exists in the server kernel. The embedded kernel stays
+  `alloc`-free.
+- Per-process address spaces arrive in stage 5/6 of the staged path; the kernel address space layout leaves the lower half
+  free for them from day one.
+
+**CPUs and interrupts (stage 2b).**
+- ACPI MADT gives the CPU list; an INIT-SIPI-SIPI trampoline below 1 MiB (not over `0x5000`) starts the APs; each gets its own
+  GDT, TSS, IDT, stacks, local APIC and APIC timer. Per-CPU data is reached through `GS`.
+- Interrupts: I/O APIC for legacy INTx, MSI/MSI-X for devices (the existing `msi` seam: `msi_allocate` etc.), vectors allocated
+  per CPU with a simple spread policy; the 8259s are masked first as in the embedded kernel.
+- Locks: ticket spinlocks with IRQ-save, a `Mutex` that sleeps once the scheduler exists; `Platform::interrupts_save_and_disable`
+  already exists as the hook. Shared `kernel-core` statics (`static mut` NIC table, FIFOs, USB registry) get a lock audit
+  (stage 2 of the staged path) before a second CPU touches them: until then drivers run on the boot CPU only.
+
+**Consoles (stage 2c).**
+- Serial (COM1, 115200) first: panics and bring-up logs; the same line discipline as the embedded shell.
+- Framebuffer from `BootInfo` (the loader's GOP/VBE mode), with the font code shared from `kernel-core` where it exists.
+- Network: the `term net` wire protocol and KUP through `nicctl::set_frame_handler`, so `tools/term_net.py`, `devloop.py` and
+  `fosadm` work unchanged against the server kernel. Console output fans out to all three.
+- `Platform::print` writes to all active consoles under one lock.
+
+**Slices, each shippable and tested under QEMU `-smp N`.**
+1. `kernel-mf` skeleton: boots through UEFI and BIOS, validates `BootInfo`, prints to serial, flavour note, `make image-mf`, and a
+   test that boots it (`test-mf-boot`).
+2. Physical allocator, higher-half page tables, kernel heap; `make test-mf-boot` also checks the memory report.
+3. ACPI (reuse `kernel-core` readers), local APIC and I/O APIC, APIC timer on the boot CPU, `Platform` timer methods.
+4. AP bring-up, per-CPU areas, locks; APs idle. `-smp 1,2,8` all boot.
+5. `Platform` block, PCI and MSI methods; `kernel-core` drivers (AHCI, NVMe, xHCI, NICs) run on the boot CPU; FOSFS mounts.
+6. Framebuffer and network consoles, `term net`, KUP with the flavour marker.
+7. Scheduler and kernel threads; then stages 5-6 of the staged path (per-process VM, ring 3).
+
+**Open.** Where the server shell lives (a `kernel-mf` module, or a shared crate once the console seam is clear), how the
+flavour marker reaches `fosadm status`, and whether the batch queue needs the scheduler before ring 3.
