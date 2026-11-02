@@ -3,7 +3,7 @@
 
 #![no_std]
 
-pub use fos_hal::{block, clock, cpu, debug, memory, paging, pci_config, print, println, timer};
+pub use fos_hal::{block, clock, cpu, debug, memory, paging, pci_config, print, println, tasks, timer};
 
 /// Interrupt vectors, plus programming a PCI device to raise one (the message comes from the platform).
 pub mod msi {
@@ -26,11 +26,14 @@ pub mod hal {
 }
 
 pub mod ahci;
+pub mod audio;
 pub mod e1000;
 pub mod fatvol;
 pub mod fosfs;
 pub mod gpt;
+pub mod i2s;
 pub mod lineedit;
+pub mod loopback;
 pub mod mounts;
 pub mod nic;
 pub mod nvme;
@@ -40,12 +43,18 @@ pub mod rtl8168;
 pub mod tape_fs;
 pub mod threecom;
 pub mod usb_class;
+pub mod usb_audio;
 pub mod usb_hub;
 pub mod usb_storage;
 pub mod volumes;
 pub mod xhci;
 #[cfg(target_arch = "x86_64")]
 pub mod ehci;
+#[cfg(target_arch = "x86_64")]
+pub mod hda;
+#[cfg(not(target_arch = "x86_64"))]
+#[path = "hda_none.rs"]
+pub mod hda;
 #[cfg(not(target_arch = "x86_64"))]
 #[path = "ehci_none.rs"]
 pub mod ehci;

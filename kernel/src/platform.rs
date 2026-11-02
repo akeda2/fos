@@ -65,6 +65,18 @@ impl Platform for Embedded {
         crate::memory::allocate_contiguous(count, below)
     }
 
+    fn allocate_contiguous_uncleared(&self, count: u64, below: Option<u64>) -> Option<u64> {
+        crate::memory::allocate_contiguous_uncleared(count, below)
+    }
+
+    fn largest_free_run(&self) -> u64 {
+        crate::memory::largest_free_run()
+    }
+
+    fn busy_wait_ms(&self, milliseconds: u64) {
+        crate::timer::busy_wait_ms(milliseconds);
+    }
+
     fn free_frames(&self, address: u64, count: u64) {
         crate::memory::free(address, count);
     }
@@ -102,6 +114,14 @@ impl Platform for Embedded {
         crate::msi::count(vector)
     }
 
+    fn task_context(&self) -> usize {
+        crate::tasks::context()
+    }
+
+    fn task_context_live(&self, context: usize) -> bool {
+        crate::tasks::context_live(context)
+    }
+
     #[cfg(target_arch = "x86_64")]
     fn msi_message(&self, vector: u8) -> (u64, u32) {
         // Physical destination mode, fixed delivery, to the boot CPU's local APIC.
@@ -136,11 +156,9 @@ impl Platform for Embedded {
     fn port_out32(&self, port: u16, value: u32) {
         crate::cpu::outl(port, value);
     }
-    #[cfg(target_arch = "x86_64")]
     fn interrupts_save_and_disable(&self) -> bool {
         crate::cpu::interrupts_save_and_disable()
     }
-    #[cfg(target_arch = "x86_64")]
     fn interrupts_restore(&self, was_enabled: bool) {
         crate::cpu::interrupts_restore(was_enabled);
     }
@@ -206,4 +224,25 @@ static EMBEDDED: Embedded = Embedded;
 pub fn install() {
     fos_hal::set_platform(&EMBEDDED);
     crate::usb_register::install();
+    #[cfg(target_arch = "aarch64")]
+    kernel_core::i2s::set(&I2S);
 }
+
+#[cfg(target_arch = "aarch64")]
+static I2S: kernel_core::i2s::Ops = kernel_core::i2s::Ops {
+    present: crate::i2s_pi::present,
+    label: crate::i2s_pi::label,
+    start: crate::i2s_pi::start,
+    stop: crate::i2s_pi::stop,
+    poll: crate::i2s_pi::poll,
+    read: crate::i2s_pi::read,
+    write: crate::i2s_pi::write,
+    playback_space: crate::i2s_pi::playback_space,
+    format: crate::i2s_pi::format,
+    select: crate::i2s_pi::select,
+    print_modes: crate::i2s_pi::print_modes,
+    status: crate::i2s_pi::status,
+    fill_info: crate::i2s_pi::fill_info,
+    fill_stats: crate::i2s_pi::fill_stats,
+    buffer_info: crate::i2s_pi::buffer_info,
+};

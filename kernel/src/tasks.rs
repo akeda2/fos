@@ -19,7 +19,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::service_host as host;
 use crate::{memory, timer};
 
-pub const MAX_SERVICES: usize = 8;
+pub const MAX_SERVICES: usize = fos_hal::tasks::MAX_SERVICES;
 /// NICs are a bit mask in `Service::nics` (bit i = NIC i + 1), so at most 64.
 const STACK_BYTES: u64 = 1024 * 1024;
 /// How long a context may run before a tape call hands the CPU on (a tape that idles hands it on at once).

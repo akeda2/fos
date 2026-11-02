@@ -194,9 +194,19 @@ by any test: USB serial adapters, the Pi 4 console and GIC paths (hardware only)
 - Eighth slice: the USB host side: `xhci`, `ehci` (x86; aarch64 keeps the stub), `usb_hub`, `usb_storage` and `usb_class`. The
   controllers know no class driver by name: `usb_class` is now a registry (`register`, `set_host`) and the embedded kernel
   installs audio, MIDI, pointer, serial and the enumerator (`usb_hid`, or `usb_kbd` on the Pi) from `kernel/src/usb_register.rs`.
-  A server kernel registers none and still gets controllers, hubs and disks. The `Platform` gained `msi_message` (core programs
+  The server kernel is a superset, so it registers the same drivers; the registry is the seam that lets the class drivers
+  follow into `kernel-core` later, not a way to leave them out. The `Platform` gained `msi_message` (core programs
   the device's MSI/MSI-X capability itself) and `block_register_usb`/`block_usb_disk`. x86 kernel 1,177,776 bytes (the
   hook tables and calls across the crate boundary cost ~5 KiB). Verified: `make test`, `test-hub`, `test-midi`, `test-usb-audio`,
   `test-usb-boot`, `test-usb-kbd-replug`, `test-usb-pointer`, `test-usb-replug`, `test-xhci-abort`, `test-disks`,
   `test-serial-shell`, `test-aarch64-boot`. Real controllers (MSI, hub unplug, audio timing) only on hardware.
-- Next: the class drivers' leaf pieces and audio; `ohci` and `usb_hid` stay with the embedded kernel.
+- Ninth slice: the audio side: `audio` (the facade), `hda` (aarch64 keeps `hda_none`), `usb_audio`, `loopback`. The `Platform`
+  gained `task_context`/`task_context_live` (which service is calling; `fos_hal::tasks`), `allocate_contiguous_uncleared`,
+  `largest_free_run` and `busy_wait_ms`. The Pi's I2S driver stays in the kernel (clock manager, GPIO, PCM block) and registers
+  with `kernel_core::i2s::set`; no registration means no I2S device. Also fixed a slice-8 regression: the `Platform` forwarded
+  `interrupts_save_and_disable`/`restore` on x86 only, so the moved `xhci` and `usb_audio` masked nothing on the Pi (aarch64
+  has both). x86 kernel 1,177,400 bytes. Verified: `make test`, `test-hda`, `test-usb-audio`, `test-loopback`,
+  `test-audio-services`, `test-record`, `test-recorder`, `test-audio-net`, `test-release-loops`, `test-fosplay`,
+  `test-xhci-abort`, `test-aarch64-boot`. The Pi interrupt masking and I2S paths only show on a Pi 4.
+- Next: the input side (`usb_hid`, `usb_pointer`, `usb_midi`, `usb_serial*`), then `ohci`.
+  The server kernel needs all of them; only the real-time guarantees (interrupt-context audio refills) differ.

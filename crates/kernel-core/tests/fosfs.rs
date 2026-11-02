@@ -67,6 +67,13 @@ impl Platform for RamDisks {
     }
     fn map_device(&self, _: u64, _: u64) {}
     fn free_frames(&self, _: u64, _: u64) {}
+    fn allocate_contiguous_uncleared(&self, _: u64, _: Option<u64>) -> Option<u64> {
+        None
+    }
+    fn largest_free_run(&self) -> u64 {
+        0
+    }
+    fn busy_wait_ms(&self, _: u64) {}
     fn wait_ticks(&self, _: u64) {}
     fn pci_read32(&self, _: u8, _: u8, _: u8, _: u8) -> u32 {
         u32::MAX
