@@ -40,7 +40,7 @@ impl Device for Partition {
 
 /// Mounts the FAT volume of disk index `disk` (0-based), if it has one.
 pub fn mount(disk: usize) -> Option<Fs> {
-    let info = block::get(disk)?;
+    let info = block::sectors(disk)?;
     let mut candidates = [Partition { disk, base: 0, sectors: 0 }; 5];
     let mut count = 0;
     // GPT basic-data partitions.
@@ -77,7 +77,7 @@ pub fn mount(disk: usize) -> Option<Fs> {
         }
     }
     // A volume that starts at sector 0.
-    candidates[count] = Partition { disk, base: 0, sectors: info.sectors };
+    candidates[count] = Partition { disk, base: 0, sectors: info };
     count += 1;
     let mut fs = candidates[..count].iter().find_map(|&partition| fat::Fs::mount(partition).ok())?;
     stamp(&mut fs);
@@ -87,7 +87,7 @@ pub fn mount(disk: usize) -> Option<Fs> {
 /// The boot disk's EFI System Partition (`esp/NAME`): on a Pi that is where `config.txt` and the firmware live, and the
 /// loader is under `EFI/BOOT`. Only the root directory is reachable, like every FAT volume here.
 pub fn mount_esp() -> Option<Fs> {
-    let disk = crate::storage::boot_disk()?;
+    let disk = block::boot_disk()?;
     let partition = gpt::find(disk, &ESP_GUID, |_| true)?;
     let mut fs = fat::Fs::mount(Partition { disk, base: partition.start, sectors: partition.sectors }).ok()?;
     stamp(&mut fs);
@@ -99,7 +99,9 @@ pub type Fs = fat::Fs<Partition>;
 
 /// The local time, or None while the clock is unset (files then get the fixed date).
 fn now() -> Option<fat::Time> {
-    crate::clock::now()
+    const UNIX_OFFSET: u64 = 946_684_800; // Unix epoch to 2000-01-01
+    let seconds = crate::clock::unix_seconds();
+    (seconds != 0).then(|| fat::Time::from_seconds_since_2000(seconds.saturating_sub(UNIX_OFFSET)))
 }
 
 /// Gives `fs` the current local time for the files it creates or writes (a fixed date if the clock was never set).
@@ -133,14 +135,13 @@ impl core::fmt::Display for FormatError {
 /// `fat::format_exfat` picks for its size. Everything on the disk is lost. The shell's `format diskN exfat` and the tape
 /// call `disk_format_exfat` both come here (each asks the user first). Returns the volume's size in MiB.
 pub fn format_exfat(disk: usize, label: &[u8]) -> Result<u64, FormatError> {
-    let info = block::get(disk).ok_or(FormatError::NoSuchDisk)?;
-    if crate::storage::boot_disk() == Some(disk) {
+    let _ = block::sectors(disk).ok_or(FormatError::NoSuchDisk)?;
+    if block::boot_disk() == Some(disk) {
         return Err(FormatError::BootDisk);
     }
     if label.len() > 11 || !label.iter().all(|&byte| (0x20..0x7f).contains(&byte) && !b"\"*/:<>?\\|".contains(&byte)) {
         return Err(FormatError::BadLabel);
     }
-    let _ = info;
     let partition = gpt::write_single_partition(disk, &BASIC_DATA_GUID, "exFAT data").map_err(|_| FormatError::Failed)?;
     let mut device = Partition { disk, base: partition.start, sectors: partition.sectors };
     // A serial number that differs between volumes: the tick and microsecond counters, mixed.

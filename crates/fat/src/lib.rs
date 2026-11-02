@@ -76,6 +76,39 @@ pub struct Time {
 impl Time {
     pub const DEFAULT: Time = Time { year: 2026, month: 1, day: 1, hour: 0, minute: 0, second: 0 };
 
+    pub fn is_leap(year: u16) -> bool {
+        year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+    }
+
+    pub fn days_in_month(year: u16, month: u8) -> u8 {
+        match month {
+            2 => 28 + u8::from(Time::is_leap(year)),
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        }
+    }
+
+    /// The date and time `seconds` after 2000-01-01 00:00:00 (no time zone: the caller's local reading).
+    pub fn from_seconds_since_2000(seconds: u64) -> Time {
+        let (second, minute, hour) = ((seconds % 60) as u8, (seconds / 60 % 60) as u8, (seconds / 3600 % 24) as u8);
+        let mut days = seconds / 86_400;
+        let mut year = 2000u16;
+        loop {
+            let length = 365 + u64::from(Time::is_leap(year));
+            if days < length {
+                break;
+            }
+            days -= length;
+            year += 1;
+        }
+        let mut month = 1u8;
+        while days >= u64::from(Time::days_in_month(year, month)) {
+            days -= u64::from(Time::days_in_month(year, month));
+            month += 1;
+        }
+        Time { year, month, day: days as u8 + 1, hour, minute, second }
+    }
+
     /// The FAT date (bits 15-9 year since 1980, 8-5 month, 4-0 day) and time (15-11 hour, 10-5 minute, 4-0 seconds/2).
     /// The inverse of `dos`; None for a stamp that is not a date (month 0, day 0, ...).
     pub(crate) fn from_dos(date: u16, time: u16) -> Option<Time> {

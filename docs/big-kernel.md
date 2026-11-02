@@ -169,4 +169,9 @@ by any test: USB serial adapters, the Pi 4 console and GIC paths (hardware only)
 - Second slice: `gpt` and `lineedit` (the `Platform` gained `block_sectors`, `timer_counter`, `timer_ticks`; `gpt` has a host test).
   x86 kernel 1,168,328 bytes. Verified: `make test`, `test-format`, `test-grow`, `test-install`, `test-fosfs4`, `test-v4-boot`,
   `test-serial-shell` (line editor), aarch64 build.
-- Next: `fatvol`, `mounts` (need `storage`, `tape_fs` hooks), then NICs, storage, USB, audio.
+- Third slice: `fatvol` (the `Platform` gained `boot_disk`, `timer_micros`; `fat::Time` now owns the date arithmetic that
+  `clock.rs` used to have, so the clock and `fatvol` share it). Host test formats and mounts exFAT on a RAM disk; the host tests
+  run one at a time because the kernel code keeps scratch tables in statics. x86 kernel 1,169,456 bytes. Verified: `make test`,
+  `test-clock`, `test-config-fat`, `test-fat-shell`, `test-format-exfat`, `test-format`, `test-fosfs4`, `test-mounts`,
+  `test-v4-boot`, aarch64 build.
+- Next: `mounts` (needs `storage` and `tape_fs` lookups behind the platform), then NICs, storage, USB, audio.

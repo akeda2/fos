@@ -19,7 +19,6 @@ mod e1000;
 mod gpu;
 mod ehci;
 mod ohci;
-mod fatvol;
 mod formatshell;
 mod fault;
 mod platform;

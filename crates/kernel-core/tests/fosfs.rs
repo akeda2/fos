@@ -33,6 +33,14 @@ impl Platform for RamDisks {
         self.0.lock().unwrap().get(&disk).map(|data| data.len() as u64 / 512)
     }
 
+    fn boot_disk(&self) -> Option<usize> {
+        Some(9)
+    }
+
+    fn timer_micros(&self) -> u64 {
+        7
+    }
+
     fn timer_counter(&self) -> u64 {
         0x1234_5678_9abc
     }
@@ -46,10 +54,23 @@ impl Platform for RamDisks {
 
 static DISKS: RamDisks = RamDisks(Mutex::new(BTreeMap::new()));
 static INSTALL: Once = Once::new();
+static SERIAL: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    static HELD: std::cell::RefCell<Option<std::sync::MutexGuard<'static, ()>>> = const { std::cell::RefCell::new(None) };
+}
 
 const SECTORS: u64 = 20_480; // 10 MiB
 
+/// Makes a blank disk. The kernel code keeps its scratch tables in statics (one CPU, no preemption), so a test holds a
+/// global lock from its first disk until it ends and the tests run one at a time.
 fn disk(number: usize) -> usize {
+    HELD.with(|held| {
+        let mut held = held.borrow_mut();
+        if held.is_none() {
+            *held = Some(SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+        }
+    });
     INSTALL.call_once(|| fos_hal::set_platform(&DISKS));
     DISKS.0.lock().unwrap().insert(number, vec![0; SECTORS as usize * 512]);
     number
@@ -111,4 +132,20 @@ fn a_partition_table_is_written_found_and_grown() {
     let found = gpt::find(number, &guid, |_| true).unwrap();
     assert_eq!((found.start, found.sectors), (made.start, made.sectors));
     assert!(matches!(gpt::inspect(number), Some(gpt::Summary::Gpt { fosfs: Some(_), other: 0 })));
+}
+
+#[test]
+fn an_exfat_disk_is_formatted_mounted_and_stamped_with_the_clock() {
+    use kernel_core::fatvol;
+    let number = disk(6);
+    let boot = disk(9);
+    assert_eq!(fatvol::format_exfat(boot, b"X"), Err(fatvol::FormatError::BootDisk));
+    assert!(fatvol::format_exfat(number, b"DEMO").unwrap() > 0);
+    let mut fs = fatvol::mount(number).unwrap();
+    let stream = fs.create(b"hello.txt", 5).unwrap();
+    fs.write(&stream, 0, b"hello", 5).unwrap();
+    let file = fs.find(b"hello.txt").unwrap().unwrap();
+    let mut buffer = [0u8; 5];
+    assert_eq!(fs.read(&file, 0, &mut buffer).unwrap(), 5);
+    assert_eq!(&buffer, b"hello");
 }

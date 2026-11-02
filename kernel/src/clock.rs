@@ -93,15 +93,11 @@ fn valid(time: &Time) -> bool {
 }
 
 fn is_leap(year: u16) -> bool {
-    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+    Time::is_leap(year)
 }
 
 fn days_in_month(year: u16, month: u8) -> u8 {
-    match month {
-        2 => 28 + u8::from(is_leap(year)),
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    }
+    Time::days_in_month(year, month)
 }
 
 /// Seconds since 2000-01-01 00:00:00 for a valid date.
@@ -118,23 +114,7 @@ fn to_seconds(time: &Time) -> u64 {
 }
 
 fn from_seconds(seconds: u64) -> Time {
-    let (second, minute, hour) = ((seconds % 60) as u8, (seconds / 60 % 60) as u8, (seconds / 3600 % 24) as u8);
-    let mut days = seconds / 86_400;
-    let mut year = 2000u16;
-    loop {
-        let length = 365 + u64::from(is_leap(year));
-        if days < length {
-            break;
-        }
-        days -= length;
-        year += 1;
-    }
-    let mut month = 1u8;
-    while days >= u64::from(days_in_month(year, month)) {
-        days -= u64::from(days_in_month(year, month));
-        month += 1;
-    }
-    Time { year, month, day: days as u8 + 1, hour, minute, second }
+    Time::from_seconds_since_2000(seconds)
 }
 
 /// Reads the RTC and starts the software clock from it. `century` is the FADT's century register (0 if none). Needs the

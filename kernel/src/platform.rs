@@ -30,6 +30,14 @@ impl Platform for Embedded {
         crate::block::get(disk).map(|disk| disk.sectors)
     }
 
+    fn boot_disk(&self) -> Option<usize> {
+        crate::storage::boot_disk()
+    }
+
+    fn timer_micros(&self) -> u64 {
+        crate::timer::micros()
+    }
+
     fn timer_counter(&self) -> u64 {
         #[cfg(target_arch = "x86_64")]
         return unsafe { core::arch::x86_64::_rdtsc() };
