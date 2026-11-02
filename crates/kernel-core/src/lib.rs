@@ -9,3 +9,4 @@ pub mod fatvol;
 pub mod fosfs;
 pub mod gpt;
 pub mod lineedit;
+pub mod mounts;

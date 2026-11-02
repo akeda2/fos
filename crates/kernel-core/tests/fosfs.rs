@@ -149,3 +149,20 @@ fn an_exfat_disk_is_formatted_mounted_and_stamped_with_the_clock() {
     assert_eq!(fs.read(&file, 0, &mut buffer).unwrap(), 5);
     assert_eq!(&buffer, b"hello");
 }
+
+#[test]
+fn fstab_fills_the_mount_table_and_the_longest_mount_point_wins() {
+    use kernel_core::mounts;
+    let number = disk(7);
+    let volume = Volume::format_version(number, 0, SECTORS, b"boot", 4).unwrap();
+    volume.mkdir(b"settings").unwrap();
+    volume.write(b"settings/fstab", b"# comment\nconfig @cfgstick\nconfig/deep @other\nnonsense\n").unwrap();
+    assert_eq!(mounts::load_from(Some(volume)), (2, 1));
+    let (label, rest) = mounts::lookup(b"config/phono.cfg").unwrap();
+    assert_eq!((label.as_bytes(), rest), (&b"cfgstick"[..], &b"phono.cfg"[..]));
+    let (label, rest) = mounts::lookup(b"config/deep/x").unwrap();
+    assert_eq!((label.as_bytes(), rest), (&b"other"[..], &b"x"[..]));
+    assert!(mounts::lookup(b"config").is_none() && mounts::lookup_dir(b"config").is_some());
+    assert_eq!(mounts::absent_with(|label| label == b"cfgstick"), 1);
+    mounts::clear();
+}
