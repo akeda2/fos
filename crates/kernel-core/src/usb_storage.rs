@@ -446,5 +446,5 @@ fn register(mut msc: Msc, origin: &str) -> Option<usize> {
     unsafe { DEVICES[slot] = Some(msc) };
     let mut model = [b' '; 40];
     model[..24].copy_from_slice(&inquiry[8..32]); // vendor (8) + product (16)
-    crate::block::register(crate::block::Backend::Usb(slot), blocks, model, origin)
+    crate::block::register_usb(slot, blocks, model, origin)
 }

@@ -6,8 +6,6 @@ mod arch;
 mod audio;
 mod loopback;
 mod audioshell;
-#[path = "ehci_none.rs"]
-mod ehci;
 #[path = "hda_none.rs"]
 mod hda;
 mod block;
@@ -49,20 +47,17 @@ mod kup_serial;
 mod kupshell;
 mod slots;
 mod sdhci;
-mod usb_hub;
 mod usb_audio;
 mod usb_midi;
 mod midishell;
-mod usb_class;
 mod usb_kbd;
 mod usb_pointer;
 mod usbshell;
 mod usb_serial;
 mod usb_serial_pl2303;
 mod usb_serial_ti;
-mod usb_storage;
+mod usb_register;
 mod virtio_blk;
-mod xhci;
 
 /// Everything printed since boot (`dmesg`), also replayed onto the screen once the framebuffer console exists (a Pi shows
 /// nothing on a silent serial port otherwise). Bytes beyond the buffer are dropped.

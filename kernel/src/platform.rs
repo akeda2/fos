@@ -34,6 +34,14 @@ impl Platform for Embedded {
         crate::block::count()
     }
 
+    fn block_register_usb(&self, slot: usize, sectors: u64, model: [u8; 40], origin: &str) -> Option<usize> {
+        crate::block::register(crate::block::Backend::Usb(slot), sectors, model, origin)
+    }
+
+    fn block_usb_disk(&self, slot: usize) -> Option<usize> {
+        crate::block::usb_disk(slot)
+    }
+
     fn boot_disk(&self) -> Option<usize> {
         crate::storage::boot_disk()
     }
@@ -92,6 +100,16 @@ impl Platform for Embedded {
 
     fn msi_count(&self, vector: u8) -> u64 {
         crate::msi::count(vector)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn msi_message(&self, vector: u8) -> (u64, u32) {
+        // Physical destination mode, fixed delivery, to the boot CPU's local APIC.
+        (0xfee0_0000 | u64::from(crate::hal::interrupt_target()) << 12, u32::from(vector))
+    }
+    #[cfg(target_arch = "aarch64")]
+    fn msi_message(&self, vector: u8) -> (u64, u32) {
+        crate::msi::message(vector)
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -187,4 +205,5 @@ static EMBEDDED: Embedded = Embedded;
 
 pub fn install() {
     fos_hal::set_platform(&EMBEDDED);
+    crate::usb_register::install();
 }

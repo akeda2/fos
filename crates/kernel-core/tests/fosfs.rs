@@ -37,6 +37,14 @@ impl Platform for RamDisks {
         self.0.lock().unwrap().keys().max().map_or(0, |last| last + 1)
     }
 
+    fn block_register_usb(&self, _: usize, _: u64, _: [u8; 40], _: &str) -> Option<usize> {
+        None
+    }
+
+    fn block_usb_disk(&self, _: usize) -> Option<usize> {
+        None
+    }
+
     fn boot_disk(&self) -> Option<usize> {
         Some(9)
     }
@@ -70,6 +78,9 @@ impl Platform for RamDisks {
     fn msi_release(&self, _: u8) {}
     fn msi_count(&self, _: u8) -> u64 {
         0
+    }
+    fn msi_message(&self, _: u8) -> (u64, u32) {
+        (0, 0)
     }
     fn msi_claim(&self) {}
     fn msi_intx_candidates(&self, _: u8) -> [u32; 9] {
