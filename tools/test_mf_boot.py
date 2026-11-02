@@ -127,6 +127,9 @@ def main():
         check(tlb is not None and int(tlb.group(1)) >= 3 and int(tlb.group(2)) == cpus, f"-smp {cpus}: exited threads' stacks are flushed from every CPU's TLB before reuse", text)
         pre = re.search(r"Scheduler: preemption ok \(\d+ and \d+ spins.*\), sleep ok \(\d+ ticks for 20\), mutex ok \(50 of 50 increments\)", text)
         check(pre is not None, f"-smp {cpus}: the tick preempts threads that never yield; sleep and the sleeping mutex work", text)
+        if cpus > 1:
+            wake = re.search(r"Scheduler: wake IPI ok \(.* started after (\d+) us on average", text)
+            check(wake is not None, f"-smp {cpus}: an idle CPU is woken by IPI to run a new thread (not at its next tick)", text)
         smp_run = re.search(r"Scheduler: SMP ok \((\d+) unpinned threads ran on (\d+) of (\d+) CPU\(s\)\)", text)
         check(smp_run is not None and int(smp_run.group(2)) == cpus == int(smp_run.group(3)), f"-smp {cpus}: unpinned threads run on every CPU", text)
         check("Hello from ring 3!" in text, f"-smp {cpus}: a ring 3 process makes system calls", text)

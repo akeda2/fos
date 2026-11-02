@@ -21,6 +21,8 @@ use crate::{cpu, pmm, vm};
 
 /// Pages per kernel thread stack (128 KiB: a tape's audio call runs the shared drivers on it, which keep large buffers on the stack).
 const STACK_PAGES: u64 = 32;
+pub const WAKE_VECTOR: u8 = 0x42;
+
 const NO_THREAD: usize = usize::MAX;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -201,7 +203,35 @@ fn spawn_on(name: &str, entry: extern "C" fn(usize), argument: usize, pinned: Op
     };
     sched.threads[id] = Some(Box::new(Thread { id, name: bytes, state: State::Ready, rsp: start, slot: Some((slot, frames)), key: 0, wake_at: 0, pinned, on_cpu: false, root, kstack_top: top, killed: false, written: 0, pid: 0, heap_next: 0, fpu: if root != 0 { crate::fpu::Area::new() } else { None } }));
     sched.queue.push_back(id);
+    let mask = idle_cpu_for(sched, pinned, 0);
+    drop(guard);
+    kick(mask);
     Some(id)
+}
+
+/// One idle CPU (not this one, not in `taken`) that may run a thread pinned to `pinned` (any CPU for None), as a bit mask, or 0.
+fn idle_cpu_for(sched: &Sched, pinned: Option<usize>, taken: u128) -> u128 {
+    let me = this_cpu();
+    for cpu in (0..crate::percpu::count()).filter(|&c| c != me && pinned.is_none_or(|p| p == c)) {
+        if taken & (1 << cpu) == 0 && sched.idle[cpu] != NO_THREAD && sched.current[cpu] == sched.idle[cpu] {
+            return 1 << cpu;
+        }
+    }
+    0
+}
+
+/// Wakes the idle CPUs in `mask` with an IPI so they run what was just made ready now, not at their next 10 ms tick. Call
+/// after the scheduler lock is released.
+fn kick(mask: u128) {
+    for cpu in (0..crate::percpu::count()).filter(|&c| mask & (1 << c) != 0) {
+        crate::apic::send_ipi(crate::percpu::get(cpu).apic_id, 0x4000 | u32::from(WAKE_VECTOR));
+    }
+}
+
+/// The wake IPI's handler: the CPU leaves `hlt` and looks at the run queue.
+pub fn wake_interrupt() {
+    crate::apic::end_of_interrupt();
+    switch_away(true);
 }
 
 /// Gives the CPU to the next ready thread, if there is one; the caller stays ready.
@@ -423,6 +453,7 @@ extern "C" fn sched_exit() -> ! {
 /// Called from the timer interrupt (after the end-of-interrupt): wakes sleepers that are due and ends the running thread's slice.
 pub fn tick() {
     let now = crate::apic::ticks();
+    let mut mask = 0;
     {
         let mut guard = SCHED.lock();
         let Some(sched) = guard.as_mut() else { return };
@@ -430,11 +461,14 @@ pub fn tick() {
             if let Some(thread) = sched.threads[id].as_mut() {
                 if thread.state == State::Sleeping && thread.wake_at <= now {
                     thread.state = State::Ready;
+                    let pinned = thread.pinned;
                     sched.queue.push_back(id);
+                    mask |= idle_cpu_for(sched, pinned, mask);
                 }
             }
         }
     }
+    kick(mask);
     switch_away(true);
 }
 
@@ -519,16 +553,22 @@ pub fn wait_while(key: usize, condition: impl FnOnce() -> bool) {
 
 /// Makes every thread blocked on `key` ready.
 pub fn wake_all(key: usize) {
-    let mut guard = SCHED.lock();
-    let Some(sched) = guard.as_mut() else { return };
-    for id in 0..sched.threads.len() {
-        if let Some(thread) = sched.threads[id].as_mut() {
-            if thread.state == State::Blocked && thread.key == key {
-                thread.state = State::Ready;
-                sched.queue.push_back(id);
+    let mut mask = 0;
+    {
+        let mut guard = SCHED.lock();
+        let Some(sched) = guard.as_mut() else { return };
+        for id in 0..sched.threads.len() {
+            if let Some(thread) = sched.threads[id].as_mut() {
+                if thread.state == State::Blocked && thread.key == key {
+                    thread.state = State::Ready;
+                    let pinned = thread.pinned;
+                    sched.queue.push_back(id);
+                    mask |= idle_cpu_for(sched, pinned, mask);
+                }
             }
         }
     }
+    kick(mask);
 }
 
 /// A mutex that puts a contending thread to sleep instead of spinning, so it may be held across `yield_now`, sleeps and long

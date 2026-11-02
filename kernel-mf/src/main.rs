@@ -423,6 +423,41 @@ fn sched_smp_selftest() {
     println!("Scheduler: SMP {} ({} unpinned threads ran on {seen} of {cpus} CPU(s)).", if seen == cpus && SMP_DONE.load(Relaxed) == workers { "ok" } else { "FAILED" }, workers);
 }
 
+static WAKE_STAMP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+extern "C" fn wake_worker(_: usize) {
+    WAKE_STAMP.store(apic::micros(), core::sync::atomic::Ordering::Release);
+}
+
+/// A thread spawned while the other CPUs idle starts within the IPI's latency, not at their next 10 ms tick (which would
+/// average 5 ms).
+fn sched_wake_selftest() {
+    use core::sync::atomic::Ordering::{Acquire, Relaxed};
+    let cpus = percpu::count();
+    if cpus < 2 {
+        return;
+    }
+    for _ in 0..4 {
+        sched::yield_now();
+    }
+    let mut total = 0;
+    const TRIALS: u64 = 10;
+    for _ in 0..TRIALS {
+        WAKE_STAMP.store(0, Relaxed);
+        apic::busy_wait_ms(3);
+        let begin = apic::micros();
+        sched::spawn_any("wake-worker", wake_worker, 0).expect("a wake worker");
+        let mut spins = 0u64;
+        while WAKE_STAMP.load(Acquire) == 0 && spins < 100_000_000 {
+            core::hint::spin_loop();
+            spins += 1;
+        }
+        total += WAKE_STAMP.load(Acquire).saturating_sub(begin);
+    }
+    let average = total / TRIALS;
+    println!("Scheduler: wake IPI {} (a thread spawned on {cpus} idle CPU(s) started after {average} us on average).", if average < 2000 { "ok" } else { "FAILED" });
+}
+
 fn sched_selftest() {
     sched::init();
     // The first stack creates the page-table pages of the stack region, which stay: do that before counting frames.
@@ -454,5 +489,6 @@ fn sched_selftest() {
     }
     sched_preempt_selftest();
     sched_smp_selftest();
+    sched_wake_selftest();
     user_test::run();
 }
