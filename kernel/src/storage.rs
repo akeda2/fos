@@ -35,21 +35,7 @@ pub fn boot_slot() -> u32 {
 pub fn payload_start() -> Option<u64> {
     unsafe { *core::ptr::addr_of!(PAYLOAD_START) }
 }
-
-/// How a freshly attached disk is named in a message. Disk numbers are settled once the
-/// boot disk is known (it becomes disk1), so a stick found before that cannot honestly be
-/// given a number yet; `disks` lists the final numbering.
-pub struct DiskNumber(pub usize);
-
-impl core::fmt::Display for DiskNumber {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        if boot_disk().is_some() {
-            write!(formatter, "disk{}", self.0 + 1)
-        } else {
-            write!(formatter, "attached (numbered after the boot disk is found; see `disks`)")
-        }
-    }
-}
+pub use kernel_core::usb_env::DiskNumber;
 
 pub use kernel_core::volumes::{VolumeError, boot_volume, set_boot_volume, volume_labelled, volume_on, volume_with_file};
 

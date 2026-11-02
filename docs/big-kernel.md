@@ -213,5 +213,8 @@ by any test: USB serial adapters, the Pi 4 console and GIC paths (hardware only)
   The pointer code reaches the screen through `screen::set` (logical size, rotation, and on the Pi the DSI touch chip, whose
   driver stays in the kernel with the I2C bus); `Rotate` and `line::Line` moved to core. The `touch monitor` loop needs the
   console and NETFS, so `kernel/src/usb_pointer.rs` is now a shim that re-exports core and adds `command`.
-- Next: the enumerators (`usb_hid`, `usb_kbd`) with `usbshell`, then `ohci`.
+- Slice 10c, the enumerators: `usb_hid` (x86), `usb_kbd` (Pi) and `ohci` are in core. What they needed from the console side
+  is `usb_env::set` (queue a key, the active keymap, whether the boot disk is known, which `DiskNumber` prints); the Pi's key
+  queue and layout stay in `kernel/src/usb_kbd.rs`, which re-exports the core enumerator. `describe_xhci` moved to `usb_hub`.
+- Next: `usbshell` and the remaining leaf drivers; then stage 1b is done and the server kernel's own `Platform` can start.
   The server kernel needs all of them; only the real-time guarantees (interrupt-context audio refills) differ.
