@@ -12,6 +12,7 @@ mod fpu;
 mod process;
 mod sched;
 mod tapeapi;
+mod tapefs;
 mod user_test;
 mod fb;
 mod config;

@@ -389,6 +389,8 @@ flavour marker reaches `fosadm status`, and whether the batch queue needs the sc
   is a read-only table of stubs `mov eax,0x100+slot; syscall`; `tapeapi::call` serves console, time, memory (`alloc`/`free`, a
   per-process heap), `gfx_*` (screen 0), `fp_level`; `fs_*` return "no volume"; everything else returns 0. Shell: `tape NAME [ARGS]`,
   `kill PID`. `make test-mf-tape` runs hello, fpcheck and gfxcheck at `-smp` 1/2/8 (SSE2 and AVX2).
-  Input: the started tape is the foreground one; typed bytes (serial or `term net`) reach it through `read_key` (64-byte queue), Escape kills it and the shell prompt returns when it ends. Gaps: no file access from tapes (the drivers are CPU-0 only and
-  unlocked, so an FS service is needed), no NIC/audio/MIDI/touch/GPIO calls, `alloc` gives virtual addresses (no DMA tapes), no SMAP,
+  Input: the started tape is the foreground one; typed bytes (serial or `term net`) reach it through `read_key` (64-byte queue), Escape kills it and the shell prompt returns when it ends. Files: `tapefs.rs` serves `fs_read`/`fs_read_at`/`fs_write`/`fs_remove`/`fs_list` and the stream calls
+  on the shared `kernel_core::tape_fs`, under one lock (also the shell's), through kernel bounce buffers (1 MiB read pieces, 8 MiB
+  whole-file write); the first process to open a stream owns the stream table until it ends. `test-mf-tape` runs `fscheck` (ranges, two streams)
+  and an `ed` save/reload through the keyboard. Gaps: the disk lock keeps interrupts off during a transfer, no NIC/audio/MIDI/touch/GPIO calls, `alloc` gives virtual addresses (no DMA tapes), no SMAP,
   no stack guard page, no TLB shootdown, no wake IPI. Only hardware shows XSAVE/AVX on silicon, SYSCALL/swapgs/SMEP and the pixel path.

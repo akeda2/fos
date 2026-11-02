@@ -181,6 +181,7 @@ fn run(line: &str) {
 
 /// Loads the ELF tape `name` from the boot volume (or whichever volume holds it) and starts it as a process.
 fn run_tape(name: &str, args: &str) {
+    let disk = crate::tapefs::LOCK.lock();
     let Some(volume) = kernel_core::volumes::volume_with_file(name.as_bytes()) else {
         return println!("tape: no file `{name}`.");
     };
@@ -192,6 +193,7 @@ fn run_tape(name: &str, args: &str) {
     if !matches!(volume.read(name.as_bytes(), &mut image), Ok(Some(_))) {
         return println!("tape: cannot read `{name}`.");
     }
+    drop(disk);
     match crate::process::spawn_elf(name, &image, args.as_bytes()) {
         Ok(pid) => {
             println!("tape: `{name}` is process {pid}; Escape stops it.");
