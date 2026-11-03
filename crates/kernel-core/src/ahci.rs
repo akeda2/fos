@@ -58,6 +58,7 @@ const ATA_READ_DMA: u8 = 0xc8;
 const ATA_READ_DMA_EXT: u8 = 0x25;
 const ATA_WRITE_DMA: u8 = 0xca;
 const ATA_WRITE_DMA_EXT: u8 = 0x35;
+const ATA_DATA_SET_MANAGEMENT: u8 = 0x06;
 const ATA_FLUSH_CACHE: u8 = 0xe7;
 const ATA_FLUSH_CACHE_EXT: u8 = 0xea;
 
@@ -102,24 +103,31 @@ pub struct Drive {
     frame: usize,
     pub sectors: u64,
     lba48: bool,
+    /// IDENTIFY word 169 bit 0: DATA SET MANAGEMENT with the TRIM feature.
+    can_trim: bool,
     pub model: [u8; 40],
 }
 
 impl Drive {
     /// Runs one ATA DMA command through command slot 0 and waits for it.
     fn command(&self, command: u8, lba: u64, count: u32, write: bool, bytes: u32) -> Result<(), Error> {
+        self.command_with(command, 0, lba, count, write, bytes)
+    }
+
+    /// `command` with a feature byte (DATA SET MANAGEMENT's TRIM is feature 1).
+    fn command_with(&self, command: u8, feature: u8, lba: u64, count: u32, write: bool, bytes: u32) -> Result<(), Error> {
         let list = self.frame + OFFSET_COMMAND_LIST;
         let table = self.frame + OFFSET_COMMAND_TABLE;
         unsafe {
             core::ptr::write_bytes(memory::phys_to_virt(table as u64) as *mut u8, 0, 0x90);
             // 28-bit commands carry LBA bits 27:24 in the device register; 48-bit ones
             // carry bits 47:24 in the second LBA byte group.
-            let ext = matches!(command, ATA_READ_DMA_EXT | ATA_WRITE_DMA_EXT | ATA_FLUSH_CACHE_EXT);
+            let ext = matches!(command, ATA_READ_DMA_EXT | ATA_WRITE_DMA_EXT | ATA_FLUSH_CACHE_EXT | ATA_DATA_SET_MANAGEMENT);
             let fis = [
                 0x27u8, // FIS type: Register Host-to-Device
                 0x80,   // bit 7: this FIS carries a command
                 command,
-                0,
+                feature,
                 lba as u8,
                 (lba >> 8) as u8,
                 (lba >> 16) as u8,
@@ -200,6 +208,41 @@ impl Drive {
         let sectors = self.check(lba, buffer.len())?;
         self.command(if self.lba48 { ATA_READ_DMA_EXT } else { ATA_READ_DMA }, lba, sectors, false, buffer.len() as u32)?;
         unsafe { core::ptr::copy_nonoverlapping(memory::phys_to_virt((self.frame + OFFSET_BOUNCE) as u64) as *const u8, buffer.as_mut_ptr(), buffer.len()) };
+        Ok(())
+    }
+
+    /// TRIM: DATA SET MANAGEMENT (feature 1) over `ranges` (start, sectors). The payload is 8-byte entries, a 48-bit LBA
+    /// and a 16-bit sector count, 64 to a sector; up to `MAX_SECTORS` payload sectors go in one command. What is read from
+    /// a trimmed range afterwards is undefined. `Unsupported` unless IDENTIFY says the drive does TRIM (and LBA48).
+    pub fn discard(&self, ranges: &[(u64, u64)]) -> Result<(), Error> {
+        if !self.can_trim || !self.lba48 {
+            return Err(Error::Unsupported);
+        }
+        const PER_COMMAND: usize = MAX_SECTORS * 64;
+        let payload = memory::phys_to_virt((self.frame + OFFSET_BOUNCE) as u64) as *mut u64;
+        let mut used = 0;
+        let send = |used: usize| -> Result<(), Error> {
+            let sectors = used.div_ceil(64);
+            // The last payload sector is padded with zero entries, which the drive ignores.
+            unsafe { core::ptr::write_bytes(payload.add(used), 0, sectors * 64 - used) };
+            self.command_with(ATA_DATA_SET_MANAGEMENT, 1, 0, sectors as u32, true, sectors as u32 * 512)
+        };
+        for &(start, count) in ranges {
+            let (mut lba, end) = (start, start + count);
+            while lba < end {
+                let length = (end - lba).min(0xffff);
+                unsafe { payload.add(used).write_volatile(lba | length << 48) };
+                used += 1;
+                lba += length;
+                if used == PER_COMMAND {
+                    send(used)?;
+                    used = 0;
+                }
+            }
+        }
+        if used > 0 {
+            send(used)?;
+        }
         Ok(())
     }
 
@@ -294,7 +337,7 @@ fn init_port(registers: usize) -> Option<Drive> {
     }
     write32(registers + P_CMD, read32(registers + P_CMD) | CMD_START);
 
-    let mut drive = Drive { registers, frame, sectors: 0, lba48: false, model: [b' '; 40] };
+    let mut drive = Drive { registers, frame, sectors: 0, lba48: false, can_trim: false, model: [b' '; 40] };
     drive.command(ATA_IDENTIFY, 0, 0, false, 512).ok()?;
     // IDENTIFY DEVICE data: 256 little-endian words in the bounce buffer.
     let words = memory::phys_to_virt((frame + OFFSET_BOUNCE) as u64) as *const u16;
@@ -305,6 +348,7 @@ fn init_port(registers: usize) -> Option<Drive> {
         drive.model[index * 2 + 1] = value as u8;
     }
     drive.lba48 = word(83) & (1 << 10) != 0;
+    drive.can_trim = word(169) & 1 != 0;
     drive.sectors = if drive.lba48 {
         u64::from(word(100)) | u64::from(word(101)) << 16 | u64::from(word(102)) << 32 | u64::from(word(103)) << 48
     } else {

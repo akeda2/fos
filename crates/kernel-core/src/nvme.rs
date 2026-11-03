@@ -46,6 +46,11 @@ const ADMIN_IDENTIFY: u32 = 0x06;
 const IO_FLUSH: u32 = 0x00;
 const IO_WRITE: u32 = 0x01;
 const IO_READ: u32 = 0x02;
+const IO_DATASET_MANAGEMENT: u32 = 0x09;
+/// Most sectors one Dataset Management range may cover (well under every controller's limit).
+const DISCARD_RANGE_SECTORS: u64 = 0xffff;
+/// Ranges per command: 16 bytes each in the 8 KiB bounce buffer (the specification allows 256).
+const DISCARD_RANGES: usize = 256;
 
 // Layout of the six frames each controller gets.
 const OFFSET_ADMIN_SQ: usize = 0 * PAGE;
@@ -150,6 +155,8 @@ struct Controller {
     frame: usize,
     io: Queue,
     timeout_ticks: u64,
+    /// ONCS bit 2: the controller implements Dataset Management (deallocate).
+    can_discard: bool,
 }
 
 static mut CONTROLLERS: [Option<Controller>; MAX_CONTROLLERS] = [const { None }; MAX_CONTROLLERS];
@@ -203,6 +210,57 @@ impl Drive {
         self.transfer(IO_READ, lba, sectors)?;
         let bounce = self.controller().frame + OFFSET_BOUNCE;
         unsafe { core::ptr::copy_nonoverlapping(memory::phys_to_virt(bounce as u64) as *const u8, buffer.as_mut_ptr(), buffer.len()) };
+        Ok(())
+    }
+
+    /// TRIM: Dataset Management with the deallocate attribute over `ranges` (start, sectors). The controller may then
+    /// forget the data; what is read back from the ranges is undefined. `Unsupported` without ONCS bit 2.
+    pub fn discard(&self, ranges: &[(u64, u64)]) -> Result<(), Error> {
+        let controller = self.controller();
+        if !controller.can_discard {
+            return Err(Error::Unsupported);
+        }
+        let bounce = controller.frame + OFFSET_BOUNCE;
+        let entries = memory::phys_to_virt(bounce as u64) as *mut u32;
+        let mut used = 0;
+        let send = |used: usize| -> Result<(), Error> {
+            let controller = self.controller();
+            let mut command = [0u32; 16];
+            command[0] = IO_DATASET_MANAGEMENT;
+            command[1] = 1;
+            command[6] = bounce as u32;
+            command[7] = (bounce as u64 >> 32) as u32;
+            if used * 16 > PAGE {
+                command[8] = (bounce + PAGE) as u32;
+                command[9] = ((bounce + PAGE) as u64 >> 32) as u32;
+            }
+            command[10] = used as u32 - 1; // number of ranges, zero based
+            command[11] = 1 << 2; // AD: attribute deallocate
+            let timeout = controller.timeout_ticks;
+            controller.io.execute(command, timeout)
+        };
+        for &(start, sectors) in ranges {
+            let (mut lba, end) = (start, start + sectors);
+            while lba < end {
+                let length = (end - lba).min(DISCARD_RANGE_SECTORS);
+                // A range entry: context attributes, length in blocks, starting LBA.
+                unsafe {
+                    entries.add(used * 4).write_volatile(0);
+                    entries.add(used * 4 + 1).write_volatile(length as u32);
+                    entries.add(used * 4 + 2).write_volatile(lba as u32);
+                    entries.add(used * 4 + 3).write_volatile((lba >> 32) as u32);
+                }
+                used += 1;
+                lba += length;
+                if used == DISCARD_RANGES {
+                    send(used)?;
+                    used = 0;
+                }
+            }
+        }
+        if used > 0 {
+            send(used)?;
+        }
         Ok(())
     }
 
@@ -296,6 +354,7 @@ fn init_controller(device: &pci::Device, index: usize) -> Option<Drive> {
 
     let result = (|| {
         identify(&mut admin, 0, 1).ok()?;
+        let oncs = unsafe { (memory::phys_to_virt((bounce + 520) as u64) as *const u16).read_volatile() }; // ONCS: bytes 521:520
         let mut model = [b' '; 40];
         unsafe { core::ptr::copy_nonoverlapping(memory::phys_to_virt((bounce + 24) as u64) as *const u8, model.as_mut_ptr(), 40) }; // MN: bytes 24..64
 
@@ -321,15 +380,15 @@ fn init_controller(device: &pci::Device, index: usize) -> Option<Drive> {
         create_sq[10] = ((QUEUE_ENTRIES as u32 - 1) << 16) | 1;
         create_sq[11] = (1 << 16) | 1; // completes into CQ 1, physically contiguous
         admin.execute(create_sq, timeout_ticks).ok()?;
-        Some((model, sectors))
+        Some((model, sectors, oncs & (1 << 2) != 0))
     })();
-    let Some((model, sectors)) = result else {
+    let Some((model, sectors, can_discard)) = result else {
         write32(registers + REG_CC, read32(registers + REG_CC) & !CC_ENABLE);
         memory::free(frame as u64, 6);
         return None;
     };
 
     let io = Queue::new(frame + OFFSET_IO_SQ, frame + OFFSET_IO_CQ, registers, stride, 1);
-    unsafe { (*core::ptr::addr_of_mut!(CONTROLLERS))[index] = Some(Controller { registers, frame, io, timeout_ticks }) };
+    unsafe { (*core::ptr::addr_of_mut!(CONTROLLERS))[index] = Some(Controller { registers, frame, io, timeout_ticks, can_discard }) };
     Some(Drive { index, sectors, model })
 }
