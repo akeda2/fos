@@ -133,6 +133,8 @@ pub struct Inode {
     pub atime: u32,
     pub ctime: u32,
     pub mtime: u32,
+    pub uid: u32,
+    pub gid: u32,
     block: [u8; 60],
 }
 
@@ -377,7 +379,7 @@ impl<D: Device> Fs<D> {
         }
         let mut map = [0u8; 60];
         map.copy_from_slice(&raw[40..100]);
-        Ok(Inode { number, mode, size, flags: le32(raw, 32), links: le16(raw, 26), atime: le32(raw, 8), ctime: le32(raw, 12), mtime: le32(raw, 16), block: map })
+        Ok(Inode { number, mode, size, flags: le32(raw, 32), links: le16(raw, 26), atime: le32(raw, 8), ctime: le32(raw, 12), mtime: le32(raw, 16), uid: u32::from(le16(raw, 2)) | u32::from(le16(raw, 120)) << 16, gid: u32::from(le16(raw, 24)) | u32::from(le16(raw, 122)) << 16, block: map })
     }
 
     /// Where logical block `logical` of the file is: the run it starts, so one call covers as much as is contiguous.
@@ -530,23 +532,32 @@ impl<D: Device> Fs<D> {
 
     /// Calls `visit` for every entry of a folder (including `.` and `..`) until it returns true.
     pub fn list(&mut self, folder: &Inode, visit: &mut dyn FnMut(&DirEntry) -> bool) -> Result<(), Error> {
+        self.list_from(folder, 0, &mut |entry, _| visit(entry))
+    }
+
+    /// Like `list`, starting at a position an earlier call handed to `visit` (0 for the start): the position after the entry
+    /// just visited, so a walk that goes on where it stopped costs one pass instead of one per entry. A position is the
+    /// folder block in the high 32 bits and the byte offset in it in the low 32.
+    pub fn list_from(&mut self, folder: &Inode, from: u64, visit: &mut dyn FnMut(&DirEntry, u64) -> bool) -> Result<(), Error> {
         if !folder.is_dir() {
             return Err(Error::NotADirectory);
         }
         let size = self.block_size as u64;
-        let mut logical = 0;
+        let mut logical = from >> 32;
+        let mut skip = (from & 0xffff_ffff) as usize;
         while logical * size < folder.size {
             let (block, blocks) = match self.map(folder, logical)? {
                 Mapping::Data { block, blocks } => (block, blocks),
                 Mapping::Hole { blocks } | Mapping::Zeros { blocks } => {
                     logical += blocks;
+                    skip = 0;
                     continue;
                 }
             };
             for step in 0..blocks.min((folder.size.div_ceil(size)).saturating_sub(logical)) {
                 self.read_block(block + step, Buffer::Data)?;
                 let bytes = &self.data[..self.block_size];
-                let mut at = 0;
+                let mut at = core::mem::take(&mut skip);
                 while at + 8 <= bytes.len() {
                     let record = usize::from(le16(bytes, at + 4));
                     let name_length = usize::from(bytes[at + 6]);
@@ -554,7 +565,8 @@ impl<D: Device> Fs<D> {
                         return Err(Error::Corrupt);
                     }
                     let inode = le32(bytes, at);
-                    if inode != 0 && visit(&DirEntry { inode, kind: bytes[at + 7], name: &bytes[at + 8..at + 8 + name_length] }) {
+                    let after = ((logical + step) << 32) | (at + record) as u64;
+                    if inode != 0 && visit(&DirEntry { inode, kind: bytes[at + 7], name: &bytes[at + 8..at + 8 + name_length] }, after) {
                         return Ok(());
                     }
                     at += record;

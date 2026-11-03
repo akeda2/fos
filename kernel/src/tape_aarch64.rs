@@ -210,6 +210,9 @@ fn make_api(info: &BootInfo, arguments: &str) -> TapeApi {
         fs_stream_write2: crate::tape_fs::api_fs_stream_write2,
         fs_stream_close2: crate::tape_fs::api_fs_stream_close2,
         phys_addr: api_phys_addr,
+        vfs_stat: kernel_core::tape_vfs::api_vfs_stat,
+        vfs_read_dir: kernel_core::tape_vfs::api_vfs_read_dir,
+        vfs_read: kernel_core::tape_vfs::api_vfs_read,
     }
 }
 

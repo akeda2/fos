@@ -10,6 +10,7 @@ tape_rt::tape_help!(br#"fscheck: read a range of a file with fs_read_at (ABI 29)
 Usage: tape run fscheck NAME OFFSET LENGTH   (NAME: NAME, diskN/NAME or @LABEL/NAME)
 Prints the bytes read; a count of 0 means the offset is at or past the end.
        tape run fscheck streams NAME1 NAME2   (two open streams, ABI 30; the files are 20000 and 19900 bytes)
+       tape run fscheck vfs PATH              (ABI 32: stat PATH, list it if a folder, else read its first 40 bytes)
        tape run fscheck remove NAME           (create NAME, delete it with fs_remove, check it is gone)
 "#);
 
@@ -23,6 +24,13 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         return match (words.next(), words.next()) {
             (Some(first), Some(second)) => streams(first, second),
             _ => println!("Usage: fscheck streams NAME1 NAME2"),
+        };
+    }
+    if arguments.starts_with("vfs ") {
+        words.next();
+        return match words.next() {
+            Some(path) => vfs(path),
+            None => println!("Usage: fscheck vfs PATH"),
         };
     }
     if arguments.starts_with("remove ") {
@@ -114,5 +122,29 @@ fn streams(first: &str, second: &str) {
             }
         }
         println!("fscheck: streams {n}: {total} bytes, {bad} wrong");
+    }
+}
+
+/// ABI 32: `vfs_stat`, then `vfs_read_dir` for every entry of a folder or `vfs_read` of the start of a file.
+fn vfs(path: &str) {
+    let stat = match tape_rt::vfs_stat(path) {
+        Ok(stat) => stat,
+        Err(code) => return println!("fscheck: vfs {path}: error {code}"),
+    };
+    println!("fscheck: vfs {path}: kind {} mode {:o} size {} uid {} gid {} mtime {}", stat.kind, stat.mode, stat.size, stat.uid, stat.gid, stat.mtime);
+    if stat.kind == 2 {
+        let mut index = 0;
+        while let Ok(Some(entry)) = tape_rt::vfs_read_dir(path, index) {
+            let name = core::str::from_utf8(entry.name()).unwrap_or("?");
+            println!("fscheck: entry {index} [{name}] kind {} size {} uid {}", entry.stat.kind, entry.stat.size, entry.stat.uid);
+            index += 1;
+        }
+        println!("fscheck: {index} entries");
+    } else {
+        let mut buffer = [0u8; 40];
+        match tape_rt::vfs_read(path, 0, &mut buffer) {
+            Ok(count) => println!("fscheck: read {count} bytes [{}]", core::str::from_utf8(&buffer[..count]).unwrap_or("?")),
+            Err(code) => println!("fscheck: read error {code}"),
+        }
     }
 }

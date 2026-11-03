@@ -782,6 +782,42 @@ pub fn phys_addr(address: usize) -> usize {
     if table.version >= 31 && table.size as usize >= end { (table.phys_addr)(address) } else { address }
 }
 
+fn vfs_table() -> Option<&'static fosfor_abi::tape::TapeApi> {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, vfs_read) + core::mem::size_of::<usize>();
+    (table.version >= 32 && table.size as usize >= end).then_some(table)
+}
+
+/// What a file or folder is (ABI 32, `vfs_stat`): any volume, ext2/3/4 included; `Err` is a negative `FS_*` code.
+pub fn vfs_stat(path: &str) -> Result<fosfor_abi::tape::VfsStat, isize> {
+    let table = vfs_table().ok_or(fosfor_abi::tape::FS_ERROR)?;
+    let mut out = fosfor_abi::tape::VfsStat::default();
+    match (table.vfs_stat)(path.as_ptr(), path.len(), &mut out) {
+        0 => Ok(out),
+        code => Err(code),
+    }
+}
+
+/// The `index`th entry of a folder (ABI 32, `vfs_read_dir`); `Ok(None)` past the end. Walk indexes in order for a one-pass listing.
+pub fn vfs_read_dir(path: &str, index: usize) -> Result<Option<fosfor_abi::tape::VfsEntry>, isize> {
+    let table = vfs_table().ok_or(fosfor_abi::tape::FS_ERROR)?;
+    let mut out = fosfor_abi::tape::VfsEntry::default();
+    match (table.vfs_read_dir)(path.as_ptr(), path.len(), index, &mut out) {
+        1 => Ok(Some(out)),
+        0 => Ok(None),
+        code => Err(code),
+    }
+}
+
+/// Reads up to `buffer.len()` bytes from `offset` (ABI 32, `vfs_read`); the count, 0 at the end.
+pub fn vfs_read(path: &str, offset: u64, buffer: &mut [u8]) -> Result<usize, isize> {
+    let table = vfs_table().ok_or(fosfor_abi::tape::FS_ERROR)?;
+    match (table.vfs_read)(path.as_ptr(), path.len(), offset, buffer.as_mut_ptr(), buffer.len()) {
+        count if count >= 0 => Ok(count as usize),
+        code => Err(code),
+    }
+}
+
 /// The I2C bus's SCL speed in Hz (Raspberry Pi 4 header); `Err(-4)` where there is none or the kernel is older than version 23.
 pub fn i2c_speed() -> Result<u32, i32> {
     let t = i2c_table().ok_or(-4)?;

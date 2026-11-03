@@ -156,6 +156,31 @@ fn run(mkfs: &[&str], name: &str) {
     let reads = READS.with(|reads| reads.get()) - before;
     eprintln!("indexed lookups: {reads} reads");
     assert!(reads < 429 * 8, "{reads} device reads for 429 indexed lookups (a linear scan needs ~40 each)");
+    // Resuming at a position `list_from` gave continues the same walk, one pass for the whole folder.
+    let mut all = Vec::new();
+    volume.list(&many, &mut |entry| { all.push(entry.name.to_vec()); false }).unwrap();
+    let mut resumed = Vec::new();
+    let mut position = 0;
+    loop {
+        let mut next = None;
+        let mut taken = 0;
+        volume.list_from(&many, position, &mut |entry, after| {
+            resumed.push(entry.name.to_vec());
+            taken += 1;
+            next = Some(after);
+            taken == 100
+        }).unwrap();
+        match next {
+            Some(after) if taken == 100 => position = after,
+            _ => break,
+        }
+    }
+    assert_eq!(all, resumed);
+    assert!(all.len() > 3000);
+    use std::os::unix::fs::MetadataExt;
+    let small = volume.resolve(b"small.txt").unwrap().unwrap();
+    let owner = fs::metadata(source.join("small.txt")).unwrap();
+    assert_eq!((small.uid, small.gid), (owner.uid(), owner.gid()));
     let found = volume.resolve("docs//deeper/deepest/Räksmörgås 日本語.txt".as_bytes()).unwrap().unwrap();
     assert_eq!(found.size, "hej på dig\n".len() as u64);
     assert!(volume.resolve(b"docs/nothere").unwrap().is_none());

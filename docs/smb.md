@@ -29,14 +29,17 @@ Tapes reach only FOSFS and FAT today (`fs_read`, `fs_read_at`, `fs_list`: names 
 folders, modes, uid/gid, times, names of 255 bytes. So the ABI grows (append-only, version 32) a path-based set that resolves a
 reference like `fs_read` does (`diskN/...`, `@LABEL/...`, the mount table) and answers for every volume type:
 
-- `vfs_stat(path, out: *mut VfsStat)`: kind (file, folder, link), size, mtime/ctime/atime, mode, uid, gid, link count, inode.
-- `vfs_read_dir(path, index, out: *mut VfsEntry)`: the `index`th entry of a folder (name up to 255 bytes UTF-8, kind, size);
-  the kernel keeps a one-folder cursor so a sequential walk costs one pass.
-- `vfs_read(path, offset, buffer, capacity)`: as `fs_read_at`, for any volume.
-- later: `vfs_create`, `vfs_write`, `vfs_mkdir`, `vfs_remove`, `vfs_rename`, `vfs_truncate`.
+Done (ABI 32, `crates/kernel-core/src/tape_vfs.rs`, `tape_rt::vfs_stat/vfs_read_dir/vfs_read`, `make test-vfs`):
 
-ext4 behind these is `crates/ext4` through `ext4vol` (already shared by both kernels). The structs are new and the kernel fills
-them, so they are sized and versioned like the other calls (never grow a struct the kernel fills).
+- `vfs_stat(path, len, *mut VfsStat)`: kind (file, folder, link), mode, size, mtime/ctime/atime, uid, gid, links, inode.
+- `vfs_read_dir(path, len, index, *mut VfsEntry)`: 1, 0 past the end or a negative code; the `VfsEntry` is a `VfsStat` plus a
+  name of up to 255 bytes UTF-8, so a listing needs no stat per entry. A one-folder cursor makes an in-order walk one pass.
+- `vfs_read(path, len, offset, buffer, capacity)`: as `fs_read_at`.
+- ext4 is reached as `diskN/path` on a disk with no FOSFS and no FAT volume; the mount is kept (`ext4vol::shared`) and dropped by
+  any shell `ext4` command. `@LABEL` and the mount table are not resolved for ext4 yet. FOSFS and FAT answer through `tape_fs`
+  (mode 0644/0755, uid/gid 0, no times).
+- Symbolic links are reported as links, not followed. Calls are serialised by the file lock (mf) like the other fs calls.
+- later: `vfs_create`, `vfs_write`, `vfs_mkdir`, `vfs_remove`, `vfs_rename`, `vfs_truncate`.
 
 ## Protocol scope
 

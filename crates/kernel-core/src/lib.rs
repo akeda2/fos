@@ -50,6 +50,7 @@ pub mod rtl8139;
 pub mod rtl8168;
 pub mod screen;
 pub mod tape_fs;
+pub mod tape_vfs;
 pub mod threecom;
 pub mod usb_class;
 pub mod usb_midi;
