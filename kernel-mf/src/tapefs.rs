@@ -12,8 +12,8 @@
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
-use fosfor_abi::tape::{FS_ERROR, FS_STREAMS, FS_TOO_BIG, FileInfo};
-use kernel_core::tape_fs;
+use fosfor_abi::tape::{FS_ERROR, FS_STREAMS, FS_TOO_BIG, FileInfo, VfsEntry, VfsStat};
+use kernel_core::{tape_fs, tape_vfs};
 
 use crate::{process, sched};
 
@@ -103,6 +103,44 @@ fn read_at(reference: &[u8], offset: u64, to: u64, count: u64) -> isize {
 pub fn read_range(name_at: u64, name_len: u64, offset: u64, buffer: u64, capacity: u64) -> isize {
     let Some(reference) = name(name_at, name_len) else { return FS_ERROR };
     read_at(&reference, offset, buffer, capacity.min(CHUNK as u64))
+}
+
+/// `vfs_stat(path, path_len, out)`: a `VfsStat` at the user address `out`.
+pub fn vfs_stat(name_at: u64, name_len: u64, out: u64) -> isize {
+    let Some(reference) = name(name_at, name_len) else { return FS_ERROR };
+    let mut info = VfsStat::default();
+    let code = {
+        let _guard = lock();
+        tape_vfs::stat(&reference, &mut info)
+    };
+    if code == 0 && !copy_struct(out, &info) { FS_ERROR } else { code }
+}
+
+/// `vfs_read_dir(path, path_len, index, out)`: 1 and a `VfsEntry` at `out`, 0 past the end, or a negative code.
+pub fn vfs_read_dir(name_at: u64, name_len: u64, index: u64, out: u64) -> isize {
+    let Some(reference) = name(name_at, name_len) else { return FS_ERROR };
+    let mut entry = VfsEntry::default();
+    let found = {
+        let _guard = lock();
+        tape_vfs::read_dir(&reference, index as usize, &mut entry)
+    };
+    if found == 1 && !copy_struct(out, &entry) { FS_ERROR } else { found }
+}
+
+/// `vfs_read(path, path_len, offset, buffer, capacity)`: up to `CHUNK` bytes per call.
+pub fn vfs_read(name_at: u64, name_len: u64, offset: u64, buffer: u64, capacity: u64) -> isize {
+    let Some(reference) = name(name_at, name_len) else { return FS_ERROR };
+    let mut piece = alloc::vec![0u8; capacity.min(CHUNK as u64) as usize];
+    let got = {
+        let _guard = lock();
+        tape_vfs::read(&reference, offset, &mut piece)
+    };
+    if got > 0 && !process::copy_to_user(buffer, &piece[..got as usize]) { FS_ERROR } else { got }
+}
+
+fn copy_struct<T>(to: u64, value: &T) -> bool {
+    let bytes = unsafe { core::slice::from_raw_parts(value as *const T as *const u8, core::mem::size_of::<T>()) };
+    process::copy_to_user(to, bytes)
 }
 
 pub fn write(name_at: u64, name_len: u64, data: u64, length: u64) -> isize {

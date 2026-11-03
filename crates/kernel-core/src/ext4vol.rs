@@ -77,6 +77,49 @@ pub fn cancel() {
 
 pub type Fs = ext4::Fs<Partition>;
 
+/// Where a folder walk by index (`tape_vfs::read_dir`) stopped: the folder's inode, how many entries (without `.` and `..`)
+/// were passed and the folder position after the last one, so asking for the next index continues there.
+#[derive(Clone, Copy)]
+pub struct Cursor {
+    pub folder: u32,
+    pub index: usize,
+    pub position: u64,
+}
+
+/// A volume kept mounted between tape calls (an SMB server asks thousands of times a minute), with its read cache intact.
+pub struct Shared {
+    pub disk: usize,
+    pub fs: Fs,
+    pub cursor: Option<Cursor>,
+}
+
+static mut SHARED: Option<Shared> = None;
+
+/// The ext volume of disk index `disk` for tape calls, mounted once and kept until something else locates a volume (any
+/// shell command that reads or changes one does, and that also empties the read cache, so nothing stale survives).
+pub fn shared(disk: usize) -> Result<&'static mut Shared, Error> {
+    // SAFETY: tape file calls are serialised by the caller (the kernel's file lock); the statics are only reached from here.
+    unsafe {
+        let slot = &mut *core::ptr::addr_of_mut!(SHARED);
+        if slot.as_ref().is_none_or(|shared| shared.disk != disk) {
+            *slot = None;
+            let fs = mount(disk)?;
+            *slot = Some(Shared { disk, fs, cursor: None });
+        }
+        Ok(slot.as_mut().unwrap())
+    }
+}
+
+/// The disk index of the kept volume, if any.
+pub fn shared_disk() -> Option<usize> {
+    unsafe { (*core::ptr::addr_of!(SHARED)).as_ref().map(|shared| shared.disk) }
+}
+
+/// Drops the kept volume: after the tape side wrote to it, or the disk went away.
+pub fn forget_shared() {
+    unsafe { *core::ptr::addr_of_mut!(SHARED) = None };
+}
+
 /// Mounts the ext volume of disk index `disk` (0-based). Err carries the last reason when something looked like ext
 /// but was refused (a dirty journal, an unsupported feature); NotExt when there is nothing.
 pub fn mount(disk: usize) -> Result<Fs, Error> {
@@ -85,6 +128,7 @@ pub fn mount(disk: usize) -> Result<Fs, Error> {
 
 /// The partition (or whole disk) holding the ext volume of disk index `disk`, even if its journal needs replaying.
 pub fn locate(disk: usize) -> Result<Partition, Error> {
+    forget_shared();
     let info = block::sectors(disk).ok_or(Error::Device)?;
     cache().clear();
     let mut candidates = [Partition { disk, base: 0, sectors: 0 }; 6];

@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`. Version 20 added `gfx_screens` and the `gfx_*_on` calls (a screen number). Version 21 added `audio_float`. Version 22 added the `gpio_*` calls. Version 23 added `i2c_speed` and `i2c_transfer`. Version 24 added `touch_info` and `touch_read`. Version 25 added `midi_read` and `midi_send`. Version 26 added `midi_devices`. Version 27 added `nic_owned`. Version 28 added `gpio_pull_get`.
-pub const TAPE_API_VERSION: u32 = 31;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`. Version 20 added `gfx_screens` and the `gfx_*_on` calls (a screen number). Version 21 added `audio_float`. Version 22 added the `gpio_*` calls. Version 23 added `i2c_speed` and `i2c_transfer`. Version 24 added `touch_info` and `touch_read`. Version 25 added `midi_read` and `midi_send`. Version 26 added `midi_devices`. Version 27 added `nic_owned`. Version 28 added `gpio_pull_get`. Version 32 added the `vfs_*` calls.
+pub const TAPE_API_VERSION: u32 = 32;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -376,6 +376,64 @@ pub struct TapeApi {
     /// mapped. Where `alloc` is identity-mapped (the embedded kernels) it returns `address` itself; the server kernel maps
     /// scattered frames, so a RAM tester reads the real address from here when it reports a failing cell.
     pub phys_addr: extern "C" fn(usize) -> usize,
+    /// `vfs_stat(path, path_len, out)` (version 32): what a file or folder is, as a `VfsStat`, for any volume the kernel can
+    /// read, ext2/3/4 included (`diskN/folder/file`; the reference is the one `fs_read` takes). Returns 0 or a negative `FS_*`
+    /// code. Names are UTF-8 on ext4 and FOSFS v4. A volume's root is `diskN` or `diskN/`.
+    pub vfs_stat: extern "C" fn(*const u8, usize, *mut VfsStat) -> isize,
+    /// `vfs_read_dir(path, path_len, index, out)` (version 32): the `index`th entry (from 0, without `.` and `..`) of a folder
+    /// as a `VfsEntry`: returns 1, 0 past the end, or a negative `FS_*` code. A walk that asks for index 0, 1, 2... in turn
+    /// costs one pass over the folder, not one per call.
+    pub vfs_read_dir: extern "C" fn(*const u8, usize, usize, *mut VfsEntry) -> isize,
+    /// `vfs_read(path, path_len, offset, buffer, capacity)` (version 32): as `fs_read_at`, for any volume `vfs_stat` knows.
+    pub vfs_read: extern "C" fn(*const u8, usize, u64, *mut u8, usize) -> isize,
+}
+
+/// `VfsStat::kind`.
+pub const VFS_FILE: u32 = 1;
+pub const VFS_DIR: u32 = 2;
+pub const VFS_LINK: u32 = 3;
+
+/// What `vfs_stat` reports (64 bytes). Times are seconds since 1970 (0: the volume keeps none). `mode` holds the permission
+/// bits (`0o755`); volumes without owners (FOSFS, FAT) say `uid` and `gid` 0 and `0o644` for files, `0o755` for folders.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct VfsStat {
+    pub kind: u32,
+    pub mode: u32,
+    pub size: u64,
+    pub mtime: u64,
+    pub ctime: u64,
+    pub atime: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub links: u32,
+    pub reserved: u32,
+    pub inode: u64,
+}
+
+/// The longest name a `VfsEntry` holds (ext4's limit).
+pub const VFS_NAME_MAX: usize = 255;
+
+/// What `vfs_read_dir` reports: the entry's `VfsStat` and its name.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VfsEntry {
+    pub stat: VfsStat,
+    pub name_length: u32,
+    pub reserved: u32,
+    pub name: [u8; 256],
+}
+
+impl Default for VfsEntry {
+    fn default() -> Self {
+        VfsEntry { stat: VfsStat::default(), name_length: 0, reserved: 0, name: [0; 256] }
+    }
+}
+
+impl VfsEntry {
+    pub fn name(&self) -> &[u8] {
+        &self.name[..(self.name_length as usize).min(256)]
+    }
 }
 
 /// How many streams `fs_stream_open2` can have open at once.

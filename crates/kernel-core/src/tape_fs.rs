@@ -93,12 +93,12 @@ pub fn split_selector(reference: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
-fn disk_number(selector: &[u8]) -> Option<usize> {
+pub(crate) fn disk_number(selector: &[u8]) -> Option<usize> {
     selector.strip_prefix(b"disk").and_then(|digits| core::str::from_utf8(digits).ok()).and_then(|digits| digits.parse::<usize>().ok())
 }
 
 /// The FAT volume of disk `number` (one-based) when it has no FOSFS volume of ours.
-fn fat_disk(number: usize) -> Option<crate::fatvol::Fs> {
+pub(crate) fn fat_disk(number: usize) -> Option<crate::fatvol::Fs> {
     if storage::volume_on(number).is_ok() {
         return None;
     }
