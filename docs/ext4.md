@@ -11,7 +11,7 @@ mf-specific fast paths (block cache, hash-tree lookup, read-ahead) go on top of 
 ## Read-only driver (`crates/ext4`)
 
 - ext2/3/4: extents or indirect blocks, 1/2/4 KiB blocks, 32/64-byte group descriptors, flex_bg, 64bit, large folders
-  (read by linear scan). Refused: meta_bg, compression, encryption, casefold, blocks over 4 KiB. Inline-data files
+  (`list` scans linearly; `lookup` walks the hash tree of an indexed folder). Refused: meta_bg, compression, encryption, casefold, blocks over 4 KiB. Inline-data files
   are refused per file. A volume with an unreplayed journal is refused (`NeedsRecovery`) until `ext4 diskN recover` (or any write command) has replayed it.
 - Names are bytes (UTF-8); lookup is byte-exact.
 - Host tests (`make test`, `crates/ext4/tests/images.rs`) read `mkfs.ext4`/`mkfs.ext2` images and compare every file.
@@ -90,8 +90,16 @@ update the slots they overlap, so it is never stale. `kernel-core/src/ext4vol.rs
 BSS) behind `Partition`, emptied at every `locate` and `mkfs`, and between candidate partitions (slots are keyed by sector
 within the partition). Measured with `tests/perf.rs` (counts device operations; `SLOTS=n`) on a 512 MiB checksummed volume:
 `mkdir` + 2000 creates 57481 -> 153 reads, 20 lookups in a 2000-name folder 236 -> 0, 100 small appends 214 -> 3; writes are
-unchanged (the journal commits each change). Not done: hash-tree lookup in the reader (indexed folders are still scanned
-linearly, and our writer linearises them on change), multi-block write coalescing.
+unchanged (the journal commits each change). Not done: multi-block write coalescing.
+
+**Hash-tree lookup** (`Fs::lookup`, `crates/ext4/src/dirhash.rs`): an indexed folder is searched through its tree (root, index
+nodes, one leaf; names whose hashes collide continue in the following leaves). Half-MD4 (what `mkfs.ext4` uses), TEA and
+the legacy hash are implemented and checked against `debugfs dx_hash` (`cargo test` in `crates/ext4`); the unsigned-char
+variants (volumes made on ARM) and anything odd in the index fall back to the linear scan. `tests/images.rs` runs
+`e2fsck -D` on the `mkfs -d` image to get real hash trees: 429 lookups in a 3060-name folder cost about 5 device reads each
+(a linear scan about 22), counting the folder map, the inode and the group descriptor, with no read cache. The writer does
+not maintain the index: it clears `INDEX_FL` on the first change of a folder (on checksummed volumes it first linearises it),
+so a folder our writer touched is scanned linearly from then on. Making the writer keep the tree is not done.
 
 ## TRIM / discard
 
