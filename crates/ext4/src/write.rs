@@ -104,6 +104,8 @@ pub struct FormatOptions<'a> {
     pub time: u32,
     /// Give the volume a jbd2 journal (what Linux expects of ext4, and what makes a power cut harmless).
     pub journal: bool,
+    /// Make the volume with `metadata_csum` (what Linux's mkfs.ext4 does; every metadata block is checksummed).
+    pub checksums: bool,
 }
 
 pub struct Writer<D: Device> {
@@ -1015,12 +1017,37 @@ impl<D: Device> Writer<D> {
         self.fs.block_size - if self.csum { DIR_TAIL } else { 0 }
     }
 
-    /// Hash-tree folders have their own checksum layout; they are not rewritten under metadata_csum.
-    fn dir_writable(&self, dir: &Inode) -> Result<(), Error> {
-        if self.csum && dir.flags & INDEX_FL != 0 {
-            return Err(Error::Unsupported);
+    /// Under metadata_csum a hash-tree folder has checksummed index blocks we do not maintain, so before its first
+    /// change it becomes a linear folder: the root block's `..` entry takes back the index space, index nodes become
+    /// empty folder blocks (leaves are plain folder blocks already), and the index flag goes.
+    fn dir_unindex(&mut self, number: u32, dir: &Inode) -> Result<(), Error> {
+        if !self.csum || dir.flags & INDEX_FL == 0 {
+            return Ok(());
         }
-        Ok(())
+        let size = self.fs.block_size;
+        let limit = self.dir_limit();
+        for logical in 0..dir.size / size as u64 {
+            let block = self.dir_block(dir, logical)?;
+            self.fs.read_block(block, Buffer::Data)?;
+            if logical == 0 {
+                if le16(&self.fs.data, 4) != 12 || self.fs.data[16 + 2] != 2 || &self.fs.data[20..22] != b".." {
+                    return Err(Error::Corrupt);
+                }
+                put16(&mut self.fs.data, 16, (limit - 12) as u16);
+                self.fs.data[24..size].fill(0);
+            } else if le32(&self.fs.data, 0) == 0 && usize::from(le16(&self.fs.data, 4)) == size {
+                self.fs.data[..size].fill(0);
+                put16(&mut self.fs.data, 4, limit as u16);
+            } else {
+                continue;
+            }
+            self.dir_seal(number)?;
+            self.write_buffer(block, Buffer::Data)?;
+        }
+        self.update_inode(number, |raw| {
+            let flags = le32(raw, 32);
+            put32(raw, 32, flags & !INDEX_FL);
+        })
     }
 
     /// Writes the end-of-block checksum entry of the folder block in `fs.data`.
@@ -1042,7 +1069,7 @@ impl<D: Device> Writer<D> {
     /// Adds `name -> number` to a folder, in free space of an existing block or in a new one.
     fn dir_add(&mut self, dir_number: u32, name: &[u8], number: u32, kind: u8) -> Result<(), Error> {
         let dir = self.checked(dir_number)?;
-        self.dir_writable(&dir)?;
+        self.dir_unindex(dir_number, &dir)?;
         let size = self.fs.block_size;
         let limit = self.dir_limit();
         let need = 8 + ((name.len() + 3) & !3);
@@ -1104,7 +1131,7 @@ impl<D: Device> Writer<D> {
     /// Takes `name` out of a folder; returns what it named.
     fn dir_remove(&mut self, dir_number: u32, name: &[u8]) -> Result<Option<u32>, Error> {
         let dir = self.checked(dir_number)?;
-        self.dir_writable(&dir)?;
+        self.dir_unindex(dir_number, &dir)?;
         let size = self.fs.block_size;
         let limit = self.dir_limit();
         for logical in 0..dir.size / size as u64 {
@@ -1286,11 +1313,6 @@ impl<D: Device> Writer<D> {
         if from_dir == to_dir && from == to {
             return Ok(());
         }
-        self.dir_writable(&source_dir)?;
-        self.dir_writable(&target_dir)?;
-        if source.is_dir() && from_dir != to_dir {
-            self.dir_writable(&source)?;
-        }
         if source.is_dir() {
             // A folder cannot go into itself or below itself: walk `..` up from the new parent.
             let mut current = to_dir;
@@ -1323,7 +1345,7 @@ impl<D: Device> Writer<D> {
         self.dir_add(to_dir, to, source.number, kind_of(source.mode))?;
         self.dir_remove(from_dir, from)?;
         if source.is_dir() && from_dir != to_dir {
-            self.dir_writable(&source)?;
+            self.dir_unindex(source.number, &source)?;
             let block = self.dir_block(&source, 0)?;
             self.fs.read_block(block, Buffer::Data)?;
             if self.fs.data[12 + 6] != 2 || &self.fs.data[20..22] != b".." {
@@ -1436,25 +1458,33 @@ pub fn format_raw<D: Device>(device: &mut D, sectors: u64, options: &FormatOptio
     let mut block = [0u8; FORMAT_BLOCK];
     let zero = [0u8; 4 * FORMAT_BLOCK];
     let lba = |block: u64| block * (FORMAT_BLOCK / SECTOR) as u64;
-    for group in 0..groups {
-        let (start, block_map, inode_map, table, total, meta) = geometry.group(group);
+    let block_bitmap = |group: u64, block: &mut [u8; FORMAT_BLOCK]| {
+        let (_, _, _, _, total, meta) = geometry.group(group);
         block.fill(0);
         for index in 0..(meta as usize + if group == 0 { used0 as usize } else { 0 }) {
-            set_bit(&mut block, index, true);
+            set_bit(block, index, true);
         }
         for index in total as usize..8 * FORMAT_BLOCK {
-            set_bit(&mut block, index, true);
+            set_bit(block, index, true);
         }
-        device.write(lba(block_map), &block)?;
+    };
+    let inode_bitmap = |group: u64, block: &mut [u8; FORMAT_BLOCK]| {
         block.fill(0);
         if group == 0 {
             for index in 0..10 {
-                set_bit(&mut block, index, true);
+                set_bit(block, index, true);
             }
         }
         for index in inodes_per_group as usize..8 * FORMAT_BLOCK {
-            set_bit(&mut block, index, true);
+            set_bit(block, index, true);
         }
+    };
+    let seed = crc32c(!0, &options.uuid);
+    for group in 0..groups {
+        let (start, block_map, inode_map, table, _, _) = geometry.group(group);
+        block_bitmap(group, &mut block);
+        device.write(lba(block_map), &block)?;
+        inode_bitmap(group, &mut block);
         device.write(lba(inode_map), &block)?;
         let mut done = 0;
         while done < geometry.itable_blocks {
@@ -1475,11 +1505,19 @@ pub fn format_raw<D: Device>(device: &mut D, sectors: u64, options: &FormatOptio
     block[7] = 2;
     block[8] = b'.';
     put32(&mut block, 12, 2);
-    put16(&mut block, 16, (FORMAT_BLOCK - 12) as u16);
+    let dir_end = FORMAT_BLOCK - if options.checksums { DIR_TAIL } else { 0 };
+    put16(&mut block, 16, (dir_end - 12) as u16);
     block[18] = 2;
     block[19] = 2;
     block[20] = b'.';
     block[21] = b'.';
+    if options.checksums {
+        // The checksum entry ending a folder block; inode 2 has generation 0.
+        let sum = crc32c(crc32c(crc32c(seed, &2u32.to_le_bytes()), &0u32.to_le_bytes()), &block[..dir_end]);
+        put16(&mut block, dir_end + 4, DIR_TAIL as u16);
+        block[dir_end + 7] = 0xde;
+        put32(&mut block, dir_end + 8, sum);
+    }
     device.write(lba(root_block), &block)?;
     if jblocks > 0 {
         let mut done = 0;
@@ -1536,6 +1574,17 @@ pub fn format_raw<D: Device>(device: &mut D, sectors: u64, options: &FormatOptio
         put16(raw, 128, 32);
     }
     let journal_map: [u8; 60] = block[7 * FORMAT_INODE + 40..7 * FORMAT_INODE + 100].try_into().unwrap();
+    if options.checksums {
+        for number in [2u32, 8] {
+            let raw = &mut block[(number as usize - 1) * FORMAT_INODE..number as usize * FORMAT_INODE];
+            if raw[0] == 0 && raw[1] == 0 {
+                continue;
+            }
+            let sum = crc32c(crc32c(crc32c(seed, &number.to_le_bytes()), &0u32.to_le_bytes()), raw);
+            put16(raw, 0x7c, sum as u16);
+            put16(raw, 0x82, (sum >> 16) as u16);
+        }
+    }
     device.write(lba(table0), &block)?;
 
     // The descriptor blocks, primary and backups, computed group by group.
@@ -1562,7 +1611,7 @@ pub fn format_raw<D: Device>(device: &mut D, sectors: u64, options: &FormatOptio
         put16(&mut sb, 90, group as u16);
         put32(&mut sb, 92, 0);
         put32(&mut sb, 96, INCOMPAT_FILETYPE | INCOMPAT_EXTENTS);
-        put32(&mut sb, 100, 0x1 | 0x2 | 0x8 | 0x20 | 0x40);
+        put32(&mut sb, 100, 0x1 | 0x2 | 0x8 | 0x20 | 0x40 | if options.checksums { RO_METADATA_CSUM } else { 0 });
         if jblocks > 0 {
             put32(&mut sb, 224, 8);
             put32(&mut sb, 92, 0x4);
@@ -1579,8 +1628,14 @@ pub fn format_raw<D: Device>(device: &mut D, sectors: u64, options: &FormatOptio
         put16(&mut sb, 348, 32);
         put16(&mut sb, 350, 32);
         put32(&mut sb, 352, 1);
+        if options.checksums {
+            sb[373] = 1; // s_checksum_type: crc32c
+            let sum = crc32c(!0, &sb[..1020]);
+            put32(&mut sb, 1020, sum);
+        }
         sb
     };
+    let mut scratch = [0u8; FORMAT_BLOCK];
     for index in 0..geometry.gdt_blocks {
         block.fill(0);
         for slot in 0..(FORMAT_BLOCK / 32) as u64 {
@@ -1596,6 +1651,14 @@ pub fn format_raw<D: Device>(device: &mut D, sectors: u64, options: &FormatOptio
             put16(raw, 12, (total - meta - if group == 0 { used0 } else { 0 }) as u16);
             put16(raw, 14, (inodes_per_group - if group == 0 { 10 } else { 0 }) as u16);
             put16(raw, 16, u16::from(group == 0));
+            if options.checksums {
+                block_bitmap(group, &mut scratch);
+                put16(raw, 0x18, crc32c(seed, &scratch[..BLOCKS_PER_GROUP as usize / 8]) as u16);
+                inode_bitmap(group, &mut scratch);
+                put16(raw, 0x1a, crc32c(seed, &scratch[..inodes_per_group as usize / 8]) as u16);
+                let sum = crc32c(crc32c(seed, &(group as u32).to_le_bytes()), raw);
+                put16(raw, 0x1e, sum as u16);
+            }
         }
         device.write(lba(1 + index), &block)?;
         for group in 1..groups {

@@ -285,7 +285,9 @@ impl<D: Device> Journaled<D> {
             let at = 1024 % self.bs;
             self.stage.blocks[slot][at + 96..at + 100].copy_from_slice(&new.to_le_bytes());
             if csum {
-                self.stage.blocks[slot][at + 1020..at + 1024].copy_from_slice(&sb[1020..1024]);
+                // The staged copy differs from the disk's (counts, state): its checksum is its own.
+                let sum = crc32c(!0, &self.stage.blocks[slot][at..at + 1020]);
+                self.stage.blocks[slot][at + 1020..at + 1024].copy_from_slice(&sum.to_le_bytes());
             }
         }
         if let Some(journal) = self.journal.as_mut() {

@@ -35,7 +35,7 @@ tests in `crates/kernel-core/tests/fosfs.rs` and `make test-mf-shell`.
 
 ## Writing (step 3)
 
-`crates/ext4/src/write.rs`: `Writer::format` (4 KiB blocks, journal optional, no checksums), `create`, `mkdir`, `write`,
+`crates/ext4/src/write.rs`: `Writer::format` (4 KiB blocks, journal and metadata_csum optional), `create`, `mkdir`, `write`,
 `truncate`, `remove`, `rename`, `flush`. `Writer` is ~100 KiB: box it. The superblock says "not clean" from the first
 change until `flush`. Only volumes without `uninit_bg`-only/`bigalloc`/inline data are writable; `mkfs.ext4`
 defaults (metadata_csum, orphan_file, metadata_csum_seed) are written correctly, see "metadata_csum" below. Files are limited to four
@@ -74,11 +74,10 @@ group descriptors (16 bits, per group), block and inode bitmaps (in the descript
 whole inode with the generation in the seed), extent leaf blocks (4-byte tail after the 340 entries) and folder blocks
 (a 12-byte fake entry, inode 0, type 0xDE, ends each block, so a folder block holds entries in `size - 12` bytes).
 `BLOCK_UNINIT` / `INODE_UNINIT` groups (what `lazy_itable_init` leaves) get their bitmaps built on first use and the
-flags cleared; `itable_unused` is kept. Hash-tree folders (`INDEX_FL`) are not rewritten on such a volume (`Unsupported`
-for `mkdir`/`create`/`rm`/`mv` in them; converting to a linear folder is not done). A journal Linux has mounted carries
+flags cleared; `itable_unused` is kept. A hash-tree folder (`INDEX_FL`) is made linear on its first change (the `..` entry takes back the index space, index nodes become empty blocks, leaves stay as they are). A journal Linux has mounted carries
 `CSUM_V3`; `open` verifies and replays such a log (descriptor, revoke, commit and per-block checksums) and then clears
-the feature, so we only write plain logs and Linux sets it again at its next mount. `Writer::format` still makes
-volumes without checksums. A volume with only `uninit_bg` (descriptor checksums) stays read-only. Tests: Linux-made
+the feature, so we only write plain logs and Linux sets it again at its next mount. `Writer::format` makes volumes with
+checksums (`FormatOptions.checksums`, on in the kernel shell; 32-byte descriptors, so no `64bit`). A volume with only `uninit_bg` (descriptor checksums) stays read-only. Tests: Linux-made
 volumes (default, lazy tables, 1 KiB blocks without orphan_file, no checksums with many groups, 768 MiB spilling into
 uninitialised groups) are filled with files, folders that grow, fragmented files, renames and removals, then judged by
 `e2fsck -fn` (which verifies every checksum); a v3 journal written by `debugfs jo -c` is replayed.
