@@ -26,4 +26,9 @@ dependencies = [
  "fosfor-fat",
  "fosfor-hal",
  "fosfor-hid",
+ "fosfor-tape-sync",
 ]
+
+[[package]]
+name = "fosfor-tape-sync"
+version = "0.1.0"

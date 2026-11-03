@@ -25,6 +25,7 @@ mod config;
 mod debug;
 mod net;
 mod netfs;
+mod netclient;
 mod tapesync;
 mod power;
 mod shell;
