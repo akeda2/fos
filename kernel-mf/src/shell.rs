@@ -123,7 +123,7 @@ fn run(line: &str) {
     let Some(command) = words.next() else { return };
     match command {
         "help" => {
-            println!("help version cpus mem pci disks nic uptime slots threads echo TEXT reboot audio");
+            println!("help version cpus mem pci disks nic uptime slots threads echo TEXT reboot audio date");
             println!("tape NAME [ARGS]  run a tape (a ring 3 process)   kill PID");
         }
         "version" => println!("Fosfor OS server kernel (mf), slice 8."),
@@ -155,9 +155,30 @@ fn run(line: &str) {
             sched::for_each(|id, name, state| println!("{id:3} {name:<16} {state:?}"));
             println!("{} context switches.", sched::switches());
         }
-        "date" => match clock::now() {
-            Some(time) => println!("{}", clock::Display(time)),
-            None => println!("the clock was never set (the RTC held no valid time)"),
+        "date" => match words.next() {
+            None => match clock::now() {
+                Some(time) => println!("{} (local time, from the RTC)", clock::Display(time)),
+                None => println!("The clock is not set. `date set YYYY-MM-DD HH:MM`."),
+            },
+            Some("set") => {
+                let parsed = (|| {
+                    let (date, time) = (words.next()?, words.next()?);
+                    let mut parts = date.split('-');
+                    let (year, month, day) = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
+                    let mut parts = time.split(':');
+                    let (hour, minute) = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
+                    let second = parts.next().map_or(Some(0), |word| word.parse().ok())?;
+                    Some(fat::Time { year, month, day, hour, minute, second })
+                })();
+                match parsed {
+                    None => println!("Usage: date set YYYY-MM-DD HH:MM[:SS]   (local time)"),
+                    Some(time) => match clock::set(&time) {
+                        Ok(()) => println!("The clock is {}.", clock::Display(time)),
+                        Err(reason) => println!("date: {reason}"),
+                    },
+                }
+            }
+            Some(_) => println!("Usage: date | date set YYYY-MM-DD HH:MM[:SS]"),
         },
         "uptime" => println!("{} s", apic::ticks() / apic::TICK_HZ),
         "slots" => match slots::read_metadata() {

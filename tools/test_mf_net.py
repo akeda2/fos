@@ -110,6 +110,12 @@ def main():
             check(red_pixels(machine, Path(tmp) / "ansi.ppm") > 20, "ANSI colour: SGR 31 draws red text on the framebuffer", "")
             out = machine.run("cpus")
             check("CPU(s)" in out, "the shell answers over the network", out)
+            out = machine.run("date set 2026-10-06 14:30:15")
+            check("The clock is 2026-10-06 14:30:15." in out, "date set accepts a local time", out)
+            out = machine.run("date")
+            check("2026-10-06 14:30:" in out, "and date reads it back (the RTC was written)", out)
+            out = machine.run("date set 2020-01-01 00:00")
+            check("not a date" in out, "date set refuses a date before 2024", out)
             before = machine.run("slots")
             check("booted slot 0, active 0, pending None" in before, "a fresh image boots slot 0", before)
 
