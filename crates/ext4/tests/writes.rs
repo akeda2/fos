@@ -223,14 +223,120 @@ fn a_full_volume_says_so_and_stays_consistent() {
     let _ = fs::remove_file(&image);
 }
 
+/// A volume made by Linux's `mkfs.ext4` (`extra` are its options), filled by this writer, judged by e2fsck.
+fn linux_volume_workload(name: &str, mb: u64, extra: &[&str]) {
+    if !have("mkfs.ext4") || !have("e2fsck") {
+        return;
+    }
+    let image = std::env::temp_dir().join(format!("fos-ext4-{name}-{}.img", std::process::id()));
+    File::create(&image).unwrap().set_len(mb << 20).unwrap();
+    let made = Command::new("/usr/sbin/mkfs.ext4").args(["-q", "-F"]).args(extra).arg(&image).status().unwrap();
+    assert!(made.success());
+    fsck(&image);
+    let file = OpenOptions::new().read(true).write(true).open(&image).unwrap();
+    let mut w = Writer::new(ext4::open(FileDevice(file), stage()).unwrap()).unwrap();
+    w.set_time(1_800_000_000);
+    let root = w.root().unwrap().number;
+    let dir = w.mkdir(root, b"docs", 0o755).unwrap().number;
+    let mut expected = Vec::new();
+    // A folder that grows to several blocks, and files of several shapes.
+    for n in 0..300 {
+        let name = format!("file-with-a-longish-name-{n:04}.txt");
+        let f = w.create(dir, name.as_bytes(), 0o644).unwrap().number;
+        let data = pattern(n, 1 + n * 37);
+        w.write(f, 0, &data).unwrap();
+        expected.push((name, data));
+    }
+    let big = pattern(5, 3 << 20);
+    let f = w.create(root, b"big.bin", 0o644).unwrap().number;
+    for (i, chunk) in big.chunks(65_537).enumerate() {
+        w.write(f, (i * 65_537) as u64, chunk).unwrap();
+    }
+    // Fragmentation: every other block of a file, so extent leaves are needed.
+    let frag = w.create(root, b"frag.bin", 0o644).unwrap().number;
+    let mut frag_data = Vec::new();
+    for n in (0..40).step_by(2) {
+        let piece = pattern(n, 4096);
+        w.write(frag, n as u64 * 4096, &piece).unwrap();
+        frag_data.resize(n * 4096, 0);
+        frag_data.extend_from_slice(&piece);
+    }
+    w.mkdir(dir, b"sub", 0o700).unwrap();
+    w.rename(root, b"big.bin", dir, b"moved.bin").unwrap();
+    w.rename(root, b"docs", root, b"papers").unwrap();
+    for n in 0..100 {
+        w.remove(dir, expected[n].0.as_bytes()).unwrap();
+    }
+    w.truncate(frag, 5000).unwrap();
+    frag_data.truncate(5000);
+    w.flush().unwrap();
+    drop(w);
+    fsck(&image);
+    assert_eq!(debugfs_cat(&image, "/papers/moved.bin"), big);
+    assert_eq!(debugfs_cat(&image, "/frag.bin"), frag_data);
+    for (name, data) in expected.iter().skip(100).step_by(37) {
+        assert_eq!(&debugfs_cat(&image, &format!("/papers/{name}")), data);
+    }
+    let _ = fs::remove_file(&image);
+}
+
 #[test]
-fn checksummed_linux_volumes_stay_read_only() {
+fn linux_default_volume_is_writable() {
+    linux_volume_workload("lx-default", 64, &[]);
+}
+
+#[test]
+fn linux_volume_with_lazy_inode_tables() {
+    linux_volume_workload("lx-lazy", 512, &["-E", "lazy_itable_init=1,lazy_journal_init=1"]);
+}
+
+#[test]
+fn linux_volume_without_orphan_file_and_small_blocks() {
+    linux_volume_workload("lx-1k", 64, &["-b", "1024", "-O", "^orphan_file"]);
+}
+
+#[test]
+fn linux_volume_without_checksums_and_with_many_groups() {
+    linux_volume_workload("lx-nocsum", 1024, &["-O", "^metadata_csum,^orphan_file", "-N", "20000"]);
+}
+
+#[test]
+fn linux_volume_spills_into_uninitialised_groups() {
+    if !have("mkfs.ext4") || !have("e2fsck") {
+        return;
+    }
+    let image = std::env::temp_dir().join(format!("fos-ext4-spill-{}.img", std::process::id()));
+    File::create(&image).unwrap().set_len(768 << 20).unwrap();
+    let args = ["-q", "-F", "-b", "4096", "-O", "^orphan_file", "-E", "lazy_itable_init=1"];
+    assert!(Command::new("/usr/sbin/mkfs.ext4").args(args).arg(&image).status().unwrap().success());
+    let dump = Command::new("/usr/sbin/dumpe2fs").arg(&image).output().unwrap();
+    assert!(String::from_utf8_lossy(&dump.stdout).contains("BLOCK_UNINIT"));
+    let file = OpenOptions::new().read(true).write(true).open(&image).unwrap();
+    let mut w = Writer::new(ext4::open(FileDevice(file), stage()).unwrap()).unwrap();
+    let root = w.root().unwrap().number;
+    let big = pattern(3, 1 << 20);
+    let f = w.create(root, b"huge.bin", 0o644).unwrap().number;
+    for n in 0..300u64 {
+        w.write(f, n << 20, &big).unwrap();
+    }
+    for n in 0..40 {
+        w.mkdir(root, format!("d{n}").as_bytes(), 0o755).unwrap();
+    }
+    w.flush().unwrap();
+    drop(w);
+    fsck(&image);
+    assert_eq!(debugfs_cat(&image, "/huge.bin").len(), 300 << 20);
+    let _ = fs::remove_file(&image);
+}
+
+#[test]
+fn linux_volume_with_gdt_checksums_only_stays_read_only() {
     if !have("mkfs.ext4") {
         return;
     }
-    let image = std::env::temp_dir().join(format!("fos-ext4-csum-{}.img", std::process::id()));
+    let image = std::env::temp_dir().join(format!("fos-ext4-uninit-{}.img", std::process::id()));
     File::create(&image).unwrap().set_len(20 << 20).unwrap();
-    assert!(Command::new("/usr/sbin/mkfs.ext4").args(["-q", "-F"]).arg(&image).status().unwrap().success());
+    assert!(Command::new("/usr/sbin/mkfs.ext4").args(["-q", "-F", "-O", "^metadata_csum,uninit_bg"]).arg(&image).status().unwrap().success());
     let fs = Fs::mount(FileDevice(File::open(&image).unwrap())).unwrap();
     assert!(matches!(Writer::new(fs), Err(Error::ReadOnly)));
     let _ = fs::remove_file(&image);
@@ -356,6 +462,53 @@ fn a_journal_linux_wrote_is_replayed() {
     w.flush().unwrap();
     drop(w);
     assert_eq!(debugfs_cat(&image, "/hello.txt"), new);
+    fsck(&image);
+    let _ = (fs::remove_file(&image), fs::remove_file(&payload), fs::remove_file(&commands));
+}
+
+#[test]
+fn a_checksummed_journal_linux_wrote_is_replayed() {
+    if !have("debugfs") || !have("mkfs.ext4") || !have("e2fsck") {
+        return;
+    }
+    let image = std::env::temp_dir().join(format!("fos-ext4-csum-journal-{}.img", std::process::id()));
+    File::create(&image).unwrap().set_len(64 << 20).unwrap();
+    assert!(Command::new("/usr/sbin/mkfs.ext4").args(["-q", "-F", "-O", "^orphan_file"]).arg(&image).status().unwrap().success());
+    let file = OpenOptions::new().read(true).write(true).open(&image).unwrap();
+    let mut w = Writer::new(ext4::open(FileDevice(file), stage()).unwrap()).unwrap();
+    let root = w.root().unwrap().number;
+    let f = w.create(root, b"hello.txt", 0o644).unwrap().number;
+    w.write(f, 0, &pattern(1, 4096)).unwrap();
+    w.flush().unwrap();
+    drop(w);
+    let out = Command::new("/usr/sbin/debugfs").arg("-R").arg("bmap /hello.txt 0").arg(&image).output().unwrap();
+    let block: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+    let new = pattern(78, 4096);
+    let payload = image.with_extension("payload");
+    fs::write(&payload, &new).unwrap();
+    let commands = image.with_extension("cmds");
+    fs::write(&commands, format!("jo -c\njw -b {block} {}\njc\n", payload.display())).unwrap();
+    let out = Command::new("/usr/sbin/debugfs").arg("-w").arg("-f").arg(&commands).arg(&image).output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    if text.contains("Unknown request") || text.contains("not supported") || text.contains("rror") {
+        eprintln!("debugfs cannot write journals here, skipping: {text}");
+        return;
+    }
+    let dump = Command::new("/usr/sbin/dumpe2fs").arg("-h").arg(&image).output().unwrap();
+    assert!(String::from_utf8_lossy(&dump.stdout).contains("journal_checksum_v3"), "the test needs a v3 journal");
+    assert_eq!(debugfs_cat(&image, "/hello.txt"), pattern(1, 4096), "the transaction is not checkpointed yet");
+    let file = OpenOptions::new().read(true).write(true).open(&image).unwrap();
+    let mut w = Writer::new(ext4::open(FileDevice(file), stage()).unwrap()).unwrap();
+    w.flush().unwrap();
+    drop(w);
+    assert_eq!(debugfs_cat(&image, "/hello.txt"), new);
+    fsck(&image);
+    // An empty v3 log (what a clean Linux unmount leaves) is accepted too, and our writes then work.
+    let file = OpenOptions::new().read(true).write(true).open(&image).unwrap();
+    let mut w = Writer::new(ext4::open(FileDevice(file), stage()).unwrap()).unwrap();
+    w.create(root, b"after.txt", 0o644).unwrap();
+    w.flush().unwrap();
+    drop(w);
     fsck(&image);
     let _ = (fs::remove_file(&image), fs::remove_file(&payload), fs::remove_file(&commands));
 }
