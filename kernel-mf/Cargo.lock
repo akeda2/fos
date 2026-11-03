@@ -26,6 +26,7 @@ dependencies = [
  "fosfor-fat",
  "fosfor-hal",
  "fosfor-hid",
+ "fosfor-tape-sync",
 ]
 
 [[package]]

@@ -182,7 +182,7 @@ pub fn kup_busy() -> bool {
 
 /// The name announced for interface `index`: `NAME<n>` from the `hostname` file (n is the one-based interface number), or
 /// without that file `fos-` and the last three bytes of the interface's MAC address.
-fn hostname(index: usize, out: &mut [u8; 20]) -> usize {
+pub fn hostname(index: usize, out: &mut [u8; 20]) -> usize {
     use core::fmt::Write;
     struct Cursor<'a>(&'a mut [u8; 20], usize);
     impl Write for Cursor<'_> {
@@ -467,6 +467,9 @@ fn frame_hook(index: usize, frame: &[u8]) -> bool {
 fn handle_frame(index: usize, frame: &[u8]) {
     let source: [u8; 6] = frame[6..12].try_into().unwrap();
     let (tag, payload) = (frame[14], &frame[15..]);
+    if crate::netclient::capture(index, source, tag, payload) {
+        return;
+    }
     match tag {
         TAG_DISCOVER_REQUEST => {
             let mut name = [0u8; 20];

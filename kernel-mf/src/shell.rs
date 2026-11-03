@@ -123,7 +123,7 @@ fn run(line: &str) {
     let Some(command) = words.next() else { return };
     match command {
         "help" => {
-            println!("help version cpus mem pci disks nic uptime slots threads echo TEXT reboot audio usb date");
+            println!("help version cpus mem pci disks nic uptime slots threads echo TEXT reboot audio usb date nic [peers|discover] tapesync");
             println!("tape NAME [ARGS]  run a tape (a ring 3 process)   kill PID");
         }
         "version" => println!("Fosfor OS server kernel (mf), slice 8."),
@@ -144,6 +144,9 @@ fn run(line: &str) {
                 }
             }
         }
+        "nic" if matches!(words.clone().next(), Some("peers")) => crate::netclient::print_peers(),
+        "nic" if matches!(words.clone().next(), Some("discover")) => crate::netclient::nic_discover(),
+        "tapesync" => crate::netclient::tapesync(words),
         "nic" => {
             for index in 0..nic::count() {
                 if let Some(mac) = net::mac(index) {
