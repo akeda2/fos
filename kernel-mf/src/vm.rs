@@ -435,7 +435,13 @@ pub fn unmap_user_page(root: u64, address: u64) -> Option<u64> {
     }
 }
 
-/// Can the kernel read (or, with `write`, write) `[address, address + length)` of the process with root `root` through its
+/// The physical address behind `address` in the user space of `root`, if a user page is mapped there.
+pub fn user_physical(root: u64, address: u64) -> Option<u64> {
+    let leaf = user_entry(root, address & !(PAGE - 1))?;
+    (leaf & USER != 0).then(|| (leaf & ADDRESS_MASK) + (address & (PAGE - 1)))
+}
+
+/// Can the kernel read (or, with `write`, write) `[address, address + length)' of the process with root `root` through its
 /// user mappings? A syscall checks every pointer it is given with this before touching it.
 pub fn user_range_ok(root: u64, address: u64, length: u64, write: bool) -> bool {
     let Some(end) = address.checked_add(length) else { return false };

@@ -4,6 +4,7 @@ FOSFS; the serial shell starts each with `tape NAME`, and the test checks their 
 Hard-float (AVX2) is checked under `-cpu max`, SSE2 under qemu64."""
 
 import os
+import re
 import select
 import subprocess
 import sys
@@ -23,6 +24,7 @@ CASES = [
     ("fscheck streams s1.bin s2.bin", ["streams 0: 20000 bytes, 0 wrong", "streams 1: 19900 bytes, 0 wrong"]),
     ("netcheck", ["lease: address", "4/4 replies."]),
     ("gpiopanel", ["gpiopanel: this machine has no GPIO pins"]),
+    ("memtest size=8 passes=1", ["memtest: PASS"]),
     ("hello", ["first file: ", "files on the boot volume: "]),
 ]
 
@@ -59,6 +61,16 @@ def run(cpu, smp):
                 if not done or "exited with code 0." not in new:
                     failures.append(f"`tape {command}` did not finish cleanly:\n{new}")
                     break
+        if not failures:
+            # memtest reports a failing word at its physical address (ABI 31 `phys_addr`), not the process's virtual one.
+            mark = len(log)
+            qemu.stdin.write(b"tape memtest size=8 passes=1 inject=100\n")
+            qemu.stdin.flush()
+            wait_for("exited with code 0.", 40, mark)
+            new = log[mark:].decode("utf8", "replace")
+            found = re.search(r"bad 1 MiB block at (0x[0-9a-f]+)", new)
+            if found is None or int(found.group(1), 16) >= 512 << 20:
+                failures.append("memtest did not report a physical address inside RAM:\n" + new)
         if not failures:
             # Escape reaches the foreground tape: gfxcheck would hold its picture for 10 s.
             mark = len(log)

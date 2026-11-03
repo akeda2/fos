@@ -774,6 +774,14 @@ pub fn multi_stream_table() -> Option<&'static TapeApi> {
     (table.version >= 30 && table.size as usize >= end).then_some(table)
 }
 
+/// The physical address behind a byte of memory from `alloc`; `address` itself on kernels before version 31 (they identity-map).
+/// 0 when the kernel says it is not mapped.
+pub fn phys_addr(address: usize) -> usize {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, phys_addr) + core::mem::size_of::<usize>();
+    if table.version >= 31 && table.size as usize >= end { (table.phys_addr)(address) } else { address }
+}
+
 /// The I2C bus's SCL speed in Hz (Raspberry Pi 4 header); `Err(-4)` where there is none or the kernel is older than version 23.
 pub fn i2c_speed() -> Result<u32, i32> {
     let t = i2c_table().ok_or(-4)?;

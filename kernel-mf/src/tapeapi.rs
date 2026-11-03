@@ -23,7 +23,11 @@ pub const SHIM_BASE: u64 = vm::USER_BASE + 0x200_0000;
 pub const TABLE_BASE: u64 = SHIM_BASE + 0x1000;
 pub const ARGS_BASE: u64 = SHIM_BASE + 0x2000;
 pub const HEAP_BASE: u64 = vm::USER_BASE + 0x4000_0000;
-const HEAP_LIMIT: u64 = HEAP_BASE + 0x1000_0000;
+const HEAP_LIMIT: u64 = HEAP_BASE + 0x100_0000_0000;
+/// The one-entry memory map a tape sees (`memory_map`): a single UEFI descriptor, kind 7 (free RAM), as large as what the
+/// allocator has free when the process starts. memtest sizes its run from it.
+pub const MAP_BASE: u64 = SHIM_BASE + 0x3000;
+const MAP_DESCRIPTOR: u64 = 48;
 pub const ARGS_MAX: usize = 4096;
 /// System call numbers from here up are table slots.
 pub const CALL_BASE: u64 = 0x100;
@@ -135,6 +139,7 @@ const FS_STREAM_CLOSE: u64 = slot(offset_of!(TapeApi, fs_stream_close));
 const FS_STREAM_OPEN2: u64 = slot(offset_of!(TapeApi, fs_stream_open2));
 const FS_STREAM_WRITE2: u64 = slot(offset_of!(TapeApi, fs_stream_write2));
 const FS_STREAM_CLOSE2: u64 = slot(offset_of!(TapeApi, fs_stream_close2));
+const PHYS_ADDR: u64 = slot(offset_of!(TapeApi, phys_addr));
 const FS_READ_AT: u64 = slot(offset_of!(TapeApi, fs_read_at));
 const MEMORY_MAP: u64 = slot(offset_of!(TapeApi, memory_map));
 const MEMORY_MAP_COUNT: u64 = slot(offset_of!(TapeApi, memory_map_count));
@@ -181,13 +186,24 @@ pub fn map_support(root: u64, args: &[u8]) -> Option<()> {
             let value = match index {
                 ARGS => ARGS_BASE,
                 ARGS_LEN => args.len().min(ARGS_MAX) as u64,
-                MEMORY_MAP | MEMORY_MAP_COUNT | MEMORY_MAP_DESCRIPTOR_SIZE => 0,
+                MEMORY_MAP => MAP_BASE,
+                MEMORY_MAP_COUNT => 1,
+                MEMORY_MAP_DESCRIPTOR_SIZE => MAP_DESCRIPTOR,
                 _ => stub_address(index),
             };
             words.add(index as usize).write(value);
         }
     }
     vm::map_user_page(root, TABLE_BASE, table, false, false).then_some(())?;
+
+    let map = pmm::allocate(1, None)?;
+    unsafe {
+        let descriptor = vm::direct(map) as *mut u8;
+        core::ptr::write_bytes(descriptor, 0, 4096);
+        (descriptor as *mut u32).write(7);
+        (descriptor.add(24) as *mut u64).write(pmm::stats().free);
+    }
+    vm::map_user_page(root, MAP_BASE, map, false, false).then_some(())?;
 
     let page = pmm::allocate(1, None)?;
     let length = args.len().min(ARGS_MAX);
@@ -342,6 +358,7 @@ pub fn call(frame: &mut Frame) {
         FS_STREAM_CLOSE => tapefs::stream_close(a) as u64,
         FS_STREAM_OPEN2 => tapefs::stream_open2(a, b, c, d) as u64,
         FS_STREAM_WRITE2 => tapefs::stream_write2(a, b, c, d, e) as u64,
+        PHYS_ADDR => vm::user_physical(sched::current_root(), a).unwrap_or(0),
         FS_STREAM_CLOSE2 => tapefs::stream_close2(a, b) as u64,
         CONSOLE_SIZE => 0,
         // This machine has no GPIO pins or I2C header (the Raspberry Pi 4 has): the answers of the embedded x86 kernel without

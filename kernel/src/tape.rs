@@ -250,6 +250,9 @@ extern "C" fn api_micros() -> u64 {
     crate::tasks::maybe_yield();
     timer::micros()
 }
+extern "C" fn api_phys_addr(address: usize) -> usize {
+    address
+}
 extern "C" fn api_alloc(bytes: usize) -> usize {
     if bytes == 0 {
         return 0;
@@ -683,6 +686,7 @@ pub fn build_api(info: &BootInfo, arguments: &str) -> TapeApi {
         fs_stream_open2: crate::tape_fs::api_fs_stream_open2,
         fs_stream_write2: crate::tape_fs::api_fs_stream_write2,
         fs_stream_close2: crate::tape_fs::api_fs_stream_close2,
+        phys_addr: api_phys_addr,
     }
 }
 

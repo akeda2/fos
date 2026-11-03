@@ -298,7 +298,7 @@ fn release(api: &TapeApi, blocks: &mut [Block; MAX_BLOCKS], count: &mut usize) {
 }
 
 fn region_of(block: &Block) -> Region {
-    unsafe { Region::new(block.address as *mut u32, block.bytes / 4, block.address as u64) }
+    unsafe { Region::new(block.address as *mut u32, block.bytes / 4, block.address as u64) }.with_translator(tape_rt::phys_addr)
 }
 
 /// Allocator churn: random-sized blocks, each with its own stream, checked in another order.
