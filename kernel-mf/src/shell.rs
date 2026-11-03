@@ -181,7 +181,7 @@ fn run(line: &str) {
             Some(_) => println!("Usage: date | date set YYYY-MM-DD HH:MM[:SS]"),
         },
         "uptime" => println!("{} s", apic::ticks() / apic::TICK_HZ),
-        "slots" => match slots::read_metadata() {
+        "slots" => match { let _disk = crate::tapefs::lock(); slots::read_metadata() } {
             Some(m) => {
                 println!("booted slot {}, active {}, pending {:?}, crash count {}", slots::boot_slot(), m.active_slot, m.pending_slot, m.crash_count);
                 match crate::debug::watchdog_seconds() {

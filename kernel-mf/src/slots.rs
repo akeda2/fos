@@ -70,6 +70,7 @@ pub fn confirm_boot() {
 
 /// Marks the stop as deliberate, so the next boot does not count it as a crash.
 pub fn mark_clean_stop() {
+    let _disk = crate::tapefs::lock();
     let _ = update_metadata(|metadata| metadata.running = RUNNING_STOPPED);
 }
 
@@ -78,6 +79,7 @@ pub fn housekeeping() {
     unsafe {
         if CLEAR_STREAK_PENDING && !STREAK_CLEARED && crate::apic::ticks() > GOOD_UPTIME_TICKS {
             STREAK_CLEARED = true;
+            let _disk = crate::tapefs::lock();
             let _ = update_metadata(|metadata| metadata.unclean_boots = 0);
         }
     }

@@ -589,6 +589,12 @@ impl<T> SleepMutex<T> {
         SleepMutex { locked: core::sync::atomic::AtomicBool::new(false), data: core::cell::UnsafeCell::new(value) }
     }
 
+    /// Takes the mutex if it is free, never sleeping: for callers that must not block (the NIC receive path).
+    pub fn try_lock(&self) -> Option<SleepGuard<'_, T>> {
+        use core::sync::atomic::Ordering;
+        self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).ok().map(|_| SleepGuard { mutex: self })
+    }
+
     pub fn lock(&self) -> SleepGuard<'_, T> {
         use core::sync::atomic::Ordering;
         loop {
