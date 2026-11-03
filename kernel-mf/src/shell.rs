@@ -222,7 +222,14 @@ fn run(line: &str) {
                     core::hint::spin_loop();
                 }
             }
-            _ => println!("usage: debug crash|hang"),
+            // Interrupts off on this CPU too (what a `term net` shell hang looks like): only the hardware watchdog can end it.
+            Some("deadhang") => {
+                crate::cpu::interrupts_disable();
+                loop {
+                    core::hint::spin_loop();
+                }
+            }
+            _ => println!("usage: debug crash|hang|deadhang"),
         },
         "reboot" => {
             println!("Restarting.");

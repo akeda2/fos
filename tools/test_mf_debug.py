@@ -23,6 +23,7 @@ class Machine:
         self.qemu = subprocess.Popen(
             ["qemu-system-x86_64", "-cpu", "max", "-machine", "q35", "-m", "512", "-smp", str(smp), "-display", "none",
              "-serial", "stdio", "-monitor", "none",
+             "-global", "ICH9-LPC.noreboot=false", "-watchdog-action", "reset",
              "-drive", f"if=pflash,format=raw,readonly=on,file={CODE}", "-drive", f"format=raw,file={image},snapshot=on"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
@@ -68,6 +69,26 @@ def crash_or_hang(smp, command, expect):
         machine.stop()
 
 
+def dead_hang():
+    """`debug deadhang` spins with interrupts off on the boot CPU: the software watchdog's tick never comes, the chipset's TCO
+    timer resets the machine (no crash record: nothing ran to write one)."""
+    machine = Machine(IMAGE, 1)
+    try:
+        if not machine.wait_for("fos> ", 150):
+            return "no shell prompt:\n" + machine.since(0)[-800:]
+        if not machine.wait_for("Hardware watchdog: TCO timer running", 1):
+            return "the hardware watchdog was not started:\n" + "\n".join(l for l in machine.since(0).splitlines() if "atchdog" in l)
+        mark = len(machine.log)
+        machine.send("debug deadhang\n")
+        if not machine.wait_for("entering the service loop", 120, mark):
+            return "the hardware watchdog never reset the machine:\n" + machine.since(mark)[-1500:]
+        if not machine.wait_for("fos> ", 150, mark + 1):
+            return "no shell after the reset:\n" + machine.since(mark)[-1500:]
+        return None
+    finally:
+        machine.stop()
+
+
 def crash_loop():
     machine = Machine(LOOP_IMAGE, 1)
     try:
@@ -87,6 +108,7 @@ for name, problem in [
     ("-smp 4 debug crash", lambda: crash_or_hang(4, "debug crash", "#UD")),
     ("-smp 1 debug hang (watchdog)", lambda: crash_or_hang(1, "debug hang", "watchdog timeout")),
     ("-smp 4 debug hang (watchdog)", lambda: crash_or_hang(4, "debug hang", "watchdog timeout")),
+    ("debug deadhang (hardware watchdog)", dead_hang),
     ("crash-on-boot (crash-loop guard)", crash_loop),
 ]:
     result = problem()

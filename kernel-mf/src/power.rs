@@ -13,6 +13,7 @@ pub fn set_acpi_reset(register: Option<(u16, u8)>) {
 
 pub fn reset() -> ! {
     cpu::interrupts_disable();
+    crate::hwwd::stop();
     if let Some((port, value)) = unsafe { ACPI_RESET } {
         cpu::outb(port, value);
         apic::busy_wait_ms(50);
