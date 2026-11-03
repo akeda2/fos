@@ -7,7 +7,7 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 use fosfor_abi::keymap::Layout;
 use kernel_core::usb_class::{self, Class, Host, NONE};
-use kernel_core::{ehci, ohci, usb_audio, usb_hid, usb_midi, usb_pointer, usb_serial, xhci};
+use kernel_core::{ehci, ohci, usb_audio, usb_hid, usb_midi, usb_pointer, usb_serial, usb_storage, xhci};
 
 use crate::sync::SpinLock;
 
@@ -106,7 +106,7 @@ pub fn init() {
     let devices = usb_hid::probe_all();
     // Events by MSI like the embedded kernel (isochronous audio refills need them); no-msi in settings keeps them polled.
     xhci::enable_interrupts_all(crate::config::no_msi());
-    println!("USB: {x} xHCI, {e} EHCI and {o} OHCI controller(s), {devices} usable device(s) (keyboards, MIDI, touch; no USB disks yet).");
+    println!("USB: {x} xHCI, {e} EHCI and {o} OHCI controller(s), {devices} usable device(s) (keyboards, MIDI, touch, disks).");
 }
 
 /// The host's `poll` hook, which kernel-core also calls from interrupt handlers: waiting for the lock there could spin forever
@@ -149,6 +149,25 @@ pub fn poll() {
 pub fn midi_devices() -> u64 {
     let _usb = tape_lock();
     u64::from(usb_midi::api_midi_devices())
+}
+
+/// A disk transfer. The controllers are CPU-0 oriented like every other USB entry, so a thread past boot moves there first; the
+/// transfer polls with the USB lock held and interrupts on (the caller's disk lock, `tapefs::lock`, already allows that).
+pub fn storage_read(device: usize, lba: u64, buffer: &mut [u8]) -> Result<(), usb_storage::Error> {
+    let _usb = storage_lock();
+    usb_storage::read(device, lba, buffer)
+}
+
+pub fn storage_write(device: usize, lba: u64, buffer: &[u8]) -> Result<(), usb_storage::Error> {
+    let _usb = storage_lock();
+    usb_storage::write(device, lba, buffer)
+}
+
+fn storage_lock() -> UsbGuard {
+    if crate::sched::ready() {
+        crate::sched::pin_current(0);
+    }
+    lock()
 }
 
 /// `midi_read`: six bytes (device, cable, count, three data bytes) to `out`.

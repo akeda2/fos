@@ -1,5 +1,5 @@
 //! The block-device layer: every disk the drivers found, by 512-byte sector. The same shape as the embedded kernel's
-//! `block.rs` (SATA and NVMe only so far; USB storage arrives with the USB stack). Registration happens on the boot CPU
+//! `block.rs` (SATA, NVMe and USB mass storage). Registration happens on the boot CPU
 //! during start-up; reads and writes go straight to the drivers.
 
 use kernel_core::{ahci, nvme};
@@ -10,6 +10,8 @@ pub const MAX_DISKS: usize = 16;
 pub enum Backend {
     Ahci(ahci::Drive),
     Nvme(nvme::Drive),
+    /// An index into `usb_storage`'s device table.
+    Usb(usize),
 }
 
 #[derive(Clone, Copy)]
@@ -60,6 +62,12 @@ pub fn count() -> usize {
     unsafe { COUNT }
 }
 
+/// The disk number of the USB mass-storage device in `usb_storage`'s slot `slot` (disk numbers move when the boot disk is put
+/// first, so the slot is the stable identity).
+pub fn usb_disk(slot: usize) -> Option<usize> {
+    (0..count()).find(|&index| matches!(get(index), Some(Disk { backend: Backend::Usb(found), .. }) if found == slot))
+}
+
 pub fn get(index: usize) -> Option<Disk> {
     unsafe { (*core::ptr::addr_of!(DISKS)).get(index).copied().flatten() }
 }
@@ -85,6 +93,7 @@ pub fn read(disk: usize, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
                 drive.read(lba + (index * nvme::MAX_SECTORS) as u64, chunk).map_err(|_| Error::Device)?;
             }
         }
+        Backend::Usb(device) => crate::usb::storage_read(device, lba, buffer).map_err(|_| Error::Device)?,
     }
     Ok(())
 }
@@ -102,6 +111,7 @@ pub fn write(disk: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
                 drive.write(lba + (index * nvme::MAX_SECTORS) as u64, chunk).map_err(|_| Error::Device)?;
             }
         }
+        Backend::Usb(device) => crate::usb::storage_write(device, lba, buffer).map_err(|_| Error::Device)?,
     }
     Ok(())
 }
