@@ -608,3 +608,9 @@ use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limi
 - Built and in use (slices 1-8 and the gaps/side items in `docs/big-kernel.md`; runs on `piano`): SMP, preemption, a real VM, ring-3 tapes, NETFS and the tapesync manifest, the `tapesync` and `gpio @HOST` clients (shared code), an Intel TCO hardware watchdog (`hwwd.rs`), a BIOS text-mode console fallback (`fb::init_text`) and a pixel-console caret.
 - QEMU-tested only: the TCO watchdog on chipsets other than ICH9/10 and the 5-8 series PCHs (the others have the software watchdog only), the BIOS text console (its ANSI colour mapping has no automated check; the serial shell drops ESC), the iso underrun fix on hardware other than `piano`.
 - Not done: tape ABI 31 needs `make image` and a tape redeploy; the branch `kernel-core-1b` is not merged to main.
+
+- **ext4 writer: keep the hash-tree index** (2026-11-03). The reader looks names up through the htree (`Fs::lookup`), but the
+  writer clears `INDEX_FL` on a folder's first change (on checksummed volumes after linearising it), so every folder we have
+  written is scanned linearly again. For big folders under an SMB server: insert into the right leaf, split full leaves and
+  index nodes, checksum index blocks (`dx_tail`), and rebuild the tree when a folder is first indexed (a linear folder past
+  one block). Also the unsigned-char hash variants (versions 3-5), which `debugfs dx_hash` cannot check. `docs/ext4.md`.
