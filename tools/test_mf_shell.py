@@ -123,6 +123,16 @@ def ext4_write_scenario():
             check("rm" not in out or "not" not in out, "an empty folder is removed", out[-300:])
             out = machine.run("ext4 disk2 rm /nothere")
             check("not found" in out, "a missing name is reported", out[-300:])
+            out = machine.run("ext4 disk2 mkfs")
+            check("already has an ext volume" in out, "mkfs refuses over an existing volume", out[-300:])
+            machine.run("ext4 disk2 remkfs again")
+            out = machine.run("ext4 disk2 remkfs confirm")
+            check("ext4: formatted" in out, "remkfs formats the existing partition again", out[-300:])
+            out = machine.run("ext4 disk2 ls")
+            check("moved.txt" not in out, "remkfs erased the old files", out[-300:])
+            machine.run("ext4 disk2 write /moved.txt hej på dig")
+            out = machine.run("ext4 disk2 recover")
+            check("journal replayed" in out, "recover opens the journal and leaves the volume clean", out[-300:])
         finally:
             machine.stop()
         if Path(e2fsck).exists():
@@ -139,6 +149,8 @@ def ext4_write_scenario():
                     dst.write(src.read(size * 512))
                 done = subprocess.run([e2fsck, "-fn", str(part)], capture_output=True, text=True)
                 check(done.returncode == 0, "e2fsck finds the volume clean", done.stdout[-400:])
+                header = subprocess.run(["/usr/sbin/dumpe2fs", "-h", str(part)], capture_output=True, text=True).stdout
+                check("has_journal" in header and "needs_recovery" not in header, "the volume has a journal and is clean", header[-500:])
                 cat = subprocess.run(["/usr/sbin/debugfs", "-R", "cat /moved.txt", str(part)], capture_output=True)
                 check(cat.stdout == "hej på dig".encode(), "debugfs reads what the kernel wrote", repr(cat.stdout))
 

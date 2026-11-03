@@ -17,7 +17,9 @@
 //! where an allocator exists.
 #![cfg_attr(not(test), no_std)]
 
+mod journal;
 mod write;
+pub use journal::{open, Journaled, Stage};
 pub use write::{format_raw, FormatOptions, Writer};
 
 /// The device's sector: `Device` addresses in 512-byte sectors from the first sector of the volume.
@@ -56,6 +58,26 @@ pub trait Device {
     /// Writes whole sectors. A read-only device keeps this default and `Writer` then fails with `ReadOnly`.
     fn write(&mut self, _lba: u64, _buffer: &[u8]) -> Result<(), Error> {
         Err(Error::ReadOnly)
+    }
+    /// File data: like `write`, but not journaled (metadata only is). Defaults to `write`.
+    fn write_data(&mut self, lba: u64, buffer: &[u8]) -> Result<(), Error> {
+        self.write(lba, buffer)
+    }
+    /// Makes the metadata written so far durable as one transaction.
+    fn commit(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+    /// Commits, and leaves the volume marked clean (no journal replay needed).
+    fn close(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+    /// Metadata blocks staged and not committed.
+    fn pending(&self) -> usize {
+        0
+    }
+    /// True when metadata writes are journaled, which a volume with a journal needs from a writer.
+    fn journaled(&self) -> bool {
+        false
     }
 }
 

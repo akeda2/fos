@@ -1,6 +1,6 @@
 //! Linux (ext2/3/4) volumes on the disks the drivers found: the glue between the `ext4` crate and `block`, and the
 //! shell's `ext4 diskN ...` command, shared by both kernels (docs/ext4.md). Reading works on any volume the driver
-//! understands; changing works on volumes made by `ext4 diskN mkfs` (no checksums, no journal).
+//! understands; changing works on volumes made by `ext4 diskN mkfs` (no checksums, a journal that is replayed first).
 //!
 //! A volume is found the way Linux lays it out: a GPT partition of the "Linux filesystem" type, an MBR partition of
 //! type 0x83, or the whole disk. The first one that mounts is the disk's ext volume.
@@ -8,7 +8,7 @@
 use crate::{block, gpt};
 use core::fmt::Write;
 use core::mem::MaybeUninit;
-use ext4::{Device, Error, FormatOptions, Writer};
+use ext4::{Device, Error, FormatOptions, Journaled, Writer};
 
 /// GPT type GUID "Linux filesystem data" (0FC63DAF-8483-4772-8E79-3D69D8477DE4), in on-disk mixed-endian order.
 const LINUX_GUID: [u8; 16] = [0xaf, 0x3d, 0xc6, 0x0f, 0x83, 0x84, 0x72, 0x47, 0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4];
@@ -38,10 +38,18 @@ impl Device for Partition {
 }
 
 /// The one writer the shell uses at a time (about 40 KiB: too big for the stack).
-static mut WRITER: MaybeUninit<Writer<Partition>> = MaybeUninit::uninit();
+static mut WRITER: MaybeUninit<Writer<Journaled<Partition>>> = MaybeUninit::uninit();
+
+/// The journal's staging area (256 KiB: a static, not the stack).
+static mut STAGE: ext4::Stage = ext4::Stage::new();
+
+fn stage() -> &'static mut ext4::Stage {
+    // SAFETY: one shell command at a time uses it; the previous `Fs`/`Writer` is dead by then.
+    unsafe { &mut *core::ptr::addr_of_mut!(STAGE) }
+}
 
 /// `ext4 diskN mkfs` waiting for `ext4 diskN mkfs confirm`: the disk number and the label.
-static mut PENDING_MKFS: Option<(usize, [u8; 16], usize)> = None;
+static mut PENDING_MKFS: Option<(usize, [u8; 16], usize, bool)> = None;
 
 /// Forgets an unconfirmed `mkfs`: a confirmation must be the very next command.
 pub fn cancel() {
@@ -53,6 +61,11 @@ pub type Fs = ext4::Fs<Partition>;
 /// Mounts the ext volume of disk index `disk` (0-based). Err carries the last reason when something looked like ext
 /// but was refused (a dirty journal, an unsupported feature); NotExt when there is nothing.
 pub fn mount(disk: usize) -> Result<Fs, Error> {
+    ext4::Fs::mount(locate(disk)?)
+}
+
+/// The partition (or whole disk) holding the ext volume of disk index `disk`, even if its journal needs replaying.
+pub fn locate(disk: usize) -> Result<Partition, Error> {
     let info = block::sectors(disk).ok_or(Error::Device)?;
     let mut candidates = [Partition { disk, base: 0, sectors: 0 }; 6];
     let mut count = 0;
@@ -90,8 +103,8 @@ pub fn mount(disk: usize) -> Result<Fs, Error> {
     count += 1;
     let mut reason = Error::NotExt;
     for &partition in &candidates[..count] {
-        match ext4::Fs::mount(partition) {
-            Ok(fs) => return Ok(fs),
+        match ext4::Fs::mount_with(partition, ext4::Options { ignore_journal: true }) {
+            Ok(_) => return Ok(partition),
             Err(Error::NotExt) => {}
             Err(other) => reason = other,
         }
@@ -104,7 +117,7 @@ fn why(error: Error) -> &'static str {
         Error::Device => "the disk could not be read",
         Error::NotExt => "no ext2/3/4 volume on that disk",
         Error::Unsupported => "this driver does not handle a feature of that volume (or file)",
-        Error::NeedsRecovery => "its journal needs recovery (mount and unmount it on Linux first)",
+        Error::NeedsRecovery => "its journal needs recovery (`ext4 diskN recover` replays it)",
         Error::Corrupt => "the volume's structures contradict themselves",
         Error::NotADirectory => "that is not a folder",
         Error::ReadOnly => "this volume cannot be changed (made with checksums or by a tool this writer does not keep up with; `ext4 diskN mkfs` makes one it can)",
@@ -159,10 +172,10 @@ fn text_out(out: &mut dyn Write, text: &str) {
     }
 }
 
-const USAGE: &str = "usage: ext4 diskN [ls|cat|info|mkfs|mkdir|rm|mv|write] [PATH ...]";
+const USAGE: &str = "usage: ext4 diskN [ls|cat|info|recover|mkfs|remkfs|mkdir|rm|mv|write] [PATH ...]";
 
 /// Splits "a/b/c" into the folder "a/b" (an inode) and the name "c".
-fn parent_of(writer: &mut Writer<Partition>, path: &str) -> Result<(u32, usize), Error> {
+fn parent_of(writer: &mut Writer<Journaled<Partition>>, path: &str) -> Result<(u32, usize), Error> {
     let trimmed = path.trim_end_matches('/');
     let cut = trimmed.rfind('/').map_or(0, |at| at + 1);
     let folder = trimmed[..cut].trim_end_matches('/');
@@ -183,47 +196,52 @@ fn seconds() -> u32 {
 
 /// `ext4 diskN mkfs [LABEL]`: adds a Linux partition over the free space after the last one, if there is no ext volume,
 /// and formats it. Asks first.
-fn mkfs(disk: usize, label: &str, confirm: bool, out: &mut dyn Write) {
+fn mkfs(disk: usize, label: &str, confirm: bool, replace: bool, out: &mut dyn Write) {
     let index = disk - 1;
     if disk == 1 && !confirm {
         let _ = writeln!(out, "ext4: disk1 is the boot disk; its free space after the FOSFS partition is used when you confirm.");
     }
-    if mount(index).is_ok() {
-        let _ = writeln!(out, "ext4: disk{disk} already has an ext volume; nothing was changed.");
+    if !replace && mount(index).is_ok() {
+        let _ = writeln!(out, "ext4: disk{disk} already has an ext volume; nothing was changed (`ext4 disk{disk} remkfs` erases and remakes it).");
         return;
     }
     if !confirm {
         let mut stored = [0u8; 16];
         let length = label.len().min(16);
         stored[..length].copy_from_slice(&label.as_bytes()[..length]);
-        unsafe { PENDING_MKFS = Some((disk, stored, length)) };
-        let _ = writeln!(out, "This adds a partition over ALL the free space after the last partition of disk{disk} and formats it as ext4 (no journal, no checksums).");
+        unsafe { PENDING_MKFS = Some((disk, stored, length, replace)) };
+        if replace {
+            let _ = writeln!(out, "This ERASES the first Linux partition of disk{disk} (all its files) and formats it again as ext4 with a journal.");
+            let _ = writeln!(out, "To go ahead, type exactly: ext4 disk{disk} remkfs confirm");
+            return;
+        }
+        let _ = writeln!(out, "This adds a partition over ALL the free space after the last partition of disk{disk} and formats it as ext4 (with a journal, no checksums).");
         let _ = writeln!(out, "Existing partitions are not touched. To go ahead, type exactly: ext4 disk{disk} mkfs confirm");
         return;
     }
-    let Some((pending, stored, length)) = (unsafe { (*core::ptr::addr_of_mut!(PENDING_MKFS)).take() }) else {
+    let Some((pending, stored, length, was_replace)) = (unsafe { (*core::ptr::addr_of_mut!(PENDING_MKFS)).take() }) else {
         let _ = writeln!(out, "ext4: nothing is waiting for confirmation; run `ext4 disk{disk} mkfs` first.");
         return;
     };
-    if pending != disk {
+    if pending != disk || was_replace != replace {
         let _ = writeln!(out, "ext4: the pending mkfs was for disk{pending}.");
         return;
     }
-    let part = match gpt::add_partition(index, &LINUX_GUID, "Linux data") {
+    let part = match if replace { gpt::find(index, &LINUX_GUID, |_| true).ok_or(gpt::AddError::NoSpace) } else { gpt::add_partition(index, &LINUX_GUID, "Linux data") } {
         Ok(part) => part,
         Err(error) => {
             let _ = writeln!(out, "ext4: the partition could not be added ({error:?}); nothing was formatted.");
             return;
         }
     };
-    let _ = writeln!(out, "ext4: partition added ({} MiB); formatting, this takes a moment...", part.sectors >> 11);
+    let _ = writeln!(out, "ext4: partition ready ({} MiB); formatting, this takes a moment...", part.sectors >> 11);
     let device = Partition { disk: index, base: part.start, sectors: part.sectors };
     let mut uuid = [0u8; 16];
     uuid.copy_from_slice(&part.unique_guid);
-    let options = FormatOptions { label: &stored[..length], bytes_per_inode: 0, uuid, time: seconds() };
+    let options = FormatOptions { label: &stored[..length], bytes_per_inode: 0, uuid, time: seconds(), journal: true };
     let mut device = device;
     let result = ext4::format_raw(&mut device, part.sectors, &options).and_then(|()| {
-        let fs = ext4::Fs::mount(device)?;
+        let fs = ext4::open(device, stage())?;
         let writer = Writer::new_in(unsafe { &mut *core::ptr::addr_of_mut!(WRITER) }, fs)?;
         writer.set_time(options.time);
         let root = writer.root()?.number;
@@ -242,7 +260,7 @@ fn mkfs(disk: usize, label: &str, confirm: bool, out: &mut dyn Write) {
 
 /// `ext4 diskN mkdir|rm|mv|write ...`
 fn change(disk: usize, action: &str, rest: &str, out: &mut dyn Write) {
-    let fs = match mount(disk - 1) {
+    let fs = match locate(disk - 1).and_then(|partition| ext4::open(partition, stage())) {
         Ok(fs) => fs,
         Err(error) => {
             let _ = writeln!(out, "ext4: disk{disk}: {}.", why(error));
@@ -305,9 +323,9 @@ fn change(disk: usize, action: &str, rest: &str, out: &mut dyn Write) {
     }
 }
 
-/// `ext4 diskN [ls|cat|info|mkfs|mkdir|rm|mv|write] [ARGS]`; `rest` is what follows the word `ext4`.
+/// `ext4 diskN [ls|cat|info|recover|mkfs|remkfs|mkdir|rm|mv|write] [ARGS]`; `rest` is what follows the word `ext4`.
 pub fn command(rest: &str, out: &mut dyn Write) {
-    let confirmed = rest.split_whitespace().nth(2) == Some("confirm") && rest.split_whitespace().nth(1) == Some("mkfs");
+    let confirmed = rest.split_whitespace().nth(2) == Some("confirm") && matches!(rest.split_whitespace().nth(1), Some("mkfs" | "remkfs"));
     if !confirmed {
         cancel();
     }
@@ -317,9 +335,22 @@ pub fn command(rest: &str, out: &mut dyn Write) {
         return;
     };
     let action = words.next().unwrap_or("ls");
-    if action == "mkfs" {
+    if action == "mkfs" || action == "remkfs" {
         let argument = words.next().unwrap_or("");
-        return if argument == "confirm" { mkfs(disk, "", true, out) } else { mkfs(disk, argument, false, out) };
+        let replace = action == "remkfs";
+        return if argument == "confirm" { mkfs(disk, "", true, replace, out) } else { mkfs(disk, argument, false, replace, out) };
+    }
+    if action == "recover" {
+        let done = locate(disk - 1).and_then(|partition| ext4::open(partition, stage())).and_then(|fs| fs.into_device().close());
+        match done {
+            Ok(()) => {
+                let _ = writeln!(out, "ext4: disk{disk}: journal replayed, the volume is clean.");
+            }
+            Err(error) => {
+                let _ = writeln!(out, "ext4: disk{disk}: {}.", why(error));
+            }
+        }
+        return;
     }
     if matches!(action, "mkdir" | "rm" | "mv" | "write") {
         let mut after = rest.trim_start();

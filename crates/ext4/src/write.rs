@@ -18,7 +18,7 @@
 //! up to hundreds of GiB even when fragmented into 128 MiB extents); deeper trees are read but not written.
 //! `Writer` is about 100 KiB: put it in a `Box` or a static, not on a small stack.
 
-use crate::{Buffer, Device, Error, Fs, Inode, Mapping, FLAG_EXTENTS, FLAG_INLINE_DATA, INCOMPAT_64BIT, INCOMPAT_EXTENTS, INCOMPAT_FILETYPE, INCOMPAT_FLEX_BG, MAGIC, MAX_BLOCK, ROOT, SECTOR, le16, le32};
+use crate::{Buffer, Device, Error, Fs, Inode, Journaled, Mapping, Stage, FLAG_EXTENTS, FLAG_INLINE_DATA, INCOMPAT_64BIT, INCOMPAT_EXTENTS, INCOMPAT_FILETYPE, INCOMPAT_FLEX_BG, MAGIC, MAX_BLOCK, ROOT, SECTOR, le16, le32};
 use core::ops::{Deref, DerefMut};
 
 const LEAVES: usize = 4;
@@ -67,6 +67,10 @@ fn kind_of(mode: u16) -> u8 {
     }
 }
 
+fn put32_be(bytes: &mut [u8], at: usize, value: u32) {
+    bytes[at..at + 4].copy_from_slice(&value.to_be_bytes());
+}
+
 fn valid_name(name: &[u8]) -> Result<(), Error> {
     if name.is_empty() || name.len() > NAME_MAX || name == b"." || name == b".." || name.iter().any(|&byte| byte == b'/' || byte == 0) {
         return Err(Error::InvalidName);
@@ -92,6 +96,8 @@ pub struct FormatOptions<'a> {
     pub uuid: [u8; 16],
     /// Seconds since 1970 for the time stamps.
     pub time: u32,
+    /// Give the volume a jbd2 journal (what Linux expects of ext4, and what makes a power cut harmless).
+    pub journal: bool,
 }
 
 pub struct Writer<D: Device> {
@@ -127,6 +133,9 @@ impl<D: Device> Writer<D> {
         if fs.compat & !COMPAT_OK != 0 || fs.incompat & !INCOMPAT_OK != 0 || fs.ro_compat & !RO_COMPAT_OK != 0 {
             return Err(Error::ReadOnly);
         }
+        if fs.compat & 0x4 != 0 && !fs.device.journaled() {
+            return Err(Error::ReadOnly);
+        }
         if fs.block_size != 4096 && fs.block_size != 2048 && fs.block_size != 1024 {
             return Err(Error::ReadOnly);
         }
@@ -146,7 +155,7 @@ impl<D: Device> Writer<D> {
 
     /// Like `new`, but builds the writer inside `slot`, so its ~40 KiB never lands on a small stack.
     pub fn new_in(slot: &mut core::mem::MaybeUninit<Self>, fs: Fs<D>) -> Result<&mut Self, Error> {
-        if fs.compat & !COMPAT_OK != 0 || fs.incompat & !INCOMPAT_OK != 0 || fs.ro_compat & !RO_COMPAT_OK != 0 || !matches!(fs.block_size, 1024 | 2048 | 4096) {
+        if fs.compat & !COMPAT_OK != 0 || fs.incompat & !INCOMPAT_OK != 0 || fs.ro_compat & !RO_COMPAT_OK != 0 || !matches!(fs.block_size, 1024 | 2048 | 4096) || (fs.compat & 0x4 != 0 && !fs.device.journaled()) {
             return Err(Error::ReadOnly);
         }
         let p = slot.as_mut_ptr();
@@ -178,7 +187,7 @@ impl<D: Device> Writer<D> {
             self.write_super(true)?;
             self.dirty = false;
         }
-        Ok(())
+        self.fs.device.close()
     }
 
     pub fn into_device(mut self) -> Result<D, Error> {
@@ -187,6 +196,9 @@ impl<D: Device> Writer<D> {
     }
 
     fn begin(&mut self) -> Result<(), Error> {
+        if self.fs.device.pending() >= 32 {
+            self.fs.device.commit()?;
+        }
         if !self.dirty {
             self.write_super(false)?;
             self.dirty = true;
@@ -215,6 +227,13 @@ impl<D: Device> Writer<D> {
             return Err(Error::Corrupt);
         }
         Ok(block * (self.fs.block_size / SECTOR) as u64)
+    }
+
+    /// Writes the cached `Data` block of a file (not journaled: file data goes straight to the disk).
+    fn write_file_block(&mut self, block: u64) -> Result<(), Error> {
+        let lba = self.lba(block)?;
+        let size = self.fs.block_size;
+        self.fs.device.write_data(lba, &self.fs.data[..size])
     }
 
     fn write_buffer(&mut self, block: u64, which: Buffer) -> Result<(), Error> {
@@ -760,7 +779,7 @@ impl<D: Device> Writer<D> {
                 if block + whole > self.fs.blocks {
                     return Err(Error::Corrupt);
                 }
-                self.fs.device.write(lba, &data[done..done + (whole * size) as usize])?;
+                self.fs.device.write_data(lba, &data[done..done + (whole * size) as usize])?;
                 done += (whole * size) as usize;
             } else {
                 let fresh = (logical == first && fresh_first) || (logical == last && fresh_last);
@@ -771,7 +790,7 @@ impl<D: Device> Writer<D> {
                 }
                 let part = (size as usize - skip).min(remaining);
                 self.fs.data[skip..skip + part].copy_from_slice(&data[done..done + part]);
-                self.write_buffer(block, Buffer::Data)?;
+                self.write_file_block(block)?;
                 done += part;
             }
         }
@@ -801,7 +820,7 @@ impl<D: Device> Writer<D> {
             if let Some((block, _)) = self.physical(logical) {
                 self.fs.read_block(block, Buffer::Data)?;
                 self.fs.data[(new_size % size) as usize..size as usize].fill(0);
-                self.write_buffer(block, Buffer::Data)?;
+                self.write_file_block(block)?;
             }
         }
         let cut = new_size.div_ceil(size);
@@ -1130,16 +1149,16 @@ impl<D: Device> Writer<D> {
         }
         Ok(())
     }
+}
 
-    // ---- format ----
-
-    /// Makes a new ext4 volume (4 KiB blocks, no journal, no checksums: see the module notes) in `sectors` sectors of
-    /// the device, with an empty root folder and `lost+found`, and returns it ready for writing. Everything on the
-    /// device's first `sectors` sectors is lost. Without a block-group backup of the superblock a dead first sector
-    /// would end the volume, so the usual sparse backups are written.
-    pub fn format(mut device: D, sectors: u64, options: &FormatOptions) -> Result<Self, Error> {
+impl<D: Device> Writer<Journaled<D>> {
+    /// Makes a new ext4 volume (4 KiB blocks, no checksums: see the module notes; a journal if `options.journal`) in
+    /// `sectors` sectors of the device, with an empty root folder and `lost+found`, and returns it ready for writing.
+    /// Everything on the device's first `sectors` sectors is lost. The usual sparse superblock backups are written, so
+    /// a dead first sector does not end the volume.
+    pub fn format(mut device: D, sectors: u64, options: &FormatOptions, stage: &'static mut Stage) -> Result<Self, Error> {
         format_raw(&mut device, sectors, options)?;
-        let mut writer = Writer::new(Fs::mount(device)?)?;
+        let mut writer = Writer::new(crate::open(device, stage)?)?;
         writer.set_time(options.time);
         let root = writer.fs.root()?.number;
         writer.mkdir(root, b"lost+found", 0o700)?;
@@ -1208,10 +1227,18 @@ pub fn format_raw<D: Device>(device: &mut D, sectors: u64, options: &FormatOptio
         blocks = (groups - 1) * BLOCKS_PER_GROUP;
     };
     let (groups, inodes_per_group) = (geometry.groups, geometry.inodes_per_group);
+    let (_, _, _, _, total0, meta0_blocks) = geometry.group(0);
+    // The journal follows the root folder's block in group 0 (an eighth of the volume at most).
+    let mut jblocks = if options.journal { (blocks / 64).clamp(1024, 16384) } else { 0 };
+    // Linux refuses a journal under 1024 blocks, so a volume under 32 MiB goes without.
+    if jblocks > blocks / 8 || total0 < meta0_blocks + 1 + jblocks + 32 {
+        jblocks = 0;
+    }
+    let used0 = 1 + jblocks;
     let mut free_blocks = 0u64;
     for group in 0..groups {
         let (_, _, _, _, total, meta) = geometry.group(group);
-        free_blocks += total - meta - u64::from(group == 0);
+        free_blocks += total - meta - if group == 0 { used0 } else { 0 };
     }
     let free_inodes = groups * inodes_per_group - 10;
 
@@ -1224,7 +1251,7 @@ pub fn format_raw<D: Device>(device: &mut D, sectors: u64, options: &FormatOptio
     for group in 0..groups {
         let (start, block_map, inode_map, table, total, meta) = geometry.group(group);
         block.fill(0);
-        for index in 0..(meta as usize + usize::from(group == 0)) {
+        for index in 0..(meta as usize + if group == 0 { used0 as usize } else { 0 }) {
             set_bit(&mut block, index, true);
         }
         for index in total as usize..8 * FORMAT_BLOCK {
@@ -1266,6 +1293,25 @@ pub fn format_raw<D: Device>(device: &mut D, sectors: u64, options: &FormatOptio
     block[20] = b'.';
     block[21] = b'.';
     device.write(lba(root_block), &block)?;
+    if jblocks > 0 {
+        let mut done = 0;
+        while done < jblocks {
+            let take = (jblocks - done).min(4);
+            device.write(lba(root_block + 1 + done), &zero[..take as usize * FORMAT_BLOCK])?;
+            done += take;
+        }
+        block.fill(0);
+        put32_be(&mut block, 0, 0xc03b_3998);
+        put32_be(&mut block, 4, 4);
+        put32_be(&mut block, 12, FORMAT_BLOCK as u32);
+        put32_be(&mut block, 16, jblocks as u32);
+        put32_be(&mut block, 20, 1);
+        put32_be(&mut block, 24, 1);
+        put32_be(&mut block, 40, 0);
+        put32_be(&mut block, 64, 1);
+        block[48..64].copy_from_slice(&options.uuid);
+        device.write(lba(root_block + 1), &block)?;
+    }
     block.fill(0);
     {
         let raw = &mut block[FORMAT_INODE..2 * FORMAT_INODE];
@@ -1284,6 +1330,24 @@ pub fn format_raw<D: Device>(device: &mut D, sectors: u64, options: &FormatOptio
         put32(raw, 40 + 20, root_block as u32);
         put16(raw, 128, 32);
     }
+    if jblocks > 0 {
+        let raw = &mut block[7 * FORMAT_INODE..8 * FORMAT_INODE];
+        put16(raw, 0, 0o100600);
+        put32(raw, 4, (jblocks * FORMAT_BLOCK as u64) as u32);
+        for at in [8, 12, 16, 144] {
+            put32(raw, at, options.time);
+        }
+        put16(raw, 26, 1);
+        put32(raw, 28, (jblocks * (FORMAT_BLOCK / SECTOR) as u64) as u32);
+        put32(raw, 32, FLAG_EXTENTS);
+        put16(raw, 40, 0xf30a);
+        put16(raw, 42, 1);
+        put16(raw, 44, 4);
+        put16(raw, 52 + 4, jblocks as u16);
+        put32(raw, 40 + 20, (root_block + 1) as u32);
+        put16(raw, 128, 32);
+    }
+    let journal_map: [u8; 60] = block[7 * FORMAT_INODE + 40..7 * FORMAT_INODE + 100].try_into().unwrap();
     device.write(lba(table0), &block)?;
 
     // The descriptor blocks, primary and backups, computed group by group.
@@ -1311,6 +1375,13 @@ pub fn format_raw<D: Device>(device: &mut D, sectors: u64, options: &FormatOptio
         put32(&mut sb, 92, 0);
         put32(&mut sb, 96, INCOMPAT_FILETYPE | INCOMPAT_EXTENTS);
         put32(&mut sb, 100, 0x1 | 0x2 | 0x8 | 0x20 | 0x40);
+        if jblocks > 0 {
+            put32(&mut sb, 224, 8);
+            put32(&mut sb, 92, 0x4);
+            sb[253] = 1;
+            sb[268..328].copy_from_slice(&journal_map);
+            put32(&mut sb, 332, (jblocks * FORMAT_BLOCK as u64) as u32);
+        }
         sb[104..120].copy_from_slice(&options.uuid);
         let label = &options.label[..options.label.len().min(16)];
         sb[120..120 + label.len()].copy_from_slice(label);
@@ -1334,7 +1405,7 @@ pub fn format_raw<D: Device>(device: &mut D, sectors: u64, options: &FormatOptio
             put32(raw, 0, block_map as u32);
             put32(raw, 4, inode_map as u32);
             put32(raw, 8, table as u32);
-            put16(raw, 12, (total - meta - u64::from(group == 0)) as u16);
+            put16(raw, 12, (total - meta - if group == 0 { used0 } else { 0 }) as u16);
             put16(raw, 14, (inodes_per_group - if group == 0 { 10 } else { 0 }) as u16);
             put16(raw, 16, u16::from(group == 0));
         }

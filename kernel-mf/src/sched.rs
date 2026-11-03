@@ -19,8 +19,8 @@ use crate::percpu::MAX_CPUS;
 use crate::sync::SpinLock;
 use crate::{cpu, pmm, vm};
 
-/// Pages per kernel thread stack (128 KiB: a tape's audio call runs the shared drivers on it, which keep large buffers on the stack).
-const STACK_PAGES: u64 = 32;
+/// Pages per kernel thread stack (256 KiB: a tape's audio call and the ext4 volume code run on it, and both keep large buffers on the stack).
+const STACK_PAGES: u64 = 64;
 pub const WAKE_VECTOR: u8 = 0x42;
 
 const NO_THREAD: usize = usize::MAX;
