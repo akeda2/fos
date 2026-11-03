@@ -2,7 +2,7 @@
 name = "smb"
 version = "0.1.0"
 edition = "2024"
-description = "A small read-only SMB 2 client and server (guest, no signing) over any byte stream, for tapes"
+description = "A small read-only SMB 2 client and server (NTLMv2, signing) over any byte stream, for tapes"
 license = "MIT"
 
 [lib]
@@ -12,3 +12,6 @@ path = "src/lib.rs"
 [profile.release]
 panic = "abort"
 opt-level = "z"
+
+[dependencies]
+fosfor-tape-sync = { path = "../tape-sync" }

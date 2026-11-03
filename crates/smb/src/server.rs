@@ -10,6 +10,8 @@
 //! One connection carries one session and one tree; a `Server` is therefore one connection's state. Reads and directory
 //! answers are limited to `MAX_IO` bytes, so the output buffer should hold `MAX_IO + 4 + 64 + 16` bytes.
 
+use crate::ntlm::{hmac_md5, ntlmv2_key, ntlmv2_proof};
+use crate::sign;
 use crate::wire::*;
 
 pub const MAX_IO: usize = 65536;
@@ -39,6 +41,7 @@ const DIALECT_MISMATCH: u32 = 0xC000_00BD;
 
 const SESSION_ID: u64 = 0x0000_0001_0000_0001;
 const TREE_ID: u32 = 1;
+const FLAG_SIGNED: u32 = 8;
 const NTLMSSP: &[u8; 8] = b"NTLMSSP\0";
 /// OID 1.3.6.1.4.1.311.2.2.10 (NTLMSSP) as a DER object identifier.
 const NTLM_OID: [u8; 12] = [0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a];
@@ -55,6 +58,24 @@ pub struct Stat {
     pub size: u64,
     /// Modification time, seconds since 1970 (0: unknown).
     pub mtime: u64,
+    /// Permission bits (`0o644`); 0 means the volume keeps none and nothing is checked.
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// Who a session acts as: its uid and gid are checked against a file's mode bits (uid 0 passes everything).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Identity {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// A user the share knows: the NT hash (MD4 of the password as UTF-16LE) is all that is stored.
+#[derive(Clone, Copy)]
+pub struct Account {
+    pub nt_hash: [u8; 16],
+    pub identity: Identity,
 }
 
 /// The files behind the share. Paths are relative to the share root with '/' between components, no leading slash, ""
@@ -67,6 +88,14 @@ pub trait Share {
     fn read_dir(&mut self, path: &str, index: usize, name: &mut [u8]) -> Option<(usize, Stat)>;
     /// Reads at `offset`; returns the bytes read (0 at or past the end).
     fn read(&mut self, path: &str, offset: u64, out: &mut [u8]) -> Result<usize, ()>;
+    /// The account named `user` (UTF-8, compare without regard to case); `None` for a name the share does not know.
+    fn account(&mut self, _user: &str) -> Option<Account> {
+        None
+    }
+    /// Who a guest (an anonymous login, or a name the share does not know) acts as; `None` refuses guests.
+    fn guest(&mut self) -> Option<Identity> {
+        Some(Identity { uid: 65534, gid: 65534 })
+    }
     /// Total and free bytes of the volume.
     fn space(&mut self) -> (u64, u64) {
         (0, 0)
@@ -110,6 +139,10 @@ pub struct Server<S: Share, const OPENS: usize> {
     dialect: u16,
     /// 0: nothing yet, 1: challenge sent, 2: logged in.
     auth: u8,
+    identity: Identity,
+    /// The signing key once a password login succeeded; messages are signed with it (`sign`).
+    signing: Option<[u8; 16]>,
+    sign_answer: bool,
     tree: bool,
     opens: [Open; OPENS],
 }
@@ -235,6 +268,9 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
             now: 0,
             dialect: 0,
             auth: 0,
+            identity: Identity { uid: 65534, gid: 65534 },
+            signing: None,
+            sign_answer: false,
             tree: false,
             opens: [Open::EMPTY; OPENS],
         }
@@ -264,6 +300,12 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
                 }
                 if next != 0 {
                     put32(out, at + 20, padded as u32);
+                }
+                if self.sign_answer {
+                    if let Some(key) = self.signing {
+                        let value = sign::signature(self.dialect, &key, &out[at..at + padded]);
+                        out[at + 48..at + 64].copy_from_slice(&value);
+                    }
                 }
                 at += padded;
             }
@@ -301,7 +343,7 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
         put32(out, 8, status);
         put16(out, 12, command);
         put16(out, 14, credits as u16);
-        put32(out, 16, FLAG_RESPONSE | (flags & FLAG_RELATED));
+        put32(out, 16, FLAG_RESPONSE | (flags & (FLAG_RELATED | FLAG_SIGNED)));
         put64(out, 24, message);
         put32(out, 36, tree);
         put64(out, 40, session);
@@ -332,6 +374,21 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
         if command == CMD_CANCEL {
             return None;
         }
+        // A signed request must carry the right signature; an answer is signed when the request was, and the answer
+        // that completes the login always.
+        self.sign_answer = false;
+        if let Some(key) = self.signing.filter(|_| self.auth == 2 || command == CMD_SESSION_SETUP) {
+            if flags & FLAG_SIGNED != 0 {
+                if !self.signature_ok(&key, msg) {
+                    let (head, body) = out.split_at_mut(HEADER);
+                    body[..9].fill(0);
+                    put16(body, 0, 9);
+                    Self::write_header(head, command, flags, message, 1, ACCESS_DENIED, tree, session);
+                    return Some(HEADER + 9);
+                }
+                self.sign_answer = true;
+            }
+        }
 
         let (head, body) = out.split_at_mut(HEADER);
         let outcome = if let Some(status) = chain.error.filter(|_| related) {
@@ -351,8 +408,19 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
             }
         };
         let granted = u32::from(credits.max(1)) | (u32::from(charge) << 16);
-        Self::write_header(head, command, flags, message, granted, status, chain.tree, chain.session);
+        let signed = self.sign_answer || (command == CMD_SESSION_SETUP && self.signing.is_some() && self.auth == 2);
+        Self::write_header(head, command, flags | if signed { FLAG_SIGNED } else { 0 }, message, granted, status, chain.tree, chain.session);
+        self.sign_answer = signed;
         Some(HEADER + length)
+    }
+
+    /// Whether the signature in `msg` (header bytes 48..64) is the one `key` gives for the message with that field zeroed.
+    fn signature_ok(&self, key: &[u8; 16], msg: &[u8]) -> bool {
+        if msg.len() < HEADER {
+            return false;
+        }
+        let expected = sign::signature(self.dialect, key, msg);
+        expected.iter().zip(&msg[48..64]).fold(0u8, |sum, (a, b)| sum | (a ^ b)) == 0
     }
 
     fn dispatch(&mut self, chain: &mut Chain, command: u16, related: bool, msg: &[u8], body: &mut [u8]) -> Result<usize, u32> {
@@ -406,7 +474,7 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
     fn negotiate_body(&self, dialect: u16, body: &mut [u8]) -> usize {
         body[..64].fill(0);
         put16(body, 0, 65);
-        put16(body, 2, 1); // signing enabled, not required
+        put16(body, 2, 1); // signing enabled, not required (guests are not signed)
         put16(body, 4, dialect);
         body[8..24].copy_from_slice(&self.guid);
         put32(body, 28, MAX_IO as u32);
@@ -460,6 +528,7 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
         chain.session = SESSION_ID;
         match get32(blob, at + 8) {
             1 => {
+                self.signing = None;
                 let mut token = [0u8; 128];
                 let token_length = self.challenge_message(get32(blob, at + 12), &mut token);
                 let written = if wrapped {
@@ -474,15 +543,67 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
                 Ok(8 + written)
             }
             3 if self.auth == 1 => {
-                // Guest: whatever the client proved, it gets the guest identity (docs/smb.md, step 2).
+                let (identity, guest, key) = self.authenticate(&blob[at..])?;
+                self.identity = identity;
+                self.signing = key.map(|session_key| if self.dialect >= 0x0300 { sign::signing_key_v3(&session_key) } else { session_key });
+                self.sign_answer = self.signing.is_some();
                 let written = if wrapped { neg_token_resp(&mut body[8..], 0, &[]) } else { 0 };
-                put16(body, 2, 1); // IS_GUEST
+                put16(body, 2, u16::from(guest)); // IS_GUEST
                 put16(body, 6, written as u16);
                 self.auth = 2;
                 Ok(8 + written)
             }
             _ => Err(LOGON_FAILURE),
         }
+    }
+
+    /// Checks an NTLMSSP AUTHENTICATE message (`msg` starts at "NTLMSSP"). A known user must prove the password with
+    /// NTLMv2 (the NTLMv1 and LM answers are refused); an anonymous login or an unknown name is a guest when the share
+    /// has guests. Returns the identity and whether it is a guest.
+    fn authenticate(&mut self, msg: &[u8]) -> Result<(Identity, bool, Option<[u8; 16]>), u32> {
+        let field = |at: usize| -> Option<&[u8]> {
+            if msg.len() < at + 8 {
+                return None;
+            }
+            let (length, offset) = (get16(msg, at) as usize, get32(msg, at + 4) as usize);
+            msg.get(offset..offset.checked_add(length)?)
+        };
+        let response = field(20).ok_or(LOGON_FAILURE)?;
+        let domain = field(28).ok_or(LOGON_FAILURE)?;
+        let user = field(36).ok_or(LOGON_FAILURE)?;
+        let mut name = [0u8; 128];
+        let used = name_to_utf8(user, &mut name);
+        let name = core::str::from_utf8(&name[..used]).map_err(|_| LOGON_FAILURE)?;
+        let guest = |server: &mut Self| server.share.guest().map(|identity| (identity, true, None)).ok_or(LOGON_FAILURE);
+        if name.is_empty() {
+            return guest(self);
+        }
+        let Some(account) = self.share.account(name) else { return guest(self) };
+        if response.len() < 16 + 28 {
+            return Err(LOGON_FAILURE);
+        }
+        let key = ntlmv2_key(&account.nt_hash, user, domain);
+        let proof = ntlmv2_proof(&key, &self.challenge, &response[16..]);
+        let difference = proof.iter().zip(&response[..16]).fold(0u8, |sum, (a, b)| sum | (a ^ b));
+        if difference != 0 {
+            return Err(LOGON_FAILURE);
+        }
+        Ok((account.identity, false, Some(hmac_md5(&key, &[&proof]))))
+    }
+
+    /// Whether the session may do `want` (4 read, 1 search) with `stat`, by its owner, group and other bits.
+    fn allowed(&self, stat: &Stat, want: u32) -> bool {
+        if stat.mode == 0 || self.identity.uid == 0 {
+            return true;
+        }
+        let bits = if self.identity.uid == stat.uid {
+            stat.mode >> 6
+        } else if self.identity.gid == stat.gid {
+            stat.mode >> 3
+        } else {
+            stat.mode
+        };
+        bits & want == want
     }
 
     /// An NTLMSSP CHALLENGE message (MS-NLMP 2.2.1.2): target name "FOS" and a target-info list naming the domain and
@@ -589,7 +710,18 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
         if text.split('/').any(|part| part == ".." || part == ".") && !text.is_empty() {
             return Err(NAME_INVALID);
         }
+        // Every folder on the way needs the search bit, the target the read bit.
+        let folders = core::iter::once(0).chain(text.match_indices('/').map(|(i, _)| i));
+        for end in folders {
+            let folder = self.share.stat(&text[..end]).ok_or(NAME_NOT_FOUND)?;
+            if !self.allowed(&folder, 1) {
+                return Err(ACCESS_DENIED);
+            }
+        }
         let stat = self.share.stat(text).ok_or(NAME_NOT_FOUND)?;
+        if !self.allowed(&stat, 4) {
+            return Err(ACCESS_DENIED);
+        }
         if options & 1 != 0 && !stat.dir {
             return Err(NOT_A_DIRECTORY);
         }

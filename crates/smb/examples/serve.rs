@@ -15,7 +15,7 @@ struct Folder {
 
 fn stat_of(meta: &fs::Metadata) -> Stat {
     let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
-    Stat { dir: meta.is_dir(), size: if meta.is_dir() { 0 } else { meta.len() }, mtime }
+    Stat { dir: meta.is_dir(), size: if meta.is_dir() { 0 } else { meta.len() }, mtime, ..Stat::default() }
 }
 
 impl Share for Folder {

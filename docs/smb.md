@@ -55,14 +55,23 @@ Done (ABI 32, `crates/kernel-core/src/tape_vfs.rs`, `tape_rt::vfs_stat/vfs_read_
 ## Authentication and permissions
 
 1. **Guest**: SESSION_SETUP runs the NTLMSSP exchange (SPNEGO-wrapped for Linux, iOS and Windows; the existing client sends it
-   raw), accepts any user and answers with the guest flag. The guest maps to the configured uid (default 65534).
+   raw). Without an `smbusers` file every login is a guest (uid and gid 65534, answered with the guest flag, not signed).
 2. **Users file** (`smbusers`, per-machine, like `hostname`): `name:uid:gid:NTHASH` lines; the hash is MD4 of the UTF-16LE
-   password, so no plaintext is stored. NTLMv2 is verified (HMAC-MD5 over the server challenge and the client blob); LM and
-   NTLMv1 are refused. A line `guest:uid:gid:` allows guests. A small shell or tape command writes the file (`smbpasswd`).
-3. **Mode bits**: every request is checked against the owner/group/other bits of the file for the session's uid and gid
-   (supplementary groups: the users file may list them). Read-only milestone: read and execute (search) bits only.
-4. Not planned: Kerberos, signing, encryption, SMB1. A client that insists on signing is refused with a clear status, and the
-   client half says why.
+   password, so no plaintext is stored. `smbd user NAME UID GID PASSWORD` prints a line to paste in (`write smbusers LINE`, or
+   `ebb`). NTLMv2 is verified (HMAC-MD5 over the server challenge and the client blob, names compared without regard to case);
+   LM and NTLMv1 are refused. A line `guest:uid:gid:` allows anonymous logins and unknown names; with the file present and no
+   such line they get LOGON_FAILURE. At most 8 users.
+3. **Mode bits**: `Stat` carries mode, uid and gid (`VfsStat` has them; FOSFS and FAT answer mode 0 for "none", nothing checked).
+   Opening a path needs the search (x) bit on every folder on the way and the read (r) bit on the target, from the owner,
+   group or other bits for the session's uid and gid. uid 0 passes everything. Supplementary groups are not supported.
+   Directory listing checks the folder's r bit through the same open; entries are not filtered one by one.
+4. **Signing**: a client that logged in with a password signs and insists on signed answers (Samba does), so the server signs
+   (`crates/smb/src/sign.rs`: HMAC-SHA-256 for SMB 2.0.2/2.1, AES-128-CMAC with the SP 800-108 derived key for 3.0; the session
+   key is the NTLMv2 session base key, no key exchange offered). Signed requests are verified. Guests are not signed. Not
+   planned: Kerberos, encryption, SMB 3.1.1 (its pre-authentication hash), SMB1.
+5. **The challenge is not from a real random source** (no entropy call in the tape ABI): it is MD5 over the microsecond clock,
+   a counter, the peer's address and port and the previous output. Good enough against replay on a lab network; an attacker who
+   can guess the clock to the microsecond could precompute. A `random` ABI call (RDRAND where present) would fix it.
 
 ## Order of work
 
@@ -70,7 +79,7 @@ Done (ABI 32, `crates/kernel-core/src/tape_vfs.rs`, `tape_rt::vfs_stat/vfs_read_
    encodings captured from `smbclient`.
 2. (done) Server half in the crate (`crates/smb/src/server.rs`), read-only and guest, against a `Share` trait; `crates/smb/tests/server.rs`
    drives it from our own client and from `smbclient` (SMB 2.0.2 and 3.0, SPNEGO, compound requests, UTF-8 names). Not yet
-   checked: Linux `mount.cifs`, Windows, VLC; the NTLM response of a login is not verified (every client is a guest).
+   checked: Linux `mount.cifs`, Windows, VLC; (step 6 added password checks).
 3. Tape ABI 32 (`vfs_*`, read side) with ext4 behind it; `make test-vfs` on QEMU. **Done.**
 4. `smbd` tape (`tapes/smbd`: service on port 445, `root=`/`share=` settings, `run smbd @SMBD.CFG &2`); `make test-smbd` runs it in
    QEMU (user-mode networking) over an ext4 disk and uses `smbclient` (SMB2_02 and SMB3_00, a 3 MB file, a 300-file folder).
@@ -78,7 +87,9 @@ Done (ABI 32, `crates/kernel-core/src/tape_vfs.rs`, `tape_rt::vfs_stat/vfs_read_
 5. `smb` client tape (`tapes/smb`: `smb ls|cat|get //HOST/SHARE/PATH [NAME]`, `get` streams to a local file); `make test-smb-client` runs it
    in QEMU against a host-side server (`crates/smb/examples/serve.rs`, through guestfwd). **Done**; Samba and Windows servers are
    unchecked (`make test-smb` still covers fosplay against a real Samba when one is reachable).
-6. Users file, NTLMv2 verification, uid/gid and mode checks.
+6. (done) Users file, NTLMv2 verification, signing, uid/gid and mode checks (`make test-smbd` second boot, `logins_are_checked` in
+   `crates/smb/tests/server.rs`: right and wrong password, unknown user, anonymous, a 0600 file of another owner, SMB 2.0.2 and 3.0).
+   The `smb` client tape is still guest only: it has no `user=`/`password=` yet (it would need an NTLMv2 response and signature checks).
 7. Writes: the `vfs_*` write calls, the ext4 writer behind them (journal commit per request batch), CREATE for write, WRITE,
    SET_INFO (rename, delete-on-close, end-of-file), FLUSH.
 
