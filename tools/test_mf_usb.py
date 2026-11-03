@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """USB on the server kernel (`make test-mf-usb`): an xHCI controller with a USB keyboard comes up, and keys typed on it
-(QEMU monitor `sendkey`) reach the shell, a USB stick (usb-storage) is a disk whose file a tape reads, at -smp 1, 2 and 8. QEMU has no USB-MIDI or touch-digitizer model, so
+(QEMU monitor `sendkey`) reach the shell, a USB stick (usb-storage) is a disk whose file a tape reads (and that survives an unplug and `usb rescan` replug), at -smp 1, 2 and 8. QEMU has no USB-MIDI or touch-digitizer model, so
 `midi_*` and `touch_*` for tapes are only verified on hardware."""
 import os
+import re
 import select
 import socket
 import subprocess
@@ -18,14 +19,15 @@ CODE = next(p for p in ["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF
                         "/usr/share/edk2/ovmf/OVMF_CODE.fd"] if Path(p).exists())
 
 
-def run(smp):
+def run(smp, ehci=False):
+    bus = ",bus=ehci.0" if ehci else ""
     with tempfile.TemporaryDirectory() as tmp:
         sock = f"{tmp}/mon.sock"
         qemu = subprocess.Popen(
             ["qemu-system-x86_64", "-cpu", "max", "-machine", "q35", "-m", "512", "-smp", str(smp), "-display", "none",
              "-serial", "stdio", "-monitor", f"unix:{sock},server,nowait", "-no-reboot",
-             "-device", "qemu-xhci", "-device", "usb-kbd",
-             "-drive", f"if=none,id=stick,format=raw,file={STICK},snapshot=on", "-device", "usb-storage,drive=stick",
+             "-device", "qemu-xhci", "-device", "usb-kbd", *(["-device", "usb-ehci,id=ehci"] if ehci else []),
+             "-drive", f"if=none,id=stick,format=raw,file={STICK},snapshot=on", "-device", "usb-storage,drive=stick,id=stickdev" + bus,
              "-drive", f"if=pflash,format=raw,readonly=on,file={CODE}", "-drive", f"format=raw,file={IMAGE},snapshot=on"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         log = b""
@@ -59,6 +61,39 @@ def run(smp):
             qemu.stdin.flush()
             if not wait_for("fscheck: 5 bytes [abcde]", 15, mark):
                 return "a file on the USB stick was not read:\n" + log[mark - 400:].decode("utf8", "replace")
+
+            def shell(command, timeout=20):
+                mark = len(log)
+                qemu.stdin.write(command.encode() + b"\n")
+                qemu.stdin.flush()
+                # the echo of the command carries a prompt too: the answer is done when the text ends with one
+                end = time.time() + timeout
+                while time.time() < end:
+                    text = log[mark:].decode("utf8", "replace")
+                    if command in text and text.rstrip().endswith("fos>") and "\n" in text.split(command, 1)[1]:
+                        break
+                    wait_for("\0", 0.2)
+                return log[mark:].decode("utf8", "replace")
+
+            # Hot-unplug: the read fails (it does not hang), the shell survives; after the replug `usb rescan` gives the stick its
+            # old disk number back and the file reads again, with no extra disk.
+            monitor.send(b"device_del stickdev\n")
+            wait_for("\0", 1.5)
+            gone = shell("tape fscheck disk2/note.txt 10 5", 40)
+            if "[abcde]" in gone or "fos> " not in gone:
+                return "a read from the unplugged stick did not fail cleanly:\n" + gone
+            # A device_del drops the drive with it: the stick comes back on a new drive, as in tools/test_usb_replug.py.
+            monitor.send(f"drive_add 0 if=none,id=stick2,format=raw,snapshot=on,file={STICK}\n".encode())
+            wait_for("\0", 1)
+            monitor.send(f"device_add usb-storage,drive=stick2,id=stickdev2{bus}\n".encode())
+            wait_for("\0", 1.5)
+            rescan = shell("usb rescan", 30)
+            back = shell("tape fscheck disk2/note.txt 10 5", 40)
+            if "fscheck: 5 bytes [abcde]" not in back:
+                return "the stick did not come back after replug and usb rescan:\n" + rescan + back + shell("disks") + shell("usb")
+            listing = shell("disks")
+            if "disk2:" not in listing or "disk3:" in listing:
+                return "a replug did not give the stick its old disk number back:\n" + listing
             return None
         finally:
             qemu.kill()
@@ -66,9 +101,9 @@ def run(smp):
 
 
 failed = False
-for smp in (1, 2, 8):
-    problem = run(smp)
-    print(f"-smp {smp}: {'ok' if problem is None else 'FAIL'}")
+for smp, ehci in ((1, False), (2, False), (8, False), (2, True)):
+    problem = run(smp, ehci)
+    print(f"-smp {smp}{' (stick on EHCI)' if ehci else ''}: {'ok' if problem is None else 'FAIL'}")
     if problem:
         print(problem)
         failed = True

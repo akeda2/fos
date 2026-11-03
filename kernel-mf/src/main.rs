@@ -16,6 +16,7 @@ mod tapeaudio;
 mod tapefs;
 mod tapenet;
 mod audioshell;
+mod usbshell;
 mod ps2;
 mod usb;
 mod user_test;
