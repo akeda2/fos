@@ -1,12 +1,15 @@
 //! The server half against real clients: our own `Client` in-process, and `smbclient` (when installed) over a loopback
 //! TCP connection. The share is a few files in memory.
-use smb::server::{Server, Share, Stat};
+use smb::ntlm::nt_hash;
+use smb::server::{Account, Identity, Server, Share, Stat};
 use smb::{Client, Error, Transport};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
 
-struct Memory(Vec<(&'static str, Option<Vec<u8>>)>);
+/// The files, and whether the share has accounts: alice (uid 1000, secret) and bob (uid 2000, hunter2), no guests, and
+/// private.txt readable by its owner alice only.
+struct Memory(Vec<(&'static str, Option<Vec<u8>>)>, bool);
 
 fn pattern(size: usize) -> Vec<u8> {
     (0..size).map(|i| (i * 7 + i / 251) as u8).collect()
@@ -19,7 +22,8 @@ fn memory() -> Memory {
         ("sub", None),
         ("sub/inner.txt", Some(b"inside".to_vec())),
         ("sub/Åäö.txt", Some(b"unicode".to_vec())),
-    ])
+        ("private.txt", Some(b"for alice".to_vec())),
+    ], false)
 }
 
 impl Share for Memory {
@@ -31,7 +35,12 @@ impl Share for Memory {
             return Some(Stat { dir: true, ..Stat::default() });
         }
         let (_, data) = self.0.iter().find(|(name, _)| *name == path)?;
-        Some(Stat { dir: data.is_none(), size: data.as_ref().map_or(0, |d| d.len() as u64), mtime: 1_700_000_000 })
+        let mode = match (self.1, path) {
+            (false, _) => 0,
+            (true, "private.txt") => 0o600,
+            (true, _) => 0o755,
+        };
+        Some(Stat { dir: data.is_none(), size: data.as_ref().map_or(0, |d| d.len() as u64), mtime: 1_700_000_000, mode, uid: 1000, gid: 1000 })
     }
     fn read_dir(&mut self, path: &str, index: usize, name: &mut [u8]) -> Option<(usize, Stat)> {
         let prefix = if path.is_empty() { String::new() } else { format!("{path}/") };
@@ -47,6 +56,17 @@ impl Share for Memory {
         let count = out.len().min(data.len() - start);
         out[..count].copy_from_slice(&data[start..start + count]);
         Ok(count)
+    }
+    fn account(&mut self, user: &str) -> Option<Account> {
+        let (password, uid) = match user {
+            "alice" => ("secret", 1000),
+            "bob" => ("hunter2", 2000),
+            _ => return None,
+        };
+        self.1.then(|| Account { nt_hash: nt_hash(password), identity: Identity { uid, gid: uid } })
+    }
+    fn guest(&mut self) -> Option<Identity> {
+        (!self.1).then_some(Identity { uid: 65534, gid: 65534 })
     }
     fn space(&mut self) -> (u64, u64) {
         (1 << 30, 1 << 29)
@@ -166,5 +186,58 @@ fn smbclient_lists_and_downloads() {
         assert_eq!(std::fs::read(dir.join("uni.txt")).unwrap(), b"unicode");
         std::fs::remove_file(dir.join("big.bin")).unwrap();
     }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn logins_are_checked() {
+    if Command::new("smbclient").arg("--version").output().is_err() {
+        eprintln!("smbclient not installed: skipped");
+        return;
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            std::thread::spawn(move || {
+                let mut share = memory();
+                share.1 = true;
+                let mut server = Box::new(Server::new(share));
+                serve(&mut server, &mut stream);
+            });
+        }
+    });
+    let run = |login: &[&str], script: &str| {
+        let output = Command::new("smbclient")
+            .args(login)
+            .args(["-p", &port.to_string(), "//127.0.0.1/fos", "-m", "SMB3_00", "-c", script])
+            .output()
+            .unwrap();
+        (output.status.success(), String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr))
+    };
+    let dir = std::env::temp_dir().join(format!("smbauth-{port}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let get = format!("get private.txt {}/p.txt", dir.display());
+
+    let (ok, text) = run(&["-U", "alice%secret"], &get);
+    assert!(ok, "alice: {text}");
+    assert_eq!(std::fs::read(dir.join("p.txt")).unwrap(), b"for alice");
+    std::fs::remove_file(dir.join("p.txt")).unwrap();
+
+    // SMB 2.0.2 signs with HMAC-SHA-256 instead of AES-CMAC.
+    let output = Command::new("smbclient").args(["-U", "alice%secret", "-p", &port.to_string(), "//127.0.0.1/fos", "-m", "SMB2_02", "-c", "ls"]).output().unwrap();
+    assert!(output.status.success(), "SMB2_02: {}", String::from_utf8_lossy(&output.stderr));
+
+    let (ok, text) = run(&["-U", "bob%hunter2"], "ls");
+    assert!(ok && text.contains("readme.txt"), "bob lists: {text}");
+    let (_, text) = run(&["-U", "bob%hunter2"], &get);
+    assert!(text.contains("ACCESS_DENIED") && !dir.join("p.txt").exists(), "bob must not read private.txt: {text}");
+
+    let (ok, text) = run(&["-U", "alice%wrong"], "ls");
+    assert!(!ok && text.contains("LOGON_FAILURE"), "wrong password: {text}");
+    let (ok, text) = run(&["-U", "mallory%secret"], "ls");
+    assert!(!ok, "unknown user without guests: {text}");
+    let (ok, text) = run(&["-N"], "ls");
+    assert!(!ok, "anonymous without guests: {text}");
     std::fs::remove_dir_all(&dir).unwrap();
 }

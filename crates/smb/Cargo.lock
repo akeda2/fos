@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "fosfor-tape-sync"
+version = "0.1.0"
+
+[[package]]
 name = "smb"
 version = "0.1.0"
+dependencies = [
+ "fosfor-tape-sync",
+]

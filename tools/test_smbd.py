@@ -22,10 +22,10 @@ HOST_PORT = port(28445)
 MANY = 300
 
 
-def smbclient(command, protocol="SMB3_00", attempts=4):
+def smbclient(command, protocol="SMB3_00", attempts=4, login=("-N",)):
     last = None
     for attempt in range(attempts):
-        last = subprocess.run(["smbclient", "//127.0.0.1/data", "-p", str(HOST_PORT), "-N", "-m", protocol, "-c", command],
+        last = subprocess.run(["smbclient", "//127.0.0.1/data", "-p", str(HOST_PORT), *login, "-m", protocol, "-c", command],
                               capture_output=True, text=True, timeout=120)
         if last.returncode == 0 or attempt == attempts - 1:
             break
@@ -47,6 +47,8 @@ def main():
         big = os.urandom(3 << 20)
         (source / "big.bin").write_bytes(big)
         (source / "hello.txt").write_text("hello over smb\n")
+        (source / "locked.txt").write_text("not for alice\n")
+        (source / "locked.txt").chmod(0o600)
         (source / "docs" / "räksmörgås.txt").write_text("hej\n")
         (source / "docs" / "deep" / "x.txt").write_text("deep\n")
         for index in range(MANY):
@@ -83,6 +85,25 @@ def main():
             check(out.returncode != 0 or "NT_STATUS" in out.stdout + out.stderr, "a write is refused", out.stdout + out.stderr)
             shell = g.line("uptime")
             check("fos>" in shell, "the shell stays usable while the service runs", shell)
+        # Second boot: the same volume with an smbusers file (alice, uid 4242, is not the owner of anything).
+        with Guest(forward=HOST_PORT, data_disk=image, guest_port=445) as g:
+            g.line("write settings no-msi")
+            screen = g.line("run smbd user alice 4242 4242 secret")
+            entry = next((word for word in screen.split() if word.startswith("alice:4242:4242:")), "")
+            check(len(entry) == len("alice:4242:4242:") + 32, "smbd user prints an smbusers line", screen)
+            g.line(f"write smbusers {entry}")
+            screen = g.line("run smbd root=disk2 share=data log ip=10.0.2.15/24 gateway=10.0.2.2 &2", "fos> ", 40)
+            check("1 user" in screen, "smbd reads the smbusers file", screen)
+            out = smbclient("get hello.txt " + str(tmp / "h1"), login=("-U", "alice%secret"))
+            check(out.returncode == 0 and (tmp / "h1").read_text() == "hello over smb\n", "the right password logs in and reads", out.stdout + out.stderr)
+            out = smbclient("ls", login=("-U", "alice%wrong"), attempts=1)
+            check(out.returncode != 0 and "LOGON_FAILURE" in out.stdout + out.stderr, "a wrong password is refused", out.stdout + out.stderr)
+            out = smbclient("ls", login=("-N",), attempts=1)
+            check(out.returncode != 0, "anonymous is refused when users exist", out.stdout + out.stderr)
+            out = smbclient("get locked.txt " + str(tmp / "h2"), login=("-U", "alice%secret"), attempts=1)
+            check("ACCESS_DENIED" in out.stdout + out.stderr and not (tmp / "h2").exists(), "mode 0600 of another owner is denied", out.stdout + out.stderr)
+            out = smbclient("get hello.txt " + str(tmp / "h3"), "SMB2_02", login=("-U", "alice%secret"))
+            check(out.returncode == 0, "SMB 2.0.2 signing works too", out.stdout + out.stderr)
     print("smbd: all checks passed")
 
 

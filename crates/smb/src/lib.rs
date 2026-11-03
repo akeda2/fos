@@ -17,6 +17,7 @@
 #![no_std]
 
 pub mod ntlm;
+pub mod sign;
 pub mod server;
 pub mod wire;
 
