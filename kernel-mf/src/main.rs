@@ -15,6 +15,7 @@ mod tapeapi;
 mod tapeaudio;
 mod tapefs;
 mod tapenet;
+mod ps2;
 mod usb;
 mod user_test;
 mod fb;
@@ -247,6 +248,13 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
         println!("  {:02x}:{:02x}.{} {:04x}:{:04x} {}", device.bus, device.device, device.function, device.vendor, device.id, pci::class_name(device.class, device.subclass));
     }
     storage::init(info);
+    // A USB stick is a disk only once USB is up; a machine that boots from one gets USB before its config is read (so `no-msi`
+    // in `settings` cannot apply to USB on such a machine).
+    let usb_first = storage::boot_disk().is_none();
+    if usb_first {
+        usb::init();
+        storage::find_boot_disk(info);
+    }
     if let Some(disk) = storage::boot_disk() {
         slots::init(info, disk);
     }
@@ -260,7 +268,10 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     }
     slots::confirm_boot();
     net::init();
-    usb::init();
+    if !usb_first {
+        usb::init();
+    }
+    ps2::init();
     sched_selftest();
     sched::spawn("service", service_thread, 0).expect("the service thread");
     println!("kernel-mf: slice 8 reached the end of boot; entering the service loop.");
@@ -326,6 +337,7 @@ extern "C" fn service_thread(_: usize) {
     loop {
         net::poll();
         usb::poll();
+        ps2::poll();
         while let Some(byte) = serial::read_byte() {
             shell::feed(byte);
         }

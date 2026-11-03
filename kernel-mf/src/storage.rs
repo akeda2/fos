@@ -60,6 +60,15 @@ pub fn init(info: &BootInfo) {
         println!("Storage: no disks found ({sata} SATA, {nvme} NVMe).");
         return;
     }
+    find_boot_disk(info);
+}
+
+/// Looks for the disk with the payload partition among the registered disks and mounts its FOSFS volume. `main` calls it a
+/// second time after `usb::init` when the machine boots from a USB stick (piano), which only exists once USB is up.
+pub fn find_boot_disk(info: &BootInfo) {
+    if boot_disk().is_some() || block::count() == 0 {
+        return;
+    }
     let (guid, start, sectors) = (info.payload_guid, info.payload_start, info.payload_sectors);
     let found = (0..block::count())
         .find(|&index| gpt::find(index, &PAYLOAD_TYPE_GUID, |p| p.unique_guid == guid && p.start == start && p.sectors == sectors).is_some());
