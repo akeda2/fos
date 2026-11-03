@@ -238,7 +238,7 @@ fn mkfs(disk: usize, label: &str, confirm: bool, replace: bool, out: &mut dyn Wr
     let device = Partition { disk: index, base: part.start, sectors: part.sectors };
     let mut uuid = [0u8; 16];
     uuid.copy_from_slice(&part.unique_guid);
-    let options = FormatOptions { label: &stored[..length], bytes_per_inode: 0, uuid, time: seconds(), journal: true };
+    let options = FormatOptions { label: &stored[..length], bytes_per_inode: 0, uuid, time: seconds(), journal: true, checksums: true };
     let mut device = device;
     let result = ext4::format_raw(&mut device, part.sectors, &options).and_then(|()| {
         let fs = ext4::open(device, stage())?;

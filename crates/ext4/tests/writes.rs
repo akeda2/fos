@@ -46,7 +46,7 @@ fn make(name: &str, mb: u64) -> (PathBuf, Writer<Journaled<FileDevice>>) {
     let image = std::env::temp_dir().join(format!("fos-ext4-{name}-{}.img", std::process::id()));
     let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&image).unwrap();
     file.set_len(mb << 20).unwrap();
-    let options = FormatOptions { label: b"fostest", bytes_per_inode: 0, uuid: [7; 16], time: 1_700_000_000, journal: true };
+    let options = FormatOptions { label: b"fostest", bytes_per_inode: 0, uuid: [7; 16], time: 1_700_000_000, journal: true, checksums: true };
     let writer = Writer::format(FileDevice(file), (mb << 20) / 512, &options, stage()).unwrap();
     (image, writer)
 }
@@ -58,6 +58,8 @@ fn formatted_volume_is_clean_and_usable() {
     }
     let (image, mut w) = make("format", 200);
     fsck(&image);
+    let dump = Command::new("/usr/sbin/dumpe2fs").arg("-h").arg(&image).output().unwrap();
+    assert!(String::from_utf8_lossy(&dump.stdout).contains("metadata_csum"));
     assert_eq!(w.label(), b"fostest");
     let root = w.root().unwrap().number;
     assert!({ let r = w.root().unwrap(); w.lookup(&r, b"lost+found") }.unwrap().is_some());
@@ -511,4 +513,69 @@ fn a_checksummed_journal_linux_wrote_is_replayed() {
     drop(w);
     fsck(&image);
     let _ = (fs::remove_file(&image), fs::remove_file(&payload), fs::remove_file(&commands));
+}
+
+#[test]
+fn hash_tree_folders_are_made_linear_on_a_checksummed_volume() {
+    if !have("mkfs.ext4") || !have("e2fsck") || !have("debugfs") {
+        return;
+    }
+    let image = std::env::temp_dir().join(format!("fos-ext4-htree-{}.img", std::process::id()));
+    File::create(&image).unwrap().set_len(64 << 20).unwrap();
+    assert!(Command::new("/usr/sbin/mkfs.ext4").args(["-q", "-F", "-O", "^orphan_file"]).arg(&image).status().unwrap().success());
+    let file = OpenOptions::new().read(true).write(true).open(&image).unwrap();
+    let mut w = Writer::new(ext4::open(FileDevice(file), stage()).unwrap()).unwrap();
+    let root = w.root().unwrap().number;
+    let mut dirs = Vec::new();
+    for (name, count) in [("small", 150), ("big", 6000)] {
+        let d = w.mkdir(root, name.as_bytes(), 0o755).unwrap().number;
+        for n in 0..count {
+            w.create(d, format!("entry-with-a-fairly-long-name-{n:05}").as_bytes(), 0o644).unwrap();
+        }
+        dirs.push(d);
+    }
+    w.flush().unwrap();
+    drop(w);
+    // e2fsck -D rebuilds the folders as hash trees (one level for `small`, two for `big`).
+    Command::new("/usr/sbin/e2fsck").args(["-fyD"]).arg(&image).output().unwrap();
+    fsck(&image);
+    let stat = |path: &str| String::from_utf8_lossy(&Command::new("/usr/sbin/debugfs").arg("-R").arg(format!("htree_dump {path}")).arg(&image).output().unwrap().stdout).to_string();
+    assert!(stat("/small").contains("Number of entries"), "small is a hash tree now");
+    assert!(stat("/big").contains("Number of entries"), "big is a hash tree now");
+    let file = OpenOptions::new().read(true).write(true).open(&image).unwrap();
+    let mut w = Writer::new(ext4::open(FileDevice(file), stage()).unwrap()).unwrap();
+    w.set_time(1_800_000_000);
+    w.create(dirs[0], b"added.txt", 0o644).unwrap();
+    w.remove(dirs[0], b"entry-with-a-fairly-long-name-00007").unwrap();
+    w.rename(root, b"big", dirs[0], b"moved-big").unwrap();
+    w.create(dirs[1], b"added.txt", 0o644).unwrap();
+    w.remove(dirs[1], b"entry-with-a-fairly-long-name-00042").unwrap();
+    w.flush().unwrap();
+    drop(w);
+    fsck(&image);
+    assert!(!stat("/small").contains("Number of entries"), "the folder is linear after our change");
+    let _ = fs::remove_file(&image);
+}
+
+#[test]
+fn format_without_checksums_still_works() {
+    if !have("e2fsck") {
+        return;
+    }
+    let image = std::env::temp_dir().join(format!("fos-ext4-plain-{}.img", std::process::id()));
+    let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&image).unwrap();
+    file.set_len(100 << 20).unwrap();
+    let options = FormatOptions { label: b"plain", bytes_per_inode: 0, uuid: [9; 16], time: 1_700_000_000, journal: true, checksums: false };
+    let mut w = Writer::format(FileDevice(file), (100 << 20) / 512, &options, stage()).unwrap();
+    let root = w.root().unwrap().number;
+    w.set_time(1_700_000_100);
+    let f = w.create(root, b"a.txt", 0o644).unwrap().number;
+    w.write(f, 0, b"plain").unwrap();
+    w.flush().unwrap();
+    drop(w);
+    fsck(&image);
+    assert_eq!(debugfs_cat(&image, "/a.txt"), b"plain");
+    let dump = Command::new("/usr/sbin/dumpe2fs").arg("-h").arg(&image).output().unwrap();
+    assert!(!String::from_utf8_lossy(&dump.stdout).contains("metadata_csum"));
+    let _ = fs::remove_file(&image);
 }
