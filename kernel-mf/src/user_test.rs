@@ -288,8 +288,12 @@ pub fn run() {
     }
     let leaked = free_before.saturating_sub(pmm::stats().free).saturating_sub(2);
     let ok = |b: bool| if b { "ok" } else { "FAILED" };
+    // An image that would run into the stack is refused before anything is allocated.
+    let mut big = build_elf();
+    big[104..112].copy_from_slice(&(process::MAX_IMAGE + 4096).to_le_bytes());
+    let big_ok = matches!(process::spawn_elf("big", &big, b""), Err(process::SpawnError::TooLarge));
     println!(
-        "Ring 3: hello {}, bad pointer {}, page fault {}, stack guard {}, #GP {}, preempted spinner {}, ELF {}, SSE{} state {}, {} frames not returned.",
-        ok(hello_ok), ok(badptr_ok), ok(fault_ok), ok(overflow_ok), ok(gp_ok), ok(spin_ok), ok(elf_ok), if avx.is_some() { "+AVX" } else { "" }, ok(fp_ok), leaked
+        "Ring 3: hello {}, bad pointer {}, page fault {}, stack guard {}, #GP {}, preempted spinner {}, ELF {}, big image {}, SSE{} state {}, {} frames not returned.",
+        ok(hello_ok), ok(badptr_ok), ok(fault_ok), ok(overflow_ok), ok(gp_ok), ok(spin_ok), ok(elf_ok), ok(big_ok), if avx.is_some() { "+AVX" } else { "" }, ok(fp_ok), leaked
     );
 }

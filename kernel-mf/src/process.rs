@@ -33,9 +33,10 @@ const MSR_SFMASK: u32 = 0xc000_0084;
 /// A vector number no CPU delivers: what the `syscall` stub puts in `Frame::vector`.
 pub const SYSCALL_VECTOR: u64 = 0x1000;
 
-/// Where a process's code is mapped, and the top of its stack.
+/// Where a process's code is mapped, and the top of its stack. The stack sits just under the tape shim (`tapeapi::SHIM_BASE`,
+/// 32 MiB up), with one unmapped page between them, so an image can be about 32 MiB.
 pub const CODE_BASE: u64 = vm::USER_BASE;
-pub const STACK_TOP: u64 = vm::USER_BASE + 0x100_0000;
+pub const STACK_TOP: u64 = vm::USER_BASE + 0x1ff_f000;
 const STACK_PAGES: u64 = 4;
 /// The stack's size; the page below it is never mapped (the code is at the bottom of the address space, the heap a gigabyte above
 /// it), so running off the end is a page fault that kills only the process.
@@ -186,7 +187,12 @@ pub fn spawn(name: &str, image: &[u8]) -> Option<u64> {
 pub enum SpawnError {
     Elf(fosfor_abi::elf::Error),
     NoMemory,
+    /// The image would reach the stack's guard page (`MAX_IMAGE` bytes at most).
+    TooLarge,
 }
+
+/// The most address space an image may span: everything below the stack and the unmapped guard page under it.
+pub const MAX_IMAGE: u64 = STACK_TOP - STACK_BYTES - 4096 - CODE_BASE;
 
 /// Starts a process from a position-independent ELF64 executable (a tape): the segments are loaded at `CODE_BASE`, relocated
 /// for it and mapped with the permissions of their program headers (a page two segments share gets the union, so it can end up
@@ -194,6 +200,9 @@ pub enum SpawnError {
 /// `TapeApi` whose `args` are `args`; when its entry returns the process exits with code 0.
 pub fn spawn_elf(name: &str, image: &[u8], args: &[u8]) -> Result<u64, SpawnError> {
     let span = fosfor_abi::elf::span(image).map_err(SpawnError::Elf)? as u64;
+    if span > MAX_IMAGE {
+        return Err(SpawnError::TooLarge);
+    }
     let pages = span / 4096;
     // Per-page permissions: bit 0 execute, bit 1 write.
     let mut flags = alloc::vec![0u8; pages as usize];
