@@ -210,15 +210,24 @@ fn run(line: &str) {
 /// Loads the ELF tape `name` from the boot volume (or whichever volume holds it) and starts it as a process.
 fn run_tape(name: &str, args: &str) {
     let disk = crate::tapefs::lock();
-    let Some(volume) = kernel_core::volumes::volume_with_file(name.as_bytes()) else {
+    // A bare name not in the root is looked for in `bin/` (a v4 volume keeps its tapes there).
+    let mut path = name.as_bytes();
+    let mut found = kernel_core::volumes::volume_with_file(path);
+    if found.is_none() {
+        if let Some(bin) = kernel_core::tape_fs::bin_path(path) {
+            found = kernel_core::volumes::volume_with_file(bin);
+            path = bin;
+        }
+    }
+    let Some(volume) = found else {
         return println!("tape: no file `{name}`.");
     };
-    let length = match volume.find(name.as_bytes()) {
+    let length = match volume.find(path) {
         Ok(Some(entry)) if !entry.is_dir => entry.length as usize,
         _ => return println!("tape: cannot find `{name}`."),
     };
     let mut image = alloc::vec![0u8; length];
-    if !matches!(volume.read(name.as_bytes(), &mut image), Ok(Some(_))) {
+    if !matches!(volume.read(path, &mut image), Ok(Some(_))) {
         return println!("tape: cannot read `{name}`.");
     }
     drop(disk);
