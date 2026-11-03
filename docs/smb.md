@@ -71,9 +71,10 @@ Done (ABI 32, `crates/kernel-core/src/tape_vfs.rs`, `tape_rt::vfs_stat/vfs_read_
 2. (done) Server half in the crate (`crates/smb/src/server.rs`), read-only and guest, against a `Share` trait; `crates/smb/tests/server.rs`
    drives it from our own client and from `smbclient` (SMB 2.0.2 and 3.0, SPNEGO, compound requests, UTF-8 names). Not yet
    checked: Linux `mount.cifs`, Windows, VLC; the NTLM response of a login is not verified (every client is a guest).
-3. Tape ABI 32 (`vfs_*`, read side) with ext4 behind it; `make test-vfs` on QEMU.
-4. `smbd` tape (service on port 445, `root=`/share name settings in `smbd.cfg`); `make test-smbd` mounts it from Linux in QEMU
-   (user-mode networking) with `mount.cifs` or `smbclient`.
+3. Tape ABI 32 (`vfs_*`, read side) with ext4 behind it; `make test-vfs` on QEMU. **Done.**
+4. `smbd` tape (`tapes/smbd`: service on port 445, `root=`/`share=` settings, `run smbd @SMBD.CFG &2`); `make test-smbd` runs it in
+   QEMU (user-mode networking) over an ext4 disk and uses `smbclient` (SMB2_02 and SMB3_00, a 3 MB file, a 300-file folder).
+   **Done**; `mount.cifs` (needs root), Windows and VLC are unchecked. Four connections at once, one message at a time.
 5. `smb` client tape over the same codecs; tested against our server and Samba.
 6. Users file, NTLMv2 verification, uid/gid and mode checks.
 7. Writes: the `vfs_*` write calls, the ext4 writer behind them (journal commit per request batch), CREATE for write, WRITE,
