@@ -117,12 +117,14 @@ def main():
             out = machine.run("date set 2020-01-01 00:00")
             check("not a date" in out, "date set refuses a date before 2024", out)
             before = machine.run("slots")
-            check("booted slot 0, active 0, pending None" in before, "a fresh image boots slot 0", before)
+            check("booted slot: 0" in before and "active slot: 0, pending: None" in before, "a fresh image boots slot 0", before)
+
+            check("booted slot: 0" in machine.run("debug slots"), "`debug slots` says the same as `slots`", before)
 
             result = machine.push(kernel, checksum=0x1234)
             check(result == ("error", 2), f"KUP with a bad checksum is rejected ({result})", "")
             after = machine.run("slots")
-            check("pending None" in after, "and leaves the slot metadata untouched", after)
+            check("pending: None" in after, "and leaves the slot metadata untouched", after)
 
             mark = len(machine.text())
             result = machine.push(kernel)
@@ -132,7 +134,7 @@ def main():
             check("Kernel update confirmed: slot 1" in third, "and the kernel confirms it, promoting it", third)
             machine.connect()
             out = machine.run("slots")
-            check("booted slot 1, active 1, pending None" in out, "slot 1 is now the active slot, nothing pending", out)
+            check("booted slot: 1" in out and "active slot: 1, pending: None" in out, "slot 1 is now the active slot, nothing pending", out)
         finally:
             machine.stop()
 

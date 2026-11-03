@@ -4,11 +4,13 @@
 //! (the crash record, `reboot-on-crash` and the watchdog are `debug.rs`).
 
 use fosfor_abi::{BootInfo, RUNNING_STOPPED, RUNNING_UP, SlotMetadata};
+use kernel_core::slot_report::{self, MetadataProblem};
 
 use crate::block;
 
 static mut PAYLOAD: Option<(usize, u64)> = None;
 static mut BOOT_SLOT: u32 = 0;
+static mut BOOT_CRASH_COUNT: u32 = 0;
 static mut CLEAR_STREAK_PENDING: bool = false;
 static mut STREAK_CLEARED: bool = false;
 /// A boot that has run this long counts as good: the unclean-boot streak is cleared (5 minutes at 100 Hz).
@@ -17,6 +19,7 @@ const GOOD_UPTIME_TICKS: u64 = 5 * 60 * 100;
 pub fn init(info: &BootInfo, disk: usize) {
     unsafe {
         BOOT_SLOT = info.boot_slot;
+        BOOT_CRASH_COUNT = info.crash_count;
         PAYLOAD = Some((disk, info.payload_start));
     }
 }
@@ -25,11 +28,26 @@ pub fn payload() -> Option<(usize, u64)> {
     unsafe { PAYLOAD }
 }
 
-pub fn read_metadata() -> Option<SlotMetadata> {
-    let (disk, start) = payload()?;
+fn read_metadata_checked() -> Result<SlotMetadata, MetadataProblem<block::Error>> {
+    let (disk, start) = payload().ok_or(MetadataProblem::NoPayload)?;
     let mut sector = [0u8; 512];
-    block::read(disk, start, &mut sector).ok()?;
-    SlotMetadata::parse(&sector)
+    block::read(disk, start, &mut sector).map_err(MetadataProblem::Read)?;
+    SlotMetadata::parse(&sector).ok_or_else(|| {
+        let mut head = [0u8; 16];
+        head.copy_from_slice(&sector[..16]);
+        MetadataProblem::Invalid(head)
+    })
+}
+
+pub fn read_metadata() -> Option<SlotMetadata> {
+    read_metadata_checked().ok()
+}
+
+/// `slots` and `debug slots`: the metadata sector, or why it cannot be read.
+pub fn report() {
+    let _disk = crate::tapefs::lock();
+    let watchdog = crate::debug::watchdog_seconds();
+    slot_report::report(|arguments| println!("{}", arguments), boot_slot(), unsafe { BOOT_CRASH_COUNT }, read_metadata_checked(), watchdog);
 }
 
 fn write_metadata(metadata: &SlotMetadata) -> bool {
