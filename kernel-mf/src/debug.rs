@@ -102,6 +102,7 @@ pub fn boot_crash_count() -> u32 {
 /// The service thread is making progress.
 pub fn pet() {
     LAST_PET.store(crate::apic::ticks(), Ordering::Relaxed);
+    crate::hwwd::reload();
 }
 
 /// Arms the watchdog at the milestone (`unclean` boots in a row keep it off).
@@ -116,6 +117,13 @@ pub fn arm(seconds: Option<u32>, unclean: u8) {
     pet();
     LIMIT_TICKS.store(u64::from(seconds) * crate::apic::TICK_HZ, Ordering::Relaxed);
     println!("Watchdog armed: reset after {seconds} s without progress.");
+    // The chipset timer is the backstop for a boot CPU that no longer takes interrupts; it must outlast the software one and
+    // the crash handler's reboot delay.
+    let hardware = seconds + crate::config::reboot_delay() + 15;
+    match crate::hwwd::start(hardware) {
+        Ok(text) => println!("Hardware watchdog: {text}, reset after {hardware} s without progress."),
+        Err(reason) => println!("Hardware watchdog: not available ({reason})."),
+    }
 }
 
 pub fn watchdog_seconds() -> Option<u64> {

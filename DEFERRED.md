@@ -606,4 +606,4 @@ use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limi
 ## Planned: a second, larger kernel (SMP, preemption, VM)
 
 - Idea and staged plan in `docs/big-kernel.md`: same tape ABI, one source tree with a shared `kernel-core` and two cores; nothing built yet.
-- The server kernel (`kernel-mf`) serves NETFS and the tapesync manifest and has the `tapesync` client (shared code, `netclient.rs`), but no hardware watchdog (a hang with interrupts off on the boot CPU is not caught), and a framebuffer console with no BIOS text-mode fallback; see `docs/big-kernel.md`.
+- The server kernel (`kernel-mf`) serves NETFS and the tapesync manifest and has the `tapesync` client (shared code, `netclient.rs`) and an Intel TCO hardware watchdog (`hwwd.rs`: QEMU-tested only; chipsets other than ICH9/10 and the 5-8 series PCHs have the software watchdog only), but a framebuffer console with no BIOS text-mode fallback; see `docs/big-kernel.md`.

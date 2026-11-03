@@ -23,6 +23,7 @@ mod user_test;
 mod fb;
 mod config;
 mod debug;
+mod hwwd;
 mod net;
 mod netfs;
 mod netclient;

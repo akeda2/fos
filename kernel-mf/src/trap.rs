@@ -123,13 +123,16 @@ fn report_and_stop(frame: &Frame, always_reset: bool) -> ! {
     crate::debug::record_crash(frame);
     if crate::config::reboot_on_crash() || always_reset {
         if crate::debug::crash_loop_tripped() {
+            crate::hwwd::stop();
             println!("*** crash loop: {} boots in a row never reached the milestone; not resetting again. Halting for an operator.", crate::debug::boot_crash_count());
         } else {
             println!("*** resetting in {} s", crate::config::reboot_delay());
+            crate::hwwd::reload();
             apic::busy_wait_ms(u64::from(crate::config::reboot_delay()) * 1000);
             crate::power::reset();
         }
     }
+    crate::hwwd::stop();
     println!("*** the kernel stops here");
     crate::halt()
 }
