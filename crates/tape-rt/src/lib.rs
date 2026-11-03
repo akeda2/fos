@@ -818,6 +818,18 @@ pub fn vfs_read(path: &str, offset: u64, buffer: &mut [u8]) -> Result<usize, isi
     }
 }
 
+/// Fills `buffer` with unpredictable bytes (ABI 33, `random`). `Some(true)` when the CPU's hardware generator contributed,
+/// `Some(false)` when only timing did (the Pi 4), `None` on a kernel older than version 33: the caller then has nothing
+/// better than `micros()`.
+pub fn random(buffer: &mut [u8]) -> Option<bool> {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, random) + core::mem::size_of::<usize>();
+    if table.version < 33 || (table.size as usize) < end {
+        return None;
+    }
+    Some((table.random)(buffer.as_mut_ptr(), buffer.len()) == 1)
+}
+
 /// The I2C bus's SCL speed in Hz (Raspberry Pi 4 header); `Err(-4)` where there is none or the kernel is older than version 23.
 pub fn i2c_speed() -> Result<u32, i32> {
     let t = i2c_table().ok_or(-4)?;
