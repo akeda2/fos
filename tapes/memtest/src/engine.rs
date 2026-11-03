@@ -134,6 +134,7 @@ pub struct Region {
     ptr: *mut u32,
     words: usize,
     base: u64,
+    translate: Option<fn(usize) -> usize>,
 }
 
 impl Region {
@@ -142,7 +143,14 @@ impl Region {
     /// anything else while the region is tested. `base` is the physical address of the
     /// first word (the address test stores its low 32 bits).
     pub unsafe fn new(ptr: *mut u32, words: usize, base: u64) -> Self {
-        Region { ptr, words, base }
+        Region { ptr, words, base, translate: None }
+    }
+
+    /// Where memory is not identity-mapped: reports a failing word at `translate(its address)` instead of `base + offset`.
+    /// The address test itself keeps using `base`, which only has to differ per word.
+    pub fn with_translator(mut self, translate: fn(usize) -> usize) -> Self {
+        self.translate = Some(translate);
+        self
     }
 
     pub fn words(&self) -> usize {
@@ -151,6 +159,14 @@ impl Region {
 
     fn physical(&self, index: usize) -> u64 {
         self.base + index as u64 * 4
+    }
+
+    /// The address to report for word `index`.
+    fn reported(&self, index: usize) -> u64 {
+        match self.translate {
+            Some(translate) => translate(self.ptr as usize + index * 4) as u64,
+            None => self.physical(index),
+        }
     }
 
     fn address(&self, index: usize) -> u32 {
@@ -220,7 +236,7 @@ fn verify(
             let expected = value_of(i);
             let actual = region.read(i);
             if actual != expected {
-                errors.record(region.physical(i), expected, actual, test);
+                errors.record(region.reported(i), expected, actual, test);
             }
         }
         errors.bytes_checked += (end - index) as u64 * 4;
@@ -316,7 +332,7 @@ fn sweep_invert(
             let i = if ascending { done + step } else { region.words - 1 - done - step };
             let actual = region.read(i);
             if actual != expected {
-                errors.record(region.physical(i), expected, actual, Test::Moving);
+                errors.record(region.reported(i), expected, actual, Test::Moving);
             }
             region.write(i, replacement);
         }
