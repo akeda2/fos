@@ -2,7 +2,7 @@
 name = "smb"
 version = "0.1.0"
 edition = "2024"
-description = "A small read-only SMB 2.1 client (anonymous/guest, no signing) over any byte stream, for tapes"
+description = "A small read-only SMB 2 client and server (guest, no signing) over any byte stream, for tapes"
 license = "MIT"
 
 [lib]

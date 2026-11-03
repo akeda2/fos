@@ -17,6 +17,7 @@
 #![no_std]
 
 pub mod ntlm;
+pub mod server;
 pub mod wire;
 
 use wire::*;
