@@ -277,11 +277,14 @@ pub fn run() {
     let spin_ok = matches!(find(spin), Some(o) if o.how == How::Killed);
     // Fresh stack slots can need a new page-table page (128 KiB stacks: one per ~15 threads); tables are kept for reuse, not leaked.
     // A dead thread's stack is released by the CPU that switches away from it, which may be a moment after the outcome was seen.
-    for _ in 0..50 {
+    // The boot thread cannot sleep (`sleep_ticks` returns at once when nothing else is eligible on CPU 0), so wait the way the
+    // loops above do. Under QEMU's TCG with 8 vCPUs a thread's exit can come a second after its outcome: poll up to 10 s.
+    for _ in 0..1000 {
         if free_before.saturating_sub(pmm::stats().free) <= 2 {
             break;
         }
-        sched::sleep_ticks(1);
+        sched::yield_now();
+        halt_a_tick();
     }
     let leaked = free_before.saturating_sub(pmm::stats().free).saturating_sub(2);
     let ok = |b: bool| if b { "ok" } else { "FAILED" };
