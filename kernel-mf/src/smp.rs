@@ -111,6 +111,7 @@ extern "sysv64" fn ap_main(index: u64) -> ! {
     idt::load();
     crate::process::init_cpu();
     crate::fpu::init_cpu();
+    cpu::pat_init();
     apic::enable_this_cpu();
     apic::start_local_timer();
     cpu.apic_id = apic::id();

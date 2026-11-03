@@ -45,6 +45,19 @@ pub fn write_msr(msr: u32, value: u64) {
     unsafe { core::arch::asm!("wrmsr", in("ecx") msr, in("eax") value as u32, in("edx") (value >> 32) as u32, options(nomem, nostack, preserves_flags)) };
 }
 
+/// IA32_PAT entry 4 (the page-table PAT bit alone) becomes write-combining; the other seven keep their defaults. Every CPU
+/// must hold the same value, so each runs this (the boot CPU before the framebuffer is mapped, the APs as they start).
+/// False when the CPU has no PAT (CPUID.1:EDX bit 16).
+pub fn pat_init() -> bool {
+    if cpuid(1, 0).3 & (1 << 16) == 0 {
+        return false;
+    }
+    const PAT: u32 = 0x277;
+    const WRITE_COMBINING: u64 = 0x01;
+    write_msr(PAT, (read_msr(PAT) & !(0xff << 32)) | WRITE_COMBINING << 32);
+    true
+}
+
 pub fn read_cr2() -> u64 {
     let value: u64;
     unsafe { core::arch::asm!("mov {}, cr2", out(reg) value, options(nomem, nostack, preserves_flags)) };

@@ -30,6 +30,8 @@ const WRITE_THROUGH: u64 = 1 << 3;
 const CACHE_DISABLE: u64 = 1 << 4;
 const USER: u64 = 1 << 2;
 const LARGE: u64 = 1 << 7;
+/// In a 4 KiB entry bit 7 is the PAT bit (PAT index 4 with PCD and PWT clear).
+const PAT_4K: u64 = 1 << 7;
 const NO_EXECUTE: u64 = 1 << 63;
 const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 
@@ -232,6 +234,48 @@ pub fn map_device(physical: u64, length: u64) {
         }
         page += PAGE;
     }
+}
+
+/// Like `map_device` for a framebuffer: write-combining (PAT entry 4, set by `cpu::pat_init`) so pixel writes are merged
+/// into bursts instead of one uncached store each. An existing 4 KiB mapping of the range is replaced; a range inside a 2 MiB
+/// mapping first splits it into 4 KiB pages with the same flags. False (and plain uncached) without a PAT.
+/// Turns the 2 MiB mapping containing `address` (if it is one) into 512 4 KiB pages with the same flags, so one page can differ.
+/// Only for use before other CPUs run: there is no shootdown.
+unsafe fn split_huge(root: u64, address: u64) {
+    unsafe {
+        let entry = directory_entry(root, address);
+        if *entry & (PRESENT | LARGE) != PRESENT | LARGE {
+            return;
+        }
+        let base = *entry & ADDRESS_MASK & !(HUGE - 1);
+        let flags = *entry & !ADDRESS_MASK & !LARGE;
+        let table = new_table() as *mut u64;
+        for index in 0..512u64 {
+            *table.add(index as usize) = (base + index * PAGE) | flags;
+        }
+        *entry = (table as u64 - direct(0)) | PRESENT | WRITABLE;
+        let first = address & !(HUGE - 1);
+        for index in 0..512u64 {
+            core::arch::asm!("invlpg [{}]", in(reg) first + index * PAGE, options(nostack, preserves_flags));
+        }
+    }
+}
+
+pub fn map_write_combining(physical: u64, length: u64) -> bool {
+    if !crate::cpu::pat_init() {
+        map_device(physical, length);
+        return false;
+    }
+    let root = root();
+    let mut page = physical & !(PAGE - 1);
+    while page < physical + length.max(1) {
+        let address = DIRECT_BASE + page;
+        unsafe { split_huge(root, address) };
+        map_page(root, address, page, WRITABLE | NO_EXECUTE | PAT_4K);
+        unsafe { core::arch::asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags)) };
+        page += PAGE;
+    }
+    true
 }
 
 /// Maps the 4 KiB page at `address` onto itself, executable and writable, in the kernel's tables: the AP trampoline runs
