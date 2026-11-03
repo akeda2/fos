@@ -66,6 +66,10 @@ struct Console {
     format: u32,
     /// VGA text mode (BIOS boot without a linear framebuffer): `base` is the 80x25 text window, one `u16` per cell.
     text: bool,
+    /// The pixel console's caret: the cell it is drawn in (`usize::MAX`: none drawn), and `ESC [ ? 25 l` (an editor draws its own).
+    caret_at: usize,
+    caret_hidden: bool,
+    private: bool,
 }
 
 static mut CONSOLE: Option<Console> = None;
@@ -109,6 +113,9 @@ pub fn init(framebuffer: &Framebuffer) -> Option<(usize, usize, bool)> {
         parameter_count: 0,
         format: framebuffer.format,
         text: false,
+        caret_at: usize::MAX,
+        caret_hidden: false,
+        private: false,
     };
     console.clear_all();
     flush_writes();
@@ -141,6 +148,9 @@ pub fn init_text() -> (usize, usize) {
         parameter_count: 0,
         format: PIXEL_NONE,
         text: true,
+        caret_at: usize::MAX,
+        caret_hidden: false,
+        private: false,
     };
     console.clear_all();
     // CRTC register 0x0A bit 5 turns the cursor off: clear it, and give it scan lines 13-15 (an underline-to-block shape).
@@ -205,11 +215,37 @@ impl Console {
 
     /// Puts the hardware cursor (CRTC registers 0x0E and 0x0F) on the next character position.
     fn place_cursor(&self) {
+        // CRTC register 0x0A bit 5 switches the hardware cursor off (`ESC [ ? 25 l`).
+        crate::cpu::outb(0x3d4, 0x0a);
+        crate::cpu::outb(0x3d5, if self.caret_hidden { 0x20 } else { 13 });
         let at = (self.row * self.columns + self.column.min(self.columns - 1)) as u16;
         crate::cpu::outb(0x3d4, 0x0e);
         crate::cpu::outb(0x3d5, (at >> 8) as u8);
         crate::cpu::outb(0x3d4, 0x0f);
         crate::cpu::outb(0x3d5, at as u8);
+    }
+
+    /// The pixel console's caret: an underline in the cell the next character goes to. A cell that was redrawn has lost it and
+    /// a cell it left must be restored, so the old cell is redrawn and the caret drawn afresh each time.
+    fn draw_caret(&mut self) {
+        let old = self.caret_at;
+        let at = self.row.min(self.rows - 1) * self.columns + self.column.min(self.columns - 1);
+        if old < self.rows * self.columns && (old != at || self.caret_hidden) {
+            self.draw_cell(old % self.columns, old / self.columns);
+        }
+        if self.caret_hidden {
+            self.caret_at = usize::MAX;
+            return;
+        }
+        let cell = cells()[(at / self.columns) * MAX_COLUMNS + at % self.columns];
+        let value = self.palette[usize::from((cell >> 8) & 15)];
+        let (x, y) = ((at % self.columns) * FONT_WIDTH, (at / self.columns) * FONT_HEIGHT);
+        for line in FONT_HEIGHT - 2..FONT_HEIGHT {
+            for bit in 0..FONT_WIDTH {
+                unsafe { self.base.add((y + line) * self.stride + x + bit).write_volatile(value) };
+            }
+        }
+        self.caret_at = at;
     }
 
     fn draw_cell(&mut self, column: usize, row: usize) {
@@ -270,6 +306,7 @@ impl Console {
                 self.escape = Escape::None;
                 if byte == b'[' {
                     self.escape = Escape::Csi;
+                    self.private = false;
                     self.parameters = [0; 4];
                     self.parameter_count = 0;
                 }
@@ -310,7 +347,8 @@ impl Console {
                 self.escape = Escape::None;
                 self.command(byte);
             }
-            // `?`, space and the other intermediate bytes of private sequences: keep collecting up to the final byte.
+            b'?' => self.private = true,
+            // Space and the other intermediate bytes of private sequences: keep collecting up to the final byte.
             _ => {}
         }
     }
@@ -323,6 +361,11 @@ impl Console {
     fn command(&mut self, final_byte: u8) {
         match final_byte {
             b'm' => self.sgr(),
+            b'l' | b'h' if self.private => {
+                if self.parameters[0] == 25 {
+                    self.caret_hidden = final_byte == b'l';
+                }
+            }
             b'H' | b'f' => {
                 self.row = (self.parameter(0, 1) - 1).min(self.rows - 1);
                 self.column = (self.parameter(1, 1) - 1).min(self.columns - 1);
@@ -399,6 +442,8 @@ pub fn write_str(text: &str) {
         }
         if console.text {
             console.place_cursor();
+        } else {
+            console.draw_caret();
         }
         flush_writes();
     }
@@ -423,6 +468,7 @@ pub fn gfx_open() -> bool {
     let Some(console) = (unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }).filter(|console| !console.text) else { return false };
     let black = console.palette[usize::from(DEFAULT_BACKGROUND)];
     console.fill(0, console.height, black);
+    console.caret_at = usize::MAX;
     flush_writes();
     GFX_OPEN.store(true, Ordering::Relaxed);
     true
@@ -438,9 +484,12 @@ pub fn gfx_close() {
     console.background = DEFAULT_BACKGROUND;
     console.bold = false;
     console.escape = Escape::None;
+    console.caret_hidden = false;
+    console.caret_at = usize::MAX;
     console.clear_all();
     console.column = 0;
     console.row = 0;
+    console.draw_caret();
     flush_writes();
 }
 

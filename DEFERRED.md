@@ -603,7 +603,8 @@ use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limi
 - The browser reads a page whole (1 MiB at most), does not decode `Transfer-Encoding: chunked` (it asks with HTTP/1.0), and treats non-UTF-8 pages as Latin-1.
 - `web` could save a page to a file (`-o`), and `tape-http`'s MIME list is short.
 
-## Planned: a second, larger kernel (SMP, preemption, VM)
+## Open: the server kernel (FOS-mf, `kernel-mf/`)
 
-- Idea and staged plan in `docs/big-kernel.md`: same tape ABI, one source tree with a shared `kernel-core` and two cores; nothing built yet.
-- The server kernel (`kernel-mf`) serves NETFS and the tapesync manifest and has the `tapesync` client (shared code, `netclient.rs`) and an Intel TCO hardware watchdog (`hwwd.rs`: QEMU-tested only; chipsets other than ICH9/10 and the 5-8 series PCHs have the software watchdog only), and a BIOS text-mode console fallback (`fb::init_text`, QEMU-tested only); see `docs/big-kernel.md`.
+- Built and in use (slices 1-8 and the gaps/side items in `docs/big-kernel.md`; runs on `piano`): SMP, preemption, a real VM, ring-3 tapes, NETFS and the tapesync manifest, the `tapesync` and `gpio @HOST` clients (shared code), an Intel TCO hardware watchdog (`hwwd.rs`), a BIOS text-mode console fallback (`fb::init_text`) and a pixel-console caret.
+- QEMU-tested only: the TCO watchdog on chipsets other than ICH9/10 and the 5-8 series PCHs (the others have the software watchdog only), the BIOS text console (its ANSI colour mapping has no automated check; the serial shell drops ESC), the iso underrun fix on hardware other than `piano`.
+- Not done: tape ABI 31 needs `make image` and a tape redeploy; the branch `kernel-core-1b` is not merged to main.
