@@ -185,7 +185,7 @@ kernel:
 
 # The server kernel (kernel-mf/, docs/big-kernel.md): same loaders, same image layout, its own crate.
 KERNEL_MF_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel-mf
-.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-tape test-mf-usb test-mf-debug test-mf-audio test-mf-netfs test-mf-tapesync
+.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-tape test-mf-usb test-mf-debug test-mf-audio test-mf-netfs test-mf-tapesync test-mf-gpio
 kernel-mf:
 	cd kernel-mf && cargo +nightly-2026-09-13 build --release
 
@@ -237,6 +237,10 @@ test-mf-netfs: image-mf
 # The `tapesync` client on the server kernel, pulling from embedded-kernel machines (the far side is the ordinary image).
 test-mf-tapesync: image-mf image
 	python3 tools/test_mf_tapesync.py
+
+# `gpio @HOST` on the server kernel, against an embedded-kernel guest with a simulated pin bank.
+test-mf-gpio: image-mf image
+	python3 tools/test_mf_gpio.py
 
 # Every v2 tape (ELF64 PIE executables for the 64-bit tape ABI).
 .PHONY: tapes

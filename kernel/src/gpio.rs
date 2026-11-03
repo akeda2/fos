@@ -23,7 +23,7 @@
 //! without a Pi (input pins read high with pull-up, low with pull-down, otherwise low).
 //! 3.3 V only: the pins are not 5 V tolerant and a few mA each.
 
-pub const PINS: usize = 58;
+pub use kernel_core::gpio_client::{PINS, Snapshot};
 const ALL: u64 = (1 << PINS) - 1;
 /// GPIO2..27 without 14 and 15 (the console UART): the pins `gpio` may change unless `gpio-deny` takes more away.
 const USER_PINS: u64 = ((1 << 28) - 1) & !0b11 & !(1 << 14) & !(1 << 15);
@@ -54,16 +54,6 @@ impl Error {
             Error::BadArgument => "bad pin, function or pull",
         }
     }
-}
-
-/// Everything a listing shows, from this machine or decoded from another's answer.
-pub struct Snapshot {
-    pub levels: u64,
-    pub allowed: u64,
-    /// Pins another machine may write (`gpio-remote`), `allowed` or 0.
-    pub writable: u64,
-    pub function: [u8; PINS],
-    pub pull: [u8; PINS],
 }
 
 enum Bank {

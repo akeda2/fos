@@ -39,6 +39,7 @@ const CHECKSUM: u8 = 8;
 const BUSY: u8 = 9;
 /// The tape-sync request (`tapesync.rs`): a nonce in, a signed manifest out as a GET stream.
 pub const TAG_SYNC_REQUEST: u8 = 0x40;
+pub use kernel_core::gpio_client::{TAG_GPIO_REPLY, TAG_GPIO_REQUEST};
 /// The shared secret of tape sync: NETFS never reads or writes it.
 pub const KEY_FILE: &str = "synckey";
 const CHUNK: usize = 1024;
@@ -78,7 +79,7 @@ fn put() -> &'static mut Option<Put> {
 
 /// True for the tags this module serves.
 pub fn owns(tag: u8) -> bool {
-    matches!(tag, TAG_GET_REQUEST | TAG_PUT_REQUEST | TAG_PUT_DATA | TAG_PUT_STOP | TAG_SYNC_REQUEST)
+    matches!(tag, TAG_GET_REQUEST | TAG_PUT_REQUEST | TAG_PUT_DATA | TAG_PUT_STOP | TAG_SYNC_REQUEST | TAG_GPIO_REQUEST)
 }
 
 /// Called from the frame handler (NIC lock held): queues the request for `serve`.
@@ -101,6 +102,8 @@ pub fn serve() {
             TAG_PUT_DATA => put_data(source, &payload),
             TAG_PUT_STOP => put_stop(index, source),
             TAG_SYNC_REQUEST => tapesync::serve(index, source, &payload),
+            // No pins here: say so to the challenge request, answer nothing else.
+            TAG_GPIO_REQUEST if payload.first() == Some(&0) => reply(index, &source, TAG_GPIO_REPLY, &[kernel_core::gpio_client::STATUS_NO_GPIO]),
             _ => {}
         }
     }
