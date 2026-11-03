@@ -42,6 +42,27 @@ def check_screen(machine, path):
     lit = [any(pixels[y * width * 3:(y + 1) * width * 3]) for y in range(height)]
     check(sum(lit) > 100, f"the framebuffer console draws the boot narration ({sum(lit)} lit pixel rows of {height})", "")
     check("Framebuffer console:" in machine.text() and "characters" in machine.text(), "and says so on the serial console", machine.text()[-1500:])
+    check("Framebuffer: write-combining (PAT)" in machine.text(), "mapped write-combining through the PAT", "\n".join(l for l in machine.text().splitlines() if "ramebuffer" in l))
+
+
+def red_pixels(machine, path):
+    """Screendump again and count pure ANSI red (0xaa0000) pixels."""
+    import socket
+    path.unlink(missing_ok=True)
+    monitor = socket.socket(socket.AF_UNIX)
+    monitor.connect(str(machine.monitor))
+    monitor.settimeout(5)
+    monitor.recv(4096)
+    monitor.send(f"screendump {path}\n".encode())
+    for _ in range(50):
+        machine.pump(0.1)
+        if path.exists() and path.stat().st_size > 1000:
+            break
+    monitor.close()
+    data = path.read_bytes()
+    width, height = (int(v) for v in data.split(b"\n", 2)[1].split())
+    pixels = data[len(f"P6\n{width} {height}\n255\n"):]
+    return pixels.count(bytes([0xaa, 0, 0]))
 
 
 def main():
@@ -68,6 +89,8 @@ def main():
             machine.connect()
             out = machine.run("echo hello from the wire")
             check("hello from the wire" in out, "a terminal session: HELLO, prompt, a command and its output", out)
+            machine.run("debug colors")
+            check(red_pixels(machine, Path(tmp) / "ansi.ppm") > 20, "ANSI colour: SGR 31 draws red text on the framebuffer", "")
             out = machine.run("cpus")
             check("CPU(s)" in out, "the shell answers over the network", out)
             before = machine.run("slots")

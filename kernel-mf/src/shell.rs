@@ -182,6 +182,13 @@ fn run(line: &str) {
         "echo" => println!("{}", line[command.len()..].trim_start()),
         // Test hooks for the unattended-operation machinery (`debug crash`: a #UD in the kernel, `debug hang`: the service thread spins).
         "debug" => match words.next() {
+            // The terminal's Escape key is a break, so a test cannot type ESC: this prints every colour through the console.
+            Some("colors") => {
+                for code in (30..=37).chain(90..=97) {
+                    print!("\x1b[{code}mcolor {code}\x1b[0m ");
+                }
+                println!("\x1b[41;1m bold on red \x1b[0m");
+            }
             Some("crash") => unsafe { core::arch::asm!("ud2") },
             Some("hang") => {
                 // The shell runs on the service thread: spinning here with interrupts on stops its petting while other threads run.

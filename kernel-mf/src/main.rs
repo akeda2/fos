@@ -157,7 +157,10 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     let alias_gone = vm::translate(frame).is_none();
     pmm::free(frame, 1);
     match fb::init(&info.framebuffer) {
-        Some((columns, rows)) => println!("Framebuffer console: {}x{} pixels, {columns}x{rows} characters (also on COM1 and the network).", info.framebuffer.width, info.framebuffer.height),
+        Some((columns, rows, combining)) => {
+            println!("Framebuffer console: {}x{} pixels, {columns}x{rows} characters (also on COM1 and the network).", info.framebuffer.width, info.framebuffer.height);
+            println!("Framebuffer: {}.", if combining { "write-combining (PAT)" } else { "uncached (no PAT, or a mapping that cannot change)" });
+        }
         None => println!("Framebuffer console: no pixel screen (serial and network only)."),
     }
     println!("Direct map: frame {frame:#x} written and read back at {:#x}.", vm::direct(frame));
