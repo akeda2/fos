@@ -56,6 +56,8 @@ pub struct Fadt {
     pub pm_timer_32_bit: bool,
     /// The reset register as (I/O port, value), when the FADT has one and it lives in I/O space.
     pub reset: Option<(u16, u8)>,
+    /// CMOS register holding the century of the RTC date (0 = none).
+    pub century: u8,
 }
 
 pub fn fadt(tables: &Tables) -> Option<Fadt> {
@@ -63,7 +65,7 @@ pub fn fadt(tables: &Tables) -> Option<Fadt> {
     let flags = read::<u32>(table + 112);
     // RESET_REG is a 12-byte generic address at 116 (space id, width, offset, size, 64-bit address); the value is at 128.
     let reset = (flags & (1 << 10) != 0 && read::<u8>(table + 116) == 1).then(|| (read::<u64>(table + 120) as u16, read::<u8>(table + 128)));
-    Some(Fadt { pm_timer_port: read::<u32>(table + 76) as u16, pm_timer_32_bit: flags & (1 << 8) != 0, reset })
+    Some(Fadt { pm_timer_port: read::<u32>(table + 76) as u16, pm_timer_32_bit: flags & (1 << 8) != 0, reset, century: if read::<u32>(table + 4) >= 109 { read::<u8>(table + 108) } else { 0 } })
 }
 
 pub const MAX_CPUS: usize = 256;

@@ -15,4 +15,5 @@ opt-level = "z"
 [dependencies]
 fosfor-abi = { path = "../abi" }
 fosfor-hal = { path = "../crates/fos-hal" }
+fosfor-fat = { path = "../crates/fat" }
 fosfor-kernel-core = { path = "../crates/kernel-core" }

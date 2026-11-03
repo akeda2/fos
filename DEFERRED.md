@@ -606,4 +606,4 @@ use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limi
 ## Planned: a second, larger kernel (SMP, preemption, VM)
 
 - Idea and staged plan in `docs/big-kernel.md`: same tape ABI, one source tree with a shared `kernel-core` and two cores; nothing built yet.
-- The server kernel (`kernel-mf`) does not yet serve NETFS, tapesync or `foscopy`, has no crash records, `reboot-on-crash` or watchdog, no RTC, and a framebuffer console without ANSI escapes, write-combining or a BIOS text-mode fallback; see `docs/big-kernel.md`.
+- The server kernel (`kernel-mf`) does not yet serve NETFS, tapesync or `foscopy`, has no crash records, `reboot-on-crash` or watchdog, and a framebuffer console without ANSI escapes, write-combining or a BIOS text-mode fallback; see `docs/big-kernel.md`.

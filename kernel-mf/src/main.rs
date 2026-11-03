@@ -46,6 +46,14 @@ mod vm;
 // `crate::ioapic` and `crate::pci`, which are provided here.
 #[path = "../../kernel/src/arch/x86_64/msi.rs"]
 mod msi;
+// The embedded kernel's wall clock (CMOS RTC read once, then advanced by the microsecond count), shared so the two cannot drift.
+mod timer {
+    pub fn micros() -> u64 {
+        crate::apic::micros()
+    }
+}
+#[path = "../../kernel/src/clock.rs"]
+mod clock;
 use apic::ioapic;
 use kernel_core::pci;
 
@@ -223,6 +231,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
         println!("CPU {index}: {} timer ticks since it came up.", percpu::ticks_of(index));
     }
     println!("Clock: {} (microseconds {}).", apic::micros_source(), apic::micros());
+    clock::init(fadt.century);
 
     // Device drivers: `kernel-core` reaches the machine through the platform below. Interrupts stay on, as the drivers wait on ticks.
     platform::install();

@@ -33,6 +33,7 @@ name = "fosfor-kernel-mf"
 version = "0.1.0"
 dependencies = [
  "fosfor-abi",
+ "fosfor-fat",
  "fosfor-hal",
  "fosfor-kernel-core",
 ]

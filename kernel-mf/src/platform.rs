@@ -37,9 +37,8 @@ impl Platform for Mf {
         crate::storage::boot_disk()
     }
 
-    /// No RTC driver yet (DEFERRED): files get no meaningful modification time.
     fn unix_seconds(&self) -> u64 {
-        0
+        crate::clock::unix_seconds()
     }
     fn timer_micros(&self) -> u64 {
         crate::apic::micros()
