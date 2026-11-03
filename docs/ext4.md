@@ -81,3 +81,14 @@ checksums (`FormatOptions.checksums`, on in the kernel shell; 32-byte descriptor
 volumes (default, lazy tables, 1 KiB blocks without orphan_file, no checksums with many groups, 768 MiB spilling into
 uninitialised groups) are filled with files, folders that grow, fragmented files, renames and removals, then judged by
 `e2fsck -fn` (which verifies every checksum); a v3 journal written by `debugfs jo -c` is replayed.
+
+## Performance (read cache)
+
+`crates/ext4/src/cache.rs`: a direct-mapped read cache of 4 KiB units (`Cache`, and `Cached<D>` as a `Device` wrapper for
+tests). Reads of at most one aligned unit fill and use a slot; bigger reads (file data runs) bypass it. Writes go through and
+update the slots they overlap, so it is never stale. `kernel-core/src/ext4vol.rs` keeps one static cache (512 slots, 2 MiB of
+BSS) behind `Partition`, emptied at every `locate` and `mkfs`, and between candidate partitions (slots are keyed by sector
+within the partition). Measured with `tests/perf.rs` (counts device operations; `SLOTS=n`) on a 512 MiB checksummed volume:
+`mkdir` + 2000 creates 57481 -> 153 reads, 20 lookups in a 2000-name folder 236 -> 0, 100 small appends 214 -> 3; writes are
+unchanged (the journal commits each change). Not done: hash-tree lookup in the reader (indexed folders are still scanned
+linearly, and our writer linearises them on change), multi-block write coalescing.
