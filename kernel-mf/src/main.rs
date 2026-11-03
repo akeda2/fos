@@ -46,6 +46,8 @@ mod memory {
         crate::pmm::free(address - crate::vm::direct(0), count);
     }
 }
+#[path = "../../kernel/src/kup_serial.rs"]
+mod kup_serial;
 #[path = "../../kernel/src/install.rs"]
 mod install;
 #[path = "../../kernel/src/bootcode.rs"]
@@ -148,6 +150,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
         println!("The memory map has more than 1024 descriptors: stopping.");
         halt();
     };
+    boot::remember(&machine);
 
     let (mut regions, mut ram_pages, mut free_pages) = (0u64, 0u64, 0u64);
     for d in machine.descriptors() {

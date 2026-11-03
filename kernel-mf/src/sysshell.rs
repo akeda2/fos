@@ -281,3 +281,228 @@ pub fn sha256(host: &mut dyn fosfor_shell::Host, rest: &str) {
         }
     }
 }
+
+pub fn keymap(rest: &str) {
+    match rest.split_whitespace().next() {
+        None => println!("keymap: {} (keymap us|sv changes it).", if crate::config::swedish() { "sv" } else { "us" }),
+        Some("us") => {
+            crate::config::set_swedish(false);
+            println!("keymap: us.");
+        }
+        Some("sv" | "se" | "fi") => {
+            crate::config::set_swedish(true);
+            println!("keymap: sv.");
+        }
+        Some(name) => println!("keymap: unknown layout `{name}` (us or sv)."),
+    }
+}
+
+/// COM1 as the serial update protocol's link.
+struct Com1;
+
+impl crate::kup_serial::Link for Com1 {
+    fn read_byte(&mut self) -> Option<u8> {
+        crate::serial::read_byte()
+    }
+    fn write_byte(&mut self, byte: u8) {
+        crate::serial::write_byte(byte);
+    }
+    fn micros(&self) -> u64 {
+        crate::apic::micros()
+    }
+}
+
+/// Room for a kernel slot from the heap, or None.
+fn staging() -> Option<alloc::vec::Vec<u8>> {
+    let mut buffer = alloc::vec::Vec::new();
+    buffer.try_reserve_exact(fosfor_abi::SLOT_SECTORS as usize * 512 + 512).ok()?;
+    buffer.resize(buffer.capacity(), 0);
+    Some(buffer)
+}
+
+/// `kup serial`: a kernel image from `tools/send_kernel_serial.py` over COM1 into the inactive slot, then a restart to try it.
+/// COM1 keeps its speed, as on the embedded x86 kernel. The disk lock is held for the transfer.
+pub fn kup(rest: &str) {
+    let mut words = rest.split_whitespace();
+    if words.next() != Some("serial") {
+        return println!("Usage: kup serial   (the sender is tools/send_kernel_serial.py)");
+    }
+    if words.next().is_some() {
+        return println!("kup serial: COM1 keeps its speed on this kernel (give no BAUD).");
+    }
+    let Some(mut staging) = staging() else { return println!("kup: no memory for the image.") };
+    println!("KUP serial: ready (the sender starts within 30 s).");
+    let result = {
+        let _disk = crate::tapefs::lock();
+        crate::kup_serial::serve(&mut Com1, &mut staging)
+    };
+    match result {
+        Ok(slot) => {
+            println!("KUP serial: image verified and written to slot {slot} (pending); restarting to try it.");
+            crate::apic::busy_wait_ms(200);
+            crate::slots::mark_clean_stop();
+            crate::power::reset();
+        }
+        Err(message) => println!("KUP serial: {message}; nothing was written."),
+    }
+}
+
+/// `recv NAME`: one file from `tools/send_file_serial.py` over COM1, written as NAME or diskN/NAME.
+pub fn recv(host: &mut dyn fosfor_shell::Host, rest: &str) {
+    let Some(name) = rest.split_whitespace().next() else {
+        return println!("Usage: recv NAME   (then run tools/send_file_serial.py PORT FILE NAME)");
+    };
+    let Some(mut staging) = staging() else { return println!("recv: no memory.") };
+    println!("KUP serial: ready for file {name} (the sender starts within 30 s).");
+    let result = crate::kup_serial::serve_file(&mut Com1, &mut staging, |data| host.write(name, data).map_err(|_| "the file could not be written (bad name, no space, or no such volume)"));
+    match result {
+        Ok(length) => println!("recv: {length} bytes written to {name}."),
+        Err(message) => println!("recv: {message}; nothing was written."),
+    }
+}
+
+/// `clear`: the framebuffer console understands the ANSI erase; a serial terminal does too.
+pub fn clear() {
+    print!("\x1b[2J");
+}
+
+/// `sleep [SECONDS <= 60]`: the calling thread sleeps, so the other CPUs and threads keep running.
+pub fn sleep(rest: &str) {
+    let seconds = rest.split_whitespace().next().and_then(|word| word.parse::<u64>().ok()).unwrap_or(1).min(60);
+    crate::sched::sleep_ticks(seconds * crate::apic::TICK_HZ);
+    println!("Slept {seconds} s.");
+}
+
+/// `io r8|r16|r32 PORT` and `io w8|w16|w32 PORT VALUE`: raw port access.
+pub fn io(rest: &str) {
+    use crate::cpu;
+    let mut words = rest.split_whitespace();
+    let usage = "Usage: io r8|r16|r32 PORT | io w8|w16|w32 PORT VALUE";
+    let (Some(verb), Some(port)) = (words.next(), words.next().and_then(number)) else { return println!("{usage}") };
+    if port > 0xffff {
+        return println!("Ports are 16 bits.");
+    }
+    let port = port as u16;
+    match verb {
+        "r8" => println!("{port:#06x} -> {:#04x}", cpu::inb(port)),
+        "r16" => println!("{port:#06x} -> {:#06x}", cpu::inw(port)),
+        "r32" => println!("{port:#06x} -> {:#010x}", cpu::inl(port)),
+        "w8" | "w16" | "w32" => {
+            let Some(value) = words.next().and_then(number) else { return println!("Usage: io {verb} PORT VALUE") };
+            match verb {
+                "w8" => cpu::outb(port, value as u8),
+                "w16" => cpu::outw(port, value as u16),
+                _ => cpu::outl(port, value as u32),
+            }
+            println!("{port:#06x} <- {value:#x}");
+        }
+        _ => println!("{usage}"),
+    }
+}
+
+fn memory_type(kind: u32) -> &'static str {
+    match kind {
+        0 => "reserved",
+        1 => "loader code",
+        2 => "loader data",
+        3 => "boot code",
+        4 => "boot data",
+        5 => "runtime code",
+        6 => "runtime data",
+        7 => "usable",
+        8 => "unusable",
+        9 => "ACPI reclaim",
+        10 => "ACPI NVS",
+        11 => "MMIO",
+        12 => "MMIO ports",
+        13 => "PAL code",
+        14 => "persistent",
+        _ => "other",
+    }
+}
+
+/// `memmap`: the firmware's memory map as the loader passed it, copied at boot.
+pub fn memmap() {
+    let Some(machine) = crate::boot::machine() else { return println!("No boot information recorded.") };
+    println!("{:>18} {:>10}  type", "physical start", "size");
+    let mut usable = 0u64;
+    for descriptor in machine.descriptors() {
+        let bytes = descriptor.pages * 4096;
+        if descriptor.kind == 7 {
+            usable += bytes;
+        }
+        let size = if bytes >= 1 << 20 { (bytes >> 20, "MiB") } else { (bytes >> 10, "KiB") };
+        println!("{:#018x} {:>6} {}  {}", descriptor.physical_start, size.0, size.1, memory_type(descriptor.kind));
+    }
+    println!("{} MiB of conventional (usable) memory in the map.", usable >> 20);
+}
+
+/// `bootinfo`: what the loader handed over (the part the kernel kept).
+pub fn bootinfo() {
+    let Some(machine) = crate::boot::machine() else { return println!("No boot information recorded.") };
+    println!("kernel   {:#x}, {} KiB", machine.kernel_base, machine.kernel_size / 1024);
+    println!("memory   map at {:#x}, {} bytes; BootInfo page {:#x}", machine.map.0, machine.map.1, machine.info_page);
+    println!("acpi     RSDP {:#x}", machine.acpi_rsdp);
+    println!("runtime  services table {:#x}", machine.runtime_services);
+    let fb = &machine.framebuffer;
+    println!("graphics {}x{} stride {} at {:#x}, pixel format {}", fb.width, fb.height, fb.stride, fb.base, fb.format);
+}
+
+/// `cpuinfo`: CPUID of the CPU running the shell.
+pub fn cpuinfo() {
+    use crate::cpu::cpuid;
+    let (max_leaf, b, c, d) = cpuid(0, 0);
+    let mut vendor = [0u8; 12];
+    vendor[0..4].copy_from_slice(&b.to_le_bytes());
+    vendor[4..8].copy_from_slice(&d.to_le_bytes());
+    vendor[8..12].copy_from_slice(&c.to_le_bytes());
+    println!("vendor     {} (highest basic CPUID leaf {max_leaf:#x})", core::str::from_utf8(&vendor).unwrap_or("?"));
+    let (max_extended, ..) = cpuid(0x8000_0000, 0);
+    if max_extended >= 0x8000_0004 {
+        let mut brand = [0u8; 48];
+        for (index, leaf) in (0x8000_0002u32..=0x8000_0004).enumerate() {
+            let (a, b, c, d) = cpuid(leaf, 0);
+            for (part, register) in [a, b, c, d].into_iter().enumerate() {
+                brand[index * 16 + part * 4..][..4].copy_from_slice(&register.to_le_bytes());
+            }
+        }
+        println!("brand      {}", core::str::from_utf8(&brand).unwrap_or("?").trim_matches(|c: char| c == '\0' || c == ' '));
+    }
+    let (signature, ebx, ecx, edx) = cpuid(1, 0);
+    let (stepping, mut model, mut family) = (signature & 0xf, (signature >> 4) & 0xf, (signature >> 8) & 0xf);
+    if family == 0xf {
+        family += (signature >> 20) & 0xff;
+    }
+    if family == 0x6 || family >= 0xf {
+        model |= ((signature >> 16) & 0xf) << 4;
+    }
+    println!("signature  family {family:#x} model {model:#x} stepping {stepping} (CPUID.1 EAX {signature:#010x})");
+    println!("logical    {} logical processor(s) per package, APIC id {}", (ebx >> 16) & 0xff, ebx >> 24);
+    let (_, _, ext_ecx, ext_edx) = if max_extended >= 0x8000_0001 { cpuid(0x8000_0001, 0) } else { (0, 0, 0, 0) };
+    let (_, leaf7_ebx, ..) = if max_leaf >= 7 { cpuid(7, 0) } else { (0, 0, 0, 0) };
+    let features = [
+        ("sse2", edx & (1 << 26) != 0),
+        ("sse4.2", ecx & (1 << 20) != 0),
+        ("aes", ecx & (1 << 25) != 0),
+        ("avx", ecx & (1 << 28) != 0),
+        ("avx2", leaf7_ebx & (1 << 5) != 0),
+        ("rdrand", ecx & (1 << 30) != 0),
+        ("x2apic", ecx & (1 << 21) != 0),
+        ("apic", edx & (1 << 9) != 0),
+        ("pat", edx & (1 << 16) != 0),
+        ("nx", ext_edx & (1 << 20) != 0),
+        ("1g-pages", ext_edx & (1 << 26) != 0),
+        ("long-mode", ext_edx & (1 << 29) != 0),
+        ("lahf", ext_ecx & 1 != 0),
+        ("hypervisor", ecx & (1 << 31) != 0),
+    ];
+    print!("features  ");
+    for (name, present) in features {
+        if present {
+            print!(" {name}");
+        }
+    }
+    println!();
+    let invariant = max_extended >= 0x8000_0007 && cpuid(0x8000_0007, 0).3 & (1 << 8) != 0;
+    println!("tsc        {}", if invariant { "invariant" } else { "not invariant" });
+}

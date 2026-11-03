@@ -10,6 +10,11 @@ use crate::block::{self, Backend};
 
 pub use kernel_core::volumes::{boot_volume, volume_labelled, volume_on, VolumeError};
 pub use crate::slots::boot_slot;
+
+/// First sector of the payload partition on the boot disk (slot metadata, then the kernel slots).
+pub fn payload_start() -> Option<u64> {
+    crate::slots::payload().map(|(_, start)| start)
+}
 pub use crate::debug::pet;
 
 static mut BOOT_DISK: Option<usize> = None;

@@ -138,7 +138,7 @@ pub fn run(line: &str) {
             "" => {
                 println!("help version cpus mem pci disks nic uptime slots threads echo TEXT reboot audio usb date nic [peers|discover] tapesync gpio @HOST ...");
                 println!("ls cat write rm cp mv cmp mkdir (`help NAME` shows one; files are NAME, diskN/NAME, @LABEL/NAME)");
-                println!("start dmesg sector mount umount label fsck grow sha256 format install bootcode (disk commands ask first)");
+                println!("keymap kup serial  recv NAME  io sleep clear memmap bootinfo cpuinfo  start dmesg sector mount umount label fsck grow sha256 format install bootcode (disk commands ask first)");
                 println!("tape NAME [ARGS]  run a tape (a ring 3 process)   NAME [ARGS]  the same   kill PID");
             }
             topic => {
@@ -247,7 +247,16 @@ pub fn run(line: &str) {
             _ => println!("usage: debug slots|crash|hang|deadhang"),
         },
         "start" => crate::config::start(run),
+        "keymap" => crate::sysshell::keymap(&line.trim_start()[command.len()..]),
+        "kup" => crate::sysshell::kup(&line.trim_start()[command.len()..]),
+        "recv" => crate::sysshell::recv(&mut crate::shellhost::MfHost, &line.trim_start()[command.len()..]),
         "dmesg" => crate::sysshell::dmesg(),
+        "clear" => crate::sysshell::clear(),
+        "sleep" => crate::sysshell::sleep(&line.trim_start()[command.len()..]),
+        "io" => crate::sysshell::io(&line.trim_start()[command.len()..]),
+        "memmap" => crate::sysshell::memmap(),
+        "bootinfo" => crate::sysshell::bootinfo(),
+        "cpuinfo" => crate::sysshell::cpuinfo(),
         "sector" => crate::sysshell::sector(&line.trim_start()[command.len()..]),
         "mount" => crate::sysshell::mount(&line.trim_start()[command.len()..]),
         "umount" => crate::sysshell::umount(&line.trim_start()[command.len()..]),

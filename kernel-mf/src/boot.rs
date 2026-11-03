@@ -51,3 +51,15 @@ impl Machine {
         self.descriptors[..self.count].iter().copied()
     }
 }
+
+static mut REMEMBERED: *const Machine = core::ptr::null();
+
+/// Keeps a pointer to the boot copy for the `memmap` and `bootinfo` shell commands. `kmain` never returns, so its `Machine`
+/// lives as long as the kernel does.
+pub fn remember(machine: &Machine) {
+    unsafe { REMEMBERED = machine };
+}
+
+pub fn machine() -> Option<&'static Machine> {
+    unsafe { REMEMBERED.as_ref() }
+}

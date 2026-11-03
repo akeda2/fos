@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Serial KUP test: `kup serial` takes a kernel over the console UART (tools/send_kernel_serial.py's protocol) into the
-inactive A/B slot and resets; the loader tries it once and the kernel confirms it. `test_kup_serial.py [aarch64|x86]`:
+inactive A/B slot and resets; the loader tries it once and the kernel confirms it. `test_kup_serial.py [aarch64|x86|mf]` (mf: the server kernel, `make test-mf-kup-serial`):
 aarch64 needs qemu-system-aarch64 and AAVMF like test_aarch64_boot.py, x86 qemu-system-x86_64 and OVMF.
 Run `make test-aarch64-kup` or `make test-kup-serial`."""
 import os
@@ -27,6 +27,9 @@ else:
     VARS = os.environ.get("OVMF_VARS", "/usr/share/OVMF/OVMF_VARS_4M.fd")
     IMAGE = Path(os.environ.get("FOSFOR_IMAGE", ROOT / "build/fosfor/fosfor.img"))
     KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fosfor-kernel"
+    if ARCH == "mf":
+        IMAGE = Path(os.environ.get("FOSFOR_IMAGE", ROOT / "build/fosfor-mf/fosfor.img"))
+        KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fosfor-kernel-mf"
     SLOTS = "debug slots"
     MACHINE = ["qemu-system-x86_64", "-machine", "q35", "-m", "512"]
     DISK = ["-device", "ide-hd,drive=boot"]
@@ -94,13 +97,13 @@ def main():
             check(wait_for("active slot: 0, pending: None"), "slot 0 is active, nothing pending", text())
 
             try:
-                sender.push(read, write, b"\0" * (5 * 1024 * 1024), log=lambda message: None)
+                sender.push(read, write, b"\0" * ((9 if ARCH == "mf" else 5) * 1024 * 1024), log=lambda message: None)
                 check(False, "an image larger than the staging area is refused")
             except SystemExit as refusal:
                 check("too large" in str(refusal), "an image larger than a slot can take is refused before anything is written", str(refusal) + text())
             check(wait_for("nothing was written"), "the shell reports the refusal and returns", text())
 
-            if ARCH == "aarch64":
+            if ARCH in ("aarch64", "mf"):
                 # `recv NAME` (tools/send_file_serial.py): a file of several frames lands in FOSFS; a bad name is refused.
                 body = b"".join(b"serial file line %04d\n" % number for number in range(300))
                 mark = len(text())
