@@ -1,4 +1,4 @@
-//! smb: the SMB client as a shell command: list, show and copy files of a share (SMB 2/3, guest, no signing) over
+//! smb: the SMB client as a shell command: list, show and copy files of a share (SMB 2/3) over
 //! `crates/smb` and the shared TCP client, on the interface chosen with `nic use N` and an address from DHCP.
 #![no_std]
 #![no_main]
@@ -13,10 +13,12 @@ tape_rt::tape_help!(
     br#"smb ls   //HOST/SHARE[/DIR]
 smb cat  //HOST/SHARE/FILE
 smb get  //HOST/SHARE/FILE [NAME]
+      add user=NAME password=SECRET to log in (default: guest)
 List a folder, print a file, or copy a file to this machine (NAME is a file
 reference: NAME, diskN/NAME or @LABEL/NAME; default the file's own name). HOST
-is an IPv4 address or a name. Guest login, SMB 2.0.2 to 3.0, no signing:
-a Linux/Samba/Windows share that allows guests, or fos's own smbd. The address
+is an IPv4 address or a name. Guest login unless user= is given (NTLMv2,
+requests signed): a Linux/Samba/Windows share or fos's own smbd (smbusers).
+SMB 2.0.2 to 2.1. The address
 comes from DHCP on the NIC of `nic use`. Escape stops a transfer.
 "#
 );
@@ -51,7 +53,16 @@ static mut BLOCK: [u8; CHUNK] = [0; CHUNK];
 pub extern "C" fn tape_main(api: &'static TapeApi) {
     tape_rt::init(api);
     let arguments = core::str::from_utf8(tape_rt::args()).unwrap_or("");
-    let mut words = arguments.split_whitespace();
+    let (mut user, mut password) = (None, "");
+    // Every word is looked at first: a lazy filter would not reach user= behind the local name of `get`.
+    for word in arguments.split_whitespace() {
+        if let Some(name) = word.strip_prefix("user=") {
+            user = Some(name);
+        } else if let Some(secret) = word.strip_prefix("password=") {
+            password = secret;
+        }
+    }
+    let mut words = arguments.split_whitespace().filter(|word| !word.starts_with("user=") && !word.starts_with("password="));
     let (Some(command), Some(url)) = (words.next(), words.next()) else { return println!("usage: smb ls|cat|get //HOST/SHARE[/PATH] [NAME]  (smb help)") };
     let Some(rest) = url.strip_prefix("//") else { return println!("smb: {url}: write //HOST/SHARE/PATH.") };
     let (host, rest) = rest.split_once('/').unwrap_or((rest, ""));
@@ -63,7 +74,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let local = words.next().unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path));
     #[allow(static_mut_refs)]
     let (client, block) = unsafe { (&mut *core::ptr::addr_of_mut!(CLIENT), &mut *core::ptr::addr_of_mut!(BLOCK)) };
-    if connect(api, client, host, share).is_none() {
+    if connect(api, client, host, share, user.map(|name| (name, password))).is_none() {
         return;
     }
     match command {
@@ -74,7 +85,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     client.transport().socket.close(api);
 }
 
-fn connect(api: &'static TapeApi, client: &mut Session, host: &str, share: &str) -> Option<()> {
+fn connect(api: &'static TapeApi, client: &mut Session, host: &str, share: &str, login: Option<(&str, &str)>) -> Option<()> {
     let nic = tape_rt::active_nic();
     if nic >= (api.nic_count)() as usize {
         println!("smb: no network interface.");
@@ -98,6 +109,17 @@ fn connect(api: &'static TapeApi, client: &mut Session, host: &str, share: &str)
     if let Err(why) = link.socket.connect(api, nic, &config, address, PORT, 3_000_000) {
         println!("smb: {host}: {why}.");
         return None;
+    }
+    if let Some((user, password)) = login {
+        // The client challenge: random where the kernel has the call, else the clock (a weaker nonce, still never repeated).
+        let mut nonce = [0u8; 8];
+        if tape_rt::random(&mut nonce).is_none() {
+            nonce = tape_rt::micros().to_le_bytes();
+        }
+        if client.login(user, password, nonce).is_err() {
+            println!("smb: the user name is too long.");
+            return None;
+        }
     }
     if let Err(error) = client.connect(host, share) {
         println!("smb: share {share}: {}.", error.describe());

@@ -1,7 +1,7 @@
 //! A small read-only SMB 2.1 client: negotiate, anonymous (guest) session, tree connect, directory listing, file reads.
 //! Written for `fosplay`, which streams music from a Samba or NAS share, and meant to stay that small: no signing, no
-//! encryption, no Kerberos, no writes. A server that insists on signing or on a user name refuses the session and the error
-//! says so.
+//! encryption, no Kerberos, no writes. `login` gives a user name and password (NTLMv2, then requests are signed with
+//! HMAC-SHA-256 and answers must be); without it the session is anonymous.
 //!
 //! The crate does no I/O of its own: it builds requests and parses answers in one buffer and moves bytes through a
 //! `Transport` (a TCP socket in a tape, a `TcpStream` in the host tests). One request is in flight at a time.
@@ -130,15 +130,40 @@ pub struct Client<T: Transport, const N: usize> {
     session: u64,
     tree: u32,
     max_read: u32,
+    login: Option<Login>,
+    signing: Option<[u8; 16]>,
+}
+
+#[derive(Clone, Copy)]
+struct Login {
+    user: [u8; 128],
+    user_length: usize,
+    nt_hash: [u8; 16],
+    nonce: [u8; 8],
 }
 
 impl<T: Transport, const N: usize> Client<T, N> {
     pub const fn new(transport: T) -> Self {
-        Client { transport, buffer: [0; N], message_id: 0, session: 0, tree: 0, max_read: 0 }
+        Client { transport, buffer: [0; N], message_id: 0, session: 0, tree: 0, max_read: 0, login: None, signing: None }
     }
 
     pub fn transport(&mut self) -> &mut T {
         &mut self.transport
+    }
+
+    /// Use this account for the next `connect` instead of an anonymous session. `nonce` is the client challenge: 8
+    /// bytes that should differ every time (ideally random). Names longer than 64 UTF-16 units are refused.
+    pub fn login(&mut self, user: &str, password: &str, nonce: [u8; 8]) -> Result<(), Error> {
+        let mut login = Login { user: [0; 128], user_length: 0, nt_hash: ntlm::nt_hash(password), nonce };
+        for unit in user.encode_utf16() {
+            if login.user_length == 128 {
+                return Err(Error::TooBig);
+            }
+            login.user[login.user_length..login.user_length + 2].copy_from_slice(&unit.to_le_bytes());
+            login.user_length += 2;
+        }
+        self.login = Some(login);
+        Ok(())
     }
 
     /// Dialect negotiation, anonymous session and the share: `\\host\share`.
@@ -146,6 +171,7 @@ impl<T: Transport, const N: usize> Client<T, N> {
         self.message_id = 0;
         self.session = 0;
         self.tree = 0;
+        self.signing = None;
         self.negotiate()?;
         self.session_setup()?;
         self.tree_connect(host, share)
@@ -174,6 +200,12 @@ impl<T: Transport, const N: usize> Client<T, N> {
         self.buffer[1] = (length >> 16) as u8;
         self.buffer[2] = (length >> 8) as u8;
         self.buffer[3] = length as u8;
+        if let Some(key) = self.signing {
+            let flags = get32(&self.buffer, 4 + 16) | 8;
+            put32(&mut self.buffer, 4 + 16, flags);
+            let value = sign::signature(0x0210, &key, &self.buffer[4..4 + length]);
+            self.buffer[4 + 48..4 + 64].copy_from_slice(&value);
+        }
         self.transport.send(&self.buffer[..4 + length])
     }
 
@@ -201,6 +233,17 @@ impl<T: Transport, const N: usize> Client<T, N> {
             let status = get32(buffer, 8);
             if status == STATUS_PENDING {
                 continue;
+            }
+            // A refused login is not signed (there is no session key yet on the server's side).
+            if let Some(key) = self.signing.filter(|_| command != CMD_SESSION_SETUP || status == 0) {
+                let value = sign::signature(0x0210, &key, &buffer[..length]);
+                let difference = value.iter().zip(&buffer[48..64]).fold(0u8, |sum, (a, b)| sum | (a ^ b));
+                if get32(buffer, 16) & 8 == 0 {
+                    return Err(Error::Protocol("an answer is not signed"));
+                }
+                if difference != 0 {
+                    return Err(Error::Protocol("an answer has a wrong signature"));
+                }
             }
             if get16(buffer, 12) != command {
                 return Err(Error::Protocol("the answer is for another command"));
@@ -253,6 +296,9 @@ impl<T: Transport, const N: usize> Client<T, N> {
             return Err(Error::Status(status));
         }
         self.session = get64(&self.buffer, 40);
+        if let Some(login) = self.login {
+            return self.authenticate(&login);
+        }
 
         // Message 2: NTLM Authenticate with an empty user name and no responses (the anonymous form; the LM response is
         // one zero byte). Field order: LM, NT, domain, user, workstation, session key, each (length, max, offset).
@@ -276,6 +322,87 @@ impl<T: Transport, const N: usize> Client<T, N> {
         self.finish(24 + 65)?;
         let (status, _) = self.receive(CMD_SESSION_SETUP)?;
         if status != 0 {
+            return Err(Error::Status(status));
+        }
+        Ok(())
+    }
+
+    /// NTLMv2 Authenticate (MS-NLMP 2.2.1.3, 3.3.2) for the challenge in the buffer: the NT response is the proof over the
+    /// server challenge and a blob that repeats the server's target info. LM response zeros, empty domain and
+    /// workstation, no key exchange: the session base key is the signing key.
+    fn authenticate(&mut self, login: &Login) -> Result<(), Error> {
+        let offset = get16(&self.buffer, HEADER + 4) as usize;
+        let length = get16(&self.buffer, HEADER + 6) as usize;
+        let token = self.buffer.get(offset..offset + length).ok_or(Error::Protocol("a short challenge"))?;
+        let at = token.windows(8).position(|w| w == NTLMSSP).ok_or(Error::Protocol("no NTLM challenge"))?;
+        let message = &token[at..];
+        if message.len() < 48 || get32(message, 8) != 2 {
+            return Err(Error::Protocol("not an NTLM challenge"));
+        }
+        let mut challenge = [0u8; 8];
+        challenge.copy_from_slice(&message[24..32]);
+        let (info_length, info_offset) = (get16(message, 40) as usize, get32(message, 44) as usize);
+        let info = message.get(info_offset..info_offset + info_length).ok_or(Error::Protocol("a bad target info"))?;
+        let mut target = [0u8; 512];
+        if info.len() > target.len() {
+            return Err(Error::TooBig);
+        }
+        target[..info.len()].copy_from_slice(info);
+        let target = &target[..info.len()];
+        let mut stamp = [0u8; 8];
+        let mut pairs = target;
+        while pairs.len() >= 4 {
+            let (id, size) = (get16(pairs, 0), get16(pairs, 2) as usize);
+            if id == 0 || pairs.len() < 4 + size {
+                break;
+            }
+            if id == 7 && size == 8 {
+                stamp.copy_from_slice(&pairs[4..12]);
+            }
+            pairs = &pairs[4 + size..];
+        }
+
+        self.begin(CMD_SESSION_SETUP);
+        let user_length = login.user_length;
+        let blob_length = 28 + target.len() + 4;
+        let payload = 24 + 16 + blob_length + user_length;
+        if BODY + 24 + 64 + payload > N {
+            return Err(Error::TooBig);
+        }
+        let buffer = &mut self.buffer;
+        put16(buffer, BODY, 25);
+        buffer[BODY + 3] = 1;
+        put16(buffer, BODY + 12, 88);
+        put16(buffer, BODY + 14, (64 + payload) as u16);
+        let msg = BODY + 24;
+        buffer[msg..msg + 8].copy_from_slice(NTLMSSP);
+        put32(buffer, msg + 8, 3);
+        let lm = 64;
+        let nt = lm + 24;
+        let user = nt + 16 + blob_length;
+        let fields = [(12, lm, 24), (20, nt, 16 + blob_length), (28, user, 0), (36, user, user_length), (44, user + user_length, 0), (52, user + user_length, 0)];
+        for (field, offset, size) in fields {
+            put16(buffer, msg + field, size as u16);
+            put16(buffer, msg + field + 2, size as u16);
+            put32(buffer, msg + field + 4, offset as u32);
+        }
+        put32(buffer, msg + 60, NTLM_FLAGS);
+        buffer[msg + lm..msg + lm + payload].fill(0);
+        let blob = msg + nt + 16;
+        buffer[blob..blob + 2].copy_from_slice(&[1, 1]);
+        buffer[blob + 8..blob + 16].copy_from_slice(&stamp);
+        buffer[blob + 16..blob + 24].copy_from_slice(&login.nonce);
+        buffer[blob + 28..blob + 28 + target.len()].copy_from_slice(target);
+        let key = ntlm::ntlmv2_key(&login.nt_hash, &login.user[..user_length], &[]);
+        let proof = ntlm::ntlmv2_proof(&key, &challenge, &buffer[blob..blob + blob_length]);
+        buffer[msg + nt..msg + nt + 16].copy_from_slice(&proof);
+        buffer[msg + user..msg + user + user_length].copy_from_slice(&login.user[..user_length]);
+        let session_key = ntlm::hmac_md5(&key, &[&proof]);
+        self.finish(24 + 64 + payload)?;
+        self.signing = Some(session_key);
+        let (status, _) = self.receive(CMD_SESSION_SETUP).inspect_err(|_| self.signing = None)?;
+        if status != 0 {
+            self.signing = None;
             return Err(Error::Status(status));
         }
         Ok(())
