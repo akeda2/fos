@@ -168,7 +168,7 @@ fn echo_char(bytes: &[u8]) {
 pub fn run(line: &str) {
     let mut words = line.split_whitespace();
     let Some(command) = words.next() else { return };
-    if !matches!(command, "format" | "shrink") {
+    if !matches!(command, "format" | "shrink" | "ext4") {
         crate::formatshell::cancel(); // a format needs its confirmation as the very next command
     }
     if command != "install" {

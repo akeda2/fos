@@ -89,7 +89,7 @@ static COMMANDS: &[Command] = &[
 ];
 
 fn execute(line: &str) {
-    if line.split_whitespace().next().map_or(true, |word| !matches!(word, "format" | "shrink")) {
+    if line.split_whitespace().next().map_or(true, |word| !matches!(word, "format" | "shrink" | "ext4")) {
         crate::formatshell::cancel();
     }
     if line.split_whitespace().next() != Some("install") {

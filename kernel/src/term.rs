@@ -617,7 +617,7 @@ fn run_script(volume: crate::fosfs::Volume, file: &[u8], name: &str, arguments: 
 fn execute(command: &str) {
     let mut words = command.split_whitespace();
     let Some(word) = words.next() else { return };
-    if !matches!(word, "format" | "shrink") {
+    if !matches!(word, "format" | "shrink" | "ext4") {
         crate::formatshell::cancel(); // a format needs its confirmation as the very next command
     }
     if word != "install" {

@@ -32,3 +32,18 @@ superblock changes next and the GPT entry (primary and backup) last. If no singl
 with nothing lost. It works on the boot disk too (the volume is remounted). Code: `Volume::shrink` in
 `crates/kernel-core/src/fosfs.rs`, `gpt::shrink_partition`, `kernel/src/formatshell.rs` (shared by both kernels);
 tests in `crates/kernel-core/tests/fosfs.rs` and `make test-mf-shell`.
+
+## Writing (step 3)
+
+`crates/ext4/src/write.rs`: `Writer::format` (4 KiB blocks, no journal, no checksums), `create`, `mkdir`, `write`,
+`truncate`, `remove`, `rename`, `flush`. `Writer` is ~100 KiB: box it. The superblock says "not clean" from the first
+change until `flush`. Only volumes without `metadata_csum`/`uninit_bg`/`bigalloc`/inline data are writable; the
+`mkfs.ext4` default (checksums) is refused with `ReadOnly` until metadata_csum lands. Files are limited to four
+extent leaf blocks (1360 extents at 4 KiB); beyond that `TooFragmented`. Folder hash indexes are dropped (flag
+cleared) on change; lookups scan. Tests: `crates/ext4/tests/writes.rs` (e2fsck -fn and debugfs judge the results).
+Shell (`kernel-core/src/ext4vol.rs`): `ext4 diskN mkfs [LABEL]` (adds a Linux partition over all free space after
+the last partition, formats it; asks, then `ext4 diskN mkfs confirm` as the very next command), `mkdir`, `rm`, `mv`,
+`write PATH TEXT`. `make test-mf-shell` runs it in QEMU and lets e2fsck/debugfs judge the disk. Rack's boot disk was
+formatted this way (243 GB, `rackdata`) after `shrink disk1 1G`. Formatting 243 GB takes minutes and blocks the shell:
+rack reset itself (60 s watchdog) once it was done; the volume was complete. Not yet: journal, installer integration,
+copying files from FOSFS.
