@@ -122,10 +122,19 @@ fn run(line: &str) {
     let mut words = line.split_whitespace();
     let Some(command) = words.next() else { return };
     match command {
-        "help" => {
-            println!("help version cpus mem pci disks nic uptime slots threads echo TEXT reboot audio usb date nic [peers|discover] tapesync gpio @HOST ...");
-            println!("tape NAME [ARGS]  run a tape (a ring 3 process)   kill PID");
-        }
+        "help" => match line.trim_start()[command.len()..].trim() {
+            "" => {
+                println!("help version cpus mem pci disks nic uptime slots threads echo TEXT reboot audio usb date nic [peers|discover] tapesync gpio @HOST ...");
+                println!("ls cat write rm cp mv cmp mkdir (`help NAME` shows one; files are NAME, diskN/NAME, @LABEL/NAME)");
+                println!("tape NAME [ARGS]  run a tape (a ring 3 process)   NAME [ARGS]  the same   kill PID");
+            }
+            topic => {
+                let mut host = crate::shellhost::MfHost;
+                if !fosfor_shell::execute(&mut host, &[fosfor_shell::files::COMMANDS], line) {
+                    println!("help: {topic} has no help screen here (try the tape's own `{topic} help`).");
+                }
+            }
+        },
         "version" => println!("Fosfor OS server kernel (mf), slice 8."),
         "cpus" => println!("{} CPU(s); boot CPU has taken {} timer ticks.", percpu::count(), percpu::ticks_of(0)),
         "mem" => {
@@ -229,12 +238,17 @@ fn run(line: &str) {
             slots::mark_clean_stop();
             power::reset();
         }
-        _ => println!("Unknown command `{command}`; try `help`."),
+        _ => {
+            let mut host = crate::shellhost::MfHost;
+            if !fosfor_shell::execute(&mut host, &[fosfor_shell::files::COMMANDS], line) && !fosfor_shell::external(&mut host, line) {
+                println!("Unknown command `{command}`; try `help`.");
+            }
+        }
     }
 }
 
 /// Loads the ELF tape `name` from the boot volume (or whichever volume holds it) and starts it as a process.
-fn run_tape(name: &str, args: &str) {
+pub fn run_tape(name: &str, args: &str) {
     let disk = crate::tapefs::lock();
     // A bare name not in the root is looked for in `bin/` (a v4 volume keeps its tapes there).
     let mut path = name.as_bytes();

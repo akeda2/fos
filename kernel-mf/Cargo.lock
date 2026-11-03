@@ -37,8 +37,13 @@ dependencies = [
  "fosfor-fat",
  "fosfor-hal",
  "fosfor-kernel-core",
+ "fosfor-shell",
  "fosfor-tape-sync",
 ]
+
+[[package]]
+name = "fosfor-shell"
+version = "0.1.0"
 
 [[package]]
 name = "fosfor-tape-sync"

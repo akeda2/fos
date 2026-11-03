@@ -30,6 +30,7 @@ mod netclient;
 mod tapesync;
 mod power;
 mod shell;
+mod shellhost;
 mod slots;
 mod acpi;
 mod apic;

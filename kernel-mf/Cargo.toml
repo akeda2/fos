@@ -17,4 +17,5 @@ fosfor-abi = { path = "../abi" }
 fosfor-hal = { path = "../crates/fos-hal" }
 fosfor-fat = { path = "../crates/fat" }
 fosfor-kernel-core = { path = "../crates/kernel-core" }
+fosfor-shell = { path = "../crates/shell" }
 fosfor-tape-sync = { path = "../crates/tape-sync" }
