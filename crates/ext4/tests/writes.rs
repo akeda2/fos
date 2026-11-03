@@ -1,6 +1,8 @@
 //! Writer tests: format with the crate, change things, and let e2fsck and debugfs judge the result.
 
-use ext4::{Device, Error, FormatOptions, Fs, Writer};
+use ext4::{Device, Error, FormatOptions, Fs, Journaled, Stage, Writer};
+use std::cell::Cell;
+use std::rc::Rc;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -36,12 +38,16 @@ fn debugfs_cat(image: &PathBuf, path: &str) -> Vec<u8> {
     Command::new("/usr/sbin/debugfs").arg("-R").arg(format!("cat \"{path}\"")).arg(image).output().unwrap().stdout
 }
 
-fn make(name: &str, mb: u64) -> (PathBuf, Writer<FileDevice>) {
+fn stage() -> &'static mut Stage {
+    Box::leak(Box::new(Stage::new()))
+}
+
+fn make(name: &str, mb: u64) -> (PathBuf, Writer<Journaled<FileDevice>>) {
     let image = std::env::temp_dir().join(format!("fos-ext4-{name}-{}.img", std::process::id()));
     let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&image).unwrap();
     file.set_len(mb << 20).unwrap();
-    let options = FormatOptions { label: b"fostest", bytes_per_inode: 0, uuid: [7; 16], time: 1_700_000_000 };
-    let writer = Writer::format(FileDevice(file), (mb << 20) / 512, &options).unwrap();
+    let options = FormatOptions { label: b"fostest", bytes_per_inode: 0, uuid: [7; 16], time: 1_700_000_000, journal: true };
+    let writer = Writer::format(FileDevice(file), (mb << 20) / 512, &options, stage()).unwrap();
     (image, writer)
 }
 
@@ -228,4 +234,128 @@ fn checksummed_linux_volumes_stay_read_only() {
     let fs = Fs::mount(FileDevice(File::open(&image).unwrap())).unwrap();
     assert!(matches!(Writer::new(fs), Err(Error::ReadOnly)));
     let _ = fs::remove_file(&image);
+}
+
+/// A disk that dies after `budget` more writes (a power cut).
+struct CrashDevice {
+    file: FileDevice,
+    budget: Rc<Cell<u64>>,
+}
+
+impl Device for CrashDevice {
+    fn read(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
+        self.file.read(lba, buffer)
+    }
+    fn write(&mut self, lba: u64, buffer: &[u8]) -> Result<(), Error> {
+        if self.budget.get() == 0 {
+            return Err(Error::Device);
+        }
+        self.budget.set(self.budget.get() - 1);
+        self.file.write(lba, buffer)
+    }
+}
+
+fn script<D: Device>(w: &mut Writer<Journaled<D>>) -> Result<(), Error> {
+    w.set_time(1_700_000_100);
+    let root = w.root().unwrap().number;
+    let dir = w.mkdir(root, b"docs", 0o755)?.number;
+    for n in 0..40 {
+        let f = w.create(dir, format!("file{n}.txt").as_bytes(), 0o644)?.number;
+        w.write(f, 0, &pattern(n, 5000 + n * 100))?;
+    }
+    let f = w.create(root, b"big.bin", 0o644)?.number;
+    w.write(f, 0, &pattern(9, 3 << 20))?;
+    w.rename(dir, b"file3.txt", root, b"moved.txt")?;
+    w.remove(dir, b"file4.txt")?;
+    w.truncate(f, 1000)?;
+    w.flush()
+}
+
+#[test]
+fn a_power_cut_at_any_write_leaves_a_consistent_volume() {
+    if !have("e2fsck") {
+        return;
+    }
+    let (base, mut w) = make("crash-base", 64);
+    w.flush().unwrap();
+    drop(w);
+    // How many writes the whole script takes.
+    let count = {
+        let copy = std::env::temp_dir().join(format!("fos-ext4-crash-count-{}.img", std::process::id()));
+        fs::copy(&base, &copy).unwrap();
+        let budget = Rc::new(Cell::new(u64::MAX));
+        let file = OpenOptions::new().read(true).write(true).open(&copy).unwrap();
+        let device = CrashDevice { file: FileDevice(file), budget: budget.clone() };
+        let mut w = Writer::new(ext4::open(device, stage()).unwrap()).unwrap();
+        script(&mut w).unwrap();
+        let _ = fs::remove_file(&copy);
+        u64::MAX - budget.get()
+    };
+    assert!(count > 100, "{count}");
+    let step = (count / 150).max(1);
+    let mut k = 0;
+    while k < count {
+        let copy = std::env::temp_dir().join(format!("fos-ext4-crash-{}-{k}.img", std::process::id()));
+        fs::copy(&base, &copy).unwrap();
+        {
+            let file = OpenOptions::new().read(true).write(true).open(&copy).unwrap();
+            let device = CrashDevice { file: FileDevice(file), budget: Rc::new(Cell::new(k)) };
+            let mut w = Writer::new(ext4::open(device, stage()).unwrap()).unwrap();
+            let _ = script(&mut w);
+        }
+        // Linux's own replay first, on a copy, then ours.
+        let linux = copy.with_extension("linux");
+        fs::copy(&copy, &linux).unwrap();
+        let out = Command::new("/usr/sbin/e2fsck").arg("-fy").arg(&linux).output().unwrap();
+        assert!(out.status.code().unwrap() <= 1, "crash {k}: e2fsck -fy: {}", String::from_utf8_lossy(&out.stdout));
+        fsck(&linux);
+        {
+            let file = OpenOptions::new().read(true).write(true).open(&copy).unwrap();
+            let mut w = Writer::new(ext4::open(FileDevice(file), stage()).unwrap()).unwrap();
+            w.flush().unwrap();
+        }
+        let out = Command::new("/usr/sbin/e2fsck").arg("-fn").arg(&copy).output().unwrap();
+        if !out.status.success() {
+            eprintln!("kept {} and {}", copy.display(), linux.display());
+        }
+        assert!(out.status.success(), "crash {k}: {}", String::from_utf8_lossy(&out.stdout));
+        let _ = fs::remove_file(&copy);
+        let _ = fs::remove_file(&linux);
+        k += step;
+    }
+    let _ = fs::remove_file(&base);
+}
+
+#[test]
+fn a_journal_linux_wrote_is_replayed() {
+    if !have("debugfs") {
+        return;
+    }
+    let (image, mut w) = make("linux-journal", 64);
+    let root = w.root().unwrap().number;
+    let f = w.create(root, b"hello.txt", 0o644).unwrap().number;
+    w.write(f, 0, &pattern(1, 4096)).unwrap();
+    w.flush().unwrap();
+    drop(w);
+    let out = Command::new("/usr/sbin/debugfs").arg("-R").arg("bmap /hello.txt 0").arg(&image).output().unwrap();
+    let block: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+    let new = pattern(77, 4096);
+    let payload = image.with_extension("payload");
+    fs::write(&payload, &new).unwrap();
+    let commands = image.with_extension("cmds");
+    fs::write(&commands, format!("jo\njw -b {block} {}\njc\n", payload.display())).unwrap();
+    let out = Command::new("/usr/sbin/debugfs").arg("-w").arg("-f").arg(&commands).arg(&image).output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    if text.contains("Unknown request") || text.contains("not supported") || text.contains("rror") {
+        eprintln!("debugfs cannot write journals here, skipping: {text}");
+        return;
+    }
+    assert_eq!(debugfs_cat(&image, "/hello.txt"), pattern(1, 4096), "the transaction is not checkpointed yet");
+    let file = OpenOptions::new().read(true).write(true).open(&image).unwrap();
+    let mut w = Writer::new(ext4::open(FileDevice(file), stage()).unwrap()).unwrap();
+    w.flush().unwrap();
+    drop(w);
+    assert_eq!(debugfs_cat(&image, "/hello.txt"), new);
+    fsck(&image);
+    let _ = (fs::remove_file(&image), fs::remove_file(&payload), fs::remove_file(&commands));
 }

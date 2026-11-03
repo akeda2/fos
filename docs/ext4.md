@@ -12,7 +12,7 @@ mf-specific fast paths (block cache, hash-tree lookup, read-ahead) go on top of 
 
 - ext2/3/4: extents or indirect blocks, 1/2/4 KiB blocks, 32/64-byte group descriptors, flex_bg, 64bit, large folders
   (read by linear scan). Refused: meta_bg, compression, encryption, casefold, blocks over 4 KiB. Inline-data files
-  are refused per file. A volume with an unreplayed journal is refused (`NeedsRecovery`) until Linux has mounted it.
+  are refused per file. A volume with an unreplayed journal is refused (`NeedsRecovery`) until `ext4 diskN recover` (or any write command) has replayed it.
 - Names are bytes (UTF-8); lookup is byte-exact.
 - Host tests (`make test`, `crates/ext4/tests/images.rs`) read `mkfs.ext4`/`mkfs.ext2` images and compare every file.
 
@@ -35,7 +35,7 @@ tests in `crates/kernel-core/tests/fosfs.rs` and `make test-mf-shell`.
 
 ## Writing (step 3)
 
-`crates/ext4/src/write.rs`: `Writer::format` (4 KiB blocks, no journal, no checksums), `create`, `mkdir`, `write`,
+`crates/ext4/src/write.rs`: `Writer::format` (4 KiB blocks, journal optional, no checksums), `create`, `mkdir`, `write`,
 `truncate`, `remove`, `rename`, `flush`. `Writer` is ~100 KiB: box it. The superblock says "not clean" from the first
 change until `flush`. Only volumes without `metadata_csum`/`uninit_bg`/`bigalloc`/inline data are writable; the
 `mkfs.ext4` default (checksums) is refused with `ReadOnly` until metadata_csum lands. Files are limited to four
@@ -45,5 +45,23 @@ Shell (`kernel-core/src/ext4vol.rs`): `ext4 diskN mkfs [LABEL]` (adds a Linux pa
 the last partition, formats it; asks, then `ext4 diskN mkfs confirm` as the very next command), `mkdir`, `rm`, `mv`,
 `write PATH TEXT`. `make test-mf-shell` runs it in QEMU and lets e2fsck/debugfs judge the disk. Rack's boot disk was
 formatted this way (243 GB, `rackdata`) after `shrink disk1 1G`. Formatting 243 GB takes minutes and blocks the shell:
-rack reset itself (60 s watchdog) once it was done; the volume was complete. Not yet: journal, installer integration,
+rack reset itself (60 s watchdog) once it was done; the volume was complete. Not yet: installer integration,
 copying files from FOSFS.
+
+## Journal (step 4)
+
+`crates/ext4/src/journal.rs`. `Journaled<D>` wraps the device: the writer's metadata writes are staged (64 blocks,
+`Stage`, 256 KiB, a static in the kernel) and `commit` makes them one jbd2 transaction: descriptor, blocks and commit
+block go to the log, the journal superblock's `start` is set (the commit point), the blocks are checkpointed to their
+home places, `start` goes back to 0. At most one transaction is in the log, so no revoke records are ever written;
+`needs_recovery` is set before the first commit and cleared by `flush`. File data (`write_data`) bypasses the journal
+and goes to disk first ("ordered" mode). `open` replays a log Linux or we left behind (scan, revoke, replay passes, with
+escapes and revokes) before mounting. Refused: journal checksums, async/fast commit, external journals, a journal that
+is not one contiguous run. `format` adds a journal (1024-16384 blocks, an eighth of the volume at most; Linux's
+minimum is 1024, so volumes under 32 MiB get none). Journal-less volumes keep working, written straight through.
+`ext4 diskN recover` replays and marks clean. Tests (`make test-ext4`): a power cut at 150 points through a
+multi-operation script, each judged by Linux's own replay (`e2fsck -fy`) and by ours (`open`, then `e2fsck -fn`); a
+transaction written by `debugfs jo/jw/jc` is replayed by `open`. There is no write barrier in `Device`: a disk with a
+volatile cache may reorder log and commit; only real hardware shows how much that matters. mf thread stacks became
+256 KiB because the volume code keeps four 4 KiB caches per `Fs` and moves it by value. Not run: the embedded kernel
+under QEMU with a journaled volume (its static grows by 256 KiB).
