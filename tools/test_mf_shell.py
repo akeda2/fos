@@ -84,6 +84,65 @@ def ext4_scenario():
             machine.stop()
 
 
+def ext4_write_scenario():
+    """`ext4 diskN mkfs|mkdir|write|mv|rm`: a partition is added after a shrunk FOSFS one, formatted, written; e2fsck agrees."""
+    import subprocess
+    import uuid
+    e2fsck = "/usr/sbin/e2fsck"
+    with tempfile.TemporaryDirectory() as tmp:
+        second = Path(tmp) / "second.img"
+        subprocess.run([sys.executable, str(ROOT / "tools/build_image.py"), "--loader", str(base.LOADER), "--kernel", str(base.KERNEL),
+                        "--output", str(second), "--label", "extwrite", "--fosfs", "4",
+                        "--payload-guid", str(uuid.uuid4()), "--no-bios"], check=True, capture_output=True)
+        machine = base.Machine(tmp, {"hostname": "mfext4w\n"}, {}, fosfs=4)
+        machine.extra = ["-drive", f"format=raw,file={second}"]
+        machine.start()
+        try:
+            machine.wait_for(READY)
+            machine.connect()
+            machine.run("shrink disk2 8M")
+            machine.run("shrink disk2 confirm")
+            out = machine.run("ext4 disk2 mkfs scratch")
+            check("ext4 disk2 mkfs confirm" in out, "mkfs announces and asks", out[-400:])
+            machine.run("echo interrupt")
+            out = machine.run("ext4 disk2 mkfs confirm")
+            check("nothing is waiting" in out, "another command cancels the mkfs", out[-300:])
+            machine.run("ext4 disk2 mkfs scratch")
+            out = machine.run("ext4 disk2 mkfs confirm")
+            check("ext4: formatted" in out, "confirm formats the new partition", out[-400:])
+            out = machine.run("ext4 disk2 info")
+            check("scratch" in out, "the new volume has its label", out[-300:])
+            machine.run("ext4 disk2 mkdir /docs")
+            machine.run("ext4 disk2 write /docs/Räksmörgås.txt hej på dig")
+            out = machine.run("ext4 disk2 cat /docs/Räksmörgås.txt")
+            check("hej på dig" in out, "write makes a file in a new folder", out[-300:])
+            machine.run("ext4 disk2 mv /docs/Räksmörgås.txt /moved.txt")
+            out = machine.run("ext4 disk2 ls")
+            check("moved.txt" in out and "docs" in out, "mv moves across folders", out[-300:])
+            out = machine.run("ext4 disk2 rm /docs")
+            check("rm" not in out or "not" not in out, "an empty folder is removed", out[-300:])
+            out = machine.run("ext4 disk2 rm /nothere")
+            check("not found" in out, "a missing name is reported", out[-300:])
+        finally:
+            machine.stop()
+        if Path(e2fsck).exists():
+            # The partition starts at 1 MiB-aligned sector after the 8 MiB FOSFS one; check it from the host.
+            import re
+            dump = subprocess.run(["sfdisk", "-d", str(second)], capture_output=True, text=True).stdout
+            match = re.search(r"start=\s*(\d+), size=\s*(\d+), type=0FC63DAF", dump)
+            check(match is not None, "the partition table lists a Linux partition", dump)
+            if match:
+                start, size = int(match.group(1)), int(match.group(2))
+                part = Path(tmp) / "part.img"
+                with second.open("rb") as src, part.open("wb") as dst:
+                    src.seek(start * 512)
+                    dst.write(src.read(size * 512))
+                done = subprocess.run([e2fsck, "-fn", str(part)], capture_output=True, text=True)
+                check(done.returncode == 0, "e2fsck finds the volume clean", done.stdout[-400:])
+                cat = subprocess.run(["/usr/sbin/debugfs", "-R", "cat /moved.txt", str(part)], capture_output=True)
+                check(cat.stdout == "hej på dig".encode(), "debugfs reads what the kernel wrote", repr(cat.stdout))
+
+
 def shrink_scenario():
     """`shrink diskN SIZE` (kernel/src/formatshell.rs): sizes with units, a confirmation, files kept, the partition cut."""
     import subprocess
@@ -221,6 +280,7 @@ def main():
             machine.stop()
     config_volume_scenario()
     ext4_scenario()
+    ext4_write_scenario()
     shrink_scenario()
     print("test-mf-shell: all checks passed")
 

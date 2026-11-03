@@ -20,6 +20,15 @@ pub fn cancel() {
         PENDING_FORMAT = None;
         PENDING_SHRINK = None;
     }
+    kernel_core::ext4vol::cancel();
+}
+
+/// For `ext4 ...`: it has its own confirmation, but a pending format or shrink is still cancelled by it.
+pub fn cancel_format() {
+    unsafe {
+        PENDING_FORMAT = None;
+        PENDING_SHRINK = None;
+    }
 }
 
 /// `shrink diskN SIZE` waiting for `shrink diskN confirm`: the disk and the new size of its FOSFS partition in sectors.
@@ -36,6 +45,7 @@ fn mib(sectors: u64) -> u64 {
 pub fn shrink(rest: &str) {
     const USAGE: &str = "Usage: shrink diskN [SIZE]   (SIZE: 512M, 2G, 1.5GiB; a bare number is MB; then: shrink diskN confirm)";
     unsafe { PENDING_FORMAT = None };
+    kernel_core::ext4vol::cancel();
     let mut words = rest.split_whitespace();
     let Some(number) = words.next().and_then(|word| word.strip_prefix("disk")).and_then(|digits| digits.parse::<usize>().ok()) else {
         return crate::println!("{USAGE}");
@@ -121,6 +131,7 @@ fn plan_format(disk: usize, force: bool) -> Result<FormatPlan, &'static str> {
 /// partition; any other disk needs `force` because its partition table is replaced.
 pub fn command(rest: &str) {
     unsafe { PENDING_SHRINK = None };
+    kernel_core::ext4vol::cancel();
     let mut words = rest.split_whitespace();
     let Some(target) = words.next() else {
         return crate::println!("Usage: format diskN [NAME] [v3] [force]   or   format diskN exfat [LABEL]   (then: format diskN confirm)");

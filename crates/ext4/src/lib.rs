@@ -17,6 +17,9 @@
 //! where an allocator exists.
 #![cfg_attr(not(test), no_std)]
 
+mod write;
+pub use write::{format_raw, FormatOptions, Writer};
+
 /// The device's sector: `Device` addresses in 512-byte sectors from the first sector of the volume.
 pub const SECTOR: usize = 512;
 const MAX_BLOCK: usize = 4096;
@@ -50,6 +53,10 @@ const FLAG_INLINE_DATA: u32 = 0x1000_0000;
 /// A block device: whole sectors, addressed from the first sector of the volume.
 pub trait Device {
     fn read(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), Error>;
+    /// Writes whole sectors. A read-only device keeps this default and `Writer` then fails with `ReadOnly`.
+    fn write(&mut self, _lba: u64, _buffer: &[u8]) -> Result<(), Error> {
+        Err(Error::ReadOnly)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,6 +72,20 @@ pub enum Error {
     /// Structures that contradict themselves.
     Corrupt,
     NotADirectory,
+    /// The device cannot be written, or the volume has features a writer cannot keep consistent (`metadata_csum`, ...).
+    ReadOnly,
+    Exists,
+    NotFound,
+    NoSpace,
+    NotEmpty,
+    IsADirectory,
+    /// A file name that is empty, longer than 255 bytes, or holds `/` or NUL.
+    InvalidName,
+    /// The file's extents would not fit the inode plus four leaf blocks.
+    TooFragmented,
+    TooManyLinks,
+    /// An impossible request (a folder moved into itself, ...).
+    Invalid,
 }
 
 /// What `mount_with` may be told.
@@ -140,6 +161,7 @@ pub struct Fs<D: Device> {
     device: D,
     block_size: usize,
     blocks: u64,
+    blocks_per_group: u32,
     free_blocks: u64,
     inodes: u32,
     free_inodes: u32,
@@ -149,6 +171,8 @@ pub struct Fs<D: Device> {
     desc_size: usize,
     groups: u32,
     incompat: u32,
+    compat: u32,
+    ro_compat: u32,
     label: [u8; 16],
     /// The cached group-descriptor block and inode-table block (volume block numbers, `u64::MAX` for none).
     gdt_at: u64,
@@ -215,6 +239,7 @@ impl<D: Device> Fs<D> {
             device,
             block_size,
             blocks,
+            blocks_per_group,
             free_blocks,
             inodes: le32(&sb, 0),
             free_inodes: le32(&sb, 16),
@@ -224,6 +249,8 @@ impl<D: Device> Fs<D> {
             desc_size,
             groups,
             incompat,
+            compat: le32(&sb, 92),
+            ro_compat: le32(&sb, 100),
             label,
             gdt_at: u64::MAX,
             gdt: [0; MAX_BLOCK],

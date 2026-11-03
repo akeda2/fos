@@ -516,7 +516,8 @@ impl core::fmt::Write for Console {
     }
 }
 
-/// `ext4 diskN [ls|cat|info] [PATH]`: a Linux volume, read-only.
+/// `ext4 diskN [ls|cat|info|mkfs|mkdir|rm|mv|write] [ARGS]`: a Linux volume.
 pub fn ext4(rest: &str) {
+    crate::formatshell::cancel_format();
     kernel_core::ext4vol::command(rest, &mut Console);
 }

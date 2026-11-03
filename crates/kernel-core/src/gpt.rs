@@ -372,3 +372,82 @@ pub fn shrink_partition(disk: usize, type_guid: &[u8; 16], sectors: u64) -> Resu
     }
     result.ok_or(ShrinkError::NoGpt)
 }
+
+/// Why `add_partition` did nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddError {
+    NoGpt,
+    /// Every entry of the table is in use.
+    TableFull,
+    /// Less than 8 MiB lies after the last partition.
+    NoSpace,
+    Disk,
+}
+
+/// Adds a partition of `type_guid` named `name` over all the free space after the last partition (aligned to 1 MiB), in
+/// both copies of the table, primary first; each copy is valid on its own, so a power cut leaves a usable disk.
+pub fn add_partition(disk: usize, type_guid: &[u8; 16], name: &str) -> Result<Partition, AddError> {
+    let mut primary = [0u8; 512];
+    block::read(disk, 1, &mut primary).map_err(|_| AddError::Disk)?;
+    if &primary[0..8] != b"EFI PART" {
+        return Err(AddError::NoGpt);
+    }
+    let backup_lba = u64::from_le_bytes(primary[32..40].try_into().unwrap());
+    let unique = random_guid(disk as u64 ^ 0xe874);
+    let mut result = None;
+    for header_lba in [1, backup_lba] {
+        let mut header = [0u8; 512];
+        block::read(disk, header_lba, &mut header).map_err(|_| AddError::Disk)?;
+        if &header[0..8] != b"EFI PART" {
+            continue;
+        }
+        let entries_lba = u64::from_le_bytes(header[72..80].try_into().unwrap());
+        let count = u32::from_le_bytes(header[80..84].try_into().unwrap()) as usize;
+        let size = u32::from_le_bytes(header[84..88].try_into().unwrap()) as usize;
+        let usable_last = u64::from_le_bytes(header[48..56].try_into().unwrap());
+        if !(128..=512).contains(&size) || count == 0 || count * size > 128 * 128 {
+            return Err(AddError::NoGpt);
+        }
+        let bytes = count * size;
+        let entries = unsafe { &mut *core::ptr::addr_of_mut!(ENTRY_ARRAY) };
+        entries.fill(0);
+        for sector in 0..bytes.div_ceil(512) {
+            block::read(disk, entries_lba + sector as u64, &mut entries[sector * 512..sector * 512 + 512]).map_err(|_| AddError::Disk)?;
+        }
+        let mut highest = 0u64;
+        let mut free = None;
+        for index in 0..count {
+            let entry = &entries[index * size..(index + 1) * size];
+            if entry[0..16].iter().all(|&byte| byte == 0) {
+                free.get_or_insert(index);
+            } else {
+                highest = highest.max(u64::from_le_bytes(entry[40..48].try_into().unwrap()));
+            }
+        }
+        let index = free.ok_or(AddError::TableFull)?;
+        let first = (highest + 1).next_multiple_of(2048);
+        if first + 8 * 2048 > usable_last {
+            return Err(AddError::NoSpace);
+        }
+        let entry = &mut entries[index * size..(index + 1) * size];
+        entry[0..16].copy_from_slice(type_guid);
+        entry[16..32].copy_from_slice(&unique);
+        entry[32..40].copy_from_slice(&first.to_le_bytes());
+        entry[40..48].copy_from_slice(&usable_last.to_le_bytes());
+        for (slot, unit) in name.encode_utf16().take(36).enumerate() {
+            entry[56 + slot * 2..58 + slot * 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        result = Some(Partition { unique_guid: unique, start: first, sectors: usable_last - first + 1 });
+        let entries_crc = crc32(&entries[..bytes]);
+        let header_size = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+        header[88..92].copy_from_slice(&entries_crc.to_le_bytes());
+        header[16..20].fill(0);
+        let crc = crc32(&header[..header_size.min(512)]);
+        header[16..20].copy_from_slice(&crc.to_le_bytes());
+        for sector in 0..bytes.div_ceil(512) {
+            block::write(disk, entries_lba + sector as u64, &entries[sector * 512..sector * 512 + 512]).map_err(|_| AddError::Disk)?;
+        }
+        block::write(disk, header_lba, &header).map_err(|_| AddError::Disk)?;
+    }
+    result.ok_or(AddError::NoGpt)
+}
