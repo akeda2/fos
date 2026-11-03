@@ -631,3 +631,35 @@ fn exfat_label_can_be_set() {
     assert!(check.find(b"keep.bin").unwrap().is_some());
     fsck(&path, &["fsck.exfat", "-n"]);
 }
+
+/// exFAT names are UTF-16 on disk: åäö, CJK and a surrogate pair round-trip, match without regard to case, rename, and
+/// `fsck.exfat` accepts the entry sets (name hash and checksum included).
+#[test]
+fn exfat_unicode_names() {
+    if !tool("mkfs.exfat") {
+        return;
+    }
+    let path = scratch("exfat-unicode.img");
+    let _cleanup = Cleanup(path.clone());
+    make_image(&path, 128, &["mkfs.exfat", "-c", "4096"]);
+    let names = ["Räksmörgås.txt", "日本語のファイル.wav", "Emoji 😀 take.wav", "Ärende-ÅÄÖ-with-a-rather-long-name-over-fifteen.txt"];
+    {
+        let mut fs = open(&path);
+        for name in names {
+            record(&mut fs, name.as_bytes(), 0, 3000, 1024);
+        }
+        assert!(fs.rename("Räksmörgås.txt".as_bytes(), "Smörgås.txt".as_bytes()).unwrap());
+    }
+    fsck(&path, &["fsck.exfat", "-n"]);
+    let mut fs = open(&path);
+    let mut listed = Vec::new();
+    fs.list(|entry| listed.push(String::from_utf8(entry.name().to_vec()).unwrap())).unwrap();
+    for name in ["Smörgås.txt", names[1], names[2], names[3]] {
+        assert!(listed.iter().any(|found| found == name), "{name} not listed in {listed:?}");
+    }
+    verify_read(&mut fs, "SMÖRGÅS.TXT".as_bytes(), 3000);
+    verify_read(&mut fs, names[2].as_bytes(), 3000);
+    assert!(fs.remove("日本語のファイル.wav".as_bytes()).unwrap());
+    drop(fs);
+    fsck(&path, &["fsck.exfat", "-n"]);
+}

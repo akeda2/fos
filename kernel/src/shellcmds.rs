@@ -70,6 +70,8 @@ pub static COMMANDS: &[Command] = &[
         }
     }),
     Command::new("sector", "sector diskN LBA [COUNT <= 4]", "raw read-only dump of disk sectors (a GPT header, the slot metadata).", |_, rest| sector(rest)),
+    Command::new("shrink", "shrink diskN [SIZE]", "makes the disk's FOSFS partition smaller (SIZE like 512M or 2G), keeping the files; asks first (then `shrink diskN confirm`).", |_, rest| crate::formatshell::shrink(rest)),
+    Command::new("ext4", "ext4 diskN [ls|cat|info] [PATH]", "reads a Linux ext2/3/4 volume (read-only).", |_, rest| ext4(rest)),
     Command::new("start", "start", "runs the start file again (as at boot).", |_, _| start()),
     Command::new("dmesg", "dmesg", "the boot log.", |_, _| dmesg()),
     Command::new("echo", "echo TEXT", "prints its arguments.", |_, rest| crate::println!("{rest}")),
@@ -409,6 +411,19 @@ fn date(rest: &str) {
         }
         Some(_) => crate::println!("Usage: date | date set YYYY-MM-DD HH:MM[:SS]"),
     }
+}
+
+struct Console;
+
+impl core::fmt::Write for Console {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        crate::print(format_args!("{text}"));
+        Ok(())
+    }
+}
+
+fn ext4(rest: &str) {
+    kernel_core::ext4vol::command(rest, &mut Console);
 }
 
 /// A raw-disk dump to look at what is really on a disk (a GPT header, the slot metadata, a boot sector) when a driver or

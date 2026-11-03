@@ -19,8 +19,59 @@ pub fn validate(name: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
+/// The most UTF-16 units an exFAT name may have here (the entry set must fit one sector).
+pub const MAX_UNITS: usize = 60;
+
+/// The longest UTF-8 form of such a name (three bytes a unit).
+pub const MAX_BYTES: usize = MAX_NAME * 3;
+
+/// The simple upper-case mapping of a character: what exFAT's up-case table is for. Characters that would expand
+/// (ß) stay as they are, like in the table.
+pub fn upcase(c: char) -> char {
+    let mut upper = c.to_uppercase();
+    match (upper.next(), upper.next()) {
+        (Some(single), None) => single,
+        _ => c,
+    }
+}
+
+/// Names are UTF-8 (exFAT stores UTF-16; FAT32 long names show anything outside ASCII as `?`). ASCII names compare
+/// the old way; others by simple case folding, and text that is not UTF-8 byte for byte.
 pub fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
+    if a.is_ascii() && b.is_ascii() {
+        return a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y));
+    }
+    match (core::str::from_utf8(a), core::str::from_utf8(b)) {
+        (Ok(a), Ok(b)) => a.chars().map(upcase).eq(b.chars().map(upcase)),
+        _ => a == b,
+    }
+}
+
+/// How many UTF-16 units `name` (UTF-8) takes; `None` when it is not UTF-8.
+pub fn units(name: &[u8]) -> Option<usize> {
+    Some(core::str::from_utf8(name).ok()?.chars().map(char::len_utf16).sum())
+}
+
+/// The entry-set size for an exFAT name: the file and stream entries plus 15 units per name entry.
+pub fn exfat_entries(name: &[u8]) -> usize {
+    2 + units(name).unwrap_or(0).div_ceil(15)
+}
+
+/// What exFAT will be asked to create: UTF-8 of at most 60 UTF-16 units, no controls or `" * / : < > ? \ |`, no
+/// leading or trailing space and no trailing dot.
+pub fn validate_exfat(name: &[u8]) -> Result<(), Error> {
+    let Ok(text) = core::str::from_utf8(name) else { return Err(Error::BadName) };
+    let count = units(name).unwrap_or(0);
+    if count == 0 || count > MAX_UNITS || text.starts_with(' ') || text.ends_with(' ') || text.ends_with('.') {
+        return Err(Error::BadName);
+    }
+    for c in text.chars() {
+        let code = c as u32;
+        if code < 0x20 || (0x7f..=0x9f).contains(&code) || matches!(c, '"' | '*' | '/' | ':' | '<' | '>' | '?' | '\\' | '|') {
+            return Err(Error::BadName);
+        }
+    }
+    Ok(())
 }
 
 /// A FAT32 short name: the 11 stored bytes, the NT case flags (0x08 = base lower case, 0x10 = extension lower case)
@@ -146,12 +197,15 @@ pub fn short_text(short: &[u8], case_flags: u8, out: &mut [u8; 13]) -> usize {
     length
 }
 
-/// exFAT's name hash: over the UTF-16LE bytes of the up-cased name.
+/// exFAT's name hash: over the UTF-16LE bytes of the up-cased name (`name` is UTF-8).
 pub fn exfat_hash(name: &[u8]) -> u16 {
     let mut hash = 0u16;
-    for &byte in name {
-        for part in [byte.to_ascii_uppercase(), 0] {
-            hash = (hash << 15 | hash >> 1).wrapping_add(u16::from(part));
+    for c in core::str::from_utf8(name).unwrap_or("").chars() {
+        let mut pair = [0u16; 2];
+        for unit in upcase(c).encode_utf16(&mut pair) {
+            for part in unit.to_le_bytes() {
+                hash = (hash << 15 | hash >> 1).wrapping_add(u16::from(part));
+            }
         }
     }
     hash
@@ -181,5 +235,19 @@ mod tests {
         assert_eq!(validate(b"bad:name"), Err(Error::BadName));
         assert_eq!(validate(b""), Err(Error::BadName));
         assert_eq!(validate("åäö".as_bytes()), Err(Error::BadName));
+    }
+
+    #[test]
+    fn exfat_names_are_unicode() {
+        assert!(validate_exfat("Räksmörgås 日本語 😀.txt".as_bytes()).is_ok());
+        assert_eq!(validate_exfat(b"bad\xe5"), Err(Error::BadName));
+        assert_eq!(validate_exfat("a:ö".as_bytes()), Err(Error::BadName));
+        assert_eq!(validate_exfat("ö".repeat(61).as_bytes()), Err(Error::BadName));
+        assert!(validate_exfat("ö".repeat(60).as_bytes()).is_ok());
+        assert_eq!(units("a😀".as_bytes()), Some(3));
+        assert!(eq_ignore_case("ÅÄÖ.TXT".as_bytes(), "åäö.txt".as_bytes()));
+        assert!(!eq_ignore_case("a\u{30a}".as_bytes(), "å".as_bytes()));
+        assert_eq!(exfat_hash("åäö".as_bytes()), exfat_hash("ÅÄÖ".as_bytes()));
+        assert_eq!(exfat_hash(b"abc"), exfat_hash(b"ABC"));
     }
 }
