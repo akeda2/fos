@@ -430,6 +430,11 @@ fn kup_finish(kup: &Kup, staging: &mut [u8]) -> Result<u8, u8> {
         println!("KUP: checksum mismatch; image rejected.");
         return Err(KUP_CHECKSUM_MISMATCH);
     }
+    // The receive path cannot sleep, so a busy disk (a tape or NETFS transfer) fails this attempt; the host retries.
+    let Some(_disk_lock) = crate::tapefs::try_lock() else {
+        println!("KUP: the disk is busy; try again.");
+        return Err(KUP_DISK_ERROR);
+    };
     let (Some(metadata), Some((disk, payload))) = (slots::read_metadata(), slots::payload()) else { return Err(KUP_DISK_ERROR) };
     let slot = 1 - (metadata.active_slot & 1);
     let sectors = kup.expected.div_ceil(512);

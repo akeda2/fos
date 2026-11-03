@@ -24,7 +24,8 @@ static LOCK: sched::SleepMutex<()> = sched::SleepMutex::new(());
 /// other callers sleep (`SleepMutex`), not spin. The drivers poll for completion and do not touch their state from an
 /// interrupt handler.
 pub struct DiskGuard {
-    flags: bool,
+    /// The interrupt state to restore; `None` when the guard left it alone (`try_lock`).
+    flags: Option<bool>,
     _lock: sched::SleepGuard<'static, ()>,
 }
 
@@ -32,12 +33,20 @@ pub fn lock() -> DiskGuard {
     let guard = LOCK.lock();
     let flags = crate::cpu::interrupts_save_and_disable();
     crate::cpu::interrupts_enable();
-    DiskGuard { flags, _lock: guard }
+    DiskGuard { flags: Some(flags), _lock: guard }
+}
+
+/// The disk lock if it is free, without sleeping and without touching the interrupt flag: for the NIC receive path (KUP), where
+/// waiting is not allowed.
+pub fn try_lock() -> Option<DiskGuard> {
+    LOCK.try_lock().map(|guard| DiskGuard { flags: None, _lock: guard })
 }
 
 impl Drop for DiskGuard {
     fn drop(&mut self) {
-        crate::cpu::interrupts_restore(self.flags);
+        if let Some(flags) = self.flags {
+            crate::cpu::interrupts_restore(flags);
+        }
     }
 }
 
