@@ -208,10 +208,50 @@ fn replace_in_place() -> bool {
     REPLACE_IN_PLACE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// A file name any FOSFS version could hold: up to 48 letters, digits, `.`, `_`, `-` or `+`. A v3 volume applies
-/// the stricter `valid_name_v3` itself, so a caller may check with this and let the volume refuse the rest.
+/// A file name a v4 volume can hold: up to 48 bytes of UTF-8 (`.`, `_`, `-`, `+`, ASCII letters and digits, and any
+/// non-ASCII character that is not a control, line separator, byte-order mark, bidirectional override or
+/// non-character). Names are compared byte for byte, so å typed precomposed (NFC) and as a + combining ring (NFD,
+/// macOS) are two different files; nothing is normalised. A v3 volume applies the stricter `valid_name_v3` itself, so
+/// a caller may check with this and let the volume refuse the rest.
 pub fn valid_name(name: &[u8]) -> bool {
-    !name.is_empty() && name.len() <= MAX_NAME && name.iter().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'+'))
+    if name.is_empty() || name.len() > MAX_NAME {
+        return false;
+    }
+    let Ok(text) = core::str::from_utf8(name) else { return false };
+    text.chars().all(|c| {
+        if c.is_ascii() {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+')
+        } else {
+            !matches!(c as u32, 0x80..=0x9f | 0x2028 | 0x2029 | 0x202a..=0x202e | 0x2066..=0x2069 | 0xfdd0..=0xfdef | 0xfeff | 0xfffe | 0xffff)
+                && (c as u32) & 0xfffe != 0xfffe
+        }
+    })
+}
+
+/// A size as a person types it: a number with an optional unit, in 512-byte sectors. `512M`, `2G`, `1.5G`, `512MB`,
+/// `2GiB`, `100K`, `1T`; units are binary (1 GB = 1024 MB, as `disks` shows MiB) and a bare number is megabytes.
+pub fn parse_size(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let digits = text.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(text.len());
+    let (number, unit) = text.split_at(digits);
+    let unit = unit.trim();
+    let unit = unit.strip_suffix("iB").or_else(|| unit.strip_suffix("ib")).or_else(|| unit.strip_suffix(['B', 'b'])).unwrap_or(unit);
+    let bytes: u64 = match unit {
+        "" | "M" | "m" => 1 << 20,
+        "K" | "k" => 1 << 10,
+        "G" | "g" => 1 << 30,
+        "T" | "t" => 1 << 40,
+        _ => return None,
+    };
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    if whole.is_empty() && fraction.is_empty() || fraction.len() > 6 {
+        return None;
+    }
+    let whole: u64 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
+    let scale = 10u64.pow(fraction.len() as u32);
+    let fraction: u64 = if fraction.is_empty() { 0 } else { fraction.parse().ok()? };
+    let total = whole.checked_mul(bytes)?.checked_add(bytes / scale * fraction + bytes % scale * fraction / scale)?;
+    Some(total / 512)
 }
 
 /// A path any v4 volume can hold: names (`valid_name`) separated by single `/`, at most `MAX_PATH` bytes.
@@ -387,6 +427,57 @@ impl Volume {
     pub fn grow(&self, sectors: u64) -> Result<Volume, Error> {
         if sectors <= self.sectors {
             return Ok(*self);
+        }
+        let mut sector = self.read_super()?;
+        sector[28..36].copy_from_slice(&(sectors - self.data_start()).to_le_bytes());
+        self.write_super(&sector)?;
+        Volume::mount(self.disk, self.base, sectors)
+    }
+
+    /// The smallest size, in sectors, this volume can be shrunk to: everything in use, if it could be packed.
+    pub fn min_sectors(&self) -> Result<u64, Error> {
+        let mut used = 0u64;
+        self.for_each_all(|entry| used += entry.sector_count)?;
+        Ok(self.data_start() + used.max(8))
+    }
+
+    /// Makes the volume `sectors` sectors (a partition about to be shrunk to that size, or already is). Every extent that
+    /// reaches past the new end is copied into a free run below it, and only then does its directory slot (one sector
+    /// write) point at the copy, so a power cut leaves each file either where it was or at its new place; the old copy is
+    /// never overwritten, since the new place was free. The size in the superblock changes last. `DataFull` if the files
+    /// cannot fit, or no single free run below the new end holds an extent (delete or copy files and try again). The
+    /// partition must be shrunk only afterwards. Returns the volume as it is now.
+    pub fn shrink(&self, sectors: u64) -> Result<Volume, Error> {
+        if sectors >= self.sectors {
+            return Ok(*self);
+        }
+        if sectors < self.min_sectors()? {
+            return Err(Error::DataFull);
+        }
+        let mut chunk = [0u8; CHUNK_SECTORS * 512];
+        loop {
+            let mut victim = None;
+            self.for_each_all(|entry| {
+                if victim.is_none() {
+                    if let Some(n) = entry.extents[..entry.extent_count].iter().position(|&(start, count)| count > 0 && start + u64::from(count) > sectors) {
+                        victim = Some((entry, n));
+                    }
+                }
+            })?;
+            let Some((entry, n)) = victim else { break };
+            let (start, count) = entry.extents[n];
+            let target = self.free_extent_within(u64::from(count), None, sectors)?.ok_or(Error::DataFull)?;
+            let mut done = 0u64;
+            while done < u64::from(count) {
+                let take = (u64::from(count) - done).min(CHUNK_SECTORS as u64) as usize;
+                block::read(self.disk, self.base + start + done, &mut chunk[..take * 512])?;
+                block::write(self.disk, self.base + target + done, &chunk[..take * 512])?;
+                done += take as u64;
+            }
+            self.patch_slot(&entry, |slot| {
+                let at = if self.version == 4 { EXTENTS_AT + n * 12 } else { 4 };
+                slot[at..at + 8].copy_from_slice(&target.to_le_bytes());
+            })?;
         }
         let mut sector = self.read_super()?;
         sector[28..36].copy_from_slice(&(sectors - self.data_start()).to_le_bytes());
@@ -1206,6 +1297,11 @@ impl Volume {
 
     /// First-fit search for `count` free sectors, ignoring the extent of `replacing`.
     fn free_extent(&self, count: u64, replacing: Option<&Entry>) -> Result<Option<u64>, Error> {
+        self.free_extent_within(count, replacing, self.sectors)
+    }
+
+    /// As `free_extent`, but the run must end at or before sector `limit`.
+    fn free_extent_within(&self, count: u64, replacing: Option<&Entry>, limit: u64) -> Result<Option<u64>, Error> {
         if count == 0 {
             return Ok(Some(self.data_start()));
         }
@@ -1217,7 +1313,7 @@ impl Volume {
             }
             candidate = candidate.max(end);
         }
-        Ok((candidate + count <= self.sectors).then_some(candidate))
+        Ok((candidate + count <= limit).then_some(candidate))
     }
 }
 

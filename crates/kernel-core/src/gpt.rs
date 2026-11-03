@@ -310,3 +310,65 @@ pub fn grow_last_partition(disk: usize, type_guid: &[u8; 16]) -> Result<Partitio
     }
     Ok(Partition { unique_guid: entries[index * size + 16..index * size + 32].try_into().unwrap(), start: first, sectors: new_last - first + 1 })
 }
+
+/// Why `shrink_partition` did nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShrinkError {
+    NoGpt,
+    NoPartition,
+    /// The new size is not smaller than the partition.
+    NotSmaller,
+    Disk,
+}
+
+/// Shortens the first partition of `type_guid` to `sectors` sectors, in both copies of the table (primary first, then the
+/// backup; each is valid on its own at every moment, so a power cut leaves a usable disk). The data in the freed tail is
+/// untouched. The caller has already shrunk whatever lives in the partition. Returns the partition as it now is.
+pub fn shrink_partition(disk: usize, type_guid: &[u8; 16], sectors: u64) -> Result<Partition, ShrinkError> {
+    let mut primary = [0u8; 512];
+    block::read(disk, 1, &mut primary).map_err(|_| ShrinkError::Disk)?;
+    if &primary[0..8] != b"EFI PART" {
+        return Err(ShrinkError::NoGpt);
+    }
+    let backup_lba = u64::from_le_bytes(primary[32..40].try_into().unwrap());
+    let mut result = None;
+    for header_lba in [1, backup_lba] {
+        let mut header = [0u8; 512];
+        block::read(disk, header_lba, &mut header).map_err(|_| ShrinkError::Disk)?;
+        if &header[0..8] != b"EFI PART" {
+            continue; // a missing backup is not this call's to repair
+        }
+        let entries_lba = u64::from_le_bytes(header[72..80].try_into().unwrap());
+        let count = u32::from_le_bytes(header[80..84].try_into().unwrap()) as usize;
+        let size = u32::from_le_bytes(header[84..88].try_into().unwrap()) as usize;
+        if !(128..=512).contains(&size) || count == 0 || count * size > 128 * 128 {
+            return Err(ShrinkError::NoGpt);
+        }
+        let bytes = count * size;
+        let entries = unsafe { &mut *core::ptr::addr_of_mut!(ENTRY_ARRAY) };
+        entries.fill(0);
+        for sector in 0..bytes.div_ceil(512) {
+            block::read(disk, entries_lba + sector as u64, &mut entries[sector * 512..sector * 512 + 512]).map_err(|_| ShrinkError::Disk)?;
+        }
+        let index = (0..count).find(|&index| &entries[index * size..index * size + 16] == type_guid).ok_or(ShrinkError::NoPartition)?;
+        let entry = &mut entries[index * size..(index + 1) * size];
+        let first = u64::from_le_bytes(entry[32..40].try_into().unwrap());
+        let last = u64::from_le_bytes(entry[40..48].try_into().unwrap());
+        if sectors == 0 || sectors >= last - first + 1 {
+            return Err(ShrinkError::NotSmaller);
+        }
+        entry[40..48].copy_from_slice(&(first + sectors - 1).to_le_bytes());
+        result = Some(Partition { unique_guid: entry[16..32].try_into().unwrap(), start: first, sectors });
+        let entries_crc = crc32(&entries[..bytes]);
+        let header_size = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+        header[88..92].copy_from_slice(&entries_crc.to_le_bytes());
+        header[16..20].fill(0);
+        let crc = crc32(&header[..header_size.min(512)]);
+        header[16..20].copy_from_slice(&crc.to_le_bytes());
+        for sector in 0..bytes.div_ceil(512) {
+            block::write(disk, entries_lba + sector as u64, &entries[sector * 512..sector * 512 + 512]).map_err(|_| ShrinkError::Disk)?;
+        }
+        block::write(disk, header_lba, &header).map_err(|_| ShrinkError::Disk)?;
+    }
+    result.ok_or(ShrinkError::NoGpt)
+}

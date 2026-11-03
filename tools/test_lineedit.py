@@ -71,6 +71,11 @@ def main():
             type_keys("uptime\n")
             check(uptimes() == before + 1, "and the next command is clean", guest.text()[-300:])
 
+            before = guest.text().count("åäö")
+            type_keys("echo åäÖ\x1b[D\x1b[Dx\x08\x03")
+            type_keys("echo åäö\n")
+            check("åäÖ" in guest.text() and guest.text().count("åäö") >= before + 2, "å ä ö are typed, edited around and echoed", guest.text()[-300:])
+
             before = memories()
             type_keys("mem" + UP + DOWN + "ory" + "\n")
             check(memories() == before + 1, "the half-typed line (mem) comes back after browsing the history, then completes to memory", guest.text()[-400:])

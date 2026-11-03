@@ -8,8 +8,11 @@
 //! keys as single private codes (`fosfor_abi::keymap`). Editing is drawn with the sequences the framebuffer console
 //! and every terminal understand: carriage return, cursor left/right, erase to the end of the line, clear screen. A
 //! change in the middle of the line redraws the line from the prompt; typing at the end just echoes the character.
+//!
+//! å ä ö Å Ä Ö: from a local Nordic keyboard (private codes) or as UTF-8 from a terminal. The line holds one byte per
+//! character (Latin-1, so every character is one cursor step) and `feed` hands the finished line back as UTF-8.
 
-use fosfor_abi::keymap::{KEY_DELETE, KEY_DOWN, KEY_END, KEY_HOME, KEY_LEFT, KEY_RIGHT, KEY_UP};
+use fosfor_abi::keymap::{utf8_sequence, KEY_DELETE, KEY_DOWN, KEY_END, KEY_HOME, KEY_LEFT, KEY_RIGHT, KEY_UP};
 
 /// The longest command line.
 pub const LINE_MAX: usize = 120;
@@ -32,6 +35,8 @@ struct Editor {
     last_was_cr: bool,
     escape: Escape,
     parameter: u16,
+    /// A UTF-8 lead byte (0xc2/0xc3) waiting for its second byte.
+    lead: u8,
     history: [[u8; LINE_MAX]; HISTORY],
     history_lengths: [usize; HISTORY],
     /// How many entries are stored (the newest is at `count - 1`).
@@ -50,6 +55,7 @@ static mut EDITOR: Editor = Editor {
     last_was_cr: false,
     escape: Escape::None,
     parameter: 0,
+    lead: 0,
     history: [[0; LINE_MAX]; HISTORY],
     history_lengths: [0; HISTORY],
     count: 0,
@@ -69,15 +75,22 @@ pub fn reset() {
     editor.cursor = 0;
     editor.last_was_cr = false;
     editor.escape = Escape::None;
+    editor.lead = 0;
     editor.browsing = None;
+}
+
+/// The Latin-1 code of a Nordic letter's private key code.
+fn latin1_of_key(key: u8) -> Option<u8> {
+    let text = core::str::from_utf8(utf8_sequence(key)?).ok()?;
+    u8::try_from(u32::from(text.chars().next()?)).ok()
 }
 
 impl Editor {
     /// Redraws the whole line from the prompt and puts the cursor where it belongs.
     fn redraw(&self) {
         crate::print(format_args!("\r{PROMPT}"));
-        if let Ok(text) = core::str::from_utf8(&self.line[..self.length]) {
-            crate::print(format_args!("{text}"));
+        for &byte in &self.line[..self.length] {
+            crate::print(format_args!("{}", byte as char));
         }
         crate::print(format_args!("\x1b[K"));
         if self.cursor < self.length {
@@ -284,6 +297,12 @@ pub fn feed(byte: u8, out: &mut [u8; LINE_MAX]) -> Option<usize> {
         }
         Escape::None => {}
     }
+    // The second byte of a UTF-8 å ä ö: 0xc3 0xa5 is U+00E5, one Latin-1 character.
+    let lead = core::mem::take(&mut editor.lead);
+    if lead != 0 && (0x80..=0xbf).contains(&byte) {
+        editor.insert((lead << 6) | (byte & 0x3f));
+        return None;
+    }
     // A CR LF pair from a terminal is one Enter.
     if byte == b'\n' && editor.last_was_cr {
         editor.last_was_cr = false;
@@ -296,8 +315,17 @@ pub fn feed(byte: u8, out: &mut [u8; LINE_MAX]) -> Option<usize> {
             editor.last_was_cr = byte == b'\r';
             crate::println!();
             editor.remember();
-            let length = editor.length;
-            out[..length].copy_from_slice(&editor.line[..length]);
+            let mut length = 0;
+            for &byte in &editor.line[..editor.length] {
+                if byte < 0x80 {
+                    out[length] = byte;
+                    length += 1;
+                } else if length + 2 <= LINE_MAX {
+                    out[length] = 0xc0 | (byte >> 6);
+                    out[length + 1] = 0x80 | (byte & 0x3f);
+                    length += 2;
+                }
+            }
             editor.length = 0;
             editor.cursor = 0;
             return Some(length);
@@ -327,7 +355,12 @@ pub fn feed(byte: u8, out: &mut [u8; LINE_MAX]) -> Option<usize> {
         KEY_END => editor.end(),
         KEY_DELETE => editor.delete(),
         0x20..=0x7e => editor.insert(byte),
-        _ => {}
+        0xc2 | 0xc3 => editor.lead = byte & 3,
+        _ => {
+            if let Some(letter) = latin1_of_key(byte) {
+                editor.insert(letter);
+            }
+        }
     }
     None
 }

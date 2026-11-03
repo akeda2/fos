@@ -28,6 +28,7 @@ pub mod hal {
 pub mod ahci;
 pub mod audio;
 pub mod e1000;
+pub mod ext4vol;
 pub mod fatvol;
 pub mod fosfs;
 pub mod slot_report;

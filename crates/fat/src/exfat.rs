@@ -109,7 +109,7 @@ impl<D: Device> Fs<D> {
         let mut remaining = 0usize; // secondary entries still to come in the current set
         let mut current = Entry::new(b"");
         let mut name_length = 0usize;
-        let mut text = [0u8; 64];
+        let mut text = [0u16; 64];
         let mut length = 0usize;
         self.root_sectors(|lba, sector| {
             for slot in 0..SECTOR / 32 {
@@ -144,7 +144,7 @@ impl<D: Device> Fs<D> {
                         for index in 0..15 {
                             let unit = le16(entry, 2 + index * 2);
                             if length < 64 {
-                                text[length] = if unit < 0x80 { unit as u8 } else { b'?' };
+                                text[length] = unit;
                                 length += 1;
                             }
                         }
@@ -154,8 +154,15 @@ impl<D: Device> Fs<D> {
                 if remaining == 0 {
                     let mut found = current;
                     let shown = name_length.min(length);
-                    found.name = Entry::new(&text[..shown]).name;
-                    found.name_length = shown;
+                    let mut utf8 = [0u8; name::MAX_BYTES];
+                    let mut used = 0;
+                    // UTF-16 to UTF-8; a lone surrogate becomes U+FFFD.
+                    for decoded in char::decode_utf16(text[..shown].iter().copied()) {
+                        let c = decoded.unwrap_or(char::REPLACEMENT_CHARACTER);
+                        used += c.encode_utf8(&mut utf8[used..]).len();
+                    }
+                    found.name = Entry::new(&utf8[..used]).name;
+                    found.name_length = used;
                     if visit(&found) {
                         return Visit::Done(());
                     }
@@ -275,7 +282,7 @@ impl<D: Device> Fs<D> {
     }
 
     pub(crate) fn exfat_create(&mut self, name: &[u8], reserve: u64) -> Result<Stream, Error> {
-        name::validate(name)?;
+        name::validate_exfat(name)?;
         let cluster_bytes = self.cluster_bytes();
         let want = if reserve == 0 { 0 } else { reserve.div_ceil(cluster_bytes).min(u64::from(self.clusters)) as u32 };
         let (start, count) = self.exfat_find_run(want)?;
@@ -283,7 +290,7 @@ impl<D: Device> Fs<D> {
             return Err(Error::NoSpace);
         }
         self.bitmap_mark(start, count, true)?;
-        let entries = 2 + name.len().div_ceil(15);
+        let entries = name::exfat_entries(name);
         let found = match self.exfat_free_entries(entries) {
             Ok(found) => found,
             Err(error) => {
@@ -320,7 +327,7 @@ impl<D: Device> Fs<D> {
     /// name entries for `name`: the entry count, name length, hash and checksum are filled in here. The set must lie
     /// inside the sector (what `exfat_free_entries` and a set found by `exfat_walk` both guarantee for our names).
     fn exfat_put_set(&mut self, lba: u64, offset: usize, head: &[u8; 64], name: &[u8]) -> Result<(), Error> {
-        let entries = 2 + name.len().div_ceil(15);
+        let entries = name::exfat_entries(name);
         if offset + entries * 32 > SECTOR {
             return Err(Error::Unsupported);
         }
@@ -330,13 +337,23 @@ impl<D: Device> Fs<D> {
         set.fill(0);
         set[..64].copy_from_slice(head);
         set[1] = (entries - 1) as u8;
-        set[35] = name.len() as u8;
+        let mut units = [0u16; name::MAX_UNITS];
+        let mut count = 0;
+        for c in core::str::from_utf8(name).unwrap_or("").chars() {
+            for unit in c.encode_utf16(&mut [0u16; 2]) {
+                if count < units.len() {
+                    units[count] = *unit;
+                    count += 1;
+                }
+            }
+        }
+        set[35] = count as u8;
         set[36..38].copy_from_slice(&name::exfat_hash(name).to_le_bytes());
-        for (index, chunk) in name.chunks(15).enumerate() {
+        for (index, chunk) in units[..count].chunks(15).enumerate() {
             let at = 64 + index * 32;
             set[at] = 0xc1;
-            for (position, &byte) in chunk.iter().enumerate() {
-                set[at + 2 + position * 2..at + 4 + position * 2].copy_from_slice(&u16::from(byte).to_le_bytes());
+            for (position, unit) in chunk.iter().enumerate() {
+                set[at + 2 + position * 2..at + 4 + position * 2].copy_from_slice(&unit.to_le_bytes());
             }
         }
         let checksum = set_checksum(set);
@@ -347,7 +364,7 @@ impl<D: Device> Fs<D> {
     /// A new directory: one zeroed cluster with its own end-of-chain mark, claimed in the bitmap, and only then the
     /// entry set that makes it visible (a cut before that leaks a cluster, which `fsck.exfat` repairs).
     pub(crate) fn exfat_mkdir(&mut self, name: &[u8]) -> Result<(), Error> {
-        name::validate(name)?;
+        name::validate_exfat(name)?;
         if self.entry(name)?.is_some() {
             return Err(Error::Exists);
         }
@@ -357,7 +374,7 @@ impl<D: Device> Fs<D> {
         }
         self.bitmap_mark(cluster, 1, true)?;
         let prepared = self.zero_cluster(cluster).and_then(|_| self.fat_set_range(cluster, 1, |_| 0xffff_ffff));
-        let placed = prepared.and_then(|_| self.exfat_free_entries(2 + name.len().div_ceil(15)));
+        let placed = prepared.and_then(|_| self.exfat_free_entries(name::exfat_entries(name)));
         let (lba, offset) = match placed {
             Ok(place) => place,
             Err(error) => {
@@ -510,7 +527,7 @@ impl<D: Device> Fs<D> {
     /// deleted after, and a cut between leaves both names on one chain, which `fsck.exfat` tidies up. False when `to`
     /// is taken by another entry.
     pub(crate) fn exfat_rename(&mut self, from: &[u8], to: &[u8]) -> Result<bool, Error> {
-        name::validate(to)?;
+        name::validate_exfat(to)?;
         let old = self.entry(from)?.ok_or(Error::NotFound)?;
         if self.entry(to)?.is_some_and(|other| (other.set_lba, other.set_offset) != (old.set_lba, old.set_offset)) {
             return Ok(false);
@@ -536,11 +553,11 @@ impl<D: Device> Fs<D> {
 
     /// Writes a parked entry set into the current directory as `name`; false if the name is taken.
     pub(crate) fn exfat_put(&mut self, head: &[u8; 64], name: &[u8]) -> Result<bool, Error> {
-        name::validate(name)?;
+        name::validate_exfat(name)?;
         if self.entry(name)?.is_some() {
             return Ok(false);
         }
-        let (lba, offset) = self.exfat_free_entries(2 + name.len().div_ceil(15))?;
+        let (lba, offset) = self.exfat_free_entries(name::exfat_entries(name))?;
         self.exfat_put_set(lba, offset, head, name)?;
         Ok(true)
     }

@@ -81,7 +81,7 @@ struct NetfsPut {
     active: bool,
     source: [u8; 6],
     disk: usize,
-    name: [u8; 16],
+    name: [u8; crate::fosfs::MAX_NAME],
     name_length: usize,
     expected: usize,
     checksum: u16,
@@ -90,7 +90,7 @@ struct NetfsPut {
     last_activity: u64,
 }
 
-static mut NETFS_PUT: NetfsPut = NetfsPut { active: false, source: [0; 6], disk: 0, name: [0; 16], name_length: 0, expected: 0, checksum: 0, received: 0, next_sequence: 0, last_activity: 0 };
+static mut NETFS_PUT: NetfsPut = NetfsPut { active: false, source: [0; 6], disk: 0, name: [0; crate::fosfs::MAX_NAME], name_length: 0, expected: 0, checksum: 0, received: 0, next_sequence: 0, last_activity: 0 };
 
 pub(crate) fn netfs_reply(index: usize, destination: &[u8; 6], tag: u8, payload: &[u8]) {
     send(index, destination, tag, payload);
@@ -184,7 +184,7 @@ fn netfs_put_request(index: usize, source: [u8; 6], payload: &[u8]) {
         return reply_error(NETFS_TOO_LARGE);
     }
     let put = unsafe { &mut *core::ptr::addr_of_mut!(NETFS_PUT) };
-    *put = NetfsPut { active: true, source, disk: usize::from(payload[0]), name: [0; 16], name_length: name.len(), expected, checksum, received: 0, next_sequence: 0, last_activity: timer::ticks() };
+    *put = NetfsPut { active: true, source, disk: usize::from(payload[0]), name: [0; crate::fosfs::MAX_NAME], name_length: name.len(), expected, checksum, received: 0, next_sequence: 0, last_activity: timer::ticks() };
     put.name[..name.len()].copy_from_slice(name);
     crate::println!("NETFS: receiving {} ({expected} bytes) from {}.", core::str::from_utf8(name).unwrap_or("?"), crate::netdump::Mac(&source));
 }

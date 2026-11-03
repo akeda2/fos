@@ -85,9 +85,23 @@ ERROR_NAMES = {
     8: "checksum mismatch (data was damaged in transit)",
     9: "busy: another transfer is in progress on that machine",
 }
-NAME_CAPACITY = 16
 CHUNK_LEN = 1024
-NAME_RE = re.compile(r"^[a-z0-9._-]{1,%d}$" % NAME_CAPACITY)  # fosfs::valid_name
+NAME_CAPACITY = 48  # fosfs::MAX_NAME: bytes of UTF-8 (a v3 volume refuses what its 16 lowercase characters cannot hold)
+NAME_RE = re.compile(r"^[A-Za-z0-9._+-]+$")  # the ASCII part of fosfs::valid_name
+
+
+def legal_name(name: str) -> bool:
+    """fosfs::valid_name: UTF-8 up to 48 bytes; ASCII letters, digits and . _ - +; other characters unless control or format."""
+    if not name or len(name.encode()) > NAME_CAPACITY:
+        return False
+    for char in name:
+        code = ord(char)
+        if code < 0x80:
+            if not NAME_RE.match(char):
+                return False
+        elif code <= 0x9F or code in (0x2028, 0x2029, 0xFEFF) or 0x202A <= code <= 0x202E or 0x2066 <= code <= 0x2069 or 0xFDD0 <= code <= 0xFDEF or code & 0xFFFE == 0xFFFE or 0xD800 <= code <= 0xDFFF:
+            return False
+    return True
 REMOTE_RE = re.compile(r"^(?P<host>[^/]*?)(?::disk(?P<disk>\d+))?/(?P<name>[^/]*)$")
 
 
@@ -346,8 +360,8 @@ def main() -> None:
             name = local.name
         if not data:
             raise Fatal("refusing to copy an empty file (fos rejects zero-length files)")
-    if not NAME_RE.match(name):
-        raise Fatal(f"'{name}' is not a legal FOSFS name (up to {NAME_CAPACITY} of a-z 0-9 . _ -)")
+    if not legal_name(name):
+        raise Fatal(f"'{name}' is not a legal FOSFS name (up to {NAME_CAPACITY} bytes of UTF-8: letters, digits . _ - + and non-ASCII characters)")
     if disk < 1:
         raise Fatal("disk numbers start at 1")
 

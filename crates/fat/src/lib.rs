@@ -130,7 +130,7 @@ impl Time {
 /// A root directory entry, as `list` and `find` see it.
 #[derive(Clone, Copy)]
 pub struct Entry {
-    name: [u8; 64],
+    name: [u8; name::MAX_BYTES],
     name_length: usize,
     pub size: u64,
     pub first_cluster: u32,
@@ -146,13 +146,13 @@ pub struct Entry {
 
 impl Entry {
     pub(crate) fn new(name: &[u8]) -> Entry {
-        let mut stored = [0u8; 64];
-        let length = name.len().min(64);
+        let mut stored = [0u8; name::MAX_BYTES];
+        let length = name.len().min(name::MAX_BYTES);
         stored[..length].copy_from_slice(&name[..length]);
         Entry { name: stored, name_length: length, size: 0, first_cluster: 0, contiguous: false, is_directory: false, modified: None, set_lba: 0, set_offset: 0, set_entries: 0 }
     }
 
-    /// The name as ASCII (characters outside it are shown as `?`).
+    /// The name as UTF-8 (exFAT; a FAT32 long name shows characters outside ASCII as `?`).
     pub fn name(&self) -> &[u8] {
         &self.name[..self.name_length]
     }

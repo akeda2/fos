@@ -187,6 +187,14 @@ fn a_partition_table_is_written_found_and_grown() {
     let found = gpt::find(number, &guid, |_| true).unwrap();
     assert_eq!((found.start, found.sectors), (made.start, made.sectors));
     assert!(matches!(gpt::inspect(number), Some(gpt::Summary::Gpt { fosfs: Some(_), other: 0 })));
+    // Shrinking changes the end in the primary and the backup table, and refuses to "shrink" to the same or a larger size.
+    let half = made.sectors / 2;
+    assert_eq!(gpt::shrink_partition(number, &guid, half).unwrap().sectors, half);
+    assert_eq!(gpt::find(number, &guid, |_| true).unwrap().sectors, half);
+    assert_eq!(gpt::shrink_partition(number, &guid, half).err(), Some(gpt::ShrinkError::NotSmaller));
+    let mut backup = [0u8; 512];
+    DISKS.block_read(number, SECTORS - 33, &mut backup).unwrap();
+    assert_eq!(u64::from_le_bytes(backup[40..48].try_into().unwrap()), made.start + half - 1);
 }
 
 #[test]
@@ -240,4 +248,103 @@ fn volumes_are_found_by_label_and_the_boot_volume_is_remembered() {
 fn gpt_fosfs(number: usize) -> bool {
     let partition = kernel_core::gpt::write_single_fosfs_partition(number).unwrap();
     Volume::format_version(number, partition.start, partition.sectors, b"findme", 4).is_ok()
+}
+
+#[test]
+fn v4_names_are_utf8() {
+    let number = disk(20);
+    let volume = Volume::format_version(number, 0, SECTORS, b"utf", 4).unwrap();
+    let name = "Räksmörgås/Ärende å ö.txt".replace(' ', "_");
+    volume.mkdir("Räksmörgås".as_bytes()).unwrap();
+    assert!(volume.accepts_name(name.as_bytes()));
+    volume.write(name.as_bytes(), b"hej").unwrap();
+    volume.write("日本語.txt".as_bytes(), b"x").unwrap();
+    let again = Volume::mount(number, 0, SECTORS).unwrap();
+    let mut buffer = [0u8; 8];
+    assert_eq!(again.read(name.as_bytes(), &mut buffer).unwrap(), Some(3));
+    assert_eq!(again.read("日本語.txt".as_bytes(), &mut buffer).unwrap(), Some(1));
+    // Byte-exact: NFC and NFD å are different names. Controls, bad UTF-8 and over-long names are refused.
+    assert_eq!(again.read("a\u{30a}".as_bytes(), &mut buffer).unwrap(), None);
+    assert!(!volume.accepts_name(b"bad\xe5name"));
+    assert!(!volume.accepts_name("tab\u{85}".as_bytes()));
+    assert!(!volume.accepts_name("ö".repeat(25).as_bytes()));
+    assert!(volume.accepts_name("ö".repeat(24).as_bytes()));
+}
+
+#[test]
+fn sizes_take_units() {
+    use kernel_core::fosfs::parse_size;
+    assert_eq!(parse_size("512"), Some(512 * 2048));
+    assert_eq!(parse_size("512M"), Some(512 * 2048));
+    assert_eq!(parse_size("512MB"), Some(512 * 2048));
+    assert_eq!(parse_size("2G"), Some(2 * 1024 * 2048));
+    assert_eq!(parse_size("2GiB"), Some(2 * 1024 * 2048));
+    assert_eq!(parse_size("1.5g"), Some(1536 * 2048));
+    assert_eq!(parse_size("64K"), Some(128));
+    assert_eq!(parse_size("1T"), Some(1 << 31));
+    assert_eq!(parse_size("G"), None);
+    assert_eq!(parse_size("12X"), None);
+    assert_eq!(parse_size(""), None);
+    assert_eq!(parse_size("99999999999T"), None);
+}
+
+fn pattern(n: usize, length: usize) -> Vec<u8> {
+    (0..length).map(|i| (i * 31 + n * 7 + (i >> 9)) as u8).collect()
+}
+
+#[test]
+fn shrink_moves_files_below_the_new_end() {
+    for (version, number) in [(4u8, 21usize), (3, 22)] {
+        let disk = disk(number);
+        let volume = Volume::format_version(disk, 0, SECTORS, b"shrink", version).unwrap();
+        let name = |n: usize| format!("f{n}");
+        for n in 0..8 {
+            volume.write(name(n).as_bytes(), &pattern(n, 1 << 20)).unwrap();
+        }
+        for n in [1, 3, 5] {
+            assert!(volume.remove(name(n).as_bytes()).unwrap());
+        }
+        // 5 MiB of files in a 10 MiB volume; the last three files lie beyond 6 MiB.
+        let minimum = volume.min_sectors().unwrap();
+        assert!(minimum > 5 * 2048 && minimum < 5 * 2048 + 128, "{minimum}");
+        assert!(volume.shrink(minimum - 1).is_err(), "cannot be smaller than what is in use");
+        let small = volume.shrink(6 * 2048 + 64).unwrap();
+        assert_eq!(small.sectors, 6 * 2048 + 64);
+        // Mounted from a partition of the new size, every file reads back intact.
+        let again = Volume::mount(disk, 0, 6 * 2048 + 64).unwrap();
+        for n in [0, 2, 4, 6, 7] {
+            let mut buffer = vec![0u8; 1 << 20];
+            assert_eq!(again.read(name(n).as_bytes(), &mut buffer).unwrap(), Some(1 << 20), "f{n}");
+            assert!(buffer == pattern(n, 1 << 20), "content of f{n} (v{version})");
+        }
+        let (free, _) = again.free_space().unwrap();
+        assert!(free < 2 * 2048 * 512, "about one MiB left: {free}");
+        assert!(again.check(|_| {}).is_ok());
+        assert!(again.write(b"extra", &pattern(9, 4 << 20)).is_err(), "the freed tail is gone");
+    }
+}
+
+#[test]
+fn shrink_says_when_a_file_cannot_move() {
+    let disk = disk(23);
+    let volume = Volume::format_version(disk, 0, SECTORS, b"frag", 4).unwrap();
+    volume.write(b"low", &pattern(1, 2 << 20)).unwrap();
+    volume.write(b"high", &pattern(2, 4 << 20)).unwrap();
+    volume.remove(b"low").unwrap();
+    // "high" is 4 MiB but the only gap below the new end is 2 MiB: refused, and nothing was changed.
+    assert!(volume.shrink(4 * 2048 + 128).is_err());
+    let same = Volume::mount(disk, 0, SECTORS).unwrap();
+    let mut buffer = vec![0u8; 4 << 20];
+    assert_eq!(same.read(b"high", &mut buffer).unwrap(), Some(4 << 20));
+    assert!(buffer == pattern(2, 4 << 20));
+    // Once a gap is big enough it moves: 5 MiB gap, 2 MiB file.
+    let disk = self::disk(24);
+    let volume = Volume::format_version(disk, 0, SECTORS, b"frag", 4).unwrap();
+    volume.write(b"low", &pattern(1, 5 << 20)).unwrap();
+    volume.write(b"high", &pattern(2, 2 << 20)).unwrap();
+    volume.remove(b"low").unwrap();
+    let moved = volume.shrink(2 * 2048 + 128).unwrap();
+    let mut buffer = vec![0u8; 2 << 20];
+    assert_eq!(moved.read(b"high", &mut buffer).unwrap(), Some(2 << 20));
+    assert!(buffer == pattern(2, 2 << 20));
 }

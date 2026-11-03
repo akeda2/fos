@@ -617,7 +617,7 @@ fn run_script(volume: crate::fosfs::Volume, file: &[u8], name: &str, arguments: 
 fn execute(command: &str) {
     let mut words = command.split_whitespace();
     let Some(word) = words.next() else { return };
-    if word != "format" {
+    if !matches!(word, "format" | "shrink") {
         crate::formatshell::cancel(); // a format needs its confirmation as the very next command
     }
     if word != "install" {
@@ -627,7 +627,7 @@ fn execute(command: &str) {
         crate::bootcode::cancel(); // and a boot-code update
     }
     // The file commands and the common ones (shellcmds.rs) are the shared shell's (`crates/shell`, docs/shell.md); `copy` (other machines too) stays here.
-    if matches!(word, "help" | "ls" | "cat" | "write" | "mkdir" | "rm" | "cp" | "mv" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill" | "about" | "version" | "hexdump" | "sha256" | "fsck" | "kup" | "recv" | "audio" | "label" | "mount" | "umount" | "format" | "debug" | "tapesync" | "gpio" | "copy" | "pci" | "cpuinfo" | "bootinfo" | "memmap" | "irqstat" | "mmio" | "io") || (word == "usb" && !matches!(words.clone().next(), Some("try" | "abort-test"))) || (word == "nic" && matches!(words.clone().next(), None | Some("list" | "sniff" | "promisc" | "peers" | "discover" | "use" | "map" | "send" | "recv"))) {
+    if matches!(word, "help" | "ls" | "cat" | "write" | "mkdir" | "rm" | "cp" | "mv" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill" | "about" | "version" | "hexdump" | "sha256" | "fsck" | "kup" | "recv" | "audio" | "label" | "shrink" | "ext4" | "mount" | "umount" | "format" | "debug" | "tapesync" | "gpio" | "copy" | "pci" | "cpuinfo" | "bootinfo" | "memmap" | "irqstat" | "mmio" | "io") || (word == "usb" && !matches!(words.clone().next(), Some("try" | "abort-test"))) || (word == "nic" && matches!(words.clone().next(), None | Some("list" | "sniff" | "promisc" | "peers" | "discover" | "use" | "map" | "send" | "recv"))) {
         fosfor_shell::execute(&mut crate::shellhost::KernelHost, &[crate::shellcmds::COMMANDS, fosfor_shell::files::COMMANDS], command);
         return;
     }

@@ -50,9 +50,9 @@ def internet_checksum(data: bytes) -> int:
 class Machine:
     """A QEMU+OVMF guest on one persistent image."""
 
-    def __init__(self, tmp, files, binaries=None):
+    def __init__(self, tmp, files, binaries=None, fosfs=3):
         self.tmp = Path(tmp)
-        arguments = []
+        arguments = ["--fosfs", str(fosfs)]
         for name, path in (binaries or {}).items():
             arguments += ["--file", f"{name}={path}"]
         for name, content in files.items():

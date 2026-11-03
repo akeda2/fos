@@ -227,8 +227,8 @@ maintainer's memory notes, not in this repository.
 - **Hostnames**: every machine broadcasts its name (`hostname` file + NIC number, else `fos-` + last 3 MAC bytes) at boot and every
   10 s (`term.rs` `announce_service`, also while a tape runs); `handle_frame` files them in the peer table (`nic peers`, ABI `peer_info`).
   `audio-net` uses that name as its session name and resolves `proto=raw|avtp to=NAME` from the table; IP `to=NAME` still needs SAP.
-- **Console text is UTF-8** (`framebuffer.rs`: Latin-9 glyphs, CP437 in BIOS text mode; `tape.rs` `api_putc` assembles sequences). Input
-  and file names are still ASCII.
+- **Console text is UTF-8** (`framebuffer.rs`: Latin-9 glyphs, CP437 in BIOS text mode; `tape.rs` `api_putc` assembles sequences). Shell
+  input takes å ä ö (private key codes or UTF-8). FOSFS v4 and exFAT file names are UTF-8 (docs/fosfs-v4.md); v3, FAT32 and labels stay ASCII.
 
 ## Conventions
 

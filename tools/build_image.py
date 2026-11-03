@@ -329,8 +329,10 @@ def build_fosfs(files, label: str = "", version: int = 3) -> bytes:
     for index, (name, contents, parent) in enumerate(entries_list):
         folder = contents is None
         contents = b"" if folder else contents
-        raw = name.encode("ascii")
-        if not (0 < len(raw) <= max_name and all(byte in allowed for byte in raw)):
+        raw = name.encode("utf-8")
+        # v4 names are UTF-8 (fosfs::valid_name): the ASCII rule applies to ASCII bytes, every other character must be printable.
+        if not (0 < len(raw) <= max_name and all(byte in allowed or (version == 4 and byte >= 0x80) for byte in raw)
+                and (version == 4 or raw.isascii()) and name.isprintable()):
             raise SystemExit(f"invalid FOSFS name {name!r}")
         if index >= directory_sectors * SECTOR // entry_size:
             raise SystemExit("too many FOSFS files")

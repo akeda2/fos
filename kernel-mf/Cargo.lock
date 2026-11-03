@@ -7,6 +7,10 @@ name = "fosfor-abi"
 version = "0.1.0"
 
 [[package]]
+name = "fosfor-ext4"
+version = "0.1.0"
+
+[[package]]
 name = "fosfor-fat"
 version = "0.1.0"
 
@@ -23,6 +27,7 @@ name = "fosfor-kernel-core"
 version = "0.1.0"
 dependencies = [
  "fosfor-abi",
+ "fosfor-ext4",
  "fosfor-fat",
  "fosfor-hal",
  "fosfor-hid",

@@ -506,3 +506,17 @@ pub fn cpuinfo() {
     let invariant = max_extended >= 0x8000_0007 && cpuid(0x8000_0007, 0).3 & (1 << 8) != 0;
     println!("tsc        {}", if invariant { "invariant" } else { "not invariant" });
 }
+
+struct Console;
+
+impl core::fmt::Write for Console {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        crate::serial::print(format_args!("{text}"));
+        Ok(())
+    }
+}
+
+/// `ext4 diskN [ls|cat|info] [PATH]`: a Linux volume, read-only.
+pub fn ext4(rest: &str) {
+    kernel_core::ext4vol::command(rest, &mut Console);
+}

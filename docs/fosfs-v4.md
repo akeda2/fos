@@ -4,8 +4,9 @@ Status: **step 1 is built (2026-10-30)**: `kernel/src/fosfs.rs` mounts v3 and v4
 volume; `tools/build_image.py --fosfs 4` builds one; `make test-fosfs4`. v3 stays the default. The rest is a plan.
 
 What step 1 does exactly: magic `FOSFS4`; 128-byte entries whose first 28 bytes match v3 (used, name length, start,
-length, sector count; name at 28, up to 48 characters of letters either case, digits, `. _ - +`, compared
-case-sensitively; the remaining bytes are zero, reserved); a directory of one entry per 4 MiB of volume, 256 to 4096
+length, sector count; name at 28, up to 48 bytes of UTF-8 (ASCII letters either case, digits, `. _ - +`, and any non-ASCII character
+except controls, line separators, BOM, bidi overrides and non-characters), compared byte for byte (no normalisation:
+NFC and NFD å are two names; `fosfs::valid_name`, `tools/build_image.py`, `tools/foscopy.py` agree); the remaining bytes are zero, reserved); a directory of one entry per 4 MiB of volume, 256 to 4096
 entries, fixed at format time; **still one contiguous extent per file** (inline multi-extent is not built: first-fit already
 fills a stick, only fragmentation would need it); labels stay v3-style (16 lowercase). No `/` in names yet (folders arrive
 with the mount table). The directory is scanned 16 sectors per request; extent searches and `fsck` use a 96 KiB static
@@ -89,7 +90,7 @@ says which one a save used.
    directory made by another system is read, and when full gets a FAT chain (`exfat_unchain_dir`: FAT first, then the flag
    cleared) and grows (`a_contiguous_exfat_directory_grows`). `tape_fs` resolves
    `diskN/rec/session1/x` on exFAT; `ls`, `mkdir`, `rm`, `write`, `cat` and the tape stream calls work in folders.
-   `fsck.exfat -n` accepts the result. FAT32 stays root-only (names stay ASCII, 60 characters). exFAT volumes mount by label
+   `fsck.exfat -n` accepts the result. FAT32 stays root-only (names stay ASCII, 60 characters). exFAT names are UTF-16 on disk and UTF-8 in the driver (up to 60 UTF-16 units, matched with simple case folding, name hash over the up-cased units; `fsck.exfat` accepts them: `exfat_unicode_names` in `crates/fat/tests/images.rs`). exFAT volumes mount by label
    (`Fs::label`, `test-mounts`).
 4. Move tapes, configs and settings into their folders; `tape-rt` and the tapes use the new paths; deploy tooling follows.
    *Built so far (search path, bare names stay valid for good: v3 volumes and FAT sticks keep working):* a bare tape

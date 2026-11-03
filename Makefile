@@ -335,6 +335,7 @@ test: image
 	python3 tools/check_hal.py
 	cargo +nightly-2026-09-13 test --manifest-path abi/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/fat/Cargo.toml
+	cargo +nightly-2026-09-13 test --manifest-path crates/ext4/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/hid/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-rec/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/tape-net/Cargo.toml

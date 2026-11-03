@@ -73,6 +73,10 @@ fn feed_foreground(byte: u8) -> bool {
 }
 static mut LINE: [u8; 128] = [0; 128];
 static mut LENGTH: usize = 0;
+/// Bytes of a UTF-8 character still to come (a `term net` or serial client sends å as two bytes).
+static mut PENDING: usize = 0;
+/// Where the character being assembled starts in `LINE`.
+static mut CHAR_START: usize = 0;
 
 pub fn prompt() {
     print!("{PROMPT}");
@@ -80,7 +84,10 @@ pub fn prompt() {
 
 /// Forgets a half-typed line (a new terminal session starts clean).
 pub fn reset() {
-    unsafe { LENGTH = 0 };
+    unsafe {
+        LENGTH = 0;
+        PENDING = 0;
+    }
 }
 
 /// One input byte: printable characters are echoed, Backspace edits, Enter runs the line.
@@ -103,12 +110,45 @@ pub fn feed(byte: u8) {
                 }
             }
             0x08 | 0x7f => {
+                PENDING = 0;
                 if LENGTH > 0 {
+                    // A multi-byte character (å) goes as a whole: drop its continuation bytes too.
+                    while LENGTH > 1 && line[LENGTH - 1] & 0xc0 == 0x80 {
+                        LENGTH -= 1;
+                    }
                     LENGTH -= 1;
                     print!("\x08 \x08");
                 }
             }
+            0x80..=0xbf if PENDING > 0 => {
+                if LENGTH < line.len() {
+                    line[LENGTH] = byte;
+                    LENGTH += 1;
+                }
+                PENDING -= 1;
+                if PENDING == 0 {
+                    echo_char(&line[CHAR_START..LENGTH]);
+                }
+            }
+            0xc2..=0xf4 if LENGTH + 4 <= line.len() => {
+                PENDING = match byte {
+                    0xc2..=0xdf => 1,
+                    0xe0..=0xef => 2,
+                    _ => 3,
+                };
+                CHAR_START = LENGTH;
+                line[LENGTH] = byte;
+                LENGTH += 1;
+            }
+            // å ä ö Å Ä Ö (and the euro sign) from a local Nordic keyboard arrive as private codes.
+            _ if fosfor_abi::keymap::utf8_sequence(byte).is_some() && LENGTH + 4 <= line.len() => {
+                let sequence = fosfor_abi::keymap::utf8_sequence(byte).unwrap_or(&[]);
+                line[LENGTH..LENGTH + sequence.len()].copy_from_slice(sequence);
+                echo_char(sequence);
+                LENGTH += sequence.len();
+            }
             0x20..=0x7e if LENGTH < line.len() => {
+                PENDING = 0;
                 line[LENGTH] = byte;
                 LENGTH += 1;
                 print!("{}", byte as char);
@@ -118,11 +158,17 @@ pub fn feed(byte: u8) {
     }
 }
 
+fn echo_char(bytes: &[u8]) {
+    if let Ok(text) = core::str::from_utf8(bytes) {
+        print!("{text}");
+    }
+}
+
 /// Runs one command line (the `start` file's lines come here).
 pub fn run(line: &str) {
     let mut words = line.split_whitespace();
     let Some(command) = words.next() else { return };
-    if command != "format" {
+    if !matches!(command, "format" | "shrink") {
         crate::formatshell::cancel(); // a format needs its confirmation as the very next command
     }
     if command != "install" {
@@ -132,13 +178,13 @@ pub fn run(line: &str) {
         crate::bootcode::cancel();
     }
     // Commands that touch a volume directly keep tape file calls off the disk meanwhile.
-    let _disk = matches!(command, "format" | "label" | "fsck" | "grow" | "install" | "bootcode").then(crate::tapefs::lock);
+    let _disk = matches!(command, "format" | "label" | "fsck" | "grow" | "shrink" | "install" | "bootcode").then(crate::tapefs::lock);
     match command {
         "help" => match line.trim_start()[command.len()..].trim() {
             "" => {
                 println!("help version cpus mem pci disks nic uptime slots threads echo TEXT reboot audio usb date nic [peers|discover] tapesync gpio @HOST ...");
                 println!("ls cat write rm cp mv cmp mkdir (`help NAME` shows one; files are NAME, diskN/NAME, @LABEL/NAME)");
-                println!("keymap kup serial  recv NAME  io sleep clear memmap bootinfo cpuinfo  start dmesg sector mount umount label fsck grow sha256 format install bootcode (disk commands ask first)");
+                println!("keymap kup serial  recv NAME  io sleep clear memmap bootinfo cpuinfo  start dmesg sector ext4 mount umount label fsck grow shrink sha256 format install bootcode (disk commands ask first)");
                 println!("tape NAME [ARGS]  run a tape (a ring 3 process)   NAME [ARGS]  the same   kill PID");
             }
             topic => {
@@ -257,6 +303,8 @@ pub fn run(line: &str) {
         "memmap" => crate::sysshell::memmap(),
         "bootinfo" => crate::sysshell::bootinfo(),
         "cpuinfo" => crate::sysshell::cpuinfo(),
+        "shrink" => crate::formatshell::shrink(&line.trim_start()[command.len()..]),
+        "ext4" => crate::sysshell::ext4(&line.trim_start()[command.len()..]),
         "sector" => crate::sysshell::sector(&line.trim_start()[command.len()..]),
         "mount" => crate::sysshell::mount(&line.trim_start()[command.len()..]),
         "umount" => crate::sysshell::umount(&line.trim_start()[command.len()..]),

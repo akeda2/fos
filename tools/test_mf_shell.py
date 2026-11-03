@@ -44,9 +44,90 @@ def config_volume_scenario():
             machine.stop()
 
 
+def ext4_scenario():
+    """`ext4 diskN` reads a Linux volume (crates/ext4, docs/ext4.md): ls, cat (UTF-8), info; a disk without ext4 is named."""
+    import shutil
+    import subprocess
+    mkfs = shutil.which("mkfs.ext4") or "/usr/sbin/mkfs.ext4"
+    if not Path(mkfs).exists():
+        print("SKIP ext4: no mkfs.ext4")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        source = Path(tmp) / "src"
+        (source / "sub").mkdir(parents=True)
+        (source / "hello.txt").write_text("hello from linux\n")
+        (source / "sub" / "Räksmörgås.txt").write_text("hej på dig\n")
+        image = Path(tmp) / "linux.img"
+        image.write_bytes(b"")
+        with image.open("r+b") as handle:
+            handle.truncate(32 << 20)
+        subprocess.run([mkfs, "-q", "-F", "-L", "linuxvol", "-d", str(source), str(image)], check=True, capture_output=True)
+        machine = base.Machine(tmp, {"hostname": "mfext4\n"}, {}, fosfs=4)
+        machine.extra = ["-drive", f"format=raw,file={image}"]
+        machine.start()
+        try:
+            machine.wait_for(READY)
+            machine.connect()
+            out = machine.run("ext4 disk2")
+            check("hello.txt" in out and "sub" in out, "ext4 ls lists the root", out[-300:])
+            out = machine.run("ext4 disk2 ls /sub")
+            check("Räksmörgås.txt" in out, "ext4 ls shows a Unicode name", out[-300:])
+            out = machine.run("ext4 disk2 cat /sub/Räksmörgås.txt")
+            check("hej på dig" in out, "ext4 cat reads it as UTF-8", out[-300:])
+            out = machine.run("ext4 disk2 info")
+            check("linuxvol" in out, "ext4 info shows the label", out[-300:])
+            out = machine.run("ext4 disk2 cat /nothere")
+            check("not found" in out, "a missing file is reported", out[-300:])
+            out = machine.run("ext4 disk1")
+            check("no ext2/3/4" in out, "the FOSFS boot disk is not ext", out[-300:])
+        finally:
+            machine.stop()
+
+
+def shrink_scenario():
+    """`shrink diskN SIZE` (kernel/src/formatshell.rs): sizes with units, a confirmation, files kept, the partition cut."""
+    import subprocess
+    import uuid
+    with tempfile.TemporaryDirectory() as tmp:
+        data = Path(tmp) / "keep.txt"
+        data.write_text("still here after the shrink\n")
+        second = Path(tmp) / "second.img"
+        subprocess.run([sys.executable, str(ROOT / "tools/build_image.py"), "--loader", str(base.LOADER), "--kernel", str(base.KERNEL),
+                        "--output", str(second), "--label", "shrinkme", "--file", f"keep.txt={data}", "--fosfs", "4",
+                        "--payload-guid", str(uuid.uuid4()), "--no-bios"], check=True, capture_output=True)
+        machine = base.Machine(tmp, {"hostname": "mfshrink\n"}, {}, fosfs=4)
+        machine.extra = ["-drive", f"format=raw,file={second}"]
+        machine.start()
+        try:
+            machine.wait_for(READY)
+            machine.connect()
+            out = machine.run("shrink disk2")
+            check("FOSFS partition" in out and "Usage: shrink" in out, "shrink without a size reports the sizes", out[-400:])
+            out = machine.run("shrink disk2 banana")
+            check("not a size" in out, "a bad size is refused", out[-300:])
+            out = machine.run("shrink disk2 64G")
+            check("not smaller" in out, "a size that is not smaller is refused", out[-300:])
+            out = machine.run("shrink disk2 confirm")
+            check("nothing is waiting" in out, "confirm without a plan does nothing", out[-300:])
+            out = machine.run("shrink disk2 8MB")
+            check("will become 8 MiB" in out and "shrink disk2 confirm" in out, "a plan with units is announced", out[-400:])
+            machine.run("echo interrupt")
+            out = machine.run("shrink disk2 confirm")
+            check("nothing is waiting" in out, "another command cancels the plan", out[-300:])
+            machine.run("shrink disk2 8M")
+            out = machine.run("shrink disk2 confirm")
+            check("shrunk from" in out and "to 8 MiB" in out, "confirm shrinks the partition", out[-400:])
+            out = machine.run("shrink disk2")
+            check("partition 8 MiB" in out, "the partition table says 8 MiB now", out[-400:])
+            out = machine.run("cat disk2/keep.txt")
+            check("still here after the shrink" in out, "the files are kept", out[-300:])
+        finally:
+            machine.stop()
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
-        machine = base.Machine(tmp, {"hostname": "mfshell\n", "start": "# comment\necho from-start-file\n"}, {})
+        machine = base.Machine(tmp, {"hostname": "mfshell\n", "start": "# comment\necho from-start-file\n"}, {}, fosfs=4)
         machine.start()
         try:
             machine.wait_for(READY)
@@ -59,6 +140,12 @@ def main():
             out = machine.run("write note.txt hello from mf")
             out = machine.run("cat note.txt")
             check("hello from mf" in out, "write makes a file and cat reads it back", out[-300:])
+            machine.run("write Räksmörgås.txt hej på dig")
+            out = machine.run("ls")
+            check("Räksmörgås.txt" in out, "ls lists a file whose name has å ä ö", out[-300:])
+            out = machine.run("cat Räksmörgås.txt")
+            check("hej på dig" in out, "cat reads a file by its Unicode name", out[-300:])
+            machine.run("rm Räksmörgås.txt")
             out = machine.run("cp note.txt copy.txt")
             out = machine.run("cmp note.txt copy.txt")
             check("identical" in out or "same" in out, "cp copies and cmp says they match", out[-300:])
@@ -105,6 +192,10 @@ def main():
             check("boot" in out.lower(), "bootcode reports the boot code", out[-400:])
             out = machine.run("start")
             check("start> echo from-start-file" in out, "the start command reruns the start file", out[-300:])
+            out = machine.run("echo åäöÅÄÖ")
+            check("åäöÅÄÖ" in out.split("echo")[-1], "the shell takes UTF-8 å ä ö", out[-200:])
+            out = machine.run("echo abc\x7fåx\x7f\x7f")
+            check(out.count("\x08 \x08") >= 3 and "\n" in out, "Backspace removes a whole å", out[-200:])
             out = machine.run("keymap")
             check("us" in out, "keymap shows the default", out[-200:])
             out = machine.run("keymap sv")
@@ -129,6 +220,8 @@ def main():
         finally:
             machine.stop()
     config_volume_scenario()
+    ext4_scenario()
+    shrink_scenario()
     print("test-mf-shell: all checks passed")
 
 

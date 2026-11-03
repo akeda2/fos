@@ -1,0 +1,12 @@
+[package]
+name = "fosfor-ext4"
+version = "0.1.0"
+edition = "2024"
+
+# ext4 (and ext2/ext3 layouts) for fos: mount a volume Linux made, walk folders, read files. `no_std`, no allocation,
+# independent of the kernel (a `Device` trait stands in for the disk), so the host tests run it against images made
+# by `mkfs.ext4` / `mkfs.ext2` and compare every file with the directory the image was populated from. Read-only so
+# far; docs/ext4.md has the plan (writes, the journal, the installer, the SMB server on top).
+[lib]
+name = "ext4"
+path = "src/lib.rs"

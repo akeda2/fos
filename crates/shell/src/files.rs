@@ -79,15 +79,29 @@ fn ls(host: &mut dyn Host, rest: &str) {
     }
 }
 
-/// Prints `bytes` as text: anything but printable ASCII and newlines shows as a dot.
+/// Prints `bytes` as text: UTF-8 characters and newlines as they are, controls and bytes that are not UTF-8 as dots.
 fn print_text(host: &mut dyn Host, bytes: &[u8]) {
     let mut shown = [0u8; 128];
-    for chunk in bytes.chunks(shown.len()) {
-        for (slot, &byte) in shown.iter_mut().zip(chunk) {
-            *slot = if byte == b'\n' || (0x20..0x7f).contains(&byte) { byte } else { b'.' };
+    let mut used = 0;
+    for piece in bytes.utf8_chunks() {
+        for c in piece.valid().chars() {
+            let c = if c == '\n' || !c.is_control() { c } else { '.' };
+            if used + c.len_utf8() > shown.len() {
+                say!(host, "{}", core::str::from_utf8(&shown[..used]).unwrap_or("?"));
+                used = 0;
+            }
+            used += c.encode_utf8(&mut shown[used..]).len();
         }
-        say!(host, "{}", core::str::from_utf8(&shown[..chunk.len()]).unwrap_or("?"));
+        for _ in piece.invalid() {
+            if used == shown.len() {
+                say!(host, "{}", core::str::from_utf8(&shown[..used]).unwrap_or("?"));
+                used = 0;
+            }
+            shown[used] = b'.';
+            used += 1;
+        }
     }
+    say!(host, "{}", core::str::from_utf8(&shown[..used]).unwrap_or("?"));
 }
 
 fn cat(host: &mut dyn Host, rest: &str) {

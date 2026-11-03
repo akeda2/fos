@@ -16,7 +16,83 @@ static mut PENDING_FORMAT: Option<PendingFormat> = None;
 
 /// Called for every other command: a format needs its confirmation as the very next one.
 pub fn cancel() {
+    unsafe {
+        PENDING_FORMAT = None;
+        PENDING_SHRINK = None;
+    }
+}
+
+/// `shrink diskN SIZE` waiting for `shrink diskN confirm`: the disk and the new size of its FOSFS partition in sectors.
+static mut PENDING_SHRINK: Option<(usize, u64)> = None;
+
+fn mib(sectors: u64) -> u64 {
+    sectors.div_ceil(2048)
+}
+
+/// `shrink diskN [SIZE]`: makes the disk's FOSFS volume and partition smaller (SIZE like `512M`, `2G`, `1.5GiB`; binary
+/// units, a bare number is MB), moving files that lie in the part to be cut off. The space after it is left unused, for
+/// a second partition (docs/ext4.md). Says what it will do and waits for `shrink diskN confirm` as the very next command.
+/// Files are kept; a power cut leaves each file where it was or where it went, and the partition is cut last.
+pub fn shrink(rest: &str) {
+    const USAGE: &str = "Usage: shrink diskN [SIZE]   (SIZE: 512M, 2G, 1.5GiB; a bare number is MB; then: shrink diskN confirm)";
     unsafe { PENDING_FORMAT = None };
+    let mut words = rest.split_whitespace();
+    let Some(number) = words.next().and_then(|word| word.strip_prefix("disk")).and_then(|digits| digits.parse::<usize>().ok()) else {
+        return crate::println!("{USAGE}");
+    };
+    let argument = words.next();
+    if number.checked_sub(1).and_then(crate::block::get).is_none() {
+        return crate::println!("disk{number}: no such disk (see `disks`).");
+    }
+    let disk = number - 1;
+    let Some(partition) = crate::gpt::find(disk, &fosfor_abi::FOSFS_TYPE_GUID, |_| true) else {
+        return crate::println!("shrink: disk{number} has no FOSFS partition on a GPT.");
+    };
+    let volume = match crate::fosfs::Volume::mount(disk, partition.start, partition.sectors) {
+        Ok(volume) => volume,
+        Err(error) => return crate::println!("shrink: disk{number}: the FOSFS volume could not be read ({error:?})."),
+    };
+    let minimum = match volume.min_sectors() {
+        Ok(minimum) => minimum,
+        Err(error) => return crate::println!("shrink: disk{number}: the directory could not be read ({error:?})."),
+    };
+    if argument == Some("confirm") {
+        let pending = unsafe { (*core::ptr::addr_of_mut!(PENDING_SHRINK)).take() };
+        let Some((_, target)) = pending.filter(|&(pending, _)| pending == number) else {
+            return crate::println!("shrink: nothing is waiting for confirmation on disk{number}; run `shrink disk{number} SIZE` first.");
+        };
+        let before = partition.sectors;
+        let shrunk = match volume.shrink(target) {
+            Ok(shrunk) => shrunk,
+            Err(crate::fosfs::Error::DataFull) => return crate::println!("shrink: no single free run below {} MiB holds one of the files (it is too fragmented or too full); nothing was lost. Remove or copy files and try again.", mib(target)),
+            Err(error) => return crate::println!("shrink: moving the files failed ({error:?}); the volume is intact, run it again."),
+        };
+        if let Err(error) = crate::gpt::shrink_partition(disk, &fosfor_abi::FOSFS_TYPE_GUID, target) {
+            return crate::println!("shrink: the volume is now {} MiB but the partition table could not be changed ({error:?}); run `shrink disk{number} {}M confirm` again.", mib(shrunk.sectors), mib(target));
+        }
+        if crate::storage::boot_disk() == Some(disk) {
+            crate::storage::remount_boot();
+        }
+        return crate::println!("disk{number}: FOSFS partition shrunk from {} MiB to {} MiB; the files are kept and {} MiB after it are free.", mib(before), mib(target), mib(before - target));
+    }
+    crate::println!("disk{number}: FOSFS partition {} MiB, volume {} MiB, files need at least {} MiB.", mib(partition.sectors), mib(volume.sectors), mib(minimum));
+    let Some(argument) = argument else {
+        return crate::println!("{USAGE}");
+    };
+    let Some(requested) = crate::fosfs::parse_size(argument) else {
+        return crate::println!("shrink: `{argument}` is not a size (for example 512M, 2G or 1.5GiB).");
+    };
+    // Whole MiB, so that whatever is placed after the partition starts on an aligned sector.
+    let target = requested.next_multiple_of(2048);
+    if target >= partition.sectors {
+        return crate::println!("shrink: {} MiB is not smaller than the partition.", mib(target));
+    }
+    if target < minimum.next_multiple_of(2048) {
+        return crate::println!("shrink: too small: the files need {} MiB.", mib(minimum));
+    }
+    crate::println!("The partition and volume will become {} MiB; files beyond that are moved first. {} MiB are freed.", mib(target), mib(partition.sectors - target));
+    unsafe { PENDING_SHRINK = Some((number, target)) };
+    crate::println!("To go ahead, type exactly: shrink disk{number} confirm");
 }
 
 /// What `format` would do to a disk.
@@ -44,6 +120,7 @@ fn plan_format(disk: usize, force: bool) -> Result<FormatPlan, &'static str> {
 /// only that partition's volume cleared; a blank disk gets a fresh GPT with one FOSFS
 /// partition; any other disk needs `force` because its partition table is replaced.
 pub fn command(rest: &str) {
+    unsafe { PENDING_SHRINK = None };
     let mut words = rest.split_whitespace();
     let Some(target) = words.next() else {
         return crate::println!("Usage: format diskN [NAME] [v3] [force]   or   format diskN exfat [LABEL]   (then: format diskN confirm)");
