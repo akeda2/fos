@@ -185,7 +185,7 @@ kernel:
 
 # The server kernel (kernel-mf/, docs/big-kernel.md): same loaders, same image layout, its own crate.
 KERNEL_MF_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel-mf
-.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-tape test-mf-usb test-mf-audio
+.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-tape test-mf-usb test-mf-debug test-mf-audio
 kernel-mf:
 	cd kernel-mf && cargo +nightly-2026-09-13 build --release
 
@@ -210,6 +210,14 @@ test-mf-usb: image-mf image
 	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_MF_ELF) --output $(BUILD)/fosfor-mf/usb-stick.img \
 		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin --file note.txt=tools/test_mf_note.txt
 	python3 tools/test_mf_usb.py
+
+# `debug crash` and `debug hang` with reboot-on-crash and a 5 s watchdog: the record survives the reset; crash-on-boot trips the guard.
+test-mf-debug: image-mf
+	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_MF_ELF) --output $(BUILD)/fosfor-mf/fosfor-debug.img \
+		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin --file debug=tools/test_mf_debug.txt
+	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_MF_ELF) --output $(BUILD)/fosfor-mf/fosfor-debug-loop.img \
+		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin --file debug=tools/test_mf_debug_loop.txt
+	python3 tools/test_mf_debug.py
 
 test-mf-audio: image-mf image
 	python3 tools/test_mf_audio.py

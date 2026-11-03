@@ -164,6 +164,12 @@ pub struct Mapping {
     pub executable: bool,
 }
 
+/// The direct-map address of physical `address` when that page is mapped writable (RAM the firmware map listed), else None.
+pub fn writable_physical(address: u64) -> Option<u64> {
+    let virtual_address = direct(address);
+    translate(virtual_address).filter(|mapping| mapping.writable).map(|_| virtual_address)
+}
+
 /// Walks the kernel's tables for `address`.
 pub fn translate(address: u64) -> Option<Mapping> {
     let root = root();

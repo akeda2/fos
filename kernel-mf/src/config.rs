@@ -1,5 +1,5 @@
 //! The per-machine text files on the boot volume that the server kernel honours so far: `hostname`, `settings`
-//! (`deny-term-net`) and `debug` (`kernel-update`). Same files and names as the embedded kernel (docs/config.md); a FOSFS v4
+//! (`deny-term-net`) and `debug` (`kernel-update`, `reboot-on-crash`, `reboot-delay`, `watchdog`, `crash-on-boot`). Same files and names as the embedded kernel (docs/config.md); a FOSFS v4
 //! volume keeps them in `settings/`, the bare name in the root stays valid. Options the server kernel has no use for yet are
 //! ignored silently.
 
@@ -10,6 +10,10 @@ static mut HOSTNAME: [u8; 15] = [0; 15];
 static mut HOSTNAME_LENGTH: usize = 0;
 static mut DENY_TERM_NET: bool = false;
 static mut KERNEL_UPDATE: bool = false;
+static mut REBOOT_ON_CRASH: bool = false;
+static mut REBOOT_DELAY: u32 = 3;
+static mut CRASH_ON_BOOT: bool = false;
+static mut WATCHDOG: Option<u32> = None;
 static mut SWEDISH: bool = false;
 static mut NO_MSI: bool = false;
 
@@ -35,6 +39,26 @@ pub fn deny_term_net() -> bool {
 /// `kernel-update` in the `debug` file: KUP is answered only when it is there.
 pub fn kernel_update() -> bool {
     unsafe { KERNEL_UPDATE }
+}
+
+/// `reboot-on-crash`: reset after a fatal exception instead of halting.
+pub fn reboot_on_crash() -> bool {
+    unsafe { REBOOT_ON_CRASH }
+}
+
+/// `reboot-delay N`: seconds the crash report stays up before the reset.
+pub fn reboot_delay() -> u32 {
+    unsafe { REBOOT_DELAY }
+}
+
+/// `crash-on-boot` (tests only).
+pub fn crash_on_boot() -> bool {
+    unsafe { CRASH_ON_BOOT }
+}
+
+/// `watchdog [N]`: seconds without progress before the reset.
+pub fn watchdog_seconds() -> Option<u32> {
+    unsafe { WATCHDOG }
 }
 
 fn read(name: &str) -> Option<&'static str> {
@@ -88,9 +112,18 @@ pub fn load() {
     }
     if let Some(text) = read("debug") {
         for line in lines(text) {
-            if line.split_whitespace().next() == Some("kernel-update") {
-                unsafe { KERNEL_UPDATE = true };
-                println!("debug: kernel-update -- the network kernel-update service (KUP) is on.");
+            let mut words = line.split_whitespace();
+            let number = |word: Option<&str>, default: u32| word.and_then(|w| w.parse().ok()).unwrap_or(default);
+            match words.next() {
+                Some("kernel-update") => {
+                    unsafe { KERNEL_UPDATE = true };
+                    println!("debug: kernel-update -- the network kernel-update service (KUP) is on.");
+                }
+                Some("reboot-on-crash") => unsafe { REBOOT_ON_CRASH = true },
+                Some("reboot-delay") => unsafe { REBOOT_DELAY = number(words.next(), 3).min(60) },
+                Some("crash-on-boot") => unsafe { CRASH_ON_BOOT = true },
+                Some("watchdog") => unsafe { WATCHDOG = Some(number(words.next(), 60)) },
+                _ => println!("debug: unknown line `{line}` ignored."),
             }
         }
     }

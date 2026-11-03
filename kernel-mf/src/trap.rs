@@ -32,7 +32,7 @@ pub struct Frame {
     pub ss: u64,
 }
 
-fn exception_name(vector: u64) -> &'static str {
+pub fn exception_name(vector: u64) -> &'static str {
     match vector {
         0 => "#DE divide error",
         1 => "#DB debug",
@@ -53,6 +53,7 @@ fn exception_name(vector: u64) -> &'static str {
         18 => "#MC machine check",
         19 => "#XM SIMD floating-point error",
         20 => "#VE virtualization exception",
+        crate::debug::WATCHDOG_VECTOR => "watchdog timeout (the service thread made no progress)",
         _ => "reserved exception",
     }
 }
@@ -72,7 +73,12 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
             BREAKPOINTS.fetch_add(1, Ordering::Relaxed);
             println!("Breakpoint exception at {:#x}: handled, execution continues.", frame.rip);
         }
-        v if v == u64::from(apic::TIMER_VECTOR) => apic::tick(),
+        v if v == u64::from(apic::TIMER_VECTOR) => {
+            if crate::percpu::this().index == 0 {
+                crate::debug::watchdog_check(frame);
+            }
+            apic::tick()
+        }
         v if v == u64::from(crate::tlb::TLB_VECTOR) => crate::tlb::handle(),
         v if v == u64::from(crate::sched::WAKE_VECTOR) => crate::sched::wake_interrupt(),
         v if v == u64::from(apic::SPURIOUS_VECTOR) => {} // a spurious interrupt needs no EOI
@@ -90,6 +96,15 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
 }
 
 fn fatal(frame: &Frame) -> ! {
+    report_and_stop(frame, false)
+}
+
+/// The watchdog's path: report, record, then reset whatever `reboot-on-crash` says (a hang is what a watchdog is for).
+pub fn fatal_reset(frame: &Frame) -> ! {
+    report_and_stop(frame, true)
+}
+
+fn report_and_stop(frame: &Frame, always_reset: bool) -> ! {
     crate::serial::break_lock();
     println!();
     println!("*** CPU exception {}: {} (error code {:#x}) ***", frame.vector, exception_name(frame.vector), frame.error);
@@ -103,6 +118,18 @@ fn fatal(frame: &Frame) -> ! {
     println!("rsi {:#x} rdi {:#x} rbp {:#x}", frame.rsi, frame.rdi, frame.rbp);
     println!("r8 {:#x} r9 {:#x} r10 {:#x} r11 {:#x}", frame.r8, frame.r9, frame.r10, frame.r11);
     println!("r12 {:#x} r13 {:#x} r14 {:#x} r15 {:#x}", frame.r12, frame.r13, frame.r14, frame.r15);
-    println!("cr3 {:#x}. The kernel stops here.", cpu::read_cr3());
+    println!("cr3 {:#x}.", cpu::read_cr3());
+    cpu::interrupts_disable();
+    crate::debug::record_crash(frame);
+    if crate::config::reboot_on_crash() || always_reset {
+        if crate::debug::crash_loop_tripped() {
+            println!("*** crash loop: {} boots in a row never reached the milestone; not resetting again. Halting for an operator.", crate::debug::boot_crash_count());
+        } else {
+            println!("*** resetting in {} s", crate::config::reboot_delay());
+            apic::busy_wait_ms(u64::from(crate::config::reboot_delay()) * 1000);
+            crate::power::reset();
+        }
+    }
+    println!("*** the kernel stops here");
     crate::halt()
 }
