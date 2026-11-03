@@ -99,6 +99,9 @@ pub fn boot_crash_count() -> u32 {
     unsafe { BOOT_CRASH_COUNT }
 }
 
+// `kup_serial.rs` (shared with the embedded kernel) reaches the slot metadata through `debug`.
+pub use crate::slots::{read_metadata, update_metadata};
+
 /// The service thread is making progress.
 pub fn pet() {
     LAST_PET.store(crate::apic::ticks(), Ordering::Relaxed);

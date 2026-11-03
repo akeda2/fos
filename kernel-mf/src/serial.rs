@@ -66,6 +66,11 @@ fn put(byte: u8) {
     outb(COM1, byte);
 }
 
+/// One byte to COM1 only (not the screen or the network terminal): the serial update protocols answer through this.
+pub fn write_byte(byte: u8) {
+    put(byte);
+}
+
 /// The next received byte, if the UART has one (LSR bit 0).
 pub fn read_byte() -> Option<u8> {
     (PRESENT.load(core::sync::atomic::Ordering::Relaxed) && inb(COM1 + 5) & 1 != 0).then(|| inb(COM1))

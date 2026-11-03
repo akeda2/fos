@@ -185,7 +185,7 @@ kernel:
 
 # The server kernel (kernel-mf/, docs/big-kernel.md): same loaders, same image layout, its own crate.
 KERNEL_MF_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel-mf
-.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-tape test-mf-usb test-mf-debug test-mf-audio test-mf-netfs test-mf-tapesync test-mf-gpio test-mf-bios-video test-mf-shell
+.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-tape test-mf-usb test-mf-debug test-mf-audio test-mf-netfs test-mf-tapesync test-mf-gpio test-mf-bios-video test-mf-shell test-mf-kup-serial
 kernel-mf:
 	cd kernel-mf && cargo +nightly-2026-09-13 build --release
 
@@ -249,6 +249,9 @@ test-mf-gpio: image-mf image
 # The shared file commands (ls cat write rm cp mv cmp mkdir) on the server kernel's shell.
 test-mf-shell: image-mf
 	python3 tools/test_mf_shell.py
+
+test-mf-kup-serial: image-mf
+	python3 tools/test_kup_serial.py mf
 
 # Every v2 tape (ELF64 PIE executables for the 64-bit tape ABI).
 .PHONY: tapes

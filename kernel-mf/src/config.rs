@@ -23,6 +23,11 @@ pub fn swedish() -> bool {
     unsafe { SWEDISH }
 }
 
+/// The `keymap` shell command: changes what USB and PS/2 keyboards type until the next boot.
+pub fn set_swedish(on: bool) {
+    unsafe { SWEDISH = on };
+}
+
 /// `no-msi` in `settings`: devices keep polling instead of taking message-signalled interrupts.
 pub fn no_msi() -> bool {
     unsafe { NO_MSI }
