@@ -19,6 +19,7 @@ mod usb;
 mod user_test;
 mod fb;
 mod config;
+mod debug;
 mod net;
 mod power;
 mod shell;
@@ -244,8 +245,14 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     if let Some(disk) = storage::boot_disk() {
         slots::init(info, disk);
     }
+    debug::init(info.crash_count);
+    debug::report_previous_crash();
     config::load();
     kernel_core::hda::init_all(config::no_msi());
+    if config::crash_on_boot() {
+        println!("debug: crash-on-boot is set; faulting now.");
+        unsafe { core::arch::asm!("ud2") };
+    }
     slots::confirm_boot();
     net::init();
     usb::init();
@@ -319,6 +326,7 @@ extern "C" fn service_thread(_: usize) {
         }
         net::housekeeping();
         slots::housekeeping();
+        debug::pet();
         sched::yield_now();
     }
 }

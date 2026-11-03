@@ -161,7 +161,13 @@ fn run(line: &str) {
         },
         "uptime" => println!("{} s", apic::ticks() / apic::TICK_HZ),
         "slots" => match slots::read_metadata() {
-            Some(m) => println!("booted slot {}, active {}, pending {:?}, crash count {}", slots::boot_slot(), m.active_slot, m.pending_slot, m.crash_count),
+            Some(m) => {
+                println!("booted slot {}, active {}, pending {:?}, crash count {}", slots::boot_slot(), m.active_slot, m.pending_slot, m.crash_count);
+                match crate::debug::watchdog_seconds() {
+                    Some(seconds) => println!("watchdog: {seconds} s"),
+                    None => println!("watchdog: off"),
+                }
+            }
             None => println!("slot metadata unreadable"),
         },
         "tape" => {
@@ -174,6 +180,17 @@ fn run(line: &str) {
             None => println!("usage: kill PID (the number `tape` printed)"),
         },
         "echo" => println!("{}", line[command.len()..].trim_start()),
+        // Test hooks for the unattended-operation machinery (`debug crash`: a #UD in the kernel, `debug hang`: the service thread spins).
+        "debug" => match words.next() {
+            Some("crash") => unsafe { core::arch::asm!("ud2") },
+            Some("hang") => {
+                // The shell runs on the service thread: spinning here with interrupts on stops its petting while other threads run.
+                loop {
+                    core::hint::spin_loop();
+                }
+            }
+            _ => println!("usage: debug crash|hang"),
+        },
         "reboot" => {
             println!("Restarting.");
             slots::mark_clean_stop();

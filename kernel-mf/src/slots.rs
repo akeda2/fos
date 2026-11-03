@@ -1,7 +1,7 @@
 //! The A/B slot metadata sector, the server kernel's side: what the loader's slot state machine leaves for the kernel
 //! (`abi::SlotMetadata`, the first sector of the payload partition). A pushed kernel gets exactly one try: it must reach
 //! `confirm_boot`, or the loader falls back to the old slot at the next boot. Same rules as the embedded kernel's `debug.rs`
-//! (crash records, the watchdog and `reboot-on-crash` are not implemented here yet).
+//! (the crash record, `reboot-on-crash` and the watchdog are `debug.rs`).
 
 use fosfor_abi::{BootInfo, RUNNING_STOPPED, RUNNING_UP, SlotMetadata};
 
@@ -65,6 +65,7 @@ pub fn confirm_boot() {
         println!("Slot metadata could not be updated: no A/B fallback or crash tracking this boot.");
     }
     unsafe { CLEAR_STREAK_PENDING = unclean > 0 };
+    crate::debug::arm(crate::config::watchdog_seconds(), unclean);
 }
 
 /// Marks the stop as deliberate, so the next boot does not count it as a crash.
