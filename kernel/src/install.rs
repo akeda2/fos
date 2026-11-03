@@ -31,7 +31,16 @@ struct Pending {
     label: [u8; fosfs::MAX_NAME],
     label_length: usize,
     bare: bool,
+    /// Sectors for the FOSFS volume when an ext4 volume takes the rest of the disk.
+    fosfs_sectors: Option<u64>,
+    ext4: bool,
+    ext4_label: [u8; 16],
+    ext4_label_length: usize,
 }
+/// FOSFS size when `ext4` is asked for without `fosfs=`.
+const DEFAULT_FOSFS_SECTORS: u64 = 1024 * 2048;
+/// Smallest ext4 volume worth making (journal and group tables take a few MiB).
+const MIN_EXT4_SECTORS: u64 = 64 * 2048;
 static mut PENDING: Option<Pending> = None;
 static mut CHUNK: [u8; CHUNK_SECTORS * 512] = [0; CHUNK_SECTORS * 512];
 
@@ -55,7 +64,7 @@ fn source(disk: usize) -> Result<Source, &'static str> {
 }
 
 pub fn command(mut words: core::str::SplitWhitespace) {
-    const USAGE: &str = "Usage: install diskN [LABEL] [bare] [force]   (then: install diskN confirm)";
+    const USAGE: &str = "Usage: install diskN [LABEL] [fosfs=SIZE] [ext4[=LABEL]] [bare] [force]   (then: install diskN confirm)";
     let Some(number) = words.next().and_then(|word| word.strip_prefix("disk")).and_then(|digits| digits.parse::<usize>().ok()) else {
         return crate::println!("{USAGE}");
     };
@@ -70,13 +79,35 @@ pub fn command(mut words: core::str::SplitWhitespace) {
         return crate::println!("disk{number} is the boot disk; install copies it onto another disk.");
     }
     let (mut confirm, mut force, mut bare, mut label) = (false, false, false, "");
+    let (mut ext4, mut ext4_label, mut fosfs_size) = (false, "data", None);
     for word in words {
         match word {
             "confirm" => confirm = true,
             "force" => force = true,
             "bare" => bare = true,
-            name => label = name,
+            "ext4" => ext4 = true,
+            other => {
+                if let Some(name) = other.strip_prefix("ext4=") {
+                    (ext4, ext4_label) = (true, name);
+                } else if let Some(size) = other.strip_prefix("fosfs=") {
+                    match fosfs::parse_size(size) {
+                        Some(sectors) if sectors >= MIN_FOSFS_SECTORS => fosfs_size = Some(sectors.next_multiple_of(2048)),
+                        _ => return crate::println!("install: fosfs= takes a size of at least {} MiB (512M, 2G, ...).", MIN_FOSFS_SECTORS / 2048),
+                    }
+                } else {
+                    label = other;
+                }
+            }
         }
+    }
+    if fosfs_size.is_some() && !ext4 {
+        return crate::println!("install: fosfs=SIZE only makes sense with ext4 (without it the FOSFS volume fills the disk).");
+    }
+    if ext4 && !fosfs_size.is_some() {
+        fosfs_size = Some(DEFAULT_FOSFS_SECTORS);
+    }
+    if ext4 && !fosfs::valid_label(ext4_label.as_bytes()) {
+        return crate::println!("install: the ext4 label is up to 16 lowercase letters, digits, `.`, `_` or `-`.");
     }
     if !label.is_empty() && !fosfs::valid_label(label.as_bytes()) {
         return crate::println!("install: a label is up to 16 lowercase letters, digits, `.`, `_` or `-`.");
@@ -92,10 +123,12 @@ pub fn command(mut words: core::str::SplitWhitespace) {
         Ok(layout) => layout,
         Err(reason) => return crate::println!("install: {reason}."),
     };
-    let needed = 2048 + layout.esp.sectors.next_multiple_of(2048) + layout.payload.sectors.next_multiple_of(2048) + MIN_FOSFS_SECTORS + 34;
+    let fixed = 2048 + layout.esp.sectors.next_multiple_of(2048) + layout.payload.sectors.next_multiple_of(2048) + 34;
+    let needed = fixed + fosfs_size.unwrap_or(MIN_FOSFS_SECTORS) + if ext4 { MIN_EXT4_SECTORS } else { 0 };
     if info.sectors < needed {
-        return crate::println!("install: disk{number} is {} MiB; the ESP, payload and a FOSFS volume need at least {} MiB.", info.sectors / 2048, needed.div_ceil(2048));
+        return crate::println!("install: disk{number} is {} MiB; the ESP, payload, FOSFS{} need at least {} MiB.", info.sectors / 2048, if ext4 { " and ext4 volumes" } else { " volume" }, needed.div_ceil(2048));
     }
+    let fosfs_final = fosfs_size.unwrap_or(info.sectors - fixed);
     crate::println!("disk{number}: {} MiB, {} ({}).", info.sectors / 2048, core::str::from_utf8(&info.model).unwrap_or("?").trim(), core::str::from_utf8(&info.origin[..info.origin_length]).unwrap_or("?"));
     let fos_disk = gpt::find(disk, &PAYLOAD_TYPE_GUID, |_| true).is_some();
     match gpt::inspect(disk) {
@@ -108,10 +141,14 @@ pub fn command(mut words: core::str::SplitWhitespace) {
         None => return crate::println!("install: cannot read disk{number}."),
     }
     crate::println!("It will get the boot disk's ESP ({} MiB){}, the running kernel (slot {}) and a FOSFS volume of about {} MiB{}.",
-        layout.esp.sectors / 2048, if cfg!(target_arch = "aarch64") { " with the Pi firmware" } else { " and BIOS boot code" }, storage::boot_slot(), (info.sectors - needed + MIN_FOSFS_SECTORS) / 2048, if bare { ", empty" } else { " with every file of the boot volume" });
+        layout.esp.sectors / 2048, if cfg!(target_arch = "aarch64") { " with the Pi firmware" } else { " and BIOS boot code" }, storage::boot_slot(), fosfs_final / 2048, if bare { ", empty" } else { " with every file of the boot volume" });
+    if ext4 {
+        crate::println!("The rest, about {} MiB, becomes an ext4 volume '{ext4_label}' (journal, metadata_csum).", (info.sectors - fixed - fosfs_final) / 2048);
+    }
     crate::println!("ALL of disk{number} is replaced.");
-    let mut stored = Pending { number, label: [0; fosfs::MAX_NAME], label_length: label.len(), bare };
+    let mut stored = Pending { number, label: [0; fosfs::MAX_NAME], label_length: label.len(), bare, fosfs_sectors: if ext4 { fosfs_size } else { None }, ext4, ext4_label: [0; 16], ext4_label_length: ext4_label.len() };
     stored.label[..label.len()].copy_from_slice(label.as_bytes());
+    stored.ext4_label[..ext4_label.len()].copy_from_slice(ext4_label.as_bytes());
     unsafe { PENDING = Some(stored) };
     crate::println!("To go ahead, type exactly: install disk{number} confirm");
 }
@@ -169,17 +206,22 @@ fn run(boot: usize, disk: usize, number: usize, pending: &Pending) {
         return crate::println!("install: the running kernel's slot is empty in the metadata.");
     }
 
-    let mut made = [Partition { unique_guid: [0; 16], start: 0, sectors: 0 }; 3];
-    let specs: [(&[u8; 16], &str, Option<u64>); 3] = [
+    let mut made = [Partition { unique_guid: [0; 16], start: 0, sectors: 0 }; 4];
+    let specs: [(&[u8; 16], &str, Option<u64>); 4] = [
         (&ESP_TYPE_GUID, "EFI System", Some(layout.esp.sectors)),
         (&PAYLOAD_TYPE_GUID, "fos payload", Some(layout.payload.sectors)),
-        (&FOSFS_TYPE_GUID, "FOSFS data", None),
+        (&FOSFS_TYPE_GUID, "FOSFS data", pending.fosfs_sectors),
+        (&kernel_core::ext4vol::LINUX_GUID, "Linux data", None),
     ];
-    if let Err(error) = gpt::write_table(disk, &specs, &mut made) {
+    let count = if pending.ext4 { 4 } else { 3 };
+    if let Err(error) = gpt::write_table(disk, &specs[..count], &mut made[..count]) {
         return crate::println!("install: disk{number}: writing the partition table failed ({error:?}).");
     }
-    let [esp, payload, data] = made;
+    let [esp, payload, data, linux] = made;
     crate::println!("disk{number}: new partition table: ESP {} MiB, payload {} MiB, FOSFS {} MiB (new GUIDs).", esp.sectors / 2048, payload.sectors / 2048, data.sectors / 2048);
+    if pending.ext4 {
+        crate::println!("disk{number}: ext4 partition {} MiB.", linux.sectors / 2048);
+    }
 
     // A Pi has no BIOS boot code; its firmware files live on the ESP, which is copied below.
     match if cfg!(target_arch = "aarch64") { Ok(false) } else { copy_bios_boot_code(boot, disk) } {
@@ -210,6 +252,13 @@ fn run(boot: usize, disk: usize, number: usize, pending: &Pending) {
         Ok(volume) => volume,
         Err(error) => return crate::println!("install: formatting the FOSFS volume failed ({error:?})."),
     };
+    if pending.ext4 {
+        crate::println!("Formatting the ext4 volume ({} MiB); this takes a moment...", linux.sectors / 2048);
+        match kernel_core::ext4vol::format_partition(disk, &linux, &pending.ext4_label[..pending.ext4_label_length]) {
+            Ok(()) => crate::println!("ext4 volume '{}' ready (see `ext4 disk{number} info`).", core::str::from_utf8(&pending.ext4_label[..pending.ext4_label_length]).unwrap_or("?")),
+            Err(error) => crate::println!("install: formatting the ext4 volume failed ({error:?}); `ext4 disk{number} remkfs` can retry."),
+        }
+    }
     if pending.bare {
         return crate::println!("disk{number} is now bootable, with an empty FOSFS v{version} volume of {} MiB.", data.sectors / 2048);
     }
