@@ -287,7 +287,7 @@ pub mod ioapic {
     /// Pin changes are an index/data pair, so two CPUs must not interleave them.
     static LOCK: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
 
-    /// Routes `gsi` to `vector` on the boot CPU (all device interrupts land there for now), with the given trigger mode
+    /// Routes `gsi` to `vector` on the CPU `percpu::interrupt_target` names (the boot CPU unless `irq-cpu`), with the given trigger mode
     /// and polarity (PCI interrupts are level, active low). False if no pin serves that GSI.
     pub fn route_gsi(gsi: u32, vector: u8, level: bool, active_low: bool) -> bool {
         let _guard = LOCK.lock();
@@ -303,7 +303,7 @@ pub mod ioapic {
             if level {
                 low |= 1 << 15;
             }
-            write(0x10 + 2 * pin + 1, crate::percpu::get(0).apic_id << 24);
+            write(0x10 + 2 * pin + 1, crate::percpu::interrupt_target() << 24);
             write(0x10 + 2 * pin, low);
         }
         true

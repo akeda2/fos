@@ -109,7 +109,7 @@ impl Platform for Mf {
         crate::msi::detach_intx(vector, context);
     }
     fn interrupt_target(&self) -> u32 {
-        crate::percpu::get(0).apic_id
+        crate::percpu::interrupt_target()
     }
     fn gsi_range(&self) -> (u32, u32) {
         crate::apic::ioapic::gsi_range()

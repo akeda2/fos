@@ -1,5 +1,5 @@
 //! The per-machine text files on the boot volume that the server kernel honours so far: `hostname`, `settings`
-//! (`deny-term-net`) and `debug` (`kernel-update`, `reboot-on-crash`, `reboot-delay`, `watchdog`, `crash-on-boot`). Same files and names as the embedded kernel (docs/config.md); a FOSFS v4
+//! (`deny-term-net`, `no-msi`, `keymap`, `irq-cpu N`) and `debug` (`kernel-update`, `reboot-on-crash`, `reboot-delay`, `watchdog`, `crash-on-boot`). Same files and names as the embedded kernel (docs/config.md); a FOSFS v4
 //! volume keeps them in `settings/`, the bare name in the root stays valid. Options the server kernel has no use for yet are
 //! ignored silently.
 
@@ -10,6 +10,7 @@ static mut HOSTNAME: [u8; 15] = [0; 15];
 static mut HOSTNAME_LENGTH: usize = 0;
 static mut DENY_TERM_NET: bool = false;
 static mut KERNEL_UPDATE: bool = false;
+static mut IRQ_CPU: usize = 0;
 static mut REBOOT_ON_CRASH: bool = false;
 static mut REBOOT_DELAY: u32 = 3;
 static mut CRASH_ON_BOOT: bool = false;
@@ -39,6 +40,11 @@ pub fn deny_term_net() -> bool {
 /// `kernel-update` in the `debug` file: KUP is answered only when it is there.
 pub fn kernel_update() -> bool {
     unsafe { KERNEL_UPDATE }
+}
+
+/// `irq-cpu N` (settings): the CPU device interrupts (MSI and I/O APIC pins) are sent to; 0, the boot CPU, by default.
+pub fn irq_cpu() -> usize {
+    unsafe { IRQ_CPU }
 }
 
 /// `reboot-on-crash`: reset after a fatal exception instead of halting.
@@ -99,6 +105,11 @@ pub fn load() {
             if words.next() == Some("keymap") && matches!(words.next(), Some("sv" | "se" | "fi")) {
                 unsafe { SWEDISH = true };
                 println!("settings: keymap sv -- USB keyboards type the Swedish/Finnish layout.");
+            }
+            if line.split_whitespace().next() == Some("irq-cpu") {
+                let cpu = line.split_whitespace().nth(1).and_then(|word| word.parse::<usize>().ok()).unwrap_or(0);
+                unsafe { IRQ_CPU = cpu };
+                println!("settings: irq-cpu {cpu} -- device interrupts go to CPU {cpu} (CPU 0 if it is not running).");
             }
             if line.split_whitespace().next() == Some("no-msi") {
                 unsafe { NO_MSI = true };
