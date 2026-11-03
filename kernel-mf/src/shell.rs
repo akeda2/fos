@@ -124,12 +124,20 @@ fn run(line: &str) {
     if command != "format" {
         crate::formatshell::cancel(); // a format needs its confirmation as the very next command
     }
+    if command != "install" {
+        crate::install::cancel();
+    }
+    if command != "bootcode" {
+        crate::bootcode::cancel();
+    }
+    // Commands that touch a volume directly keep tape file calls off the disk meanwhile.
+    let _disk = matches!(command, "format" | "label" | "fsck" | "grow" | "install" | "bootcode").then(crate::tapefs::lock);
     match command {
         "help" => match line.trim_start()[command.len()..].trim() {
             "" => {
                 println!("help version cpus mem pci disks nic uptime slots threads echo TEXT reboot audio usb date nic [peers|discover] tapesync gpio @HOST ...");
                 println!("ls cat write rm cp mv cmp mkdir (`help NAME` shows one; files are NAME, diskN/NAME, @LABEL/NAME)");
-                println!("dmesg sector diskN LBA [N]  mount [PATH @LABEL|fstab] umount PATH  format diskN [...] confirm");
+                println!("dmesg sector mount umount label fsck grow sha256 format install bootcode (disk commands ask first)");
                 println!("tape NAME [ARGS]  run a tape (a ring 3 process)   NAME [ARGS]  the same   kill PID");
             }
             topic => {
@@ -242,6 +250,12 @@ fn run(line: &str) {
         "mount" => crate::sysshell::mount(&line.trim_start()[command.len()..]),
         "umount" => crate::sysshell::umount(&line.trim_start()[command.len()..]),
         "format" => crate::formatshell::command(&line.trim_start()[command.len()..]),
+        "label" => crate::sysshell::label(&line.trim_start()[command.len()..]),
+        "fsck" => crate::sysshell::fsck(&line.trim_start()[command.len()..]),
+        "grow" => crate::sysshell::grow(&line.trim_start()[command.len()..]),
+        "sha256" => crate::sysshell::sha256(&mut crate::shellhost::MfHost, &line.trim_start()[command.len()..]),
+        "install" => crate::install::command(words),
+        "bootcode" => crate::bootcode::command(words),
         "reboot" => {
             println!("Restarting.");
             slots::mark_clean_stop();

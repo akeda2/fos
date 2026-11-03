@@ -8,7 +8,9 @@ use kernel_core::{ahci, fosfs, gpt, nvme, volumes};
 
 use crate::block::{self, Backend};
 
-pub use kernel_core::volumes::volume_on;
+pub use kernel_core::volumes::{boot_volume, volume_labelled, volume_on, VolumeError};
+pub use crate::slots::boot_slot;
+pub use crate::debug::pet;
 
 static mut BOOT_DISK: Option<usize> = None;
 
@@ -97,5 +99,16 @@ pub fn find_boot_disk(info: &BootInfo) {
             Err(error) => println!("FOSFS: cannot read the data partition ({error:?})."),
         },
         None => println!("FOSFS: no FOSFS data partition on the boot disk."),
+    }
+}
+
+/// Mounts the boot disk's FOSFS volume again (after `grow` changed its size).
+pub fn remount_boot() {
+    if let Some(disk) = boot_disk() {
+        if let Some(partition) = gpt::find(disk, &FOSFS_TYPE_GUID, |_| true) {
+            if let Ok(volume) = fosfs::Volume::mount(disk, partition.start, partition.sectors) {
+                volumes::set_boot_volume(volume);
+            }
+        }
     }
 }
