@@ -17,6 +17,7 @@
 //! where an allocator exists.
 #![cfg_attr(not(test), no_std)]
 
+mod crc;
 mod journal;
 mod write;
 pub use journal::{open, Journaled, Stage};

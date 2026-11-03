@@ -120,7 +120,7 @@ fn why(error: Error) -> &'static str {
         Error::NeedsRecovery => "its journal needs recovery (`ext4 diskN recover` replays it)",
         Error::Corrupt => "the volume's structures contradict themselves",
         Error::NotADirectory => "that is not a folder",
-        Error::ReadOnly => "this volume cannot be changed (made with checksums or by a tool this writer does not keep up with; `ext4 diskN mkfs` makes one it can)",
+        Error::ReadOnly => "this volume cannot be changed (it uses a feature this writer does not keep up with; `ext4 diskN mkfs` makes one it can)",
         Error::Exists => "that name exists already",
         Error::NotFound => "not found",
         Error::NoSpace => "the volume is full",

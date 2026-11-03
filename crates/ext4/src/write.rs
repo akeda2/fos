@@ -3,9 +3,9 @@
 //! Scope, on purpose: this writer keeps a volume consistent *without a journal and without checksums*, so it only
 //! accepts volumes whose features it can maintain: `filetype`, `extents`, `64bit`, `flex_bg`, `sparse_super`,
 //! `large_file`, `huge_file`, `dir_nlink`, `extra_isize`, and (as inherited from Linux-made volumes) `dir_index`,
-//! `resize_inode`, `ext_attr`, and a *clean* `has_journal`. A volume with `metadata_csum` or `uninit_bg` (the
-//! `mkfs.ext4` default) is refused with `ReadOnly`; Linux-made volumes for fos are made by `Writer::format`, which
-//! leaves those off. Adding `metadata_csum` and a journal are the next steps.
+//! `resize_inode`, `ext_attr`, a *clean* `has_journal`, and `metadata_csum` (with `metadata_csum_seed` and an empty
+//! `orphan_file`), which is what `mkfs.ext4` makes today. `uninit_bg` alone (a checksum of the descriptors only) is
+//! refused with `ReadOnly`; `Writer::format` leaves checksums off.
 //!
 //! Crash behaviour (no journal): the superblock is marked "not clean" at the first change and "clean" again by `flush`.
 //! Data goes to disk before the extents that name it, the directory entry goes last when creating and first when
@@ -18,6 +18,7 @@
 //! up to hundreds of GiB even when fragmented into 128 MiB extents); deeper trees are read but not written.
 //! `Writer` is about 100 KiB: put it in a `Box` or a static, not on a small stack.
 
+use crate::crc::crc32c;
 use crate::{Buffer, Device, Error, Fs, Inode, Journaled, Mapping, Stage, FLAG_EXTENTS, FLAG_INLINE_DATA, INCOMPAT_64BIT, INCOMPAT_EXTENTS, INCOMPAT_FILETYPE, INCOMPAT_FLEX_BG, MAGIC, MAX_BLOCK, ROOT, SECTOR, le16, le32};
 use core::ops::{Deref, DerefMut};
 
@@ -29,9 +30,14 @@ const INDEX_FL: u32 = 0x1000;
 const NAME_MAX: usize = 255;
 const LINKS_MAX: u16 = 65000;
 
-const COMPAT_OK: u32 = 0x8 | 0x4 | 0x10 | 0x20; // ext_attr, has_journal, resize_inode, dir_index
-const RO_COMPAT_OK: u32 = 0x1 | 0x2 | 0x8 | 0x20 | 0x40; // sparse_super, large_file, huge_file, dir_nlink, extra_isize
-const INCOMPAT_OK: u32 = INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_64BIT | INCOMPAT_FLEX_BG;
+const COMPAT_OK: u32 = 0x8 | 0x4 | 0x10 | 0x20 | 0x1000; // ext_attr, has_journal, resize_inode, dir_index, orphan_file
+const RO_COMPAT_OK: u32 = 0x1 | 0x2 | 0x8 | 0x20 | 0x40 | 0x400; // sparse_super, large_file, huge_file, dir_nlink, extra_isize, metadata_csum
+const INCOMPAT_OK: u32 = INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_64BIT | INCOMPAT_FLEX_BG | 0x2000; // + csum_seed
+const RO_METADATA_CSUM: u32 = 0x400;
+const BG_INODE_UNINIT: u16 = 1;
+const BG_BLOCK_UNINIT: u16 = 2;
+/// Bytes at the end of a folder block holding the checksum under metadata_csum (a fake empty entry, then the sum).
+const DIR_TAIL: usize = 12;
 
 fn put16(bytes: &mut [u8], at: usize, value: u16) {
     bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
@@ -112,6 +118,9 @@ pub struct Writer<D: Device> {
     log_len: usize,
     now: u32,
     dirty: bool,
+    /// metadata_csum: the volume's checksum seed (zero and unused without it).
+    csum: bool,
+    seed: u32,
 }
 
 impl<D: Device> Deref for Writer<D> {
@@ -129,7 +138,8 @@ impl<D: Device> DerefMut for Writer<D> {
 
 impl<D: Device> Writer<D> {
     /// Takes a mounted volume for writing; `ReadOnly` if it has features this writer cannot keep consistent.
-    pub fn new(fs: Fs<D>) -> Result<Self, Error> {
+    pub fn new(mut fs: Fs<D>) -> Result<Self, Error> {
+        let (csum, seed) = Self::checksum_setup(&mut fs)?;
         if fs.compat & !COMPAT_OK != 0 || fs.incompat & !INCOMPAT_OK != 0 || fs.ro_compat & !RO_COMPAT_OK != 0 {
             return Err(Error::ReadOnly);
         }
@@ -150,14 +160,28 @@ impl<D: Device> Writer<D> {
             log_len: 0,
             now: 0,
             dirty: false,
+            csum,
+            seed,
         })
     }
 
+    /// Whether the volume has metadata_csum, and its seed: crc32c of the UUID, or the superblock's fixed seed.
+    fn checksum_setup(fs: &mut Fs<D>) -> Result<(bool, u32), Error> {
+        if fs.ro_compat & RO_METADATA_CSUM == 0 {
+            return Ok((false, 0));
+        }
+        let mut sb = [0u8; 1024];
+        fs.device.read(2, &mut sb)?;
+        let seed = if fs.incompat & 0x2000 != 0 { le32(&sb, 0x270) } else { crc32c(!0, &sb[104..120]) };
+        Ok((true, seed))
+    }
+
     /// Like `new`, but builds the writer inside `slot`, so its ~40 KiB never lands on a small stack.
-    pub fn new_in(slot: &mut core::mem::MaybeUninit<Self>, fs: Fs<D>) -> Result<&mut Self, Error> {
+    pub fn new_in(slot: &mut core::mem::MaybeUninit<Self>, mut fs: Fs<D>) -> Result<&mut Self, Error> {
         if fs.compat & !COMPAT_OK != 0 || fs.incompat & !INCOMPAT_OK != 0 || fs.ro_compat & !RO_COMPAT_OK != 0 || !matches!(fs.block_size, 1024 | 2048 | 4096) || (fs.compat & 0x4 != 0 && !fs.device.journaled()) {
             return Err(Error::ReadOnly);
         }
+        let (csum, seed) = Self::checksum_setup(&mut fs)?;
         let p = slot.as_mut_ptr();
         // SAFETY: every field is written once; the arrays are plain integers, all-zero is a valid value.
         unsafe {
@@ -171,6 +195,8 @@ impl<D: Device> Writer<D> {
             core::ptr::addr_of_mut!((*p).log_len).write(0);
             core::ptr::addr_of_mut!((*p).now).write(0);
             core::ptr::addr_of_mut!((*p).dirty).write(false);
+            core::ptr::addr_of_mut!((*p).csum).write(csum);
+            core::ptr::addr_of_mut!((*p).seed).write(seed);
             Ok(&mut *p)
         }
     }
@@ -217,6 +243,10 @@ impl<D: Device> Writer<D> {
         put32(&mut sb, 48, self.now);
         let state = le16(&sb, 58);
         put16(&mut sb, 58, if clean { state | 1 } else { state & !1 });
+        if self.csum {
+            let sum = crc32c(!0, &sb[..1020]);
+            put32(&mut sb, 1020, sum);
+        }
         self.fs.device.write(2, &sb)
     }
 
@@ -264,7 +294,15 @@ impl<D: Device> Writer<D> {
         Ok(byte % self.fs.block_size)
     }
 
-    fn store_gdt(&mut self) -> Result<(), Error> {
+    /// Writes the cached descriptor block back; `group`'s descriptor (in it) gets its checksum first.
+    fn store_gdt(&mut self, group: u32) -> Result<(), Error> {
+        if self.csum {
+            let size = self.fs.desc_size;
+            let at = (group as usize * size) % self.fs.block_size;
+            put16(&mut self.fs.gdt, at + 0x1e, 0);
+            let sum = crc32c(crc32c(self.seed, &group.to_le_bytes()), &self.fs.gdt[at..at + size]);
+            put16(&mut self.fs.gdt, at + 0x1e, sum as u16);
+        }
         let block = self.fs.gdt_at;
         self.write_buffer(block, Buffer::Gdt)
     }
@@ -292,7 +330,7 @@ impl<D: Device> Writer<D> {
         }
         self.fs.free_blocks = (self.fs.free_blocks as i64 + blocks).max(0) as u64;
         self.fs.free_inodes = (i64::from(self.fs.free_inodes) + inodes).max(0) as u32;
-        self.store_gdt()
+        self.store_gdt(group)
     }
 
     fn bitmap_block(&mut self, group: u32, inode_map: bool) -> Result<u64, Error> {
@@ -305,16 +343,84 @@ impl<D: Device> Writer<D> {
         Ok(block)
     }
 
-    fn load_bitmap(&mut self, block: u64) -> Result<(), Error> {
-        let lba = self.lba(block)?;
+    /// Reads a group's bitmap into `bm`. Under metadata_csum a group flagged BLOCK_UNINIT / INODE_UNINIT has no valid
+    /// bitmap on disk (Linux creates it on first use), so it is built here: all free for inodes, and for blocks only
+    /// the group's own metadata (superblock and descriptor copies, and bitmaps and inode table if they lie inside).
+    fn load_bitmap(&mut self, group: u32, inode_map: bool, block: u64) -> Result<(), Error> {
         let size = self.fs.block_size;
+        if self.csum {
+            let at = self.load_gdt(group)?;
+            let flags = le16(&self.fs.gdt, at + 0x12);
+            if inode_map && flags & BG_INODE_UNINIT != 0 {
+                self.bm[..size].fill(0);
+                return Ok(());
+            }
+            if !inode_map && flags & BG_BLOCK_UNINIT != 0 {
+                return self.synthesize_block_bitmap(group);
+            }
+        }
+        let lba = self.lba(block)?;
         self.fs.device.read(lba, &mut self.bm[..size])
     }
 
-    fn store_bitmap(&mut self, block: u64) -> Result<(), Error> {
+    fn synthesize_block_bitmap(&mut self, group: u32) -> Result<(), Error> {
+        let size = self.fs.block_size;
+        self.bm[..size].fill(0);
+        let start = u64::from(self.fs.first_data_block) + u64::from(group) * u64::from(self.fs.blocks_per_group);
+        let total = self.group_blocks(group);
+        let backup = group == 0 || self.fs.ro_compat & 1 == 0 || is_sparse_group(group);
+        if backup {
+            let mut sb = [0u8; 1024];
+            self.fs.device.read(2, &mut sb)?;
+            let table = (self.fs.groups as usize * self.fs.desc_size).div_ceil(size);
+            for index in 0..(1 + table + usize::from(le16(&sb, 0xce))).min(total) {
+                set_bit(&mut self.bm, index, true);
+            }
+        }
+        let at = self.load_gdt(group)?;
+        let mut itable = u64::from(le32(&self.fs.gdt, at + 8));
+        let (mut block_map, mut inode_map) = (u64::from(le32(&self.fs.gdt, at)), u64::from(le32(&self.fs.gdt, at + 4)));
+        if self.fs.desc_size >= 64 {
+            itable |= u64::from(le32(&self.fs.gdt, at + 0x28)) << 32;
+            block_map |= u64::from(le32(&self.fs.gdt, at + 0x20)) << 32;
+            inode_map |= u64::from(le32(&self.fs.gdt, at + 0x24)) << 32;
+        }
+        let itable_blocks = (self.fs.inodes_per_group as usize * self.fs.inode_size).div_ceil(size) as u64;
+        let mut mark = |block: u64| {
+            if block >= start && block < start + total as u64 {
+                set_bit(&mut self.bm, (block - start) as usize, true);
+            }
+        };
+        mark(block_map);
+        mark(inode_map);
+        for block in itable..itable + itable_blocks {
+            mark(block);
+        }
+        for index in total..size * 8 {
+            set_bit(&mut self.bm, index, true);
+        }
+        Ok(())
+    }
+
+    /// Writes a group's bitmap. Under metadata_csum the checksum (and "initialised" flag) goes into the cached
+    /// descriptor, which the caller stores right after (`adjust_group`).
+    fn store_bitmap(&mut self, group: u32, inode_map: bool, block: u64) -> Result<(), Error> {
         let lba = self.lba(block)?;
         let size = self.fs.block_size;
-        self.fs.device.write(lba, &self.bm[..size])
+        self.fs.device.write(lba, &self.bm[..size])?;
+        if self.csum {
+            let bytes = if inode_map { self.fs.inodes_per_group } else { self.fs.blocks_per_group } as usize / 8;
+            let sum = crc32c(self.seed, &self.bm[..bytes]);
+            let at = self.load_gdt(group)?;
+            let (lo, hi) = if inode_map { (0x1a, 0x3a) } else { (0x18, 0x38) };
+            put16(&mut self.fs.gdt, at + lo, sum as u16);
+            if self.fs.desc_size >= 64 {
+                put16(&mut self.fs.gdt, at + hi, (sum >> 16) as u16);
+            }
+            let flags = le16(&self.fs.gdt, at + 0x12);
+            put16(&mut self.fs.gdt, at + 0x12, flags & !if inode_map { BG_INODE_UNINIT } else { BG_BLOCK_UNINIT });
+        }
+        Ok(())
     }
 
     fn group_blocks(&self, group: u32) -> usize {
@@ -338,7 +444,7 @@ impl<D: Device> Writer<D> {
             }
             let from = if step == 0 { ((goal - first) % per_group) as usize } else { 0 };
             let bitmap = self.bitmap_block(group, false)?;
-            self.load_bitmap(bitmap)?;
+            self.load_bitmap(group, false, bitmap)?;
             let total = self.group_blocks(group);
             let Some(begin) = (from..total).find(|&index| !bit(&self.bm, index)) else { continue };
             let mut end = begin;
@@ -346,7 +452,7 @@ impl<D: Device> Writer<D> {
                 set_bit(&mut self.bm, end, true);
                 end += 1;
             }
-            self.store_bitmap(bitmap)?;
+            self.store_bitmap(group, false, bitmap)?;
             self.adjust_group(group, -((end - begin) as i64), 0, 0)?;
             return Ok((first + u64::from(group) * per_group + begin as u64, (end - begin) as u32));
         }
@@ -365,7 +471,7 @@ impl<D: Device> Writer<D> {
             let offset = ((block - first) % per_group) as usize;
             let take = left.min(per_group - offset as u64) as usize;
             let bitmap = self.bitmap_block(group, false)?;
-            self.load_bitmap(bitmap)?;
+            self.load_bitmap(group, false, bitmap)?;
             let mut freed = 0;
             for index in offset..offset + take {
                 if bit(&self.bm, index) {
@@ -373,7 +479,7 @@ impl<D: Device> Writer<D> {
                     freed += 1;
                 }
             }
-            self.store_bitmap(bitmap)?;
+            self.store_bitmap(group, false, bitmap)?;
             self.adjust_group(group, freed, 0, 0)?;
             block += take as u64;
             left -= take as u64;
@@ -390,10 +496,16 @@ impl<D: Device> Writer<D> {
                 continue;
             }
             let bitmap = self.bitmap_block(group, true)?;
-            self.load_bitmap(bitmap)?;
+            self.load_bitmap(group, true, bitmap)?;
             let Some(index) = (0..per_group as usize).find(|&index| !bit(&self.bm, index)) else { continue };
             set_bit(&mut self.bm, index, true);
-            self.store_bitmap(bitmap)?;
+            self.store_bitmap(group, true, bitmap)?;
+            if self.csum {
+                // Slots past the highest used one are "unused" (Linux skips them when scanning).
+                let at = self.load_gdt(group)?;
+                let unused = self.gdt_value(at, 0x1c, 0x32).min(per_group - (index as u32 + 1));
+                self.set_gdt_value(at, 0x1c, 0x32, unused);
+            }
             self.adjust_group(group, 0, -1, i64::from(is_dir))?;
             return Ok(group * per_group + index as u32 + 1);
         }
@@ -404,9 +516,9 @@ impl<D: Device> Writer<D> {
         let per_group = self.fs.inodes_per_group;
         let group = (number - 1) / per_group;
         let bitmap = self.bitmap_block(group, true)?;
-        self.load_bitmap(bitmap)?;
+        self.load_bitmap(group, true, bitmap)?;
         set_bit(&mut self.bm, ((number - 1) % per_group) as usize, false);
-        self.store_bitmap(bitmap)?;
+        self.store_bitmap(group, true, bitmap)?;
         self.adjust_group(group, 0, 1, -i64::from(was_dir))
     }
 
@@ -434,9 +546,34 @@ impl<D: Device> Writer<D> {
         self.fs.read_block(block, Buffer::Itable)?;
         let size = self.fs.inode_size;
         change(&mut self.fs.itable[offset..offset + size]);
+        if self.csum {
+            let seed = self.inode_seed_of(number, &self.fs.itable[offset..offset + size]);
+            let raw = &mut self.fs.itable[offset..offset + size];
+            let wide = size > 128 && le16(raw, 128) >= 4;
+            put16(raw, 0x7c, 0);
+            if wide {
+                put16(raw, 0x82, 0);
+            }
+            let sum = crc32c(seed, raw);
+            put16(raw, 0x7c, sum as u16);
+            if wide {
+                put16(raw, 0x82, (sum >> 16) as u16);
+            }
+        }
         self.write_buffer(block, Buffer::Itable)?;
         self.fs.itable_at = block;
         Ok(())
+    }
+
+    /// The checksum seed of one inode (also the seed of its extent blocks and folder blocks): the volume seed, the
+    /// inode number and the inode's generation.
+    fn inode_seed_of(&self, number: u32, raw: &[u8]) -> u32 {
+        crc32c(crc32c(self.seed, &number.to_le_bytes()), &raw[0x64..0x68])
+    }
+
+    fn inode_seed(&mut self, number: u32) -> Result<u32, Error> {
+        let generation = self.read_raw(number, 0x64)?;
+        Ok(crc32c(crc32c(self.seed, &number.to_le_bytes()), &generation.to_le_bytes()))
     }
 
     fn read_raw(&mut self, number: u32, at: usize) -> Result<u32, Error> {
@@ -647,6 +784,11 @@ impl<D: Device> Writer<D> {
                     put32(&mut self.fs.node, at + 8, ext.p as u32);
                 }
                 let block = self.leaves[leaf];
+                if self.csum {
+                    let tail = 12 + capacity * 12;
+                    let sum = crc32c(self.inode_seed(number)?, &self.fs.node[..tail]);
+                    put32(&mut self.fs.node, tail, sum);
+                }
                 self.write_buffer(block, Buffer::Node)?;
                 let at = 12 + leaf * 12;
                 put32(&mut root, at, self.exts[from].l);
@@ -868,10 +1010,41 @@ impl<D: Device> Writer<D> {
         }
     }
 
+    /// Folder blocks end in a checksum under metadata_csum; entries live in the first `size - DIR_TAIL` bytes.
+    fn dir_limit(&self) -> usize {
+        self.fs.block_size - if self.csum { DIR_TAIL } else { 0 }
+    }
+
+    /// Hash-tree folders have their own checksum layout; they are not rewritten under metadata_csum.
+    fn dir_writable(&self, dir: &Inode) -> Result<(), Error> {
+        if self.csum && dir.flags & INDEX_FL != 0 {
+            return Err(Error::Unsupported);
+        }
+        Ok(())
+    }
+
+    /// Writes the end-of-block checksum entry of the folder block in `fs.data`.
+    fn dir_seal(&mut self, dir_number: u32) -> Result<(), Error> {
+        if !self.csum {
+            return Ok(());
+        }
+        let size = self.fs.block_size;
+        let seed = self.inode_seed(dir_number)?;
+        let sum = crc32c(seed, &self.fs.data[..size - DIR_TAIL]);
+        let tail = &mut self.fs.data[size - DIR_TAIL..size];
+        tail.fill(0);
+        put16(tail, 4, DIR_TAIL as u16);
+        tail[7] = 0xde;
+        put32(tail, 8, sum);
+        Ok(())
+    }
+
     /// Adds `name -> number` to a folder, in free space of an existing block or in a new one.
     fn dir_add(&mut self, dir_number: u32, name: &[u8], number: u32, kind: u8) -> Result<(), Error> {
         let dir = self.checked(dir_number)?;
+        self.dir_writable(&dir)?;
         let size = self.fs.block_size;
+        let limit = self.dir_limit();
         let need = 8 + ((name.len() + 3) & !3);
         let place = |data: &mut [u8], at: usize| {
             put32(data, at, number);
@@ -883,9 +1056,9 @@ impl<D: Device> Writer<D> {
             let block = self.dir_block(&dir, logical)?;
             self.fs.read_block(block, Buffer::Data)?;
             let mut at = 0;
-            while at < size {
+            while at < limit {
                 let record = usize::from(le16(&self.fs.data, at + 4));
-                if record < 8 || record % 4 != 0 || at + record > size {
+                if record < 8 || record % 4 != 0 || at + record > limit {
                     return Err(Error::Corrupt);
                 }
                 let used = if le32(&self.fs.data, at) == 0 { 0 } else { 8 + ((usize::from(self.fs.data[at + 6]) + 3) & !3) };
@@ -896,6 +1069,7 @@ impl<D: Device> Writer<D> {
                     }
                     put16(&mut self.fs.data, at_new + 4, (record - used) as u16);
                     place(&mut self.fs.data, at_new);
+                    self.dir_seal(dir_number)?;
                     self.write_buffer(block, Buffer::Data)?;
                     return self.touch(dir_number, INDEX_FL);
                 }
@@ -913,8 +1087,9 @@ impl<D: Device> Writer<D> {
             return Err(error);
         }
         self.fs.data[..size].fill(0);
-        put16(&mut self.fs.data, 4, size as u16);
+        put16(&mut self.fs.data, 4, limit as u16);
         place(&mut self.fs.data, 0);
+        self.dir_seal(dir_number)?;
         self.write_buffer(block, Buffer::Data)?;
         let (new_size, now) = (dir.size + size as u64, self.now);
         self.update_inode(dir_number, |raw| {
@@ -929,14 +1104,16 @@ impl<D: Device> Writer<D> {
     /// Takes `name` out of a folder; returns what it named.
     fn dir_remove(&mut self, dir_number: u32, name: &[u8]) -> Result<Option<u32>, Error> {
         let dir = self.checked(dir_number)?;
+        self.dir_writable(&dir)?;
         let size = self.fs.block_size;
+        let limit = self.dir_limit();
         for logical in 0..dir.size / size as u64 {
             let block = self.dir_block(&dir, logical)?;
             self.fs.read_block(block, Buffer::Data)?;
             let (mut at, mut before) = (0, None::<usize>);
-            while at < size {
+            while at < limit {
                 let record = usize::from(le16(&self.fs.data, at + 4));
-                if record < 8 || record % 4 != 0 || at + record > size {
+                if record < 8 || record % 4 != 0 || at + record > limit {
                     return Err(Error::Corrupt);
                 }
                 let length = usize::from(self.fs.data[at + 6]);
@@ -949,6 +1126,7 @@ impl<D: Device> Writer<D> {
                         }
                         None => put32(&mut self.fs.data, at, 0),
                     }
+                    self.dir_seal(dir_number)?;
                     self.write_buffer(block, Buffer::Data)?;
                     self.touch(dir_number, INDEX_FL)?;
                     return Ok(Some(found));
@@ -1013,6 +1191,13 @@ impl<D: Device> Writer<D> {
         };
         let size = self.fs.block_size;
         let made = (|| {
+            let mut root = Self::empty_root();
+            put16(&mut root, 2, 1);
+            put16(&mut root, 16, 1);
+            put32(&mut root, 20, block as u32);
+            put16(&mut root, 18, (block >> 32) as u16);
+            // The inode first: a folder block's checksum depends on the inode's generation.
+            self.init_inode(number, 0x4000 | (permissions & 0o7777), 2, size as u64, &root, (size / SECTOR) as u64)?;
             self.fs.data[..size].fill(0);
             put32(&mut self.fs.data, 0, number);
             put16(&mut self.fs.data, 4, 12);
@@ -1020,18 +1205,14 @@ impl<D: Device> Writer<D> {
             self.fs.data[7] = 2;
             self.fs.data[8] = b'.';
             put32(&mut self.fs.data, 12, parent);
-            put16(&mut self.fs.data, 16, (size - 12) as u16);
+            let limit = self.dir_limit();
+            put16(&mut self.fs.data, 16, (limit - 12) as u16);
             self.fs.data[18] = 2;
             self.fs.data[19] = 2;
             self.fs.data[20] = b'.';
             self.fs.data[21] = b'.';
+            self.dir_seal(number)?;
             self.write_buffer(block, Buffer::Data)?;
-            let mut root = Self::empty_root();
-            put16(&mut root, 2, 1);
-            put16(&mut root, 16, 1);
-            put32(&mut root, 20, block as u32);
-            put16(&mut root, 18, (block >> 32) as u16);
-            self.init_inode(number, 0x4000 | (permissions & 0o7777), 2, size as u64, &root, (size / SECTOR) as u64)?;
             self.dir_add(parent, name, number, 2)?;
             self.add_links(parent, 1)
         })();
@@ -1105,6 +1286,11 @@ impl<D: Device> Writer<D> {
         if from_dir == to_dir && from == to {
             return Ok(());
         }
+        self.dir_writable(&source_dir)?;
+        self.dir_writable(&target_dir)?;
+        if source.is_dir() && from_dir != to_dir {
+            self.dir_writable(&source)?;
+        }
         if source.is_dir() {
             // A folder cannot go into itself or below itself: walk `..` up from the new parent.
             let mut current = to_dir;
@@ -1137,12 +1323,14 @@ impl<D: Device> Writer<D> {
         self.dir_add(to_dir, to, source.number, kind_of(source.mode))?;
         self.dir_remove(from_dir, from)?;
         if source.is_dir() && from_dir != to_dir {
+            self.dir_writable(&source)?;
             let block = self.dir_block(&source, 0)?;
             self.fs.read_block(block, Buffer::Data)?;
             if self.fs.data[12 + 6] != 2 || &self.fs.data[20..22] != b".." {
                 return Err(Error::Corrupt);
             }
             put32(&mut self.fs.data, 12, to_dir);
+            self.dir_seal(source.number)?;
             self.write_buffer(block, Buffer::Data)?;
             self.add_links(from_dir, -1)?;
             self.add_links(to_dir, 1)?;
@@ -1426,4 +1614,18 @@ pub fn format_raw<D: Device>(device: &mut D, sectors: u64, options: &FormatOptio
     block.fill(0);
     block[1024..2048].copy_from_slice(&superblock(0));
     device.write(0, &block)
+}
+
+/// With sparse_super only groups 0, 1 and powers of 3, 5 and 7 carry a copy of the superblock and descriptors.
+fn is_sparse_group(group: u32) -> bool {
+    if group <= 1 {
+        return true;
+    }
+    [3u32, 5, 7].iter().any(|&base| {
+        let mut power = base;
+        while power < group {
+            power = power.saturating_mul(base);
+        }
+        power == group
+    })
 }

@@ -37,8 +37,8 @@ tests in `crates/kernel-core/tests/fosfs.rs` and `make test-mf-shell`.
 
 `crates/ext4/src/write.rs`: `Writer::format` (4 KiB blocks, journal optional, no checksums), `create`, `mkdir`, `write`,
 `truncate`, `remove`, `rename`, `flush`. `Writer` is ~100 KiB: box it. The superblock says "not clean" from the first
-change until `flush`. Only volumes without `metadata_csum`/`uninit_bg`/`bigalloc`/inline data are writable; the
-`mkfs.ext4` default (checksums) is refused with `ReadOnly` until metadata_csum lands. Files are limited to four
+change until `flush`. Only volumes without `uninit_bg`-only/`bigalloc`/inline data are writable; `mkfs.ext4`
+defaults (metadata_csum, orphan_file, metadata_csum_seed) are written correctly, see "metadata_csum" below. Files are limited to four
 extent leaf blocks (1360 extents at 4 KiB); beyond that `TooFragmented`. Folder hash indexes are dropped (flag
 cleared) on change; lookups scan. Tests: `crates/ext4/tests/writes.rs` (e2fsck -fn and debugfs judge the results).
 Shell (`kernel-core/src/ext4vol.rs`): `ext4 diskN mkfs [LABEL]` (adds a Linux partition over all free space after
@@ -56,8 +56,8 @@ block go to the log, the journal superblock's `start` is set (the commit point),
 home places, `start` goes back to 0. At most one transaction is in the log, so no revoke records are ever written;
 `needs_recovery` is set before the first commit and cleared by `flush`. File data (`write_data`) bypasses the journal
 and goes to disk first ("ordered" mode). `open` replays a log Linux or we left behind (scan, revoke, replay passes, with
-escapes and revokes) before mounting. Refused: journal checksums, async/fast commit, external journals, a journal that
-is not one contiguous run. `format` adds a journal (1024-16384 blocks, an eighth of the volume at most; Linux's
+escapes and revokes) before mounting. Refused: the older journal checksum modes (v1, v2), async/fast commit, external
+journals, a journal in more than 8 pieces (mke2fs cuts the journal of a small volume around group metadata). `format` adds a journal (1024-16384 blocks, an eighth of the volume at most; Linux's
 minimum is 1024, so volumes under 32 MiB get none). Journal-less volumes keep working, written straight through.
 `ext4 diskN recover` replays and marks clean. Tests (`make test-ext4`): a power cut at 150 points through a
 multi-operation script, each judged by Linux's own replay (`e2fsck -fy`) and by ours (`open`, then `e2fsck -fn`); a
@@ -65,3 +65,20 @@ transaction written by `debugfs jo/jw/jc` is replayed by `open`. There is no wri
 volatile cache may reorder log and commit; only real hardware shows how much that matters. mf thread stacks became
 256 KiB because the volume code keeps four 4 KiB caches per `Fs` and moves it by value. Not run: the embedded kernel
 under QEMU with a journaled volume (its static grows by 256 KiB).
+
+## metadata_csum (step 5)
+
+`crates/ext4/src/crc.rs` (CRC32C) and `write.rs`: a volume with `metadata_csum` (Linux's `mkfs.ext4` default, with
+`metadata_csum_seed` and an empty `orphan_file`) is written with every checksum kept right: superblock (offset 1020),
+group descriptors (16 bits, per group), block and inode bitmaps (in the descriptor), inodes (lo and hi halves, over the
+whole inode with the generation in the seed), extent leaf blocks (4-byte tail after the 340 entries) and folder blocks
+(a 12-byte fake entry, inode 0, type 0xDE, ends each block, so a folder block holds entries in `size - 12` bytes).
+`BLOCK_UNINIT` / `INODE_UNINIT` groups (what `lazy_itable_init` leaves) get their bitmaps built on first use and the
+flags cleared; `itable_unused` is kept. Hash-tree folders (`INDEX_FL`) are not rewritten on such a volume (`Unsupported`
+for `mkdir`/`create`/`rm`/`mv` in them; converting to a linear folder is not done). A journal Linux has mounted carries
+`CSUM_V3`; `open` verifies and replays such a log (descriptor, revoke, commit and per-block checksums) and then clears
+the feature, so we only write plain logs and Linux sets it again at its next mount. `Writer::format` still makes
+volumes without checksums. A volume with only `uninit_bg` (descriptor checksums) stays read-only. Tests: Linux-made
+volumes (default, lazy tables, 1 KiB blocks without orphan_file, no checksums with many groups, 768 MiB spilling into
+uninitialised groups) are filled with files, folders that grow, fragmented files, renames and removals, then judged by
+`e2fsck -fn` (which verifies every checksum); a v3 journal written by `debugfs jo -c` is replayed.
