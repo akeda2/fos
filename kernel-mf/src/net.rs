@@ -9,7 +9,9 @@
 //! - KUP (0x3a-0x3e): a kernel image is staged in RAM, checked (length, RFC 1071 checksum), written to the inactive slot
 //!   and made pending; the loader gives it one try. Only with `kernel-update` in the `debug` file.
 //!
-//! Not served yet: NETFS (file GET/PUT), tape sync and GPIO (`DEFERRED.md`). Everything runs on the boot CPU.
+//! - NETFS (0x30-0x39) and the tape-sync manifest (0x40): `netfs.rs`, `tapesync.rs`.
+//!
+//! Not served yet: GPIO and the `tapesync` client command (`DEFERRED.md`). Everything runs on the boot CPU.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -19,7 +21,7 @@ use kernel_core::{e1000, netdump::Mac, pci, rtl8139, rtl8168, threecom};
 
 use crate::apic::{self, TICK_HZ};
 use crate::sync::SpinLock;
-use crate::{config, pmm, power, shell, slots, vm};
+use crate::{config, netfs, pmm, power, shell, slots, vm};
 
 const ETHERTYPE: [u8; 2] = [0x88, 0xb6];
 const TAG_DISCOVER_REQUEST: u8 = 0x02;
@@ -165,6 +167,17 @@ fn send(index: usize, destination: &[u8; 6], tag: u8, payload: &[u8]) -> bool {
     frame[14] = tag;
     frame[15..15 + payload.len()].copy_from_slice(payload);
     nic.send(&frame[..15 + payload.len()])
+}
+
+/// `send` for the NETFS module.
+pub fn send_frame(index: usize, destination: &[u8; 6], tag: u8, payload: &[u8]) -> bool {
+    send(index, destination, tag, payload)
+}
+
+/// True while a kernel update is arriving (NETFS then refuses a transfer: both want the disk and the NIC).
+pub fn kup_busy() -> bool {
+    let kup = kup();
+    kup.active && apic::ticks().wrapping_sub(kup.last_activity) < KUP_STALE_TICKS
 }
 
 /// The name announced for interface `index`: `NAME<n>` from the `hostname` file (n is the one-based interface number), or
@@ -458,6 +471,7 @@ fn handle_frame(index: usize, frame: &[u8]) {
         TAG_KUP_REQUEST if config::kernel_update() => kup_request(index, source, payload),
         TAG_KUP_DATA if config::kernel_update() => kup_data(source, payload),
         TAG_KUP_STOP if config::kernel_update() => kup_stop(index, source),
+        tag if netfs::owns(tag) => netfs::handle(index, source, tag, payload),
         _ => {
             handle_terminal(index, source, tag, payload);
         }
@@ -470,6 +484,7 @@ pub fn poll() {
         let _nics = lock_nics();
         nicctl::drain_nics_to_fifo();
     }
+    netfs::serve();
     announce();
     if session_open() {
         flush();

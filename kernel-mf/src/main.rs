@@ -21,6 +21,8 @@ mod fb;
 mod config;
 mod debug;
 mod net;
+mod netfs;
+mod tapesync;
 mod power;
 mod shell;
 mod slots;
