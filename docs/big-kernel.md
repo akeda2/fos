@@ -1,7 +1,7 @@
-# A second, larger kernel (idea, not started)
+# A second, larger kernel (FOS-mf, `kernel-mf/`: built, in use on `piano`)
 
 Question: can fos have two kernels, the current small one for embedded machines and a larger one (SMP, preemptive multitasking,
-real memory management) that supports everything the small one does? Yes. This file is the plan and the trade-offs; nothing is built.
+real memory management) that supports everything the small one does? Yes. This file is the plan, the trade-offs and (from "Stage 2" on) the status of what was built.
 
 ## Why it is feasible
 
@@ -420,3 +420,5 @@ flavour marker reaches `fosadm status`, and whether the batch queue needs the sc
 **BIOS text-mode console on the server kernel (side item 8).** A BIOS boot that skips the VBE mode (Shift held, or `debug video skip`; `BootInfo` has no framebuffer and `runtime_services == 0`) used to leave kernel-mf serial/network only. `fb::init_text` now draws the same grid and ANSI escapes into the 80x25 VGA text window at 0xB8000 (`vm::init` already mapped it uncached): one `u16` cell per character, ANSI colour numbers swizzled to VGA's (red 1 -> 4, blue 4 -> 1), backgrounds kept to 0-7 so a bright one does not blink, bytes above 0x7f shown as `?` (the grid is Latin-9, the cells would be code page 437), the hardware cursor (CRTC 0x0A/0x0B shape, 0x0E/0x0F position) following the caret. `gfx_*` report no pixel screen, so a graphics tape says so. `make test-mf-bios-video` (SeaBIOS, Shift held; reads 0xB8000 through the QEMU monitor; a normal boot still gets the pixel console); `test-mf-boot` (UEFI and BIOS) and `test-mf-tape` pass. QEMU only: a real video BIOS, the cursor and a card's text-mode quirks are for hardware. The ANSI-colour swizzle has no automated check (the serial shell drops ESC).
 
 **Start-up underruns (side item 9).** `audio tone` on EHCI USB audio counted ~176 underruns in the first 48 packets: the first iTD ring goes out before the caller has written anything (silence by construction), and `publish_ehci` did not reset the counter as `publish` (xHCI) does; it now does. The tone command also no longer prints between `start` and the loop (the line moved after it). QEMU only (`test-mf-audio`, `test-usb-audio`); the real count on `piano` is for hardware to show.
+
+**Pixel-console caret (2026-11-03).** The server kernel's pixel console drew no caret (the embedded one does): `fb.rs` now draws an underline in the next cell after every write (`draw_caret`: the old cell is redrawn, the caret drawn afresh; `ESC [ ? 25 l/h` hides and shows it, and in BIOS text mode drives the hardware cursor). `test-mf-bios-video` counts the caret cells on a screendump. The start-up fix above was also run on `piano`: `audio tone 440 4` now reports 32768 packets, 0 underruns (was 176).
