@@ -166,6 +166,10 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
             println!("Framebuffer console: {}x{} pixels, {columns}x{rows} characters (also on COM1 and the network).", info.framebuffer.width, info.framebuffer.height);
             println!("Framebuffer: {}.", if combining { "write-combining (PAT)" } else { "uncached (no PAT, or a mapping that cannot change)" });
         }
+        None if info.runtime_services == 0 => {
+            let (columns, rows) = fb::init_text();
+            println!("Framebuffer console: none; using the BIOS's {columns}x{rows} VGA text screen (also on COM1 and the network).");
+        }
         None => println!("Framebuffer console: no pixel screen (serial and network only)."),
     }
     println!("Direct map: frame {frame:#x} written and read back at {:#x}.", vm::direct(frame));

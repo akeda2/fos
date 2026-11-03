@@ -185,7 +185,7 @@ kernel:
 
 # The server kernel (kernel-mf/, docs/big-kernel.md): same loaders, same image layout, its own crate.
 KERNEL_MF_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel-mf
-.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-tape test-mf-usb test-mf-debug test-mf-audio test-mf-netfs test-mf-tapesync test-mf-gpio
+.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-tape test-mf-usb test-mf-debug test-mf-audio test-mf-netfs test-mf-tapesync test-mf-gpio test-mf-bios-video
 kernel-mf:
 	cd kernel-mf && cargo +nightly-2026-09-13 build --release
 
@@ -237,6 +237,10 @@ test-mf-netfs: image-mf
 # The `tapesync` client on the server kernel, pulling from embedded-kernel machines (the far side is the ordinary image).
 test-mf-tapesync: image-mf image
 	python3 tools/test_mf_tapesync.py
+
+# The server kernel's BIOS text-mode console (Shift held: no VBE mode; the screen is read through the QEMU monitor).
+test-mf-bios-video: image-mf
+	python3 tools/test_mf_bios_video.py
 
 # `gpio @HOST` on the server kernel, against an embedded-kernel guest with a simulated pin bank.
 test-mf-gpio: image-mf image

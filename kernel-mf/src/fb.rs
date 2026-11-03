@@ -64,6 +64,8 @@ struct Console {
     parameters: [u16; 4],
     parameter_count: usize,
     format: u32,
+    /// VGA text mode (BIOS boot without a linear framebuffer): `base` is the 80x25 text window, one `u16` per cell.
+    text: bool,
 }
 
 static mut CONSOLE: Option<Console> = None;
@@ -77,7 +79,7 @@ fn pixel(format: u32, red: u8, green: u8, blue: u8) -> u32 {
 }
 
 /// Starts the console on the boot framebuffer and clears it. Returns (columns, rows, write-combining), or None when there is no pixel screen
-/// (BIOS text mode and headless machines stay serial/network only).
+/// (a BIOS boot without one uses `init_text`; headless machines stay serial/network only).
 pub fn init(framebuffer: &Framebuffer) -> Option<(usize, usize, bool)> {
     if framebuffer.format >= PIXEL_NONE || framebuffer.base == 0 || framebuffer.width == 0 || framebuffer.height == 0 {
         return None;
@@ -106,6 +108,7 @@ pub fn init(framebuffer: &Framebuffer) -> Option<(usize, usize, bool)> {
         parameters: [0; 4],
         parameter_count: 0,
         format: framebuffer.format,
+        text: false,
     };
     console.clear_all();
     flush_writes();
@@ -114,12 +117,57 @@ pub fn init(framebuffer: &Framebuffer) -> Option<(usize, usize, bool)> {
     Some(size)
 }
 
+/// Starts the console in the BIOS's VGA text mode (80x25 at 0xB8000, which `vm::init` maps on a BIOS boot without a framebuffer,
+/// e.g. after `debug video skip` or Shift at boot): the same grid and escapes as the pixel console, drawn as text cells. Only
+/// for a BIOS boot (`runtime_services == 0`); a UEFI machine has no text screen. Bytes above 0x7f show as `?` (the cells use
+/// code page 437, the grid Latin-9), and a bright background is shown dark (the top bit would make the cell blink).
+pub fn init_text() -> (usize, usize) {
+    let mut console = Console {
+        base: vm::direct(VGA_TEXT_BASE) as *mut u32,
+        stride: TEXT_COLUMNS,
+        width: TEXT_COLUMNS,
+        height: TEXT_ROWS,
+        columns: TEXT_COLUMNS,
+        rows: TEXT_ROWS,
+        column: 0,
+        row: 0,
+        foreground: DEFAULT_FOREGROUND,
+        background: DEFAULT_BACKGROUND,
+        bold: false,
+        palette: [0; 16],
+        stale: false,
+        escape: Escape::None,
+        parameters: [0; 4],
+        parameter_count: 0,
+        format: PIXEL_NONE,
+        text: true,
+    };
+    console.clear_all();
+    // CRTC register 0x0A bit 5 turns the cursor off: clear it, and give it scan lines 13-15 (an underline-to-block shape).
+    crate::cpu::outb(0x3d4, 0x0a);
+    crate::cpu::outb(0x3d5, 13);
+    crate::cpu::outb(0x3d4, 0x0b);
+    crate::cpu::outb(0x3d5, 15);
+    console.place_cursor();
+    unsafe { *core::ptr::addr_of_mut!(CONSOLE) = Some(console) };
+    (TEXT_COLUMNS, TEXT_ROWS)
+}
+
+const VGA_TEXT_BASE: u64 = 0xb8000;
+const TEXT_COLUMNS: usize = 80;
+const TEXT_ROWS: usize = 25;
+/// ANSI colour number (red = 1, blue = 4) to the VGA attribute's colour number (blue = 1, red = 4).
+const ANSI_TO_VGA: [u8; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
+
 fn cells() -> &'static mut [u16; MAX_COLUMNS * MAX_ROWS] {
     unsafe { &mut *core::ptr::addr_of_mut!(CELLS) }
 }
 
 impl Console {
     fn fill(&mut self, first_line: usize, last_line: usize, value: u32) {
+        if self.text {
+            return;
+        }
         for line in first_line..last_line {
             for x in 0..self.width {
                 unsafe { self.base.add(line * self.stride + x).write_volatile(value) };
@@ -141,13 +189,37 @@ impl Console {
     fn clear_all(&mut self) {
         let blank = self.blank();
         cells().fill(blank);
+        if self.text {
+            return self.redraw();
+        }
         let background = self.palette[usize::from(self.background)];
         self.fill(0, self.height, background);
         self.stale = false;
     }
 
+    /// A text cell's VGA attribute from the grid's (foreground 0-15, background 0-7: the top bit would blink).
+    fn vga_attribute(attribute: u16) -> u16 {
+        let colour = |ansi: u16| u16::from(ANSI_TO_VGA[usize::from(ansi & 7)]) | (ansi & 8);
+        colour(attribute & 15) | colour((attribute >> 4) & 7) << 4
+    }
+
+    /// Puts the hardware cursor (CRTC registers 0x0E and 0x0F) on the next character position.
+    fn place_cursor(&self) {
+        let at = (self.row * self.columns + self.column.min(self.columns - 1)) as u16;
+        crate::cpu::outb(0x3d4, 0x0e);
+        crate::cpu::outb(0x3d5, (at >> 8) as u8);
+        crate::cpu::outb(0x3d4, 0x0f);
+        crate::cpu::outb(0x3d5, at as u8);
+    }
+
     fn draw_cell(&mut self, column: usize, row: usize) {
         let cell = cells()[row * MAX_COLUMNS + column];
+        if self.text {
+            let character = if (cell as u8) < 0x80 { cell as u8 } else { b'?' };
+            let value = u16::from(character) | Self::vga_attribute(cell >> 8) << 8;
+            unsafe { self.base.cast::<u16>().add(row * self.stride + column).write_volatile(value) };
+            return;
+        }
         let foreground = self.palette[usize::from((cell >> 8) & 15)];
         let background = self.palette[usize::from((cell >> 12) & 15)];
         for (line, bits) in FONT[usize::from(cell as u8)].iter().enumerate() {
@@ -325,6 +397,9 @@ pub fn write_str(text: &str) {
         if console.stale {
             console.redraw();
         }
+        if console.text {
+            console.place_cursor();
+        }
         flush_writes();
     }
 }
@@ -340,12 +415,12 @@ static GFX_OPEN: AtomicBool = AtomicBool::new(false);
 
 /// Width and height of the pixel screen, or None without one.
 pub fn gfx_info() -> Option<(u32, u32)> {
-    let console = unsafe { (*core::ptr::addr_of!(CONSOLE)).as_ref() }?;
+    let console = unsafe { (*core::ptr::addr_of!(CONSOLE)).as_ref() }.filter(|console| !console.text)?;
     Some((console.width as u32, console.height as u32))
 }
 
 pub fn gfx_open() -> bool {
-    let Some(console) = (unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }) else { return false };
+    let Some(console) = (unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }).filter(|console| !console.text) else { return false };
     let black = console.palette[usize::from(DEFAULT_BACKGROUND)];
     console.fill(0, console.height, black);
     flush_writes();
