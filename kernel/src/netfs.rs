@@ -33,8 +33,7 @@ pub(crate) const NETFS_NO_SYNC: u8 = 10;
 /// The tape-sync request (see `tapesync.rs` and crates/tape-sync): a nonce in, a signed manifest out as a GET stream.
 pub(crate) const TAG_SYNC_REQUEST: u8 = 0x40;
 /// GPIO over the network (`gpio_remote.rs`): a signed request and its answer, one frame each.
-pub(crate) const TAG_GPIO_REQUEST: u8 = 0x41;
-pub(crate) const TAG_GPIO_REPLY: u8 = 0x42;
+pub(crate) use kernel_core::gpio_client::TAG_GPIO_REQUEST;
 /// The shared secret of `tapesync`; NETFS never reads or writes it.
 pub(crate) const KEY_FILE: &str = "synckey";
 pub(crate) const NETFS_CHUNK: usize = 1024;

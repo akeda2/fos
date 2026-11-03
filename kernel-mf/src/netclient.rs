@@ -13,7 +13,7 @@ use kernel_core::nicctl;
 use kernel_core::tapesync_client::{self as client, Env};
 use kernel_core::volumes;
 
-use crate::netfs::{self, TAG_GET_DATA, TAG_GET_ERROR, TAG_GET_REQUEST, TAG_GET_START, TAG_GET_STOP};
+use crate::netfs::{self, TAG_GPIO_REPLY, TAG_GPIO_REQUEST, TAG_GET_DATA, TAG_GET_ERROR, TAG_GET_REQUEST, TAG_GET_START, TAG_GET_STOP};
 use crate::{apic, net, tapefs};
 
 const TAG_DISCOVER_REQUEST: u8 = 0x02;
@@ -136,6 +136,9 @@ pub fn capture(index: usize, source: [u8; 6], tag: u8, payload: &[u8]) -> bool {
         remember(index, source, payload);
         return false;
     }
+    if tag == TAG_GPIO_REPLY {
+        return gpio_frame(source, payload);
+    }
     let rx = rx();
     if !rx.active {
         return false;
@@ -152,6 +155,56 @@ pub fn capture(index: usize, source: [u8; 6], tag: u8, payload: &[u8]) -> bool {
         }
         _ => false,
     }
+}
+
+/// One request frame out, one reply frame back (`gpio @HOST`); touched under the NIC lock like `RX`.
+struct Single {
+    active: bool,
+    mac: [u8; 6],
+    out: *mut u8,
+    capacity: usize,
+    length: Option<usize>,
+}
+
+static mut SINGLE: Single = Single { active: false, mac: [0; 6], out: core::ptr::null_mut(), capacity: 0, length: None };
+
+fn gpio_frame(source: [u8; 6], payload: &[u8]) -> bool {
+    let single = unsafe { &mut *core::ptr::addr_of_mut!(SINGLE) };
+    if !single.active || single.length.is_some() || source != single.mac {
+        return false;
+    }
+    let take = payload.len().min(single.capacity);
+    unsafe { core::ptr::copy_nonoverlapping(payload.as_ptr(), single.out, take) };
+    single.length = Some(take);
+    true
+}
+
+/// Sends `request` with the GPIO request tag and waits up to 2 s for the same machine's reply frame.
+fn exchange(mac: [u8; 6], nic_index: usize, request: &[u8], out: &mut [u8]) -> Result<usize, &'static str> {
+    let single = unsafe { &mut *core::ptr::addr_of_mut!(SINGLE) };
+    {
+        let _nics = net::lock_nics();
+        *single = Single { active: true, mac, out: out.as_mut_ptr(), capacity: out.len(), length: None };
+    }
+    net::send_frame(nic_index, &mac, TAG_GPIO_REQUEST, request);
+    let deadline = apic::micros() + 2_000_000;
+    let result = loop {
+        {
+            let _nics = net::lock_nics();
+            nicctl::drain_nics_to_fifo();
+            if let Some(length) = single.length {
+                break Ok(length);
+            }
+            if apic::micros() > deadline {
+                break Err("no answer");
+            }
+        }
+        crate::debug::pet();
+        core::hint::spin_loop();
+    };
+    let _nics = net::lock_nics();
+    single.active = false;
+    result
 }
 
 fn receive_frame(rx: &mut Rx, tag: u8, payload: &[u8]) {
@@ -337,4 +390,25 @@ impl Env for Mf {
 /// `tapesync [HOST] [apply]`.
 pub fn tapesync(words: core::str::SplitWhitespace) {
     client::command(&Mf, words);
+}
+
+impl kernel_core::gpio_client::Env for Mf {
+    fn print(&self, line: core::fmt::Arguments) {
+        println!("{}", line);
+    }
+    fn key(&self, out: &mut [u8; kernel_core::gpio_client::KEY_MAX]) -> Option<usize> {
+        let volume = volumes::boot_volume()?;
+        client::read_key(self, &volume, out)
+    }
+    fn peer(&self, host: &str) -> Option<([u8; 6], usize)> {
+        Env::peer(self, host)
+    }
+    fn exchange(&self, mac: [u8; 6], nic: usize, request: &[u8], out: &mut [u8]) -> Result<usize, &'static str> {
+        exchange(mac, nic, request, out)
+    }
+}
+
+/// `gpio [@HOST] ...`: this kernel has no pins of its own.
+pub fn gpio(rest: &str) {
+    kernel_core::gpio_client::command(&Mf, rest, |_| println!("gpio: this machine has no GPIO pins; `gpio @HOST ...` works on one that has."));
 }

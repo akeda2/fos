@@ -514,7 +514,7 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
   reads with the key, writes also need `gpio-remote` in `settings`; served at the prompt/`term net`, not while a tape runs.
   `gpio-sim` is a RAM bank for `make test-gpio`. Only real pins verify: register offsets, pull read-back, pin safety. `tools/gpio.py` is the host
   client (`--mac HOST`, `--key`; `make test-gpio`) and `gpiopanel` the touch tape (docs/design.md, `make test-gpiopanel`). Open: edge
-  events/IRQs (Linux groups 0-27, 28-45, 46-57). ABI 28 `gpio_pull_get` reads the pulls back.
+  events/IRQs (Linux groups 0-27, 28-45, 46-57). ABI 28 `gpio_pull_get` reads the pulls back. The client (`crates/kernel-core/src/gpio_client.rs`) is shared: `gpio @HOST` also works from `kernel-mf` (`make test-mf-gpio`).
 - **Pi interrupt-driven SD and I2C completion** (user, 2026-10-23): SD (`sdhci.rs`) and I2C (`i2c.rs`) sleep in `wfi` but still read the status
   by polling; move completion to the interrupt handlers later. xHCI is already MSI/interrupt driven except where a disk stays polled.
 - **Touchscreen** (Pi). The panel may be USB (the official 7" DSI panel's touch is I2C behind the firmware instead; DFRobot ~4.5" DSI: ICN6211 bridge, see docs/aarch64-plan.md "I2C on the Pi"). If USB, so it goes through `usb_hid` as a pointer device. To test 2026-10-22: which HID report

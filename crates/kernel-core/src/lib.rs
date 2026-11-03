@@ -31,6 +31,7 @@ pub mod e1000;
 pub mod fatvol;
 pub mod fosfs;
 pub mod tapesync_client;
+pub mod gpio_client;
 pub mod gpt;
 pub mod i2s;
 pub mod line;
