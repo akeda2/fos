@@ -35,6 +35,21 @@ mod sysshell;
 mod log;
 #[path = "../../kernel/src/formatshell.rs"]
 mod formatshell;
+/// The embedded kernel's `install` and `bootcode` use physical memory as pointers (identity map); here a buffer's
+/// "address" is its direct-map address and `free` takes it back to the physical frame.
+mod memory {
+    pub const FRAME: u64 = crate::pmm::FRAME;
+    pub fn allocate_contiguous(count: u64, below: Option<u64>) -> Option<u64> {
+        crate::pmm::allocate(count, below).map(crate::vm::direct)
+    }
+    pub fn free(address: u64, count: u64) {
+        crate::pmm::free(address - crate::vm::direct(0), count);
+    }
+}
+#[path = "../../kernel/src/install.rs"]
+mod install;
+#[path = "../../kernel/src/bootcode.rs"]
+mod bootcode;
 use kernel_core::{fatvol, fosfs, gpt};
 // formatshell (shared with the embedded kernel) names the macro by path
 pub(crate) use serial::println;
