@@ -9,8 +9,13 @@ use std::process::Command;
 
 struct FileDevice(File);
 
+thread_local! {
+    static READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl Device for FileDevice {
     fn read(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
+        READS.with(|reads| reads.set(reads.get() + 1));
         self.0.seek(SeekFrom::Start(lba * SECTOR as u64)).map_err(|_| Error::Device)?;
         self.0.read_exact(buffer).map_err(|_| Error::Device)
     }
@@ -53,6 +58,9 @@ fn populate(root: &Path) {
     fs::create_dir(root.join("many")).unwrap();
     for index in 0..3000 {
         fs::write(root.join(format!("many/file-{index:05}-with-a-longish-name.txt")), format!("number {index}\n")).unwrap();
+    }
+    for index in 0..60 {
+        fs::write(root.join(format!("many/räksmörgås-{index:03}.txt")), "x").unwrap();
     }
     std::os::unix::fs::symlink("small.txt", root.join("link")).unwrap();
 }
@@ -119,6 +127,10 @@ fn run(mkfs: &[&str], name: &str) {
     let made = Command::new(mkfs[0]).args(&mkfs[1..]).arg("-q").arg("-F").arg("-d").arg(&source).arg(&image).output().unwrap();
     assert!(made.status.success(), "{mkfs:?}: {}", String::from_utf8_lossy(&made.stderr));
 
+    // `mkfs -d` writes linear folders; `e2fsck -D` optimises them into hash trees (exit 1 = fixed something).
+    let optimised = Command::new("/usr/sbin/e2fsck").args(["-fyD"]).arg(&image).output().unwrap();
+    assert!(optimised.status.code().is_some_and(|code| code <= 1), "{}", String::from_utf8_lossy(&optimised.stdout));
+
     let mut volume = Fs::mount(FileDevice(File::open(&image).unwrap())).unwrap();
     assert_eq!(volume.label(), b"fostest");
     let root = volume.root().unwrap();
@@ -126,6 +138,24 @@ fn run(mkfs: &[&str], name: &str) {
     let mut count = 0;
     compare_tree(&mut volume, &root, &source, &mut count);
     assert!(count > 3000, "{count} entries compared");
+    // The big folder is indexed (mkfs makes a hash tree for it): a lookup reads the tree and one leaf, not the folder.
+    let many = volume.resolve(b"many").unwrap().unwrap();
+    assert!(many.flags & 0x1000 != 0, "the big folder has an htree index");
+    let before = READS.with(|reads| reads.get());
+    for index in (0..3000).step_by(7) {
+        let name = format!("file-{index:05}-with-a-longish-name.txt");
+        let entry = volume.lookup(&many, name.as_bytes()).unwrap().expect("indexed lookup finds the name");
+        assert!(volume.inode(entry.number).is_ok());
+    }
+    for index in 0..60 {
+        let name = format!("räksmörgås-{index:03}.txt");
+        assert!(volume.lookup(&many, name.as_bytes()).unwrap().is_some(), "{name}");
+    }
+    assert!(volume.lookup(&many, b"file-99999-nothere").unwrap().is_none());
+    assert!(volume.lookup(&many, b"a").unwrap().is_none());
+    let reads = READS.with(|reads| reads.get()) - before;
+    eprintln!("indexed lookups: {reads} reads");
+    assert!(reads < 429 * 8, "{reads} device reads for 429 indexed lookups (a linear scan needs ~40 each)");
     let found = volume.resolve("docs//deeper/deepest/Räksmörgås 日本語.txt".as_bytes()).unwrap().unwrap();
     assert_eq!(found.size, "hej på dig\n".len() as u64);
     assert!(volume.resolve(b"docs/nothere").unwrap().is_none());

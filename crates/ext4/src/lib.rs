@@ -6,8 +6,8 @@
 //!
 //! Handled: 1, 2 and 4 KiB blocks; 32- and 64-byte group descriptors (`64bit`), `flex_bg`; extent trees of any
 //! depth and the old direct/indirect block maps (ext2/ext3 volumes); uninitialised extents (read as zeros) and
-//! sparse files; folders by linear scan (an indexed folder stays readable that way; the hash-tree lookup is for the
-//! performance work). Refused with a reason: a journal that needs recovery (`mount_with` can ignore it, then the
+//! sparse files; folders: `lookup` walks the hash tree of an indexed folder, `list` scans linearly (which also reads
+//! an indexed folder). Refused with a reason: a journal that needs recovery (`mount_with` can ignore it, then the
 //! last transactions are missing), `meta_bg`, inline data, compression, encryption, case folding, other block sizes.
 //! Checksums are not verified yet.
 //!
@@ -19,6 +19,7 @@
 
 mod cache;
 mod crc;
+mod dirhash;
 mod journal;
 mod write;
 pub use cache::{Cache, Cached};
@@ -199,6 +200,8 @@ pub struct Fs<D: Device> {
     compat: u32,
     ro_compat: u32,
     label: [u8; 16],
+    /// `s_hash_seed`, the folder hash's seed.
+    hash_seed: [u32; 4],
     /// The cached group-descriptor block and inode-table block (volume block numbers, `u64::MAX` for none).
     gdt_at: u64,
     gdt: [u8; MAX_BLOCK],
@@ -277,6 +280,7 @@ impl<D: Device> Fs<D> {
             compat: le32(&sb, 92),
             ro_compat: le32(&sb, 100),
             label,
+            hash_seed: [le32(&sb, 0xec), le32(&sb, 0xf0), le32(&sb, 0xf4), le32(&sb, 0xf8)],
             gdt_at: u64::MAX,
             gdt: [0; MAX_BLOCK],
             itable_at: u64::MAX,
@@ -561,8 +565,20 @@ impl<D: Device> Fs<D> {
         Ok(())
     }
 
-    /// The entry called `name` in a folder (byte-exact, like Linux).
+    /// The entry called `name` in a folder (byte-exact, like Linux). An indexed folder is searched through its hash
+    /// tree (one block per level plus one leaf); anything unexpected in the index falls back to the linear scan.
     pub fn lookup(&mut self, folder: &Inode, name: &[u8]) -> Result<Option<Inode>, Error> {
+        let found = match self.indexed(folder, name) {
+            Some(result) => result?,
+            None => self.scan(folder, name)?,
+        };
+        match found {
+            Some(number) => self.inode(number).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn scan(&mut self, folder: &Inode, name: &[u8]) -> Result<Option<u32>, Error> {
         let mut found = None;
         self.list(folder, &mut |entry| {
             if entry.name == name {
@@ -571,9 +587,95 @@ impl<D: Device> Fs<D> {
             }
             false
         })?;
-        match found {
-            Some(number) => self.inode(number).map(Some),
-            None => Ok(None),
+        Ok(found)
+    }
+
+    /// Looks `name` up in the leaf block `logical` of a folder.
+    fn leaf(&mut self, folder: &Inode, logical: u64, name: &[u8]) -> Result<Option<u32>, Error> {
+        let Mapping::Data { block, .. } = self.map(folder, logical)? else { return Err(Error::Corrupt) };
+        self.read_block(block, Buffer::Data)?;
+        let bytes = &self.data[..self.block_size];
+        let mut at = 0;
+        while at + 8 <= bytes.len() {
+            let record = usize::from(le16(bytes, at + 4));
+            let length = usize::from(bytes[at + 6]);
+            if record < 8 + length || record % 4 != 0 || at + record > bytes.len() {
+                return Err(Error::Corrupt);
+            }
+            if le32(bytes, at) != 0 && &bytes[at + 8..at + 8 + length] == name {
+                return Ok(Some(le32(bytes, at)));
+            }
+            at += record;
+        }
+        Ok(None)
+    }
+
+    /// The hash-tree search: `None` when the folder is not indexed or the index cannot be trusted (the caller scans
+    /// linearly), else the result. The root block holds `.`, `..` and the root of the tree (hash version, number of
+    /// index levels, then entries of (hash, block)); an index node is a fake empty entry followed by entries. Entry 0
+    /// of a node covers every hash below entry 1's; its hash field holds the node's limit and count instead.
+    fn indexed(&mut self, folder: &Inode, name: &[u8]) -> Option<Result<Option<u32>, Error>> {
+        if folder.flags & 0x1000 == 0 || !folder.is_dir() || folder.size < 2 * self.block_size as u64 {
+            return None;
+        }
+        let Mapping::Data { block, .. } = self.map(folder, 0).ok()? else { return None };
+        self.read_block(block, Buffer::Data).ok()?;
+        let root = &self.data[..self.block_size];
+        let (version, info_length, mut levels) = (root[28], root[29], root[30]);
+        if le16(root, 4) != 12 || root[20..22] != *b".." || info_length != 8 || levels > 3 {
+            return None;
+        }
+        let hash = dirhash::hash(version, self.hash_seed, name)?;
+        let blocks = folder.size / self.block_size as u64;
+        let mut offset = 32;
+        loop {
+            let bytes = &self.data[..self.block_size];
+            let count = usize::from(le16(bytes, offset + 2));
+            if count == 0 || offset + count * 8 > self.block_size {
+                return None;
+            }
+            // The last entry whose hash is at most ours (entry 0 has no hash of its own).
+            let mut chosen = 0;
+            while chosen + 1 < count && le32(bytes, offset + (chosen + 1) * 8) <= hash {
+                chosen += 1;
+            }
+            let next = u64::from(le32(bytes, offset + chosen * 8 + 4) & 0x0fff_ffff);
+            if next == 0 || next >= blocks {
+                return None;
+            }
+            if levels == 0 {
+                // Names whose hashes collide continue in the following leaves, marked by the hash's low bit; the
+                // leaves are noted first because reading one reuses the buffer that holds the node.
+                let mut leaves = [next, 0, 0, 0];
+                let mut noted = 1;
+                let mut index = chosen + 1;
+                while index < count && le32(bytes, offset + index * 8) == hash | 1 && noted < leaves.len() {
+                    leaves[noted] = u64::from(le32(bytes, offset + index * 8 + 4) & 0x0fff_ffff);
+                    noted += 1;
+                    index += 1;
+                }
+                // A chain that runs on past the node or past what we noted is left to the linear scan.
+                let open = index == count || le32(bytes, offset + index * 8) == hash | 1;
+                for &leaf in &leaves[..noted] {
+                    if leaf == 0 || leaf >= blocks {
+                        return None;
+                    }
+                    match self.leaf(folder, leaf, name) {
+                        Ok(None) => {}
+                        other => return Some(other),
+                    }
+                }
+                return if open { None } else { Some(Ok(None)) };
+            }
+            levels -= 1;
+            let Ok(Mapping::Data { block, .. }) = self.map(folder, next) else { return None };
+            self.read_block(block, Buffer::Data).ok()?;
+            // A node: a fake entry (inode 0, record length = the block), then the count/limit header.
+            let bytes = &self.data[..self.block_size];
+            if le32(bytes, 0) != 0 || usize::from(le16(bytes, 4)) != self.block_size {
+                return None;
+            }
+            offset = 8;
         }
     }
 
