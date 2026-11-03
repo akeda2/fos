@@ -543,3 +543,58 @@ pub unsafe fn gfx_blit(x: u32, y: u32, width: u32, height: u32, source: *const u
     flush_writes();
     true
 }
+
+fn hex_colour(name: &str) -> Option<(u8, u8, u8)> {
+    let digits = name.strip_prefix('#').unwrap_or(name);
+    if digits.len() != 6 {
+        return None;
+    }
+    let value = u32::from_str_radix(digits, 16).ok()?;
+    Some(((value >> 16) as u8, (value >> 8) as u8, value as u8))
+}
+
+/// The colours the `foreground` setting accepts (a name, or #rrggbb), as in the embedded kernel.
+fn foreground_colour(name: &str) -> Option<(u8, u8, u8)> {
+    Some(match name {
+        "gray" | "grey" => (0xc0, 0xc0, 0xc0),
+        "green" => (0x33, 0xff, 0x33),
+        "amber" => (0xff, 0xb0, 0x00),
+        "black" => (0x00, 0x00, 0x00),
+        _ => return hex_colour(name),
+    })
+}
+
+fn background_colour(name: &str) -> Option<(u8, u8, u8)> {
+    Some(match name {
+        "black" => (0x00, 0x00, 0x00),
+        "blue" => (0x00, 0x00, 0xaa),
+        "gray" | "grey" => (0xc0, 0xc0, 0xc0),
+        _ => return hex_colour(name),
+    })
+}
+
+/// The `foreground` and `background` settings: the console's default text and background colours (palette entries 7 and 0, what
+/// text without an explicit colour uses). `None` keeps the current one. Redraws the whole screen. False for an unknown name or
+/// when there is no pixel console (the VGA text screen keeps its fixed grey on black).
+pub fn set_colours(foreground: Option<&str>, background: Option<&str>) -> bool {
+    let Some(console) = (unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }).filter(|console| !console.text) else { return false };
+    let (Some(foreground), Some(background)) = (
+        foreground.map_or(Some(None), |name| foreground_colour(name).map(Some)),
+        background.map_or(Some(None), |name| background_colour(name).map(Some)),
+    ) else {
+        return false;
+    };
+    if let Some((red, green, blue)) = foreground {
+        console.palette[usize::from(DEFAULT_FOREGROUND)] = pixel(console.format, red, green, blue);
+    }
+    if let Some((red, green, blue)) = background {
+        console.palette[usize::from(DEFAULT_BACKGROUND)] = pixel(console.format, red, green, blue);
+    }
+    let (height, black) = (console.height, console.palette[usize::from(DEFAULT_BACKGROUND)]);
+    console.fill(0, height, black);
+    console.caret_at = usize::MAX;
+    console.redraw();
+    console.draw_caret();
+    flush_writes();
+    true
+}
