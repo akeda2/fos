@@ -121,11 +121,15 @@ pub fn feed(byte: u8) {
 fn run(line: &str) {
     let mut words = line.split_whitespace();
     let Some(command) = words.next() else { return };
+    if command != "format" {
+        crate::formatshell::cancel(); // a format needs its confirmation as the very next command
+    }
     match command {
         "help" => match line.trim_start()[command.len()..].trim() {
             "" => {
                 println!("help version cpus mem pci disks nic uptime slots threads echo TEXT reboot audio usb date nic [peers|discover] tapesync gpio @HOST ...");
                 println!("ls cat write rm cp mv cmp mkdir (`help NAME` shows one; files are NAME, diskN/NAME, @LABEL/NAME)");
+                println!("dmesg sector diskN LBA [N]  mount [PATH @LABEL|fstab] umount PATH  format diskN [...] confirm");
                 println!("tape NAME [ARGS]  run a tape (a ring 3 process)   NAME [ARGS]  the same   kill PID");
             }
             topic => {
@@ -233,6 +237,11 @@ fn run(line: &str) {
             }
             _ => println!("usage: debug slots|crash|hang|deadhang"),
         },
+        "dmesg" => crate::sysshell::dmesg(),
+        "sector" => crate::sysshell::sector(&line.trim_start()[command.len()..]),
+        "mount" => crate::sysshell::mount(&line.trim_start()[command.len()..]),
+        "umount" => crate::sysshell::umount(&line.trim_start()[command.len()..]),
+        "format" => crate::formatshell::command(&line.trim_start()[command.len()..]),
         "reboot" => {
             println!("Restarting.");
             slots::mark_clean_stop();
