@@ -279,7 +279,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     let devices = pci::scan();
     println!("PCI: {devices} function(s) found.");
     for device in pci::devices() {
-        println!("  {:02x}:{:02x}.{} {:04x}:{:04x} {}", device.bus, device.device, device.function, device.vendor, device.id, pci::class_name(device.class, device.subclass));
+        println!("  {:02x}:{:02x}.{} {:04x}:{:04x} {} (class {:02x}{:02x}, interface {:02x})", device.bus, device.device, device.function, device.vendor, device.id, pci::class_name(device.class, device.subclass), device.class, device.subclass, device.interface);
     }
     storage::init(info);
     // A USB stick is a disk only once USB is up; a machine that boots from one gets USB before its config is read (so `no-msi`
@@ -294,6 +294,11 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     }
     debug::init(info.crash_count);
     debug::report_previous_crash();
+    // `settings` and `hostname` may live on a USB stick, which is a disk only once USB is up. The controllers stay polled, so
+    // `no-msi` has nothing to change there.
+    if !usb_first {
+        usb::init();
+    }
     config::load();
     kernel_core::hda::init_all(config::no_msi());
     if config::crash_on_boot() {
@@ -302,9 +307,6 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     }
     slots::confirm_boot();
     net::init();
-    if !usb_first {
-        usb::init();
-    }
     ps2::init();
     sched_selftest();
     sched::spawn("service", service_thread, 0).expect("the service thread");
