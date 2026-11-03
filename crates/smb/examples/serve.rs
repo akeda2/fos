@@ -1,7 +1,8 @@
 //! A host-side SMB server for tests: `cargo run --example serve -- DIR PORT [SHARE]` shares DIR (read-only, guest) as
 //! //HOST/SHARE (default `share`) on 127.0.0.1:PORT, one connection at a time per thread. `tools/test_smb_client.py` points the
-//! `smb` tape at it through QEMU's guestfwd.
-use smb::server::{Server, Share, Stat};
+//! `smb` tape at it through QEMU's guestfwd. With `SMB_LOGIN=user:password` in the environment only that user may log in.
+use smb::ntlm::nt_hash;
+use smb::server::{Account, Identity, Server, Share, Stat};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
@@ -11,6 +12,7 @@ use std::time::UNIX_EPOCH;
 struct Folder {
     root: PathBuf,
     name: String,
+    login: Option<(String, String)>,
 }
 
 fn stat_of(meta: &fs::Metadata) -> Stat {
@@ -21,6 +23,13 @@ fn stat_of(meta: &fs::Metadata) -> Stat {
 impl Share for Folder {
     fn name(&self) -> &str {
         &self.name
+    }
+    fn account(&mut self, user: &str) -> Option<Account> {
+        let (name, password) = self.login.as_ref()?;
+        name.eq_ignore_ascii_case(user).then(|| Account { nt_hash: nt_hash(password), identity: Identity { uid: 1000, gid: 1000 } })
+    }
+    fn guest(&mut self) -> Option<Identity> {
+        self.login.is_none().then_some(Identity { uid: 65534, gid: 65534 })
     }
     fn stat(&mut self, path: &str) -> Option<Stat> {
         fs::metadata(self.root.join(path)).ok().map(|meta| stat_of(&meta))
@@ -42,7 +51,10 @@ impl Share for Folder {
 }
 
 fn connection(mut stream: TcpStream, root: PathBuf, name: String) {
-    let mut server = Box::new(Server::<Folder, 16>::new(Folder { root, name }));
+    let login = std::env::var("SMB_LOGIN").ok().and_then(|text| text.split_once(':').map(|(user, password)| (user.to_string(), password.to_string())));
+    let mut server = Box::new(Server::<Folder, 16>::new(Folder { root, name, login }));
+    let nanos = std::time::SystemTime::now().duration_since(UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
+    server.challenge = nanos.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes();
     let mut out = vec![0u8; 70_000 + 200];
     loop {
         let mut header = [0u8; 4];

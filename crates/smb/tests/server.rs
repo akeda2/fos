@@ -241,3 +241,59 @@ fn logins_are_checked() {
     assert!(!ok, "anonymous without guests: {text}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn our_client_logs_in() {
+    let accounts = |password: &str, user: &str| {
+        let mut share = memory();
+        share.1 = true;
+        let mut server = Box::new(Server::new(share));
+        server.challenge = *b"\x01\x23\x45\x67\x89\xab\xcd\xef";
+        let mut client = Box::new(Client::<Loopback, 70_000>::new(Loopback { server, out: vec![0; 70_000 + 200], incoming: Vec::new() }));
+        client.login(user, password, *b"clientnc").unwrap();
+        (client.connect("fos", "fos"), client)
+    };
+    let (result, mut client) = accounts("secret", "alice");
+    result.unwrap();
+    let file = client.open("private.txt", false).unwrap();
+    let mut data = [0u8; 64];
+    let count = client.read(&file, 0, &mut data).unwrap();
+    assert_eq!(&data[..count], b"for alice");
+    assert_eq!(accounts("wrong", "alice").0, Err(Error::Status(0xC000_006D)));
+    assert!(accounts("hunter2", "bob").0.is_ok());
+}
+
+struct Tcp(TcpStream);
+
+impl Transport for Tcp {
+    fn send(&mut self, data: &[u8]) -> Result<(), Error> {
+        self.0.write_all(data).map_err(|_| Error::Transport)
+    }
+    fn recv_exact(&mut self, out: &mut [u8]) -> Result<(), Error> {
+        self.0.read_exact(out).map_err(|_| Error::Transport)
+    }
+}
+
+#[test]
+fn our_client_logs_in_over_tcp_with_reads() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut share = memory();
+        share.1 = true;
+        let mut server = Box::new(Server::new(share));
+        serve(&mut server, &mut stream);
+    });
+    let mut client = Box::new(Client::<Tcp, { 64 * 1024 + 1024 }>::new(Tcp(TcpStream::connect(("127.0.0.1", port)).unwrap())));
+    client.login("alice", "secret", *b"12345678").unwrap();
+    client.connect("127.0.0.1", "fos").unwrap();
+    let file = client.open("big.bin", false).unwrap();
+    let mut data = vec![0u8; 65536];
+    let mut offset = 0;
+    while offset < file.size {
+        let count = client.read(&file, offset, &mut data).unwrap();
+        assert_eq!(&data[..count], &pattern(300_000)[offset as usize..offset as usize + count]);
+        offset += count as u64;
+    }
+}

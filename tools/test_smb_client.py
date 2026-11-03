@@ -69,6 +69,28 @@ def main():
                 check("//HOST/SHARE" in out, "a URL without // is refused", out[-300:])
         finally:
             server.terminate()
+        # A second server that wants alice/secret: the client logs in with NTLMv2 and signs.
+        server = subprocess.Popen([str(server_binary), str(share), str(SERVER_PORT + 1)], stdout=subprocess.DEVNULL,
+                                  env={**os.environ, "SMB_LOGIN": "alice:secret"})
+        time.sleep(0.5)
+        try:
+            extra = f",guestfwd=tcp:10.0.2.100:445-cmd:nc 127.0.0.1 {SERVER_PORT + 1}"
+            with Guest(user_extra=extra) as g:
+                g.line("write settings no-msi")
+                g.line("nic use 2")
+                url = "//10.0.2.100/share"
+                out = g.line(f"run smb ls {url} user=alice password=secret", "fos> ", 60)
+                check("hello.txt" in out and "4 entries" in out, "a password login lists the share", out[-400:])
+                out = g.line(f"run smb get {url}/big.bin signed.bin user=alice password=secret", "fos> ", 120)
+                check("3145728 bytes" in out, "signed reads of 3 MB work", out[-400:])
+                out = g.line("sha256 signed.bin", "fos> ", 60)
+                check(hashlib.sha256(big).hexdigest() in out, "and arrive intact", out[-300:])
+                out = g.line(f"run smb ls {url} user=alice password=wrong", "fos> ", 40)
+                check("smb: " in out.lower() and "hello.txt" not in out, "a wrong password is refused", out[-300:])
+                out = g.line(f"run smb ls {url}", "fos> ", 40)
+                check("hello.txt" not in out, "a guest is refused", out[-300:])
+        finally:
+            server.terminate()
     print("smb client: all checks passed")
 
 
