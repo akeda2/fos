@@ -27,11 +27,11 @@ impl Platform for Mf {
     fn block_count(&self) -> usize {
         crate::block::count()
     }
-    fn block_register_usb(&self, _slot: usize, _sectors: u64, _model: [u8; 40], _origin: &str) -> Option<usize> {
-        None
+    fn block_register_usb(&self, slot: usize, sectors: u64, model: [u8; 40], origin: &str) -> Option<usize> {
+        crate::block::register(crate::block::Backend::Usb(slot), sectors, model, origin)
     }
-    fn block_usb_disk(&self, _slot: usize) -> Option<usize> {
-        None
+    fn block_usb_disk(&self, slot: usize) -> Option<usize> {
+        crate::block::usb_disk(slot)
     }
     fn boot_disk(&self) -> Option<usize> {
         crate::storage::boot_disk()

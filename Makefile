@@ -203,7 +203,12 @@ test-mf-tape: image-mf image
 		--file fscheck=$(BUILD)/fosfor/tapes/fscheck --file ed=$(BUILD)/fosfor/tapes/ed --file netcheck=$(BUILD)/fosfor/tapes/netcheck --file memtest=$(BUILD)/fosfor/tapes/memtest --file note.txt=tools/test_mf_note.txt
 	python3 tools/test_mf_tape.py
 
-test-mf-usb: image-mf
+# A USB keyboard types into the shell, and a USB stick (a second image holding note.txt) is read through `fscheck disk2/note.txt`.
+test-mf-usb: image-mf image
+	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_MF_ELF) --output $(BUILD)/fosfor-mf/fosfor-usb.img \
+		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin --file fscheck=$(BUILD)/fosfor/tapes/fscheck
+	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_MF_ELF) --output $(BUILD)/fosfor-mf/usb-stick.img \
+		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin --file note.txt=tools/test_mf_note.txt
 	python3 tools/test_mf_usb.py
 
 test-mf-audio: image-mf image
