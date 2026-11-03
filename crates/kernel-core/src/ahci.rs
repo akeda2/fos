@@ -213,12 +213,18 @@ impl Drive {
     }
 }
 
-/// Starts every AHCI controller (PCI class 0x01, subclass 0x06, interface 0x01) and
+/// Intel PCHs in "RAID" (Intel RST) mode: the same AHCI registers at BAR 5, but class 0x01 subclass 0x04 and interface 0, so
+/// the class test alone skips them (Linux's `ahci` driver lists these IDs too). Mobile/desktop 5, 6 and 7 series.
+fn is_intel_raid_mode_ahci(device: &pci::Device) -> bool {
+    device.vendor == 0x8086 && device.class == 0x01 && device.subclass == 0x04 && matches!(device.id, 0x2822 | 0x2826 | 0x282a)
+}
+
+/// Starts every AHCI controller (PCI class 0x01, subclass 0x06, interface 0x01, or an Intel PCH in RAID mode) and
 /// calls `found` with each drive that identifies itself. Returns the drive count.
 pub fn init_all(mut found: impl FnMut(Drive, usize, u8)) -> usize {
     let mut drives = 0;
     let mut controller = 0;
-    for device in pci::devices().filter(|d| d.class == 0x01 && d.subclass == 0x06 && d.interface == 0x01) {
+    for device in pci::devices().filter(|d| (d.class == 0x01 && d.subclass == 0x06 && d.interface == 0x01) || is_intel_raid_mode_ahci(d)) {
         if controller == MAX_CONTROLLERS {
             break;
         }

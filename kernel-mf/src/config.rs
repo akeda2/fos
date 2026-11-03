@@ -72,21 +72,59 @@ pub fn watchdog_seconds() -> Option<u32> {
     unsafe { WATCHDOG }
 }
 
+/// Reads `name` into the shared buffer: from the boot volume (`settings/NAME`, then the root), else any other FOSFS volume,
+/// else the root of the first FAT32/exFAT disk that has it (a stick a PC can edit), as the embedded kernel does.
 fn read(name: &str) -> Option<&'static str> {
-    let volume = volumes::boot_volume()?;
     let buffer = unsafe { &mut *core::ptr::addr_of_mut!(BUFFER) };
     let mut path = [0u8; 40];
-    path[..9].copy_from_slice(b"settings/");
     let length = name.len().min(31);
+    path[..9].copy_from_slice(b"settings/");
     path[9..9 + length].copy_from_slice(&name.as_bytes()[..length]);
-    let length = match volume.read(&path[..9 + length], buffer) {
-        Ok(Some(length)) => length,
-        _ => match volume.read(name.as_bytes(), buffer) {
-            Ok(Some(length)) => length,
-            _ => return None,
-        },
+    let folder = &path[..9 + length];
+    let has = |volume: &kernel_core::fosfs::Volume| {
+        [folder, name.as_bytes()].into_iter().find(|file| matches!(volume.file_length(file), Ok(Some(_))))
     };
-    core::str::from_utf8(&buffer[..length]).ok()
+    let found = volumes::boot_volume().and_then(|volume| has(&volume).map(|file| (volume, file))).or_else(|| {
+        (1..=crate::block::count()).find_map(|number| {
+            let volume = volumes::volume_on(number).ok()?;
+            has(&volume).map(|file| (volume, file))
+        })
+    });
+    let Some((volume, file)) = found else { return read_fat(name, buffer) };
+    match volume.read(file, buffer) {
+        Ok(Some(length)) => core::str::from_utf8(&buffer[..length]).ok(),
+        _ => None,
+    }
+}
+
+/// The fallback when no FOSFS volume has `name`: the root of the first FAT32/exFAT disk that does. Disks with a FOSFS
+/// volume are skipped, and a file longer than the buffer is ignored rather than cut.
+fn read_fat(name: &str, buffer: &'static mut [u8; 4096]) -> Option<&'static str> {
+    for number in 1..=crate::block::count() {
+        if volumes::volume_on(number).is_ok() {
+            continue;
+        }
+        let Some(mut fs) = kernel_core::fatvol::mount(number - 1) else { continue };
+        let Ok(Some(entry)) = fs.entry(name.as_bytes()) else { continue };
+        if entry.is_directory {
+            continue;
+        }
+        if entry.size as usize > buffer.len() {
+            println!("{name}: disk{number} has it but it is over {} bytes; ignored.", buffer.len());
+            return None;
+        }
+        return match fs.read(&entry.file(), 0, &mut buffer[..entry.size as usize]) {
+            Ok(length) => {
+                println!("{name}: read from disk{number} (FAT/exFAT).");
+                core::str::from_utf8(&buffer[..length]).ok()
+            }
+            Err(error) => {
+                println!("{name}: cannot be read from disk{number} ({error:?}); ignored.");
+                None
+            }
+        };
+    }
+    None
 }
 
 fn lines(text: &str) -> impl Iterator<Item = &str> {
