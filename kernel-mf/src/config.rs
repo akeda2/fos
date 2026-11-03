@@ -81,6 +81,27 @@ fn read(name: &str) -> Option<&'static str> {
     path[..9].copy_from_slice(b"settings/");
     path[9..9 + length].copy_from_slice(&name.as_bytes()[..length]);
     let folder = &path[..9 + length];
+    // `settings` mounted from a config volume (fstab): its copy overrides the root's.
+    if let Some((label, rest)) = kernel_core::mounts::lookup(folder) {
+        let volume = volumes::volume_labelled(label.as_bytes());
+        match volume {
+            Some((_, volume)) if matches!(volume.file_length(rest), Ok(Some(_))) => {
+                println!("{name}: read from @{} (mounted at settings).", core::str::from_utf8(label.as_bytes()).unwrap_or("?"));
+                return match volume.read(rest, buffer) {
+                    Ok(Some(length)) => core::str::from_utf8(&buffer[..length]).ok(),
+                    _ => None,
+                };
+            }
+            None => {
+                let length = kernel_core::tape_fs::read(folder, buffer);
+                if length >= 0 {
+                    println!("{name}: read from the FAT volume mounted at settings.");
+                    return core::str::from_utf8(&buffer[..length as usize]).ok();
+                }
+            }
+            _ => {}
+        }
+    }
     let has = |volume: &kernel_core::fosfs::Volume| {
         [folder, name.as_bytes()].into_iter().find(|file| matches!(volume.file_length(file), Ok(Some(_))))
     };
@@ -133,6 +154,7 @@ fn lines(text: &str) -> impl Iterator<Item = &str> {
 
 /// Loads `hostname`, `settings` and `debug` from the boot volume (call after storage is up).
 pub fn load() {
+    load_fstab();
     if let Some(text) = read("hostname") {
         let name = text.lines().next().unwrap_or("").trim();
         let take = name.len().min(15);
@@ -206,4 +228,25 @@ pub fn start(run: impl FnMut(&str)) {
         println!("start: no start file on a FOSFS volume.");
     }
     RUNNING.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Fills the mount table from `fstab` before the other files are read, so a `settings` mount reaches them. A stick that is
+/// still being enumerated gets up to 10 s; after that the boot volume's folders stand (`usb rescan` and `mount fstab` look again).
+fn load_fstab() {
+    let (mounted, _) = kernel_core::mounts::load_from(volumes::boot_volume());
+    let absent = || {
+        kernel_core::mounts::absent_with(|label| volumes::volume_labelled(label).is_some() || kernel_core::tape_fs::fat_labelled(label).is_some())
+    };
+    if mounted == 0 || absent() == 0 {
+        return;
+    }
+    println!("fstab: waiting for a mounted volume (up to 10 s; the root's folders are used if it never appears).");
+    for _ in 0..20 {
+        crate::apic::busy_wait_ms(500);
+        crate::usb::poll();
+        if absent() == 0 {
+            return;
+        }
+    }
+    println!("fstab: {} mounted volume(s) still absent; the boot volume's folders stand.", absent());
 }

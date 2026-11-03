@@ -16,6 +16,29 @@ base.KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fosfor-kernel
 READY = "entering the service loop"
 
 
+def config_volume_scenario():
+    """`fstab` mounts a second FOSFS volume on `settings`: its `hostname` is read from there, not from the boot volume's root."""
+    import subprocess
+    import uuid
+    with tempfile.TemporaryDirectory() as tmp:
+        hostname = Path(tmp) / "hostname"
+        hostname.write_text("cfgmf\n")
+        config = Path(tmp) / "config.img"
+        subprocess.run([sys.executable, str(ROOT / "tools/build_image.py"), "--loader", str(base.LOADER), "--kernel", str(base.KERNEL),
+                        "--output", str(config), "--label", "cfgvol", "--file", f"hostname={hostname}",
+                        "--payload-guid", str(uuid.uuid4()), "--no-bios"], check=True, capture_output=True)
+        machine = base.Machine(tmp, {"fstab": "settings @cfgvol\n", "hostname": "bootmf\n"}, {})
+        machine.extra = ["-drive", f"format=raw,file={config}"]
+        machine.start()
+        try:
+            machine.wait_for(READY)
+            text = machine.text()
+            check("read from @cfgvol (mounted at settings)" in text, "a settings mount is read at boot", text[-600:])
+            check("announces itself as cfgmf1" in text and "bootmf" not in text, "the mounted volume's hostname wins over the root's", text[-600:])
+        finally:
+            machine.stop()
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         machine = base.Machine(tmp, {"hostname": "mfshell\n", "start": "# comment\necho from-start-file\n"}, {})
@@ -100,6 +123,7 @@ def main():
             check("Unknown command" in out, "an unknown command is reported", out[-300:])
         finally:
             machine.stop()
+    config_volume_scenario()
     print("test-mf-shell: all checks passed")
 
 
