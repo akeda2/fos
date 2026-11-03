@@ -63,9 +63,11 @@ them, so they are sized and versioned like the other calls (never grow a struct 
 
 ## Order of work
 
-1. `crates/smb` restructure (wire, ntlm) with host tests: NTLMv2 against the MS-NLMP test vectors, MD4/MD5/HMAC vectors, SPNEGO
+1. (done) `crates/smb` restructure (wire, ntlm) with host tests: NTLMv2 against the MS-NLMP test vectors, MD4/MD5/HMAC vectors, SPNEGO
    encodings captured from `smbclient`.
-2. Server half in the crate, read-only and guest, against an in-memory `Share`; driven by `smbclient` in a host test.
+2. (done) Server half in the crate (`crates/smb/src/server.rs`), read-only and guest, against a `Share` trait; `crates/smb/tests/server.rs`
+   drives it from our own client and from `smbclient` (SMB 2.0.2 and 3.0, SPNEGO, compound requests, UTF-8 names). Not yet
+   checked: Linux `mount.cifs`, Windows, VLC; the NTLM response of a login is not verified (every client is a guest).
 3. Tape ABI 32 (`vfs_*`, read side) with ext4 behind it; `make test-vfs` on QEMU.
 4. `smbd` tape (service on port 445, `root=`/share name settings in `smbd.cfg`); `make test-smbd` mounts it from Linux in QEMU
    (user-mode networking) with `mount.cifs` or `smbclient`.
