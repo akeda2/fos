@@ -598,3 +598,42 @@ fn a_read_cache_under_the_journal_stays_coherent() {
     assert_eq!(debugfs_cat(&image, "/big.bin"), pattern(9, 1000));
     let _ = fs::remove_file(&image);
 }
+
+#[test]
+fn trim_covers_exactly_the_free_blocks() {
+    let (image, mut w) = make("trim", 200);
+    let root = w.root().unwrap().number;
+    let f = w.create(root, b"data.bin", 0o644).unwrap().number;
+    w.write(f, 0, &pattern(3, 5 << 20)).unwrap();
+    let g = w.create(root, b"gone.bin", 0o644).unwrap().number;
+    w.write(g, 0, &pattern(4, 3 << 20)).unwrap();
+    w.remove(root, b"gone.bin").unwrap();
+    let mut seen: Vec<(u64, u64)> = Vec::new();
+    let blocks = w.trim(|ranges| {
+        assert!(ranges.len() <= 64);
+        seen.extend_from_slice(ranges);
+        Ok(())
+    })
+    .unwrap();
+    let (total, free) = w.space();
+    let size = w.block_size() as u64;
+    assert_eq!(blocks * size, free, "every free block, and only those, is trimmed (total {total})");
+    assert_eq!(seen.iter().map(|r| r.1).sum::<u64>() * 512, free);
+    let spb = size / 512;
+    for pair in seen.windows(2) {
+        assert!(pair[0].0 + pair[0].1 < pair[1].0, "ranges are sorted, disjoint and merged");
+    }
+    // The 5 MiB file's blocks are in none of them.
+    let out = Command::new("/usr/sbin/debugfs").arg("-R").arg("stat /data.bin").arg(&image).output();
+    if let Ok(out) = out {
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        if let Some(extents) = text.split("EXTENTS:").nth(1) {
+            let first: u64 = extents.trim().split(['(', ')', ':', '-', ',', ' ']).filter_map(|t| t.parse().ok()).nth(2).unwrap_or(0);
+            if first > 0 {
+                let sector = first * spb;
+                assert!(!seen.iter().any(|&(start, n)| sector >= start && sector < start + n), "file data is not trimmed");
+            }
+        }
+    }
+    let _ = fs::remove_file(&image);
+}

@@ -218,6 +218,67 @@ impl<D: Device> Writer<D> {
         self.fs.device.close()
     }
 
+    /// TRIM support: calls `discard` with batches of (first sector, sectors) ranges covering every free block of the
+    /// volume, and returns how many blocks that was. The volume is flushed (committed) first, so a block that is free
+    /// now was free before the last transaction too: a power cut cannot bring back a freed block's old owner. Nothing
+    /// is written to the volume. What is read from a discarded block afterwards is undefined, which is fine for free space.
+    pub fn trim(&mut self, mut discard: impl FnMut(&[(u64, u64)]) -> Result<(), Error>) -> Result<u64, Error> {
+        const BATCH: usize = 64;
+        self.flush()?;
+        let spb = (self.fs.block_size / SECTOR) as u64;
+        let first = u64::from(self.fs.first_data_block);
+        let per_group = u64::from(self.fs.blocks_per_group);
+        let mut batch = [(0u64, 0u64); BATCH];
+        let (mut used, mut total) = (0usize, 0u64);
+        // The run being built: first block and length, merged across groups.
+        let mut run: Option<(u64, u64)> = None;
+        for group in 0..self.fs.groups {
+            let at = self.load_gdt(group)?;
+            if self.gdt_value(at, 12, 0x2c) == 0 {
+                continue;
+            }
+            let bitmap = self.bitmap_block(group, false)?;
+            self.load_bitmap(group, false, bitmap)?;
+            let blocks = self.group_blocks(group);
+            let base = first + u64::from(group) * per_group;
+            let mut index = 0;
+            while index < blocks {
+                if bit(&self.bm, index) {
+                    index += 1;
+                    continue;
+                }
+                let begin = index;
+                while index < blocks && !bit(&self.bm, index) {
+                    index += 1;
+                }
+                let (start, length) = (base + begin as u64, (index - begin) as u64);
+                run = match run {
+                    Some((from, count)) if from + count == start => Some((from, count + length)),
+                    Some(done) => {
+                        batch[used] = (done.0 * spb, done.1 * spb);
+                        used += 1;
+                        total += done.1;
+                        Some((start, length))
+                    }
+                    None => Some((start, length)),
+                };
+                if used == BATCH {
+                    discard(&batch[..used])?;
+                    used = 0;
+                }
+            }
+        }
+        if let Some(done) = run {
+            batch[used] = (done.0 * spb, done.1 * spb);
+            used += 1;
+            total += done.1;
+        }
+        if used > 0 {
+            discard(&batch[..used])?;
+        }
+        Ok(total)
+    }
+
     pub fn into_device(mut self) -> Result<D, Error> {
         self.flush()?;
         Ok(self.fs.into_device())

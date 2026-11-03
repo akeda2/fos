@@ -17,6 +17,8 @@ pub enum BlockError {
     NoSuchDisk,
     OutOfRange,
     Device,
+    /// The disk cannot do this (a discard on a disk without TRIM, for one).
+    Unsupported,
 }
 
 /// What a platform knows of a disk.
@@ -32,6 +34,11 @@ pub trait Platform: Sync {
     fn block_read(&self, disk: usize, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError>;
     /// Writes whole 512-byte sectors.
     fn block_write(&self, disk: usize, lba: u64, buffer: &[u8]) -> Result<(), BlockError>;
+    /// Tells an SSD that these (start, sectors) ranges hold nothing worth keeping (TRIM / deallocate). Contents read back
+    /// afterwards are undefined. `Unsupported` when the disk cannot.
+    fn block_discard(&self, _disk: usize, _ranges: &[(u64, u64)]) -> Result<(), BlockError> {
+        Err(BlockError::Unsupported)
+    }
     /// The wall clock as Unix seconds (local reading taken as UTC), 0 when it was never set.
     fn unix_seconds(&self) -> u64;
     /// Size and model of disk `disk` (0-based), `None` when there is no such disk.
@@ -152,6 +159,11 @@ pub mod block {
 
     pub fn write(disk: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
         platform().ok_or(BlockError::NoSuchDisk)?.block_write(disk, lba, buffer)
+    }
+
+    /// TRIM: the ranges are free space. See [`Platform::block_discard`].
+    pub fn discard(disk: usize, ranges: &[(u64, u64)]) -> Result<(), Error> {
+        platform().ok_or(BlockError::NoSuchDisk)?.block_discard(disk, ranges)
     }
 
     /// Size of the disk in sectors.

@@ -84,6 +84,37 @@ def ext4_scenario():
             machine.stop()
 
 
+def ext4_trim_nvme_scenario():
+    """`ext4 diskN trim` on an NVMe disk: Dataset Management (deallocate) reaches the host image, files survive."""
+    import subprocess
+    import uuid
+    with tempfile.TemporaryDirectory() as tmp:
+        second = Path(tmp) / "second.img"
+        subprocess.run([sys.executable, str(ROOT / "tools/build_image.py"), "--loader", str(base.LOADER), "--kernel", str(base.KERNEL),
+                        "--output", str(second), "--label", "nvmetrim", "--fosfs", "4",
+                        "--payload-guid", str(uuid.uuid4()), "--no-bios"], check=True, capture_output=True)
+        machine = base.Machine(tmp, {"hostname": "mfnvme\n"}, {}, fosfs=4)
+        machine.extra = ["-drive", f"format=raw,file={second},if=none,id=nv,discard=unmap", "-device", "nvme,drive=nv,serial=fostrim"]
+        machine.start()
+        try:
+            machine.wait_for(READY)
+            machine.connect()
+            machine.run("shrink disk1 8M")
+            machine.run("shrink disk1 confirm")
+            start = second.stat().st_blocks
+            machine.run("ext4 disk1 mkfs scratch")
+            out = machine.run("ext4 disk1 mkfs confirm")
+            check("ext4: formatted" in out, "the NVMe disk is formatted", out[-300:])
+            machine.run("ext4 disk1 write /kept.txt nvme hej")
+            out = machine.run("ext4 disk1 trim")
+            check("MiB of free space trimmed" in out, "trim works on NVMe", out[-300:])
+            check(second.stat().st_blocks < start, "NVMe: the discard reached the host image", f"{start} -> {second.stat().st_blocks}")
+            out = machine.run("ext4 disk1 cat /kept.txt")
+            check("nvme hej" in out, "NVMe: files survive a trim", out[-300:])
+        finally:
+            machine.stop()
+
+
 def ext4_write_scenario():
     """`ext4 diskN mkfs|mkdir|write|mv|rm`: a partition is added after a shrunk FOSFS one, formatted, written; e2fsck agrees."""
     import subprocess
@@ -95,7 +126,7 @@ def ext4_write_scenario():
                         "--output", str(second), "--label", "extwrite", "--fosfs", "4",
                         "--payload-guid", str(uuid.uuid4()), "--no-bios"], check=True, capture_output=True)
         machine = base.Machine(tmp, {"hostname": "mfext4w\n"}, {}, fosfs=4)
-        machine.extra = ["-drive", f"format=raw,file={second}"]
+        machine.extra = ["-drive", f"format=raw,file={second},discard=unmap"]
         machine.start()
         try:
             machine.wait_for(READY)
@@ -133,6 +164,12 @@ def ext4_write_scenario():
             machine.run("ext4 disk2 write /moved.txt hej på dig")
             out = machine.run("ext4 disk2 recover")
             check("journal replayed" in out, "recover opens the journal and leaves the volume clean", out[-300:])
+            before = second.stat().st_blocks
+            out = machine.run("ext4 disk2 trim")
+            check("MiB of free space trimmed" in out, "trim sends the free blocks to the disk as TRIM", out[-300:])
+            check(second.stat().st_blocks < before, "the host image shrank: QEMU saw the discard", f"{before} -> {second.stat().st_blocks}")
+            out = machine.run("ext4 disk2 cat /moved.txt")
+            check("hej på dig" in out, "files survive a trim", out[-300:])
         finally:
             machine.stop()
         if Path(e2fsck).exists():
@@ -293,6 +330,7 @@ def main():
     config_volume_scenario()
     ext4_scenario()
     ext4_write_scenario()
+    ext4_trim_nvme_scenario()
     shrink_scenario()
     print("test-mf-shell: all checks passed")
 

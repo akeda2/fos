@@ -37,6 +37,8 @@ pub enum Error {
     NoSuchDisk,
     OutOfRange,
     Device,
+    /// The disk cannot do it (TRIM on a disk without it).
+    Unsupported,
 }
 
 static mut DISKS: [Option<Disk>; MAX_DISKS] = [None; MAX_DISKS];
@@ -144,5 +146,22 @@ pub fn write(disk: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
         Backend::Virtio(drive) => drive.write(lba, buffer).map_err(|_| Error::Device),
         #[cfg(target_arch = "aarch64")]
         Backend::Sd(drive) => drive.write(lba, buffer).map_err(|_| Error::Device),
+    }
+}
+
+/// TRIM: tells the disk that these (start, sectors) ranges are free space and may be erased or forgotten. What a later
+/// read returns from them is undefined. SATA and NVMe SSDs only (`Unsupported` for a disk without it, USB sticks and SD cards
+/// included for now); the caller must not discard anything it still needs.
+pub fn discard(disk: usize, ranges: &[(u64, u64)]) -> Result<(), Error> {
+    let info = get(disk).ok_or(Error::NoSuchDisk)?;
+    if ranges.iter().any(|&(lba, sectors)| lba.checked_add(sectors).map_or(true, |end| end > info.sectors)) {
+        return Err(Error::OutOfRange);
+    }
+    match info.backend {
+        #[cfg(target_arch = "x86_64")]
+        Backend::Ahci(drive) => drive.discard(ranges).map_err(|error| if error == ahci::Error::Unsupported { Error::Unsupported } else { Error::Device }),
+        #[cfg(target_arch = "x86_64")]
+        Backend::Nvme(drive) => drive.discard(ranges).map_err(|error| if error == nvme::Error::Unsupported { Error::Unsupported } else { Error::Device }),
+        _ => Err(Error::Unsupported),
     }
 }

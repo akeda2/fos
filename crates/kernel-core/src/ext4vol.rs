@@ -193,7 +193,7 @@ fn text_out(out: &mut dyn Write, text: &str) {
     }
 }
 
-const USAGE: &str = "usage: ext4 diskN [ls|cat|info|recover|mkfs|remkfs|mkdir|rm|mv|write] [PATH ...]";
+const USAGE: &str = "usage: ext4 diskN [ls|cat|info|recover|trim|mkfs|remkfs|mkdir|rm|mv|write] [PATH ...]";
 
 /// Splits "a/b/c" into the folder "a/b" (an inode) and the name "c".
 fn parent_of(writer: &mut Writer<Journaled<Partition>>, path: &str) -> Result<(u32, usize), Error> {
@@ -269,6 +269,8 @@ fn mkfs(disk: usize, label: &str, confirm: bool, replace: bool, out: &mut dyn Wr
 /// Formats `part` of disk index `disk` as ext4 (journal, metadata_csum) with a `lost+found`. Erases the partition.
 pub fn format_partition(disk: usize, part: &gpt::Partition, label: &[u8]) -> Result<(), Error> {
     cache().clear();
+    // An SSD is told the whole partition is free first (best effort: it may not support it); the format writes everything it needs.
+    let _ = discard_ranges(disk, part.start, &[(0, part.sectors)]);
     let mut device = Partition { disk, base: part.start, sectors: part.sectors };
     let mut uuid = [0u8; 16];
     uuid.copy_from_slice(&part.unique_guid);
@@ -281,6 +283,43 @@ pub fn format_partition(disk: usize, part: &gpt::Partition, label: &[u8]) -> Res
         writer.mkdir(root, b"lost+found", 0o700)?;
         writer.flush()
     })
+}
+
+/// Sends the free-space ranges of a volume to the disk as TRIM (`base` turns volume sectors into disk sectors).
+fn discard_ranges(disk: usize, base: u64, ranges: &[(u64, u64)]) -> Result<(), Error> {
+    let mut shifted = [(0u64, 0u64); 64];
+    for (slot, &(lba, sectors)) in shifted.iter_mut().zip(ranges) {
+        *slot = (base + lba, sectors);
+    }
+    crate::debug::pet();
+    match block::discard(disk, &shifted[..ranges.len()]) {
+        Ok(()) => Ok(()),
+        Err(block::Error::Unsupported) => Err(Error::Unsupported),
+        Err(_) => Err(Error::Device),
+    }
+}
+
+/// `ext4 diskN trim`: tells an SSD which blocks of the volume are free (TRIM), so it can erase them in advance. Done on
+/// request, not at every delete: the free blocks are read from the bitmaps after a commit, so nothing in use is touched.
+fn trim(disk: usize, out: &mut dyn Write) {
+    let result = locate(disk - 1).and_then(|partition| {
+        let fs = ext4::open(partition, stage())?;
+        let writer = Writer::new_in(unsafe { &mut *core::ptr::addr_of_mut!(WRITER) }, fs)?;
+        writer.set_time(seconds());
+        let blocks = writer.trim(|ranges| discard_ranges(disk - 1, partition.base, ranges))?;
+        Ok((blocks, writer.block_size()))
+    });
+    match result {
+        Ok((blocks, size)) => {
+            let _ = writeln!(out, "ext4: disk{disk}: {} MiB of free space trimmed.", blocks * size as u64 >> 20);
+        }
+        Err(Error::Unsupported) => {
+            let _ = writeln!(out, "ext4: disk{disk}: this disk does not support TRIM (SATA and NVMe SSDs only).");
+        }
+        Err(error) => {
+            let _ = writeln!(out, "ext4: disk{disk}: trim failed: {}.", why(error));
+        }
+    }
 }
 
 /// `ext4 diskN mkdir|rm|mv|write ...`
@@ -376,6 +415,9 @@ pub fn command(rest: &str, out: &mut dyn Write) {
             }
         }
         return;
+    }
+    if action == "trim" {
+        return trim(disk, out);
     }
     if matches!(action, "mkdir" | "rm" | "mv" | "write") {
         let mut after = rest.trim_start();

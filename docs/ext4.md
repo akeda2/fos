@@ -92,3 +92,21 @@ within the partition). Measured with `tests/perf.rs` (counts device operations; 
 `mkdir` + 2000 creates 57481 -> 153 reads, 20 lookups in a 2000-name folder 236 -> 0, 100 small appends 214 -> 3; writes are
 unchanged (the journal commits each change). Not done: hash-tree lookup in the reader (indexed folders are still scanned
 linearly, and our writer linearises them on change), multi-block write coalescing.
+
+## TRIM / discard
+
+`ext4 diskN trim` tells an SSD which blocks of the volume are free (like `fstrim`). It is on request, not at every delete:
+a freed block may not be discarded before the journal transaction that freed it has committed, and the journal commits per
+change. `Writer::trim` flushes first and then walks the group bitmaps, so only blocks free in the committed state are
+sent; it merges runs across groups and calls back with batches of at most 64 ranges. Nothing is written to the volume.
+`mkfs`/`remkfs`/`install` also discard the whole partition before formatting (best effort; `format_raw` writes every
+metadata block it needs, so undefined contents afterwards do not matter).
+
+Plumbing: `block::discard(disk, &[(sector, sectors)])` (both kernels, `Platform::block_discard` in `fos-hal`). AHCI sends
+DATA SET MANAGEMENT (0x06, feature 1, 48-bit; needs IDENTIFY word 169 bit 0), 64 entries per sector, up to 16 sectors per
+command. NVMe sends Dataset Management (0x09, AD bit; needs ONCS bit 2), up to 256 ranges of at most 65535 sectors per
+command. USB mass storage (SCSI UNMAP), virtio and SD report `Unsupported`. Contents of trimmed ranges are undefined
+afterwards on some SATA SSDs, which is fine for free space.
+
+Verified in QEMU with `discard=unmap` (the host image shrinks): `make test-mf-shell` on AHCI and NVMe, `make test-install`.
+Only real hardware shows whether a given SSD honours it.
