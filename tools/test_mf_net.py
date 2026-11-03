@@ -45,6 +45,19 @@ def check_screen(machine, path):
     check("Framebuffer: write-combining (PAT)" in machine.text(), "mapped write-combining through the PAT", "\n".join(l for l in machine.text().splitlines() if "ramebuffer" in l))
 
 
+def type_keys(machine, keys):
+    """Types on QEMU's emulated PS/2 keyboard through the monitor and returns once the keys are sent."""
+    import socket
+    monitor = socket.socket(socket.AF_UNIX)
+    monitor.connect(str(machine.monitor))
+    monitor.settimeout(5)
+    monitor.recv(4096)
+    for key in keys:
+        monitor.send(f"sendkey {key}\n".encode())
+        machine.pump(0.1)
+    monitor.close()
+
+
 def red_pixels(machine, path):
     """Screendump again and count pure ANSI red (0xaa0000) pixels."""
     import socket
@@ -75,6 +88,10 @@ def main():
         try:
             machine.wait_for(READY)
             check_screen(machine, Path(tmp) / "screen.ppm")
+            before = machine.text().count("Fosfor OS server kernel (mf)")
+            type_keys(machine, ["v", "e", "r", "s", "i", "o", "n", "ret"])
+            machine.pump(1.0)
+            check(machine.text().count("Fosfor OS server kernel (mf)") > before, "the PS/2 keyboard types into the shell", machine.text()[-600:])
             check("debug: kernel-update" in machine.text(), "the debug file is read from the boot volume", machine.text()[-1500:])
             check("interrupts: Intx" in machine.text(), "the e1000 came up and proved its interrupt", machine.text()[-1500:])
 

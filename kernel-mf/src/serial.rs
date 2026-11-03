@@ -14,8 +14,19 @@ fn inb(port: u16) -> u8 {
     value
 }
 
+/// False on a machine with no UART at COM1 (most laptops): the line status register then reads 0xff, which would look like
+/// "data received" forever, so reads return nothing and writes skip the transmit wait.
+static PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
 /// 115200 baud, 8N1, FIFOs on: what the rest of this project assumes.
 pub fn init() {
+    // The scratch register holds any byte on a real UART and reads back 0xff (or the bus float) on an empty port.
+    outb(COM1 + 7, 0x5a);
+    let present = inb(COM1 + 7) == 0x5a && inb(COM1 + 5) != 0xff;
+    PRESENT.store(present, core::sync::atomic::Ordering::Relaxed);
+    if !present {
+        return;
+    }
     outb(COM1 + 1, 0x00); // no interrupts
     outb(COM1 + 3, 0x80); // DLAB on
     outb(COM1, 0x01); // divisor 1 = 115200 baud
@@ -42,6 +53,9 @@ impl Write for Serial {
 }
 
 fn put(byte: u8) {
+    if !PRESENT.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     // Bounded wait for the transmit register: a machine with no UART reads 0xff and must not hang the kernel.
     for _ in 0..100_000 {
         if inb(COM1 + 5) & 0x20 != 0 {
@@ -53,7 +67,7 @@ fn put(byte: u8) {
 
 /// The next received byte, if the UART has one (LSR bit 0).
 pub fn read_byte() -> Option<u8> {
-    (inb(COM1 + 5) & 1 != 0).then(|| inb(COM1))
+    (PRESENT.load(core::sync::atomic::Ordering::Relaxed) && inb(COM1 + 5) & 1 != 0).then(|| inb(COM1))
 }
 
 /// One line at a time: CPUs print whole lines, never interleaved characters.
