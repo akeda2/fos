@@ -23,9 +23,11 @@ def config_volume_scenario():
     with tempfile.TemporaryDirectory() as tmp:
         hostname = Path(tmp) / "hostname"
         hostname.write_text("cfgmf\n")
+        settings = Path(tmp) / "settings"
+        settings.write_text("keymap sv\nforeground amber\nbackground blue\nhwp performance\n")
         config = Path(tmp) / "config.img"
         subprocess.run([sys.executable, str(ROOT / "tools/build_image.py"), "--loader", str(base.LOADER), "--kernel", str(base.KERNEL),
-                        "--output", str(config), "--label", "cfgvol", "--file", f"hostname={hostname}",
+                        "--output", str(config), "--label", "cfgvol", "--file", f"hostname={hostname}", "--file", f"settings={settings}",
                         "--payload-guid", str(uuid.uuid4()), "--no-bios"], check=True, capture_output=True)
         machine = base.Machine(tmp, {"fstab": "settings @cfgvol\n", "hostname": "bootmf\n"}, {})
         machine.extra = ["-drive", f"format=raw,file={config}"]
@@ -35,6 +37,9 @@ def config_volume_scenario():
             text = machine.text()
             check("read from @cfgvol (mounted at settings)" in text, "a settings mount is read at boot", text[-600:])
             check("announces itself as cfgmf1" in text and "bootmf" not in text, "the mounted volume's hostname wins over the root's", text[-600:])
+            check("settings: keymap sv" in text and "settings: foreground amber." in text and "settings: background blue." in text,
+                  "keymap and the console colours are applied from the mounted settings", text[-800:])
+            check("hwp is not supported by the server kernel yet" in text, "an option mf cannot honour says so", text[-800:])
         finally:
             machine.stop()
 

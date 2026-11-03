@@ -180,6 +180,25 @@ pub fn load() {
                 unsafe { NO_MSI = true };
                 println!("settings: no-msi -- devices are polled.");
             }
+            if let Some(key @ ("foreground" | "background")) = line.split_whitespace().next() {
+                let name = line.split_whitespace().nth(1).unwrap_or("");
+                let (foreground, background) = if key == "foreground" { (Some(name), None) } else { (None, Some(name)) };
+                if crate::fb::set_colours(foreground, background) {
+                    println!("settings: {key} {name}.");
+                } else {
+                    println!("settings: `{line}` ignored (unknown colour, or no pixel console).");
+                }
+            }
+            if line.split_whitespace().next() == Some("mouse-speed") {
+                let percent = line.split_whitespace().nth(1).and_then(|word| word.parse::<u32>().ok());
+                match percent {
+                    Some(percent) if kernel_core::usb_pointer::set_speed_percent(percent) => println!("settings: mouse-speed {percent}% of the default pointer gain."),
+                    _ => println!("settings: `{line}` ignored (mouse-speed PERCENT, 25-1000; 100 is the default)."),
+                }
+            }
+            if let Some(key @ ("hwp" | "park-idle" | "rotate" | "serial-shell" | "gpio-remote" | "gpio-sim" | "gpio-deny" | "prefer-msix" | "replace-in-place")) = line.split_whitespace().next() {
+                println!("settings: {key} is not supported by the server kernel yet; ignored.");
+            }
             if line.split_whitespace().next() == Some("deny-term-net") {
                 unsafe { DENY_TERM_NET = true };
                 println!("settings: deny-term-net -- the network terminal is closed.");
