@@ -11,7 +11,7 @@ use core::mem::MaybeUninit;
 use ext4::{Cache, Device, Error, FormatOptions, Journaled, Writer};
 
 /// GPT type GUID "Linux filesystem data" (0FC63DAF-8483-4772-8E79-3D69D8477DE4), in on-disk mixed-endian order.
-const LINUX_GUID: [u8; 16] = [0xaf, 0x3d, 0xc6, 0x0f, 0x83, 0x84, 0x72, 0x47, 0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4];
+pub const LINUX_GUID: [u8; 16] = [0xaf, 0x3d, 0xc6, 0x0f, 0x83, 0x84, 0x72, 0x47, 0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4];
 
 #[derive(Clone, Copy)]
 pub struct Partition {
@@ -256,21 +256,7 @@ fn mkfs(disk: usize, label: &str, confirm: bool, replace: bool, out: &mut dyn Wr
         }
     };
     let _ = writeln!(out, "ext4: partition ready ({} MiB); formatting, this takes a moment...", part.sectors >> 11);
-    cache().clear();
-    let device = Partition { disk: index, base: part.start, sectors: part.sectors };
-    let mut uuid = [0u8; 16];
-    uuid.copy_from_slice(&part.unique_guid);
-    let options = FormatOptions { label: &stored[..length], bytes_per_inode: 0, uuid, time: seconds(), journal: true, checksums: true };
-    let mut device = device;
-    let result = ext4::format_raw(&mut device, part.sectors, &options).and_then(|()| {
-        let fs = ext4::open(device, stage())?;
-        let writer = Writer::new_in(unsafe { &mut *core::ptr::addr_of_mut!(WRITER) }, fs)?;
-        writer.set_time(options.time);
-        let root = writer.root()?.number;
-        writer.mkdir(root, b"lost+found", 0o700)?;
-        writer.flush()
-    });
-    match result {
+    match format_partition(index, &part, &stored[..length]) {
         Ok(()) => {
             let _ = writeln!(out, "ext4: formatted. See `ext4 disk{disk} info`.");
         }
@@ -278,6 +264,23 @@ fn mkfs(disk: usize, label: &str, confirm: bool, replace: bool, out: &mut dyn Wr
             let _ = writeln!(out, "ext4: formatting failed: {}.", why(error));
         }
     }
+}
+
+/// Formats `part` of disk index `disk` as ext4 (journal, metadata_csum) with a `lost+found`. Erases the partition.
+pub fn format_partition(disk: usize, part: &gpt::Partition, label: &[u8]) -> Result<(), Error> {
+    cache().clear();
+    let mut device = Partition { disk, base: part.start, sectors: part.sectors };
+    let mut uuid = [0u8; 16];
+    uuid.copy_from_slice(&part.unique_guid);
+    let options = FormatOptions { label, bytes_per_inode: 0, uuid, time: seconds(), journal: true, checksums: true };
+    ext4::format_raw(&mut device, part.sectors, &options).and_then(|()| {
+        let fs = ext4::open(device, stage())?;
+        let writer = Writer::new_in(unsafe { &mut *core::ptr::addr_of_mut!(WRITER) }, fs)?;
+        writer.set_time(options.time);
+        let root = writer.root()?.number;
+        writer.mkdir(root, b"lost+found", 0o700)?;
+        writer.flush()
+    })
 }
 
 /// `ext4 diskN mkdir|rm|mv|write ...`

@@ -75,6 +75,29 @@ def main():
         check("bin" in out[0] and "ptp" in out[3], "folders and the tapes inside them are copied (v4)", out[0] + out[3])
         check("usage" in out[4].lower() or "ptp" in out[4], "a tape in bin/ is found by its bare name", out[4])
         check("installed copy" in out[1], "with their contents", out[1])
+        # FOSFS of a chosen size plus an ext4 volume over the rest.
+        target2 = tmp / "target2.img"
+        with open(target2, "wb") as handle:
+            handle.truncate(512 << 20)
+        boot2 = tmp / "boot2.img"
+        shutil.copy(IMAGE, boot2)
+        out = session(tmp, "inst3", boot2, [
+            "install disk2 ext4 fosfs=oops", "install disk2 fosfs=64M", "install disk2 fosfs=64M ext4=scratch", "install disk2 confirm",
+        ], extra=["-drive", f"format=raw,file={target2}"])
+        check("fosfs=" in out[0], "a bad fosfs= size is refused", out[0])
+        check("only makes sense with ext4" in out[1], "fosfs= alone is refused", out[1])
+        check("ext4 volume 'scratch'" in out[2], "the announcement names the ext4 volume", out[2])
+        check("ext4 volume 'scratch' ready" in out[3], "the install formats ext4", out[3])
+        table = guids(target2)
+        check("Linux data" in table and "FOSFS data" in table, "FOSFS and a Linux partition", table)
+        if Path("/usr/sbin/e2fsck").exists():
+            start = next(int(line.split()[1]) for line in table.splitlines() if "Linux data" in line) * 512
+            volume = tmp / "ext4.img"
+            volume.write_bytes(target2.read_bytes()[start:])
+            fsck = subprocess.run(["/usr/sbin/e2fsck", "-fn", str(volume)], capture_output=True, text=True)
+            check(fsck.returncode == 0, "e2fsck finds the installed ext4 volume clean", fsck.stdout + fsck.stderr)
+        out = session(tmp, "inst4", target2, ["ext4 disk1 info", "ls"])
+        check("scratch" in out[0], "the installed disk mounts its ext4 volume", out[0])
         print("install: all checks passed")
 
 
