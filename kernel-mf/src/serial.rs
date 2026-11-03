@@ -40,6 +40,7 @@ pub struct Serial;
 
 impl Write for Serial {
     fn write_str(&mut self, text: &str) -> fmt::Result {
+        crate::log::push(text);
         crate::net::relay(text);
         crate::fb::write_str(text);
         for byte in text.bytes() {
@@ -87,6 +88,8 @@ macro_rules! println {
     () => { $crate::serial::print(format_args!("\n")) };
     ($($argument:tt)*) => { $crate::serial::print(format_args!("{}\n", format_args!($($argument)*))) };
 }
+
+pub(crate) use println;
 
 macro_rules! print {
     ($($argument:tt)*) => { $crate::serial::print(format_args!($($argument)*)) };

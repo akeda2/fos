@@ -31,6 +31,13 @@ mod tapesync;
 mod power;
 mod shell;
 mod shellhost;
+mod sysshell;
+mod log;
+#[path = "../../kernel/src/formatshell.rs"]
+mod formatshell;
+use kernel_core::{fatvol, fosfs, gpt};
+// formatshell (shared with the embedded kernel) names the macro by path
+pub(crate) use serial::println;
 mod slots;
 mod acpi;
 mod apic;

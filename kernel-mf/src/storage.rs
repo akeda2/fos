@@ -8,6 +8,8 @@ use kernel_core::{ahci, fosfs, gpt, nvme, volumes};
 
 use crate::block::{self, Backend};
 
+pub use kernel_core::volumes::volume_on;
+
 static mut BOOT_DISK: Option<usize> = None;
 
 pub fn boot_disk() -> Option<usize> {
