@@ -1,6 +1,6 @@
 //! Writer tests: format with the crate, change things, and let e2fsck and debugfs judge the result.
 
-use ext4::{Device, Error, FormatOptions, Fs, Journaled, Stage, Writer};
+use ext4::{Cache, Cached, Device, Error, FormatOptions, Fs, Journaled, Stage, Writer};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::fs::{self, File, OpenOptions};
@@ -577,5 +577,24 @@ fn format_without_checksums_still_works() {
     assert_eq!(debugfs_cat(&image, "/a.txt"), b"plain");
     let dump = Command::new("/usr/sbin/dumpe2fs").arg("-h").arg(&image).output().unwrap();
     assert!(!String::from_utf8_lossy(&dump.stdout).contains("metadata_csum"));
+    let _ = fs::remove_file(&image);
+}
+
+#[test]
+fn a_read_cache_under_the_journal_stays_coherent() {
+    if !have("e2fsck") {
+        return;
+    }
+    let image = std::env::temp_dir().join(format!("fos-ext4-cache-{}.img", std::process::id()));
+    let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&image).unwrap();
+    file.set_len(200 << 20).unwrap();
+    let options = FormatOptions { label: b"fostest", bytes_per_inode: 0, uuid: [7; 16], time: 1_700_000_000, journal: true, checksums: true };
+    // Few slots, so that many units collide and get replaced.
+    let cache: &'static mut Cache = Box::leak(Box::new(Cache::new(Box::leak(vec![0u64; 16].into_boxed_slice()), Box::leak(vec![0u8; 16 * 4096].into_boxed_slice()))));
+    let mut w = Writer::format(Cached::new(FileDevice(file), cache), (200 << 20) / 512, &options, stage()).unwrap();
+    script(&mut w).unwrap();
+    drop(w);
+    fsck(&image);
+    assert_eq!(debugfs_cat(&image, "/big.bin"), pattern(9, 1000));
     let _ = fs::remove_file(&image);
 }

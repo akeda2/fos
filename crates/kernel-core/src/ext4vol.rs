@@ -8,7 +8,7 @@
 use crate::{block, gpt};
 use core::fmt::Write;
 use core::mem::MaybeUninit;
-use ext4::{Device, Error, FormatOptions, Journaled, Writer};
+use ext4::{Cache, Device, Error, FormatOptions, Journaled, Writer};
 
 /// GPT type GUID "Linux filesystem data" (0FC63DAF-8483-4772-8E79-3D69D8477DE4), in on-disk mixed-endian order.
 const LINUX_GUID: [u8; 16] = [0xaf, 0x3d, 0xc6, 0x0f, 0x83, 0x84, 0x72, 0x47, 0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4];
@@ -20,12 +20,29 @@ pub struct Partition {
     pub sectors: u64,
 }
 
+/// Read cache for the volume in use (docs/ext4.md "Performance"): 512 slots of 4 KiB. A folder of thousands of names or the
+/// allocation bitmaps are read from the disk once, not on every use. It is emptied whenever a volume is located or made, so
+/// nothing written behind its back (`sector`, `foscopy`, another tool) can be served stale.
+const CACHE_SLOTS: usize = 512;
+static mut CACHE_TAGS: [u64; CACHE_SLOTS] = [0; CACHE_SLOTS];
+static mut CACHE_DATA: [u8; CACHE_SLOTS * 4096] = [0; CACHE_SLOTS * 4096];
+static mut CACHE: Option<Cache> = None;
+
+fn cache() -> &'static mut Cache {
+    // SAFETY: one shell command at a time uses the volume code; the statics are only reached from here.
+    unsafe {
+        let slot = &mut *core::ptr::addr_of_mut!(CACHE);
+        slot.get_or_insert_with(|| Cache::new(&mut *core::ptr::addr_of_mut!(CACHE_TAGS), &mut *core::ptr::addr_of_mut!(CACHE_DATA)))
+    }
+}
+
 impl Device for Partition {
     fn read(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
         if lba + (buffer.len() / 512) as u64 > self.sectors {
             return Err(Error::Device);
         }
-        block::read(self.disk, self.base + lba, buffer).map_err(|_| Error::Device)
+        let (disk, base) = (self.disk, self.base);
+        cache().read(lba, buffer, |lba, buffer| block::read(disk, base + lba, buffer).map_err(|_| Error::Device))
     }
 
     fn write(&mut self, lba: u64, buffer: &[u8]) -> Result<(), Error> {
@@ -33,7 +50,9 @@ impl Device for Partition {
             return Err(Error::Device);
         }
         crate::debug::pet(); // a format writes gigabytes of inode tables: longer than the watchdog period
-        block::write(self.disk, self.base + lba, buffer).map_err(|_| Error::Device)
+        block::write(self.disk, self.base + lba, buffer).map_err(|_| Error::Device)?;
+        cache().wrote(lba, buffer);
+        Ok(())
     }
 }
 
@@ -67,6 +86,7 @@ pub fn mount(disk: usize) -> Result<Fs, Error> {
 /// The partition (or whole disk) holding the ext volume of disk index `disk`, even if its journal needs replaying.
 pub fn locate(disk: usize) -> Result<Partition, Error> {
     let info = block::sectors(disk).ok_or(Error::Device)?;
+    cache().clear();
     let mut candidates = [Partition { disk, base: 0, sectors: 0 }; 6];
     let mut count = 0;
     let mut index = 0;
@@ -103,6 +123,7 @@ pub fn locate(disk: usize) -> Result<Partition, Error> {
     count += 1;
     let mut reason = Error::NotExt;
     for &partition in &candidates[..count] {
+        cache().clear(); // slots are keyed by sector within the partition, so each candidate starts empty
         match ext4::Fs::mount_with(partition, ext4::Options { ignore_journal: true }) {
             Ok(_) => return Ok(partition),
             Err(Error::NotExt) => {}
@@ -235,6 +256,7 @@ fn mkfs(disk: usize, label: &str, confirm: bool, replace: bool, out: &mut dyn Wr
         }
     };
     let _ = writeln!(out, "ext4: partition ready ({} MiB); formatting, this takes a moment...", part.sectors >> 11);
+    cache().clear();
     let device = Partition { disk: index, base: part.start, sectors: part.sectors };
     let mut uuid = [0u8; 16];
     uuid.copy_from_slice(&part.unique_guid);

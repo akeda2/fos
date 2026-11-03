@@ -17,9 +17,11 @@
 //! where an allocator exists.
 #![cfg_attr(not(test), no_std)]
 
+mod cache;
 mod crc;
 mod journal;
 mod write;
+pub use cache::{Cache, Cached};
 pub use journal::{open, Journaled, Stage};
 pub use write::{format_raw, FormatOptions, Writer};
 
