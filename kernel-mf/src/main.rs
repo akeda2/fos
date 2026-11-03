@@ -306,7 +306,6 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     sched_selftest();
     sched::spawn("service", service_thread, 0).expect("the service thread");
     println!("kernel-mf: slice 8 reached the end of boot; entering the service loop.");
-    shell::prompt();
     // The boot context is the idle thread: it runs when nothing else is ready and sleeps until the next interrupt.
     loop {
         sched::yield_now();
@@ -365,6 +364,9 @@ fn panic(info: &PanicInfo) -> ! {
 
 /// The server's housekeeping: NICs, serial input, the reset timer and the slot streak. Polls once per pass and gives way.
 extern "C" fn service_thread(_: usize) {
+    // The `start` file runs here, as at the end of the embedded kernel's boot; the prompt follows it.
+    config::run_start(shell::run);
+    shell::prompt();
     loop {
         net::poll();
         usb::poll();

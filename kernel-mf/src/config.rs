@@ -1,5 +1,5 @@
 //! The per-machine text files on the boot volume that the server kernel honours so far: `hostname`, `settings`
-//! (`deny-term-net`, `no-msi`, `keymap`, `irq-cpu N`) and `debug` (`kernel-update`, `reboot-on-crash`, `reboot-delay`, `watchdog`, `crash-on-boot`). Same files and names as the embedded kernel (docs/config.md); a FOSFS v4
+//! (`deny-term-net`, `no-msi`, `keymap`, `irq-cpu N`), `start` (the boot script, rerun by the `start` command) and `debug` (`kernel-update`, `reboot-on-crash`, `reboot-delay`, `watchdog`, `crash-on-boot`). Same files and names as the embedded kernel (docs/config.md); a FOSFS v4
 //! volume keeps them in `settings/`, the bare name in the root stays valid. Options the server kernel has no use for yet are
 //! ignored silently.
 
@@ -138,4 +138,29 @@ pub fn load() {
             }
         }
     }
+}
+
+/// Runs the `start` file through `run`, one command per line. False if there is no such file.
+pub fn run_start(mut run: impl FnMut(&str)) -> bool {
+    let Some(text) = read("start") else { return false };
+    // `read` shares one buffer, and the commands may read files themselves.
+    let script = alloc::string::String::from(text);
+    println!("start file: running {} command(s).", lines(&script).count());
+    for line in lines(&script) {
+        println!("start> {line}");
+        run(line);
+    }
+    true
+}
+
+/// The `start` command, and the boot-time run: one at a time.
+pub fn start(run: impl FnMut(&str)) {
+    static RUNNING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if RUNNING.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return println!("start: the start file is already running.");
+    }
+    if !run_start(run) {
+        println!("start: no start file on a FOSFS volume.");
+    }
+    RUNNING.store(false, core::sync::atomic::Ordering::Relaxed);
 }

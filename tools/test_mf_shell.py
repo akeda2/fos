@@ -18,10 +18,11 @@ READY = "entering the service loop"
 
 def main():
     with tempfile.TemporaryDirectory() as tmp:
-        machine = base.Machine(tmp, {"hostname": "mfshell\n"}, {})
+        machine = base.Machine(tmp, {"hostname": "mfshell\n", "start": "# comment\necho from-start-file\n"}, {})
         machine.start()
         try:
             machine.wait_for(READY)
+            check("start> echo from-start-file" in machine.text() and "start file: running 1 command" in machine.text(), "the start file runs at boot", machine.text()[-400:])
             machine.connect()
             out = machine.run("ls")
             check("hostname" in out, "ls lists the boot volume", out[-400:])
@@ -74,6 +75,8 @@ def main():
             check("install" in out.lower(), "install answers", out[-400:])
             out = machine.run("bootcode")
             check("boot" in out.lower(), "bootcode reports the boot code", out[-400:])
+            out = machine.run("start")
+            check("start> echo from-start-file" in out, "the start command reruns the start file", out[-300:])
             out = machine.run("bogus")
             check("Unknown command" in out, "an unknown command is reported", out[-300:])
         finally:
