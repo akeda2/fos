@@ -185,16 +185,7 @@ fn run(line: &str) {
             Some(_) => println!("Usage: date | date set YYYY-MM-DD HH:MM[:SS]"),
         },
         "uptime" => println!("{} s", apic::ticks() / apic::TICK_HZ),
-        "slots" => match { let _disk = crate::tapefs::lock(); slots::read_metadata() } {
-            Some(m) => {
-                println!("booted slot {}, active {}, pending {:?}, crash count {}", slots::boot_slot(), m.active_slot, m.pending_slot, m.crash_count);
-                match crate::debug::watchdog_seconds() {
-                    Some(seconds) => println!("watchdog: {seconds} s"),
-                    None => println!("watchdog: off"),
-                }
-            }
-            None => println!("slot metadata unreadable"),
-        },
+        "slots" => slots::report(),
         "audio" => crate::audioshell::command(words),
         "usb" => crate::usbshell::command(words),
         "tape" => {
@@ -216,6 +207,7 @@ fn run(line: &str) {
                 }
                 println!("\x1b[41;1m bold on red \x1b[0m");
             }
+            Some("slots") | Some("status") => slots::report(),
             Some("crash") => unsafe { core::arch::asm!("ud2") },
             Some("hang") => {
                 // The shell runs on the service thread: spinning here with interrupts on stops its petting while other threads run.
@@ -230,7 +222,7 @@ fn run(line: &str) {
                     core::hint::spin_loop();
                 }
             }
-            _ => println!("usage: debug crash|hang|deadhang"),
+            _ => println!("usage: debug slots|crash|hang|deadhang"),
         },
         "reboot" => {
             println!("Restarting.");

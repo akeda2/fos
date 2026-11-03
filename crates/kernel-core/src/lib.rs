@@ -30,6 +30,7 @@ pub mod audio;
 pub mod e1000;
 pub mod fatvol;
 pub mod fosfs;
+pub mod slot_report;
 pub mod tapesync_client;
 pub mod gpio_client;
 pub mod gpt;
