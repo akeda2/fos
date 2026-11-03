@@ -72,3 +72,10 @@ pub fn activate(index: usize, ist_top: u64) {
 pub fn ticks_of(index: usize) -> u64 {
     get(index).ticks.load(Ordering::Relaxed)
 }
+
+/// The APIC id device interrupts are sent to: the CPU of `irq-cpu N` in `settings` if it is running, else the boot CPU.
+/// MSI messages and I/O APIC pins both ask here, once, when a device is set up (after `config::load`).
+pub fn interrupt_target() -> u32 {
+    let wanted = crate::config::irq_cpu();
+    if wanted < count() && get(wanted).online.load(core::sync::atomic::Ordering::Acquire) { get(wanted).apic_id } else { get(0).apic_id }
+}

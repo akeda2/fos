@@ -90,6 +90,24 @@ def main():
         finally:
             machine.stop()
 
+    # `irq-cpu 1`: the NIC's interrupt (self-test, then every frame) is delivered to CPU 1 and the terminal still works.
+    with tempfile.TemporaryDirectory() as tmp:
+        machine = base.Machine(tmp, {"settings": "irq-cpu 1\n"})
+        machine.extra = ["-smp", "4"]
+        machine.start()
+        try:
+            machine.wait_for(READY)
+            text = machine.text()
+            check("irq-cpu 1" in text, "settings: irq-cpu 1 is read", text[-1500:])
+            check("interrupts: Intx" in text or "interrupts: Msi" in text, "the NIC proved its interrupt path with the target on CPU 1", text[-1500:])
+            machine.connect()
+            out = machine.run("echo routed")
+            check("routed" in out, "the network terminal works with interrupts on CPU 1", out)
+            out = machine.run("cpus")
+            check("4 CPU(s)" in out, "on a 4 CPU machine", out)
+        finally:
+            machine.stop()
+
     # No kernel-update: KUP frames are not answered; deny-term-net: no terminal.
     with tempfile.TemporaryDirectory() as tmp:
         machine = base.Machine(tmp, {"settings": "deny-term-net\n"})
