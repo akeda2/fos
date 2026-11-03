@@ -10,6 +10,7 @@ tape_rt::tape_help!(br#"fscheck: read a range of a file with fs_read_at (ABI 29)
 Usage: tape run fscheck NAME OFFSET LENGTH   (NAME: NAME, diskN/NAME or @LABEL/NAME)
 Prints the bytes read; a count of 0 means the offset is at or past the end.
        tape run fscheck streams NAME1 NAME2   (two open streams, ABI 30; the files are 20000 and 19900 bytes)
+       tape run fscheck remove NAME           (create NAME, delete it with fs_remove, check it is gone)
 "#);
 
 #[unsafe(no_mangle)]
@@ -24,6 +25,13 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             _ => println!("Usage: fscheck streams NAME1 NAME2"),
         };
     }
+    if arguments.starts_with("remove ") {
+        words.next();
+        return match words.next() {
+            Some(name) => remove(api, name),
+            None => println!("Usage: fscheck remove NAME"),
+        };
+    }
     let (Some(name), Some(offset), Some(length)) = (words.next(), words.next().and_then(|word| word.parse::<u64>().ok()), words.next().and_then(|word| word.parse::<usize>().ok())) else {
         return println!("Usage: fscheck NAME OFFSET LENGTH");
     };
@@ -36,6 +44,18 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         }
         Err(code) => println!("fscheck: error {code}"),
     }
+}
+
+/// Creates NAME, deletes it with fs_remove, and checks it is gone and that a second delete fails.
+fn remove(api: &'static TapeApi, name: &str) {
+    let write = (api.fs_write)(name.as_ptr(), name.len(), b"gone".as_ptr(), 4);
+    let mut byte = [0u8; 4];
+    let before = tape_rt::read_file_at(name, 0, &mut byte);
+    let first = (api.fs_remove)(name.as_ptr(), name.len());
+    let after = tape_rt::read_file_at(name, 0, &mut byte);
+    let second = (api.fs_remove)(name.as_ptr(), name.len());
+    let ok = write == 0 && before == Ok(4) && first == 0 && after.is_err() && second < 0;
+    println!("fscheck: remove {}: write {write}, before {before:?}, remove {first}, after {after:?}, again {second}", if ok { "ok" } else { "FAILED" });
 }
 
 const BLOCK: usize = 2048;
