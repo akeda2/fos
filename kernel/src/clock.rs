@@ -125,9 +125,9 @@ pub fn init(century: u8) {
     match read_rtc() {
         Some(time) => {
             set_base(&time);
-            crate::println!("Clock: {} (the RTC, taken as local time).", Display(time));
+            println!("Clock: {} (the RTC, taken as local time).", Display(time));
         }
-        None => crate::println!("Clock: the RTC holds no valid time (dead battery?); files get a fixed date until `date set`."),
+        None => println!("Clock: the RTC holds no valid time (dead battery?); files get a fixed date until `date set`."),
     }
 }
 

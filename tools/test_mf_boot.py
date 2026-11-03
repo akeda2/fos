@@ -137,6 +137,7 @@ def main():
               f"-smp {cpus}: ring 3 processes: syscalls, pointer checks, faults and stack overflows kill only the process, user code is preempted, an ELF is loaded and relocated, SSE/AVX state survives switches, memory returns", text)
         micros = re.search(r"Clock: .* \(microseconds (\d+)\)", text)
         check(micros is not None and int(micros.group(1)) > 150_000, f"-smp {cpus}: the monotonic microsecond clock runs", text)
+        check(re.search(r"Clock: 20\d\d-\d\d-\d\d \d\d:\d\d:\d\d \(the RTC", text) is not None, f"-smp {cpus}: the RTC sets the wall clock", text)
         check("PANIC" not in text and "CPU exception" not in text, f"-smp {cpus}: no panic", text)
     text = boot(4, numa=True)
     check(re.search(r"SRAT: 2 NUMA node\(s\), \d+ memory range\(s\), 4 CPU affinity", text) is not None, "-numa: the SRAT shows two nodes and four CPUs", text)

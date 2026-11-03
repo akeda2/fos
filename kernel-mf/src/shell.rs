@@ -2,7 +2,7 @@
 //! inspection commands. Output goes through `println!`, which reaches every console (serial and, while a session is open,
 //! the network). Runs on the boot CPU from the service loop.
 
-use crate::{apic, block, net, percpu, pmm, power, sched, slots};
+use crate::{apic, block, clock, net, percpu, pmm, power, sched, slots};
 use kernel_core::netdump::Mac;
 use kernel_core::{nic, pci};
 
@@ -155,6 +155,10 @@ fn run(line: &str) {
             sched::for_each(|id, name, state| println!("{id:3} {name:<16} {state:?}"));
             println!("{} context switches.", sched::switches());
         }
+        "date" => match clock::now() {
+            Some(time) => println!("{}", clock::Display(time)),
+            None => println!("the clock was never set (the RTC held no valid time)"),
+        },
         "uptime" => println!("{} s", apic::ticks() / apic::TICK_HZ),
         "slots" => match slots::read_metadata() {
             Some(m) => println!("booted slot {}, active {}, pending {:?}, crash count {}", slots::boot_slot(), m.active_slot, m.pending_slot, m.crash_count),
