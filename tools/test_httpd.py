@@ -29,8 +29,9 @@ HOST_PORT = port(28080)
 class Guest:
     """A booted guest with a shell on the term net session. `with Guest(forward=...) as g: g.line("uptime", "ticks")`."""
 
-    def __init__(self, forward=None, data_disk=False, timeout=240, guest_port=80):
+    def __init__(self, forward=None, data_disk=False, timeout=240, guest_port=80, user_extra=""):
         self.forward, self.data_disk, self.timeout, self.guest_port = forward, data_disk, timeout, guest_port
+        self.user_extra = user_extra
 
     def __enter__(self):
         code, variables = find("FOS_OVMF_CODE", CODE_CANDIDATES), find("FOS_OVMF_VARS", VARS_CANDIDATES)
@@ -39,7 +40,7 @@ class Guest:
         image, vars_copy = tmp / "image.img", tmp / "vars.fd"
         shutil.copy(IMAGE, image)
         shutil.copy(variables, vars_copy)
-        user = "user,id=net1" + (f",hostfwd=tcp:127.0.0.1:{self.forward}-10.0.2.15:{self.guest_port}" if self.forward else "")
+        user = "user,id=net1" + self.user_extra + (f",hostfwd=tcp:127.0.0.1:{self.forward}-10.0.2.15:{self.guest_port}" if self.forward else "")
         command = ["qemu-system-x86_64", "-machine", "q35", "-m", "512", "-display", "none", "-serial", "stdio", "-no-reboot",
                    "-drive", f"if=pflash,format=raw,readonly=on,file={code}", "-drive", f"if=pflash,format=raw,file={vars_copy}",
                    "-drive", f"format=raw,file={image}"]
