@@ -123,7 +123,7 @@ fn run(line: &str) {
     let Some(command) = words.next() else { return };
     match command {
         "help" => {
-            println!("help version cpus mem pci disks nic uptime slots threads echo TEXT reboot");
+            println!("help version cpus mem pci disks nic uptime slots threads echo TEXT reboot audio");
             println!("tape NAME [ARGS]  run a tape (a ring 3 process)   kill PID");
         }
         "version" => println!("Fosfor OS server kernel (mf), slice 8."),
@@ -170,6 +170,7 @@ fn run(line: &str) {
             }
             None => println!("slot metadata unreadable"),
         },
+        "audio" => crate::audioshell::command(words),
         "tape" => {
             let Some(name) = words.next() else { return println!("usage: tape NAME [ARGS]") };
             let args = line.trim_start()[command.len()..].trim_start()[name.len()..].trim_start();
