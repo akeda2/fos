@@ -51,13 +51,13 @@ fn tone(words: &mut core::str::SplitWhitespace) {
     }
     let Some((channels, slot)) = ua::playback_format() else { return };
     let (channels, slot) = (usize::from(channels), usize::from(slot));
-    println!("audio: started, {channels} channels, {slot} bytes per sample");
     let step = (u64::from(frequency) << 16) / u64::from(rate);
     let mut phase = 0u64;
     let end = apic::micros() + seconds * 1_000_000;
     let frame_bytes = channels * slot;
     let float = ua::playback_float() && slot == 4;
     let mut chunk = [0u8; 2048];
+    // No print from `start` to the end of the loop: a console line costs milliseconds, and the ring would run dry meanwhile.
     while apic::micros() < end {
         crate::debug::pet();
         crate::usb::poll();
@@ -80,6 +80,7 @@ fn tone(words: &mut core::str::SplitWhitespace) {
         }
         ua::write(&chunk[..frames * frame_bytes]);
     }
+    println!("audio: {channels} channels, {slot} bytes per sample");
     ua::status();
     ua::stop_mine();
 }

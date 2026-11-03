@@ -1238,6 +1238,8 @@ fn publish_ehci(controller: &mut ehci::Controller, slot: &mut Option<Stream>, st
     for offset in 0..ehci::ISO_RING {
         ehci_fill(stream, (first + offset) % ehci::ISO_RING);
     }
+    // The first ring goes out before the caller can have written anything: silence by construction, not an underrun (as `publish`).
+    stream.underruns.store(0, Ordering::Relaxed);
     stream.active.store(true, Ordering::Release);
     crate::cpu::interrupts_restore(was);
 }
