@@ -2,8 +2,8 @@
 //! `kernel_core::tape_fs` so a tape sees the same names, volumes and error codes as on the embedded kernel.
 //!
 //! `tape_fs` and the drivers under it keep their state in statics and know nothing of other CPUs, so every call here runs under one
-//! lock (`LOCK`, also taken by the shell when it loads a tape). The lock keeps interrupts off while a disk transfer runs; the
-//! drivers poll, so that is only a latency cost. A tape's memory is never handed to a driver: data goes through a kernel buffer
+//! lock (`lock()`, also taken by the shell when it loads a tape). The lock is a sleeping mutex and interrupts stay on while a disk
+//! transfer runs (`DiskGuard`). A tape's memory is never handed to a driver: data goes through a kernel buffer
 //! (a bounce buffer, at most `CHUNK` bytes for reads and `WRITE_LIMIT` for a whole-file write), as a driver's DMA needs physical
 //! addresses the tape's virtual ones are not.
 //!
@@ -15,10 +15,31 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use fosfor_abi::tape::{FS_ERROR, FS_STREAMS, FS_TOO_BIG, FileInfo};
 use kernel_core::tape_fs;
 
-use crate::sync::SpinLock;
 use crate::{process, sched};
 
-pub static LOCK: SpinLock<()> = SpinLock::new(());
+static LOCK: sched::SleepMutex<()> = sched::SleepMutex::new(());
+
+/// Holds the disk lock with interrupts on. A tape's system call arrives with them off (SFMASK), and a transfer can take
+/// milliseconds: the timer, the NICs and the wake IPIs must keep running, and a holder that is preempted just makes the
+/// other callers sleep (`SleepMutex`), not spin. The drivers poll for completion and do not touch their state from an
+/// interrupt handler.
+pub struct DiskGuard {
+    flags: bool,
+    _lock: sched::SleepGuard<'static, ()>,
+}
+
+pub fn lock() -> DiskGuard {
+    let guard = LOCK.lock();
+    let flags = crate::cpu::interrupts_save_and_disable();
+    crate::cpu::interrupts_enable();
+    DiskGuard { flags, _lock: guard }
+}
+
+impl Drop for DiskGuard {
+    fn drop(&mut self) {
+        crate::cpu::interrupts_restore(self.flags);
+    }
+}
 
 const CHUNK: usize = 1 << 20;
 const WRITE_LIMIT: usize = 8 << 20;
@@ -36,7 +57,7 @@ fn name(address: u64, length: u64) -> Option<Vec<u8>> {
 pub fn read(name_at: u64, name_len: u64, buffer: u64, capacity: u64) -> isize {
     let Some(reference) = name(name_at, name_len) else { return FS_ERROR };
     let length = {
-        let _guard = LOCK.lock();
+        let _guard = lock();
         tape_fs::length(&reference)
     };
     if length < 0 {
@@ -60,7 +81,7 @@ pub fn read(name_at: u64, name_len: u64, buffer: u64, capacity: u64) -> isize {
 fn read_at(reference: &[u8], offset: u64, to: u64, count: u64) -> isize {
     let mut piece = alloc::vec![0u8; count as usize];
     let got = {
-        let _guard = LOCK.lock();
+        let _guard = lock();
         tape_fs::read_at(reference, offset, &mut piece)
     };
     if got > 0 && !process::copy_to_user(to, &piece[..got as usize]) {
@@ -81,13 +102,13 @@ pub fn write(name_at: u64, name_len: u64, data: u64, length: u64) -> isize {
         return FS_TOO_BIG;
     }
     let Some(bytes) = copy_from_user(data, length) else { return FS_ERROR };
-    let _guard = LOCK.lock();
+    let _guard = lock();
     tape_fs::write(&reference, &bytes)
 }
 
 pub fn remove(name_at: u64, name_len: u64) -> isize {
     let Some(reference) = name(name_at, name_len) else { return FS_ERROR };
-    let _guard = LOCK.lock();
+    let _guard = lock();
     tape_fs::remove(&reference)
 }
 
@@ -96,7 +117,7 @@ pub fn list(volume_at: u64, volume_len: u64, index: u64, out: u64) -> isize {
     let Some(volume) = name(volume_at, volume_len) else { return FS_ERROR };
     let mut info = FileInfo { length: 0, flags: 0, name_length: 0, name: [0; 64] };
     let found = {
-        let _guard = LOCK.lock();
+        let _guard = lock();
         tape_fs::list(&volume, index as usize, &mut info)
     };
     if found == 1 {
@@ -119,7 +140,7 @@ pub fn stream_open(name_at: u64, name_len: u64, max_bytes: u64) -> isize {
     if !claim_streams() {
         return FS_ERROR;
     }
-    let _guard = LOCK.lock();
+    let _guard = lock();
     tape_fs::stream_open(&reference, max_bytes)
 }
 
@@ -131,11 +152,11 @@ pub fn stream_open2(name_at: u64, name_len: u64, max_bytes: u64, capacity_out: u
     }
     let mut capacity = 0u64;
     let handle = {
-        let _guard = LOCK.lock();
+        let _guard = lock();
         tape_fs::api_fs_stream_open2(reference.as_ptr(), reference.len(), max_bytes, &mut capacity)
     };
     if handle >= 0 && !process::copy_to_user(capacity_out, &capacity.to_le_bytes()) {
-        let _guard = LOCK.lock();
+        let _guard = lock();
         tape_fs::api_fs_stream_close2(handle, 0);
         return FS_ERROR;
     }
@@ -152,7 +173,7 @@ fn stream_data(handle: Option<isize>, offset: u64, data: u64, length: u64, file_
         let piece = (length - done).min(CHUNK as u64);
         let Some(bytes) = copy_from_user(data + done, piece) else { return FS_ERROR };
         let result = {
-            let _guard = LOCK.lock();
+            let _guard = lock();
             match handle {
                 Some(handle) => tape_fs::api_fs_stream_write2(handle, offset + done, bytes.as_ptr(), bytes.len(), file_length),
                 None => tape_fs::stream_write(offset + done, &bytes, file_length),
@@ -183,7 +204,7 @@ pub fn stream_close(file_length: u64) -> isize {
     if STREAM_OWNER.load(Ordering::Acquire) != sched::current_pid() {
         return FS_ERROR;
     }
-    let _guard = LOCK.lock();
+    let _guard = lock();
     tape_fs::stream_close(file_length)
 }
 
@@ -191,14 +212,14 @@ pub fn stream_close2(handle: u64, file_length: u64) -> isize {
     if handle >= FS_STREAMS as u64 || STREAM_OWNER.load(Ordering::Acquire) != sched::current_pid() {
         return FS_ERROR;
     }
-    let _guard = LOCK.lock();
+    let _guard = lock();
     tape_fs::api_fs_stream_close2(handle as isize, file_length)
 }
 
 /// The process `pid` ended: drop its streams (a file left open keeps what was written and its reservation).
 pub fn process_ended(pid: u64) {
     if STREAM_OWNER.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-        let _guard = LOCK.lock();
+        let _guard = lock();
         tape_fs::stream_reset();
     }
 }

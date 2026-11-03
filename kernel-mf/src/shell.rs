@@ -181,7 +181,7 @@ fn run(line: &str) {
 
 /// Loads the ELF tape `name` from the boot volume (or whichever volume holds it) and starts it as a process.
 fn run_tape(name: &str, args: &str) {
-    let disk = crate::tapefs::LOCK.lock();
+    let disk = crate::tapefs::lock();
     let Some(volume) = kernel_core::volumes::volume_with_file(name.as_bytes()) else {
         return println!("tape: no file `{name}`.");
     };
