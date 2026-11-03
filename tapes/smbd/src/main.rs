@@ -253,14 +253,19 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                 files.name[..share.len()].copy_from_slice(share.as_bytes());
                 files.name_length = share.len();
                 let mut session = Server::new(files);
-                // No random source in the tape ABI: the challenge is a hash of the clock, a counter and the peer's address
-                // and port, which a remote peer cannot predict to the microsecond but could narrow down. docs/smb.md.
-                let (ip, port) = tcp.peer(slot);
-                *pool = pool.wrapping_add(1);
-                let mixed = md5(&[&tape_rt::micros().to_le_bytes(), &pool.to_le_bytes(), &ip.0, &port.to_le_bytes(), &state[..]]);
-                state.copy_from_slice(&mixed);
-                session.challenge.copy_from_slice(&mixed[..8]);
-                session.guid.copy_from_slice(&mixed);
+                // ABI 33 `random`; a kernel without it falls back to a hash of the clock, a counter and the peer
+                // (unpredictable only to a peer that cannot guess the microsecond; docs/smb.md).
+                let mut fresh = [0u8; 24];
+                if tape_rt::random(&mut fresh).is_none() {
+                    let (ip, port) = tcp.peer(slot);
+                    *pool = pool.wrapping_add(1);
+                    let mixed = md5(&[&tape_rt::micros().to_le_bytes(), &pool.to_le_bytes(), &ip.0, &port.to_le_bytes(), &state[..]]);
+                    state.copy_from_slice(&mixed);
+                    fresh[..16].copy_from_slice(&mixed);
+                    fresh[16..].copy_from_slice(&mixed[..8]);
+                }
+                session.challenge.copy_from_slice(&fresh[..8]);
+                session.guid.copy_from_slice(&fresh[8..24]);
                 sessions[slot] = Some(session);
                 if log {
                     let (ip, _) = tcp.peer(slot);

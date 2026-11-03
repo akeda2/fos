@@ -213,6 +213,7 @@ fn make_api(info: &BootInfo, arguments: &str) -> TapeApi {
         vfs_stat: kernel_core::tape_vfs::api_vfs_stat,
         vfs_read_dir: kernel_core::tape_vfs::api_vfs_read_dir,
         vfs_read: kernel_core::tape_vfs::api_vfs_read,
+        random: kernel_core::random::api_random,
     }
 }
 

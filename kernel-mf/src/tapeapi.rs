@@ -143,6 +143,7 @@ const PHYS_ADDR: u64 = slot(offset_of!(TapeApi, phys_addr));
 const VFS_STAT: u64 = slot(offset_of!(TapeApi, vfs_stat));
 const VFS_READ_DIR: u64 = slot(offset_of!(TapeApi, vfs_read_dir));
 const VFS_READ: u64 = slot(offset_of!(TapeApi, vfs_read));
+const RANDOM: u64 = slot(offset_of!(TapeApi, random));
 const FS_READ_AT: u64 = slot(offset_of!(TapeApi, fs_read_at));
 const MEMORY_MAP: u64 = slot(offset_of!(TapeApi, memory_map));
 const MEMORY_MAP_COUNT: u64 = slot(offset_of!(TapeApi, memory_map_count));
@@ -355,6 +356,10 @@ pub fn call(frame: &mut Frame) {
         VFS_STAT => tapefs::vfs_stat(a, b, c) as u64,
         VFS_READ_DIR => tapefs::vfs_read_dir(a, b, c, d) as u64,
         VFS_READ => tapefs::vfs_read(a, b, c, d, e) as u64,
+        RANDOM => {
+            let out = unsafe { core::slice::from_raw_parts_mut(a as *mut u8, b as usize) };
+            u64::from(kernel_core::random::fill(out))
+        }
         FS_READ_AT => tapefs::read_range(a, b, c, d, e) as u64,
         FS_WRITE => tapefs::write(a, b, c, d) as u64,
         FS_REMOVE => tapefs::remove(a, b) as u64,

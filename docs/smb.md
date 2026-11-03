@@ -69,9 +69,9 @@ Done (ABI 32, `crates/kernel-core/src/tape_vfs.rs`, `tape_rt::vfs_stat/vfs_read_
    (`crates/smb/src/sign.rs`: HMAC-SHA-256 for SMB 2.0.2/2.1, AES-128-CMAC with the SP 800-108 derived key for 3.0; the session
    key is the NTLMv2 session base key, no key exchange offered). Signed requests are verified. Guests are not signed. Not
    planned: Kerberos, encryption, SMB 3.1.1 (its pre-authentication hash), SMB1.
-5. **The challenge is not from a real random source** (no entropy call in the tape ABI): it is MD5 over the microsecond clock,
-   a counter, the peer's address and port and the previous output. Good enough against replay on a lab network; an attacker who
-   can guess the clock to the microsecond could precompute. A `random` ABI call (RDRAND where present) would fix it.
+5. **The challenge** comes from the tape ABI `random` call (33: a SHA-256 pool fed by RDSEED/RDRAND, the TSC and a counter;
+   the Pi 4 has no hardware source yet, so there it is clock and counter only). Without the call (older kernel) smbd falls back to MD5
+   over the clock and a counter, good enough against replay on a lab network only.
 
 ## Order of work
 
@@ -89,7 +89,8 @@ Done (ABI 32, `crates/kernel-core/src/tape_vfs.rs`, `tape_rt::vfs_stat/vfs_read_
    unchecked (`make test-smb` still covers fosplay against a real Samba when one is reachable).
 6. (done) Users file, NTLMv2 verification, signing, uid/gid and mode checks (`make test-smbd` second boot, `logins_are_checked` in
    `crates/smb/tests/server.rs`: right and wrong password, unknown user, anonymous, a 0600 file of another owner, SMB 2.0.2 and 3.0).
-   The `smb` client tape is still guest only: it has no `user=`/`password=` yet (it would need an NTLMv2 response and signature checks).
+   The `smb` client tape logs in with `user=NAME password=SECRET` (NTLMv2, HMAC-SHA-256 signing, client nonce from `random`); `make test-smb-client`
+   second section: password login, signed 3 MB `get`, wrong password and guest refused (the host `serve` example with `SMB_LOGIN`).
 7. Writes: the `vfs_*` write calls, the ext4 writer behind them (journal commit per request batch), CREATE for write, WRITE,
    SET_INFO (rename, delete-on-close, end-of-file), FLUSH.
 
