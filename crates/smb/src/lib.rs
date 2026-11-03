@@ -16,6 +16,11 @@
 //! sent raw, not wrapped in SPNEGO, which Samba accepts.
 #![no_std]
 
+pub mod ntlm;
+pub mod wire;
+
+use wire::*;
+
 /// Moves bytes to and from the server.
 pub trait Transport {
     fn send(&mut self, data: &[u8]) -> Result<(), Error>;
@@ -70,15 +75,7 @@ pub fn status_name(status: u32) -> &'static str {
     }
 }
 
-const CMD_NEGOTIATE: u16 = 0;
-const CMD_SESSION_SETUP: u16 = 1;
-const CMD_TREE_CONNECT: u16 = 3;
-const CMD_CREATE: u16 = 5;
-const CMD_CLOSE: u16 = 6;
-const CMD_READ: u16 = 8;
-const CMD_QUERY_DIRECTORY: u16 = 14;
 
-const HEADER: usize = 64;
 /// Request layout in the buffer: 4 bytes of frame header, then the SMB2 header, then the body.
 const BODY: usize = 4 + HEADER;
 const NTLMSSP: &[u8; 8] = b"NTLMSSP\0";
@@ -131,41 +128,6 @@ pub struct Client<T: Transport, const N: usize> {
     session: u64,
     tree: u32,
     max_read: u32,
-}
-
-fn put16(buffer: &mut [u8], at: usize, value: u16) {
-    buffer[at..at + 2].copy_from_slice(&value.to_le_bytes());
-}
-fn put32(buffer: &mut [u8], at: usize, value: u32) {
-    buffer[at..at + 4].copy_from_slice(&value.to_le_bytes());
-}
-fn put64(buffer: &mut [u8], at: usize, value: u64) {
-    buffer[at..at + 8].copy_from_slice(&value.to_le_bytes());
-}
-fn get16(buffer: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([buffer[at], buffer[at + 1]])
-}
-fn get32(buffer: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes([buffer[at], buffer[at + 1], buffer[at + 2], buffer[at + 3]])
-}
-fn get64(buffer: &[u8], at: usize) -> u64 {
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&buffer[at..at + 8]);
-    u64::from_le_bytes(bytes)
-}
-
-/// Writes `text` as UTF-16LE at `at`, '/' becoming '\'; returns the byte count.
-fn put_name(buffer: &mut [u8], at: usize, text: &str) -> Result<usize, Error> {
-    let mut length = 0;
-    for unit in text.encode_utf16() {
-        if at + length + 2 > buffer.len() {
-            return Err(Error::TooBig);
-        }
-        let unit = if unit == b'/' as u16 { b'\\' as u16 } else { unit };
-        put16(buffer, at + length, unit);
-        length += 2;
-    }
-    Ok(length)
 }
 
 impl<T: Transport, const N: usize> Client<T, N> {
@@ -323,10 +285,10 @@ impl<T: Transport, const N: usize> Client<T, N> {
         put16(buffer, BODY, 9);
         put16(buffer, BODY + 4, 72);
         let mut at = BODY + 8;
-        at += put_name(buffer, at, "\\\\")?;
-        at += put_name(buffer, at, host)?;
-        at += put_name(buffer, at, "\\")?;
-        at += put_name(buffer, at, share)?;
+        at += put_name(buffer, at, "\\\\").ok_or(Error::TooBig)?;
+        at += put_name(buffer, at, host).ok_or(Error::TooBig)?;
+        at += put_name(buffer, at, "\\").ok_or(Error::TooBig)?;
+        at += put_name(buffer, at, share).ok_or(Error::TooBig)?;
         let path = at - (BODY + 8);
         put16(buffer, BODY + 6, path as u16);
         self.finish(8 + path)?;
@@ -350,7 +312,7 @@ impl<T: Transport, const N: usize> Client<T, N> {
         put32(buffer, BODY + 36, 1); // open existing
         put32(buffer, BODY + 40, if directory { 0x01 } else { 0x40 });
         put16(buffer, BODY + 44, 120);
-        let name = put_name(buffer, BODY + 56, path.trim_start_matches(['/', '\\']))?;
+        let name = put_name(buffer, BODY + 56, path.trim_start_matches(['/', '\\'])).ok_or(Error::TooBig)?;
         put16(buffer, BODY + 46, name as u16);
         self.finish(56 + name.max(1))?;
         let (status, length) = self.receive(CMD_CREATE)?;
