@@ -272,9 +272,11 @@ const ITR_VALUE: u32 = 100;
 const DESCRIPTOR_DONE: u8 = 1;
 const TX_EOP_IFCS_RS: u8 = (1 << 0) | (1 << 1) | (1 << 3);
 
-/// 256 descriptors of 16 bytes fill the one page the ring gets. 128 let a 1 Gbit/s burst of 1400-byte
-/// frames overrun a slower CPU (rack: ~360 missed packets in 5 s); the card counts them in MPC.
-const RX_COUNT: usize = 128;
+/// 128 descriptors let a 1 Gbit/s burst of 1400-byte frames overrun a slower CPU (rack: ~360 missed packets in 5 s; the
+/// card counts them in MPC), and a file server that is on the disk for a few milliseconds with a megabyte request (smbd,
+/// ~80,000 frames a second) overran it at once: its transfers ran at 8 MB/s on retransmissions. 1024 (16 KiB of
+/// descriptors, 2 MiB of buffers, about 12 ms at line rate) keeps a burst queued while the tape is away.
+const RX_COUNT: usize = 1024;
 /// 16 descriptors were 10 us of runway at 64-byte line rate: a tape that came back late for a few microseconds left
 /// the wire idle. 128 (the ring still fits its page) keeps a burst queued while the tape is away.
 const TX_COUNT: usize = 128;
@@ -568,10 +570,10 @@ impl E1000 {
             return Err(Error::BadMac);
         }
 
-        // DMA memory: one page of descriptors per ring, buffers as one contiguous run.
+        // DMA memory: descriptor rings, buffers as one contiguous run.
         // Below 4 GiB keeps the high address registers at zero on every variant.
         let limit = Some(1u64 << 32);
-        let rx_ring = memory::allocate_contiguous(1, limit).ok_or(Error::OutOfMemory)?;
+        let rx_ring = memory::allocate_contiguous((RX_COUNT * 16) as u64 / memory::FRAME, limit).ok_or(Error::OutOfMemory)?;
         let tx_ring = memory::allocate_contiguous(1, limit).ok_or(Error::OutOfMemory)?;
         let pages_per_buffer = (BUFFER_SIZE as u64) / memory::FRAME; // 2 KiB: half a page
         let _ = pages_per_buffer;

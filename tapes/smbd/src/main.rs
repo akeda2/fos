@@ -7,7 +7,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use smb::ntlm::{md5, nt_hash};
-use smb::server::{Account, Fail, Identity, MAX_IO, Server, Share, Stat};
+use smb::server::{Account, DEFAULT_IO, Fail, Identity, MAX_IO, Server, Share, Stat};
 use tape_ip::net::{self, NetConfig};
 use tape_ip::tcp::Server as Tcp;
 use tape_net::MacAddress;
@@ -16,7 +16,7 @@ use tape_rt::{TapeApi, arg_value as value, println};
 
 tape_rt::tape_help!(
     br#"smbd [@NAME] [root=DIR] [share=NAME] [port=445] [nic=N] [ip=A.B.C.D/N]
-      [gateway=A.B.C.D] [log] [stats] [ro]
+      [gateway=A.B.C.D] [maxio=KIB] [log] [stats] [ro]
 An SMB file server (SMB 2.0.2 to 3.0, no signing): Linux mount.cifs/smbclient,
 Windows and macOS can browse, copy from it and, on ext volumes, write to it. It runs as
 a service: run smbd @SMBD.CFG &2 (the service owns NIC 2; tape run smbd takes
@@ -29,6 +29,8 @@ share=  the share name clients use, //HOST/NAME (default: share).
 port=   TCP port (default 445).
 ip=     a fixed address like 192.168.1.20/24 (gateway= for the router);
         without it DHCP. nic= is the NIC number from 1 (default: nic use).
+maxio=  largest read or write in KiB, 64 to 1024 (default 1024; SMB 2.1+
+        clients use it, 2.0.2 stays at 64). 64 is the low-memory mode.
 log     print one line per request (slows a transfer: use stats to time one).
 stats   print only the totals after a transfer: KB and ms in file reads, writes
         and sends, and the ms the transfer lasted.
@@ -48,11 +50,14 @@ Needs tape ABI 32.
 /// Open files per connection. Connections at once: 128, or 16 or 4 when the kernel has less memory; when all are taken a new
 /// connection evicts the quietest idle one.
 const OPENS: usize = 16;
-/// Room for the largest message: a WRITE of MAX_IO bytes plus the headers.
-const REQ: usize = MAX_IO + 4096;
-/// Each connection's TCP receive buffer, and so its window (scaled, RFC 7323): three requests in flight, so the client keeps
-/// sending while a write is on the disk. Not much more than the NIC's receive ring (128 frames), or a stall drops frames.
-const RX: usize = 3 * MAX_IO;
+/// Largest read or write offered with `maxio=` unset (SMB 2.1+ clients; the multi-credit requests of `smb::server::MAX_IO`),
+/// and each connection's TCP receive buffer for it: two requests, so the client keeps sending while one is on the disk.
+/// With `maxio=64` (or when the kernel has too little memory) the 64 KiB tier runs: three requests in flight, not much
+/// more than the NIC's receive ring (128 frames), or a stall drops frames.
+const BIG_RX: usize = 2 * MAX_IO;
+const SMALL_RX: usize = 3 * DEFAULT_IO;
+/// Room around a message's payload: the SMB and WRITE headers.
+const SLACK: usize = 4096;
 const ROOT_MAX: usize = 200;
 const SEND_TIMEOUT: u64 = 5_000_000;
 const IDLE_US: u64 = 600_000_000;
@@ -223,6 +228,7 @@ impl Share for Files {
         let start = tape_rt::micros();
         let _timing = Timed(start);
         WRITE_BYTES.fetch_add(data.len() as u64, Ordering::Relaxed);
+        WRITE_COUNT.fetch_add(1, Ordering::Relaxed);
         while done < data.len() {
             let count = tape_rt::vfs_write(reference, offset + done as u64, &data[done..]).map_err(fail)?;
             if count == 0 {
@@ -256,6 +262,7 @@ impl Share for Files {
 /// Where the time goes (shown with `log` when a connection ends): microseconds and bytes spent in file reads and in sending answers.
 static WRITE_US: AtomicU64 = AtomicU64::new(0);
 static WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
+static WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// When the last write ended, and 0 once the kernel's held-open writes were committed (`vfs_sync`).
 static UNSYNCED_AT: AtomicU64 = AtomicU64::new(0);
 /// How long the writes must pause before they are committed: a stream shares one journal commit.
@@ -279,8 +286,6 @@ static SEND_US: AtomicU64 = AtomicU64::new(0);
 static SEND_BYTES: AtomicU64 = AtomicU64::new(0);
 static CONNECTED_US: AtomicU64 = AtomicU64::new(0);
 
-static mut REQUEST: [u8; REQ] = [0; REQ];
-static mut ANSWER: [u8; MAX_IO + 256] = [0; MAX_IO + 256];
 
 #[unsafe(no_mangle)]
 pub extern "C" fn tape_main(api: &'static TapeApi) {
@@ -333,20 +338,34 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             None => return println!("smbd: no DHCP lease (give ip=A.B.C.D/N for a fixed address)."),
         },
     };
-    #[allow(static_mut_refs)]
-    let (request, answer) = unsafe { (&mut *core::ptr::addr_of_mut!(REQUEST), &mut *core::ptr::addr_of_mut!(ANSWER)) };
-    let setup = Setup { nic, network, port, root, share, read_only, log, stats };
-    // Each connection holds two RX-byte buffers, so a kernel short of memory gets fewer of them.
-    if !(start::<128>(api, &setup, request, answer) || start::<16>(api, &setup, request, answer) || start::<4>(api, &setup, request, answer)) {
+    let io_kib = match value(text, "maxio") {
+        None => MAX_IO / 1024,
+        Some(word) => match word.parse::<usize>() {
+            Ok(kib) if (DEFAULT_IO / 1024..=MAX_IO / 1024).contains(&kib) => kib,
+            _ => return println!("smbd: maxio= takes KiB from {} to {}.", DEFAULT_IO / 1024, MAX_IO / 1024),
+        },
+    };
+    let big = io_kib > DEFAULT_IO / 1024;
+    // Each connection holds two receive buffers, so a kernel short of memory gets fewer connections, then the small tier.
+    let started = if big {
+        let setup = Setup { nic, network, port, root, share, read_only, log, stats, io: io_kib * 1024 };
+        start::<BIG_RX, 32>(api, &setup) || start::<BIG_RX, 8>(api, &setup)
+    } else {
+        false
+    };
+    let setup = Setup { nic, network, port, root, share, read_only, log, stats, io: DEFAULT_IO };
+    if !(started || start::<SMALL_RX, 128>(api, &setup) || start::<SMALL_RX, 16>(api, &setup) || start::<SMALL_RX, 4>(api, &setup)) {
         println!("smbd: no memory for the connections.");
     }
 }
 
 /// Runs the server with room for `N` connections if the kernel can give the memory; false if it cannot.
-fn start<const N: usize>(api: &TapeApi, setup: &Setup, request: &mut [u8; REQ], answer: &mut [u8]) -> bool {
+fn start<const RX: usize, const N: usize>(api: &TapeApi, setup: &Setup) -> bool {
     let Some(tcp) = alloc_in_kernel::<Tcp<RX, N>>(api) else { return false };
     let Some(sessions) = many_sessions::<N>(api) else { return false };
-    println!("smbd: room for {N} connections.");
+    let Some(request) = buffer(api, setup.io + SLACK) else { return false };
+    let Some(answer) = buffer(api, setup.io + 256) else { return false };
+    println!("smbd: room for {N} connections, reads and writes up to {} KiB.", setup.io / 1024);
     run(api, setup, tcp, request, answer, sessions);
     true
 }
@@ -360,6 +379,20 @@ struct Setup<'a> {
     read_only: bool,
     log: bool,
     stats: bool,
+    /// Largest read or write offered to the client.
+    io: usize,
+}
+
+/// `bytes` of zeroed kernel memory for a message.
+fn buffer(api: &TapeApi, bytes: usize) -> Option<&'static mut [u8]> {
+    let address = (api.alloc)(bytes);
+    if address == 0 {
+        return None;
+    }
+    unsafe {
+        core::ptr::write_bytes(address as *mut u8, 0, bytes);
+        Some(core::slice::from_raw_parts_mut(address as *mut u8, bytes))
+    }
 }
 
 /// A zeroed `T` from the kernel; all-zero is a valid `Tcp` (every slot is made a listener by `start`).
@@ -383,8 +416,8 @@ fn many_sessions<const N: usize>(api: &TapeApi) -> Option<&'static mut [Option<S
     }
 }
 
-fn run<const N: usize>(api: &TapeApi, setup: &Setup, tcp: &mut Tcp<RX, N>, request: &mut [u8; REQ], answer: &mut [u8], sessions: &mut [Option<Server<Files, OPENS>>; N]) {
-    let Setup { nic, network, port, root, share, read_only, log, stats } = *setup;
+fn run<const RX: usize, const N: usize>(api: &TapeApi, setup: &Setup, tcp: &mut Tcp<RX, N>, request: &mut [u8], answer: &mut [u8], sessions: &mut [Option<Server<Files, OPENS>>; N]) {
+    let Setup { nic, network, port, root, share, read_only, log, stats, io } = *setup;
     let (mut pool, mut state) = (0u64, [0u8; 16]);
     let (pool, state) = (&mut pool, &mut state);
     tcp.start(nic, &network, port);
@@ -428,6 +461,7 @@ fn run<const N: usize>(api: &TapeApi, setup: &Setup, tcp: &mut Tcp<RX, N>, reque
                     session.trace = Some(trace_request);
                 }
                 session.guid.copy_from_slice(&fresh[8..24]);
+                session.max_io = io;
                 sessions[slot] = Some(session);
                 if log {
                     let (ip, _) = tcp.peer(slot);
@@ -483,7 +517,8 @@ fn report(dropped: u32, busy_us: u64) {
     let total = tape_rt::micros() - CONNECTED_US.swap(tape_rt::micros(), Ordering::Relaxed);
     let (write_us, write_bytes) = (WRITE_US.swap(0, Ordering::Relaxed), WRITE_BYTES.swap(0, Ordering::Relaxed));
     if write_bytes > 0 {
-        println!("smbd: wrote {} KB in {} ms", write_bytes / 1024, write_us / 1000);
+        let requests = WRITE_COUNT.swap(0, Ordering::Relaxed).max(1);
+        println!("smbd: wrote {} KB in {} ms ({} requests, {} KiB each on average)", write_bytes / 1024, write_us / 1000, requests, write_bytes / requests / 1024);
     }
     if dropped > 0 {
         println!("smbd: the card refused {dropped} frames");
@@ -492,14 +527,14 @@ fn report(dropped: u32, busy_us: u64) {
 }
 
 /// Answers every complete message waiting on `slot` (a 4-byte frame header, then the SMB message).
-fn serve<const N: usize>(api: &TapeApi, tcp: &mut Tcp<RX, N>, slot: usize, request: &mut [u8; REQ], answer: &mut [u8], session: &mut Server<Files, OPENS>) {
+fn serve<const RX: usize, const N: usize>(api: &TapeApi, tcp: &mut Tcp<RX, N>, slot: usize, request: &mut [u8], answer: &mut [u8], session: &mut Server<Files, OPENS>) {
     loop {
         let waiting = tcp.received(slot);
         if waiting.len() < 4 {
             return;
         }
         let length = (usize::from(waiting[1]) << 16) | (usize::from(waiting[2]) << 8) | usize::from(waiting[3]);
-        if waiting[0] != 0 || length + 4 > REQ {
+        if waiting[0] != 0 || length + 4 > request.len() {
             // Not SMB, or larger than the server negotiated: hang up.
             tcp.close(api, slot);
             return;

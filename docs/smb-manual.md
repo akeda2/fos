@@ -33,6 +33,7 @@ run smbd root=ext1 share=data &2
 | `ip=A.B.C.D/N`, `gateway=` | Fixed address; otherwise DHCP. |
 | `nic=N` | NIC number from 1 (default: `nic use`). |
 | `ro` | Refuse every change. |
+| `maxio=KIB` | Largest read or write the clients may use, 64 to 1024 (default 1024). SMB 2.1 and 3.0 clients send and fetch that much per request (multi-credit, `CreditCharge` 1 per 64 KiB); 2.0.2 clients stay at 64 KiB. Each connection then holds two 2 MiB receive buffers, so the server takes 32 (or 8) connections from kernel memory; `maxio=64` is the low-memory tier (128 connections, 192 KiB buffers). |
 | `log` | Print one line per connection and per request (command, status, detail, flags). Use it to find client problems. It slows a transfer a lot (a console line per request): to time one, use `stats`. |
 | `stats` | Print only totals after a transfer ends (half a second quiet): KB and ms spent in file reads, in file writes (journal commits included) and in sending, and how long the transfer was active. If the write time is most of the active time the disk is the limit; if it is small the network path is. `tools/bench_smb_write.py` runs the same in QEMU. |
 
