@@ -48,8 +48,8 @@ formatted this way (243 GB, `rackdata`) after `shrink disk1 1G`. Formatting 243 
 rack reset itself (60 s watchdog) once it was done; the volume was complete. The shell's `ls`, `cat`, `write`, `mkdir`,
 `rm` and `cp` reach an ext volume as `extN/path` (also from or to `//NAME` remote volumes, `tape_vfs::read_whole` and
 friends behind `tape_fs`), `make test-vfs-write`. `@LABEL` finds an ext volume too (only when no FOSFS or FAT volume has that
-label); `sha256` streams, so it works on ext, `@LABEL` and `//NAME` files of any size. Not yet: installer integration,
-`diskN` for ext on a disk that also has FOSFS.
+label); `sha256` streams, so it works on ext, `@LABEL` and `//NAME` files of any size. Installer: `install diskN fosfs=SIZE ext4[=LABEL]` makes the FOSFS volume that size and an ext4 volume over the rest (`make test-install`).
+On a disk that holds FOSFS, `diskN/` always means FOSFS by design; reach the ext volume as `extN/path` or `@LABEL/path`.
 
 ## Journal (step 4)
 
