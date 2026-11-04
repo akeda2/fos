@@ -67,6 +67,9 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
     if from_user && frame.vector < 32 {
         crate::process::fault(frame);
     }
+    if !from_user && frame.vector == 14 {
+        kernel_fault_on_user_address(frame);
+    }
     match frame.vector {
         crate::process::SYSCALL_VECTOR => crate::process::syscall(frame),
         3 => {
@@ -93,6 +96,19 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
     if from_user {
         crate::process::check_killed();
     }
+}
+
+/// A page fault in the kernel while serving a process is a kernel bug triggered by that process's pointer
+/// (the `random` crash: a write without `stac`). Stopping the whole machine for it is the worse failure, so the process dies and
+/// the fault is reported loudly. Caveat: a kernel lock held at the fault stays held, so the next user of it can hang; that is
+/// still better than a reset, and the message says what to fix.
+fn kernel_fault_on_user_address(frame: &Frame) {
+    let address = cpu::read_cr2();
+    if crate::sched::current_root() == 0 {
+        return;
+    }
+    println!("*** KERNEL BUG: fault at rip {:#x} on address {address:#x} (error code {:#x}); killing the process, not the machine.", frame.rip, frame.error);
+    crate::process::terminate(crate::process::How::Fault(frame.vector, address))
 }
 
 fn fatal(frame: &Frame) -> ! {

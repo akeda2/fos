@@ -21,7 +21,7 @@ fn pin() -> usb::UsbGuard {
 }
 
 fn put<T: Copy>(address: u64, value: &T) -> bool {
-    let bytes = unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>()) };
+    let bytes = unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>()) }; // kernel-memory
     process::copy_to_user(address, bytes)
 }
 

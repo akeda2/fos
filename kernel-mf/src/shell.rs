@@ -273,6 +273,8 @@ pub fn run(line: &str) {
         "echo" => println!("{}", line[command.len()..].trim_start()),
         // Test hooks for the unattended-operation machinery (`debug crash`: a #UD in the kernel, `debug hang`: the service thread spins).
         "debug" => match words.next() {
+            // These take the machine down on purpose (rack once lost its crash record to a reset): they need `now` to be typed.
+            Some(word @ ("crash" | "hang" | "deadhang")) if words.next() != Some("now") => println!("debug {word} stops the machine on purpose; type `debug {word} now` to do it."),
             // The terminal's Escape key is a break, so a test cannot type ESC: this prints every colour through the console.
             Some("colors") => {
                 for code in (30..=37).chain(90..=97) {
@@ -295,7 +297,7 @@ pub fn run(line: &str) {
                     core::hint::spin_loop();
                 }
             }
-            _ => println!("usage: debug slots|crash|hang|deadhang"),
+            _ => println!("usage: debug slots|crash now|hang now|deadhang now"),
         },
         "start" => crate::config::start(run),
         "keymap" => crate::sysshell::keymap(&line.trim_start()[command.len()..]),

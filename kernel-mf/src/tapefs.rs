@@ -148,7 +148,7 @@ pub fn vfs_create(name_at: u64, name_len: u64, make: u64) -> isize {
     let Some(reference) = name(name_at, name_len) else { return FS_ERROR };
     let Some(raw) = copy_from_user(make, core::mem::size_of::<VfsMake>() as u64) else { return FS_ERROR };
     // SAFETY: `VfsMake` is four u32; the bytes were just copied from the tape and any bit pattern is valid.
-    let make = unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const VfsMake) };
+    let make = unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const VfsMake) }; // kernel-memory
     let _guard = lock();
     tape_vfs::create(&reference, &make)
 }
@@ -219,14 +219,14 @@ pub fn remote_reply(id: u64, code: u64, entry: u64, data: u64, length: u64) -> i
         None
     } else {
         let Some(bytes) = copy_from_user(entry, core::mem::size_of::<VfsEntry>() as u64) else { return FS_ERROR };
-        Some(unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const VfsEntry) })
+        Some(unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const VfsEntry) }) // kernel-memory
     };
     let Some(bytes) = copy_from_user(data, length.min(CHUNK as u64)) else { return FS_ERROR };
     kernel_core::remote::reply(id, code as isize, entry.as_ref(), &bytes)
 }
 
 fn copy_struct<T>(to: u64, value: &T) -> bool {
-    let bytes = unsafe { core::slice::from_raw_parts(value as *const T as *const u8, core::mem::size_of::<T>()) };
+    let bytes = unsafe { core::slice::from_raw_parts(value as *const T as *const u8, core::mem::size_of::<T>()) }; // kernel-memory
     process::copy_to_user(to, bytes)
 }
 
@@ -255,7 +255,7 @@ pub fn list(volume_at: u64, volume_len: u64, index: u64, out: u64) -> isize {
         tape_fs::list(&volume, index as usize, &mut info)
     };
     if found == 1 {
-        let bytes = unsafe { core::slice::from_raw_parts(&info as *const FileInfo as *const u8, core::mem::size_of::<FileInfo>()) };
+        let bytes = unsafe { core::slice::from_raw_parts(&info as *const FileInfo as *const u8, core::mem::size_of::<FileInfo>()) }; // kernel-memory
         if !process::copy_to_user(out, bytes) {
             return FS_ERROR;
         }
