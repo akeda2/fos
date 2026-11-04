@@ -185,7 +185,7 @@ kernel:
 
 # The server kernel (kernel-mf/, docs/big-kernel.md): same loaders, same image layout, its own crate.
 KERNEL_MF_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel-mf
-.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-tape test-mf-usb test-mf-debug test-mf-audio test-mf-netfs test-mf-tapesync test-mf-gpio test-mf-bios-video test-mf-shell test-mf-kup-serial
+.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-tape test-mf-usb test-mf-debug test-mf-audio test-mf-netfs test-mf-tapesync test-mf-gpio test-mf-bios-video test-mf-shell test-mf-kup-serial test-mf-smbmount
 kernel-mf:
 	cd kernel-mf && cargo +nightly-2026-09-13 build --release
 
@@ -202,6 +202,12 @@ test-mf-tape: image-mf image
 		--file hello=$(BUILD)/fosfor/tapes/hello --file fpcheck=$(BUILD)/fosfor/tapes/fpcheck --file gfxcheck=$(BUILD)/fosfor/tapes/gfxcheck --file gpiopanel=$(BUILD)/fosfor/tapes/gpiopanel \
 		--file fscheck=$(BUILD)/fosfor/tapes/fscheck --file ed=$(BUILD)/fosfor/tapes/ed --file netcheck=$(BUILD)/fosfor/tapes/netcheck --file memtest=$(BUILD)/fosfor/tapes/memtest --file note.txt=tools/test_mf_note.txt
 	python3 tools/test_mf_tape.py
+
+# smbmount runs as a background process (`run smbmount ... &1`) on the server kernel and the shell reads and writes the share.
+test-mf-smbmount: image-mf image
+	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_MF_ELF) --output $(BUILD)/fosfor-mf/fosfor-smbmount.img \
+		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin --file smbmount=$(BUILD)/fosfor/tapes/smbmount
+	python3 tools/test_mf_smbmount.py
 
 # A USB keyboard types into the shell, and a USB stick (a second image holding note.txt) is read through `fscheck disk2/note.txt`.
 test-mf-usb: image-mf image

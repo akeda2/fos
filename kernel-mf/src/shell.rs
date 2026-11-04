@@ -256,8 +256,8 @@ pub fn run(line: &str) {
         "slots" => slots::report(),
         "audio" => crate::audioshell::command(words),
         "usb" => crate::usbshell::command(words),
-        "tape" => {
-            let Some(name) = words.next() else { return println!("usage: tape NAME [ARGS]") };
+        "tape" | "run" => {
+            let Some(name) = words.next() else { return println!("usage: tape NAME [ARGS] [&N]") };
             let args = line.trim_start()[command.len()..].trim_start()[name.len()..].trim_start();
             run_tape(name, args);
         }
@@ -330,7 +330,41 @@ pub fn run(line: &str) {
 }
 
 /// Loads the ELF tape `name` from the boot volume (or whichever volume holds it) and starts it as a process.
+/// Splits a trailing `&N` or `&N,M` off the arguments of `run`: the 0-based NIC mask (`&0`: none) of a background tape.
+/// `Err` when the `&` word is not a list of NIC numbers.
+fn split_background(args: &str) -> (&str, Option<Result<u64, ()>>) {
+    let args = args.trim();
+    let Some((before, last)) = args.rsplit_once(char::is_whitespace).filter(|(_, last)| last.starts_with('&')) else {
+        return (args, None);
+    };
+    let mut mask = 0u64;
+    for number in last[1..].split(',') {
+        match number.parse::<usize>() {
+            Ok(0) => {}
+            Ok(n) if n <= 64 => mask |= 1 << (n - 1),
+            _ => return (before.trim(), Some(Err(()))),
+        }
+    }
+    (before.trim(), Some(Ok(mask)))
+}
+
+/// `run NAME ARGS`: the tape becomes the foreground process (Escape stops it). With `&N` it is a background tape (a service):
+/// it owns NIC N, keeps running while the shell takes commands, and ends with `kill PID`.
 pub fn run_tape(name: &str, args: &str) {
+    let (args, background) = split_background(args);
+    let nics = match background {
+        Some(Err(())) => return println!("run: `&N` or `&N,M` names the NICs the background tape owns (`&0` for none)."),
+        Some(Ok(mask)) => {
+            if let Some(nic) = (0..64).find(|&nic| mask >> nic & 1 != 0 && !crate::tapenet::exists(nic)) {
+                return println!("run: no NIC {}.", nic + 1);
+            }
+            if let Some(nic) = (0..64).find(|&nic| mask >> nic & 1 != 0 && crate::tapenet::owner(nic) != 0) {
+                return println!("run: a process already owns NIC {}.", nic + 1);
+            }
+            Some(mask)
+        }
+        None => None,
+    };
     let disk = crate::tapefs::lock();
     // A bare name not in the root is looked for in `bin/` (a v4 volume keeps its tapes there).
     let mut path = name.as_bytes();
@@ -353,11 +387,19 @@ pub fn run_tape(name: &str, args: &str) {
         return println!("tape: cannot read `{name}`.");
     }
     drop(disk);
-    match crate::process::spawn_elf(name, &image, args.as_bytes()) {
-        Ok(pid) => {
-            println!("tape: `{name}` is process {pid}; Escape stops it.");
-            set_foreground(pid);
-        }
+    crate::process::START_NICS.store(nics.unwrap_or(0), core::sync::atomic::Ordering::Release);
+    let started = crate::process::spawn_elf(name, &image, args.as_bytes());
+    crate::process::START_NICS.store(0, core::sync::atomic::Ordering::Release);
+    match started {
+        Ok(pid) => match nics {
+            Some(_) => {
+                println!("tape: `{name}` runs in the background as process {pid} (`kill {pid}` stops it).");
+            }
+            None => {
+                println!("tape: `{name}` is process {pid}; Escape stops it.");
+                set_foreground(pid);
+            }
+        },
         Err(error) => println!("tape: `{name}` cannot start: {error:?}."),
     }
 }

@@ -127,6 +127,8 @@ Limits: one request in flight, 128 KiB per call (larger files are split by
 the callers), 128 entries per folder listing, `truncate` only to 0,
 `set_owner` is a no-op, `fs_stream_*` is not remote. A killed provider keeps
 its name until it is replaced; callers get errors after the timeout. On
-FOS-mf a tape runs in the foreground, so a background provider is not
-possible there yet. Verified in QEMU against the host `serve` example
-(`make test-smbmount`); real servers are not yet checked.
+FOS-mf the same works as a background process: `tape smbmount //HOST/SHARE
+as=nas &1` (or `run ...`) owns NIC 1 from its first instruction, leaves the
+shell free, and `kill PID` (the number it prints; `threads` lists it) stops
+it. Verified in QEMU against the host `serve` example (`make test-smbmount`,
+`make test-mf-smbmount`); real servers are not yet checked.
