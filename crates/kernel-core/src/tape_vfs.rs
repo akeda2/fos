@@ -83,6 +83,10 @@ pub fn stat(reference: &[u8], out: &mut VfsStat) -> isize {
             Err(error) => ext4_error(error),
         };
     }
+    // An `extN` that could not be mounted must not fall back to `tape_fs`, which hands it straight back here.
+    if is_ext_reference(reference) {
+        return FS_NO_VOLUME;
+    }
     let length = tape_fs::length(reference);
     if length >= 0 {
         *out = plain(false, length as u64);
@@ -104,6 +108,10 @@ pub fn read_dir(reference: &[u8], index: usize, out: &mut VfsEntry) -> isize {
     }
     if let Some((shared, path)) = ext(reference) {
         return ext_read_dir(shared, path, index, out);
+    }
+    // An `extN` that could not be mounted must not fall back to `tape_fs`, which hands it straight back here.
+    if is_ext_reference(reference) {
+        return FS_NO_VOLUME;
     }
     let (mut position, mut found) = (0, false);
     let outcome = tape_fs::each_entry(reference, &mut |name, length, directory, _| {
@@ -174,6 +182,10 @@ pub fn read(reference: &[u8], offset: u64, buffer: &mut [u8]) -> isize {
             Ok(_) => FS_NOT_FOUND,
             Err(error) => ext4_error(error),
         };
+    }
+    // An `extN` that could not be mounted must not fall back to `tape_fs`, which hands it straight back here.
+    if is_ext_reference(reference) {
+        return FS_NO_VOLUME;
     }
     tape_fs::read_at(reference, offset, buffer)
 }
@@ -372,4 +384,89 @@ pub extern "C" fn api_vfs_sync() -> isize {
 /// Tape ABI 34 `vfs_set_owner(path, path_len, uid, gid, mode)`.
 pub extern "C" fn api_vfs_set_owner(path: *const u8, path_length: usize, uid: u32, gid: u32, mode: u32) -> isize {
     set_owner(bytes(path, path_length), uid, gid, mode)
+}
+
+// ---- whole-file calls for the shell: `extN/path` references only (`tape_fs::read`, `write`, ... hand them over) ----
+
+/// True when `reference` names an ext volume by `extN`: the shell's file commands reach those through here.
+pub fn is_ext_reference(reference: &[u8]) -> bool {
+    let (selector, _) = tape_fs::split_selector(reference);
+    tape_fs::ext_number(selector).is_some_and(|number| number > 0)
+}
+
+/// What one `vfs_read` or `vfs_write` carries for the whole-file calls.
+const WHOLE_CHUNK: usize = 128 * 1024;
+
+pub fn read_whole(reference: &[u8], buffer: &mut [u8]) -> isize {
+    let mut info = VfsStat::default();
+    let code = stat(reference, &mut info);
+    if code < 0 {
+        return code;
+    }
+    if info.kind != VFS_FILE {
+        return FS_NOT_FOUND;
+    }
+    let size = info.size as usize;
+    if size > buffer.len() {
+        return FS_TOO_BIG;
+    }
+    let mut done = 0;
+    while done < size {
+        let end = size.min(done + WHOLE_CHUNK);
+        match read(reference, done as u64, &mut buffer[done..end]) {
+            count if count < 0 => return count,
+            0 => break,
+            count => done += count as usize,
+        }
+    }
+    done as isize
+}
+
+/// Replaces the file (or makes it) and commits, so the shell's `cp` and `write` leave the volume consistent.
+pub fn write_whole(reference: &[u8], data: &[u8]) -> isize {
+    let mut info = VfsStat::default();
+    let prepared = match stat(reference, &mut info) {
+        0 if info.kind == VFS_FILE => truncate(reference, 0),
+        0 => FS_ERROR,
+        FS_NOT_FOUND => create(reference, &VfsMake { kind: VFS_FILE, mode: 0o644, uid: 0, gid: 0 }),
+        code => code,
+    };
+    if prepared < 0 {
+        return prepared;
+    }
+    let mut done = 0;
+    while done < data.len() {
+        let end = data.len().min(done + WHOLE_CHUNK);
+        match write(reference, done as u64, &data[done..end]) {
+            count if count <= 0 => return if count < 0 { count } else { FS_ERROR },
+            count => done += count as usize,
+        }
+    }
+    api_vfs_sync()
+}
+
+pub fn make_folder(reference: &[u8]) -> isize {
+    create(reference, &VfsMake { kind: VFS_DIR, mode: 0o755, uid: 0, gid: 0 })
+}
+
+pub fn length(reference: &[u8]) -> isize {
+    let mut info = VfsStat::default();
+    match stat(reference, &mut info) {
+        0 if info.kind == VFS_FILE => info.size as isize,
+        0 => FS_NOT_FOUND,
+        code => code,
+    }
+}
+
+pub fn each_entry(reference: &[u8], each: &mut dyn FnMut(&[u8], u64, bool, Option<fat::Time>)) -> Result<&'static str, isize> {
+    let mut entry = VfsEntry::default();
+    let mut index = 0;
+    loop {
+        match read_dir(reference, index, &mut entry) {
+            0 => return Ok("ext4"),
+            code if code < 0 => return Err(code),
+            _ => each(entry.name(), entry.stat.size, entry.stat.kind == VFS_DIR, None),
+        }
+        index += 1;
+    }
 }

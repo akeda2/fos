@@ -34,6 +34,10 @@ def main():
         def scenario(run):
             outputs["write"] = run("run fscheck vfswrite disk3")
             outputs["ls"] = run("run fscheck vfs disk3")
+            run("write ext3/shell.txt shell text")
+            run("mkdir ext3/shdir")
+            run("cp ext3/shell.txt ext3/shdir/copy.txt")
+            outputs["shell"] = run("ls ext3/shdir")
 
         boot(tmp, [boot_disk, ext], scenario)
         out = outputs["write"]
@@ -67,8 +71,11 @@ def main():
         listing = outputs["ls"]
         check("[keep.txt] kind 1 size 14 uid 1000" in listing and "[kdir] kind 2" in listing, "the survivors are listed", listing[-500:])
 
+        check("copy.txt" in outputs["shell"], "the shell's mkdir, write and cp reach an extN volume", outputs["shell"])
         done = subprocess.run([tool("e2fsck"), "-fn", str(ext)], capture_output=True, text=True)
         check(done.returncode == 0, "e2fsck finds the volume consistent", done.stdout + done.stderr)
+        shell_cat = subprocess.run([tool("debugfs"), "-R", "cat /shdir/copy.txt", str(ext)], capture_output=True).stdout
+        check(shell_cat == b"shell text", "debugfs reads the file the shell copied", repr(shell_cat))
         cat = subprocess.run([tool("debugfs"), "-R", "cat /keep.txt", str(ext)], capture_output=True).stdout
         check(cat == b"kept text more", "debugfs reads the file back, the synced write included", repr(cat))
         stat = subprocess.run([tool("debugfs"), "-R", "stat /kdir", str(ext)], capture_output=True, text=True).stdout

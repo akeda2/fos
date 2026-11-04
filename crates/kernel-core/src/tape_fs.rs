@@ -199,6 +199,9 @@ fn fat_error(error: fat::Error) -> isize {
 }
 
 pub fn read(reference: &[u8], buffer: &mut [u8]) -> isize {
+    if crate::tape_vfs::is_ext_reference(reference) {
+        return crate::tape_vfs::read_whole(reference, buffer);
+    }
     if crate::remote::is_remote(reference) {
         return crate::remote::read_whole(reference, buffer);
     }
@@ -227,6 +230,9 @@ pub fn read(reference: &[u8], buffer: &mut [u8]) -> isize {
 
 /// `fs_read_at`: up to `buffer.len()` bytes of a file from byte `offset`; the count (0 at or past the end) or an `FS_*` code.
 pub fn read_at(reference: &[u8], offset: u64, buffer: &mut [u8]) -> isize {
+    if crate::tape_vfs::is_ext_reference(reference) {
+        return crate::tape_vfs::read(reference, offset, buffer);
+    }
     if crate::remote::is_remote(reference) {
         return crate::remote::read(reference, offset, buffer);
     }
@@ -268,6 +274,9 @@ fn make_mount_folders(reference: &[u8], volume: &Volume, name: &[u8]) -> Result<
 }
 
 pub fn write(reference: &[u8], data: &[u8]) -> isize {
+    if crate::tape_vfs::is_ext_reference(reference) {
+        return crate::tape_vfs::write_whole(reference, data);
+    }
     if crate::remote::is_remote(reference) {
         return crate::remote::write_whole(reference, data);
     }
@@ -315,6 +324,9 @@ pub fn replace_target<'a>(volume: &Volume, name: &'a [u8]) -> &'a [u8] {
 }
 
 pub fn remove(reference: &[u8]) -> isize {
+    if crate::tape_vfs::is_ext_reference(reference) {
+        return crate::tape_vfs::remove(reference);
+    }
     if crate::remote::is_remote(reference) {
         return crate::remote::remove(reference);
     }
@@ -399,6 +411,9 @@ fn rename_exfat(source: &mut crate::fatvol::Fs, old: &[u8], target: &mut crate::
 
 /// Makes a folder (FOSFS v4 and exFAT volumes only).
 pub fn mkdir(reference: &[u8]) -> isize {
+    if crate::tape_vfs::is_ext_reference(reference) {
+        return crate::tape_vfs::make_folder(reference);
+    }
     if crate::remote::is_remote(reference) {
         return crate::remote::make_folder(reference);
     }
@@ -435,6 +450,9 @@ pub fn resolve_volume(reference: &[u8]) -> Option<Volume> {
 /// was written; the result is the kind of volume (`FOSFS`, `FAT32`, `exFAT`) or an `FS_*` code. A disk with only a
 /// FAT32/exFAT volume lists its root directory.
 pub fn each_entry(reference: &[u8], each: &mut dyn FnMut(&[u8], u64, bool, Option<fat::Time>)) -> Result<&'static str, isize> {
+    if crate::tape_vfs::is_ext_reference(reference) {
+        return crate::tape_vfs::each_entry(reference, each);
+    }
     if crate::remote::is_remote(reference) {
         return crate::remote::each_entry(reference, each);
     }
@@ -492,6 +510,9 @@ pub fn list(reference: &[u8], index: usize, out: &mut FileInfo) -> isize {
 
 /// The length of a file, or an `FS_*` code.
 pub fn length(reference: &[u8]) -> isize {
+    if crate::tape_vfs::is_ext_reference(reference) {
+        return crate::tape_vfs::length(reference);
+    }
     if crate::remote::is_remote(reference) {
         return crate::remote::length(reference);
     }
