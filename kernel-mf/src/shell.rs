@@ -115,8 +115,17 @@ pub fn feed(byte: u8) {
     }
 }
 
-/// Runs one command line (the `start` file's lines come here).
+/// Runs one line: the scripting language when the line uses it (`crate::script::wants`), else one command.
 pub fn run(line: &str) {
+    if crate::script::wants(line) {
+        crate::script::interactive(line);
+    } else {
+        run_command(line);
+    }
+}
+
+/// Runs one plain command (no language): what the interpreter itself calls for every command it runs.
+pub fn run_command(line: &str) {
     let mut words = line.split_whitespace();
     let Some(command) = words.next() else { return };
     if !matches!(command, "format" | "shrink" | "ext4") {

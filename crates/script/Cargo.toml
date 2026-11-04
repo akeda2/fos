@@ -1,0 +1,11 @@
+[package]
+name = "fosfor-script"
+version = "0.1.0"
+edition = "2024"
+
+# The scripting language of the server shell (docs/shell.md "Scripting"): variables, `if`/`while`/`until`/`for`, `&&` `||`,
+# `$(...)` and `$((...))`, redirection and pipes into a few built-in filters. `no_std` with `alloc`, so only kernels with a heap
+# use it (mf); a port supplies an `Env` (run a command, capture its output, look at files). Host-tested with a mock `Env`.
+[lib]
+name = "fosfor_script"
+path = "src/lib.rs"

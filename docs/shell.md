@@ -18,3 +18,29 @@ NETFS) and `fsck`; its bare names are pinned to the boot disk (`shellhost.rs` `p
 through `fosfor_shell::external` too (`Host::exists/run_script/run_tape`; the Pi has no scripts). The common commands (`sleep uptime date keymap ps kill memory disks clear echo reset shutdown`) are one table, `kernel/src/shellcmds.rs`, with `cfg` for the few differences (RTC or software clock, PIC count in `uptime`). `reset` and `shutdown` too (a `cfg` power shim: x86 firmware/ACPI, Pi PM watchdog or PSCI). `start`, `dmesg`, `run`, `grow`, `sector`, `about` (alias `version`), `hexdump`, `sha256 [diskN/]NAME...` (SHA-256 and length of stored files, for `fosadm` over serial; over Ethernet `fosadm` prefers the signed tapesync manifest, `tools/tape_manifest.py`, when a gitignored `synckey` copy is in the repo root), `label`, `format`, `debug` (`video` on x86 BIOS boots only) and `fsck [diskN|@LABEL]` too. Commands that touch hardware follow one pattern: shared wording and loops in a kernel module, a small per-kernel `imp` block for the drivers: `nic [list|sniff|promisc|peers|discover|use|map|send|recv]` (`nicshell.rs`; the chip-specific `nic park|phy|ts|csum|vlan|mcast|regs` stay x86-only in `term.rs`), `usb [rescan]` (`usbshell.rs`; one xHCI listing), `kup serial [BAUD]` (`kupshell.rs`); `pci [read|write]`, `cpuinfo`, `bootinfo`, `memmap`, `irqstat` (Pi alias `irqs`) and `mmio` are shared too (`diag.rs`; `copy` (peer forms `HOST[:diskN]/NAME DST` and `SRC NAME HOST[:diskN]` in `netfs.rs`; locally x86 keeps its FAT-aware copy, the Pi uses `cp`), `io` stays x86, the Pi has no port space; `peek`/`poke` stay Pi bring-up aliases of `mmio`'s job). Discovery, name announcements, the peer table, the NETFS server and client and `tapesync` are shared too (`netfs.rs`, `tapesync.rs`; per-kernel `imp`: NICs, staging buffer, break key): the Pi announces itself, shows peers and serves and pulls files like x86 (hardware-untested; `copy` and `tape` stay x86). The Pi `slots` command is gone: `debug slots` is the one way, same wording on both. The rest moves into tables as its code is shared; the Pi-only ones stay in `shell.rs`.
 
 **Line editing and Tab completion.** Both kernels' shells use one editor, `crates/kernel-core/src/lineedit.rs`: cursor keys, Home/End/Delete, Ctrl-A/E/K/U/W/C/L, history of 32 lines on Up/Down (kept for the boot, not saved), lines up to 240 bytes, the same from the local keyboard, serial and `term net`. Tab completes the word at the cursor through a hook (`lineedit::set_completer`): one match is filled in, several as far as they agree, a second Tab lists them. The mf kernel installs `fosfor_shell::complete::complete` (`crates/shell/src/complete.rs`): the first word is a command (the tables, the port's `BUILTINS`), a tape in `bin/` or a script; later words are paths (`Host::list` on any folder, `Host::volumes` for `diskN/` and `extN/`); after `help` a command name. The embedded kernel does not install a completer yet. `make test-mf-shell`, `make test-lineedit`.
+
+## Scripting (mf)
+
+The server kernel's shell has a small scripting language (`crates/script`, host-tested; `kernel-mf/src/script.rs` is the glue).
+A prompt line that uses it goes to one interpreter that keeps its variables between lines; `NAME.sh` runs in a fresh one with
+`$1..$9`, `$#`, `$*`, `"$@"`. Lines without any of `;` `&&` `||` `$` `>`, a leading `if/for/while/until`, an assignment or `#`
+stay on the plain command path, so `run A | B`, `run X &2` and a `write` of quoted text behave as before.
+
+```
+X=5; Y=$((X * 2 + 1))              # variables, $((arithmetic)), no spaces around =
+if [ -f data.txt ]; then ... elif ...; else ...; fi
+for f in *.txt; do cp "$f" backup/; done      # globs expand in the leaf name only
+while [ $N -lt 3 ]; do N=$((N + 1)); done     # also until, break [N], continue [N]
+cmd && ok || failed        a; b
+NAME=$(cmd; cmd)           # output of built-in commands, trailing newlines removed
+echo text > file           echo more >> file  # one redirection per command, output only
+set -x / set +x            # trace each command as `+ cmd`; scripts are silent by default
+```
+
+Builtins of the language: `echo [-n] set [NAME=V | -x | +x | -- ARGS] exit [N] shift [N] test/[ true false : break continue`.
+`test`: `-e -f -d -z -n`, `= != -eq -ne -lt -le -gt -ge`, leading `!`. Quote with `'..'`, `".."` (expands `$`) or `\`.
+
+Limits, on purpose: no functions, `case`, here-documents, `<` or `|` (it means split screen elsewhere; a script says so). Commands
+have no exit codes: a command's status is 1 when it prints a line `NAME: message` for its own name, 127 when unknown, else 0.
+`$(...)` and `>` only catch what the calling thread prints, so a tape's output (its own thread) is not caught, and a foreground
+tape does not make the script wait. Loops stop after 1,000,000 rounds, or on Ctrl-C/Escape from the serial line.

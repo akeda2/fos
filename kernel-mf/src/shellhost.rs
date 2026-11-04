@@ -156,6 +156,10 @@ impl Host for MfHost {
         tape_fs::length(reference.as_bytes()) >= 0
     }
 
+    fn run_script(&mut self, reference: &str, _name: &str, arguments: &str) -> bool {
+        crate::script::run_file(reference, arguments)
+    }
+
     fn run_tape(&mut self, line: &str) {
         let (name, args) = fosfor_shell::split_word(line);
         crate::shell::run_tape(name, args);
