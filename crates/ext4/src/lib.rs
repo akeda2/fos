@@ -67,6 +67,11 @@ pub trait Device {
     fn write_data(&mut self, lba: u64, buffer: &[u8]) -> Result<(), Error> {
         self.write(lba, buffer)
     }
+    /// Makes the file data written with `write_data` durable (it may have stayed in the drive's cache). Called before the
+    /// metadata that refers to it is committed.
+    fn sync(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
     /// Makes the metadata written so far durable as one transaction.
     fn commit(&mut self) -> Result<(), Error> {
         Ok(())

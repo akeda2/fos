@@ -660,6 +660,17 @@ pub fn for_each(mut visit: impl FnMut(usize, &str, State)) {
     }
 }
 
+/// Calls `visit(pid, id, name, state)` for every thread that belongs to a process (a tape or service; kernel threads have pid 0).
+pub fn for_each_process(mut visit: impl FnMut(u64, usize, &str, State)) {
+    let guard = SCHED.lock();
+    if let Some(sched) = guard.as_ref() {
+        for thread in sched.threads.iter().flatten().filter(|t| t.pid != 0) {
+            let length = thread.name.iter().position(|&b| b == 0).unwrap_or(16);
+            visit(thread.pid, thread.id, core::str::from_utf8(&thread.name[..length]).unwrap_or("?"), thread.state);
+        }
+    }
+}
+
 /// What `top` shows of one thread.
 pub struct Info {
     pub id: usize,

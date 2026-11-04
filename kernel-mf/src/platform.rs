@@ -22,6 +22,12 @@ impl Platform for Mf {
     fn block_write(&self, disk: usize, lba: u64, buffer: &[u8]) -> Result<(), BlockError> {
         crate::block::write(disk, lba, buffer).map_err(convert)
     }
+    fn block_write_deferred(&self, disk: usize, lba: u64, buffer: &[u8]) -> Result<(), BlockError> {
+        crate::block::write_deferred(disk, lba, buffer).map_err(convert)
+    }
+    fn block_flush(&self, disk: usize) -> Result<(), BlockError> {
+        crate::block::flush(disk).map_err(convert)
+    }
     fn block_discard(&self, disk: usize, ranges: &[(u64, u64)]) -> Result<(), BlockError> {
         crate::block::discard(disk, ranges).map_err(convert)
     }

@@ -120,6 +120,24 @@ pub fn read(disk: usize, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
 
 /// Writes whole sectors to `lba`.
 pub fn write(disk: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
+    write_with(disk, lba, buffer, true)
+}
+
+/// Writes without flushing a SATA drive's cache (`flush` does); the other drivers ignore the difference.
+pub fn write_deferred(disk: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
+    write_with(disk, lba, buffer, false)
+}
+
+/// Makes the writes so far durable (SATA: FLUSH CACHE).
+pub fn flush(disk: usize) -> Result<(), Error> {
+    match get(disk).ok_or(Error::NoSuchDisk)?.backend {
+        #[cfg(target_arch = "x86_64")]
+        Backend::Ahci(drive) => drive.flush().map_err(|_| Error::Device),
+        _ => Ok(()),
+    }
+}
+
+fn write_with(disk: usize, lba: u64, buffer: &[u8], flush: bool) -> Result<(), Error> {
     #[cfg(target_arch = "aarch64")]
     let _busy = crate::crash::disk_busy();
     let info = get(disk).ok_or(Error::NoSuchDisk)?;
@@ -130,7 +148,8 @@ pub fn write(disk: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
         #[cfg(target_arch = "x86_64")]
         Backend::Ahci(drive) => {
             for (index, chunk) in buffer.chunks(ahci::MAX_SECTORS * 512).enumerate() {
-                drive.write(lba + (index * ahci::MAX_SECTORS) as u64, chunk).map_err(|_| Error::Device)?;
+                let at = lba + (index * ahci::MAX_SECTORS) as u64;
+                if flush { drive.write(at, chunk) } else { drive.write_deferred(at, chunk) }.map_err(|_| Error::Device)?;
             }
             Ok(())
         }

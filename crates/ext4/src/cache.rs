@@ -120,4 +120,8 @@ impl<D: Device> Device for Cached<D> {
         self.cache.wrote(lba, buffer);
         Ok(())
     }
+
+    fn sync(&mut self) -> Result<(), Error> {
+        self.dev.sync()
+    }
 }

@@ -1689,6 +1689,8 @@ pub struct TcpSegment<'a> {
     pub window: u16,
     pub checksum: u16,
     pub urgent: u16,
+    /// The window scale option of a SYN (RFC 7323), the shift the sender applies to the windows it advertises later.
+    pub window_scale: Option<u8>,
     pub data: &'a [u8],
 }
 
@@ -1713,6 +1715,7 @@ impl<'a> TcpSegment<'a> {
             window,
             checksum: 0,
             urgent: 0,
+            window_scale: None,
             data,
         }
     }
@@ -1742,6 +1745,7 @@ impl<'a> TcpSegment<'a> {
             window: u16::from_be_bytes([bytes[14], bytes[15]]),
             checksum: u16::from_be_bytes([bytes[16], bytes[17]]),
             urgent: u16::from_be_bytes([bytes[18], bytes[19]]),
+            window_scale: scale_option(&bytes[Self::MIN_HEADER_LEN..data_offset]),
             data: &bytes[data_offset..],
         })
     }
@@ -1765,7 +1769,20 @@ impl<'a> TcpSegment<'a> {
         destination: Ipv4Address,
         mss: Option<u16>,
     ) -> Result<usize> {
-        let header = Self::MIN_HEADER_LEN + if mss.is_some() { 4 } else { 0 };
+        self.encode_with_options(output, source, destination, mss, None)
+    }
+
+    /// `encode_with_mss`, plus a window scale option (a NOP, then kind 3) when `scale` is given: the shift for the
+    /// windows this side advertises from now on. Only a SYN carries it.
+    pub fn encode_with_options(
+        &self,
+        output: &mut [u8],
+        source: Ipv4Address,
+        destination: Ipv4Address,
+        mss: Option<u16>,
+        scale: Option<u8>,
+    ) -> Result<usize> {
+        let header = Self::MIN_HEADER_LEN + if mss.is_some() { 4 } else { 0 } + if scale.is_some() { 4 } else { 0 };
         let length = header + self.data.len();
         if length > u16::MAX as usize || output.len() < length {
             return Err(Error::BufferTooSmall);
@@ -1783,11 +1800,37 @@ impl<'a> TcpSegment<'a> {
             output[20..22].copy_from_slice(&[2, 4]);
             output[22..24].copy_from_slice(&mss.to_be_bytes());
         }
+        if let Some(scale) = scale {
+            let at = header - 4;
+            output[at..header].copy_from_slice(&[1, 3, 3, scale]);
+        }
         output[header..length].copy_from_slice(self.data);
         let checksum = pseudo_checksum(source, destination, 6, &output[..length]);
         output[16..18].copy_from_slice(&checksum.to_be_bytes());
         Ok(length)
     }
+}
+
+/// The window scale shift in a TCP option list, if there is one (RFC 7323: at most 14).
+fn scale_option(options: &[u8]) -> Option<u8> {
+    let mut at = 0;
+    while at < options.len() {
+        match options[at] {
+            0 => break,
+            1 => at += 1,
+            kind => {
+                let length = *options.get(at + 1)? as usize;
+                if length < 2 || at + length > options.len() {
+                    break;
+                }
+                if kind == 3 && length == 3 {
+                    return Some(options[at + 2].min(14));
+                }
+                at += length;
+            }
+        }
+    }
+    None
 }
 
 /// The states of the bounded single-connection TCP helper.
@@ -1835,6 +1878,12 @@ pub struct TcpConnection<const RX: usize = TCP_RX_CAPACITY> {
     /// advertised window, and whether any data went out this way (it then owns the retransmission timer).
     stream_una: u32,
     peer_window: u32,
+    /// Window scaling (RFC 7323), used only when the receive buffer is larger than a 16-bit window and the peer asked
+    /// for it too: our SYN offers it (`scale_offered`), and `scaling` is set once both sides did. `peer_shift` is the
+    /// peer's shift for the windows it advertises.
+    scale_offered: bool,
+    scaling: bool,
+    peer_shift: u8,
     stream_active: bool,
     /// Duplicate acknowledgements (the peer repeating `stream_una` while data is in flight) seen since it last moved; the
     /// third sets `fast_retransmit`, which `take_fast_retransmit` hands out once.
@@ -1871,11 +1920,23 @@ impl<const RX: usize> TcpConnection<RX> {
             receive_len: 0,
             stream_una: initial_sequence,
             peer_window: 0xffff,
+            scale_offered: false,
+            scaling: false,
+            peer_shift: 0,
             stream_active: false,
             dup_acks: 0,
             fast_retransmit: false,
         }
     }
+
+    /// The shift that brings a full receive buffer into the 16-bit window field: 0 for buffers under 64 KiB.
+    const SHIFT: u8 = {
+        let mut shift = 0;
+        while (RX >> shift) > 0xffff {
+            shift += 1;
+        }
+        shift
+    };
 
     pub const fn active(
         local_ip: Ipv4Address,
@@ -1925,6 +1986,9 @@ impl<const RX: usize> TcpConnection<RX> {
         self.receive_len = 0;
         self.stream_una = initial_sequence;
         self.peer_window = 0xffff;
+        self.scale_offered = false;
+        self.scaling = false;
+        self.peer_shift = 0;
         self.stream_active = false;
         self.dup_acks = 0;
         self.fast_retransmit = false;
@@ -1968,6 +2032,7 @@ impl<const RX: usize> TcpConnection<RX> {
             return Err(Error::Unexpected);
         }
         let sequence = self.send_next;
+        self.scale_offered = Self::SHIFT > 0;
         let length = self.emit(sequence, 0, TCP_SYN, &[], output)?;
         self.send_next = sequence.wrapping_add(1);
         self.remember_pending(sequence, sequence.wrapping_add(1), TCP_SYN, &[], now);
@@ -2005,6 +2070,11 @@ impl<const RX: usize> TcpConnection<RX> {
                     self.remote_port = segment.source_port;
                 }
                 self.receive_next = segment.sequence.wrapping_add(1);
+                if let (Some(shift), true) = (segment.window_scale, Self::SHIFT > 0) {
+                    self.scale_offered = true;
+                    self.scaling = true;
+                    self.peer_shift = shift;
+                }
                 let sequence = self.send_next;
                 let length =
                     self.emit(sequence, self.receive_next, TCP_SYN | TCP_ACK, &[], output)?;
@@ -2022,6 +2092,10 @@ impl<const RX: usize> TcpConnection<RX> {
                     self.deadline = None;
                     self.stream_una = self.send_next;
                     self.peer_window = u32::from(segment.window);
+                    if let (Some(shift), true) = (segment.window_scale, self.scale_offered) {
+                        self.scaling = true;
+                        self.peer_shift = shift;
+                    }
                     let length =
                         self.emit(self.send_next, self.receive_next, TCP_ACK, &[], output)?;
                     self.state = TcpState::Established;
@@ -2035,7 +2109,7 @@ impl<const RX: usize> TcpConnection<RX> {
                     self.pending = false;
                     self.deadline = None;
                     self.stream_una = self.send_next;
-                    self.peer_window = u32::from(segment.window);
+                    self.peer_window = u32::from(segment.window) << self.peer_shift;
                     self.state = TcpState::Established;
                 }
                 Ok(None)
@@ -2050,12 +2124,12 @@ impl<const RX: usize> TcpConnection<RX> {
                     // No room: take nothing, and say what is free (a window probe gets its answer, the sender's
                     // retransmission timer is not left to find out).
                     self.accept_ack(segment.acknowledgment);
-                    self.peer_window = u32::from(segment.window);
+                    self.peer_window = u32::from(segment.window) << self.peer_shift;
                     return Ok(Some(self.emit(self.send_next, self.receive_next, TCP_ACK, &[], output)?));
                 }
                 let una_before = self.stream_una;
                 self.accept_ack(segment.acknowledgment);
-                self.peer_window = u32::from(segment.window);
+                self.peer_window = u32::from(segment.window) << self.peer_shift;
                 if self.stream_active && !self.pending {
                     if self.stream_una == self.send_next {
                         self.deadline = None;
@@ -2139,8 +2213,7 @@ impl<const RX: usize> TcpConnection<RX> {
         self.send_next.wrapping_sub(self.stream_una) as usize
     }
 
-    /// The peer's last advertised receive window, in bytes (this stack offers no window scaling, so it is the plain
-    /// 16-bit value).
+    /// The peer's last advertised receive window, in bytes (scaled by the peer's shift when window scaling is on).
     pub fn peer_window(&self) -> usize {
         self.peer_window as usize
     }
@@ -2248,11 +2321,22 @@ impl<const RX: usize> TcpConnection<RX> {
         count
     }
 
-    /// The receive window offered: the free room in the receive buffer (at most 65535, there is no window scaling). Less
-    /// than a segment's worth is offered as 0 (silly-window avoidance), so the peer waits for `window_update`.
+    /// The receive window field offered: the free room in the receive buffer, shifted right by `SHIFT` when the peer
+    /// agreed to window scaling, else at most 65535. Less than a segment's worth is offered as 0 (silly-window
+    /// avoidance), so the peer waits for `window_update`. A SYN's window is never scaled.
     pub fn advertised_window(&self) -> u16 {
+        self.window_field(false)
+    }
+
+    fn window_field(&self, syn: bool) -> u16 {
         let free = RX.saturating_sub(self.receive_len);
-        if free < RX.min(1460) { 0 } else { free.min(u16::MAX as usize) as u16 }
+        if free < RX.min(1460) {
+            0
+        } else if self.scaling && !syn {
+            (free >> Self::SHIFT).min(u16::MAX as usize) as u16
+        } else {
+            free.min(u16::MAX as usize) as u16
+        }
     }
 
     /// An empty ACK carrying the current window: sent after the application took data from a buffer whose window had
@@ -2270,19 +2354,22 @@ impl<const RX: usize> TcpConnection<RX> {
         output: &mut [u8],
     ) -> Result<usize> {
         // A SYN says how much one segment may carry: what fits the receive buffer, at most an Ethernet frame's worth.
-        let mss = (flags & TCP_SYN != 0).then(|| RX.min(1460) as u16);
+        let syn = flags & TCP_SYN != 0;
+        let mss = syn.then(|| RX.min(1460) as u16);
+        let scale = (syn && self.scale_offered).then_some(Self::SHIFT);
         TcpSegment {
             source_port: self.local_port,
             destination_port: self.remote_port,
             sequence,
             acknowledgment,
             flags,
-            window: self.advertised_window(),
+            window: self.window_field(syn),
             checksum: 0,
             urgent: 0,
+            window_scale: None,
             data,
         }
-        .encode_with_mss(output, self.local_ip, self.remote_ip, mss)
+        .encode_with_options(output, self.local_ip, self.remote_ip, mss, scale)
     }
 
     fn remember_pending(&mut self, sequence: u32, end: u32, flags: u16, payload: &[u8], now: u32) {
@@ -2773,6 +2860,7 @@ mod tests {
             window: 512,
             checksum: 0,
             urgent: 0,
+            window_scale: None,
             data,
         };
         let mut bytes = [0u8; 64];
@@ -2836,12 +2924,12 @@ mod tests {
 
         let first = [7u8; 1400];
         let mut bytes = [0u8; 1600];
-        let length = TcpSegment { source_port: 2000, destination_port: 1000, sequence: 51, acknowledgment: 11, flags: TCP_ACK, window: 512, checksum: 0, urgent: 0, data: &first }.encode(&mut bytes, IP_B, IP_A).unwrap();
+        let length = TcpSegment { source_port: 2000, destination_port: 1000, sequence: 51, acknowledgment: 11, flags: TCP_ACK, window: 512, checksum: 0, urgent: 0, window_scale: None, data: &first }.encode(&mut bytes, IP_B, IP_A).unwrap();
         let reply = client.on_segment(&TcpSegment::parse(&bytes[..length], IP_B, IP_A, true).unwrap(), 102, &mut out).unwrap().unwrap();
         // 600 bytes free is less than a segment: the peer is told to wait.
         assert_eq!(TcpSegment::parse(&out[..reply], IP_A, IP_B, true).unwrap().window, 0);
 
-        let length = TcpSegment { source_port: 2000, destination_port: 1000, sequence: 1451, acknowledgment: 11, flags: TCP_ACK, window: 512, checksum: 0, urgent: 0, data: &first }.encode(&mut bytes, IP_B, IP_A).unwrap();
+        let length = TcpSegment { source_port: 2000, destination_port: 1000, sequence: 1451, acknowledgment: 11, flags: TCP_ACK, window: 512, checksum: 0, urgent: 0, window_scale: None, data: &first }.encode(&mut bytes, IP_B, IP_A).unwrap();
         let reply = client.on_segment(&TcpSegment::parse(&bytes[..length], IP_B, IP_A, true).unwrap(), 103, &mut out).unwrap().unwrap();
         let answer = TcpSegment::parse(&out[..reply], IP_A, IP_B, true).unwrap();
         assert_eq!((answer.acknowledgment, answer.window), (1451, 0));
@@ -2851,6 +2939,38 @@ mod tests {
         assert_eq!(client.take_received(&mut sink), 1400);
         let update = client.window_update(&mut out).unwrap();
         assert_eq!(TcpSegment::parse(&out[..update], IP_A, IP_B, true).unwrap().window, 2000);
+    }
+
+    #[test]
+    fn tcp_window_scaling_is_used_only_when_both_sides_ask_for_it() {
+        let mut out = [0u8; 1600];
+        // A listener with a 256 KiB buffer (shift 3) and a peer that offers a shift of 7.
+        let mut server = TcpConnection::<262_144>::listen(IP_B, 445, Ipv4Address([0; 4]), 0, 100, 5);
+        let mut bytes = [0u8; 64];
+        let mut syn = TcpSegment::new(3000, 445, 10, 0, TCP_SYN, 65535, &[]);
+        syn.window_scale = Some(7);
+        let length = syn.encode_with_options(&mut bytes, IP_A, IP_B, Some(1460), Some(7)).unwrap();
+        let parsed = TcpSegment::parse(&bytes[..length], IP_A, IP_B, true).unwrap();
+        assert_eq!(parsed.window_scale, Some(7));
+        server.accept_from(IP_A);
+        let reply = server.on_segment(&parsed, 1, &mut out).unwrap().unwrap();
+        let syn_ack = TcpSegment::parse(&out[..reply], IP_B, IP_A, true).unwrap();
+        assert_eq!((syn_ack.window_scale, syn_ack.window), (Some(3), 65535));
+        let (ack, ack_len) = segment(3000, 445, 11, 101, TCP_ACK, &[]);
+        let mut ack = TcpSegment::parse(&ack[..ack_len], IP_A, IP_B, true).unwrap();
+        ack.window = 100;
+        server.on_segment(&ack, 2, &mut out).unwrap();
+        assert_eq!(server.peer_window(), 100 << 7);
+        assert_eq!(server.advertised_window(), (262_144 >> 3) as u16);
+
+        // A peer without the option gets an unscaled window and no option back.
+        let mut plain = TcpConnection::<262_144>::listen(IP_B, 445, Ipv4Address([0; 4]), 0, 100, 5);
+        let length = TcpSegment::new(3001, 445, 10, 0, TCP_SYN, 65535, &[]).encode(&mut bytes, IP_A, IP_B).unwrap();
+        plain.accept_from(IP_A);
+        let reply = plain.on_segment(&TcpSegment::parse(&bytes[..length], IP_A, IP_B, true).unwrap(), 1, &mut out).unwrap().unwrap();
+        let syn_ack = TcpSegment::parse(&out[..reply], IP_B, IP_A, true).unwrap();
+        assert_eq!(syn_ack.window_scale, None);
+        assert_eq!(plain.advertised_window(), 65535);
     }
 
     #[test]

@@ -16,7 +16,7 @@ use tape_rt::{TapeApi, arg_value as value, println};
 
 tape_rt::tape_help!(
     br#"smbd [@NAME] [root=DIR] [share=NAME] [port=445] [nic=N] [ip=A.B.C.D/N]
-      [gateway=A.B.C.D] [log] [ro]
+      [gateway=A.B.C.D] [log] [stats] [ro]
 An SMB file server (SMB 2.0.2 to 3.0, no signing): Linux mount.cifs/smbclient,
 Windows and macOS can browse, copy from it and, on ext volumes, write to it. It runs as
 a service: run smbd @SMBD.CFG &2 (the service owns NIC 2; tape run smbd takes
@@ -29,7 +29,9 @@ share=  the share name clients use, //HOST/NAME (default: share).
 port=   TCP port (default 445).
 ip=     a fixed address like 192.168.1.20/24 (gateway= for the router);
         without it DHCP. nic= is the NIC number from 1 (default: nic use).
-log     print one line per connection.
+log     print one line per request (slows a transfer: use stats to time one).
+stats   print only the totals after a transfer: KB and ms in file reads, writes
+        and sends, and the ms the transfer lasted.
 ro      refuse all changes (otherwise ext volumes can be written).
 Users: the file smbusers, one line per user, name:uid:gid:NTHASH. The line
 guest:uid:gid: lets anonymous and unknown logins in (as that uid/gid). With
@@ -43,13 +45,14 @@ Needs tape ABI 32.
 "#
 );
 
-/// Connections at once: `MANY` in memory from the kernel (a server kernel has plenty), `FEW` in the tape's own image when the
-/// kernel has no room for that. When all are taken a new connection evicts the quietest idle one.
-const MANY: usize = 128;
-const FEW: usize = 8;
+/// Open files per connection. Connections at once: 128, or 16 or 4 when the kernel has less memory; when all are taken a new
+/// connection evicts the quietest idle one.
 const OPENS: usize = 16;
 /// Room for the largest message: a WRITE of MAX_IO bytes plus the headers.
-const RX: usize = MAX_IO + 4096;
+const REQ: usize = MAX_IO + 4096;
+/// Each connection's TCP receive buffer, and so its window (scaled, RFC 7323): three requests in flight, so the client keeps
+/// sending while a write is on the disk. Not much more than the NIC's receive ring (128 frames), or a stall drops frames.
+const RX: usize = 3 * MAX_IO;
 const ROOT_MAX: usize = 200;
 const SEND_TIMEOUT: u64 = 5_000_000;
 const IDLE_US: u64 = 600_000_000;
@@ -257,6 +260,8 @@ static WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
 static UNSYNCED_AT: AtomicU64 = AtomicU64::new(0);
 /// How long the writes must pause before they are committed: a stream shares one journal commit.
 const SYNC_QUIET_US: u64 = 20_000;
+/// How long the main loop keeps polling after the last frame before it sleeps.
+const SPIN_US: u64 = 2_000;
 
 /// Adds the time since its start to `WRITE_US` when dropped, whichever way `write` returns.
 struct Timed(u64);
@@ -274,10 +279,8 @@ static SEND_US: AtomicU64 = AtomicU64::new(0);
 static SEND_BYTES: AtomicU64 = AtomicU64::new(0);
 static CONNECTED_US: AtomicU64 = AtomicU64::new(0);
 
-static mut TCP: Tcp<RX, FEW> = Tcp::new();
-static mut REQUEST: [u8; RX] = [0; RX];
+static mut REQUEST: [u8; REQ] = [0; REQ];
 static mut ANSWER: [u8; MAX_IO + 256] = [0; MAX_IO + 256];
-static mut SESSIONS: [Option<Server<Files, OPENS>>; FEW] = [const { None }; FEW];
 
 #[unsafe(no_mangle)]
 pub extern "C" fn tape_main(api: &'static TapeApi) {
@@ -309,6 +312,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     }
     let read_only = text.split_ascii_whitespace().any(|word| word == "ro");
     let log = text.split_ascii_whitespace().any(|word| word == "log" || word == "log=on");
+    let stats = log || text.split_ascii_whitespace().any(|word| word == "stats");
     let Some(port) = value(text, "port").map_or(Some(445), |word| word.parse::<u16>().ok().filter(|&port| port != 0)) else {
         return println!("smbd: port= takes a number from 1 to 65535.");
     };
@@ -331,16 +335,20 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     };
     #[allow(static_mut_refs)]
     let (request, answer) = unsafe { (&mut *core::ptr::addr_of_mut!(REQUEST), &mut *core::ptr::addr_of_mut!(ANSWER)) };
-    let setup = Setup { nic, network, port, root, share, read_only, log };
-    if let (Some(tcp), Some(sessions)) = (alloc_in_kernel::<Tcp<RX, MANY>>(api), many_sessions(api)) {
-        println!("smbd: room for {MANY} connections.");
-        run(api, &setup, tcp, request, answer, sessions);
-    } else {
-        #[allow(static_mut_refs)]
-        let (tcp, sessions) = unsafe { (&mut *core::ptr::addr_of_mut!(TCP), &mut *core::ptr::addr_of_mut!(SESSIONS)) };
-        println!("smbd: room for {FEW} connections (no memory for more).");
-        run(api, &setup, tcp, request, answer, sessions);
+    let setup = Setup { nic, network, port, root, share, read_only, log, stats };
+    // Each connection holds two RX-byte buffers, so a kernel short of memory gets fewer of them.
+    if !(start::<128>(api, &setup, request, answer) || start::<16>(api, &setup, request, answer) || start::<4>(api, &setup, request, answer)) {
+        println!("smbd: no memory for the connections.");
     }
+}
+
+/// Runs the server with room for `N` connections if the kernel can give the memory; false if it cannot.
+fn start<const N: usize>(api: &TapeApi, setup: &Setup, request: &mut [u8; REQ], answer: &mut [u8]) -> bool {
+    let Some(tcp) = alloc_in_kernel::<Tcp<RX, N>>(api) else { return false };
+    let Some(sessions) = many_sessions::<N>(api) else { return false };
+    println!("smbd: room for {N} connections.");
+    run(api, setup, tcp, request, answer, sessions);
+    true
 }
 
 struct Setup<'a> {
@@ -351,6 +359,7 @@ struct Setup<'a> {
     share: &'a str,
     read_only: bool,
     log: bool,
+    stats: bool,
 }
 
 /// A zeroed `T` from the kernel; all-zero is a valid `Tcp` (every slot is made a listener by `start`).
@@ -358,31 +367,32 @@ fn alloc_in_kernel<T>(api: &TapeApi) -> Option<&'static mut T> {
     tape_rt::alloc_zeroed::<T>(api)
 }
 
-/// Room for `MANY` sessions from the kernel, each set to `None`.
-fn many_sessions(api: &TapeApi) -> Option<&'static mut [Option<Server<Files, OPENS>>; MANY]> {
-    let bytes = MANY * core::mem::size_of::<Option<Server<Files, OPENS>>>();
+/// Room for `N` sessions from the kernel, each set to `None`.
+fn many_sessions<const N: usize>(api: &TapeApi) -> Option<&'static mut [Option<Server<Files, OPENS>>; N]> {
+    let bytes = N * core::mem::size_of::<Option<Server<Files, OPENS>>>();
     let address = (api.alloc)(bytes);
     if address == 0 {
         return None;
     }
     let first = address as *mut Option<Server<Files, OPENS>>;
     unsafe {
-        for index in 0..MANY {
+        for index in 0..N {
             first.add(index).write(None);
         }
-        Some(&mut *(address as *mut [Option<Server<Files, OPENS>>; MANY]))
+        Some(&mut *(address as *mut [Option<Server<Files, OPENS>>; N]))
     }
 }
 
-fn run<const N: usize>(api: &TapeApi, setup: &Setup, tcp: &mut Tcp<RX, N>, request: &mut [u8; RX], answer: &mut [u8], sessions: &mut [Option<Server<Files, OPENS>>; N]) {
-    let Setup { nic, network, port, root, share, read_only, log } = *setup;
+fn run<const N: usize>(api: &TapeApi, setup: &Setup, tcp: &mut Tcp<RX, N>, request: &mut [u8; REQ], answer: &mut [u8], sessions: &mut [Option<Server<Files, OPENS>>; N]) {
+    let Setup { nic, network, port, root, share, read_only, log, stats } = *setup;
     let (mut pool, mut state) = (0u64, [0u8; 16]);
     let (pool, state) = (&mut pool, &mut state);
     tcp.start(nic, &network, port);
     // A mount idles between requests (the Linux client's echo is 60 s apart); do not drop it behind its back.
     tcp.set_idle(IDLE_US);
     CONNECTED_US.store(tape_rt::micros(), Ordering::Relaxed);
-    let mut last_busy = 0u64;
+    let (mut last_busy, mut first_busy) = (0u64, 0u64);
+    let mut last_frame = 0u64;
     println!("smbd: NIC {} at {}.{}.{}.{}:{port}, sharing {} as //HOST/{share}.", nic + 1, network.ip.0[0], network.ip.0[1], network.ip.0[2], network.ip.0[3], if root.is_empty() { "the boot volume" } else { root });
     loop {
         if (api.should_abort)() != 0 {
@@ -431,11 +441,15 @@ fn run<const N: usize>(api: &TapeApi, setup: &Setup, tcp: &mut Tcp<RX, N>, reque
                 tcp.finish(api, slot);
             }
         }
-        if log && SEND_BYTES.load(Ordering::Relaxed) > 0 {
+        if stats && SEND_BYTES.load(Ordering::Relaxed) > 0 {
             if busy {
                 last_busy = tape_rt::micros();
+                if first_busy == 0 {
+                    first_busy = last_busy;
+                }
             } else if tape_rt::micros() - last_busy > 500_000 {
-                report(tcp.tx_dropped());
+                report(tcp.tx_dropped(), last_busy - first_busy);
+                first_busy = 0;
             }
         }
         let unsynced = UNSYNCED_AT.load(Ordering::Relaxed);
@@ -445,7 +459,12 @@ fn run<const N: usize>(api: &TapeApi, setup: &Setup, tcp: &mut Tcp<RX, N>, reque
             let _ = tape_rt::vfs_sync();
             WRITE_US.fetch_add(tape_rt::micros() - start, Ordering::Relaxed);
         }
-        if !busy {
+        // `idle` sleeps a whole timer tick on mf, and a transfer's frames arrive a few hundred microseconds apart once the disk keeps
+        // up: sleeping at every gap makes each 64 KiB request cost milliseconds. Spin while traffic is recent, sleep when it stops.
+        let now = tape_rt::micros();
+        if busy {
+            last_frame = now;
+        } else if now - last_frame > SPIN_US {
             tape_rt::idle();
         }
     }
@@ -458,7 +477,7 @@ fn trace_request(command: u16, status: u32, detail: u32, flags: u32) {
 }
 
 /// Prints and resets the counters: reading, sending, and everything else since the last report.
-fn report(dropped: u32) {
+fn report(dropped: u32, busy_us: u64) {
     let (read_us, read_bytes) = (READ_US.swap(0, Ordering::Relaxed), READ_BYTES.swap(0, Ordering::Relaxed));
     let (send_us, send_bytes) = (SEND_US.swap(0, Ordering::Relaxed), SEND_BYTES.swap(0, Ordering::Relaxed));
     let total = tape_rt::micros() - CONNECTED_US.swap(tape_rt::micros(), Ordering::Relaxed);
@@ -469,18 +488,18 @@ fn report(dropped: u32) {
     if dropped > 0 {
         println!("smbd: the card refused {dropped} frames");
     }
-    println!("smbd: read {} KB in {} ms, sent {} KB in {} ms, {} ms since the last report.", read_bytes / 1024, read_us / 1000, send_bytes / 1024, send_us / 1000, total / 1000);
+    println!("smbd: read {} KB in {} ms, sent {} KB in {} ms, active for {} ms ({} ms since the last report).", read_bytes / 1024, read_us / 1000, send_bytes / 1024, send_us / 1000, busy_us / 1000, total / 1000);
 }
 
 /// Answers every complete message waiting on `slot` (a 4-byte frame header, then the SMB message).
-fn serve<const N: usize>(api: &TapeApi, tcp: &mut Tcp<RX, N>, slot: usize, request: &mut [u8; RX], answer: &mut [u8], session: &mut Server<Files, OPENS>) {
+fn serve<const N: usize>(api: &TapeApi, tcp: &mut Tcp<RX, N>, slot: usize, request: &mut [u8; REQ], answer: &mut [u8], session: &mut Server<Files, OPENS>) {
     loop {
         let waiting = tcp.received(slot);
         if waiting.len() < 4 {
             return;
         }
         let length = (usize::from(waiting[1]) << 16) | (usize::from(waiting[2]) << 8) | usize::from(waiting[3]);
-        if waiting[0] != 0 || length + 4 > RX {
+        if waiting[0] != 0 || length + 4 > REQ {
             // Not SMB, or larger than the server negotiated: hang up.
             tcp.close(api, slot);
             return;
