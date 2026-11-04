@@ -180,6 +180,12 @@ pub fn vfs_set_owner(name_at: u64, name_len: u64, uid: u64, gid: u64, mode: u64)
     tape_vfs::set_owner(&reference, uid as u32, gid as u32, mode as u32)
 }
 
+/// `vfs_sync()` (ABI 36): commits the file writes held open.
+pub fn vfs_sync() -> isize {
+    let _guard = lock();
+    kernel_core::tape_vfs::api_vfs_sync()
+}
+
 /// `remote_register(name, name_len)` (ABI 35): the provider side takes no file lock, the waiting caller holds it.
 pub fn remote_register(name_at: u64, name_len: u64) -> isize {
     name(name_at, name_len).map_or(FS_ERROR, |name| kernel_core::remote::register(&name))

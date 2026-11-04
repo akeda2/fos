@@ -874,6 +874,17 @@ pub fn vfs_set_owner(path: &str, uid: u32, gid: u32, mode: u32) -> Result<(), is
     vfs_done((table.vfs_set_owner)(path.as_ptr(), path.len(), uid, gid, mode))
 }
 
+/// Commits the file writes the kernel keeps open between `vfs_write` calls (ABI 36, `vfs_sync`); call it when a stream of
+/// writes pauses and before a file is reported closed. A kernel without it commits every write at once, so `Ok` then.
+pub fn vfs_sync() -> Result<(), isize> {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, vfs_sync) + core::mem::size_of::<usize>();
+    if table.version < 36 || (table.size as usize) < end {
+        return Ok(());
+    }
+    vfs_done((table.vfs_sync)())
+}
+
 fn remote_table() -> Option<&'static fosfor_abi::tape::TapeApi> {
     let table = api();
     let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, remote_reply) + core::mem::size_of::<usize>();

@@ -700,6 +700,7 @@ pub fn build_api(info: &BootInfo, arguments: &str) -> TapeApi {
         remote_unregister: kernel_core::remote::api_remote_unregister,
         remote_poll: kernel_core::remote::api_remote_poll,
         remote_reply: kernel_core::remote::api_remote_reply,
+        vfs_sync: kernel_core::tape_vfs::api_vfs_sync,
         random: kernel_core::random::api_random,
     }
 }

@@ -21,11 +21,11 @@ fn ext4_error(error: ext4::Error) -> isize {
     }
 }
 
-/// The ext volume a reference names and the path on it, or `None` when it names something else.
-fn ext(reference: &[u8]) -> Option<(&'static mut Shared, &[u8])> {
+/// The disk index (0-based) and path of the ext volume a reference names, or `None` when it names something else.
+fn ext_ref(reference: &[u8]) -> Option<(usize, &[u8])> {
     let (selector, path) = tape_fs::split_selector(reference);
     if let Some(number) = tape_fs::ext_number(selector).filter(|&number| number > 0) {
-        return ext4vol::shared(number - 1).ok().map(|shared| (shared, path));
+        return Some((number - 1, path));
     }
     let number = tape_fs::disk_number(selector).filter(|&number| number > 0)?;
     // A disk that already is the kept ext volume skips the FOSFS and FAT probes (a few reads each).
@@ -33,7 +33,13 @@ fn ext(reference: &[u8]) -> Option<(&'static mut Shared, &[u8])> {
     if !known && (storage::volume_on(number).is_ok() || tape_fs::fat_disk(number).is_some()) {
         return None;
     }
-    ext4vol::shared(number - 1).ok().map(|shared| (shared, path))
+    Some((number - 1, path))
+}
+
+/// The kept ext volume a reference names and the path on it (changes left open are committed first).
+fn ext(reference: &[u8]) -> Option<(&'static mut Shared, &[u8])> {
+    let (disk, path) = ext_ref(reference)?;
+    ext4vol::shared(disk).ok().map(|shared| (shared, path))
 }
 
 fn stat_of(inode: &ext4::Inode) -> VfsStat {
@@ -209,8 +215,8 @@ type Writer = ext4::Writer<ext4::Journaled<Partition>>;
 
 /// The ext volume a reference names, as (disk index, partition, path), or `None` for FOSFS, FAT and everything else.
 fn ext_target(reference: &[u8]) -> Option<(usize, Partition, &[u8])> {
-    let (shared, path) = ext(reference)?;
-    Some((shared.disk, shared.partition, path))
+    let (disk, path) = ext_ref(reference)?;
+    Some((disk, ext4vol::partition_of(disk).ok()?, path))
 }
 
 /// "a/b/c" -> ("a/b", "c"); trailing slashes do not count.
@@ -264,7 +270,7 @@ pub fn write(reference: &[u8], offset: u64, data: &[u8]) -> isize {
         return remote::write(reference, offset, data);
     }
     let Some((disk, partition, path)) = ext_target(reference) else { return FS_READ_ONLY };
-    let done = ext4vol::with_writer(disk, partition, |writer| {
+    let done = ext4vol::with_writer_deferred(disk, partition, |writer| {
         let inode = file_number(writer, path)?;
         writer.write(inode.number, offset, data)
     });
@@ -356,6 +362,11 @@ pub extern "C" fn api_vfs_remove(path: *const u8, path_length: usize) -> isize {
 /// Tape ABI 34 `vfs_rename(from, from_len, to, to_len)`.
 pub extern "C" fn api_vfs_rename(from: *const u8, from_length: usize, to: *const u8, to_length: usize) -> isize {
     rename(bytes(from, from_length), bytes(to, to_length))
+}
+
+/// Tape ABI 36 `vfs_sync()`: commits the file writes still held open (0 when there are none).
+pub extern "C" fn api_vfs_sync() -> isize {
+    ext4vol::commit_pending().map_or_else(change_error, |()| 0)
 }
 
 /// Tape ABI 34 `vfs_set_owner(path, path_len, uid, gid, mode)`.
