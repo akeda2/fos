@@ -64,11 +64,16 @@ def main():
             g.line("write settings no-msi")
             screen = g.line("run smbd root=disk2 share=data log ip=10.0.2.15/24 gateway=10.0.2.2 &2", "fos> ", 40)
             check("smbd" in screen.lower() and "disk2" in screen, "smbd starts as a service on NIC 2", screen)
+            room = [line.strip() for line in screen.splitlines() if "room for" in line]
+            check(bool(room), "smbd reports how many connections it has room for", screen)
 
             out = smbclient("ls")
             check(out.returncode == 0 and "hello.txt" in out.stdout and "big.bin" in out.stdout and "docs" in out.stdout,
                   "the share root lists its files", out.stdout + out.stderr)
             check(f"{len(big)}" in out.stdout, "with the real size", out.stdout)
+            # A mount idles between requests (the Linux client's echo is 60 s apart): the server must not drop it.
+            out = smbclient("ls hello.txt; !sleep 15; ls hello.txt")
+            check(out.returncode == 0 and out.stdout.count("hello.txt") == 2, "a connection idle for 15 s still works", out.stdout + out.stderr)
             out = smbclient("ls docs\\*")
             check("räksmörgås.txt" in out.stdout and "deep" in out.stdout, "a subfolder lists, UTF-8 names included", out.stdout + out.stderr)
             out = smbclient("ls many\\*")

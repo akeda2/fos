@@ -83,7 +83,7 @@ Done (ABI 32, `crates/kernel-core/src/tape_vfs.rs`, `tape_rt::vfs_stat/vfs_read_
 3. Tape ABI 32 (`vfs_*`, read side) with ext4 behind it; `make test-vfs` on QEMU. **Done.**
 4. `smbd` tape (`tapes/smbd`: service on port 445, `root=`/`share=` settings, `run smbd @SMBD.CFG &2`); `make test-smbd` runs it in
    QEMU (user-mode networking) over an ext4 disk and uses `smbclient` (SMB2_02 and SMB3_00, a 3 MB file, a 300-file folder).
-   **Done**; `mount.cifs` (needs root), Windows and VLC are unchecked. Four connections at once, one message at a time.
+   **Done**; `mount.cifs` (needs root), Windows and VLC are unchecked. 128 connections at once, taken from kernel memory (8 if the kernel has no room; a new one evicts the quietest idle one when all are taken), one message at a time; idle ones are kept 10 minutes, and a segment for a forgotten connection is answered with RST.
 5. `smb` client tape (`tapes/smb`: `smb ls|cat|get //HOST/SHARE/PATH [NAME]`, `get` streams to a local file); `make test-smb-client` runs it
    in QEMU against a host-side server (`crates/smb/examples/serve.rs`, through guestfwd). **Done**; Samba and Windows servers are
    unchecked (`make test-smb` still covers fosplay against a real Samba when one is reachable).

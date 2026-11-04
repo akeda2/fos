@@ -9,7 +9,7 @@
 //! with `Socket::new()` and (re)open it with `connect`.
 
 use crate::net::{self, MAX_FRAME, NetConfig};
-use tape_net::{ArpCache, ETHERTYPE_IPV4, EthernetFrame, TCP_SYN, Ipv4Address, Ipv4Packet, MacAddress, TcpConnection, TcpSegment, TcpState};
+use tape_net::{ArpCache, ETHERTYPE_IPV4, EthernetFrame, TCP_ACK, TCP_RST, TCP_SYN, Ipv4Address, Ipv4Packet, MacAddress, TcpConnection, TcpSegment, TcpState};
 use tape_rt::TapeApi;
 
 /// How long an unacknowledged segment waits before it is sent again.
@@ -173,6 +173,8 @@ impl<const RX: usize> Socket<RX> {
 /// lost handshake, a peer that vanished mid-close), and an established one that has gone quiet.
 const HALF_OPEN_MICROS: u64 = 3_000_000;
 const IDLE_MICROS: u64 = 10_000_000;
+/// With every slot taken, a SYN may evict the quietest established connection if it has been silent this long.
+const EVICT_MICROS: u64 = 1_000_000;
 /// The most unacknowledged bytes `Server::send` keeps in flight (the peer's window may be larger).
 const FLIGHT: usize = 44 * SEND_CHUNK;
 
@@ -204,6 +206,7 @@ pub struct Server<const RX: usize, const N: usize> {
     segment: [u8; MAX_FRAME],
     tx: [u8; MAX_FRAME],
     tx_dropped: u32,
+    idle_micros: u64,
 }
 
 impl<const RX: usize, const N: usize> Server<RX, N> {
@@ -220,7 +223,15 @@ impl<const RX: usize, const N: usize> Server<RX, N> {
             segment: [0; MAX_FRAME],
             tx: [0; MAX_FRAME],
             tx_dropped: 0,
+            idle_micros: IDLE_MICROS,
         }
+    }
+
+    /// How long an established connection may be silent before its slot is taken back (default 10 s). A server whose
+    /// clients idle on purpose (an SMB mount sends an echo every 60 s) sets it above that; a SYN that finds every slot
+    /// taken still evicts the quietest connection, so a vanished client cannot lock the others out.
+    pub fn set_idle(&mut self, micros: u64) {
+        self.idle_micros = micros;
     }
 
     /// Starts listening on `port` through `nic` with the address `config` gives.
@@ -325,9 +336,42 @@ impl<const RX: usize, const N: usize> Server<RX, N> {
                     self.slots[index].peer_mac = source_mac;
                     index
                 }
-                None => return,
+                None => {
+                    let quietest = (0..N)
+                        .filter(|&i| matches!(self.slots[i].connection.state(), TcpState::Established | TcpState::CloseWait))
+                        .max_by_key(|&i| now.saturating_sub(self.slots[i].last));
+                    match quietest.filter(|&i| now.saturating_sub(self.slots[i].last) > EVICT_MICROS) {
+                        Some(index) => {
+                            // `recycle` inline: `segment` still borrows `self.rx`.
+                            self.sequence = self.sequence.wrapping_add(64_000);
+                            self.slots[index].connection.reopen_listen(self.config.ip, self.port, self.sequence, RETRANSMIT_MICROS);
+                            self.slots[index].tx_len = 0;
+                            self.slots[index].connection.accept_from(peer);
+                            self.slots[index].peer_mac = source_mac;
+                            index
+                        }
+                        None => return,
+                    }
+                }
             },
-            None => return,
+            None => {
+                // A segment for a connection we no longer have (an idle slot taken back): tell the peer at once, or it
+                // retransmits into silence for minutes before it gives up.
+                if segment.flags & TCP_RST == 0 {
+                    let (sequence, acknowledgment, flags) = if segment.flags & TCP_ACK != 0 {
+                        (segment.acknowledgment, 0, TCP_RST)
+                    } else {
+                        (0, segment.sequence.wrapping_add(segment.data.len() as u32 + u32::from(segment.flags & TCP_SYN != 0)), TCP_RST | TCP_ACK)
+                    };
+                    let reset = TcpSegment::new(self.port, segment.source_port, sequence, acknowledgment, flags, 0, &[]);
+                    if let Ok(length) = reset.encode(&mut self.segment, self.config.ip, peer) {
+                        if let Some(total) = net::build_ip_frame(&mut self.tx, &self.config, source_mac, peer, 6, &self.segment[..length]) {
+                            net::send_frame(api, self.nic, &self.tx[..total]);
+                        }
+                    }
+                }
+                return;
+            }
         };
         self.slots[index].last = now;
         if let Ok(Some(reply)) = self.slots[index].connection.on_segment(&segment, now as u32, &mut self.segment) {
@@ -353,7 +397,7 @@ impl<const RX: usize, const N: usize> Server<RX, N> {
             let dead = match state {
                 TcpState::Listen => false,
                 TcpState::Closed => self.slots[index].connection.received().is_empty(),
-                TcpState::Established | TcpState::CloseWait => quiet > IDLE_MICROS,
+                TcpState::Established | TcpState::CloseWait => quiet > self.idle_micros,
                 _ => quiet > HALF_OPEN_MICROS,
             };
             if dead {
