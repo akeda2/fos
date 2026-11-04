@@ -162,6 +162,7 @@ struct Launch {
     entry: u64,
     argument: u64,
     second: u64,
+    stack: u64,
 }
 
 /// Starts a process running the machine code `image` (read-only, executable, at `CODE_BASE`) with a fresh stack. Returns the
@@ -263,7 +264,7 @@ fn start(name: &str, root: u64, entry: Option<(u64, u64, u64)>) -> Option<u64> {
     };
     let pid = NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     crate::tapenet::reserve(pid, START_NICS.swap(0, core::sync::atomic::Ordering::AcqRel));
-    let launch = Box::into_raw(Box::new(Launch { pid, entry, argument, second })) as usize;
+    let launch = Box::into_raw(Box::new(Launch { pid, entry, argument, second, stack: STACK_TOP })) as usize;
     let id = sched::spawn_user(name, user_thread, launch, root);
     if id.is_none() {
         crate::tapenet::process_ended(pid);
@@ -276,21 +277,52 @@ fn start(name: &str, root: u64, entry: Option<(u64, u64, u64)>) -> Option<u64> {
 extern "C" fn user_thread(launch: usize) {
     let launch = unsafe { Box::from_raw(launch as *mut Launch) };
     sched::set_pid(launch.pid);
-    let (entry, argument, second) = (launch.entry, launch.argument, launch.second);
+    let (entry, argument, second, stack) = (launch.entry, launch.argument, launch.second, launch.stack);
     drop(launch);
-    unsafe { enter_user_mode(entry, STACK_TOP, argument, second) }
+    unsafe { enter_user_mode(entry, stack, argument, second) }
+}
+
+/// The kernel thread of an extra user thread: its process (pid, address space) already exists.
+extern "C" fn extra_thread(launch: usize) {
+    let launch = unsafe { Box::from_raw(launch as *mut Launch) };
+    let (entry, argument, second, stack) = (launch.entry, launch.argument, launch.second, launch.stack);
+    drop(launch);
+    unsafe { enter_user_mode(entry, stack, argument, second) }
+}
+
+/// Starts another thread in the calling process: it runs `entry(argument)` on the user stack ending at `stack_top`, through
+/// the shim (which ends the thread when `entry` returns). Returns its tid, or `None` (too many threads, no memory).
+pub fn spawn_thread(entry: u64, argument: u64, stack_top: u64) -> Option<u64> {
+    let launch = Box::into_raw(Box::new(Launch { pid: sched::current_pid(), entry: crate::tapeapi::thread_start(), argument: entry, second: argument, stack: stack_top })) as usize;
+    let tid = sched::spawn_thread("thread", extra_thread, launch, sched::current_root(), sched::current_pid());
+    if tid.is_none() {
+        unsafe { drop(Box::from_raw(launch as *mut Launch)) };
+    }
+    tid
 }
 
 /// Ends the calling process: records how, gives its address space back and ends the thread. Interrupts must be off or
 /// the caller must be in an exception or system call (its own kernel stack).
 pub fn terminate(how: How) -> ! {
     cpu::interrupts_disable();
-    let written = sched::add_written(0);
+    // Any thread ending the process ends all of them; the last one out tears it down.
+    sched::end_process(how);
+    leave(Some(how))
+}
+
+/// The calling thread ends on its own (its entry returned); the process goes on until its last thread is gone.
+pub fn thread_exit() -> ! {
+    cpu::interrupts_disable();
+    leave(None)
+}
+
+fn leave(how: Option<How>) -> ! {
     let thread = sched::current_pid();
+    let root = sched::detach_root();
+    let Some((how, written)) = sched::leave_process(how) else { sched::exit() };
     if SCREEN_OWNER.compare_exchange(thread, 0, core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed).is_ok() {
         crate::fb::gfx_close();
     }
-    let root = sched::detach_root();
     if root != 0 {
         vm::destroy_user_space(root);
     }
@@ -393,6 +425,7 @@ pub fn syscall(frame: &mut Frame) {
             0
         }
         4 => apic::ticks(),
+        5 => thread_exit(),
         _ => u64::MAX,
     };
 }

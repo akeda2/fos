@@ -885,6 +885,70 @@ pub fn vfs_sync() -> Result<(), isize> {
     vfs_done((table.vfs_sync)())
 }
 
+fn thread_table() -> Option<&'static fosfor_abi::tape::TapeApi> {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, futex_wake) + core::mem::size_of::<usize>();
+    (table.version >= 37 && table.size as usize >= end).then_some(table)
+}
+
+/// Can this kernel run several threads of one tape (ABI 37)? The server kernel can; the embedded kernels cannot, and a tape
+/// that wants threads for speed keeps a single-loop path for them.
+pub fn threads_supported() -> bool {
+    thread_table().is_some_and(|table| (table.thread_join)(0) != fosfor_abi::tape::THREAD_UNSUPPORTED)
+}
+
+/// A thread started by `spawn_thread`; `join` waits for it and frees its stack. Dropping it without joining leaks the stack.
+pub struct Thread {
+    id: isize,
+    stack: usize,
+    stack_bytes: usize,
+}
+
+impl Thread {
+    /// Waits until the thread's entry has returned, then gives its stack back.
+    pub fn join(self) {
+        if let Some(table) = thread_table() {
+            (table.thread_join)(self.id);
+        }
+        (api().free)(self.stack, self.stack_bytes);
+    }
+}
+
+/// Starts `entry(argument)` on a new thread of this tape (ABI 37) with a stack of `stack_bytes` (rounded up to 4 KiB). The
+/// thread shares all memory: `argument` usually points at a `static` or an allocation that outlives it, and shared state needs
+/// atomics (or `futex_wait`/`futex_wake` to sleep). `Err` is a `THREAD_*` code (`THREAD_UNSUPPORTED` on the embedded kernels).
+pub fn spawn_thread(entry: extern "C" fn(usize), argument: usize, stack_bytes: usize) -> Result<Thread, isize> {
+    let table = thread_table().ok_or(fosfor_abi::tape::THREAD_UNSUPPORTED)?;
+    let stack_bytes = stack_bytes.max(16384).div_ceil(4096) * 4096;
+    let stack = (table.alloc)(stack_bytes);
+    if stack == 0 {
+        return Err(fosfor_abi::tape::THREAD_LIMIT);
+    }
+    match (table.thread_spawn)(entry, argument, stack + stack_bytes) {
+        id if id > 0 => Ok(Thread { id, stack, stack_bytes }),
+        code => {
+            (table.free)(stack, stack_bytes);
+            Err(code)
+        }
+    }
+}
+
+/// Sleeps while the word at `word` still holds `expected` (ABI 37). May return early: loop and re-check. Where there are no
+/// threads it returns at once, so such a loop must not depend on it.
+pub fn futex_wait(word: &core::sync::atomic::AtomicU32, expected: u32) {
+    if let Some(table) = thread_table() {
+        (table.futex_wait)(word as *const _ as usize, expected);
+    }
+}
+
+/// Wakes up to `count` threads sleeping in `futex_wait` on `word`; returns how many.
+pub fn futex_wake(word: &core::sync::atomic::AtomicU32, count: usize) -> usize {
+    match thread_table() {
+        Some(table) => (table.futex_wake)(word as *const _ as usize, count).max(0) as usize,
+        None => 0,
+    }
+}
+
 fn remote_table() -> Option<&'static fosfor_abi::tape::TapeApi> {
     let table = api();
     let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, remote_reply) + core::mem::size_of::<usize>();
