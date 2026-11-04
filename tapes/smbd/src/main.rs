@@ -5,7 +5,7 @@
 #![no_std]
 #![no_main]
 
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use smb::ntlm::{md5, nt_hash};
 use smb::server::{Account, DEFAULT_IO, Fail, Identity, MAX_IO, Server, Share, Stat};
 use tape_ip::net::{self, NetConfig};
@@ -126,6 +126,9 @@ struct Files {
     name: [u8; 32],
     name_length: usize,
     read_only: bool,
+    /// Where this session's last read ended (hash of the file's path, offset): the next read there is sequential.
+    next_hash: u64,
+    next_offset: u64,
 }
 
 /// The `Fail` an ABI 34 error code stands for.
@@ -143,7 +146,7 @@ fn fail(code: isize) -> Fail {
 
 impl Files {
     const fn new() -> Self {
-        Files { root: [0; ROOT_MAX], root_length: 0, name: [0; 32], name_length: 0, read_only: false }
+        Files { root: [0; ROOT_MAX], root_length: 0, name: [0; 32], name_length: 0, read_only: false, next_hash: 0, next_offset: 0 }
     }
 
     /// `root` and `path` joined with a slash, into `out`.
@@ -203,10 +206,24 @@ impl Share for Files {
     fn read(&mut self, path: &str, offset: u64, out: &mut [u8]) -> Result<usize, ()> {
         let mut buffer = [0u8; 512];
         let reference = self.join(path, &mut buffer).ok_or(())?;
-        let start = tape_rt::micros();
-        let result = tape_rt::vfs_read(reference, offset, out).map_err(|_| ());
-        READ_US.fetch_add(tape_rt::micros() - start, Ordering::Relaxed);
-        READ_BYTES.fetch_add(*result.as_ref().unwrap_or(&0) as u64, Ordering::Relaxed);
+        let hash = fnv(reference.as_bytes());
+        let sequential = self.next_hash == hash && self.next_offset == offset;
+        let result = if ahead_take(reference, offset, out) {
+            Ok(out.len())
+        } else {
+            let start = tape_rt::micros();
+            let result = tape_rt::vfs_read(reference, offset, out).map_err(|_| ());
+            READ_US.fetch_add(tape_rt::micros() - start, Ordering::Relaxed);
+            result
+        };
+        if let Ok(count) = result {
+            READ_BYTES.fetch_add(count as u64, Ordering::Relaxed);
+            self.next_hash = hash;
+            self.next_offset = offset + count as u64;
+            if sequential && count == out.len() {
+                ahead_hint(reference, offset + count as u64, out.len());
+            }
+        }
         result
     }
 
@@ -215,6 +232,7 @@ impl Share for Files {
     }
 
     fn create(&mut self, path: &str, dir: bool, mode: u32, owner: Identity) -> Result<(), Fail> {
+        ahead_invalidate();
         let mut buffer = [0u8; 512];
         let reference = self.join(path, &mut buffer).ok_or(Fail::Io)?;
         let kind = if dir { tape_rt::VFS_DIR } else { tape_rt::VFS_FILE };
@@ -222,6 +240,7 @@ impl Share for Files {
     }
 
     fn write(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<(), Fail> {
+        ahead_invalidate();
         let mut buffer = [0u8; 512];
         let reference = self.join(path, &mut buffer).ok_or(Fail::Io)?;
         let mut done = 0;
@@ -240,18 +259,21 @@ impl Share for Files {
     }
 
     fn truncate(&mut self, path: &str, size: u64) -> Result<(), Fail> {
+        ahead_invalidate();
         let mut buffer = [0u8; 512];
         let reference = self.join(path, &mut buffer).ok_or(Fail::Io)?;
         tape_rt::vfs_truncate(reference, size).map_err(fail)
     }
 
     fn remove(&mut self, path: &str) -> Result<(), Fail> {
+        ahead_invalidate();
         let mut buffer = [0u8; 512];
         let reference = self.join(path, &mut buffer).ok_or(Fail::Io)?;
         tape_rt::vfs_remove(reference).map_err(fail)
     }
 
     fn rename(&mut self, from: &str, to: &str) -> Result<(), Fail> {
+        ahead_invalidate();
         let (mut first, mut second) = ([0u8; 512], [0u8; 512]);
         let from = self.join(from, &mut first).ok_or(Fail::Io)?;
         let to = self.join(to, &mut second).ok_or(Fail::Io)?;
@@ -646,6 +668,102 @@ fn serve<const RX: usize, const N: usize>(api: &TapeApi, tcp: &mut Tcp<RX, N>, s
     }
 }
 
+fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, &byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// Read-ahead for a sequential read (server kernel, with the workers): a client that reads a file in 1 MiB requests waits for
+/// each answer before asking for the next, so the disk read of one request used to sit between two stretches of wire time. After
+/// the second read in a row a worker reads the next range into `AHEAD` while the network thread is still sending the answer,
+/// and the next request is a memory copy. One cache for all sessions, taken only for a request that it covers entirely; any
+/// change to a file (`ahead_invalidate`, counted in `generation`) throws it away, also a read that was in progress.
+struct Ahead {
+    data: usize,
+    room: usize,
+    valid: bool,
+    key: [u8; 512],
+    key_length: usize,
+    offset: u64,
+    length: usize,
+    wanted: bool,
+    want_key: [u8; 512],
+    want_key_length: usize,
+    want_offset: u64,
+    want_length: usize,
+    generation: u64,
+}
+
+static AHEAD_LOCK: AtomicBool = AtomicBool::new(false);
+static mut AHEAD: Ahead = Ahead { data: 0, room: 0, valid: false, key: [0; 512], key_length: 0, offset: 0, length: 0, wanted: false, want_key: [0; 512], want_key_length: 0, want_offset: 0, want_length: 0, generation: 0 };
+
+/// Runs `body` on the cache with its spin lock held (it is held for a memory copy at most).
+fn with_ahead<T>(body: impl FnOnce(&mut Ahead) -> T) -> T {
+    while AHEAD_LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    let result = body(unsafe { &mut *core::ptr::addr_of_mut!(AHEAD) });
+    AHEAD_LOCK.store(false, Ordering::Release);
+    result
+}
+
+/// Fills `out` from the cache if it covers `offset..offset + out.len()` of `key`.
+fn ahead_take(key: &str, offset: u64, out: &mut [u8]) -> bool {
+    with_ahead(|ahead| {
+        let covers = ahead.valid && &ahead.key[..ahead.key_length] == key.as_bytes() && offset >= ahead.offset && offset + out.len() as u64 <= ahead.offset + ahead.length as u64;
+        if covers {
+            let from = (offset - ahead.offset) as usize;
+            unsafe { core::ptr::copy_nonoverlapping((ahead.data + from) as *const u8, out.as_mut_ptr(), out.len()) };
+        }
+        covers
+    })
+}
+
+/// Asks for `length` bytes of `key` from `offset` to be read ahead by the next worker that has a moment.
+fn ahead_hint(key: &str, offset: u64, length: usize) {
+    with_ahead(|ahead| {
+        if ahead.data != 0 && key.len() <= ahead.want_key.len() && length <= ahead.room {
+            ahead.want_key[..key.len()].copy_from_slice(key.as_bytes());
+            ahead.want_key_length = key.len();
+            ahead.want_offset = offset;
+            ahead.want_length = length;
+            ahead.wanted = true;
+        }
+    });
+}
+
+fn ahead_invalidate() {
+    with_ahead(|ahead| {
+        ahead.valid = false;
+        ahead.wanted = false;
+        ahead.generation += 1;
+    });
+}
+
+/// A worker's spare moment: does the read-ahead somebody asked for, into its own `scratch` and then into the cache.
+fn ahead_fill(scratch: &mut [u8]) {
+    let wanted = with_ahead(|ahead| {
+        if !ahead.wanted {
+            return None;
+        }
+        ahead.wanted = false;
+        Some((ahead.want_key, ahead.want_key_length, ahead.want_offset, ahead.want_length, ahead.generation))
+    });
+    let Some((key, key_length, offset, length, generation)) = wanted else { return };
+    let Ok(name) = core::str::from_utf8(&key[..key_length]) else { return };
+    let room = length.min(scratch.len());
+    let Ok(count) = tape_rt::vfs_read(name, offset, &mut scratch[..room]) else { return };
+    with_ahead(|ahead| {
+        if ahead.generation == generation && count <= ahead.room {
+            unsafe { core::ptr::copy_nonoverlapping(scratch.as_ptr(), ahead.data as *mut u8, count) };
+            ahead.key = key;
+            ahead.key_length = key_length;
+            ahead.offset = offset;
+            ahead.length = count;
+            ahead.valid = true;
+        }
+    });
+}
+
 /// Worker threads (tape ABI 37, server kernel): the network thread owns the NIC and every `Tcp` slot; a worker only runs
 /// `Server::handle` (and with it the file I/O) for one request at a time, so a slow disk does not stop the frames coming in
 /// and sessions do not wait for each other. A slot has one request in flight, so a session's requests stay in order and
@@ -666,6 +784,9 @@ struct Worker {
     request: usize,
     answer: usize,
     answer_room: usize,
+    /// The worker's own buffer for read-ahead.
+    scratch: usize,
+    scratch_room: usize,
     /// Network thread only: how much of the answer is out, and when the peer last took some (0: not started).
     sent: usize,
     progress: u64,
@@ -686,6 +807,8 @@ extern "C" fn worker_main(address: usize) {
         let sent = session.handle(request, answer);
         worker.length.store(sent, Ordering::Relaxed);
         worker.state.store(DONE, Ordering::Release);
+        // The network thread is sending the answer now; this is the moment for the disk to read what comes next.
+        ahead_fill(unsafe { core::slice::from_raw_parts_mut(worker.scratch as *mut u8, worker.scratch_room) });
     }
 }
 
@@ -694,6 +817,12 @@ fn start_workers(api: &TapeApi, io: usize, workers: &mut [usize; WORKERS]) -> us
     if !tape_rt::threads_supported() {
         return 0;
     }
+    if let Some(cache) = buffer(api, io) {
+        with_ahead(|ahead| {
+            ahead.data = cache.as_ptr() as usize;
+            ahead.room = cache.len();
+        });
+    }
     let mut count = 0;
     while count < WORKERS {
         let Some(worker) = tape_rt::alloc_zeroed::<Worker>(api) else { break };
@@ -701,6 +830,9 @@ fn start_workers(api: &TapeApi, io: usize, workers: &mut [usize; WORKERS]) -> us
         worker.request = request.as_ptr() as usize;
         worker.answer = answer.as_ptr() as usize;
         worker.answer_room = answer.len();
+        let Some(scratch) = buffer(api, io) else { break };
+        worker.scratch = scratch.as_ptr() as usize;
+        worker.scratch_room = scratch.len();
         let address = worker as *mut Worker as usize;
         match tape_rt::spawn_thread(worker_main, address, 64 * 1024) {
             Ok(thread) => core::mem::forget(thread),
