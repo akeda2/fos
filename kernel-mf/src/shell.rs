@@ -209,6 +209,7 @@ pub fn run(line: &str) {
             for index in 0..block::count() {
                 if let Some(disk) = block::get(index) {
                     println!("disk{}: {} MiB", index + 1, disk.sectors >> 11);
+                    kernel_core::ext4vol::describe(index, &mut crate::sysshell::Console);
                 }
             }
         }

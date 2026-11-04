@@ -49,6 +49,7 @@ rack reset itself (60 s watchdog) once it was done; the volume was complete. The
 `rm` and `cp` reach an ext volume as `extN/path` (also from or to `//NAME` remote volumes, `tape_vfs::read_whole` and
 friends behind `tape_fs`), `make test-vfs-write`. `@LABEL` finds an ext volume too (only when no FOSFS or FAT volume has that
 label); `sha256` streams, so it works on ext, `@LABEL` and `//NAME` files of any size. Installer: `install diskN fosfs=SIZE ext4[=LABEL]` makes the FOSFS volume that size and an ext4 volume over the rest (`make test-install`).
+`disks` lists each ext volume under its disk as `extN: 'LABEL' SIZE MiB, FREE MiB free (partition|whole disk)` (or says its journal needs recovery).
 On a disk that holds FOSFS, `diskN/` always means FOSFS by design; reach the ext volume as `extN/path` or `@LABEL/path`.
 
 ## Journal (step 4)
