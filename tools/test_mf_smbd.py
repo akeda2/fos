@@ -57,6 +57,18 @@ def main():
                 print(("PASS: " if "readme.txt" in listing.stdout else "FAIL: ") + "smbclient lists the share")
                 if "readme.txt" not in listing.stdout:
                     failures.append("smbclient did not list the share:\n" + listing.stdout + listing.stderr)
+                # Several clients at once go to the worker threads together; each must get its own file whole.
+                clients = [subprocess.Popen(["smbclient", "//127.0.0.1/data", "-p", str(HOST_PORT), "-N", "-c", "ls; get readme.txt /dev/null"],
+                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(6)]
+                results = [client.communicate(timeout=90) for client in clients]
+                ok = all("readme.txt" in out for out, _ in results) and all(c.returncode == 0 for c in clients)
+                print(("PASS: " if ok else "FAIL: ") + "six clients at once are all served")
+                if not ok:
+                    failures.append("concurrent clients failed: " + repr(results)[:400])
+                workers = wait_for("worker threads", 1)
+                print(("PASS: " if workers else "FAIL: ") + "smbd runs worker threads on the server kernel")
+                if not workers:
+                    failures.append("no worker threads announced")
                 if b"CPU exception" in log:
                     failures.append("the kernel faulted:\n" + log[-1200:].decode("utf8", "replace"))
     finally:

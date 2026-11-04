@@ -5,7 +5,7 @@
 #![no_std]
 #![no_main]
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use smb::ntlm::{md5, nt_hash};
 use smb::server::{Account, DEFAULT_IO, Fail, Identity, MAX_IO, Server, Share, Stat};
 use tape_ip::net::{self, NetConfig};
@@ -426,13 +426,35 @@ fn run<const RX: usize, const N: usize>(api: &TapeApi, setup: &Setup, tcp: &mut 
     CONNECTED_US.store(tape_rt::micros(), Ordering::Relaxed);
     let (mut last_busy, mut first_busy) = (0u64, 0u64);
     let mut last_frame = 0u64;
+    let mut workers = [0usize; WORKERS];
+    let worker_count = start_workers(api, io, &mut workers);
+    // The worker (if any) holding the request of each slot.
+    let mut assigned = [usize::MAX; N];
+    if worker_count > 0 {
+        println!("smbd: {worker_count} worker threads.");
+    }
     println!("smbd: NIC {} at {}.{}.{}.{}:{port}, sharing {} as //HOST/{share}.", nic + 1, network.ip.0[0], network.ip.0[1], network.ip.0[2], network.ip.0[3], if root.is_empty() { "the boot volume" } else { root });
     loop {
         if (api.should_abort)() != 0 {
             break;
         }
-        let busy = tcp.poll(api, 16);
+        let mut busy = tcp.poll(api, 16);
         for slot in 0..N {
+            if assigned[slot] != usize::MAX {
+                let worker = unsafe { &*(workers[assigned[slot]] as *const Worker) };
+                if worker.state.load(Ordering::Acquire) != DONE {
+                    // The worker has the session; the network thread must not poll sleep until it answers.
+                    busy = true;
+                    continue;
+                }
+                if tcp.is_open(slot) {
+                    let answer = unsafe { core::slice::from_raw_parts(worker.answer as *const u8, worker.answer_room) };
+                    reply(api, tcp, slot, answer, worker.length.load(Ordering::Relaxed));
+                }
+                worker.state.store(IDLE, Ordering::Release);
+                assigned[slot] = usize::MAX;
+                busy = true;
+            }
             if !tcp.is_open(slot) {
                 sessions[slot] = None;
                 continue;
@@ -468,10 +490,25 @@ fn run<const RX: usize, const N: usize>(api: &TapeApi, setup: &Setup, tcp: &mut 
                     println!("smbd: connection from {}.{}.{}.{}", ip.0[0], ip.0[1], ip.0[2], ip.0[3]);
                 }
             }
-            serve(api, tcp, slot, request, answer, sessions[slot].as_mut().unwrap());
+            if worker_count == 0 {
+                serve(api, tcp, slot, request, answer, sessions[slot].as_mut().unwrap());
+            } else if let Some(length) = peek_message(api, tcp, slot, io + SLACK) {
+                let free = (0..worker_count).find(|&index| unsafe { &*(workers[index] as *const Worker) }.state.load(Ordering::Acquire) == IDLE);
+                if let Some(index) = free {
+                    let worker = unsafe { &mut *(workers[index] as *mut Worker) };
+                    let into = unsafe { core::slice::from_raw_parts_mut(worker.request as *mut u8, io + SLACK) };
+                    take_message(api, tcp, slot, length, into);
+                    worker.length.store(length, Ordering::Relaxed);
+                    worker.session.store(sessions[slot].as_mut().unwrap() as *mut Server<Files, OPENS> as usize, Ordering::Relaxed);
+                    worker.state.store(JOB, Ordering::Release);
+                    tape_rt::futex_wake(&worker.state, 1);
+                    assigned[slot] = index;
+                    busy = true;
+                }
+            }
             // A client that hung up leaves the slot in CloseWait; without our FIN it stays taken for the idle timeout,
             // and a few quick connections in a row would fill all of them.
-            if tcp.peer_closed(slot) && tcp.received(slot).is_empty() {
+            if assigned[slot] == usize::MAX && tcp.peer_closed(slot) && tcp.received(slot).is_empty() {
                 tcp.finish(api, slot);
             }
         }
@@ -526,40 +563,118 @@ fn report(dropped: u32, busy_us: u64) {
     println!("smbd: read {} KB in {} ms, sent {} KB in {} ms, active for {} ms ({} ms since the last report).", read_bytes / 1024, read_us / 1000, send_bytes / 1024, send_us / 1000, busy_us / 1000, total / 1000);
 }
 
-/// Answers every complete message waiting on `slot` (a 4-byte frame header, then the SMB message).
+/// The length of the SMB message at the front of `slot`'s stream (without its 4-byte frame header), once all of it has arrived.
+/// Hangs up on a frame that is not SMB or is larger than the server negotiated.
+fn peek_message<const RX: usize, const N: usize>(api: &TapeApi, tcp: &mut Tcp<RX, N>, slot: usize, limit: usize) -> Option<usize> {
+    let waiting = tcp.received(slot);
+    if waiting.len() < 4 {
+        return None;
+    }
+    let length = (usize::from(waiting[1]) << 16) | (usize::from(waiting[2]) << 8) | usize::from(waiting[3]);
+    if waiting[0] != 0 || length + 4 > limit {
+        tcp.close(api, slot);
+        return None;
+    }
+    (waiting.len() >= length + 4).then_some(length)
+}
+
+/// Moves the `length + 4` bytes of the message peeked at into `into`.
+fn take_message<const RX: usize, const N: usize>(api: &TapeApi, tcp: &mut Tcp<RX, N>, slot: usize, length: usize, into: &mut [u8]) {
+    let mut taken = 0;
+    while taken < length + 4 {
+        let got = tcp.take(api, slot, &mut into[taken..length + 4]);
+        if got == 0 {
+            break;
+        }
+        taken += got;
+    }
+}
+
+/// Sends an answer of `sent` bytes (none if 0) and counts the time; false if the send failed.
+fn reply<const RX: usize, const N: usize>(api: &TapeApi, tcp: &mut Tcp<RX, N>, slot: usize, answer: &[u8], sent: usize) -> bool {
+    let start = tape_rt::micros();
+    let result = if sent > 0 { tcp.send_buffered(api, slot, &answer[..sent], SEND_TIMEOUT) } else { Ok(()) };
+    SEND_US.fetch_add(tape_rt::micros() - start, Ordering::Relaxed);
+    SEND_BYTES.fetch_add(sent as u64, Ordering::Relaxed);
+    if let Err(reason) = result {
+        println!("smbd: sending failed: {reason}");
+        return false;
+    }
+    true
+}
+
+/// Answers every complete message waiting on `slot` (a 4-byte frame header, then the SMB message); the single-threaded path.
 fn serve<const RX: usize, const N: usize>(api: &TapeApi, tcp: &mut Tcp<RX, N>, slot: usize, request: &mut [u8], answer: &mut [u8], session: &mut Server<Files, OPENS>) {
-    loop {
-        let waiting = tcp.received(slot);
-        if waiting.len() < 4 {
-            return;
-        }
-        let length = (usize::from(waiting[1]) << 16) | (usize::from(waiting[2]) << 8) | usize::from(waiting[3]);
-        if waiting[0] != 0 || length + 4 > request.len() {
-            // Not SMB, or larger than the server negotiated: hang up.
-            tcp.close(api, slot);
-            return;
-        }
-        if waiting.len() < length + 4 {
-            return;
-        }
-        let mut taken = 0;
-        while taken < length + 4 {
-            let got = tcp.take(api, slot, &mut request[taken..length + 4]);
-            if got == 0 {
-                break;
-            }
-            taken += got;
-        }
+    while let Some(length) = peek_message(api, tcp, slot, request.len()) {
+        take_message(api, tcp, slot, length, request);
         let sent = session.handle(&request[4..length + 4], answer);
-        let start = tape_rt::micros();
-        let result = if sent > 0 { tcp.send_buffered(api, slot, &answer[..sent], SEND_TIMEOUT) } else { Ok(()) };
-        SEND_US.fetch_add(tape_rt::micros() - start, Ordering::Relaxed);
-        SEND_BYTES.fetch_add(sent as u64, Ordering::Relaxed);
-        if let Err(reason) = result {
-            println!("smbd: sending failed: {reason}");
+        if !reply(api, tcp, slot, answer, sent) {
             return;
         }
     }
+}
+
+/// Worker threads (tape ABI 37, server kernel): the network thread owns the NIC and every `Tcp` slot; a worker only runs
+/// `Server::handle` (and with it the file I/O) for one request at a time, so a slow disk does not stop the frames coming in
+/// and sessions do not wait for each other. A slot has one request in flight, so a session's requests stay in order and
+/// only one thread ever touches its `Server`.
+const WORKERS: usize = 4;
+const IDLE: u32 = 0;
+const JOB: u32 = 1;
+const DONE: u32 = 2;
+
+/// Shared between the network thread and one worker; all-zero is valid. `state` hands the buffers over: IDLE -> JOB
+/// (network thread, request and session filled in) -> DONE (worker, answer and `length` filled in) -> IDLE (network
+/// thread, answer sent). The Release store and Acquire load on `state` order the plain fields around it.
+struct Worker {
+    state: AtomicU32,
+    /// The request's SMB length going in, the answer's length coming out.
+    length: AtomicUsize,
+    session: AtomicUsize,
+    request: usize,
+    answer: usize,
+    answer_room: usize,
+}
+
+extern "C" fn worker_main(address: usize) {
+    let worker = unsafe { &*(address as *const Worker) };
+    loop {
+        let state = worker.state.load(Ordering::Acquire);
+        if state != JOB {
+            tape_rt::futex_wait(&worker.state, state);
+            continue;
+        }
+        let length = worker.length.load(Ordering::Relaxed);
+        let session = unsafe { &mut *(worker.session.load(Ordering::Relaxed) as *mut Server<Files, OPENS>) };
+        let request = unsafe { core::slice::from_raw_parts((worker.request + 4) as *const u8, length) };
+        let answer = unsafe { core::slice::from_raw_parts_mut(worker.answer as *mut u8, worker.answer_room) };
+        let sent = session.handle(request, answer);
+        worker.length.store(sent, Ordering::Relaxed);
+        worker.state.store(DONE, Ordering::Release);
+    }
+}
+
+/// Starts up to `WORKERS` workers, each with its own request and answer buffer; returns how many started.
+fn start_workers(api: &TapeApi, io: usize, workers: &mut [usize; WORKERS]) -> usize {
+    if !tape_rt::threads_supported() {
+        return 0;
+    }
+    let mut count = 0;
+    while count < WORKERS {
+        let Some(worker) = tape_rt::alloc_zeroed::<Worker>(api) else { break };
+        let (Some(request), Some(answer)) = (buffer(api, io + SLACK), buffer(api, io + 256)) else { break };
+        worker.request = request.as_ptr() as usize;
+        worker.answer = answer.as_ptr() as usize;
+        worker.answer_room = answer.len();
+        let address = worker as *mut Worker as usize;
+        match tape_rt::spawn_thread(worker_main, address, 64 * 1024) {
+            Ok(thread) => core::mem::forget(thread),
+            Err(_) => break,
+        }
+        workers[count] = address;
+        count += 1;
+    }
+    count
 }
 
 /// `smbd user NAME UID GID PASSWORD`: prints the line for the smbusers file.

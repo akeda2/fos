@@ -202,3 +202,13 @@ On mf `idle` sleeps a whole timer tick, so a fast writer must not call it betwee
 | 1 MiB requests (`maxio=`, SMB 2.1+ multi-credit; remount the client, its `wsize` is fixed at mount time) and a 1024-frame e1000 receive ring | 6.0 s | ~908 Mbit/s |
 
 With 1 MiB requests and the old 128-frame ring the transfer fell to ~8 MB/s: the 2 MiB window outran the ring while a request was on the disk, and TCP retransmitted. The ring (about 12 ms at line rate) fixed it. One gigabit TCP stream carries about 941 Mbit/s.
+
+## Worker threads (server kernel, ABI 37)
+
+On mf `smbd` starts four worker threads (`WORKERS` in `tapes/smbd/src/main.rs`; the line "smbd: 4 worker threads." shows it). The
+network thread keeps the NIC and every TCP slot and takes each complete request into an idle worker's buffer; the worker runs
+`Server::handle` (all file I/O) and hands the answer back, and the network thread sends it. A slot has one request in flight, so
+a session's requests stay in order and only one thread touches its `Server`. A slow disk no longer stops frames coming in, and
+several clients no longer wait behind each other's I/O (the disk itself is still one lock). Embedded kernels have no threads
+(`tape_rt::threads_supported()`) and keep the single loop. Tested by `make test-mf-smbd` (six clients at once); throughput with
+several clients on rack is not measured yet.
