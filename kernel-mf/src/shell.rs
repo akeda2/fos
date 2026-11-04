@@ -16,8 +16,13 @@ struct Keys {
     buffer: [u8; 64],
     head: usize,
     count: usize,
+    /// Tick at which an Escape arrived that may start a cursor-key sequence (`ESC [ D`); 0 when none is pending.
+    escape_tick: u64,
 }
-static KEYS: crate::sync::SpinLock<Keys> = crate::sync::SpinLock::new(Keys { pid: 0, buffer: [0; 64], head: 0, count: 0 });
+static KEYS: crate::sync::SpinLock<Keys> = crate::sync::SpinLock::new(Keys { pid: 0, buffer: [0; 64], head: 0, count: 0, escape_tick: 0 });
+
+/// How long an Escape waits for the `[` of a sequence; a terminal sends the bytes back to back, a person never types that fast.
+const ESCAPE_WAIT_TICKS: u64 = 3;
 
 /// Makes `pid` the tape that receives typed bytes. Gives up at once if it already ended.
 pub fn set_foreground(pid: u64) {
@@ -28,6 +33,7 @@ pub fn set_foreground(pid: u64) {
     keys.pid = pid;
     keys.head = 0;
     keys.count = 0;
+    keys.escape_tick = 0;
 }
 
 /// The tape `pid` ended: the shell takes the keyboard back (and says so with a fresh prompt).
@@ -52,24 +58,52 @@ pub fn take_key(pid: u64) -> Option<u8> {
     Some(byte)
 }
 
-/// Routes a byte to the foreground tape; false when there is none.
+fn push_key(keys: &mut Keys, byte: u8) {
+    if keys.count < keys.buffer.len() {
+        let tail = (keys.head + keys.count) % keys.buffer.len();
+        keys.buffer[tail] = byte;
+        keys.count += 1;
+    }
+}
+
+/// Routes a byte to the foreground tape; false when there is none. A lone Escape kills the tape, but Escape followed at once
+/// by `[` or `O` is a cursor key and goes to the tape as typed (the embedded kernel does the same).
 fn feed_foreground(byte: u8) -> bool {
     let mut keys = KEYS.lock();
     let pid = keys.pid;
     if pid == 0 {
         return false;
     }
-    if byte == ESCAPE {
+    if keys.escape_tick != 0 {
+        keys.escape_tick = 0;
+        if byte == b'[' || byte == b'O' {
+            push_key(&mut keys, ESCAPE);
+            push_key(&mut keys, byte);
+            return true;
+        }
         drop(keys);
         sched::kill(pid);
         return true;
     }
-    if keys.count < keys.buffer.len() {
-        let tail = (keys.head + keys.count) % keys.buffer.len();
-        keys.buffer[tail] = byte;
-        keys.count += 1;
+    if byte == ESCAPE {
+        keys.escape_tick = apic::ticks().max(1);
+        return true;
     }
+    push_key(&mut keys, byte);
     true
+}
+
+/// A lone Escape that nothing followed in time stops the foreground tape; called from the service loop.
+pub fn poll_escape() {
+    let mut keys = KEYS.lock();
+    if keys.escape_tick != 0 && apic::ticks().saturating_sub(keys.escape_tick) >= ESCAPE_WAIT_TICKS {
+        keys.escape_tick = 0;
+        let pid = keys.pid;
+        drop(keys);
+        if pid != 0 {
+            sched::kill(pid);
+        }
+    }
 }
 pub fn prompt() {
     print!("{PROMPT}");
