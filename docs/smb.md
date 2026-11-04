@@ -1,6 +1,6 @@
 # SMB file server and client
 
-Status: design (2026-11-03). Nothing here is built yet except the client in `crates/smb` (guest only, used by `fosplay`).
+Status: built (server, client, mount, writes to ext4). This file is the design and measurement log; the how-to is `docs/smb-manual.md`.
 
 ## Goal
 
