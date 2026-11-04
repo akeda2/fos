@@ -56,12 +56,10 @@ pub struct Thread {
     kstack_top: u64,
     /// Set by `kill`: a process thread ends itself the next time it is in the kernel.
     killed: bool,
-    /// Bytes the process has written to the console (for the self-test).
-    written: u64,
     /// Unique process number (thread ids are reused), 0 for a kernel thread.
     pid: u64,
-    /// Next free address of the process's `alloc` heap (0 until the first allocation).
-    heap_next: u64,
+    /// Unique number of a thread started by `thread_spawn` (what `join` waits for), 0 for the first thread of a process.
+    tid: u64,
     /// Timer ticks this thread was the one running when a CPU's timer fired (10 ms each): its CPU time, sampled.
     cpu_ticks: u64,
     /// The CPU it was last seen running on.
@@ -83,7 +81,24 @@ struct Sched {
     switches: u64,
     /// Ticks each CPU found a thread other than an idle thread or the polling `service` thread running (`top`).
     busy: [u64; MAX_CPUS],
+    /// What the threads of one process share: how many are alive, its heap, its console byte count and how it ended first.
+    procs: Vec<Proc>,
 }
+
+struct Proc {
+    pid: u64,
+    live: usize,
+    heap_next: u64,
+    written: u64,
+    outcome: Option<crate::process::How>,
+}
+
+/// Threads one process may have at a time (each holds a kernel stack of 256 KiB).
+pub const MAX_PROCESS_THREADS: usize = 64;
+/// Marks a wait key as "thread `tid` has ended" so it cannot collide with a futex key (user addresses are below 2^47).
+const JOIN_KEY: usize = 1 << 63;
+
+static NEXT_TID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 static SCHED: SpinLock<Option<Sched>> = SpinLock::new(None);
 
@@ -130,8 +145,8 @@ fn this_cpu() -> usize {
 
 /// Makes the calling (boot) context thread 0. Call once, on the boot CPU, before spawning.
 pub fn init() {
-    let boot = Box::new(Thread { id: 0, name: *b"idle0\0\0\0\0\0\0\0\0\0\0\0", state: State::Running, rsp: 0, slot: None, key: 0, wake_at: 0, pinned: Some(0), on_cpu: true, root: 0, kstack_top: 0, killed: false, written: 0, pid: 0, heap_next: 0, cpu_ticks: 0, last_cpu: 0, fpu: None });
-    let mut sched = Sched { threads: Vec::new(), queue: VecDeque::new(), free_slots: Vec::new(), next_slot: 0, current: [NO_THREAD; MAX_CPUS], previous: [NO_THREAD; MAX_CPUS], idle: [NO_THREAD; MAX_CPUS], switches: 0, busy: [0; MAX_CPUS] };
+    let boot = Box::new(Thread { id: 0, name: *b"idle0\0\0\0\0\0\0\0\0\0\0\0", state: State::Running, rsp: 0, slot: None, key: 0, wake_at: 0, pinned: Some(0), on_cpu: true, root: 0, kstack_top: 0, killed: false, pid: 0, tid: 0, cpu_ticks: 0, last_cpu: 0, fpu: None });
+    let mut sched = Sched { threads: Vec::new(), queue: VecDeque::new(), free_slots: Vec::new(), next_slot: 0, current: [NO_THREAD; MAX_CPUS], previous: [NO_THREAD; MAX_CPUS], idle: [NO_THREAD; MAX_CPUS], switches: 0, busy: [0; MAX_CPUS], procs: Vec::new() };
     sched.threads.push(Some(boot));
     sched.current[0] = 0;
     *SCHED.lock() = Some(sched);
@@ -152,7 +167,7 @@ pub fn attach_cpu() {
     let mut name = *b"idle\0\0\0\0\0\0\0\0\0\0\0\0";
     name[4] = b'0' + (cpu_index % 10) as u8;
     let id = sched.threads.iter().position(Option::is_none).unwrap_or(sched.threads.len());
-    let thread = Box::new(Thread { id, name, state: State::Running, rsp: 0, slot: None, key: 0, wake_at: 0, pinned: Some(cpu_index), on_cpu: true, root: 0, kstack_top: 0, killed: false, written: 0, pid: 0, heap_next: 0, cpu_ticks: 0, last_cpu: 0, fpu: None });
+    let thread = Box::new(Thread { id, name, state: State::Running, rsp: 0, slot: None, key: 0, wake_at: 0, pinned: Some(cpu_index), on_cpu: true, root: 0, kstack_top: 0, killed: false, pid: 0, tid: 0, cpu_ticks: 0, last_cpu: 0, fpu: None });
     if id == sched.threads.len() {
         sched.threads.push(Some(thread));
     } else {
@@ -164,29 +179,48 @@ pub fn attach_cpu() {
 
 /// Starts a thread on CPU 0 running `entry(argument)`; it is queued, not run yet. Returns its id.
 pub fn spawn(name: &str, entry: extern "C" fn(usize), argument: usize) -> Option<usize> {
-    spawn_on(name, entry, argument, Some(0), 0)
+    spawn_on(name, entry, argument, Some(0), 0, 0, 0)
 }
 
 /// Starts a thread that runs a process: `root` is its address space (`vm::create_user_space`), loaded whenever the thread runs.
 /// Any CPU may run it; its entry function ends in `process::enter_user`.
 pub fn spawn_user(name: &str, entry: extern "C" fn(usize), argument: usize, root: u64) -> Option<usize> {
-    spawn_on(name, entry, argument, None, root)
+    spawn_on(name, entry, argument, None, root, 0, 0)
+}
+
+/// Starts another thread of the process `pid` (which must be running): it shares `root`, the heap and the process's
+/// fate. Returns the kernel thread id and the thread's `tid`, or `None` at `MAX_PROCESS_THREADS` or out of memory.
+pub fn spawn_thread(name: &str, entry: extern "C" fn(usize), argument: usize, root: u64, pid: u64) -> Option<u64> {
+    let tid = NEXT_TID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    spawn_on(name, entry, argument, None, root, pid, tid).map(|_| tid)
 }
 
 /// Like `spawn`, but any CPU may run the thread: it must not touch the unlocked boot-CPU drivers.
 pub fn spawn_any(name: &str, entry: extern "C" fn(usize), argument: usize) -> Option<usize> {
-    spawn_on(name, entry, argument, None, 0)
+    spawn_on(name, entry, argument, None, 0, 0, 0)
 }
 
-fn spawn_on(name: &str, entry: extern "C" fn(usize), argument: usize, pinned: Option<usize>, root: u64) -> Option<usize> {
+fn spawn_on(name: &str, entry: extern "C" fn(usize), argument: usize, pinned: Option<usize>, root: u64, pid: u64, tid: u64) -> Option<usize> {
     let mut guard = SCHED.lock();
     let sched = guard.as_mut()?;
+    if pid != 0 {
+        let process = sched.procs.iter_mut().find(|p| p.pid == pid)?;
+        if process.live >= MAX_PROCESS_THREADS {
+            return None;
+        }
+        process.live += 1;
+    }
     let slot = sched.free_slots.pop().unwrap_or_else(|| {
         sched.next_slot += 1;
         sched.next_slot - 1
     });
     let Some(frames) = pmm::allocate(STACK_PAGES, None) else {
         sched.free_slots.push(slot);
+        if pid != 0 {
+            if let Some(process) = sched.procs.iter_mut().find(|p| p.pid == pid) {
+                process.live -= 1;
+            }
+        }
         return None;
     };
     let top = vm::map_stack(slot, STACK_PAGES, frames);
@@ -207,7 +241,7 @@ fn spawn_on(name: &str, entry: extern "C" fn(usize), argument: usize, pinned: Op
             sched.threads.len() - 1
         }
     };
-    sched.threads[id] = Some(Box::new(Thread { id, name: bytes, state: State::Ready, rsp: start, slot: Some((slot, frames)), key: 0, wake_at: 0, pinned, on_cpu: false, root, kstack_top: top, killed: false, written: 0, pid: 0, heap_next: 0, cpu_ticks: 0, last_cpu: 0, fpu: if root != 0 { crate::fpu::Area::new() } else { None } }));
+    sched.threads[id] = Some(Box::new(Thread { id, name: bytes, state: State::Ready, rsp: start, slot: Some((slot, frames)), key: 0, wake_at: 0, pinned, on_cpu: false, root, kstack_top: top, killed: false, pid, tid, cpu_ticks: 0, last_cpu: 0, fpu: if root != 0 { crate::fpu::Area::new() } else { None } }));
     sched.queue.push_back(id);
     let mask = idle_cpu_for(sched, pinned, 0);
     drop(guard);
@@ -392,28 +426,125 @@ pub fn detach_root() -> u64 {
 
 /// Asks a process to end: it does so the next time it is in the kernel (at the latest on its next timer tick).
 pub fn kill(pid: u64) {
-    let mut guard = SCHED.lock();
-    if let Some(sched) = guard.as_mut() {
-        for thread in sched.threads.iter_mut().flatten() {
-            if thread.pid == pid {
-                thread.killed = true;
+    kill_where(|thread| thread.pid == pid);
+}
+
+/// The process as a whole is ending: records `how` (first caller wins, so a sibling flagged below cannot report "killed" first)
+/// and flags the other threads of the calling thread's process.
+pub fn end_process(how: crate::process::How) {
+    let me = current_id();
+    let pid = current_pid();
+    if let Some(process) = SCHED.lock().as_mut().and_then(|s| s.procs.iter_mut().find(|p| p.pid == pid)) {
+        process.outcome.get_or_insert(how);
+    }
+    kill_where(|thread| thread.pid == pid && thread.id != me);
+}
+
+/// Flags the matching threads; one blocked in the kernel (a futex, a join) is made ready so it notices.
+fn kill_where(matches: impl Fn(&Thread) -> bool) {
+    let mut mask = 0;
+    {
+        let mut guard = SCHED.lock();
+        let Some(sched) = guard.as_mut() else { return };
+        for id in 0..sched.threads.len() {
+            let Some(thread) = sched.threads[id].as_mut() else { continue };
+            if thread.pid == 0 || !matches(thread) {
+                continue;
+            }
+            thread.killed = true;
+            if thread.state == State::Blocked {
+                thread.state = State::Ready;
+                let pinned = thread.pinned;
+                sched.queue.push_back(id);
+                mask |= idle_cpu_for(sched, pinned, mask);
             }
         }
     }
+    kick(mask);
+}
+
+/// One thread of the calling process is done. Records `how` (when given) if the process has no outcome yet; the last thread out gets
+/// `Some((outcome, console bytes written))` and the process is forgotten.
+pub fn leave_process(how: Option<crate::process::How>) -> Option<(crate::process::How, u64)> {
+    let pid = current_pid();
+    let mut guard = SCHED.lock();
+    let sched = guard.as_mut()?;
+    let index = sched.procs.iter().position(|p| p.pid == pid)?;
+    let process = &mut sched.procs[index];
+    if process.outcome.is_none() {
+        process.outcome = how;
+    }
+    process.live -= 1;
+    if process.live == 0 {
+        let outcome = process.outcome.unwrap_or(crate::process::How::Exited(0));
+        let written = process.written;
+        sched.procs.swap_remove(index);
+        Some((outcome, written))
+    } else {
+        None
+    }
+}
+
+/// Is the thread `tid` still running?
+fn tid_alive(sched: &Sched, tid: u64) -> bool {
+    sched.threads.iter().flatten().any(|t| t.tid == tid && t.state != State::Dead)
+}
+
+/// Waits until thread `tid` (of any process; a stale or unknown number returns at once) has ended.
+pub fn join(tid: u64) {
+    let flags = cpu::interrupts_save_and_disable();
+    let blocked = {
+        let mut guard = SCHED.lock();
+        let sched = guard.as_mut().unwrap();
+        if tid != 0 && tid_alive(sched, tid) {
+            let current = sched.current[this_cpu()];
+            let thread = sched.threads[current].as_mut().unwrap();
+            thread.state = State::Blocked;
+            thread.key = JOIN_KEY | tid as usize;
+            true
+        } else {
+            false
+        }
+    };
+    if blocked {
+        switch_away(false);
+    }
+    cpu::interrupts_restore(flags);
+}
+
+/// Number of live threads in the calling thread's process.
+pub fn process_threads() -> usize {
+    let pid = current_pid();
+    SCHED.lock().as_ref().and_then(|s| s.procs.iter().find(|p| p.pid == pid)).map_or(1, |p| p.live)
 }
 
 /// Gives the calling thread its process number.
 pub fn set_pid(pid: u64) {
-    with_current(|t| t.pid = pid);
+    let mut guard = SCHED.lock();
+    let Some(sched) = guard.as_mut() else { return };
+    sched.procs.push(Proc { pid, live: 1, heap_next: 0, written: 0, outcome: None });
+    let current = sched.current[this_cpu()];
+    if let Some(thread) = sched.threads.get_mut(current).and_then(Option::as_mut) {
+        thread.pid = pid;
+    }
+}
+
+/// Runs `f` on the process record of the calling thread (its threads share one).
+fn with_proc<R>(f: impl FnOnce(&mut Proc) -> R) -> Option<R> {
+    let mut guard = SCHED.lock();
+    let sched = guard.as_mut()?;
+    let current = sched.current[this_cpu()];
+    let pid = sched.threads.get(current)?.as_ref()?.pid;
+    sched.procs.iter_mut().find(|p| p.pid == pid).map(f)
 }
 
 /// The process heap's next free address (0 before the first allocation) and a way to move it.
 pub fn heap_next() -> u64 {
-    with_current(|t| t.heap_next).unwrap_or(0)
+    with_proc(|p| p.heap_next).unwrap_or(0)
 }
 
 pub fn set_heap_next(address: u64) {
-    with_current(|t| t.heap_next = address);
+    with_proc(|p| p.heap_next = address);
 }
 
 pub fn current_pid() -> u64 {
@@ -426,9 +557,9 @@ pub fn current_killed() -> bool {
 
 /// Counts console bytes a process wrote; returns the running total.
 pub fn add_written(bytes: u64) -> u64 {
-    with_current(|t| {
-        t.written += bytes;
-        t.written
+    with_proc(|p| {
+        p.written += bytes;
+        p.written
     })
     .unwrap_or(0)
 }
@@ -441,12 +572,28 @@ extern "C" fn sched_finish_switch() {
 /// Ends the calling thread. Its stack is released by the thread that runs next.
 pub fn exit() -> ! {
     cpu::interrupts_disable();
+    let mut mask = 0;
     {
         let mut guard = SCHED.lock();
         let sched = guard.as_mut().unwrap();
         let current = sched.current[this_cpu()];
-        sched.threads[current].as_mut().unwrap().state = State::Dead;
+        let thread = sched.threads[current].as_mut().unwrap();
+        thread.state = State::Dead;
+        let tid = thread.tid;
+        if tid != 0 {
+            for id in 0..sched.threads.len() {
+                if let Some(waiter) = sched.threads[id].as_mut() {
+                    if waiter.state == State::Blocked && waiter.key == JOIN_KEY | tid as usize {
+                        waiter.state = State::Ready;
+                        let pinned = waiter.pinned;
+                        sched.queue.push_back(id);
+                        mask |= idle_cpu_for(sched, pinned, mask);
+                    }
+                }
+            }
+        }
     }
+    kick(mask);
     switch_away(false);
     unreachable!("a dead thread was resumed");
 }
@@ -568,13 +715,20 @@ pub fn wait_while(key: usize, condition: impl FnOnce() -> bool) {
 
 /// Makes every thread blocked on `key` ready.
 pub fn wake_all(key: usize) {
+    wake_up_to(key, usize::MAX);
+}
+
+/// Makes at most `limit` threads blocked on `key` ready (the longest-blocked are not favoured: lowest thread id first).
+pub fn wake_up_to(key: usize, limit: usize) -> usize {
     let mut mask = 0;
+    let mut woken = 0;
     {
         let mut guard = SCHED.lock();
-        let Some(sched) = guard.as_mut() else { return };
+        let Some(sched) = guard.as_mut() else { return 0 };
         for id in 0..sched.threads.len() {
             if let Some(thread) = sched.threads[id].as_mut() {
-                if thread.state == State::Blocked && thread.key == key {
+                if woken < limit && thread.state == State::Blocked && thread.key == key {
+                    woken += 1;
                     thread.state = State::Ready;
                     let pinned = thread.pinned;
                     sched.queue.push_back(id);
@@ -584,6 +738,7 @@ pub fn wake_all(key: usize) {
         }
     }
     kick(mask);
+    woken
 }
 
 /// A mutex that puts a contending thread to sleep instead of spinning, so it may be held across `yield_now`, sleeps and long

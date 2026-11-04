@@ -48,6 +48,7 @@ pub mod nvme;
 pub mod pci;
 pub mod random;
 pub mod remote;
+pub mod tape_threads;
 pub mod rtl8139;
 pub mod rtl8168;
 pub mod screen;

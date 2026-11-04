@@ -17,7 +17,7 @@ use core::mem::{offset_of, size_of};
 use fosfor_abi::tape::{KEY_BASE, KEY_NONE, TAPE_API_VERSION, TapeApi};
 
 use crate::trap::Frame;
-use crate::{apic, fb, fpu, pmm, process, sched, tapeaudio, tapefs, tapenet, vm};
+use crate::{threads, apic, fb, fpu, pmm, process, sched, tapeaudio, tapefs, tapenet, vm};
 
 pub const SHIM_BASE: u64 = vm::USER_BASE + 0x200_0000;
 pub const TABLE_BASE: u64 = SHIM_BASE + 0x1000;
@@ -39,11 +39,19 @@ core::arch::global_asm!(
     r#"
     .text
     .balign 16
-    .global tape_shim_start, tape_shim_stubs, tape_shim_end
+    .global tape_shim_start, tape_shim_stubs, tape_shim_end, tape_thread_start
 tape_shim_start:                     # entered with rdi = the table, rsi = the tape's entry point
     call rsi
     mov eax, 1                       # the tape returned: exit(0)
     xor edi, edi
+    syscall
+    ud2
+    .balign 16
+tape_thread_start:                   # another thread: rdi = its entry point, rsi = its argument (the stack is 16-aligned)
+    mov rax, rdi
+    mov rdi, rsi
+    call rax
+    mov eax, 5                       # the entry returned: end this thread only
     syscall
     ud2
     .balign 16
@@ -63,6 +71,7 @@ tape_shim_end:
 
 unsafe extern "C" {
     static tape_shim_start: u8;
+    static tape_thread_start: u8;
     static tape_shim_stubs: u8;
     static tape_shim_end: u8;
 }
@@ -151,6 +160,10 @@ const VFS_REMOVE: u64 = slot(offset_of!(TapeApi, vfs_remove));
 const VFS_RENAME: u64 = slot(offset_of!(TapeApi, vfs_rename));
 const VFS_SET_OWNER: u64 = slot(offset_of!(TapeApi, vfs_set_owner));
 const VFS_SYNC: u64 = slot(offset_of!(TapeApi, vfs_sync));
+const THREAD_SPAWN: u64 = slot(offset_of!(TapeApi, thread_spawn));
+const THREAD_JOIN: u64 = slot(offset_of!(TapeApi, thread_join));
+const FUTEX_WAIT: u64 = slot(offset_of!(TapeApi, futex_wait));
+const FUTEX_WAKE: u64 = slot(offset_of!(TapeApi, futex_wake));
 const REMOTE_REGISTER: u64 = slot(offset_of!(TapeApi, remote_register));
 const REMOTE_UNREGISTER: u64 = slot(offset_of!(TapeApi, remote_unregister));
 const REMOTE_POLL: u64 = slot(offset_of!(TapeApi, remote_poll));
@@ -178,6 +191,11 @@ const GFX_BLIT_ON: u64 = slot(offset_of!(TapeApi, gfx_blit_on));
 /// The table slots that hold data, not a function.
 fn is_data(slot: u64) -> bool {
     [ARGS, ARGS_LEN, MEMORY_MAP, MEMORY_MAP_COUNT, MEMORY_MAP_DESCRIPTOR_SIZE].contains(&slot)
+}
+
+/// Where a new thread starts: the shim's `tape_thread_start`, mapped at the same place in every process.
+pub fn thread_start() -> u64 {
+    SHIM_BASE + unsafe { &tape_thread_start as *const u8 as usize - &tape_shim_start as *const u8 as usize } as u64 // kernel-memory
 }
 
 /// Where a process's code stub for table slot `slot` lives.
@@ -237,6 +255,7 @@ fn pages(bytes: u64) -> u64 {
 fn alloc_pages(bytes: u64) -> u64 {
     let count = pages(bytes);
     let root = sched::current_root();
+    let _map = threads::MAP_LOCK.lock();
     let start = match sched::heap_next() {
         0 => HEAP_BASE,
         next => next,
@@ -272,10 +291,21 @@ fn free_pages_at(address: u64, bytes: u64) {
     if address % 4096 != 0 || address < HEAP_BASE || address.saturating_add(bytes) > HEAP_LIMIT {
         return;
     }
-    for page in 0..pages(bytes) {
-        if let Some(frame) = vm::unmap_user_page(root, address + page * 4096) {
-            pmm::free(frame, 1);
+    let mut frames = alloc::vec::Vec::new();
+    {
+        let _map = threads::MAP_LOCK.lock();
+        for page in 0..pages(bytes) {
+            if let Some(frame) = vm::unmap_user_page(root, address + page * 4096) {
+                frames.push(frame);
+            }
         }
+    }
+    // Another thread of the process may run on another CPU and still cache the mappings: flush them there before the frames are reused.
+    if sched::process_threads() > 1 {
+        crate::tlb::shootdown(address, pages(bytes));
+    }
+    for frame in frames {
+        pmm::free(frame, 1);
     }
 }
 
@@ -375,6 +405,10 @@ pub fn call(frame: &mut Frame) {
         VFS_RENAME => tapefs::vfs_rename(a, b, c, d) as u64,
         VFS_SET_OWNER => tapefs::vfs_set_owner(a, b, c, d, e) as u64,
         VFS_SYNC => tapefs::vfs_sync() as u64,
+        THREAD_SPAWN => threads::spawn(a, b, c) as u64,
+        THREAD_JOIN => threads::join(a) as u64,
+        FUTEX_WAIT => threads::futex_wait(a, b) as u64,
+        FUTEX_WAKE => threads::futex_wake(a, b) as u64,
         REMOTE_REGISTER => tapefs::remote_register(a, b) as u64,
         REMOTE_UNREGISTER => tapefs::remote_unregister(a, b) as u64,
         REMOTE_POLL => tapefs::remote_poll(a, b, c, d, e) as u64,

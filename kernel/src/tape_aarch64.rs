@@ -224,6 +224,10 @@ fn make_api(info: &BootInfo, arguments: &str) -> TapeApi {
         remote_poll: kernel_core::remote::api_remote_poll,
         remote_reply: kernel_core::remote::api_remote_reply,
         vfs_sync: kernel_core::tape_vfs::api_vfs_sync,
+        thread_spawn: kernel_core::tape_threads::api_thread_spawn,
+        thread_join: kernel_core::tape_threads::api_thread_join,
+        futex_wait: kernel_core::tape_threads::api_futex_wait,
+        futex_wake: kernel_core::tape_threads::api_futex_wake,
         random: kernel_core::random::api_random,
     }
 }

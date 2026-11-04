@@ -47,6 +47,7 @@ their own.
 | Tape | What it does |
 | --- | --- |
 | `hello`, `calc`, `memtest` | The smallest example; an RPN calculator; a RAM tester and soak test. |
+| `thrcheck` | Tests tape threads (ABI 37, server kernel only): spawn, join, futex, concurrent alloc, kill. |
 | `abibad` | Server-kernel test: calls every tape-table function with hostile pointers (`abibad server`, `make test-mf-abibad`). |
 | `ed` | A line editor with cursor keys; saves to FOSFS, FAT32 or exFAT. |
 | `ebb` | A full-screen text editor (`tape run ebb NAME`): selection, undo, clipboard, mouse, colours via the console SGR support; `crates/edit-core` is its engine. |

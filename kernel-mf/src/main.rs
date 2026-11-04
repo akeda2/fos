@@ -12,6 +12,7 @@ mod fpu;
 mod process;
 mod sched;
 mod tapeapi;
+mod threads;
 mod tapeaudio;
 mod tapefs;
 mod tapenet;
