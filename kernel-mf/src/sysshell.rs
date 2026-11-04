@@ -507,7 +507,7 @@ pub fn cpuinfo() {
     println!("tsc        {}", if invariant { "invariant" } else { "not invariant" });
 }
 
-struct Console;
+pub(crate) struct Console;
 
 impl core::fmt::Write for Console {
     fn write_str(&mut self, text: &str) -> core::fmt::Result {

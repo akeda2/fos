@@ -269,6 +269,26 @@ pub fn locate(disk: usize) -> Result<Partition, Error> {
     Err(reason)
 }
 
+/// One line for `disks` when disk index `disk` holds an ext volume (`extN` names it); nothing otherwise. A volume whose
+/// journal is unreplayed is still listed.
+pub fn describe(disk: usize, out: &mut dyn Write) {
+    if commit_pending().is_err() {
+        return;
+    }
+    let Ok(partition) = locate(disk) else { return };
+    let kind = if partition.base == 0 { "whole disk" } else { "partition" };
+    match ext4::Fs::mount(partition) {
+        Ok(fs) => {
+            let (total, free) = fs.space();
+            let _ = writeln!(out, "  ext{}: '{}' {} MiB, {} MiB free ({kind})", disk + 1, core::str::from_utf8(fs.label()).unwrap_or("?"), total >> 20, free >> 20);
+        }
+        Err(Error::NeedsRecovery) => {
+            let _ = writeln!(out, "  ext{}: {} MiB {kind}, journal needs recovery (`ext4 disk{} recover`)", disk + 1, partition.sectors >> 11, disk + 1);
+        }
+        Err(_) => {}
+    }
+}
+
 fn why(error: Error) -> &'static str {
     match error {
         Error::Device => "the disk could not be read",

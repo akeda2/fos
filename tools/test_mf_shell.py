@@ -76,6 +76,8 @@ def ext4_scenario():
             check("hej på dig" in out, "ext4 cat reads it as UTF-8", out[-300:])
             out = machine.run("ext4 disk2 info")
             check("linuxvol" in out, "ext4 info shows the label", out[-300:])
+            out = machine.run("disks")
+            check("ext2: 'linuxvol'" in out and "ext1:" not in out, "disks lists the ext volume under its extN name", out[-300:])
             out = machine.run("ext4 disk2 cat /nothere")
             check("not found" in out, "a missing file is reported", out[-300:])
             out = machine.run("ext4 disk1")

@@ -318,6 +318,7 @@ fn disks() {
             core::str::from_utf8(&disk.origin[..disk.origin_length]).unwrap_or("?"),
             core::str::from_utf8(&disk.model).unwrap_or("?").trim()
         );
+        kernel_core::ext4vol::describe(index, &mut Console);
     }
     match crate::storage::boot_disk() {
         Some(disk) => crate::println!("boot disk: disk{}", disk + 1),
