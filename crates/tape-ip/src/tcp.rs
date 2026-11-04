@@ -176,6 +176,8 @@ const IDLE_MICROS: u64 = 10_000_000;
 /// With every slot taken, a SYN may evict the quietest established connection if it has been silent this long.
 const EVICT_MICROS: u64 = 1_000_000;
 /// The most unacknowledged bytes `Server::send` keeps in flight (the peer's window may be larger).
+/// How long `send_buffered` spins for the next acknowledgement before it sleeps.
+const ACK_SPIN_MICROS: u64 = 2_000;
 const FLIGHT: usize = 44 * SEND_CHUNK;
 
 /// What `send_buffered` keeps per slot: a copy of the bytes sent and not yet acknowledged (the newest `stream_in_flight()`
@@ -471,40 +473,25 @@ impl<const RX: usize, const N: usize> Server<RX, N> {
     pub fn send_buffered(&mut self, api: &TapeApi, slot: usize, data: &[u8], timeout_micros: u64) -> Result<(), &'static str> {
         let mut sent = 0;
         let mut progress = tape_rt::micros();
+        let mut acked = progress;
         while sent < data.len() {
-            if !self.is_open(slot) {
-                return Err("the connection was closed");
-            }
-            let in_flight = self.slots[slot].connection.stream_in_flight();
-            let window = self.slots[slot].connection.peer_window().min(FLIGHT).max(1);
-            if in_flight < window {
-                let chunk = (data.len() - sent).min(SEND_CHUNK).min(RX).min(window - in_flight);
-                let entry = &mut self.slots[slot];
-                // `tx_len` can be stale (older than what is in flight) after a plain `send`; with nothing in flight start over.
-                let mut kept = if in_flight == 0 || entry.tx_len < in_flight { 0 } else { entry.tx_len };
-                if kept < in_flight {
-                    return Err("the connection has data in flight that is not kept");
-                }
-                if kept + chunk > TX_KEEP {
-                    entry.tx_keep.copy_within(kept - in_flight..kept, 0);
-                    kept = in_flight;
-                }
-                entry.tx_keep[kept..kept + chunk].copy_from_slice(&data[sent..sent + chunk]);
-                entry.tx_len = kept + chunk;
-                let now = tape_rt::micros() as u32;
-                let length = entry.connection.stream_send(&data[sent..sent + chunk], now, &mut self.segment).map_err(|_| "the connection is not open")?;
-                self.transmit(api, slot, length);
-                sent += chunk;
+            let before = self.slots[slot].connection.stream_in_flight();
+            let taken = self.send_some(api, slot, &data[sent..])?;
+            sent += taken;
+            if taken > 0 {
                 progress = tape_rt::micros();
-                self.poll(api, 4);
                 continue;
             }
-            if !self.poll(api, 8) {
+            let busy = self.poll(api, 8);
+            let now = tape_rt::micros();
+            // `idle` sleeps until the next interrupt, a whole timer tick on the server kernel: a full flight then moved once per
+            // tick (about 6 MB/s). The acknowledgements of a LAN come within a round trip, so spin while they keep coming.
+            if !busy && now > acked + ACK_SPIN_MICROS {
                 tape_rt::idle();
             }
-            let now = tape_rt::micros();
-            if self.slots[slot].connection.stream_in_flight() < in_flight {
+            if self.slots[slot].connection.stream_in_flight() < before {
                 progress = now;
+                acked = now;
             }
             if now > progress + timeout_micros {
                 return Err("the peer did not acknowledge");
@@ -512,6 +499,46 @@ impl<const RX: usize, const N: usize> Server<RX, N> {
         }
         self.slots[slot].last = tape_rt::micros();
         Ok(())
+    }
+
+    /// The part of `send_buffered` that never waits: hands as much of `data` to the card as the peer's window and `FLIGHT`
+    /// allow right now and returns how many bytes that was (0 when the flight is full). A server with several connections
+    /// calls it from its main loop and keeps serving the others while the acknowledgements come in; the caller gives up on
+    /// a peer that takes nothing for too long.
+    pub fn send_some(&mut self, api: &TapeApi, slot: usize, data: &[u8]) -> Result<usize, &'static str> {
+        let mut sent = 0;
+        while sent < data.len() {
+            if !self.is_open(slot) {
+                return Err("the connection was closed");
+            }
+            let in_flight = self.slots[slot].connection.stream_in_flight();
+            let window = self.slots[slot].connection.peer_window().min(FLIGHT).max(1);
+            if in_flight >= window {
+                break;
+            }
+            let chunk = (data.len() - sent).min(SEND_CHUNK).min(RX).min(window - in_flight);
+            let entry = &mut self.slots[slot];
+            // `tx_len` can be stale (older than what is in flight) after a plain `send`; with nothing in flight start over.
+            let mut kept = if in_flight == 0 || entry.tx_len < in_flight { 0 } else { entry.tx_len };
+            if kept < in_flight {
+                return Err("the connection has data in flight that is not kept");
+            }
+            if kept + chunk > TX_KEEP {
+                entry.tx_keep.copy_within(kept - in_flight..kept, 0);
+                kept = in_flight;
+            }
+            entry.tx_keep[kept..kept + chunk].copy_from_slice(&data[sent..sent + chunk]);
+            entry.tx_len = kept + chunk;
+            let now = tape_rt::micros() as u32;
+            let length = entry.connection.stream_send(&data[sent..sent + chunk], now, &mut self.segment).map_err(|_| "the connection is not open")?;
+            self.transmit(api, slot, length);
+            sent += chunk;
+            self.poll(api, 4);
+        }
+        if sent > 0 {
+            self.slots[slot].last = tape_rt::micros();
+        }
+        Ok(sent)
     }
 
     /// Says goodbye (FIN) and waits a moment for the acknowledgement; the slot is taken back once the peer has closed too
