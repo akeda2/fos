@@ -3,7 +3,7 @@
 use core::fmt;
 
 use crate::glob::{has_wildcards, matches, unescape};
-use crate::{Command, Entry, FsError, Host, say, sayln, split_word};
+use crate::{Command, Entry, FsError, Host, Owner, say, sayln, split_word};
 
 pub static COMMANDS: &[Command] = &[
     Command::new("ls", "ls [diskN|@LABEL|esp][/FOLDER|PATTERN]", "lists the files of a volume or folder, or the matches of a pattern (* ? [a-z]).", ls),
@@ -14,7 +14,149 @@ pub static COMMANDS: &[Command] = &[
     Command::new("mv", "mv SRC|PATTERN DST", "moves a file (copy, read back, remove); DST may be a volume or folder (required for a pattern).", mv),
     Command::new("cmp", "cmp A B", "says whether two files are byte-identical (a read-back check of `cp`).", cmp),
     Command::new("mkdir", "mkdir NAME", "makes a folder on a FOSFS v4 or exFAT volume (NAME, diskN/NAME or @LABEL/NAME); `ls diskN/NAME` lists it.", mkdir),
+    Command::new("stat", "stat NAME", "shows the owner, permission bits and size of a file or folder on an ext volume (extN/NAME or @LABEL/NAME).", stat),
+    Command::new("chmod", "chmod [-R] MODE NAME", "sets the permission bits (octal, e.g. 755) of a file or folder on an ext volume; -R includes everything inside a folder.", chmod),
+    Command::new("chown", "chown [-R] UID[:GID] NAME", "sets the owner (and group) of a file or folder on an ext volume; :GID alone changes only the group; -R includes everything inside a folder.", chown),
 ];
+
+fn rwx(mode: u32) -> [u8; 9] {
+    let mut text = *b"---------";
+    for (index, letter) in b"rwxrwxrwx".iter().enumerate() {
+        if mode & (0o400 >> index) != 0 {
+            text[index] = *letter;
+        }
+    }
+    text
+}
+
+fn stat(host: &mut dyn Host, rest: &str) {
+    let (reference, _) = split_word(rest);
+    if reference.is_empty() {
+        return sayln!(host, "Usage: stat NAME   (extN/NAME or @LABEL/NAME)");
+    }
+    match host.owner_of(reference) {
+        Ok(Owner { uid, gid, mode, directory, size, links }) => {
+            let text = rwx(mode);
+            sayln!(host, "{reference}: {}, {size} bytes, mode {:04o} ({}), uid {uid} gid {gid}, {links} link(s)", if directory { "folder" } else { "file" }, mode & 0o7777, core::str::from_utf8(&text).unwrap_or("?"));
+        }
+        Err(FsError::Denied) => sayln!(host, "stat: {reference}: only ext volumes keep owners and modes."),
+        Err(error) => sayln!(host, "stat: {reference}: {error}."),
+    }
+}
+
+/// What `chmod` and `chown` change; `None` keeps the old value.
+struct Change {
+    uid: Option<u32>,
+    gid: Option<u32>,
+    mode: Option<u16>,
+}
+
+/// (changed, failed)
+type Counts = (usize, usize);
+
+fn change_one(host: &mut dyn Host, verb: &str, reference: &str, change: &Change, counts: &mut Counts) {
+    let result = host.owner_of(reference).and_then(|now| host.set_owner(reference, change.uid.unwrap_or(now.uid), change.gid.unwrap_or(now.gid), change.mode));
+    match result {
+        Ok(()) => counts.0 += 1,
+        Err(error) => {
+            counts.1 += 1;
+            match error {
+                FsError::Denied => sayln!(host, "{verb}: {reference}: only a writable ext volume keeps owners and modes."),
+                error => sayln!(host, "{verb}: {reference}: {error}."),
+            }
+        }
+    }
+}
+
+fn change_tree(host: &mut dyn Host, scratch: &mut [u8], verb: &str, reference: &str, change: &Change, depth: usize, counts: &mut Counts) {
+    change_one(host, verb, reference, change, counts);
+    let directory = host.owner_of(reference).is_ok_and(|owner| owner.directory);
+    if !directory {
+        return;
+    }
+    if depth >= DEPTH {
+        counts.1 += 1;
+        return sayln!(host, "{verb}: {reference} nests deeper than {DEPTH} folders; the rest is skipped.");
+    }
+    let (region, deeper) = scratch.split_at_mut(LEVEL);
+    let capacity = region.len() / RECORD;
+    let (mut found, mut skipped) = (0, 0);
+    let listed = host.list(reference.trim_end_matches('/'), &mut |_, entry| {
+        if entry.name.len() > NAME_MAX || found >= capacity {
+            skipped += 1;
+            return;
+        }
+        let record = &mut region[found * RECORD..(found + 1) * RECORD];
+        record[0] = entry.name.len() as u8;
+        record[10..10 + entry.name.len()].copy_from_slice(entry.name);
+        found += 1;
+    });
+    if let Err(error) = listed {
+        counts.1 += 1;
+        return sayln!(host, "{verb}: {reference}: {error}.");
+    }
+    if skipped > 0 {
+        counts.1 += skipped;
+        sayln!(host, "{verb}: {skipped} entries of {reference} were skipped (names over {NAME_MAX} bytes, or more than {capacity} in a folder).");
+    }
+    for index in 0..found {
+        let record = &region[index * RECORD..(index + 1) * RECORD];
+        let name = &record[10..10 + usize::from(record[0])];
+        let mut path = [0u8; 192];
+        match join(&mut path, reference, name) {
+            Some(path) => change_tree(host, deeper, verb, path, change, depth + 1, counts),
+            None => counts.1 += 1,
+        }
+    }
+}
+
+/// Shared by `chmod` and `chown`: `[-R] ARG NAME`, with `parse` turning ARG into the change.
+fn change(host: &mut dyn Host, verb: &str, usage: &str, rest: &str, parse: fn(&str) -> Option<Change>) {
+    let (first, after) = split_word(rest);
+    let (recursive, rest) = if matches!(first, "-R" | "-r") { (true, after) } else { (false, rest) };
+    let (argument, after) = split_word(rest);
+    let (reference, _) = split_word(after);
+    if argument.is_empty() || reference.is_empty() {
+        return sayln!(host, "Usage: {usage}");
+    }
+    let Some(change) = parse(argument) else {
+        return sayln!(host, "{verb}: {argument}: not understood. Usage: {usage}");
+    };
+    let mut counts = (0, 0);
+    if recursive {
+        let reference = reference.trim_end_matches('/');
+        if !host.with_buffer(DEPTH * LEVEL, &mut |host, scratch| change_tree(host, scratch, verb, reference, &change, 0, &mut counts)) {
+            return sayln!(host, "{verb}: not enough free memory.");
+        }
+    } else {
+        change_one(host, verb, reference, &change, &mut counts);
+    }
+    if recursive || counts.1 > 0 {
+        sayln!(host, "{} changed{}.", counts.0, if counts.1 > 0 { ", some failed" } else { "" });
+    }
+}
+
+fn chmod(host: &mut dyn Host, rest: &str) {
+    change(host, "chmod", "chmod [-R] MODE NAME   (MODE octal, e.g. 755)", rest, |text| {
+        let mode = u16::from_str_radix(text, 8).ok().filter(|&mode| mode <= 0o7777)?;
+        Some(Change { uid: None, gid: None, mode: Some(mode) })
+    });
+}
+
+fn chown(host: &mut dyn Host, rest: &str) {
+    change(host, "chown", "chown [-R] UID[:GID] NAME   (:GID alone changes the group)", rest, |text| {
+        let (user, group) = match text.split_once(':') {
+            Some((user, group)) => (user, Some(group)),
+            None => (text, None),
+        };
+        let uid = if user.is_empty() { None } else { Some(user.parse().ok()?) };
+        let gid = match group {
+            Some("") | None => None,
+            Some(group) => Some(group.parse().ok()?),
+        };
+        (uid.is_some() || gid.is_some()).then_some(Change { uid, gid, mode: None })
+    });
+}
 
 /// The largest file `cat` shows.
 const CAT_LIMIT: u64 = 64 * 1024;

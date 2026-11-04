@@ -43,6 +43,17 @@ pub struct Entry<'a> {
     pub modified: Option<Stamp>,
 }
 
+/// Owner, permission bits and kind of an entry on a volume that keeps them (ext4).
+#[derive(Clone, Copy, Debug)]
+pub struct Owner {
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
+    pub directory: bool,
+    pub size: u64,
+    pub links: u32,
+}
+
 /// Why a file call failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FsError {
@@ -92,6 +103,14 @@ pub trait Host {
     /// a volume without in-place rename, or the name is taken), so the caller copies.
     fn rename(&mut self, _from: &str, _to: &str) -> Result<bool, FsError> {
         Ok(false)
+    }
+    /// Owner and permission bits of `reference`; `Err(Denied)` when the volume keeps none (only ext volumes do).
+    fn owner_of(&mut self, _reference: &str) -> Result<Owner, FsError> {
+        Err(FsError::Denied)
+    }
+    /// Sets owner and, when given, the permission bits (ext volumes only).
+    fn set_owner(&mut self, _reference: &str, _uid: u32, _gid: u32, _mode: Option<u16>) -> Result<(), FsError> {
+        Err(FsError::Denied)
     }
     /// Calls `each` (handing it the host back, to print with) for every entry of the volume and returns its kind (`"FOSFS"`, `"FAT32"`, `"exFAT"`).
     fn list(&mut self, volume: &str, each: &mut dyn FnMut(&mut dyn Host, Entry)) -> Result<&'static str, FsError>;

@@ -43,6 +43,12 @@ def main():
             outputs["disks"] = run("disks")
             outputs["sha_ext"] = run("sha256 ext3/shell.txt")
             outputs["sha_label"] = run("sha256 @vfswrite/shdir/copy.txt")
+            outputs["stat_before"] = run("stat ext3/shdir")
+            run("chown -R 1000:100 ext3/shdir")
+            run("chmod 700 ext3/shdir")
+            outputs["stat_after"] = run("stat ext3/shdir/copy.txt")
+            outputs["stat_dir"] = run("stat @vfswrite/shdir")
+            outputs["chown_bad"] = run("chown x ext3/shdir")
 
         boot(tmp, [boot_disk, ext], scenario)
         out = outputs["write"]
@@ -82,6 +88,10 @@ def main():
         digest = hashlib.sha256(b"shell text").hexdigest()
         check(digest in outputs["sha_ext"], "sha256 of an extN file", outputs["sha_ext"])
         check(digest in outputs["sha_label"], "sha256 of an @LABEL ext file", outputs["sha_label"])
+        check("folder" in outputs["stat_before"] and "uid 0 gid 0" in outputs["stat_before"], "stat shows the owner of a folder", outputs["stat_before"])
+        check("uid 1000 gid 100" in outputs["stat_after"], "chown -R reaches the files inside", outputs["stat_after"])
+        check("mode 0700 (rwx------)" in outputs["stat_dir"] and "uid 1000 gid 100" in outputs["stat_dir"], "chmod keeps the owner, chown kept the mode", outputs["stat_dir"])
+        check("not understood" in outputs["chown_bad"], "a bad chown argument is refused", outputs["chown_bad"])
         done = subprocess.run([tool("e2fsck"), "-fn", str(ext)], capture_output=True, text=True)
         check(done.returncode == 0, "e2fsck finds the volume consistent", done.stdout + done.stderr)
         shell_cat = subprocess.run([tool("debugfs"), "-R", "cat /shdir/copy.txt", str(ext)], capture_output=True).stdout
@@ -89,6 +99,8 @@ def main():
         cat = subprocess.run([tool("debugfs"), "-R", "cat /keep.txt", str(ext)], capture_output=True).stdout
         check(cat == b"kept text more", "debugfs reads the file back, the synced write included", repr(cat))
         stat = subprocess.run([tool("debugfs"), "-R", "stat /kdir", str(ext)], capture_output=True, text=True).stdout
+        owner = subprocess.run([tool("debugfs"), "-R", "stat /shdir/copy.txt", str(ext)], capture_output=True, text=True).stdout
+        check("User:  1000" in owner and "Group:   100" in owner, "debugfs agrees with chown -R", owner[:300])
         check("User:     7" in stat and "Group:     8" in stat and "Mode:  0750" in stat, "owner set, mode kept", stat[:400])
     print("vfs-write: all checks passed")
 
