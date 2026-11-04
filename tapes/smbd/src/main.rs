@@ -1,4 +1,4 @@
-//! smbd: a read-only SMB 2/3 file server (guest access, no signing, no encryption) for one folder of any volume the kernel
+//! smbd: an SMB 2/3 file server (guest access, no signing, no encryption) for one folder of any volume the kernel
 //! can read, ext2/3/4 included (`vfs_*`, tape ABI 32). The protocol is `crates/smb` (`server`); this tape is its TCP
 //! front end, a service like `httpd` (`run smbd @SMBD.CFG &2`). Logins are checked against the `smbusers` file (NTLMv2);
 //! without that file everyone is a guest, so use it on a network you trust.
@@ -6,7 +6,7 @@
 #![no_main]
 
 use smb::ntlm::{md5, nt_hash};
-use smb::server::{Account, Identity, MAX_IO, Server, Share, Stat};
+use smb::server::{Account, Fail, Identity, MAX_IO, Server, Share, Stat};
 use tape_ip::net::{self, NetConfig};
 use tape_ip::tcp::Server as Tcp;
 use tape_net::MacAddress;
@@ -15,9 +15,9 @@ use tape_rt::{TapeApi, arg_value as value, println};
 
 tape_rt::tape_help!(
     br#"smbd [@NAME] [root=DIR] [share=NAME] [port=445] [nic=N] [ip=A.B.C.D/N]
-      [gateway=A.B.C.D] [log]
-A read-only SMB file server (SMB 2.0.2 to 3.0, guest, no signing): Linux
-mount.cifs/smbclient, Windows and macOS can browse and copy from it. It runs as
+      [gateway=A.B.C.D] [log] [ro]
+An SMB file server (SMB 2.0.2 to 3.0, no signing): Linux mount.cifs/smbclient,
+Windows and macOS can browse, copy from it and, on ext volumes, write to it. It runs as
 a service: run smbd @SMBD.CFG &2 (the service owns NIC 2; tape run smbd takes
 the foreground and Escape stops it). Settings are key=value words on the
 command line or in the file (one per line, # for comments).
@@ -28,18 +28,23 @@ port=   TCP port (default 445).
 ip=     a fixed address like 192.168.1.20/24 (gateway= for the router);
         without it DHCP. nic= is the NIC number from 1 (default: nic use).
 log     print one line per connection.
+ro      refuse all changes (otherwise ext volumes can be written).
 Users: the file smbusers, one line per user, name:uid:gid:NTHASH. The line
 guest:uid:gid: lets anonymous and unknown logins in (as that uid/gid). With
 the file present, other logins need the password; without it everyone is a
 guest. A file's owner/group/other bits are checked against the uid and gid
 (uid 0 sees everything). Make a line with: smbd user NAME UID GID PASSWORD
-Nothing can be written. Needs tape ABI 32.
+Changes (put, mkdir, rename, delete) need tape ABI 34 and an ext2/3/4 volume;
+a new file belongs to the logged-in uid/gid, and the folder's mode bits decide
+who may add or remove entries. FOSFS and FAT shares stay read-only.
+Needs tape ABI 32.
 "#
 );
 
 const SLOTS: usize = 4;
 const OPENS: usize = 16;
-const RX: usize = 8192;
+/// Room for the largest message: a WRITE of MAX_IO bytes plus the headers.
+const RX: usize = MAX_IO + 4096;
 const ROOT_MAX: usize = 200;
 const SEND_TIMEOUT: u64 = 5_000_000;
 
@@ -106,11 +111,25 @@ struct Files {
     root_length: usize,
     name: [u8; 32],
     name_length: usize,
+    read_only: bool,
+}
+
+/// The `Fail` an ABI 34 error code stands for.
+fn fail(code: isize) -> Fail {
+    match code {
+        tape_rt::FS_NOT_FOUND => Fail::NotFound,
+        tape_rt::FS_EXISTS => Fail::Exists,
+        tape_rt::FS_NO_SPACE => Fail::NoSpace,
+        tape_rt::FS_NOT_EMPTY => Fail::NotEmpty,
+        tape_rt::FS_IS_DIR => Fail::IsDir,
+        tape_rt::FS_READ_ONLY | tape_rt::FS_BAD_NAME => Fail::Denied,
+        _ => Fail::Io,
+    }
 }
 
 impl Files {
     const fn new() -> Self {
-        Files { root: [0; ROOT_MAX], root_length: 0, name: [0; 32], name_length: 0 }
+        Files { root: [0; ROOT_MAX], root_length: 0, name: [0; 32], name_length: 0, read_only: false }
     }
 
     /// `root` and `path` joined with a slash, into `out`.
@@ -172,6 +191,50 @@ impl Share for Files {
         let reference = self.join(path, &mut buffer).ok_or(())?;
         tape_rt::vfs_read(reference, offset, out).map_err(|_| ())
     }
+
+    fn writable(&self) -> bool {
+        !self.read_only && tape_rt::vfs_can_change()
+    }
+
+    fn create(&mut self, path: &str, dir: bool, mode: u32, owner: Identity) -> Result<(), Fail> {
+        let mut buffer = [0u8; 512];
+        let reference = self.join(path, &mut buffer).ok_or(Fail::Io)?;
+        let kind = if dir { tape_rt::VFS_DIR } else { tape_rt::VFS_FILE };
+        tape_rt::vfs_create(reference, kind, mode, owner.uid, owner.gid).map_err(fail)
+    }
+
+    fn write(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<(), Fail> {
+        let mut buffer = [0u8; 512];
+        let reference = self.join(path, &mut buffer).ok_or(Fail::Io)?;
+        let mut done = 0;
+        while done < data.len() {
+            let count = tape_rt::vfs_write(reference, offset + done as u64, &data[done..]).map_err(fail)?;
+            if count == 0 {
+                return Err(Fail::Io);
+            }
+            done += count;
+        }
+        Ok(())
+    }
+
+    fn truncate(&mut self, path: &str, size: u64) -> Result<(), Fail> {
+        let mut buffer = [0u8; 512];
+        let reference = self.join(path, &mut buffer).ok_or(Fail::Io)?;
+        tape_rt::vfs_truncate(reference, size).map_err(fail)
+    }
+
+    fn remove(&mut self, path: &str) -> Result<(), Fail> {
+        let mut buffer = [0u8; 512];
+        let reference = self.join(path, &mut buffer).ok_or(Fail::Io)?;
+        tape_rt::vfs_remove(reference).map_err(fail)
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), Fail> {
+        let (mut first, mut second) = ([0u8; 512], [0u8; 512]);
+        let from = self.join(from, &mut first).ok_or(Fail::Io)?;
+        let to = self.join(to, &mut second).ok_or(Fail::Io)?;
+        tape_rt::vfs_rename(from, to).map_err(fail)
+    }
 }
 
 static mut TCP: Tcp<RX, SLOTS> = Tcp::new();
@@ -207,6 +270,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     } else {
         println!("smbd: no smbusers file: everyone is a guest.");
     }
+    let read_only = text.split_ascii_whitespace().any(|word| word == "ro");
     let log = text.split_ascii_whitespace().any(|word| word == "log" || word == "log=on");
     let Some(port) = value(text, "port").map_or(Some(445), |word| word.parse::<u16>().ok().filter(|&port| port != 0)) else {
         return println!("smbd: port= takes a number from 1 to 65535.");
@@ -252,6 +316,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                 files.root_length = root.len();
                 files.name[..share.len()].copy_from_slice(share.as_bytes());
                 files.name_length = share.len();
+                files.read_only = read_only;
                 let mut session = Server::new(files);
                 // ABI 33 `random`; a kernel without it falls back to a hash of the clock, a counter and the peer
                 // (unpredictable only to a peer that cannot guess the microsecond; docs/smb.md).
@@ -289,7 +354,7 @@ fn serve(api: &TapeApi, tcp: &mut Tcp<RX, SLOTS>, slot: usize, request: &mut [u8
         }
         let length = (usize::from(waiting[1]) << 16) | (usize::from(waiting[2]) << 8) | usize::from(waiting[3]);
         if waiting[0] != 0 || length + 4 > RX {
-            // A message this server never takes (a write, or not SMB at all): hang up.
+            // Not SMB, or larger than the server negotiated: hang up.
             tcp.close(api, slot);
             return;
         }

@@ -1,7 +1,7 @@
 //! The server half against real clients: our own `Client` in-process, and `smbclient` (when installed) over a loopback
 //! TCP connection. The share is a few files in memory.
 use smb::ntlm::nt_hash;
-use smb::server::{Account, Identity, Server, Share, Stat};
+use smb::server::{Account, Fail, Identity, Server, Share, Stat};
 use smb::{Client, Error, Transport};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -32,7 +32,8 @@ impl Share for Memory {
     }
     fn stat(&mut self, path: &str) -> Option<Stat> {
         if path.is_empty() {
-            return Some(Stat { dir: true, ..Stat::default() });
+            let mode = if self.1 { 0o755 } else { 0 };
+            return Some(Stat { dir: true, mode, uid: 1000, gid: 1000, ..Stat::default() });
         }
         let (_, data) = self.0.iter().find(|(name, _)| *name == path)?;
         let mode = match (self.1, path) {
@@ -70,6 +71,47 @@ impl Share for Memory {
     }
     fn space(&mut self) -> (u64, u64) {
         (1 << 30, 1 << 29)
+    }
+    fn writable(&self) -> bool {
+        true
+    }
+    fn create(&mut self, path: &str, dir: bool, _mode: u32, _owner: Identity) -> Result<(), Fail> {
+        if self.0.iter().any(|(name, _)| *name == path) {
+            return Err(Fail::Exists);
+        }
+        self.0.push((Box::leak(path.to_string().into_boxed_str()), if dir { None } else { Some(Vec::new()) }));
+        Ok(())
+    }
+    fn write(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<(), Fail> {
+        let (_, file) = self.0.iter_mut().find(|(name, _)| *name == path).ok_or(Fail::NotFound)?;
+        let file = file.as_mut().ok_or(Fail::IsDir)?;
+        let end = offset as usize + data.len();
+        if file.len() < end {
+            file.resize(end, 0);
+        }
+        file[offset as usize..end].copy_from_slice(data);
+        Ok(())
+    }
+    fn truncate(&mut self, path: &str, size: u64) -> Result<(), Fail> {
+        let (_, file) = self.0.iter_mut().find(|(name, _)| *name == path).ok_or(Fail::NotFound)?;
+        file.as_mut().ok_or(Fail::IsDir)?.resize(size as usize, 0);
+        Ok(())
+    }
+    fn remove(&mut self, path: &str) -> Result<(), Fail> {
+        let at = self.0.iter().position(|(name, _)| *name == path).ok_or(Fail::NotFound)?;
+        let prefix = format!("{path}/");
+        if self.0.iter().any(|(name, _)| name.starts_with(&prefix)) {
+            return Err(Fail::NotEmpty);
+        }
+        self.0.remove(at);
+        Ok(())
+    }
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), Fail> {
+        let at = self.0.iter().position(|(name, _)| *name == from).ok_or(Fail::NotFound)?;
+        self.0.retain(|(name, _)| *name != to);
+        let at = self.0.iter().position(|(name, _)| *name == from).unwrap_or(at);
+        self.0[at].0 = Box::leak(to.to_string().into_boxed_str());
+        Ok(())
     }
 }
 
@@ -296,4 +338,89 @@ fn our_client_logs_in_over_tcp_with_reads() {
         assert_eq!(&data[..count], &pattern(300_000)[offset as usize..offset as usize + count]);
         offset += count as u64;
     }
+}
+
+#[test]
+fn smbclient_changes_files() {
+    if Command::new("smbclient").arg("--version").output().is_err() {
+        eprintln!("smbclient not installed: skipped");
+        return;
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            std::thread::spawn(move || {
+                let mut share = memory();
+                share.1 = true;
+                let mut server = Box::new(Server::new(share));
+                serve(&mut server, &mut stream);
+            });
+        }
+    });
+    let run = |user: &str, script: &str| {
+        let output = Command::new("smbclient")
+            .args(["-U", user, "-p", &port.to_string(), "//127.0.0.1/fos", "-m", "SMB3_00", "-c", script])
+            .output()
+            .unwrap();
+        (output.status.success(), String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr))
+    };
+    let dir = std::env::temp_dir().join(format!("smbwrite-{port}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("up.bin");
+    std::fs::write(&source, pattern(200_000)).unwrap();
+    let back = dir.join("back.bin");
+    let moved = dir.join("moved.txt");
+    let script = format!(
+        "put {s} up.bin; mkdir newdir; put {s} newdir\\in.bin; rename up.bin renamed.bin; get renamed.bin {b}; \
+         put {s} readme.txt; get readme.txt {m}; rm newdir\\in.bin; rmdir newdir; rm sub\\inner.txt; ls",
+        s = source.display(), b = back.display(), m = moved.display()
+    );
+    let (ok, text) = run("alice%secret", &script);
+    assert!(ok, "alice: {text}");
+    assert_eq!(std::fs::read(&back).unwrap(), pattern(200_000), "uploaded and renamed file");
+    assert_eq!(std::fs::read(&moved).unwrap(), pattern(200_000), "overwritten file");
+    let listing = text.split("blocks of size").next().unwrap();
+    assert!(!listing.contains("newdir") && !listing.contains(" up.bin") && listing.contains("renamed.bin"), "listing: {text}");
+
+    let (_, text) = run("alice%secret", "rmdir sub");
+    assert!(text.contains("DIRECTORY_NOT_EMPTY"), "non-empty folder: {text}");
+
+    let (_, text) = run("bob%hunter2", &format!("put {} bob.bin", source.display()));
+    assert!(text.contains("ACCESS_DENIED"), "bob may not write: {text}");
+    let (_, text) = run("bob%hunter2", "rm readme.txt");
+    assert!(text.contains("ACCESS_DENIED"), "bob may not delete: {text}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn our_client_changes_files() {
+    let mut client: Client<Loopback, 70_000> = Client::new(Loopback { server: Box::new(Server::new(memory())), out: vec![0; 70_200], incoming: Vec::new() });
+    client.connect("h", "fos").unwrap();
+    let data = pattern(150_000);
+    let file = client.create_file("new.bin", false).unwrap();
+    let mut done = 0;
+    while done < data.len() {
+        done += client.write(&file, done as u64, &data[done..]).unwrap();
+    }
+    client.close(&file).unwrap();
+    assert_eq!(client.create_file("new.bin", false).err(), Some(Error::Status(0xC000_0035)), "an existing file collides");
+    let back = client.open("new.bin", false).unwrap();
+    assert_eq!(back.size, data.len() as u64);
+    let mut buffer = vec![0u8; 65_000];
+    let count = client.read(&back, 140_000, &mut buffer).unwrap();
+    assert_eq!(&buffer[..count], &data[140_000..]);
+    client.close(&back).unwrap();
+
+    let again = client.create_file("new.bin", true).unwrap();
+    assert_eq!(again.size, 0, "replace empties the file");
+    client.close(&again).unwrap();
+    client.make_dir("folder").unwrap();
+    client.rename("new.bin", "folder/moved.bin").unwrap();
+    assert!(client.open("new.bin", false).is_err());
+    assert!(client.open("folder/moved.bin", false).is_ok());
+    assert_eq!(client.remove("folder", true).err(), Some(Error::Status(0xC000_0101)), "a folder with a file stays");
+    client.remove("folder/moved.bin", false).unwrap();
+    client.remove("folder", true).unwrap();
+    assert!(client.open("folder", true).is_err());
 }

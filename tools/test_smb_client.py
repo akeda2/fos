@@ -2,7 +2,7 @@
 """The `smb` tape (client shell command) against a host-side server: `crates/smb/examples/serve.rs` shares a folder on a
 loopback port, QEMU's user-mode network (guestfwd) makes it reachable as 10.0.2.100:445 from the guest's NIC 2. Checks `smb ls`
 (root, a subfolder, UTF-8 names, a long folder), `smb cat`, `smb get` of a 3 MB file (SHA-256 on the guest compared with the
-host's), a missing file and a bad URL. Run with `make test-smb-client`."""
+host's), a missing file and a bad URL, then `smb put` (3 MB, checked on the host), mkdir, mv, rm and rmdir. Run with `make test-smb-client`."""
 import hashlib
 import os
 import re
@@ -23,7 +23,7 @@ MANY = 200
 
 def main():
     root = Path(__file__).resolve().parent.parent
-    built = subprocess.run(["cargo", "build", "--release", "--example", "serve"], cwd=root / "crates" / "smb", capture_output=True, text=True)
+    built = subprocess.run(["cargo", "build", "--release", "--example", "serve", "--target-dir", "target"], cwd=root / "crates" / "smb", capture_output=True, text=True)
     if built.returncode != 0:
         raise SystemExit("FAIL: cannot build the host server\n" + built.stderr[-1500:])
     server_binary = root / "crates" / "smb" / "target" / "release" / "examples" / "serve"
@@ -67,6 +67,24 @@ def main():
                 check("smb: " in out and "no such file" in out.lower(), "a missing file is reported", out[-300:])
                 out = g.line("run smb ls 10.0.2.100/share", "fos> ", 20)
                 check("//HOST/SHARE" in out, "a URL without // is refused", out[-300:])
+                out = g.line(f"run smb put {url}/up.bin got.bin", "fos> ", 120)
+                check("3145728 bytes" in out and (share / "up.bin").exists(), "put sends a 3 MB file", out[-400:])
+                check((share / "up.bin").read_bytes() == big, "and it arrives intact on the host")
+                out = g.line(f"run smb mkdir {url}/newdir", "fos> ", 40)
+                check((share / "newdir").is_dir(), "mkdir makes a folder", out[-300:])
+                out = g.line(f"run smb put {url}/newdir/h.txt hello.txt", "fos> ", 40)
+                check((share / "newdir" / "h.txt").read_text() == "hello from the host\n", "put into the new folder", out[-300:])
+                out = g.line(f"run smb mv {url}/newdir/h.txt moved.txt", "fos> ", 40)
+                check((share / "moved.txt").exists() and not (share / "newdir" / "h.txt").exists(), "mv renames across folders", out[-300:])
+                out = g.line(f"run smb rm {url}/moved.txt", "fos> ", 40)
+                check(not (share / "moved.txt").exists(), "rm removes a file", out[-300:])
+                out = g.line(f"run smb rm {url}/up.bin", "fos> ", 40)
+                out = g.line(f"run smb rmdir {url}/newdir", "fos> ", 40)
+                check(not (share / "newdir").exists(), "rmdir removes a folder", out[-300:])
+                out = g.line(f"run smb rm {url}/nothere.txt", "fos> ", 40)
+                check("no such file" in out.lower(), "rm of a missing file is reported", out[-300:])
+                out = g.line(f"run smb ls {url}", "fos> ", 40)
+                check("4 entries" in out, "the share is back to its four entries", out[-300:])
         finally:
             server.terminate()
         # A second server that wants alice/secret: the client logs in with NTLMv2 and signs.

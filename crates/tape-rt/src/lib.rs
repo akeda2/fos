@@ -818,6 +818,62 @@ pub fn vfs_read(path: &str, offset: u64, buffer: &mut [u8]) -> Result<usize, isi
     }
 }
 
+fn vfs_change_table() -> Option<&'static fosfor_abi::tape::TapeApi> {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, vfs_set_owner) + core::mem::size_of::<usize>();
+    (table.version >= 34 && table.size as usize >= end).then_some(table)
+}
+
+/// Whether this kernel has the `vfs_*` change calls (ABI 34); on a volume that cannot be changed they fail with `FS_READ_ONLY`.
+pub fn vfs_can_change() -> bool {
+    vfs_change_table().is_some()
+}
+
+fn vfs_done(code: isize) -> Result<(), isize> {
+    if code < 0 { Err(code) } else { Ok(()) }
+}
+
+/// Makes a file or folder (ABI 34, `vfs_create`; `kind` is `VFS_FILE` or `VFS_DIR`) with permission bits `mode` and an owner.
+/// Only on ext volumes; `Err` is a negative `FS_*` code (`FS_READ_ONLY` elsewhere and on kernels older than 34).
+pub fn vfs_create(path: &str, kind: u32, mode: u32, uid: u32, gid: u32) -> Result<(), isize> {
+    let table = vfs_change_table().ok_or(fosfor_abi::tape::FS_READ_ONLY)?;
+    let make = fosfor_abi::tape::VfsMake { kind, mode, uid, gid };
+    vfs_done((table.vfs_create)(path.as_ptr(), path.len(), &make))
+}
+
+/// Writes `data` into an existing file at `offset` (ABI 34, `vfs_write`); the count written, which may be less than `data.len()`.
+pub fn vfs_write(path: &str, offset: u64, data: &[u8]) -> Result<usize, isize> {
+    let table = vfs_change_table().ok_or(fosfor_abi::tape::FS_READ_ONLY)?;
+    match (table.vfs_write)(path.as_ptr(), path.len(), offset, data.as_ptr(), data.len()) {
+        count if count >= 0 => Ok(count as usize),
+        code => Err(code),
+    }
+}
+
+/// Sets a file's size (ABI 34, `vfs_truncate`).
+pub fn vfs_truncate(path: &str, size: u64) -> Result<(), isize> {
+    let table = vfs_change_table().ok_or(fosfor_abi::tape::FS_READ_ONLY)?;
+    vfs_done((table.vfs_truncate)(path.as_ptr(), path.len(), size))
+}
+
+/// Removes a file or an empty folder (ABI 34, `vfs_remove`).
+pub fn vfs_remove(path: &str) -> Result<(), isize> {
+    let table = vfs_change_table().ok_or(fosfor_abi::tape::FS_READ_ONLY)?;
+    vfs_done((table.vfs_remove)(path.as_ptr(), path.len()))
+}
+
+/// Moves or renames inside one volume, replacing a target of the same kind (ABI 34, `vfs_rename`).
+pub fn vfs_rename(from: &str, to: &str) -> Result<(), isize> {
+    let table = vfs_change_table().ok_or(fosfor_abi::tape::FS_READ_ONLY)?;
+    vfs_done((table.vfs_rename)(from.as_ptr(), from.len(), to.as_ptr(), to.len()))
+}
+
+/// Sets owner and (unless `mode` is `VFS_KEEP_MODE`) permission bits (ABI 34, `vfs_set_owner`).
+pub fn vfs_set_owner(path: &str, uid: u32, gid: u32, mode: u32) -> Result<(), isize> {
+    let table = vfs_change_table().ok_or(fosfor_abi::tape::FS_READ_ONLY)?;
+    vfs_done((table.vfs_set_owner)(path.as_ptr(), path.len(), uid, gid, mode))
+}
+
 /// Fills `buffer` with unpredictable bytes (ABI 33, `random`). `Some(true)` when the CPU's hardware generator contributed,
 /// `Some(false)` when only timing did (the Pi 4), `None` on a kernel older than version 33: the caller then has nothing
 /// better than `micros()`.

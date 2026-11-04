@@ -89,6 +89,7 @@ pub struct Cursor {
 /// A volume kept mounted between tape calls (an SMB server asks thousands of times a minute), with its read cache intact.
 pub struct Shared {
     pub disk: usize,
+    pub partition: Partition,
     pub fs: Fs,
     pub cursor: Option<Cursor>,
 }
@@ -103,11 +104,33 @@ pub fn shared(disk: usize) -> Result<&'static mut Shared, Error> {
         let slot = &mut *core::ptr::addr_of_mut!(SHARED);
         if slot.as_ref().is_none_or(|shared| shared.disk != disk) {
             *slot = None;
-            let fs = mount(disk)?;
-            *slot = Some(Shared { disk, fs, cursor: None });
+            let partition = locate(disk)?;
+            let fs = ext4::Fs::mount(partition)?;
+            *slot = Some(Shared { disk, partition, fs, cursor: None });
         }
         Ok(slot.as_mut().unwrap())
     }
+}
+
+/// Changes the kept volume of disk index `disk` (on `partition`, as `Shared::partition` says) for a tape call: opens it for
+/// writing (the journal is replayed if needed), runs `change`, commits, and keeps the volume mounted again afterwards. The
+/// read cache stays (it follows every write), so a stream of small writes costs a mount each, not a rescan of the disk.
+/// The caller serialises calls, as for `shared`.
+pub fn with_writer<T>(disk: usize, partition: Partition, change: impl FnOnce(&mut Writer<Journaled<Partition>>) -> Result<T, Error>) -> Result<T, Error> {
+    forget_shared();
+    let fs = ext4::open(partition, stage())?;
+    // SAFETY: the one writer slot is only used by the (serialised) shell and tape calls, and the previous writer is dead.
+    let writer = Writer::new_in(unsafe { &mut *core::ptr::addr_of_mut!(WRITER) }, fs)?;
+    writer.set_time(seconds());
+    let done = change(writer);
+    let flushed = writer.flush();
+    if let Ok(fs) = ext4::Fs::mount(partition) {
+        // SAFETY: as in `shared`.
+        unsafe { *core::ptr::addr_of_mut!(SHARED) = Some(Shared { disk, partition, fs, cursor: None }) };
+    }
+    let value = done?;
+    flushed?;
+    Ok(value)
 }
 
 /// The disk index of the kept volume, if any.

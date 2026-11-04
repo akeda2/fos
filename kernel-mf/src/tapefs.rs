@@ -12,7 +12,7 @@
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
-use fosfor_abi::tape::{FS_ERROR, FS_STREAMS, FS_TOO_BIG, FileInfo, VfsEntry, VfsStat};
+use fosfor_abi::tape::{FS_ERROR, FS_STREAMS, FS_TOO_BIG, FileInfo, VfsEntry, VfsMake, VfsStat};
 use kernel_core::{tape_fs, tape_vfs};
 
 use crate::{process, sched};
@@ -136,6 +136,48 @@ pub fn vfs_read(name_at: u64, name_len: u64, offset: u64, buffer: u64, capacity:
         tape_vfs::read(&reference, offset, &mut piece)
     };
     if got > 0 && !process::copy_to_user(buffer, &piece[..got as usize]) { FS_ERROR } else { got }
+}
+
+/// `vfs_create(path, path_len, make)`: a `VfsMake` at the user address `make`.
+pub fn vfs_create(name_at: u64, name_len: u64, make: u64) -> isize {
+    let Some(reference) = name(name_at, name_len) else { return FS_ERROR };
+    let Some(raw) = copy_from_user(make, core::mem::size_of::<VfsMake>() as u64) else { return FS_ERROR };
+    // SAFETY: `VfsMake` is four u32; the bytes were just copied from the tape and any bit pattern is valid.
+    let make = unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const VfsMake) };
+    let _guard = lock();
+    tape_vfs::create(&reference, &make)
+}
+
+/// `vfs_write(path, path_len, offset, data, len)`: up to `CHUNK` bytes per call (a short count is a limit, not an error).
+pub fn vfs_write(name_at: u64, name_len: u64, offset: u64, data: u64, length: u64) -> isize {
+    let Some(reference) = name(name_at, name_len) else { return FS_ERROR };
+    let Some(bytes) = copy_from_user(data, length.min(CHUNK as u64)) else { return FS_ERROR };
+    let _guard = lock();
+    tape_vfs::write(&reference, offset, &bytes)
+}
+
+pub fn vfs_truncate(name_at: u64, name_len: u64, size: u64) -> isize {
+    let Some(reference) = name(name_at, name_len) else { return FS_ERROR };
+    let _guard = lock();
+    tape_vfs::truncate(&reference, size)
+}
+
+pub fn vfs_remove(name_at: u64, name_len: u64) -> isize {
+    let Some(reference) = name(name_at, name_len) else { return FS_ERROR };
+    let _guard = lock();
+    tape_vfs::remove(&reference)
+}
+
+pub fn vfs_rename(from_at: u64, from_len: u64, to_at: u64, to_len: u64) -> isize {
+    let (Some(from), Some(to)) = (name(from_at, from_len), name(to_at, to_len)) else { return FS_ERROR };
+    let _guard = lock();
+    tape_vfs::rename(&from, &to)
+}
+
+pub fn vfs_set_owner(name_at: u64, name_len: u64, uid: u64, gid: u64, mode: u64) -> isize {
+    let Some(reference) = name(name_at, name_len) else { return FS_ERROR };
+    let _guard = lock();
+    tape_vfs::set_owner(&reference, uid as u32, gid as u32, mode as u32)
 }
 
 fn copy_struct<T>(to: u64, value: &T) -> bool {

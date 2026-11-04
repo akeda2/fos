@@ -74,6 +74,24 @@ fn formatted_volume_is_clean_and_usable() {
 }
 
 #[test]
+fn owner_and_mode_can_be_set() {
+    if !have("e2fsck") {
+        return;
+    }
+    let (image, mut w) = make("owner", 200);
+    let root = w.root().unwrap().number;
+    let f = w.create(root, b"mine.txt", 0o644).unwrap().number;
+    w.set_owner(f, 1000, 70_000, Some(0o600)).unwrap();
+    let inode = w.inode(f).unwrap();
+    assert_eq!((inode.uid, inode.gid, inode.permissions(), inode.is_file()), (1000, 70_000, 0o600, true));
+    w.set_owner(f, 5, 6, None).unwrap();
+    assert_eq!(w.inode(f).unwrap().permissions(), 0o600);
+    w.flush().unwrap();
+    fsck(&image);
+    let _ = fs::remove_file(&image);
+}
+
+#[test]
 fn files_grow_shrink_and_leave_holes() {
     if !have("e2fsck") {
         return;

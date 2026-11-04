@@ -1,8 +1,8 @@
-//! A host-side SMB server for tests: `cargo run --example serve -- DIR PORT [SHARE]` shares DIR (read-only, guest) as
+//! A host-side SMB server for tests: `cargo run --example serve -- DIR PORT [SHARE]` shares DIR (guest, writable) as
 //! //HOST/SHARE (default `share`) on 127.0.0.1:PORT, one connection at a time per thread. `tools/test_smb_client.py` points the
 //! `smb` tape at it through QEMU's guestfwd. With `SMB_LOGIN=user:password` in the environment only that user may log in.
 use smb::ntlm::nt_hash;
-use smb::server::{Account, Identity, Server, Share, Stat};
+use smb::server::{Account, Fail, Identity, Server, Share, Stat};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
@@ -18,6 +18,17 @@ struct Folder {
 fn stat_of(meta: &fs::Metadata) -> Stat {
     let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
     Stat { dir: meta.is_dir(), size: if meta.is_dir() { 0 } else { meta.len() }, mtime, ..Stat::default() }
+}
+
+fn failure(error: std::io::Error) -> Fail {
+    use std::io::ErrorKind::*;
+    match error.kind() {
+        NotFound => Fail::NotFound,
+        AlreadyExists => Fail::Exists,
+        PermissionDenied => Fail::Denied,
+        DirectoryNotEmpty => Fail::NotEmpty,
+        _ => Fail::Io,
+    }
 }
 
 impl Share for Folder {
@@ -47,6 +58,29 @@ impl Share for Folder {
         let mut file = File::open(self.root.join(path)).map_err(|_| ())?;
         file.seek(SeekFrom::Start(offset)).map_err(|_| ())?;
         file.read(out).map_err(|_| ())
+    }
+    fn writable(&self) -> bool {
+        true
+    }
+    fn create(&mut self, path: &str, dir: bool, _mode: u32, _owner: Identity) -> Result<(), Fail> {
+        let target = self.root.join(path);
+        let made = if dir { fs::create_dir(&target) } else { File::create_new(&target).map(|_| ()) };
+        made.map_err(failure)
+    }
+    fn write(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<(), Fail> {
+        let mut file = fs::OpenOptions::new().write(true).open(self.root.join(path)).map_err(failure)?;
+        file.seek(SeekFrom::Start(offset)).map_err(failure)?;
+        file.write_all(data).map_err(failure)
+    }
+    fn truncate(&mut self, path: &str, size: u64) -> Result<(), Fail> {
+        fs::OpenOptions::new().write(true).open(self.root.join(path)).and_then(|file| file.set_len(size)).map_err(failure)
+    }
+    fn remove(&mut self, path: &str) -> Result<(), Fail> {
+        let target = self.root.join(path);
+        if target.is_dir() { fs::remove_dir(&target) } else { fs::remove_file(&target) }.map_err(failure)
+    }
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), Fail> {
+        fs::rename(self.root.join(from), self.root.join(to)).map_err(failure)
     }
 }
 

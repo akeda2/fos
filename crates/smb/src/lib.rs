@@ -73,6 +73,10 @@ pub fn status_name(status: u32) -> &'static str {
         0xC000_00D0 => "request not accepted",
         0xC000_0103 => "not a directory",
         0xC000_0016 => "more processing required",
+        0xC000_0035 => "already exists",
+        0xC000_007F => "disk full",
+        0xC000_00BA => "is a directory",
+        0xC000_0101 => "folder not empty",
         _ => "the server refused the request",
     }
 }
@@ -130,6 +134,7 @@ pub struct Client<T: Transport, const N: usize> {
     session: u64,
     tree: u32,
     max_read: u32,
+    max_write: u32,
     login: Option<Login>,
     signing: Option<[u8; 16]>,
 }
@@ -144,7 +149,7 @@ struct Login {
 
 impl<T: Transport, const N: usize> Client<T, N> {
     pub const fn new(transport: T) -> Self {
-        Client { transport, buffer: [0; N], message_id: 0, session: 0, tree: 0, max_read: 0, login: None, signing: None }
+        Client { transport, buffer: [0; N], message_id: 0, session: 0, tree: 0, max_read: 0, max_write: 0, login: None, signing: None }
     }
 
     pub fn transport(&mut self) -> &mut T {
@@ -275,6 +280,7 @@ impl<T: Transport, const N: usize> Client<T, N> {
         }
         // Without the large-MTU capability a read is at most 64 KiB whatever the server would allow.
         self.max_read = get32(&self.buffer, HEADER + 32).min(65536);
+        self.max_write = get32(&self.buffer, HEADER + 36).min(65536);
         Ok(())
     }
 
@@ -432,14 +438,19 @@ impl<T: Transport, const N: usize> Client<T, N> {
     /// Opens a file (`directory` false) or directory by its path below the share ("" is the share's root; '/' or '\'
     /// separate).
     pub fn open(&mut self, path: &str, directory: bool) -> Result<Handle, Error> {
+        self.create(path, 0x0012_0089, 1, if directory { 0x01 } else { 0x40 })
+    }
+
+    /// One CREATE request: `access` mask, `disposition` (1 open, 2 create, 5 overwrite or create) and create `options`.
+    fn create(&mut self, path: &str, access: u32, disposition: u32, options: u32) -> Result<Handle, Error> {
         self.begin(CMD_CREATE);
         let buffer = &mut self.buffer;
         put16(buffer, BODY, 57);
         put32(buffer, BODY + 4, 2); // impersonation
-        put32(buffer, BODY + 24, 0x0012_0089); // read data, attributes, read control, synchronize
+        put32(buffer, BODY + 24, access);
         put32(buffer, BODY + 32, 7); // share read, write, delete
-        put32(buffer, BODY + 36, 1); // open existing
-        put32(buffer, BODY + 40, if directory { 0x01 } else { 0x40 });
+        put32(buffer, BODY + 36, disposition);
+        put32(buffer, BODY + 40, options);
         put16(buffer, BODY + 44, 120);
         let name = put_name(buffer, BODY + 56, path.trim_start_matches(['/', '\\'])).ok_or(Error::TooBig)?;
         put16(buffer, BODY + 46, name as u16);
@@ -454,6 +465,69 @@ impl<T: Transport, const N: usize> Client<T, N> {
         let mut id = [0u8; 16];
         id.copy_from_slice(&self.buffer[HEADER + 64..HEADER + 80]);
         Ok(Handle { id, size: get64(&self.buffer, HEADER + 48) })
+    }
+
+    /// Makes a new empty file for writing; with `replace` an existing file is emptied, without it one that exists is an
+    /// error (`STATUS_OBJECT_NAME_COLLISION`).
+    pub fn create_file(&mut self, path: &str, replace: bool) -> Result<Handle, Error> {
+        self.create(path, 0x0012_0196, if replace { 5 } else { 2 }, 0x40)
+    }
+
+    /// Makes a folder; one that exists is an error.
+    pub fn make_dir(&mut self, path: &str) -> Result<(), Error> {
+        let handle = self.create(path, 0x0012_0080, 2, 0x01)?;
+        self.close(&handle)
+    }
+
+    /// Removes a file or an empty folder (opened with delete-on-close, so the server removes it when the handle closes).
+    pub fn remove(&mut self, path: &str, directory: bool) -> Result<(), Error> {
+        let handle = self.create(path, 0x0011_0080, 1, 0x1000 | if directory { 0x01 } else { 0x40 })?;
+        self.close(&handle)
+    }
+
+    /// Moves or renames a file or folder inside the share; an existing target of the same kind is replaced.
+    pub fn rename(&mut self, from: &str, to: &str) -> Result<(), Error> {
+        let handle = self.create(from, 0x0011_0080, 1, 0)?;
+        self.begin(CMD_SET_INFO);
+        let buffer = &mut self.buffer;
+        put16(buffer, BODY, 33);
+        buffer[BODY + 2] = 1; // file information
+        buffer[BODY + 3] = 10; // FileRenameInformation
+        put16(buffer, BODY + 8, (HEADER + 32) as u16);
+        buffer[BODY + 16..BODY + 32].copy_from_slice(&handle.id);
+        let info = BODY + 32;
+        buffer[info] = 1; // replace if it exists
+        let name = put_name(buffer, info + 20, to.trim_start_matches(['/', '\\'])).ok_or(Error::TooBig)?;
+        put32(buffer, info + 16, name as u32);
+        put32(buffer, BODY + 4, (20 + name) as u32);
+        let sent = self.finish(32 + 20 + name);
+        let answered = sent.and_then(|()| self.receive(CMD_SET_INFO)).and_then(|(status, _)| if status != 0 { Err(Error::Status(status)) } else { Ok(()) });
+        let closed = self.close(&handle);
+        answered.and(closed)
+    }
+
+    /// The most one `write` takes.
+    pub fn max_write(&self) -> usize {
+        (self.max_write as usize).min(N.saturating_sub(HEADER + 48)).max(1)
+    }
+
+    /// Writes up to `data.len()` bytes (at most `max_write`) at `offset`; the count the server took.
+    pub fn write(&mut self, handle: &Handle, offset: u64, data: &[u8]) -> Result<usize, Error> {
+        let count = data.len().min(self.max_write());
+        self.begin(CMD_WRITE);
+        let buffer = &mut self.buffer;
+        put16(buffer, BODY, 49);
+        put16(buffer, BODY + 2, (HEADER + 48) as u16);
+        put32(buffer, BODY + 4, count as u32);
+        put64(buffer, BODY + 8, offset);
+        buffer[BODY + 16..BODY + 32].copy_from_slice(&handle.id);
+        buffer[BODY + 48..BODY + 48 + count].copy_from_slice(&data[..count]);
+        self.finish(48 + count)?;
+        let (status, _) = self.receive(CMD_WRITE)?;
+        if status != 0 {
+            return Err(Error::Status(status));
+        }
+        Ok((get32(&self.buffer, HEADER + 4) as usize).min(count))
     }
 
     pub fn close(&mut self, handle: &Handle) -> Result<(), Error> {

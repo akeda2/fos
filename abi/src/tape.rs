@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`. Version 20 added `gfx_screens` and the `gfx_*_on` calls (a screen number). Version 21 added `audio_float`. Version 22 added the `gpio_*` calls. Version 23 added `i2c_speed` and `i2c_transfer`. Version 24 added `touch_info` and `touch_read`. Version 25 added `midi_read` and `midi_send`. Version 26 added `midi_devices`. Version 27 added `nic_owned`. Version 28 added `gpio_pull_get`. Version 32 added the `vfs_*` calls.
-pub const TAPE_API_VERSION: u32 = 33;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`. Version 20 added `gfx_screens` and the `gfx_*_on` calls (a screen number). Version 21 added `audio_float`. Version 22 added the `gpio_*` calls. Version 23 added `i2c_speed` and `i2c_transfer`. Version 24 added `touch_info` and `touch_read`. Version 25 added `midi_read` and `midi_send`. Version 26 added `midi_devices`. Version 27 added `nic_owned`. Version 28 added `gpio_pull_get`. Version 32 added the `vfs_*` calls. Version 33 added `random`. Version 34 added the `vfs_*` change calls (`vfs_create`, `vfs_write`, `vfs_truncate`, `vfs_remove`, `vfs_rename`, `vfs_set_owner`).
+pub const TAPE_API_VERSION: u32 = 34;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -30,6 +30,13 @@ pub const FS_TOO_BIG: isize = -2;
 pub const FS_ERROR: isize = -3;
 pub const FS_BAD_NAME: isize = -4;
 pub const FS_NO_VOLUME: isize = -5;
+/// Codes of the `vfs_*` change calls (version 34), besides `FS_NOT_FOUND`, `FS_ERROR` and `FS_BAD_NAME`.
+pub const FS_EXISTS: isize = -6;
+pub const FS_NO_SPACE: isize = -7;
+pub const FS_NOT_EMPTY: isize = -8;
+/// The volume cannot be changed: not an ext volume the writer handles (FOSFS and FAT are changed with the `fs_*` calls).
+pub const FS_READ_ONLY: isize = -9;
+pub const FS_IS_DIR: isize = -10;
 
 #[repr(C)]
 pub struct TapeApi {
@@ -391,7 +398,37 @@ pub struct TapeApi {
     /// the bytes come from timing alone (always on the Pi 4): fine for challenges and nonces, but a tape that makes long-term
     /// keys should say so. `crates/kernel-core/src/random.rs`.
     pub random: extern "C" fn(*mut u8, usize) -> isize,
+    /// `vfs_create(path, path_len, make)` (version 34): makes a file or folder (`VfsMake`: kind, permission bits, owner) in an
+    /// existing folder of an ext volume. 0, or `FS_EXISTS`, `FS_NOT_FOUND` (no such folder), `FS_BAD_NAME`, `FS_NO_SPACE`,
+    /// `FS_READ_ONLY` (not an ext volume this kernel can change). Every call is committed (journaled) before it returns.
+    pub vfs_create: extern "C" fn(*const u8, usize, *const VfsMake) -> isize,
+    /// `vfs_write(path, path_len, offset, data, len)` (version 34): writes into an existing file, growing it (a gap stays a
+    /// hole). The count written (a call may take less than `len`: the server kernel's limit is 64 KiB per call) or a code.
+    pub vfs_write: extern "C" fn(*const u8, usize, u64, *const u8, usize) -> isize,
+    /// `vfs_truncate(path, path_len, size)` (version 34): sets a file's size; larger leaves a hole, smaller frees blocks.
+    pub vfs_truncate: extern "C" fn(*const u8, usize, u64) -> isize,
+    /// `vfs_remove(path, path_len)` (version 34): removes a file or an empty folder (`FS_NOT_EMPTY` otherwise).
+    pub vfs_remove: extern "C" fn(*const u8, usize) -> isize,
+    /// `vfs_rename(from, from_len, to, to_len)` (version 34): moves or renames inside one volume; an existing target of the
+    /// same kind is replaced.
+    pub vfs_rename: extern "C" fn(*const u8, usize, *const u8, usize) -> isize,
+    /// `vfs_set_owner(path, path_len, uid, gid, mode)` (version 34): the owner and, unless `mode` is `VFS_KEEP_MODE`, the
+    /// permission bits of a file or folder.
+    pub vfs_set_owner: extern "C" fn(*const u8, usize, u32, u32, u32) -> isize,
 }
+
+/// What `vfs_create` is told: `kind` is `VFS_FILE` or `VFS_DIR`, `mode` the permission bits, `uid`/`gid` the owner.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VfsMake {
+    pub kind: u32,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// `vfs_set_owner`'s `mode` when the permission bits stay as they are.
+pub const VFS_KEEP_MODE: u32 = u32::MAX;
 
 /// `VfsStat::kind`.
 pub const VFS_FILE: u32 = 1;

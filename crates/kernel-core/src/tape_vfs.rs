@@ -1,5 +1,5 @@
-//! The tape `vfs_*` calls (ABI 32): what a file or folder is and what is in it, for every volume a tape can name, ext2/3/4
-//! included (`tape_fs` knows FOSFS and FAT only). Shared by both kernels.
+//! The tape `vfs_*` calls (ABI 32 reads, ABI 34 changes): what a file or folder is and what is in it, for every volume a tape
+//! can name, ext2/3/4 included (`tape_fs` knows FOSFS and FAT only); ext volumes can be changed too. Shared by both kernels.
 //!
 //! A reference is the one `fs_read` takes. `diskN/path` on a disk with no FOSFS and no FAT volume is that disk's ext volume
 //! (found the way the shell's `ext4` command does and kept mounted, `ext4vol::shared`); everything else is answered from the
@@ -8,7 +8,7 @@
 
 use fosfor_abi::tape::*;
 
-use crate::ext4vol::{self, Cursor, Shared};
+use crate::ext4vol::{self, Cursor, Partition, Shared};
 use crate::tape_fs;
 use crate::volumes as storage;
 
@@ -175,4 +175,159 @@ pub extern "C" fn api_vfs_read_dir(path: *const u8, path_length: usize, index: u
 pub extern "C" fn api_vfs_read(path: *const u8, path_length: usize, offset: u64, buffer: *mut u8, capacity: usize) -> isize {
     let (path, buffer) = unsafe { (core::slice::from_raw_parts(path, path_length), core::slice::from_raw_parts_mut(buffer, capacity)) };
     read(path, offset, buffer)
+}
+
+// ---- changes (ABI 34): ext volumes only, each call journaled and committed before it returns ----
+
+fn change_error(error: ext4::Error) -> isize {
+    match error {
+        ext4::Error::NotFound | ext4::Error::NotADirectory => FS_NOT_FOUND,
+        ext4::Error::InvalidName => FS_BAD_NAME,
+        ext4::Error::Exists => FS_EXISTS,
+        ext4::Error::NoSpace => FS_NO_SPACE,
+        ext4::Error::NotEmpty => FS_NOT_EMPTY,
+        ext4::Error::IsADirectory => FS_IS_DIR,
+        ext4::Error::ReadOnly | ext4::Error::Unsupported => FS_READ_ONLY,
+        _ => FS_ERROR,
+    }
+}
+
+type Writer = ext4::Writer<ext4::Journaled<Partition>>;
+
+/// The ext volume a reference names, as (disk index, partition, path), or `None` for FOSFS, FAT and everything else.
+fn ext_target(reference: &[u8]) -> Option<(usize, Partition, &[u8])> {
+    let (shared, path) = ext(reference)?;
+    Some((shared.disk, shared.partition, path))
+}
+
+/// "a/b/c" -> ("a/b", "c"); trailing slashes do not count.
+fn split_leaf(path: &[u8]) -> (&[u8], &[u8]) {
+    let mut end = path.len();
+    while end > 0 && path[end - 1] == b'/' {
+        end -= 1;
+    }
+    let trimmed = &path[..end];
+    match trimmed.iter().rposition(|&byte| byte == b'/') {
+        Some(at) => (&trimmed[..at], &trimmed[at + 1..]),
+        None => (&[], trimmed),
+    }
+}
+
+fn parent_number(writer: &mut Writer, folder: &[u8]) -> Result<u32, ext4::Error> {
+    let inode = if folder.iter().all(|&byte| byte == b'/') { writer.root()? } else { writer.resolve(folder)?.ok_or(ext4::Error::NotFound)? };
+    if !inode.is_dir() {
+        return Err(ext4::Error::NotADirectory);
+    }
+    Ok(inode.number)
+}
+
+fn file_number(writer: &mut Writer, path: &[u8]) -> Result<ext4::Inode, ext4::Error> {
+    writer.resolve(path)?.ok_or(ext4::Error::NotFound)
+}
+
+/// `vfs_create`: a file or folder `make` describes at `reference`; 0 or an `FS_*` code.
+pub fn create(reference: &[u8], make: &VfsMake) -> isize {
+    let Some((disk, partition, path)) = ext_target(reference) else { return FS_READ_ONLY };
+    let (folder, name) = split_leaf(path);
+    let done = ext4vol::with_writer(disk, partition, |writer| {
+        let parent = parent_number(writer, folder)?;
+        let mode = (make.mode & 0o7777) as u16;
+        let made = match make.kind {
+            VFS_DIR => writer.mkdir(parent, name, mode)?,
+            VFS_FILE => writer.create(parent, name, mode)?,
+            _ => return Err(ext4::Error::Invalid),
+        };
+        writer.set_owner(made.number, make.uid, make.gid, None)
+    });
+    done.map_or_else(change_error, |()| 0)
+}
+
+/// `vfs_write`: the bytes written into the existing file at `reference`, or an `FS_*` code.
+pub fn write(reference: &[u8], offset: u64, data: &[u8]) -> isize {
+    let Some((disk, partition, path)) = ext_target(reference) else { return FS_READ_ONLY };
+    let done = ext4vol::with_writer(disk, partition, |writer| {
+        let inode = file_number(writer, path)?;
+        writer.write(inode.number, offset, data)
+    });
+    done.map_or_else(change_error, |count| count as isize)
+}
+
+/// `vfs_truncate`.
+pub fn truncate(reference: &[u8], size: u64) -> isize {
+    let Some((disk, partition, path)) = ext_target(reference) else { return FS_READ_ONLY };
+    let done = ext4vol::with_writer(disk, partition, |writer| {
+        let inode = file_number(writer, path)?;
+        writer.truncate(inode.number, size)
+    });
+    done.map_or_else(change_error, |()| 0)
+}
+
+/// `vfs_remove`.
+pub fn remove(reference: &[u8]) -> isize {
+    let Some((disk, partition, path)) = ext_target(reference) else { return FS_READ_ONLY };
+    let (folder, name) = split_leaf(path);
+    let done = ext4vol::with_writer(disk, partition, |writer| {
+        let parent = parent_number(writer, folder)?;
+        writer.remove(parent, name)
+    });
+    done.map_or_else(change_error, |()| 0)
+}
+
+/// `vfs_rename`: both references must name the same ext volume.
+pub fn rename(from: &[u8], to: &[u8]) -> isize {
+    let (Some((disk, partition, from_path)), Some((to_disk, _, to_path))) = (ext_target(from), ext_target(to)) else { return FS_READ_ONLY };
+    if disk != to_disk {
+        return FS_ERROR;
+    }
+    let ((from_folder, from_name), (to_folder, to_name)) = (split_leaf(from_path), split_leaf(to_path));
+    let done = ext4vol::with_writer(disk, partition, |writer| {
+        let from_parent = parent_number(writer, from_folder)?;
+        let to_parent = parent_number(writer, to_folder)?;
+        writer.rename(from_parent, from_name, to_parent, to_name)
+    });
+    done.map_or_else(change_error, |()| 0)
+}
+
+/// `vfs_set_owner`.
+pub fn set_owner(reference: &[u8], uid: u32, gid: u32, mode: u32) -> isize {
+    let Some((disk, partition, path)) = ext_target(reference) else { return FS_READ_ONLY };
+    let done = ext4vol::with_writer(disk, partition, |writer| {
+        let inode = file_number(writer, path)?;
+        writer.set_owner(inode.number, uid, gid, (mode != VFS_KEEP_MODE).then_some((mode & 0o7777) as u16))
+    });
+    done.map_or_else(change_error, |()| 0)
+}
+
+fn bytes<'a>(at: *const u8, length: usize) -> &'a [u8] {
+    unsafe { core::slice::from_raw_parts(at, length) }
+}
+
+/// Tape ABI 34 `vfs_create(path, path_len, make)`; shared by the x86 and aarch64 tape tables.
+pub extern "C" fn api_vfs_create(path: *const u8, path_length: usize, make: *const VfsMake) -> isize {
+    create(bytes(path, path_length), unsafe { &*make })
+}
+
+/// Tape ABI 34 `vfs_write(path, path_len, offset, data, len)`.
+pub extern "C" fn api_vfs_write(path: *const u8, path_length: usize, offset: u64, data: *const u8, length: usize) -> isize {
+    write(bytes(path, path_length), offset, bytes(data, length))
+}
+
+/// Tape ABI 34 `vfs_truncate(path, path_len, size)`.
+pub extern "C" fn api_vfs_truncate(path: *const u8, path_length: usize, size: u64) -> isize {
+    truncate(bytes(path, path_length), size)
+}
+
+/// Tape ABI 34 `vfs_remove(path, path_len)`.
+pub extern "C" fn api_vfs_remove(path: *const u8, path_length: usize) -> isize {
+    remove(bytes(path, path_length))
+}
+
+/// Tape ABI 34 `vfs_rename(from, from_len, to, to_len)`.
+pub extern "C" fn api_vfs_rename(from: *const u8, from_length: usize, to: *const u8, to_length: usize) -> isize {
+    rename(bytes(from, from_length), bytes(to, to_length))
+}
+
+/// Tape ABI 34 `vfs_set_owner(path, path_len, uid, gid, mode)`.
+pub extern "C" fn api_vfs_set_owner(path: *const u8, path_length: usize, uid: u32, gid: u32, mode: u32) -> isize {
+    set_owner(bytes(path, path_length), uid, gid, mode)
 }
