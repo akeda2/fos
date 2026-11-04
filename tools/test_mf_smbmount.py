@@ -86,6 +86,11 @@ def main():
                   "cp to the mount arrives on the host", out)
             out = line("threads")
             check("smbmount" in out, "threads shows the service", out)
+            out = line("top 1 once", "fos> ", 20)
+            row = next((text for text in out.splitlines() if "smbmount" in text and "nic1" in text), "")
+            check("CPU0" in out and "PID" in out, "top shows the CPUs and a header", out)
+            check(bool(row) and pid is not None and row.split()[0] == pid.group(1), "top shows the process holding nic1", out)
+            check(bool(re.search(r"nic1 +smbmount \(\d+\)", out)), "top's hardware list names the owner of nic1", out)
             if pid:
                 line(f"kill {pid.group(1)}")
                 time.sleep(2)

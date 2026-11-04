@@ -25,6 +25,11 @@ fn put<T: Copy>(address: u64, value: &T) -> bool {
     process::copy_to_user(address, bytes)
 }
 
+/// The pid that holds the audio stream, 0 when nobody does (`top`).
+pub fn owner() -> u64 {
+    OWNER.load(Ordering::Acquire)
+}
+
 pub fn info(out: u64) -> u64 {
     let _usb = pin();
     let mut info = AudioInfo::default();

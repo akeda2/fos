@@ -359,6 +359,11 @@ pub fn user_u64(address: u64) -> Option<u64> {
 
 static SCREEN_OWNER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// The pid that has the pixel screen open, 0 when nobody does (`top`; a pid that no longer exists means the same).
+pub fn screen_owner() -> u64 {
+    SCREEN_OWNER.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// The calling process now has the pixel screen: give it back when the process ends.
 pub fn note_screen_open() {
     SCREEN_OWNER.store(sched::current_pid(), core::sync::atomic::Ordering::Relaxed);

@@ -55,6 +55,11 @@ const WRITE_LIMIT: usize = 8 << 20;
 const NAME_LIMIT: u64 = 128;
 static STREAM_OWNER: AtomicU64 = AtomicU64::new(0);
 
+/// The pid that has file streams open, 0 when nobody does (`top`).
+pub fn stream_owner() -> u64 {
+    STREAM_OWNER.load(Ordering::Acquire)
+}
+
 fn name(address: u64, length: u64) -> Option<Vec<u8>> {
     if length > NAME_LIMIT {
         return None;

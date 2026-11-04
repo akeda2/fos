@@ -62,6 +62,10 @@ pub struct Thread {
     pid: u64,
     /// Next free address of the process's `alloc` heap (0 until the first allocation).
     heap_next: u64,
+    /// Timer ticks this thread was the one running when a CPU's timer fired (10 ms each): its CPU time, sampled.
+    cpu_ticks: u64,
+    /// The CPU it was last seen running on.
+    last_cpu: u8,
     /// Floating point state, saved while a process thread is switched out.
     fpu: Option<crate::fpu::Area>,
 }
@@ -77,6 +81,8 @@ struct Sched {
     /// Each application processor's idle thread (never queued); `NO_THREAD` on CPU 0 and before the CPU has attached.
     idle: [usize; MAX_CPUS],
     switches: u64,
+    /// Ticks each CPU found a thread other than an idle thread or the polling `service` thread running (`top`).
+    busy: [u64; MAX_CPUS],
 }
 
 static SCHED: SpinLock<Option<Sched>> = SpinLock::new(None);
@@ -124,8 +130,8 @@ fn this_cpu() -> usize {
 
 /// Makes the calling (boot) context thread 0. Call once, on the boot CPU, before spawning.
 pub fn init() {
-    let boot = Box::new(Thread { id: 0, name: *b"idle0\0\0\0\0\0\0\0\0\0\0\0", state: State::Running, rsp: 0, slot: None, key: 0, wake_at: 0, pinned: Some(0), on_cpu: true, root: 0, kstack_top: 0, killed: false, written: 0, pid: 0, heap_next: 0, fpu: None });
-    let mut sched = Sched { threads: Vec::new(), queue: VecDeque::new(), free_slots: Vec::new(), next_slot: 0, current: [NO_THREAD; MAX_CPUS], previous: [NO_THREAD; MAX_CPUS], idle: [NO_THREAD; MAX_CPUS], switches: 0 };
+    let boot = Box::new(Thread { id: 0, name: *b"idle0\0\0\0\0\0\0\0\0\0\0\0", state: State::Running, rsp: 0, slot: None, key: 0, wake_at: 0, pinned: Some(0), on_cpu: true, root: 0, kstack_top: 0, killed: false, written: 0, pid: 0, heap_next: 0, cpu_ticks: 0, last_cpu: 0, fpu: None });
+    let mut sched = Sched { threads: Vec::new(), queue: VecDeque::new(), free_slots: Vec::new(), next_slot: 0, current: [NO_THREAD; MAX_CPUS], previous: [NO_THREAD; MAX_CPUS], idle: [NO_THREAD; MAX_CPUS], switches: 0, busy: [0; MAX_CPUS] };
     sched.threads.push(Some(boot));
     sched.current[0] = 0;
     *SCHED.lock() = Some(sched);
@@ -146,7 +152,7 @@ pub fn attach_cpu() {
     let mut name = *b"idle\0\0\0\0\0\0\0\0\0\0\0\0";
     name[4] = b'0' + (cpu_index % 10) as u8;
     let id = sched.threads.iter().position(Option::is_none).unwrap_or(sched.threads.len());
-    let thread = Box::new(Thread { id, name, state: State::Running, rsp: 0, slot: None, key: 0, wake_at: 0, pinned: Some(cpu_index), on_cpu: true, root: 0, kstack_top: 0, killed: false, written: 0, pid: 0, heap_next: 0, fpu: None });
+    let thread = Box::new(Thread { id, name, state: State::Running, rsp: 0, slot: None, key: 0, wake_at: 0, pinned: Some(cpu_index), on_cpu: true, root: 0, kstack_top: 0, killed: false, written: 0, pid: 0, heap_next: 0, cpu_ticks: 0, last_cpu: 0, fpu: None });
     if id == sched.threads.len() {
         sched.threads.push(Some(thread));
     } else {
@@ -201,7 +207,7 @@ fn spawn_on(name: &str, entry: extern "C" fn(usize), argument: usize, pinned: Op
             sched.threads.len() - 1
         }
     };
-    sched.threads[id] = Some(Box::new(Thread { id, name: bytes, state: State::Ready, rsp: start, slot: Some((slot, frames)), key: 0, wake_at: 0, pinned, on_cpu: false, root, kstack_top: top, killed: false, written: 0, pid: 0, heap_next: 0, fpu: if root != 0 { crate::fpu::Area::new() } else { None } }));
+    sched.threads[id] = Some(Box::new(Thread { id, name: bytes, state: State::Ready, rsp: start, slot: Some((slot, frames)), key: 0, wake_at: 0, pinned, on_cpu: false, root, kstack_top: top, killed: false, written: 0, pid: 0, heap_next: 0, cpu_ticks: 0, last_cpu: 0, fpu: if root != 0 { crate::fpu::Area::new() } else { None } }));
     sched.queue.push_back(id);
     let mask = idle_cpu_for(sched, pinned, 0);
     drop(guard);
@@ -457,6 +463,15 @@ pub fn tick() {
     {
         let mut guard = SCHED.lock();
         let Some(sched) = guard.as_mut() else { return };
+        let cpu = this_cpu();
+        let running = sched.current[cpu];
+        if let Some(thread) = sched.threads.get_mut(running).and_then(Option::as_mut) {
+            thread.cpu_ticks += 1;
+            thread.last_cpu = cpu as u8;
+            if running != 0 && running != sched.idle[cpu] && !thread.name.starts_with(b"service\0") {
+                sched.busy[cpu] += 1;
+            }
+        }
         for id in 0..sched.threads.len() {
             if let Some(thread) = sched.threads[id].as_mut() {
                 if thread.state == State::Sleeping && thread.wake_at <= now {
@@ -643,4 +658,45 @@ pub fn for_each(mut visit: impl FnMut(usize, &str, State)) {
             visit(thread.id, core::str::from_utf8(&thread.name[..length]).unwrap_or("?"), thread.state);
         }
     }
+}
+
+/// What `top` shows of one thread.
+pub struct Info {
+    pub id: usize,
+    pub name: [u8; 16],
+    pub state: State,
+    /// The process number, 0 for a kernel thread.
+    pub pid: u64,
+    /// The CPU it is running on right now.
+    pub running_on: Option<usize>,
+    /// The CPU it was last seen on.
+    pub last_cpu: usize,
+    pub pinned: Option<usize>,
+    /// CPU time in timer ticks.
+    pub ticks: u64,
+    /// An idle thread (never shown as load).
+    pub idle: bool,
+}
+
+impl Info {
+    pub fn name(&self) -> &str {
+        let length = self.name.iter().position(|&b| b == 0).unwrap_or(16);
+        core::str::from_utf8(&self.name[..length]).unwrap_or("?")
+    }
+}
+
+/// Calls `visit` for every thread with its CPU placement and accumulated CPU time.
+pub fn snapshot(mut visit: impl FnMut(&Info)) {
+    let guard = SCHED.lock();
+    let Some(sched) = guard.as_ref() else { return };
+    for thread in sched.threads.iter().flatten() {
+        let running_on = (0..MAX_CPUS).find(|&cpu| sched.current[cpu] == thread.id);
+        let idle = thread.id == 0 || sched.idle.contains(&thread.id);
+        visit(&Info { id: thread.id, name: thread.name, state: thread.state, pid: thread.pid, running_on, last_cpu: thread.last_cpu as usize, pinned: thread.pinned, ticks: thread.cpu_ticks, idle });
+    }
+}
+
+/// Ticks CPU `cpu` spent on real work since boot (not idle, not the polling service thread).
+pub fn busy_ticks(cpu: usize) -> u64 {
+    SCHED.lock().as_ref().map_or(0, |sched| sched.busy[cpu])
 }
