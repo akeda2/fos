@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use fosfor_abi::tape::{FS_BAD_NAME, FS_NO_VOLUME, FS_NOT_FOUND, FS_TOO_BIG};
-use fosfor_shell::{Entry, FsError, Host, Stamp};
+use fosfor_shell::{Entry, FsError, Host, Owner, Stamp};
 use kernel_core::{mounts, tape_fs};
 
 use crate::{storage, tapefs};
@@ -76,6 +76,23 @@ impl Host for MfHost {
     fn mkdir(&mut self, reference: &str) -> Result<(), FsError> {
         let _disk = tapefs::lock();
         match tape_fs::mkdir(reference.as_bytes()) {
+            0 => Ok(()),
+            code => Err(error(code)),
+        }
+    }
+
+    fn owner_of(&mut self, reference: &str) -> Result<Owner, FsError> {
+        let _disk = tapefs::lock();
+        let mut stat = fosfor_abi::tape::VfsStat::default();
+        match kernel_core::tape_vfs::stat(reference.as_bytes(), &mut stat) {
+            0 => Ok(Owner { uid: stat.uid, gid: stat.gid, mode: stat.mode, directory: stat.kind == fosfor_abi::tape::VFS_DIR, size: stat.size, links: stat.links }),
+            code => Err(error(code)),
+        }
+    }
+
+    fn set_owner(&mut self, reference: &str, uid: u32, gid: u32, mode: Option<u16>) -> Result<(), FsError> {
+        let _disk = tapefs::lock();
+        match kernel_core::tape_vfs::set_owner(reference.as_bytes(), uid, gid, mode.map_or(fosfor_abi::tape::VFS_KEEP_MODE, u32::from)) {
             0 => Ok(()),
             code => Err(error(code)),
         }

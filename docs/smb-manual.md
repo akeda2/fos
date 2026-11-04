@@ -64,7 +64,7 @@ It prints a line like `alice:1000:1000:a08576c2...` (the NT hash, no plaintext).
 - Password logins are NTLMv2 and signed (HMAC-SHA-256 for SMB 2.x, AES-CMAC for 3.0). No Kerberos, encryption, SMB1 or 3.1.1.
 - Mode bits are checked on every folder on the way (search bit) and the target (read/write), against owner, group or
   other for the session's uid/gid. uid 0 passes everything. No supplementary groups. To let a user write, `chown`/`chmod`
-  on the volume from Linux, or log in with uid 0 (`smbd user NAME 0 0 PW`).
+  on the volume (FOS shell: `chown -R 1000:1000 ext1/media`, check with `stat`, or from Linux), or log in with uid 0 (`smbd user NAME 0 0 PW`).
 
 ## 4. Using another machine's share from FOS
 

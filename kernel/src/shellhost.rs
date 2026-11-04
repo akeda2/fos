@@ -4,7 +4,7 @@
 
 use core::fmt;
 
-use fosfor_shell::{Entry, FsError, Host, Stamp};
+use fosfor_shell::{Entry, FsError, Host, Owner, Stamp};
 
 use crate::{memory, tape_fs};
 
@@ -83,6 +83,21 @@ impl Host for KernelHost {
 
     fn mkdir(&mut self, reference: &str) -> Result<(), FsError> {
         match tape_fs::mkdir(reference.as_bytes()) {
+            0 => Ok(()),
+            code => Err(error(code)),
+        }
+    }
+
+    fn owner_of(&mut self, reference: &str) -> Result<Owner, FsError> {
+        let mut stat = fosfor_abi::tape::VfsStat::default();
+        match kernel_core::tape_vfs::stat(reference.as_bytes(), &mut stat) {
+            0 => Ok(Owner { uid: stat.uid, gid: stat.gid, mode: stat.mode, directory: stat.kind == fosfor_abi::tape::VFS_DIR, size: stat.size, links: stat.links }),
+            code => Err(error(code)),
+        }
+    }
+
+    fn set_owner(&mut self, reference: &str, uid: u32, gid: u32, mode: Option<u16>) -> Result<(), FsError> {
+        match kernel_core::tape_vfs::set_owner(reference.as_bytes(), uid, gid, mode.map_or(fosfor_abi::tape::VFS_KEEP_MODE, u32::from)) {
             0 => Ok(()),
             code => Err(error(code)),
         }
