@@ -204,6 +204,8 @@ pub struct Fs<D: Device> {
     label: [u8; 16],
     /// `s_hash_seed`, the folder hash's seed.
     hash_seed: [u32; 4],
+    /// `s_def_hash_version`, the hash a new index uses.
+    def_hash: u8,
     /// The cached group-descriptor block and inode-table block (volume block numbers, `u64::MAX` for none).
     gdt_at: u64,
     gdt: [u8; MAX_BLOCK],
@@ -283,6 +285,7 @@ impl<D: Device> Fs<D> {
             ro_compat: le32(&sb, 100),
             label,
             hash_seed: [le32(&sb, 0xec), le32(&sb, 0xf0), le32(&sb, 0xf4), le32(&sb, 0xf8)],
+            def_hash: sb[0xfc],
             gdt_at: u64::MAX,
             gdt: [0; MAX_BLOCK],
             itable_at: u64::MAX,

@@ -19,6 +19,7 @@
 //! `Writer` is about 100 KiB: put it in a `Box` or a static, not on a small stack.
 
 use crate::crc::crc32c;
+use crate::dirhash;
 use crate::{Buffer, Device, Error, Fs, Inode, Journaled, Mapping, Stage, FLAG_EXTENTS, FLAG_INLINE_DATA, INCOMPAT_64BIT, INCOMPAT_EXTENTS, INCOMPAT_FILETYPE, INCOMPAT_FLEX_BG, MAGIC, MAX_BLOCK, ROOT, SECTOR, le16, le32};
 use core::ops::{Deref, DerefMut};
 
@@ -38,6 +39,19 @@ const BG_INODE_UNINIT: u16 = 1;
 const BG_BLOCK_UNINIT: u16 = 2;
 /// Bytes at the end of a folder block holding the checksum under metadata_csum (a fake empty entry, then the sum).
 const DIR_TAIL: usize = 12;
+
+/// Where a name belongs in an indexed folder: the index node (block, offset of its count/limit header, entry chosen,
+/// entries in use, entries it can hold) and the leaves to look in, the first being the one to add to.
+struct Probe {
+    version: u8,
+    node_block: u64,
+    off: usize,
+    chosen: usize,
+    count: usize,
+    limit: usize,
+    leaves: [u64; 4],
+    noted: usize,
+}
 
 fn put16(bytes: &mut [u8], at: usize, value: u16) {
     bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
@@ -416,6 +430,10 @@ impl<D: Device> Writer<D> {
             let flags = le16(&self.fs.gdt, at + 0x12);
             if inode_map && flags & BG_INODE_UNINIT != 0 {
                 self.bm[..size].fill(0);
+                // The bits past the group's last inode are set, as Linux does when it initialises the bitmap.
+                for index in self.fs.inodes_per_group as usize..size * 8 {
+                    set_bit(&mut self.bm, index, true);
+                }
                 return Ok(());
             }
             if !inode_map && flags & BG_BLOCK_UNINIT != 0 {
@@ -1127,41 +1145,340 @@ impl<D: Device> Writer<D> {
         Ok(())
     }
 
-    /// Adds `name -> number` to a folder, in free space of an existing block or in a new one.
-    fn dir_add(&mut self, dir_number: u32, name: &[u8], number: u32, kind: u8) -> Result<(), Error> {
-        let dir = self.checked(dir_number)?;
-        self.dir_unindex(dir_number, &dir)?;
-        let size = self.fs.block_size;
+    /// Puts `name -> number` into free space of the folder block `block` (shrinking the record that has room);
+    /// false when no record has room.
+    fn dir_place(&mut self, dir_number: u32, block: u64, name: &[u8], number: u32, kind: u8) -> Result<bool, Error> {
         let limit = self.dir_limit();
         let need = 8 + ((name.len() + 3) & !3);
-        let place = |data: &mut [u8], at: usize| {
-            put32(data, at, number);
-            data[at + 6] = name.len() as u8;
-            data[at + 7] = kind;
-            data[at + 8..at + 8 + name.len()].copy_from_slice(name);
-        };
+        self.fs.read_block(block, Buffer::Data)?;
+        let mut at = 0;
+        while at < limit {
+            let record = usize::from(le16(&self.fs.data, at + 4));
+            if record < 8 || record % 4 != 0 || at + record > limit {
+                return Err(Error::Corrupt);
+            }
+            let used = if le32(&self.fs.data, at) == 0 { 0 } else { 8 + ((usize::from(self.fs.data[at + 6]) + 3) & !3) };
+            if record - used >= need {
+                let at_new = at + used;
+                if used > 0 {
+                    put16(&mut self.fs.data, at + 4, used as u16);
+                }
+                put16(&mut self.fs.data, at_new + 4, (record - used) as u16);
+                put32(&mut self.fs.data, at_new, number);
+                self.fs.data[at_new + 6] = name.len() as u8;
+                self.fs.data[at_new + 7] = kind;
+                self.fs.data[at_new + 8..at_new + 8 + name.len()].copy_from_slice(name);
+                self.dir_seal(dir_number)?;
+                self.write_buffer(block, Buffer::Data)?;
+                return Ok(true);
+            }
+            at += record;
+        }
+        Ok(false)
+    }
+
+    /// Takes `name` out of the folder block `block`; returns what it named.
+    fn dir_take(&mut self, dir_number: u32, block: u64, name: &[u8]) -> Result<Option<u32>, Error> {
+        let limit = self.dir_limit();
+        self.fs.read_block(block, Buffer::Data)?;
+        let (mut at, mut before) = (0, None::<usize>);
+        while at < limit {
+            let record = usize::from(le16(&self.fs.data, at + 4));
+            if record < 8 || record % 4 != 0 || at + record > limit {
+                return Err(Error::Corrupt);
+            }
+            let length = usize::from(self.fs.data[at + 6]);
+            let found = le32(&self.fs.data, at);
+            if found != 0 && &self.fs.data[at + 8..at + 8 + length] == name {
+                match before {
+                    Some(previous) => {
+                        let merged = usize::from(le16(&self.fs.data, previous + 4)) + record;
+                        put16(&mut self.fs.data, previous + 4, merged as u16);
+                    }
+                    None => put32(&mut self.fs.data, at, 0),
+                }
+                self.dir_seal(dir_number)?;
+                self.write_buffer(block, Buffer::Data)?;
+                return Ok(Some(found));
+            }
+            before = Some(at);
+            at += record;
+        }
+        Ok(None)
+    }
+
+    /// Writes the checksum of the hash-tree node in `fs.data` whose count/limit header is at `off` (32 in the root, 8 in
+    /// an index node): over the node up to its last entry, the reserved word of the tail after the `limit` entries, and a zero word.
+    fn dx_seal(&mut self, dir_number: u32, off: usize) -> Result<(), Error> {
+        if !self.csum {
+            return Ok(());
+        }
+        let limit = usize::from(le16(&self.fs.data, off));
+        let count = usize::from(le16(&self.fs.data, off + 2));
+        let (end, tail) = (off + count * 8, off + limit * 8);
+        if count > limit || tail + 8 > self.fs.block_size {
+            return Err(Error::Corrupt);
+        }
+        let seed = self.inode_seed(dir_number)?;
+        let mut sum = crc32c(seed, &self.fs.data[..end]);
+        sum = crc32c(sum, &self.fs.data[tail..tail + 4]);
+        sum = crc32c(sum, &[0; 4]);
+        put32(&mut self.fs.data, tail + 4, sum);
+        Ok(())
+    }
+
+    /// Finds where `name` belongs in an indexed folder. `None` when the folder is not indexed or the index is not one
+    /// we maintain (more than one level of index nodes, a hash we cannot compute, anything odd): the caller then
+    /// works on the folder as a linear one.
+    fn dx_probe(&mut self, dir: &Inode, name: &[u8]) -> Result<Option<Probe>, Error> {
+        let size = self.fs.block_size;
+        if dir.flags & INDEX_FL == 0 || !dir.is_dir() || dir.size < 2 * size as u64 {
+            return Ok(None);
+        }
+        let root = self.dir_block(dir, 0)?;
+        self.fs.read_block(root, Buffer::Data)?;
+        let (version, info_length, levels) = (self.fs.data[28], self.fs.data[29], self.fs.data[30]);
+        if le16(&self.fs.data, 4) != 12 || self.fs.data[20..22] != *b".." || info_length != 8 || levels > 1 {
+            return Ok(None);
+        }
+        let Some(hash) = dirhash::hash(version, self.fs.hash_seed, name) else { return Ok(None) };
+        let blocks = dir.size / size as u64;
+        let (mut node_block, mut off, mut level) = (root, 32, levels);
+        loop {
+            let data = &self.fs.data[..size];
+            let (limit, count) = (usize::from(le16(data, off)), usize::from(le16(data, off + 2)));
+            if count == 0 || count > limit || off + limit * 8 > size {
+                return Ok(None);
+            }
+            let mut chosen = 0;
+            while chosen + 1 < count && le32(data, off + (chosen + 1) * 8) <= hash {
+                chosen += 1;
+            }
+            let next = u64::from(le32(data, off + chosen * 8 + 4) & 0x0fff_ffff);
+            if next == 0 || next >= blocks {
+                return Ok(None);
+            }
+            if level == 0 {
+                // Names whose hashes collide continue in the following leaves, marked by the hash's low bit.
+                let mut leaves = [next, 0, 0, 0];
+                let mut noted = 1;
+                let mut index = chosen + 1;
+                while index < count && le32(data, off + index * 8) == hash | 1 {
+                    if noted == leaves.len() {
+                        return Ok(None);
+                    }
+                    leaves[noted] = u64::from(le32(data, off + index * 8 + 4) & 0x0fff_ffff);
+                    noted += 1;
+                    index += 1;
+                }
+                if leaves[..noted].iter().any(|&leaf| leaf == 0 || leaf >= blocks) {
+                    return Ok(None);
+                }
+                return Ok(Some(Probe { version, node_block, off, chosen, count, limit, leaves, noted }));
+            }
+            level -= 1;
+            node_block = self.dir_block(dir, next)?;
+            self.fs.read_block(node_block, Buffer::Data)?;
+            if le32(&self.fs.data, 0) != 0 || usize::from(le16(&self.fs.data, 4)) != size {
+                return Ok(None);
+            }
+            off = 8;
+        }
+    }
+
+    /// Splits the full leaf `probe.leaves[0]` of an indexed folder: its entries, sorted by hash, are halved between it
+    /// and a new block at the end of the folder, and the new leaf gets an entry in the index node (which must have room).
+    /// False, with nothing changed, when the leaf cannot be split (fewer than two names).
+    fn dx_split(&mut self, dir_number: u32, dir: &Inode, probe: &Probe) -> Result<bool, Error> {
+        const MAX_ENTRIES: usize = MAX_BLOCK / 12 + 1;
+        let size = self.fs.block_size;
+        let limit = self.dir_limit();
+        let leaf_block = self.dir_block(dir, probe.leaves[0])?;
+        self.fs.read_block(leaf_block, Buffer::Data)?;
+        let (mut names, mut at) = (0, 0);
+        while at < limit {
+            let record = usize::from(le16(&self.fs.data, at + 4));
+            if record < 8 || record % 4 != 0 || at + record > limit {
+                return Err(Error::Corrupt);
+            }
+            names += usize::from(le32(&self.fs.data, at) != 0);
+            at += record;
+        }
+        if names < 2 {
+            return Ok(false);
+        }
+        // The extent update first: it works in `node`, where the old leaf is parked below.
+        self.load_extents(dir)?;
+        let logical = dir.size / size as u64;
+        let goal = self.exts[..self.count].last().map_or(0, |ext| ext.p + u64::from(ext.len));
+        let (new_block, _) = self.alloc_run(goal, 1)?;
+        if let Err(error) = self.ext_insert(logical as u32, 1, new_block).and_then(|()| self.store_extents(dir_number)) {
+            let _ = self.free_run(new_block, 1);
+            let _ = self.load_extents(dir);
+            return Err(error);
+        }
+        // The old leaf's bytes go to `node`, the buffer folders do not use, while `data` is rebuilt.
+        self.fs.read_block(leaf_block, Buffer::Data)?;
+        self.fs.node[..size].copy_from_slice(&self.fs.data[..size]);
+        let mut map = [(0u32, 0u16); MAX_ENTRIES];
+        let (mut n, mut at, mut total) = (0, 0, 0);
+        while at < limit {
+            let record = usize::from(le16(&self.fs.node, at + 4));
+            if record < 8 || record % 4 != 0 || at + record > limit {
+                return Err(Error::Corrupt);
+            }
+            if le32(&self.fs.node, at) != 0 {
+                let length = usize::from(self.fs.node[at + 6]);
+                let Some(hash) = dirhash::hash(probe.version, self.fs.hash_seed, &self.fs.node[at + 8..at + 8 + length]) else {
+                    return Err(Error::Corrupt);
+                };
+                map[n] = (hash, at as u16);
+                total += 8 + ((length + 3) & !3);
+                n += 1;
+            }
+            at += record;
+        }
+        map[..n].sort_unstable_by_key(|entry| entry.0);
+        let used_of = |node: &[u8], at: usize| 8 + ((usize::from(node[at + 6]) + 3) & !3);
+        let (mut split, mut moved) = (n, 0);
+        while split > 1 && moved < total / 2 {
+            split -= 1;
+            moved += used_of(&self.fs.node, usize::from(map[split].1));
+        }
+        let continued = u32::from(map[split].0 == map[split - 1].0);
+        let boundary = map[split].0 | continued;
+        // The upper half into a block of its own, the lower half back into the old leaf.
+        let mut upper = [0u8; MAX_BLOCK];
+        for (range, target) in [(split..n, &mut upper[..size]), (0..split, &mut self.fs.data[..size])] {
+            target.fill(0);
+            let (mut put, mut last) = (0, 0);
+            for entry in &map[range] {
+                let at = usize::from(entry.1);
+                let used = used_of(&self.fs.node, at);
+                target[put..put + used].copy_from_slice(&self.fs.node[at..at + used]);
+                put16(target, put + 4, used as u16);
+                last = put;
+                put += used;
+            }
+            put16(target, last + 4, (limit - last) as u16);
+        }
+        self.dir_seal(dir_number)?;
+        self.write_buffer(leaf_block, Buffer::Data)?;
+        self.fs.data[..size].copy_from_slice(&upper[..size]);
+        self.dir_seal(dir_number)?;
+        self.write_buffer(new_block, Buffer::Data)?;
+        // The index node learns the new leaf, right after the entry of the one that was split.
+        self.fs.read_block(probe.node_block, Buffer::Data)?;
+        let (off, from) = (probe.off, probe.off + (probe.chosen + 1) * 8);
+        self.fs.data.copy_within(from..off + probe.count * 8, from + 8);
+        put32(&mut self.fs.data, from, boundary);
+        put32(&mut self.fs.data, from + 4, logical as u32);
+        put16(&mut self.fs.data, off + 2, (probe.count + 1) as u16);
+        self.dx_seal(dir_number, off)?;
+        self.write_buffer(probe.node_block, Buffer::Data)?;
+        let (new_size, now) = (dir.size + size as u64, self.now);
+        self.update_inode(dir_number, |raw| {
+            put32(raw, 4, new_size as u32);
+            put32(raw, 12, now);
+            put32(raw, 16, now);
+        })?;
+        Ok(true)
+    }
+
+    /// Turns a one-block linear folder into an indexed one (what Linux does when the block fills): the entries after `..`
+    /// move to a new block 1, block 0 becomes the root of the tree with one entry pointing at it.
+    fn dx_create(&mut self, dir_number: u32, dir: &Inode) -> Result<(), Error> {
+        let size = self.fs.block_size;
+        let limit = self.dir_limit();
+        let version = self.fs.def_hash;
+        let root = self.dir_block(dir, 0)?;
+        self.load_extents(dir)?;
+        let goal = self.exts[..self.count].last().map_or(0, |ext| ext.p + u64::from(ext.len));
+        let (leaf_block, _) = self.alloc_run(goal, 1)?;
+        if let Err(error) = self.ext_insert(1, 1, leaf_block).and_then(|()| self.store_extents(dir_number)) {
+            let _ = self.free_run(leaf_block, 1);
+            let _ = self.load_extents(dir);
+            return Err(error);
+        }
+        self.fs.read_block(root, Buffer::Data)?;
+        if le16(&self.fs.data, 4) != 12 || self.fs.data[18] != 2 || self.fs.data[20..22] != *b".." {
+            return Err(Error::Corrupt);
+        }
+        // The leaf: everything from offset 24 on, its last record stretched over the 24 bytes the move frees.
+        let moved = limit - 24;
+        self.fs.node[..moved].copy_from_slice(&self.fs.data[24..limit]);
+        self.fs.node[moved..size].fill(0);
+        let mut at = 0;
+        loop {
+            let record = usize::from(le16(&self.fs.node, at + 4));
+            if record < 8 || record % 4 != 0 || at + record > moved {
+                return Err(Error::Corrupt);
+            }
+            if at + record == moved {
+                put16(&mut self.fs.node, at + 4, (record + 24) as u16);
+                break;
+            }
+            at += record;
+        }
+        self.fs.data[..size].copy_from_slice(&self.fs.node[..size]);
+        self.dir_seal(dir_number)?;
+        self.write_buffer(leaf_block, Buffer::Data)?;
+        // The root: `.`, `..` over the rest of the block, the tree header, one entry.
+        self.fs.read_block(root, Buffer::Data)?;
+        put16(&mut self.fs.data, 16, (size - 12) as u16);
+        self.fs.data[24..size].fill(0);
+        self.fs.data[28] = version;
+        self.fs.data[29] = 8;
+        let entries = (size - 32 - if self.csum { 8 } else { 0 }) / 8;
+        put16(&mut self.fs.data, 32, entries as u16);
+        put16(&mut self.fs.data, 34, 1);
+        put32(&mut self.fs.data, 36, 1);
+        self.dx_seal(dir_number, 32)?;
+        self.write_buffer(root, Buffer::Data)?;
+        let (new_size, now) = (dir.size + size as u64, self.now);
+        self.update_inode(dir_number, |raw| {
+            put32(raw, 4, new_size as u32);
+            put32(raw, 12, now);
+            put32(raw, 16, now);
+            let flags = le32(raw, 32);
+            put32(raw, 32, flags | INDEX_FL);
+        })
+    }
+
+    /// Adds `name -> number` to a folder. An indexed folder takes it in the leaf the hash names, splitting the leaf when
+    /// it is full; a one-block folder that fills up becomes indexed; any other folder takes it in free space of
+    /// an existing block, or in a new one.
+    fn dir_add(&mut self, dir_number: u32, name: &[u8], number: u32, kind: u8) -> Result<(), Error> {
+        let dir = self.checked(dir_number)?;
+        let size = self.fs.block_size;
+        let mut dir = dir;
+        for attempt in 0..3 {
+            if let Some(probe) = self.dx_probe(&dir, name)? {
+                let block = self.dir_block(&dir, probe.leaves[0])?;
+                if self.dir_place(dir_number, block, name, number, kind)? {
+                    return self.touch(dir_number, 0);
+                }
+                if attempt < 2 && probe.count < probe.limit && self.dx_split(dir_number, &dir, &probe)? {
+                    dir = self.checked(dir_number)?;
+                    continue;
+                }
+            } else if attempt == 0 && dir.flags & INDEX_FL == 0 && dir.size == size as u64 && self.fs.compat & 0x20 != 0 && dirhash::hash(self.fs.def_hash, self.fs.hash_seed, b"").is_some() {
+                let block = self.dir_block(&dir, 0)?;
+                if self.dir_place(dir_number, block, name, number, kind)? {
+                    return self.touch(dir_number, 0);
+                }
+                self.dx_create(dir_number, &dir)?;
+                dir = self.checked(dir_number)?;
+                continue;
+            }
+            break;
+        }
+        self.dir_unindex(dir_number, &dir)?;
+        let limit = self.dir_limit();
         for logical in 0..dir.size / size as u64 {
             let block = self.dir_block(&dir, logical)?;
-            self.fs.read_block(block, Buffer::Data)?;
-            let mut at = 0;
-            while at < limit {
-                let record = usize::from(le16(&self.fs.data, at + 4));
-                if record < 8 || record % 4 != 0 || at + record > limit {
-                    return Err(Error::Corrupt);
-                }
-                let used = if le32(&self.fs.data, at) == 0 { 0 } else { 8 + ((usize::from(self.fs.data[at + 6]) + 3) & !3) };
-                if record - used >= need {
-                    let at_new = at + used;
-                    if used > 0 {
-                        put16(&mut self.fs.data, at + 4, used as u16);
-                    }
-                    put16(&mut self.fs.data, at_new + 4, (record - used) as u16);
-                    place(&mut self.fs.data, at_new);
-                    self.dir_seal(dir_number)?;
-                    self.write_buffer(block, Buffer::Data)?;
-                    return self.touch(dir_number, INDEX_FL);
-                }
-                at += record;
+            if self.dir_place(dir_number, block, name, number, kind)? {
+                return self.touch(dir_number, INDEX_FL);
             }
         }
         // No room: the folder grows by one block.
@@ -1176,7 +1493,10 @@ impl<D: Device> Writer<D> {
         }
         self.fs.data[..size].fill(0);
         put16(&mut self.fs.data, 4, limit as u16);
-        place(&mut self.fs.data, 0);
+        put32(&mut self.fs.data, 0, number);
+        self.fs.data[6] = name.len() as u8;
+        self.fs.data[7] = kind;
+        self.fs.data[8..8 + name.len()].copy_from_slice(name);
         self.dir_seal(dir_number)?;
         self.write_buffer(block, Buffer::Data)?;
         let (new_size, now) = (dir.size + size as u64, self.now);
@@ -1189,38 +1509,26 @@ impl<D: Device> Writer<D> {
         })
     }
 
-    /// Takes `name` out of a folder; returns what it named.
+    /// Takes `name` out of a folder; returns what it named. An indexed folder is searched through its tree and stays
+    /// indexed (leaves only lose a record; the tree does not change).
     fn dir_remove(&mut self, dir_number: u32, name: &[u8]) -> Result<Option<u32>, Error> {
         let dir = self.checked(dir_number)?;
-        self.dir_unindex(dir_number, &dir)?;
-        let size = self.fs.block_size;
-        let limit = self.dir_limit();
-        for logical in 0..dir.size / size as u64 {
-            let block = self.dir_block(&dir, logical)?;
-            self.fs.read_block(block, Buffer::Data)?;
-            let (mut at, mut before) = (0, None::<usize>);
-            while at < limit {
-                let record = usize::from(le16(&self.fs.data, at + 4));
-                if record < 8 || record % 4 != 0 || at + record > limit {
-                    return Err(Error::Corrupt);
-                }
-                let length = usize::from(self.fs.data[at + 6]);
-                let found = le32(&self.fs.data, at);
-                if found != 0 && &self.fs.data[at + 8..at + 8 + length] == name {
-                    match before {
-                        Some(previous) => {
-                            let merged = usize::from(le16(&self.fs.data, previous + 4)) + record;
-                            put16(&mut self.fs.data, previous + 4, merged as u16);
-                        }
-                        None => put32(&mut self.fs.data, at, 0),
-                    }
-                    self.dir_seal(dir_number)?;
-                    self.write_buffer(block, Buffer::Data)?;
-                    self.touch(dir_number, INDEX_FL)?;
+        if let Some(probe) = self.dx_probe(&dir, name)? {
+            for &leaf in &probe.leaves[..probe.noted] {
+                let block = self.dir_block(&dir, leaf)?;
+                if let Some(found) = self.dir_take(dir_number, block, name)? {
+                    self.touch(dir_number, 0)?;
                     return Ok(Some(found));
                 }
-                before = Some(at);
-                at += record;
+            }
+            return Ok(None);
+        }
+        self.dir_unindex(dir_number, &dir)?;
+        for logical in 0..dir.size / self.fs.block_size as u64 {
+            let block = self.dir_block(&dir, logical)?;
+            if let Some(found) = self.dir_take(dir_number, block, name)? {
+                self.touch(dir_number, INDEX_FL)?;
+                return Ok(Some(found));
             }
         }
         Ok(None)
@@ -1425,14 +1733,22 @@ impl<D: Device> Writer<D> {
         self.dir_add(to_dir, to, source.number, kind_of(source.mode))?;
         self.dir_remove(from_dir, from)?;
         if source.is_dir() && from_dir != to_dir {
-            self.dir_unindex(source.number, &source)?;
             let block = self.dir_block(&source, 0)?;
             self.fs.read_block(block, Buffer::Data)?;
+            let indexed = source.flags & INDEX_FL != 0 && self.fs.data[29] == 8;
+            if !indexed {
+                self.dir_unindex(source.number, &source)?;
+                self.fs.read_block(block, Buffer::Data)?;
+            }
             if self.fs.data[12 + 6] != 2 || &self.fs.data[20..22] != b".." {
                 return Err(Error::Corrupt);
             }
             put32(&mut self.fs.data, 12, to_dir);
-            self.dir_seal(source.number)?;
+            if indexed {
+                self.dx_seal(source.number, 32)?;
+            } else {
+                self.dir_seal(source.number)?;
+            }
             self.write_buffer(block, Buffer::Data)?;
             self.add_links(from_dir, -1)?;
             self.add_links(to_dir, 1)?;
@@ -1689,12 +2005,13 @@ pub fn format_raw<D: Device>(device: &mut D, sectors: u64, options: &FormatOptio
         put32(&mut sb, 84, 11);
         put16(&mut sb, 88, FORMAT_INODE as u16);
         put16(&mut sb, 90, group as u16);
-        put32(&mut sb, 92, 0);
+        put32(&mut sb, 92, 0x20);
+        sb[0xfc] = 1;
         put32(&mut sb, 96, INCOMPAT_FILETYPE | INCOMPAT_EXTENTS);
         put32(&mut sb, 100, 0x1 | 0x2 | 0x8 | 0x20 | 0x40 | if options.checksums { RO_METADATA_CSUM } else { 0 });
         if jblocks > 0 {
             put32(&mut sb, 224, 8);
-            put32(&mut sb, 92, 0x4);
+            put32(&mut sb, 92, 0x4 | 0x20);
             sb[253] = 1;
             sb[268..328].copy_from_slice(&journal_map);
             put32(&mut sb, 332, (jblocks * FORMAT_BLOCK as u64) as u32);

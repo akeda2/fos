@@ -534,7 +534,7 @@ fn a_checksummed_journal_linux_wrote_is_replayed() {
 }
 
 #[test]
-fn hash_tree_folders_are_made_linear_on_a_checksummed_volume() {
+fn hash_tree_folders_stay_indexed_on_a_checksummed_volume() {
     if !have("mkfs.ext4") || !have("e2fsck") || !have("debugfs") {
         return;
     }
@@ -571,7 +571,16 @@ fn hash_tree_folders_are_made_linear_on_a_checksummed_volume() {
     w.flush().unwrap();
     drop(w);
     fsck(&image);
-    assert!(!stat("/small").contains("Number of entries"), "the folder is linear after our change");
+    assert!(stat("/small").contains("Number of entries"), "the folder is still a hash tree after our change");
+    assert!(stat("/small/moved-big").contains("Number of entries"), "so is the two-level one we moved");
+    let file = OpenOptions::new().read(true).write(true).open(&image).unwrap();
+    let mut w = Writer::new(ext4::open(FileDevice(file), stage()).unwrap()).unwrap();
+    assert!(w.resolve(b"small/added.txt").unwrap().is_some());
+    assert!(w.resolve(b"small/entry-with-a-fairly-long-name-00007").unwrap().is_none());
+    assert!(w.resolve(b"small/entry-with-a-fairly-long-name-00008").unwrap().is_some());
+    assert!(w.resolve(b"small/moved-big/added.txt").unwrap().is_some());
+    assert!(w.resolve(b"small/moved-big/entry-with-a-fairly-long-name-05999").unwrap().is_some());
+    assert!(w.resolve(b"small/moved-big/entry-with-a-fairly-long-name-00042").unwrap().is_none());
     let _ = fs::remove_file(&image);
 }
 
@@ -653,5 +662,94 @@ fn trim_covers_exactly_the_free_blocks() {
             }
         }
     }
+    let _ = fs::remove_file(&image);
+}
+
+/// A folder our writer grows past one block becomes a hash tree, keeps it through leaf splits, removals and a move, and
+/// e2fsck accepts every step (it checks the tree's order, the leaves' hashes and, with checksums, the node checksums).
+fn grown_folder_is_indexed(checksums: bool) {
+    if !have("e2fsck") {
+        return;
+    }
+    let image = std::env::temp_dir().join(format!("fos-ext4-dx{}-{}.img", checksums as u8, std::process::id()));
+    let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&image).unwrap();
+    file.set_len(400 << 20).unwrap();
+    let options = FormatOptions { label: b"fostest", bytes_per_inode: 0, uuid: [9; 16], time: 1_700_000_000, journal: true, checksums };
+    let mut w = Writer::format(FileDevice(file), (400 << 20) / 512, &options, stage()).unwrap();
+    w.set_time(1_800_000_000);
+    let root = w.root().unwrap().number;
+    let big = w.mkdir(root, b"big", 0o755).unwrap().number;
+    let name = |n: usize| format!("entry-{n:05}-with-a-fairly-long-name-to-fill-leaves.txt");
+    for n in 0..2500 {
+        w.create(big, name(n).as_bytes(), 0o644).unwrap();
+        if n == 20 || n == 400 {
+            w.flush().unwrap();
+            fsck(&image);
+        }
+    }
+    let folder = w.inode(big).unwrap();
+    assert!(folder.flags & 0x1000 != 0, "the folder is indexed");
+    for n in (0..2500).step_by(3) {
+        w.remove(big, name(n).as_bytes()).unwrap();
+    }
+    for n in 2500..2700 {
+        w.create(big, name(n).as_bytes(), 0o644).unwrap();
+    }
+    let other = w.mkdir(root, b"other", 0o755).unwrap().number;
+    w.rename(root, b"big", other, b"moved").unwrap();
+    w.flush().unwrap();
+    fsck(&image);
+    let moved = w.resolve(b"other/moved").unwrap().unwrap();
+    assert!(moved.flags & 0x1000 != 0, "the index survives removals and a move");
+    for n in 0..2700 {
+        let wanted = n >= 2500 || n % 3 != 0;
+        assert_eq!(w.resolve(format!("other/moved/{}", name(n)).as_bytes()).unwrap().is_some(), wanted, "{n}");
+    }
+    drop(w);
+    fsck(&image);
+    let _ = fs::remove_file(&image);
+}
+
+#[test]
+fn grown_folder_is_indexed_with_checksums() {
+    grown_folder_is_indexed(true);
+}
+
+#[test]
+fn grown_folder_is_indexed_without_checksums() {
+    grown_folder_is_indexed(false);
+}
+
+/// With 1 KiB blocks the root of the tree holds 123 leaves: a folder that outgrows it falls back to a linear scan
+/// (the index is dropped) and stays consistent, on a volume Linux made.
+#[test]
+fn full_index_root_falls_back_to_linear() {
+    if !have("mkfs.ext4") || !have("e2fsck") {
+        return;
+    }
+    let image = std::env::temp_dir().join(format!("fos-ext4-dxfull-{}.img", std::process::id()));
+    File::create(&image).unwrap().set_len(64 << 20).unwrap();
+    let made = Command::new("/usr/sbin/mkfs.ext4").args(["-q", "-F", "-b", "1024", "-N", "6000"]).arg(&image).status().unwrap();
+    assert!(made.success());
+    let file = OpenOptions::new().read(true).write(true).open(&image).unwrap();
+    let mut w = Writer::new(ext4::open(FileDevice(file), stage()).unwrap()).unwrap();
+    w.set_time(1_780_000_000);
+    let root = w.root().unwrap().number;
+    let dir = w.mkdir(root, b"many", 0o755).unwrap().number;
+    let mut indexed_at = None;
+    for n in 0..4000 {
+        w.create(dir, format!("a-rather-long-file-name-for-hash-tree-tests-{n:05}").as_bytes(), 0o644).unwrap();
+        let flagged = w.inode(dir).unwrap().flags & 0x1000 != 0;
+        match (flagged, indexed_at) {
+            (true, None) => indexed_at = Some(n),
+            (false, Some(_)) => break,
+            _ => {}
+        }
+    }
+    assert!(indexed_at.is_some(), "the folder became indexed");
+    assert!(w.inode(dir).unwrap().flags & 0x1000 == 0, "and was made linear when the root filled");
+    w.flush().unwrap();
+    drop(w);
+    fsck(&image);
     let _ = fs::remove_file(&image);
 }
