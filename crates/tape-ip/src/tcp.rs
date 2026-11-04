@@ -246,8 +246,17 @@ impl<const RX: usize, const N: usize> Server<RX, N> {
         self.slots[slot].connection.received()
     }
 
-    pub fn take(&mut self, slot: usize, out: &mut [u8]) -> usize {
-        self.slots[slot].connection.take_received(out)
+    pub fn take(&mut self, api: &TapeApi, slot: usize, out: &mut [u8]) -> usize {
+        let connection = &mut self.slots[slot].connection;
+        let closed = connection.advertised_window() == 0;
+        let count = connection.take_received(out);
+        // The window we last offered was 0: the peer is waiting to hear that room is back.
+        if closed && count > 0 && connection.advertised_window() > 0 {
+            if let Ok(length) = connection.window_update(&mut self.segment) {
+                self.transmit(api, slot, length);
+            }
+        }
+        count
     }
 
     /// True while the peer can still be answered (the connection is established, perhaps half-closed by the peer).

@@ -126,7 +126,7 @@ fn handle(api: &TapeApi, server: &mut Server<RX, SLOTS>, buffer: &mut [u8], slot
     // Whatever else the peer sent (a body, pipelined requests) is not wanted.
     let mut sink = [0u8; 256];
     while !server.received(slot).is_empty() {
-        server.take(slot, &mut sink);
+        server.take(api, slot, &mut sink);
     }
     serve(api, server, buffer, slot, settings, method == b"HEAD", method, target);
 }
@@ -134,7 +134,7 @@ fn handle(api: &TapeApi, server: &mut Server<RX, SLOTS>, buffer: &mut [u8], slot
 fn refuse(api: &TapeApi, server: &mut Server<RX, SLOTS>, buffer: &mut [u8], slot: usize, settings: &Settings, method: &[u8], target: &[u8], status: u16) {
     let mut sink = [0u8; 256];
     while !server.received(slot).is_empty() {
-        server.take(slot, &mut sink);
+        server.take(api, slot, &mut sink);
     }
     reply(api, server, buffer, slot, settings, method, target, status);
 }
