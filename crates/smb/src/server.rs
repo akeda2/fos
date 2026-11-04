@@ -38,6 +38,9 @@ const NO_RESOURCES: u32 = 0xC000_009A;
 const IO_ERROR: u32 = 0xC000_00E9;
 const LENGTH_MISMATCH: u32 = 0xC000_0004;
 const DIALECT_MISMATCH: u32 = 0xC000_00BD;
+const NAME_COLLISION: u32 = 0xC000_0035;
+const DIRECTORY_NOT_EMPTY: u32 = 0xC000_0101;
+const DISK_FULL: u32 = 0xC000_007F;
 
 const SESSION_ID: u64 = 0x0000_0001_0000_0001;
 const TREE_ID: u32 = 1;
@@ -78,6 +81,32 @@ pub struct Account {
     pub identity: Identity,
 }
 
+/// Why a change to the share failed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fail {
+    Denied,
+    Exists,
+    NotFound,
+    NotEmpty,
+    NoSpace,
+    IsDir,
+    Io,
+}
+
+impl Fail {
+    fn status(self) -> u32 {
+        match self {
+            Fail::Denied => ACCESS_DENIED,
+            Fail::Exists => NAME_COLLISION,
+            Fail::NotFound => NAME_NOT_FOUND,
+            Fail::NotEmpty => DIRECTORY_NOT_EMPTY,
+            Fail::NoSpace => DISK_FULL,
+            Fail::IsDir => IS_A_DIRECTORY,
+            Fail::Io => IO_ERROR,
+        }
+    }
+}
+
 /// The files behind the share. Paths are relative to the share root with '/' between components, no leading slash, ""
 /// for the root; names are UTF-8.
 pub trait Share {
@@ -100,6 +129,30 @@ pub trait Share {
     fn space(&mut self) -> (u64, u64) {
         (0, 0)
     }
+    /// Whether the share accepts changes at all; a read-only share never sees the calls below.
+    fn writable(&self) -> bool {
+        false
+    }
+    /// Makes an empty file or folder owned by `owner` with permission bits `mode`; the parent exists.
+    fn create(&mut self, _path: &str, _dir: bool, _mode: u32, _owner: Identity) -> Result<(), Fail> {
+        Err(Fail::Denied)
+    }
+    /// Writes `data` at `offset`, growing the file (a gap reads as zeros).
+    fn write(&mut self, _path: &str, _offset: u64, _data: &[u8]) -> Result<(), Fail> {
+        Err(Fail::Denied)
+    }
+    /// Sets the file's length, cutting it or extending it with zeros.
+    fn truncate(&mut self, _path: &str, _size: u64) -> Result<(), Fail> {
+        Err(Fail::Denied)
+    }
+    /// Removes a file or an empty folder.
+    fn remove(&mut self, _path: &str) -> Result<(), Fail> {
+        Err(Fail::Denied)
+    }
+    /// Renames; an existing target of the same kind is replaced.
+    fn rename(&mut self, _from: &str, _to: &str) -> Result<(), Fail> {
+        Err(Fail::Denied)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -108,12 +161,16 @@ struct Open {
     dir: bool,
     length: usize,
     path: [u8; MAX_PATH],
+    /// Opened with an access that changes data (write, append or delete).
+    write: bool,
+    /// Removed when closed.
+    delete: bool,
     /// Folder enumeration position: 0 is ".", 1 is "..", then the share's entries.
     next: usize,
 }
 
 impl Open {
-    const EMPTY: Open = Open { used: false, dir: false, length: 0, path: [0; MAX_PATH], next: 0 };
+    const EMPTY: Open = Open { used: false, dir: false, length: 0, path: [0; MAX_PATH], write: false, delete: false, next: 0 };
 
     fn path(&self) -> &str {
         core::str::from_utf8(&self.path[..self.length]).unwrap_or("")
@@ -459,7 +516,9 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
             CMD_QUERY_INFO => self.query_info(chain, related, msg, body),
             CMD_IOCTL => self.ioctl(msg, body),
             CMD_FLUSH => Self::empty(body),
-            CMD_WRITE | CMD_SET_INFO | CMD_LOCK => Err(ACCESS_DENIED),
+            CMD_WRITE => self.write(chain, related, msg, body),
+            CMD_SET_INFO => self.set_info(chain, related, msg, body),
+            CMD_LOCK => Err(ACCESS_DENIED),
             _ => Err(NOT_SUPPORTED),
         }
     }
@@ -661,7 +720,8 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
         body[..16].fill(0);
         put16(body, 0, 16);
         body[2] = 1; // disk
-        put32(body, 12, 0x0012_00A9); // read and execute
+        // read and execute, or everything but the owner-only rights on a share that takes changes
+        put32(body, 12, if self.share.writable() { 0x001F_01FF } else { 0x0012_00A9 });
         Ok(16)
     }
 
@@ -685,20 +745,9 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
         self.share.stat(open.path()).ok_or(NAME_NOT_FOUND)
     }
 
-    fn create(&mut self, chain: &mut Chain, msg: &[u8], body: &mut [u8]) -> Result<usize, u32> {
-        need(msg, 57)?;
-        let access = get32(msg, HEADER + 24);
-        let disposition = get32(msg, HEADER + 36);
-        let options = get32(msg, HEADER + 40);
-        let offset = get16(msg, HEADER + 44) as usize;
-        let length = get16(msg, HEADER + 46) as usize;
-        let name = if length == 0 { &[][..] } else { msg.get(offset..offset + length).ok_or(INVALID_PARAMETER)? };
-        // WRITE_DATA, APPEND_DATA, DELETE, GENERIC_ALL, GENERIC_WRITE
-        if access & (0x2 | 0x4 | 0x1_0000 | 0x1000_0000 | 0x4000_0000) != 0 || options & 0x1000 != 0 || !matches!(disposition, 1 | 3) {
-            return Err(ACCESS_DENIED);
-        }
-        let mut path = [0u8; MAX_PATH];
-        let mut used = name_to_utf8(name, &mut path);
+    /// `name` (UTF-16 from the wire) as a clean share path: no leading or trailing slash, no "." or ".." parts.
+    fn clean<'a>(name: &[u8], path: &'a mut [u8; MAX_PATH]) -> Result<&'a str, u32> {
+        let mut used = name_to_utf8(name, path);
         if used == MAX_PATH {
             return Err(NAME_INVALID);
         }
@@ -710,6 +759,47 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
         if text.split('/').any(|part| part == ".." || part == ".") && !text.is_empty() {
             return Err(NAME_INVALID);
         }
+        Ok(text)
+    }
+
+    /// The folder part of `path` ("" for a name in the root).
+    fn parent(path: &str) -> &str {
+        path.rfind('/').map_or("", |at| &path[..at])
+    }
+
+    /// Whether the session may add, remove or rename entries in the folder `path`: write and search.
+    fn may_change(&mut self, folder: &str) -> Result<(), u32> {
+        let stat = self.share.stat(folder).ok_or(NAME_NOT_FOUND)?;
+        if !stat.dir {
+            return Err(NOT_A_DIRECTORY);
+        }
+        if self.allowed(&stat, 3) { Ok(()) } else { Err(ACCESS_DENIED) }
+    }
+
+    fn create(&mut self, chain: &mut Chain, msg: &[u8], body: &mut [u8]) -> Result<usize, u32> {
+        need(msg, 57)?;
+        let access = get32(msg, HEADER + 24);
+        let disposition = get32(msg, HEADER + 36);
+        let options = get32(msg, HEADER + 40);
+        let offset = get16(msg, HEADER + 44) as usize;
+        let length = get16(msg, HEADER + 46) as usize;
+        let name = if length == 0 { &[][..] } else { msg.get(offset..offset + length).ok_or(INVALID_PARAMETER)? };
+        // WRITE_DATA, APPEND_DATA, DELETE, GENERIC_ALL, GENERIC_WRITE
+        let write = access & (0x2 | 0x4 | 0x1_0000 | 0x1000_0000 | 0x4000_0000) != 0;
+        let data_write = access & (0x2 | 0x4 | 0x1000_0000 | 0x4000_0000) != 0;
+        let delete = options & 0x1000 != 0;
+        let wants_read = access & (0x1 | 0x1000_0000 | 0x8000_0000) != 0;
+        if disposition > 5 {
+            return Err(INVALID_PARAMETER);
+        }
+        // Dispositions: 0 supersede, 1 open, 2 create, 3 open or create, 4 overwrite, 5 overwrite or create.
+        let may_create = matches!(disposition, 0 | 2 | 3 | 5);
+        let replaces = matches!(disposition, 0 | 4 | 5);
+        if (write || delete || disposition >= 2) && !self.share.writable() {
+            return Err(ACCESS_DENIED);
+        }
+        let mut path = [0u8; MAX_PATH];
+        let text = Self::clean(name, &mut path)?;
         // Every folder on the way needs the search bit, the target the read bit.
         let folders = core::iter::once(0).chain(text.match_indices('/').map(|(i, _)| i));
         for end in folders {
@@ -718,20 +808,60 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
                 return Err(ACCESS_DENIED);
             }
         }
-        let stat = self.share.stat(text).ok_or(NAME_NOT_FOUND)?;
-        if !self.allowed(&stat, 4) {
-            return Err(ACCESS_DENIED);
-        }
-        if options & 1 != 0 && !stat.dir {
-            return Err(NOT_A_DIRECTORY);
-        }
-        if options & 0x40 != 0 && stat.dir {
-            return Err(IS_A_DIRECTORY);
-        }
+        let mut action = 1; // FILE_OPENED
+        let stat = match self.share.stat(text) {
+            Some(stat) => {
+                if disposition == 2 {
+                    return Err(NAME_COLLISION);
+                }
+                if (!write || wants_read) && !self.allowed(&stat, 4) {
+                    return Err(ACCESS_DENIED);
+                }
+                if data_write && !stat.dir && !self.allowed(&stat, 2) {
+                    return Err(ACCESS_DENIED);
+                }
+                if options & 1 != 0 && !stat.dir {
+                    return Err(NOT_A_DIRECTORY);
+                }
+                if options & 0x40 != 0 && stat.dir {
+                    return Err(IS_A_DIRECTORY);
+                }
+                if replaces {
+                    if stat.dir {
+                        return Err(IS_A_DIRECTORY);
+                    }
+                    if !self.allowed(&stat, 2) {
+                        return Err(ACCESS_DENIED);
+                    }
+                    self.share.truncate(text, 0).map_err(Fail::status)?;
+                    action = if disposition == 0 { 0 } else { 3 };
+                }
+                if delete || access & 0x1_0000 != 0 && stat.dir {
+                    self.may_change(Self::parent(text))?;
+                }
+                if replaces { self.share.stat(text).unwrap_or(stat) } else { stat }
+            }
+            None => {
+                if !may_create {
+                    return Err(NAME_NOT_FOUND);
+                }
+                let dir = options & 1 != 0;
+                if text.is_empty() {
+                    return Err(ACCESS_DENIED);
+                }
+                self.may_change(Self::parent(text))?;
+                let identity = self.identity;
+                self.share.create(text, dir, if dir { 0o755 } else { 0o644 }, identity).map_err(Fail::status)?;
+                action = 2; // FILE_CREATED
+                self.share.stat(text).ok_or(IO_ERROR)?
+            }
+        };
         let slot = self.opens.iter().position(|open| !open.used).ok_or(NO_RESOURCES)?;
         let mut open = Open::EMPTY;
         open.used = true;
         open.dir = stat.dir;
+        open.write = write || delete;
+        open.delete = delete;
         open.length = text.len();
         open.path[..text.len()].copy_from_slice(text.as_bytes());
         self.opens[slot] = open;
@@ -742,7 +872,7 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
         }
         body[..89].fill(0);
         put16(body, 0, 89);
-        put32(body, 4, 1); // FILE_OPENED
+        put32(body, 4, action);
         let mtime = if stat.mtime == 0 { self.now } else { stat.mtime };
         put_times(body, 8, mtime);
         put64(body, 40, allocation(&stat));
@@ -758,7 +888,11 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
         let slot = self.slot(chain, related, msg, HEADER + 8)?;
         let flags = get16(msg, HEADER + 2);
         let stat = if flags & 1 != 0 { self.stat_open(slot).ok() } else { None };
+        let open = self.opens[slot];
         self.opens[slot] = Open::EMPTY;
+        if open.delete {
+            self.share.remove(open.path()).map_err(Fail::status)?;
+        }
         body[..60].fill(0);
         put16(body, 0, 60);
         if let Some(stat) = stat {
@@ -791,6 +925,110 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
         body[2] = (HEADER + 16) as u8;
         put32(body, 4, read as u32);
         Ok(16 + read)
+    }
+
+    fn write(&mut self, chain: &mut Chain, related: bool, msg: &[u8], body: &mut [u8]) -> Result<usize, u32> {
+        need(msg, 49)?;
+        let data_at = get16(msg, HEADER + 2) as usize;
+        let length = get32(msg, HEADER + 4) as usize;
+        let offset = get64(msg, HEADER + 8);
+        let slot = self.slot(chain, related, msg, HEADER + 16)?;
+        let open = self.opens[slot];
+        if open.dir {
+            return Err(IS_A_DIRECTORY);
+        }
+        if !open.write {
+            return Err(ACCESS_DENIED);
+        }
+        let data = msg.get(data_at..data_at.checked_add(length).ok_or(INVALID_PARAMETER)?).ok_or(INVALID_PARAMETER)?;
+        if !data.is_empty() {
+            self.share.write(open.path(), offset, data).map_err(Fail::status)?;
+        }
+        body[..16].fill(0);
+        put16(body, 0, 17);
+        put32(body, 4, length as u32);
+        Ok(16)
+    }
+
+    fn set_info(&mut self, chain: &mut Chain, related: bool, msg: &[u8], body: &mut [u8]) -> Result<usize, u32> {
+        need(msg, 33)?;
+        let kind = msg[HEADER + 2];
+        let class = msg[HEADER + 3];
+        let length = get32(msg, HEADER + 4) as usize;
+        let at = get16(msg, HEADER + 8) as usize;
+        let slot = self.slot(chain, related, msg, HEADER + 16)?;
+        let buffer = msg.get(at..at.checked_add(length).ok_or(INVALID_PARAMETER)?).ok_or(INVALID_PARAMETER)?;
+        if kind != 1 {
+            return Err(NOT_SUPPORTED);
+        }
+        let open = self.opens[slot];
+        match class {
+            // Basic (times, attributes) and allocation size: nothing to keep.
+            4 | 19 => {}
+            // FileRenameInformation: replace flag, then a UTF-16 name relative to the share root.
+            10 => {
+                if !open.write || !self.share.writable() {
+                    return Err(ACCESS_DENIED);
+                }
+                if buffer.len() < 20 {
+                    return Err(INVALID_PARAMETER);
+                }
+                let replace = buffer[0] != 0;
+                let name_length = get32(buffer, 16) as usize;
+                let name = buffer.get(20..20 + name_length).ok_or(INVALID_PARAMETER)?;
+                let mut path = [0u8; MAX_PATH];
+                let target = Self::clean(name, &mut path)?;
+                if target.is_empty() || open.path().is_empty() {
+                    return Err(ACCESS_DENIED);
+                }
+                if target != open.path() {
+                    self.may_change(Self::parent(open.path()))?;
+                    self.may_change(Self::parent(target))?;
+                    if let Some(existing) = self.share.stat(target) {
+                        if !replace {
+                            return Err(NAME_COLLISION);
+                        }
+                        if existing.dir != open.dir {
+                            return Err(if existing.dir { IS_A_DIRECTORY } else { NOT_A_DIRECTORY });
+                        }
+                    }
+                    self.share.rename(open.path(), target).map_err(Fail::status)?;
+                    let entry = &mut self.opens[slot];
+                    entry.length = target.len();
+                    entry.path[..target.len()].copy_from_slice(target.as_bytes());
+                }
+            }
+            // FileDispositionInformation: delete when closed.
+            13 => {
+                let pending = buffer.first().is_some_and(|&flag| flag != 0);
+                if pending {
+                    if !open.write || !self.share.writable() {
+                        return Err(ACCESS_DENIED);
+                    }
+                    self.may_change(Self::parent(open.path()))?;
+                    if open.dir && self.share.read_dir(open.path(), 0, &mut [0u8; MAX_PATH]).is_some() {
+                        return Err(DIRECTORY_NOT_EMPTY);
+                    }
+                }
+                self.opens[slot].delete = pending;
+            }
+            // FileEndOfFileInformation.
+            20 => {
+                if open.dir {
+                    return Err(IS_A_DIRECTORY);
+                }
+                if !open.write {
+                    return Err(ACCESS_DENIED);
+                }
+                if buffer.len() < 8 {
+                    return Err(INVALID_PARAMETER);
+                }
+                self.share.truncate(open.path(), get64(buffer, 0)).map_err(Fail::status)?;
+            }
+            _ => return Err(NOT_SUPPORTED),
+        }
+        put16(body, 0, 2);
+        Ok(2)
     }
 
     /// One directory entry in the layout of information class `class`; returns its length before padding.

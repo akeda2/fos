@@ -13,9 +13,14 @@ tape_rt::tape_help!(
     br#"smb ls   //HOST/SHARE[/DIR]
 smb cat  //HOST/SHARE/FILE
 smb get  //HOST/SHARE/FILE [NAME]
+smb put  //HOST/SHARE/FILE [NAME]
+smb mkdir|rmdir|rm  //HOST/SHARE/PATH
+smb mv   //HOST/SHARE/OLD NEW
       add user=NAME password=SECRET to log in (default: guest)
-List a folder, print a file, or copy a file to this machine (NAME is a file
-reference: NAME, diskN/NAME or @LABEL/NAME; default the file's own name). HOST
+List a folder, print a file, copy a file to this machine (get) or from it (put;
+NAME is a file reference: NAME, diskN/NAME or @LABEL/NAME; default the file's
+own name), make or remove a folder or file, rename (NEW is a path in the same
+share; an existing file there is replaced). put replaces FILE. HOST
 is an IPv4 address or a name. Guest login unless user= is given (NTLMv2,
 requests signed): a Linux/Samba/Windows share or fos's own smbd (smbusers).
 SMB 2.0.2 to 2.1. The address
@@ -63,13 +68,13 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         }
     }
     let mut words = arguments.split_whitespace().filter(|word| !word.starts_with("user=") && !word.starts_with("password="));
-    let (Some(command), Some(url)) = (words.next(), words.next()) else { return println!("usage: smb ls|cat|get //HOST/SHARE[/PATH] [NAME]  (smb help)") };
+    let (Some(command), Some(url)) = (words.next(), words.next()) else { return println!("usage: smb ls|cat|get|put|mkdir|rmdir|rm|mv //HOST/SHARE[/PATH] [NAME]  (smb help)") };
     let Some(rest) = url.strip_prefix("//") else { return println!("smb: {url}: write //HOST/SHARE/PATH.") };
     let (host, rest) = rest.split_once('/').unwrap_or((rest, ""));
     let (share, path) = rest.split_once('/').unwrap_or((rest, ""));
     let path = path.trim_end_matches('/');
-    if host.is_empty() || share.is_empty() || !matches!(command, "ls" | "cat" | "get") || (command != "ls" && path.is_empty()) {
-        return println!("usage: smb ls|cat|get //HOST/SHARE[/PATH] [NAME]  (smb help)");
+    if host.is_empty() || share.is_empty() || !matches!(command, "ls" | "cat" | "get" | "put" | "mkdir" | "rmdir" | "rm" | "mv") || (command != "ls" && path.is_empty()) {
+        return println!("usage: smb ls|cat|get|put|mkdir|rmdir|rm|mv //HOST/SHARE[/PATH] [NAME]  (smb help)");
     }
     let local = words.next().unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path));
     #[allow(static_mut_refs)]
@@ -80,6 +85,14 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     match command {
         "ls" => list(client, path),
         "cat" => cat(api, client, path, block),
+        "put" => put(api, client, path, local, block),
+        "mkdir" => report(path, client.make_dir(path), "folder made"),
+        "rmdir" => report(path, client.remove(path, true), "folder removed"),
+        "rm" => report(path, client.remove(path, false), "file removed"),
+        "mv" => {
+            let target = local.trim_start_matches('/');
+            report(path, client.rename(path, target), "renamed")
+        }
         _ => get(api, client, path, local, block),
     }
     client.transport().socket.close(api);
@@ -231,4 +244,64 @@ fn get(api: &TapeApi, client: &mut Session, path: &str, local: &str, block: &mut
     }
     let micros = (tape_rt::micros() - started).max(1);
     println!("smb: {path} -> {local}: {total} bytes in {} ms, {} kbit/s.", micros / 1000, total * 8 * 1000 / micros);
+}
+
+fn report(path: &str, result: Result<(), Error>, done: &str) {
+    match result {
+        Ok(()) => println!("smb: {path}: {done}."),
+        Err(error) => println!("smb: {path}: {}.", error.describe()),
+    }
+}
+
+/// Copies the local file `local` to `path` on the share, replacing it.
+fn put(api: &TapeApi, client: &mut Session, path: &str, local: &str, block: &mut [u8; CHUNK]) {
+    let mut probe = [0u8; 1];
+    if tape_rt::read_file_at(local, 0, &mut probe).is_err() {
+        return println!("smb: {local}: no such file here (or a kernel without tape ABI 29).");
+    }
+    let file = match client.create_file(path, true) {
+        Ok(file) => file,
+        Err(error) => return println!("smb: {path}: {}.", error.describe()),
+    };
+    let started = tape_rt::micros();
+    let (mut offset, mut failed) = (0u64, false);
+    'copy: loop {
+        if (api.should_abort)() != 0 {
+            println!("smb: stopped.");
+            failed = true;
+            break;
+        }
+        let count = match tape_rt::read_file_at(local, offset, &mut block[..]) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(_) => {
+                println!("smb: reading {local} failed at {offset}.");
+                failed = true;
+                break;
+            }
+        };
+        let mut sent = 0;
+        while sent < count {
+            match client.write(&file, offset + sent as u64, &block[sent..count]) {
+                Ok(0) => {
+                    println!("smb: the server took no data at {}.", offset + sent as u64);
+                    failed = true;
+                    break 'copy;
+                }
+                Ok(took) => sent += took,
+                Err(error) => {
+                    println!("smb: write at {}: {}.", offset + sent as u64, error.describe());
+                    failed = true;
+                    break 'copy;
+                }
+            }
+        }
+        offset += count as u64;
+    }
+    let closed = client.close(&file);
+    if failed || closed.is_err() {
+        return println!("smb: {path}: sent {offset} bytes, not complete.");
+    }
+    let micros = (tape_rt::micros() - started).max(1);
+    println!("smb: {local} -> {path}: {offset} bytes in {} ms, {} kbit/s.", micros / 1000, offset * 8 * 1000 / micros);
 }

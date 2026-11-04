@@ -29,7 +29,8 @@ HOST_PORT = port(28080)
 class Guest:
     """A booted guest with a shell on the term net session. `with Guest(forward=...) as g: g.line("uptime", "ticks")`."""
 
-    def __init__(self, forward=None, data_disk=False, timeout=240, guest_port=80, user_extra=""):
+    def __init__(self, forward=None, data_disk=False, timeout=240, guest_port=80, user_extra="", save_data=None):
+        self.save_data = save_data  # where to copy the data disk when the guest is gone
         self.forward, self.data_disk, self.timeout, self.guest_port = forward, data_disk, timeout, guest_port
         self.user_extra = user_extra
 
@@ -90,6 +91,8 @@ class Guest:
             self.process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             self.process.kill()
+        if self.save_data and self.data_disk:
+            shutil.copy(Path(self.tmp.name) / "data.img", self.save_data)
         self.tmp.cleanup()
 
 

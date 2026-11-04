@@ -1250,6 +1250,25 @@ impl<D: Device> Writer<D> {
         Ok(dir)
     }
 
+    /// Gives an inode an owner and, when `mode` is given, new permission bits (the file type bits stay). A file made by
+    /// `create` belongs to root until this is called.
+    pub fn set_owner(&mut self, number: u32, uid: u32, gid: u32, mode: Option<u16>) -> Result<(), Error> {
+        self.checked(number)?;
+        self.begin()?;
+        let now = self.now;
+        self.update_inode(number, |raw| {
+            put16(raw, 2, uid as u16);
+            put16(raw, 120, (uid >> 16) as u16);
+            put16(raw, 24, gid as u16);
+            put16(raw, 122, (gid >> 16) as u16);
+            if let Some(bits) = mode {
+                let kind = le16(raw, 0) & 0xf000;
+                put16(raw, 0, kind | (bits & 0o7777));
+            }
+            put32(raw, 12, now);
+        })
+    }
+
     /// Makes an empty file `name` in folder `parent` (inode numbers) with the permission bits `permissions`.
     pub fn create(&mut self, parent: u32, name: &[u8], permissions: u16) -> Result<Inode, Error> {
         self.start_check(parent, name)?;

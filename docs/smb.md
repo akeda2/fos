@@ -91,8 +91,18 @@ Done (ABI 32, `crates/kernel-core/src/tape_vfs.rs`, `tape_rt::vfs_stat/vfs_read_
    `crates/smb/tests/server.rs`: right and wrong password, unknown user, anonymous, a 0600 file of another owner, SMB 2.0.2 and 3.0).
    The `smb` client tape logs in with `user=NAME password=SECRET` (NTLMv2, HMAC-SHA-256 signing, client nonce from `random`); `make test-smb-client`
    second section: password login, signed 3 MB `get`, wrong password and guest refused (the host `serve` example with `SMB_LOGIN`).
-7. Writes: the `vfs_*` write calls, the ext4 writer behind them (journal commit per request batch), CREATE for write, WRITE,
-   SET_INFO (rename, delete-on-close, end-of-file), FLUSH.
+7. (done) Writes. Tape ABI 34 `vfs_create/write/truncate/remove/rename/set_owner` over the ext4 writer (every call opens the
+   volume for writing, changes it, commits the journal and remounts the read side, `ext4vol::with_writer`; ext volumes only, other
+   volumes answer `FS_READ_ONLY`; `make test-vfs-write` checks the result with e2fsck and debugfs). The server handles CREATE with
+   all dispositions and the directory option, WRITE, SET_INFO (rename, delete-on-close, end-of-file; times and attributes are
+   accepted and ignored) and FLUSH (a no-op: every call is already committed). Permissions: adding, removing or renaming needs
+   write and search on the parent folder, writing an existing file the write bit, and a new file belongs to the session's uid/gid
+   (mode 0644, folders 0755). smbd takes `ro` to refuse all changes. A message is up to `MAX_IO` (64 KiB), so the tape's receive
+   buffer is that plus headers. The client tape has `put`, `mkdir`, `rmdir`, `rm` and `mv`. Tests: `smbclient_changes_files` and
+   `our_client_changes_files` (`crates/smb/tests/server.rs`), `make test-smbd` (smbclient writes as a logged-in user into a
+   world-writable folder, then e2fsck/debugfs of the guest's disk copy), `make test-smb-client` (put of 3 MB, mkdir, mv, rm, rmdir
+   against the host `serve` example). Not checked: Windows, macOS, `mount.cifs` writes, and a power cut during a write on real
+   disks; delete-on-close of a file that others hold open is not tracked (opens are not shared-mode checked).
 
 Open points for later: the ext4 writer does not keep hash-tree indexes (`DEFERRED.md`), which matters for big shared folders;
 a tape runs one request at a time on the boot CPU (fine for a first server, `httpd` is the same); the tape ABI's file calls

@@ -144,6 +144,12 @@ const VFS_STAT: u64 = slot(offset_of!(TapeApi, vfs_stat));
 const VFS_READ_DIR: u64 = slot(offset_of!(TapeApi, vfs_read_dir));
 const VFS_READ: u64 = slot(offset_of!(TapeApi, vfs_read));
 const RANDOM: u64 = slot(offset_of!(TapeApi, random));
+const VFS_CREATE: u64 = slot(offset_of!(TapeApi, vfs_create));
+const VFS_WRITE: u64 = slot(offset_of!(TapeApi, vfs_write));
+const VFS_TRUNCATE: u64 = slot(offset_of!(TapeApi, vfs_truncate));
+const VFS_REMOVE: u64 = slot(offset_of!(TapeApi, vfs_remove));
+const VFS_RENAME: u64 = slot(offset_of!(TapeApi, vfs_rename));
+const VFS_SET_OWNER: u64 = slot(offset_of!(TapeApi, vfs_set_owner));
 const FS_READ_AT: u64 = slot(offset_of!(TapeApi, fs_read_at));
 const MEMORY_MAP: u64 = slot(offset_of!(TapeApi, memory_map));
 const MEMORY_MAP_COUNT: u64 = slot(offset_of!(TapeApi, memory_map_count));
@@ -356,6 +362,12 @@ pub fn call(frame: &mut Frame) {
         VFS_STAT => tapefs::vfs_stat(a, b, c) as u64,
         VFS_READ_DIR => tapefs::vfs_read_dir(a, b, c, d) as u64,
         VFS_READ => tapefs::vfs_read(a, b, c, d, e) as u64,
+        VFS_CREATE => tapefs::vfs_create(a, b, c) as u64,
+        VFS_WRITE => tapefs::vfs_write(a, b, c, d, e) as u64,
+        VFS_TRUNCATE => tapefs::vfs_truncate(a, b, c) as u64,
+        VFS_REMOVE => tapefs::vfs_remove(a, b) as u64,
+        VFS_RENAME => tapefs::vfs_rename(a, b, c, d) as u64,
+        VFS_SET_OWNER => tapefs::vfs_set_owner(a, b, c, d, e) as u64,
         RANDOM => {
             let out = unsafe { core::slice::from_raw_parts_mut(a as *mut u8, b as usize) };
             u64::from(kernel_core::random::fill(out))

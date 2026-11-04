@@ -11,6 +11,7 @@ Usage: tape run fscheck NAME OFFSET LENGTH   (NAME: NAME, diskN/NAME or @LABEL/N
 Prints the bytes read; a count of 0 means the offset is at or past the end.
        tape run fscheck streams NAME1 NAME2   (two open streams, ABI 30; the files are 20000 and 19900 bytes)
        tape run fscheck vfs PATH              (ABI 32: stat PATH, list it if a folder, else read its first 40 bytes)
+       tape run fscheck vfswrite DIR          (ABI 34: create, write, truncate, rename, remove under DIR on an ext volume)
        tape run fscheck remove NAME           (create NAME, delete it with fs_remove, check it is gone)
 "#);
 
@@ -31,6 +32,13 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         return match words.next() {
             Some(path) => vfs(path),
             None => println!("Usage: fscheck vfs PATH"),
+        };
+    }
+    if arguments.starts_with("vfswrite ") {
+        words.next();
+        return match words.next() {
+            Some(path) => vfs_write(path),
+            None => println!("Usage: fscheck vfswrite DIR"),
         };
     }
     if arguments.starts_with("remove ") {
@@ -145,6 +153,85 @@ fn vfs(path: &str) {
         match tape_rt::vfs_read(path, 0, &mut buffer) {
             Ok(count) => println!("fscheck: read {count} bytes [{}]", core::str::from_utf8(&buffer[..count]).unwrap_or("?")),
             Err(code) => println!("fscheck: read error {code}"),
+        }
+    }
+}
+
+/// ABI 34: the change calls, one step per line as `fscheck: STEP -> RESULT`. Leaves `keep.txt` (owner 1000:100, mode 640, "kept
+/// text") and the folder `kdir` (mode 750) behind for the host to check with e2fsck.
+fn vfs_write(dir: &str) {
+    use tape_rt::{VFS_DIR, VFS_FILE, VFS_KEEP_MODE};
+    fn show<T: core::fmt::Debug>(step: &str, result: Result<T, isize>) {
+        match result {
+            Ok(value) => println!("fscheck: {step} -> ok {value:?}"),
+            Err(code) => println!("fscheck: {step} -> error {code}"),
+        }
+    }
+    let path = |name: &str| {
+        let mut text = alloc_free::Text::new();
+        text.push(dir);
+        text.push("/");
+        text.push(name);
+        text
+    };
+    show("mkdir sub", tape_rt::vfs_create(path("sub").as_str(), VFS_DIR, 0o755, 1000, 100));
+    show("create sub/a.txt", tape_rt::vfs_create(path("sub/a.txt").as_str(), VFS_FILE, 0o640, 1000, 100));
+    show("create sub/a.txt again", tape_rt::vfs_create(path("sub/a.txt").as_str(), VFS_FILE, 0o640, 1000, 100));
+    show("create nodir/x", tape_rt::vfs_create(path("nodir/x").as_str(), VFS_FILE, 0o640, 0, 0));
+    show("write hello", tape_rt::vfs_write(path("sub/a.txt").as_str(), 0, b"hello"));
+    let mut block = [0u8; 30_000];
+    for (index, byte) in block.iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+    let mut total = 0;
+    for round in 0..4 {
+        match tape_rt::vfs_write(path("sub/a.txt").as_str(), 5 + round * 30_000, &block) {
+            Ok(count) => total += count,
+            Err(code) => println!("fscheck: big write error {code}"),
+        }
+    }
+    println!("fscheck: big writes -> {total} bytes");
+    match tape_rt::vfs_stat(path("sub/a.txt").as_str()) {
+        Ok(stat) => println!("fscheck: stat a.txt -> size {} mode {:o} uid {} gid {}", stat.size, stat.mode, stat.uid, stat.gid),
+        Err(code) => println!("fscheck: stat a.txt -> error {code}"),
+    }
+    let mut check = [0u8; 8];
+    show("read back at 30000", tape_rt::vfs_read(path("sub/a.txt").as_str(), 30_000 + 5 - 4, &mut check).map(|count| (count, check)));
+    show("truncate 50", tape_rt::vfs_truncate(path("sub/a.txt").as_str(), 50));
+    show("rename a to b", tape_rt::vfs_rename(path("sub/a.txt").as_str(), path("sub/b.txt").as_str()));
+    show("stat a gone", tape_rt::vfs_stat(path("sub/a.txt").as_str()).map(|_| ()));
+    show("stat b size", tape_rt::vfs_stat(path("sub/b.txt").as_str()).map(|stat| stat.size));
+    show("remove sub (not empty)", tape_rt::vfs_remove(path("sub").as_str()));
+    show("remove b", tape_rt::vfs_remove(path("sub/b.txt").as_str()));
+    show("remove sub", tape_rt::vfs_remove(path("sub").as_str()));
+    show("create keep.txt", tape_rt::vfs_create(path("keep.txt").as_str(), VFS_FILE, 0o600, 0, 0));
+    show("write keep.txt", tape_rt::vfs_write(path("keep.txt").as_str(), 0, b"kept text"));
+    show("set owner keep.txt", tape_rt::vfs_set_owner(path("keep.txt").as_str(), 1000, 100, 0o640));
+    show("mkdir kdir", tape_rt::vfs_create(path("kdir").as_str(), VFS_DIR, 0o750, 0, 0));
+    show("set owner kdir", tape_rt::vfs_set_owner(path("kdir").as_str(), 7, 8, VFS_KEEP_MODE));
+    println!("fscheck: vfswrite done");
+}
+
+/// A path built without an allocator.
+mod alloc_free {
+    pub struct Text {
+        bytes: [u8; 128],
+        length: usize,
+    }
+
+    impl Text {
+        pub fn new() -> Self {
+            Text { bytes: [0; 128], length: 0 }
+        }
+
+        pub fn push(&mut self, text: &str) {
+            let take = text.len().min(self.bytes.len() - self.length);
+            self.bytes[self.length..self.length + take].copy_from_slice(&text.as_bytes()[..take]);
+            self.length += take;
+        }
+
+        pub fn as_str(&self) -> &str {
+            core::str::from_utf8(&self.bytes[..self.length]).unwrap_or("")
         }
     }
 }

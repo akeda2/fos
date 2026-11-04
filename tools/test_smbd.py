@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""The `smbd` tape: a read-only SMB server run as a service on a user-mode NIC, used from the host with `smbclient`.
+"""The `smbd` tape: an SMB server run as a service on a user-mode NIC, used from the host with `smbclient`.
 
 The second disk is an ext4 volume made by mkfs.ext4 -d (a UTF-8 name, a 3 MB file with a checksum, a folder of 300 files, a
 subfolder). The guest shares it as //HOST/data through QEMU's forwarded port 445. Checks: share root listing, a subfolder, a
-long folder, a big file's checksum, a ranged read, a missing file, that a write is refused, and that the shell stays usable.
+long folder, a big file's checksum, a ranged read, a missing file, that a write is refused where the folder's mode bits
+forbid it, and that the shell stays usable. A second boot with an smbusers file checks logins and writes (put, mkdir, rename,
+overwrite, delete) into a world-writable folder, then e2fsck and debugfs check the volume on the host.
 Run with `make test-smbd`."""
 import hashlib
 import os
@@ -49,6 +51,8 @@ def main():
         (source / "hello.txt").write_text("hello over smb\n")
         (source / "locked.txt").write_text("not for alice\n")
         (source / "locked.txt").chmod(0o600)
+        (source / "drop").mkdir()
+        (source / "drop").chmod(0o777)
         (source / "docs" / "räksmörgås.txt").write_text("hej\n")
         (source / "docs" / "deep" / "x.txt").write_text("deep\n")
         for index in range(MANY):
@@ -86,7 +90,8 @@ def main():
             shell = g.line("uptime")
             check("fos>" in shell, "the shell stays usable while the service runs", shell)
         # Second boot: the same volume with an smbusers file (alice, uid 4242, is not the owner of anything).
-        with Guest(forward=HOST_PORT, data_disk=image, guest_port=445) as g:
+        written = tmp / "written.img"
+        with Guest(forward=HOST_PORT, data_disk=image, guest_port=445, save_data=written) as g:
             g.line("write settings no-msi")
             screen = g.line("run smbd user alice 4242 4242 secret")
             entry = next((word for word in screen.split() if word.startswith("alice:4242:4242:")), "")
@@ -104,6 +109,38 @@ def main():
             check("ACCESS_DENIED" in out.stdout + out.stderr and not (tmp / "h2").exists(), "mode 0600 of another owner is denied", out.stdout + out.stderr)
             out = smbclient("get hello.txt " + str(tmp / "h3"), "SMB2_02", login=("-U", "alice%secret"))
             check(out.returncode == 0, "SMB 2.0.2 signing works too", out.stdout + out.stderr)
+            payload = os.urandom(300_000)
+            (tmp / "up.bin").write_bytes(payload)
+            (tmp / "small.txt").write_text("small file\n")
+            out = smbclient(f"put {tmp / 'up.bin'} hello2.bin", login=("-U", "alice%secret"), attempts=1)
+            check("ACCESS_DENIED" in out.stdout + out.stderr, "a folder without the write bit refuses a new file", out.stdout + out.stderr)
+            out = smbclient(f"put {source / 'hello.txt'} hello.txt", login=("-U", "alice%secret"), attempts=1)
+            check("ACCESS_DENIED" in out.stdout + out.stderr, "a file of another owner is not overwritten", out.stdout + out.stderr)
+            script = (f"put {tmp / 'up.bin'} drop\\up.bin; mkdir drop\\sub; put {tmp / 'small.txt'} drop\\sub\\a.txt; "
+                      f"put {tmp / 'small.txt'} drop\\gone.txt; rename drop\\up.bin drop\\moved.bin; rm drop\\gone.txt; "
+                      f"put {tmp / 'small.txt'} drop\\over.txt; put {tmp / 'up.bin'} drop\\over.txt")
+            out = smbclient(script, login=("-U", "alice%secret"), attempts=1)
+            check(out.returncode == 0 and "NT_STATUS" not in out.stdout + out.stderr, "alice writes into the world-writable folder", out.stdout + out.stderr)
+            out = smbclient("get drop\\moved.bin " + str(tmp / "back.bin"), login=("-U", "alice%secret"))
+            check((tmp / "back.bin").read_bytes() == payload, "the uploaded, renamed file reads back", out.stdout + out.stderr)
+            out = smbclient("ls drop\\*", login=("-U", "alice%secret"))
+            check("moved.bin" in out.stdout and "gone.txt" not in out.stdout and "up.bin" not in out.stdout.replace("moved.bin", ""),
+                  "rename and delete show in the listing", out.stdout + out.stderr)
+            out = smbclient("rmdir drop\\sub", login=("-U", "alice%secret"), attempts=1)
+            check("NOT_EMPTY" in out.stdout + out.stderr, "a folder with files in it is not removed", out.stdout + out.stderr)
+            shell = g.line("uptime")
+            check("fos>" in shell, "the shell stays usable after the writes", shell)
+        # The guest is gone: its copy of the volume must be consistent and hold what was written, owned by alice.
+        e2fsck = shutil.which("e2fsck") or "/usr/sbin/e2fsck"
+        debugfs = shutil.which("debugfs") or "/usr/sbin/debugfs"
+        done = subprocess.run([e2fsck, "-fn", str(written)], capture_output=True, text=True)
+        check(done.returncode == 0, "e2fsck finds the volume consistent after the writes", done.stdout + done.stderr)
+        cat = subprocess.run([debugfs, "-R", "cat /drop/moved.bin", str(written)], capture_output=True).stdout
+        check(cat == payload, "debugfs reads the uploaded file back", f"{len(cat)} bytes")
+        cat = subprocess.run([debugfs, "-R", "cat /drop/over.txt", str(written)], capture_output=True).stdout
+        check(cat == payload, "an overwritten file holds only the new data", f"{len(cat)} bytes")
+        stat = subprocess.run([debugfs, "-R", "stat /drop/sub/a.txt", str(written)], capture_output=True, text=True).stdout
+        check("User:  4242" in stat and "Group:  4242" in stat, "a new file belongs to the logged-in uid and gid", stat[:200])
     print("smbd: all checks passed")
 
 
