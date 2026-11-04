@@ -198,3 +198,7 @@ same once pipelined. Reads of the volume are no longer the limit (180 MB/s).
 | `smbd` polls for 2 ms after the last frame before it sleeps | 6.5 s | ~830 Mbit/s |
 
 On mf `idle` sleeps a whole timer tick, so a fast writer must not call it between frames. Disk writes were 1.6 s of the 6.5 s.
+
+| 1 MiB requests (`maxio=`, SMB 2.1+ multi-credit; remount the client, its `wsize` is fixed at mount time) and a 1024-frame e1000 receive ring | 6.0 s | ~908 Mbit/s |
+
+With 1 MiB requests and the old 128-frame ring the transfer fell to ~8 MB/s: the 2 MiB window outran the ring while a request was on the disk, and TCP retransmitted. The ring (about 12 ms at line rate) fixed it. One gigabit TCP stream carries about 941 Mbit/s.

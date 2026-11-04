@@ -14,7 +14,12 @@ use crate::ntlm::{hmac_md5, ntlmv2_key, ntlmv2_proof};
 use crate::sign;
 use crate::wire::*;
 
-pub const MAX_IO: usize = 65536;
+/// The largest `max_io` a server can be given (SMB 2.1+ with multi-credit requests; SMB 2.0.2 stays at 64 KiB).
+pub const MAX_IO: usize = 1 << 20;
+/// What `max_io` is until the owner raises it: a request's credit charge is 1 per 64 KiB, and a client without large-MTU asks for no more.
+pub const DEFAULT_IO: usize = 65536;
+/// Capability bit: requests may carry a credit charge above 1 (SMB 2.1 and later).
+const CAP_LARGE_MTU: u32 = 4;
 pub const MAX_PATH: usize = 256;
 
 const OK: u32 = 0;
@@ -195,6 +200,8 @@ pub struct Server<S: Share, const OPENS: usize> {
     pub now: u64,
     /// Called with every request's command, the status it got and a detail (QUERY_INFO: type << 8 | class; IOCTL: the code) and the request flags (bit 2: related).
     pub trace: Option<fn(u16, u32, u32, u32)>,
+    /// Largest read or write the client is told it may send (`DEFAULT_IO` to `MAX_IO`); the owner's buffers must hold it.
+    pub max_io: usize,
     dialect: u16,
     /// 0: nothing yet, 1: challenge sent, 2: logged in.
     auth: u8,
@@ -325,6 +332,7 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
             challenge: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
             guid: *b"fosfor-smbd-0001",
             now: 0,
+            max_io: DEFAULT_IO,
             dialect: 0,
             auth: 0,
             identity: Identity { uid: 65534, gid: 65534 },
@@ -541,15 +549,28 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
         Ok(4)
     }
 
+    /// The capabilities the negotiate answer states (and the validate-negotiate answer must repeat).
+    fn capabilities(&self, dialect: u16) -> u32 {
+        if self.io_limit(dialect) > DEFAULT_IO { CAP_LARGE_MTU } else { 0 }
+    }
+
+    /// What a connection of that dialect may read or write at once: 2.0.2 has no multi-credit requests.
+    fn io_limit(&self, dialect: u16) -> usize {
+        let limit = self.max_io.clamp(DEFAULT_IO, MAX_IO);
+        if dialect >= 0x0210 { limit } else { DEFAULT_IO }
+    }
+
     fn negotiate_body(&self, dialect: u16, body: &mut [u8]) -> usize {
         body[..64].fill(0);
         put16(body, 0, 65);
         put16(body, 2, 1); // signing enabled, not required (guests are not signed)
         put16(body, 4, dialect);
         body[8..24].copy_from_slice(&self.guid);
-        put32(body, 28, MAX_IO as u32);
-        put32(body, 32, MAX_IO as u32);
-        put32(body, 36, MAX_IO as u32);
+        let io = self.io_limit(dialect) as u32;
+        put32(body, 24, self.capabilities(dialect));
+        put32(body, 28, io);
+        put32(body, 32, io);
+        put32(body, 36, io);
         put64(body, 40, filetime(self.now));
         put64(body, 48, filetime(self.now));
         put16(body, 56, (HEADER + 64) as u16);
@@ -926,7 +947,7 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
         if open.dir {
             return Err(IS_A_DIRECTORY);
         }
-        let capacity = length.min(MAX_IO).min(body.len().saturating_sub(16));
+        let capacity = length.min(self.io_limit(self.dialect)).min(body.len().saturating_sub(16));
         let read = self.share.read(open.path(), offset, &mut body[16..16 + capacity]).map_err(|_| IO_ERROR)?;
         if read == 0 && length > 0 {
             return Err(END_OF_FILE);
@@ -1082,7 +1103,7 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
         let slot = self.slot(chain, related, msg, HEADER + 8)?;
         let pattern_at = get16(msg, HEADER + 24) as usize;
         let pattern_length = get16(msg, HEADER + 26) as usize;
-        let limit = (get32(msg, HEADER + 28) as usize).min(MAX_IO).min(body.len().saturating_sub(8));
+        let limit = (get32(msg, HEADER + 28) as usize).min(DEFAULT_IO).min(body.len().saturating_sub(8));
         let mut pattern = [0u8; MAX_PATH];
         let pattern_used = if pattern_length == 0 {
             pattern[0] = b'*';
@@ -1168,7 +1189,7 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
         need(msg, 40)?;
         let kind = msg[HEADER + 2];
         let class = msg[HEADER + 3];
-        let limit = (get32(msg, HEADER + 4) as usize).min(MAX_IO).min(body.len().saturating_sub(8));
+        let limit = (get32(msg, HEADER + 4) as usize).min(DEFAULT_IO).min(body.len().saturating_sub(8));
         let slot = self.slot(chain, related, msg, HEADER + 24)?;
         let mut info = [0u8; 512];
         let length = match kind {
@@ -1299,7 +1320,7 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
         put32(body, 32, (HEADER + 48) as u32);
         put32(body, 36, 24);
         put32(body, 44, 0);
-        body[48..52].fill(0);
+        put32(body, 48, self.capabilities(self.dialect));
         body[52..68].copy_from_slice(&self.guid);
         put16(body, 68, 1);
         put16(body, 70, self.dialect);
