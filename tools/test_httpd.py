@@ -29,10 +29,11 @@ HOST_PORT = port(28080)
 class Guest:
     """A booted guest with a shell on the term net session. `with Guest(forward=...) as g: g.line("uptime", "ticks")`."""
 
-    def __init__(self, forward=None, data_disk=False, timeout=240, guest_port=80, user_extra="", save_data=None):
+    def __init__(self, forward=None, data_disk=False, timeout=240, guest_port=80, user_extra="", save_data=None, extra_command=()):
         self.save_data = save_data  # where to copy the data disk when the guest is gone
         self.forward, self.data_disk, self.timeout, self.guest_port = forward, data_disk, timeout, guest_port
         self.user_extra = user_extra
+        self.extra_command = list(extra_command)  # more QEMU arguments, e.g. a third NIC
 
     def __enter__(self):
         code, variables = find("FOS_OVMF_CODE", CODE_CANDIDATES), find("FOS_OVMF_VARS", VARS_CANDIDATES)
@@ -53,7 +54,7 @@ class Guest:
                 data.write_bytes(bytes(64 << 20))
             command += ["-drive", f"format=raw,file={data}"]
         command += ["-netdev", f"socket,id=net0,mcast={MCAST_GROUP}:{MCAST_PORT}", "-device", "e1000,netdev=net0,mac=52:54:00:12:34:7a",
-                    "-netdev", user, "-device", "e1000,netdev=net1,mac=52:54:00:12:34:7b"]
+                    "-netdev", user, "-device", "e1000,netdev=net1,mac=52:54:00:12:34:7b"] + self.extra_command
         self.wire = Wire()
         self.process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.raw = bytearray()
