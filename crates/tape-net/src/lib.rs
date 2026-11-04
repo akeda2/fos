@@ -458,19 +458,37 @@ impl<'a> Ipv4Packet<'a> {
 
 /// Internet checksum in network byte order.
 pub fn internet_checksum(bytes: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    let mut index = 0;
-    while index + 1 < bytes.len() {
-        sum += u16::from_be_bytes([bytes[index], bytes[index + 1]]) as u32;
-        index += 2;
-    }
-    if index < bytes.len() {
-        sum += u32::from(bytes[index]) << 8;
-    }
+    let mut sum = ones_sum(bytes);
     while (sum >> 16) != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
     !(sum as u16)
+}
+
+/// The 16-bit big-endian words of `bytes` added up (not folded; fits a u32 for any frame). Eight bytes at a time as two
+/// little-endian u32 halves: the one's-complement sum does not depend on byte order (RFC 1071), so the folded result is
+/// swapped once at the end. A TCP segment's checksum was the largest per-frame cost of a tape sending at line rate.
+fn ones_sum(bytes: &[u8]) -> u32 {
+    let mut wide = 0u64;
+    let chunks = bytes.chunks_exact(8);
+    let rest = chunks.remainder();
+    for chunk in chunks {
+        wide += u64::from(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        wide += u64::from(u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]));
+    }
+    while (wide >> 16) != 0 {
+        wide = (wide & 0xffff) + (wide >> 16);
+    }
+    let mut sum = u32::from((wide as u16).swap_bytes());
+    let pairs = rest.chunks_exact(2);
+    let odd = pairs.remainder();
+    for pair in pairs {
+        sum += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+    }
+    if let Some(&last) = odd.first() {
+        sum += u32::from(last) << 8;
+    }
+    sum
 }
 
 fn pseudo_checksum(
@@ -486,14 +504,7 @@ fn pseudo_checksum(
     sum += u16::from_be_bytes([destination.0[2], destination.0[3]]) as u32;
     sum += u32::from(protocol);
     sum += body.len() as u32;
-    let mut index = 0;
-    while index + 1 < body.len() {
-        sum += u16::from_be_bytes([body[index], body[index + 1]]) as u32;
-        index += 2;
-    }
-    if index < body.len() {
-        sum += u32::from(body[index]) << 8;
-    }
+    sum += ones_sum(body);
     while (sum >> 16) != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
@@ -2255,6 +2266,25 @@ mod tests {
     const MAC_B: MacAddress = MacAddress([0x02, 0, 0, 0, 0, 2]);
     const IP_A: Ipv4Address = Ipv4Address([192, 0, 2, 1]);
     const IP_B: Ipv4Address = Ipv4Address([192, 0, 2, 2]);
+
+    #[test]
+    fn wide_checksum_matches_the_word_by_word_sum() {
+        let mut data = [0u8; 1500];
+        for (i, byte) in data.iter_mut().enumerate() {
+            *byte = ((i as u32).wrapping_mul(2654435761) >> 13) as u8 | if i % 7 == 0 { 0xff } else { 0 };
+        }
+        for length in (0..40).chain([255, 256, 1399, 1400, 1459, 1460, 1500]) {
+            let bytes = &data[..length];
+            let mut sum = 0u32;
+            for pair in bytes.chunks(2) {
+                sum += u32::from(pair[0]) << 8 | pair.get(1).copied().map_or(0, u32::from);
+            }
+            while sum >> 16 != 0 {
+                sum = (sum & 0xffff) + (sum >> 16);
+            }
+            assert_eq!(internet_checksum(bytes), !(sum as u16), "length {length}");
+        }
+    }
 
     #[test]
     fn ethernet_round_trip() {
