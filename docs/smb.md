@@ -169,3 +169,11 @@ same once pipelined. Reads of the volume are no longer the limit (180 MB/s).
   a row timed out in `smbclient` (5 s). smbd now answers the client's FIN (`Server::finish`, non-blocking).
 - Result: 20 gets in a row about 120 ms each (65 MB/s), puts about 290 ms. The stalls and the slot leak only show on real
   hardware; the QEMU suites do not reproduce them.
+
+### Real servers and a Linux client (2026-11-04)
+
+- `smbmount //fraktal/media` (Samba on a NAS, guest) lists, reads and copies: `cp //media/sound-experiments/.../Caravan.flac
+  ext1/media/` put 9 MB on rack's ext4 volume; `smbd root=ext1` shared it and the Linux desktop (gvfs, `gio mount -a
+  smb://HOST/share`) read it back with the identical SHA-256 (0.24 s). `mount.cifs` itself is not installed there.
+- One file on the NAS (`4-bar-house.wav`) cannot be read through smbmount (the shell says "could not be read"), others
+  of any size can; not yet looked into.
