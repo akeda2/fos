@@ -1064,7 +1064,7 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
     }
 
     /// One directory entry in the layout of information class `class`; returns its length before padding.
-    fn dir_entry(buffer: &mut [u8], class: u8, index: u32, name: &[u8], stat: &Stat, now: u64) -> Option<usize> {
+    fn dir_entry(buffer: &mut [u8], class: u8, index: u32, id: u64, name: &[u8], stat: &Stat, now: u64) -> Option<usize> {
         let (name_at, length_at) = match class {
             1 => (64, 60),
             2 => (68, 60),
@@ -1088,8 +1088,8 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
             put64(buffer, 48, allocation(stat));
             put32(buffer, 56, attributes(stat));
             match class {
-                0x25 => put64(buffer, 96, u64::from(index) + 1),
-                0x26 => put64(buffer, 72, u64::from(index) + 1),
+                0x25 => put64(buffer, 96, id),
+                0x26 => put64(buffer, 72, id),
                 _ => {}
             }
         }
@@ -1148,7 +1148,12 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
                 continue;
             }
             let target = &mut body[8 + used..8 + limit];
-            let entry = Self::dir_entry(target, class, next as u32, &name[..length], &stat, self.now);
+            let id = match next {
+                0 => file_id(open.path(), b""),
+                1 => file_id(Self::parent(open.path()), b""),
+                _ => file_id(open.path(), &name[..length]),
+            };
+            let entry = Self::dir_entry(target, class, next as u32, id, &name[..length], &stat, self.now);
             let Some(entry) = entry.filter(|entry| used + ((entry + 7) & !7) <= limit) else {
                 overflow = true;
                 break;
@@ -1211,7 +1216,7 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
                         24
                     }
                     6 => {
-                        put64(&mut info, 0, slot as u64 + 1);
+                        put64(&mut info, 0, file_id(open.path(), b""));
                         8
                     }
                     7 => 4,
@@ -1234,7 +1239,7 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
                         put64(&mut info, 48, stat.size);
                         put32(&mut info, 56, 1);
                         info[61] = stat.dir as u8;
-                        put64(&mut info, 64, slot as u64 + 1);
+                        put64(&mut info, 64, file_id(open.path(), b""));
                         put32(&mut info, 88, 0x0012_00A9);
                         let name = open.path().rsplit('/').next().unwrap_or("");
                         let units = put_utf16(&mut info, 104, name.as_bytes()).ok_or(INVALID_PARAMETER)?;
@@ -1325,5 +1330,40 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
         put16(body, 68, 1);
         put16(body, 70, self.dialect);
         Ok(72)
+    }
+}
+
+/// A file number that is the same however the client asks (listing entry, QUERY_INFO of an open, "." and ".."): an
+/// FNV-1a hash of the path, `folder` then `name` below it. The Linux client (serverino) compares the numbers and
+/// answers ESTALE when a path's number changes, so they cannot depend on the handle or the position in a listing.
+/// A rename gives a file a new number; two paths colliding is a 1 in 2^63 chance.
+fn file_id(folder: &str, name: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut feed = |bytes: &[u8]| {
+        for &byte in bytes {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    feed(folder.as_bytes());
+    if !name.is_empty() {
+        if !folder.is_empty() {
+            feed(b"/");
+        }
+        feed(name);
+    }
+    hash | 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::file_id;
+
+    #[test]
+    fn file_numbers_follow_the_path_not_the_handle() {
+        // A listing entry and the same path asked about directly agree; "." and ".." are their folders' numbers.
+        assert_eq!(file_id("a", b"b"), file_id("a/b", b""));
+        assert_eq!(file_id("", b"b"), file_id("b", b""));
+        assert_ne!(file_id("a", b"b"), file_id("a", b"c"));
+        assert_ne!(file_id("", b""), 0);
     }
 }

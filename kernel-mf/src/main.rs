@@ -383,6 +383,7 @@ extern "C" fn service_thread(_: usize) {
         while let Some(byte) = serial::read_byte() {
             shell::feed(byte);
         }
+        shell::poll_escape();
         top::poll();
         net::housekeeping();
         slots::housekeeping();
