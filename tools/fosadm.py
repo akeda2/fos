@@ -87,6 +87,7 @@ def load_config() -> dict:
         [host.amd1]
         note = "master clock"
         restart = "start"     # run on the host after a deploy that stopped a tape
+        services = ["run smbd @smbd.cfg &2"]   # run after every kernel deploy (a reboot ends background tapes)
         skip = false          # true: deploy leaves it alone
     """
     import tomllib
@@ -317,6 +318,29 @@ def kernel_sectors(kernel: Path | None) -> int | None:
     return math.ceil(kernel.stat().st_size / 512) if kernel else None
 
 
+# Tapes only the server kernel (mf) can run as intended: `--add-missing` does not install them on other hosts.
+SERVER_ONLY_TAPES = {"abibad"}
+
+
+def build_abi() -> int | None:
+    """The tape ABI version the build's tapes are made for (`TAPE_API_VERSION` in abi/src/tape.rs)."""
+    found = re.search(r"TAPE_API_VERSION: u32 = (\d+)", (ROOT / "abi/src/tape.rs").read_text())
+    return int(found.group(1)) if found else None
+
+
+def host_abi(text: str) -> int | None:
+    """The tape ABI the running kernel implements (`debug slots` prints it; older kernels do not)."""
+    found = re.search(r"tape ABI: (\d+)", text)
+    return int(found.group(1)) if found else None
+
+
+def abi_note(have: int | None) -> str | None:
+    want = build_abi()
+    if want is None or have is None or have == want:
+        return None
+    return f"kernel tape ABI {have}, tapes in the build need {want}" if have < want else f"kernel tape ABI {have} is newer than the build's {want}"
+
+
 def arch_of(text: str) -> str:
     """`aarch64`, `x86_64`, or `x86_64-mf` for the server kernel (its `version` says "server kernel (mf)"):
     it has its own kernel image, so the embedded one must never be pushed to it."""
@@ -353,6 +377,12 @@ def cmd_status(args, iface: str) -> int:
         have = int(sizes.group(1 + int(booted.group(1))))
         state = "unknown" if want_sectors is None else ("current" if have == want_sectors else f"differs (build {want_sectors})")
         print(f"  {arch} kernel: slot {booted.group(1)}, {have} sectors, {state}")
+        abi = host_abi(out)
+        note = abi_note(abi)
+        if abi is not None:
+            print(f"  tape ABI: {abi}" + (f"  ** {note}: redeploy the kernel first" if note else ""))
+        else:
+            print("  tape ABI: not reported (an older kernel)")
         old = [n for n, s in tapes.items() if n in files and files[n] != s]
         missing = [n for n in tapes if n not in files]
         states = content_states(iface, host, tape_dir, sorted(n for n in tapes if n in files)) if args.content else {}
@@ -442,15 +472,15 @@ def stop_running_tape(iface: str, host: Host) -> None:
     subprocess.run(["bash", "-c", send_tape_cmd], capture_output=True, timeout=30)
 
 
-def probe(iface: str, host: Host) -> tuple[str, int, dict[str, int], bool] | None:
-    """`(cpu, booted slot's sectors, files, stopped_a_tape)`; sends ESC once if the shell does not answer."""
+def probe(iface: str, host: Host) -> tuple[str, int, dict[str, int], bool, int | None] | None:
+    """`(cpu, booted slot's sectors, files, stopped_a_tape, tape ABI)`; sends ESC once if the shell does not answer."""
     stopped = False
     for attempt in range(2):
         out = ask_host(iface, host, ["debug slots", "ls", "ls bin", "about", "version"])
         booted = re.search(r"booted slot: (\d+)", out)
         sizes = re.search(r"slot sizes \(sectors\): (\d+) / (\d+)", out)
         if booted and sizes:
-            return arch_of(out), int(sizes.group(1 + int(booted.group(1)))), listing(host, out), stopped
+            return arch_of(out), int(sizes.group(1 + int(booted.group(1)))), listing(host, out), stopped, host_abi(out)
         if attempt == 0:
             stop_running_tape(iface, host)
             stopped = True
@@ -507,7 +537,7 @@ def plan_host(iface: str, args, host: Host, parallel: bool):
     if state is None:
         say(host, f"{host.name}: no answer, skipped", parallel)
         return None
-    arch, have, files, stopped = state
+    arch, have, files, stopped, abi = state
     running = arch
     wanted = {"embedded": "x86_64", "mf": "x86_64-mf"}.get(getattr(args, "kernel", "current"))
     if wanted and arch.startswith("x86_64"):
@@ -527,7 +557,11 @@ def plan_host(iface: str, args, host: Host, parallel: bool):
         changed = sorted(n for n, state in states.items() if state != "same")
     else:
         changed = sorted(n for n, s in tapes.items() if do_tapes and n in files and files[n] != s)
-    tape_list = changed + (sorted(n for n in tapes if do_tapes and n not in files) if args.add_missing else [])
+    server = arch == "x86_64-mf"
+    tape_list = changed + (sorted(n for n in tapes if do_tapes and n not in files and (server or n not in SERVER_ONLY_TAPES)) if args.add_missing else [])
+    note = abi_note(abi)
+    if note and tape_list and not new_kernel:
+        say(host, f"{host.name}: WARNING {note}; deploy the kernel too (tapes may not run)", parallel)
     return host, new_kernel, tape_list, stopped, arch
 
 
@@ -565,6 +599,16 @@ def deploy_host(iface: str, args, plan, parallel: bool) -> int:
             print(f"  kernel: FELL BACK to the old kernel (slot {after[0]}, {after[1]} sectors); tapes not touched")
             return failed + 1
         print(f"  kernel: running (slot {after[0]}, {after[1]} sectors)")
+        now = arch_of(ask_host(iface, host, ["version"], timeout=40))
+        if now != arch:
+            print(f"  kernel: WRONG TYPE, the host runs {now}, wanted {arch}")
+            failed += 1
+        else:
+            print(f"  kernel: type verified ({now})")
+        services = host_setting(host, "services", [])
+        for command in [services] if isinstance(services, str) else services:
+            out = ask_host(iface, host, [command], timeout=60)
+            print(f"  service: ran `{command}` (hosts.toml): {out.strip().splitlines()[-1][:100] if out.strip() else 'no output'}")
     if tape_list:
         state = probe(iface, host)
         stopped = stopped or (state is not None and state[3])
@@ -650,6 +694,24 @@ def cmd_run(args, iface: str) -> int:
     return 0
 
 
+def cmd_revert(args, iface: str) -> int:
+    """Makes the other kernel slot active (`debug revert`), reboots and checks what came up."""
+    host = one_host(iface, args)
+    before = probe_quiet(iface, host)
+    out = ask_host(iface, host, ["debug revert"], timeout=40)
+    print(next((l for l in out.splitlines() if "revert" in l or "active slot now" in l), "no answer").replace("fos> ", ""))
+    if "is the active slot now" not in out:
+        return 1
+    ask_host(iface, host, ["reboot"], timeout=20)
+    after = wait_up(iface, host)
+    if after is None:
+        print("the host did not come back in time; check it by hand")
+        return 1
+    version = ask_host(iface, host, ["version"], timeout=40)
+    print(f"{host.name}: now slot {after[0]} ({after[1]} sectors), {arch_of(version)} kernel" + (f"; was slot {before[0]}" if before else ""))
+    return 0
+
+
 def cmd_put(args, iface: str) -> int:
     host = one_host(iface, args)
     name = args.name or Path(args.file).name
@@ -720,6 +782,7 @@ def main() -> int:
     deploy.add_argument("--dry-run", action="store_true", help="show the plan and stop")
     deploy.add_argument("-y", "--yes", action="store_true", help="do not ask before acting")
     for name, text in (("run", "run one shell command on a host"), ("put", "copy a file to a host's boot volume"),
+                       ("revert", "go back to the other kernel slot (the previous kernel) and reboot"),
                        ("shell", "open an interactive shell (term net)"), ("bootcode", "show or update the boot code")):
         sp = sub.add_parser(name, help=text)
         sp.add_argument("host", **({"nargs": "?", "default": ""} if name == "shell" else {}), help="host name or MAC (shell: not needed with --serial)")
@@ -739,7 +802,7 @@ def main() -> int:
     CONFIG.update(load_config())
     iface = "" if args.serial else (args.iface or CONFIG.get("iface") or send_tape.default_interface())
     return {"hosts": cmd_hosts, "status": cmd_status, "deploy": cmd_deploy, "run": cmd_run,
-            "put": cmd_put, "shell": cmd_shell, "bootcode": cmd_bootcode}[args.command](args, iface)
+            "put": cmd_put, "revert": cmd_revert, "shell": cmd_shell, "bootcode": cmd_bootcode}[args.command](args, iface)
 
 
 if __name__ == "__main__":

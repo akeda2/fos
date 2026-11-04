@@ -240,6 +240,16 @@ pub fn run_command(line: &str) {
                 println!("\x1b[41;1m bold on red \x1b[0m");
             }
             Some("slots") | Some("status") => slots::report(),
+            Some("revert") => {
+                let _disk = crate::tapefs::lock();
+                let mut outcome = Err("the slot metadata cannot be read or written");
+                let updated = slots::update_metadata(|m| outcome = kernel_core::slot_report::revert(m));
+                match (updated, outcome) {
+                    (Some(_), Ok(slot)) => println!("Slot {slot} is the active slot now; `reboot` starts its kernel."),
+                    (_, Err(why)) => println!("debug revert: {why}."),
+                    _ => println!("debug revert: the slot metadata could not be written."),
+                }
+            }
             Some("crash") => unsafe { core::arch::asm!("ud2") },
             Some("hang") => {
                 // The shell runs on the service thread: spinning here with interrupts on stops its petting while other threads run.
@@ -254,7 +264,7 @@ pub fn run_command(line: &str) {
                     core::hint::spin_loop();
                 }
             }
-            _ => println!("usage: debug slots|crash now|hang now|deadhang now"),
+            _ => println!("usage: debug slots|revert|crash now|hang now|deadhang now"),
         },
         "start" => crate::config::start(run),
         "keymap" => crate::sysshell::keymap(&line.trim_start()[command.len()..]),

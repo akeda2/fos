@@ -347,6 +347,10 @@ def main():
             check("vendor" in out and "features" in out, "cpuinfo prints CPUID", out[-300:])
             out = machine.run("bogus")
             check("Unknown command" in out, "an unknown command is reported", out[-300:])
+            out = machine.run("debug slots")
+            check("tape ABI: " in out, "debug slots prints the tape ABI", out[-300:])
+            out = machine.run("debug revert")
+            check("holds no kernel" in out or "is the active slot now" in out, "debug revert answers", out[-300:])
             # The scripting language (docs/shell.md "Scripting"): variables persist between prompt lines.
             machine.run("X=40")
             out = machine.run("echo $((X + 2)) \"$X\"")
