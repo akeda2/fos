@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`. Version 20 added `gfx_screens` and the `gfx_*_on` calls (a screen number). Version 21 added `audio_float`. Version 22 added the `gpio_*` calls. Version 23 added `i2c_speed` and `i2c_transfer`. Version 24 added `touch_info` and `touch_read`. Version 25 added `midi_read` and `midi_send`. Version 26 added `midi_devices`. Version 27 added `nic_owned`. Version 28 added `gpio_pull_get`. Version 32 added the `vfs_*` calls. Version 33 added `random`. Version 34 added the `vfs_*` change calls (`vfs_create`, `vfs_write`, `vfs_truncate`, `vfs_remove`, `vfs_rename`, `vfs_set_owner`).
-pub const TAPE_API_VERSION: u32 = 34;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`. Version 20 added `gfx_screens` and the `gfx_*_on` calls (a screen number). Version 21 added `audio_float`. Version 22 added the `gpio_*` calls. Version 23 added `i2c_speed` and `i2c_transfer`. Version 24 added `touch_info` and `touch_read`. Version 25 added `midi_read` and `midi_send`. Version 26 added `midi_devices`. Version 27 added `nic_owned`. Version 28 added `gpio_pull_get`. Version 32 added the `vfs_*` calls. Version 33 added `random`. Version 34 added the `vfs_*` change calls (`vfs_create`, `vfs_write`, `vfs_truncate`, `vfs_remove`, `vfs_rename`, `vfs_set_owner`). Version 35 added the `remote_*` calls (a tape serves a volume named `//NAME`).
+pub const TAPE_API_VERSION: u32 = 35;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -415,6 +415,55 @@ pub struct TapeApi {
     /// `vfs_set_owner(path, path_len, uid, gid, mode)` (version 34): the owner and, unless `mode` is `VFS_KEEP_MODE`, the
     /// permission bits of a file or folder.
     pub vfs_set_owner: extern "C" fn(*const u8, usize, u32, u32, u32) -> isize,
+    /// `remote_register(name, name_len)` (version 35): the calling tape serves the volume `//NAME` (1-16 characters of lower
+    /// case letters, digits, `-` and `_`). From then on every `vfs_*` call, `fs_read`, `fs_read_at` and the shell's file
+    /// commands that name `//NAME/path` are not answered by a disk but queued for this tape (`remote_poll`), and the caller waits
+    /// (at most 10 s before the tape has taken the request, 60 s after) for `remote_reply`. Registering a name again replaces
+    /// the old provider. 0, or `FS_BAD_NAME`, `FS_NO_SPACE` (the table of 4 is full). Protocol-agnostic: SMB today, the native
+    /// layer-2 protocol later.
+    pub remote_register: extern "C" fn(*const u8, usize) -> isize,
+    /// `remote_unregister(name, name_len)` (version 35): the tape stops serving the name; a caller still waiting gets `FS_ERROR`.
+    pub remote_unregister: extern "C" fn(*const u8, usize) -> isize,
+    /// `remote_poll(name, name_len, request, buffer, capacity)` (version 35): takes the next queued request for `//NAME`.
+    /// Returns 1 and fills the `RemoteRequest`; `buffer` receives the path, then the second path, then the data to write
+    /// (`path_len`, `path2_len`, `data_len` bytes). A request that does not fit `capacity` is answered `FS_TOO_BIG` by the
+    /// kernel and not delivered. 0 when nothing is queued, `FS_NOT_FOUND` when the name is not registered.
+    pub remote_poll: extern "C" fn(*const u8, usize, *mut RemoteRequest, *mut u8, usize) -> isize,
+    /// `remote_reply(id, code, entry, data, len)` (version 35): answers request `id`. `code` is the call's result (>= 0, or an
+    /// `FS_*` code). `entry` (may be null) is the `VfsEntry` for `REMOTE_STAT` (only its `stat`) and `REMOTE_READ_DIR`; `data`
+    /// holds `len` bytes for `REMOTE_READ` (at most the request's `length`); a read's result is `len`. Returns 0, or `FS_ERROR`
+    /// when that request is no longer waiting (it timed out).
+    pub remote_reply: extern "C" fn(u64, isize, *const VfsEntry, *const u8, usize) -> isize,
+}
+
+/// `RemoteRequest::op`.
+pub const REMOTE_STAT: u32 = 1;
+pub const REMOTE_READ_DIR: u32 = 2;
+pub const REMOTE_READ: u32 = 3;
+pub const REMOTE_CREATE: u32 = 4;
+pub const REMOTE_WRITE: u32 = 5;
+pub const REMOTE_TRUNCATE: u32 = 6;
+pub const REMOTE_REMOVE: u32 = 7;
+pub const REMOTE_RENAME: u32 = 8;
+pub const REMOTE_SET_OWNER: u32 = 9;
+
+/// A file call queued for the provider of `//NAME` (56 bytes). The paths are relative to the volume (no `//NAME`, no leading
+/// slash; empty for the root). `offset`: byte offset (`READ`, `WRITE`), directory index (`READ_DIR`) or new size (`TRUNCATE`);
+/// `length`: bytes wanted (`READ`). `kind`, `mode`, `uid`, `gid`: what `vfs_create` and `vfs_set_owner` were given.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct RemoteRequest {
+    pub id: u64,
+    pub op: u32,
+    pub kind: u32,
+    pub mode: u32,
+    pub path_len: u32,
+    pub path2_len: u32,
+    pub data_len: u32,
+    pub offset: u64,
+    pub length: u64,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 /// What `vfs_create` is told: `kind` is `VFS_FILE` or `VFS_DIR`, `mode` the permission bits, `uid`/`gid` the owner.

@@ -122,6 +122,10 @@ impl Platform for Embedded {
         crate::tasks::context()
     }
 
+    fn task_yield(&self) {
+        crate::tasks::wait_for_service();
+    }
+
     fn task_context_live(&self, context: usize) -> bool {
         crate::tasks::context_live(context)
     }

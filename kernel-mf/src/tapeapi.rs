@@ -150,6 +150,10 @@ const VFS_TRUNCATE: u64 = slot(offset_of!(TapeApi, vfs_truncate));
 const VFS_REMOVE: u64 = slot(offset_of!(TapeApi, vfs_remove));
 const VFS_RENAME: u64 = slot(offset_of!(TapeApi, vfs_rename));
 const VFS_SET_OWNER: u64 = slot(offset_of!(TapeApi, vfs_set_owner));
+const REMOTE_REGISTER: u64 = slot(offset_of!(TapeApi, remote_register));
+const REMOTE_UNREGISTER: u64 = slot(offset_of!(TapeApi, remote_unregister));
+const REMOTE_POLL: u64 = slot(offset_of!(TapeApi, remote_poll));
+const REMOTE_REPLY: u64 = slot(offset_of!(TapeApi, remote_reply));
 const FS_READ_AT: u64 = slot(offset_of!(TapeApi, fs_read_at));
 const MEMORY_MAP: u64 = slot(offset_of!(TapeApi, memory_map));
 const MEMORY_MAP_COUNT: u64 = slot(offset_of!(TapeApi, memory_map_count));
@@ -368,6 +372,10 @@ pub fn call(frame: &mut Frame) {
         VFS_REMOVE => tapefs::vfs_remove(a, b) as u64,
         VFS_RENAME => tapefs::vfs_rename(a, b, c, d) as u64,
         VFS_SET_OWNER => tapefs::vfs_set_owner(a, b, c, d, e) as u64,
+        REMOTE_REGISTER => tapefs::remote_register(a, b) as u64,
+        REMOTE_UNREGISTER => tapefs::remote_unregister(a, b) as u64,
+        REMOTE_POLL => tapefs::remote_poll(a, b, c, d, e) as u64,
+        REMOTE_REPLY => tapefs::remote_reply(a, b, c, d, e) as u64,
         RANDOM => {
             let out = unsafe { core::slice::from_raw_parts_mut(a as *mut u8, b as usize) };
             u64::from(kernel_core::random::fill(out))

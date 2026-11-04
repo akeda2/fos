@@ -107,3 +107,26 @@ Done (ABI 32, `crates/kernel-core/src/tape_vfs.rs`, `tape_rt::vfs_stat/vfs_read_
 Open points for later: the ext4 writer does not keep hash-tree indexes (`DEFERRED.md`), which matters for big shared folders;
 a tape runs one request at a time on the boot CPU (fine for a first server, `httpd` is the same); the tape ABI's file calls
 read into the caller's buffer, so big reads are chunked at the 1 MiB credit limit.
+
+## Mounting a share (smbmount)
+
+`run smbmount //HOST/SHARE [as=NAME] [user=NAME PASSWORD] &N` is a service
+tape that owns NIC N, connects with the `smb` client and registers `NAME`
+(default: the share) as a *remote volume* (ABI 35, `remote_register`). The
+kernel then routes any `//NAME/path` to it: shell commands (`ls`, `cat`,
+`cp`, `mkdir`, `mv`, `rm`), `fs_*` and `vfs_*` calls, so tapes and `smbd`
+(re-export) need no changes.
+
+The layer (`crates/kernel-core/src/remote.rs`) is protocol-agnostic: one
+request slot, posted by the caller and taken by the provider with
+`remote_poll`, answered with `remote_reply`. The native layer-2 NETFS can
+become a provider the same way. Callers yield to services while they wait
+(10 s until taken, then 60 s).
+
+Limits: one request in flight, 128 KiB per call (larger files are split by
+the callers), 128 entries per folder listing, `truncate` only to 0,
+`set_owner` is a no-op, `fs_stream_*` is not remote. A killed provider keeps
+its name until it is replaced; callers get errors after the timeout. On
+FOS-mf a tape runs in the foreground, so a background provider is not
+possible there yet. Verified in QEMU against the host `serve` example
+(`make test-smbmount`); real servers are not yet checked.

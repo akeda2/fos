@@ -108,6 +108,11 @@ pub trait Platform: Sync {
     fn task_context(&self) -> usize {
         0
     }
+    /// Lets another context run while this one waits for it (a file call queued for a provider tape). The embedded kernels
+    /// switch to the next service; a preemptive core just waits a millisecond.
+    fn task_yield(&self) {
+        self.busy_wait_ms(1);
+    }
     /// Whether context `context` (1-based service number) is a running service.
     fn task_context_live(&self, _context: usize) -> bool {
         false
@@ -341,6 +346,12 @@ pub mod tasks {
 
     pub fn context() -> usize {
         super::platform().map_or(0, |platform| platform.task_context())
+    }
+
+    pub fn yield_now() {
+        if let Some(platform) = super::platform() {
+            platform.task_yield();
+        }
     }
 
     pub fn context_live(context: usize) -> bool {
