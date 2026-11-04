@@ -53,6 +53,8 @@ def main():
             ("remove b", "ok ()"),
             ("remove sub", "ok ()"),
             ("write keep.txt", "ok 9"),
+            ("write keep.txt more", "ok 5"),
+            ("sync", "ok ()"),
         ]:
             line = next((line for line in out.splitlines() if f"fscheck: {step} ->" in line), "")
             check(wanted in line, f"{step}: {wanted}", line or out[-600:])
@@ -63,12 +65,12 @@ def main():
         check(f"ok (8, {expected})" in line, "a read after the writes sees the bytes written", line)
         check("vfswrite done" in out, "the sequence ran to the end", out[-400:])
         listing = outputs["ls"]
-        check("[keep.txt] kind 1 size 9 uid 1000" in listing and "[kdir] kind 2" in listing, "the survivors are listed", listing[-500:])
+        check("[keep.txt] kind 1 size 14 uid 1000" in listing and "[kdir] kind 2" in listing, "the survivors are listed", listing[-500:])
 
         done = subprocess.run([tool("e2fsck"), "-fn", str(ext)], capture_output=True, text=True)
         check(done.returncode == 0, "e2fsck finds the volume consistent", done.stdout + done.stderr)
         cat = subprocess.run([tool("debugfs"), "-R", "cat /keep.txt", str(ext)], capture_output=True).stdout
-        check(cat == b"kept text", "debugfs reads the file back", repr(cat))
+        check(cat == b"kept text more", "debugfs reads the file back, the synced write included", repr(cat))
         stat = subprocess.run([tool("debugfs"), "-R", "stat /kdir", str(ext)], capture_output=True, text=True).stdout
         check("User:     7" in stat and "Group:     8" in stat and "Mode:  0750" in stat, "owner set, mode kept", stat[:400])
     print("vfs-write: all checks passed")

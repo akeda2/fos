@@ -209,6 +209,9 @@ fn vfs_write(dir: &str) {
     show("set owner keep.txt", tape_rt::vfs_set_owner(path("keep.txt").as_str(), 1000, 100, 0o640));
     show("mkdir kdir", tape_rt::vfs_create(path("kdir").as_str(), VFS_DIR, 0o750, 0, 0));
     show("set owner kdir", tape_rt::vfs_set_owner(path("kdir").as_str(), 7, 8, VFS_KEEP_MODE));
+    // A write is held open by the kernel (ABI 36) until something else touches the volume or this call commits it.
+    show("write keep.txt more", tape_rt::vfs_write(path("keep.txt").as_str(), 9, b" more"));
+    show("sync", tape_rt::vfs_sync());
     println!("fscheck: vfswrite done");
 }
 

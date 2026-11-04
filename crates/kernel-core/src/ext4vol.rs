@@ -99,6 +99,7 @@ static mut SHARED: Option<Shared> = None;
 /// The ext volume of disk index `disk` for tape calls, mounted once and kept until something else locates a volume (any
 /// shell command that reads or changes one does, and that also empties the read cache, so nothing stale survives).
 pub fn shared(disk: usize) -> Result<&'static mut Shared, Error> {
+    commit_pending()?;
     // SAFETY: tape file calls are serialised by the caller (the kernel's file lock); the statics are only reached from here.
     unsafe {
         let slot = &mut *core::ptr::addr_of_mut!(SHARED);
@@ -112,34 +113,90 @@ pub fn shared(disk: usize) -> Result<&'static mut Shared, Error> {
     }
 }
 
+/// The volume `WRITER` holds changes for that are not committed yet (`with_writer_deferred`): the disk index and partition.
+static mut OPEN: Option<(usize, Partition)> = None;
+
+/// The writer for `partition`: the open one when it is for the same volume (its uncommitted changes carry on), else a new
+/// one (the old one is committed first; the journal is replayed if needed).
+fn writer_for(disk: usize, partition: Partition) -> Result<&'static mut Writer<Journaled<Partition>>, Error> {
+    // SAFETY: the one writer slot is only used by the (serialised) shell and tape calls; a writer that is replaced is committed first.
+    unsafe {
+        if let Some((open_disk, open)) = *core::ptr::addr_of!(OPEN) {
+            if open_disk == disk && open.base == partition.base {
+                let writer = (*core::ptr::addr_of_mut!(WRITER)).assume_init_mut();
+                writer.set_time(seconds());
+                return Ok(writer);
+            }
+            commit_pending()?;
+        }
+        forget_shared();
+        let fs = ext4::open(partition, stage())?;
+        let writer = Writer::new_in(&mut *core::ptr::addr_of_mut!(WRITER), fs)?;
+        writer.set_time(seconds());
+        *core::ptr::addr_of_mut!(OPEN) = Some((disk, partition));
+        Ok(writer)
+    }
+}
+
 /// Changes the kept volume of disk index `disk` (on `partition`, as `Shared::partition` says) for a tape call: opens it for
 /// writing (the journal is replayed if needed), runs `change`, commits, and keeps the volume mounted again afterwards. The
 /// read cache stays (it follows every write), so a stream of small writes costs a mount each, not a rescan of the disk.
-/// The caller serialises calls, as for `shared`.
+/// The caller serialises calls, as for `shared`. Changes an earlier `with_writer_deferred` left open are committed with it.
 pub fn with_writer<T>(disk: usize, partition: Partition, change: impl FnOnce(&mut Writer<Journaled<Partition>>) -> Result<T, Error>) -> Result<T, Error> {
-    forget_shared();
-    let fs = ext4::open(partition, stage())?;
-    // SAFETY: the one writer slot is only used by the (serialised) shell and tape calls, and the previous writer is dead.
-    let writer = Writer::new_in(unsafe { &mut *core::ptr::addr_of_mut!(WRITER) }, fs)?;
-    writer.set_time(seconds());
+    let writer = writer_for(disk, partition)?;
     let done = change(writer);
-    let flushed = writer.flush();
-    if let Ok(fs) = ext4::Fs::mount(partition) {
-        // SAFETY: as in `shared`.
-        unsafe { *core::ptr::addr_of_mut!(SHARED) = Some(Shared { disk, partition, fs, cursor: None }) };
-    }
+    let flushed = commit_pending();
     let value = done?;
     flushed?;
     Ok(value)
 }
 
+/// Like `with_writer`, but the commit waits: the writer stays open and the next change to the same volume carries on in it,
+/// which saves the open, the journal commit and the remount of every call of a stream of file writes. The changes are
+/// committed by `commit_pending`, which every other way into the volume (`shared`, `locate`, `with_writer`, a shell command)
+/// runs first, and by the tape call `vfs_sync`. A failed change is committed at once.
+pub fn with_writer_deferred<T>(disk: usize, partition: Partition, change: impl FnOnce(&mut Writer<Journaled<Partition>>) -> Result<T, Error>) -> Result<T, Error> {
+    let writer = writer_for(disk, partition)?;
+    let done = change(writer);
+    if done.is_err() {
+        let _ = commit_pending();
+    }
+    done
+}
+
+/// Commits what `with_writer_deferred` left open (marks the volume clean, commits the journal) and keeps the volume mounted
+/// for reading again. Nothing is open: nothing happens.
+pub fn commit_pending() -> Result<(), Error> {
+    // SAFETY: as in `writer_for`.
+    unsafe {
+        let Some((disk, partition)) = (*core::ptr::addr_of_mut!(OPEN)).take() else { return Ok(()) };
+        let flushed = (*core::ptr::addr_of_mut!(WRITER)).assume_init_mut().flush();
+        if let Ok(fs) = ext4::Fs::mount(partition) {
+            *core::ptr::addr_of_mut!(SHARED) = Some(Shared { disk, partition, fs, cursor: None });
+        }
+        flushed
+    }
+}
+
+/// The partition of the ext volume of disk index `disk`: the one with changes open, else the kept volume's.
+pub fn partition_of(disk: usize) -> Result<Partition, Error> {
+    // SAFETY: as in `writer_for`.
+    if let Some((open_disk, partition)) = unsafe { *core::ptr::addr_of!(OPEN) } {
+        if open_disk == disk {
+            return Ok(partition);
+        }
+    }
+    Ok(shared(disk)?.partition)
+}
+
 /// The disk index of the kept volume, if any.
 pub fn shared_disk() -> Option<usize> {
-    unsafe { (*core::ptr::addr_of!(SHARED)).as_ref().map(|shared| shared.disk) }
+    unsafe { (*core::ptr::addr_of!(OPEN)).map(|(disk, _)| disk).or_else(|| (*core::ptr::addr_of!(SHARED)).as_ref().map(|shared| shared.disk)) }
 }
 
 /// Drops the kept volume: after the tape side wrote to it, or the disk went away.
 pub fn forget_shared() {
+    let _ = commit_pending();
     unsafe { *core::ptr::addr_of_mut!(SHARED) = None };
 }
 
