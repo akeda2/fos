@@ -1836,6 +1836,10 @@ pub struct TcpConnection<const RX: usize = TCP_RX_CAPACITY> {
     stream_una: u32,
     peer_window: u32,
     stream_active: bool,
+    /// Duplicate acknowledgements (the peer repeating `stream_una` while data is in flight) seen since it last moved; the
+    /// third sets `fast_retransmit`, which `take_fast_retransmit` hands out once.
+    dup_acks: u8,
+    fast_retransmit: bool,
 }
 
 impl<const RX: usize> TcpConnection<RX> {
@@ -1868,6 +1872,8 @@ impl<const RX: usize> TcpConnection<RX> {
             stream_una: initial_sequence,
             peer_window: 0xffff,
             stream_active: false,
+            dup_acks: 0,
+            fast_retransmit: false,
         }
     }
 
@@ -1920,6 +1926,8 @@ impl<const RX: usize> TcpConnection<RX> {
         self.stream_una = initial_sequence;
         self.peer_window = 0xffff;
         self.stream_active = false;
+        self.dup_acks = 0;
+        self.fast_retransmit = false;
     }
 
     /// Makes this a listener again that takes a connection from any peer on `local_port` (see `accept_from`).
@@ -2045,12 +2053,25 @@ impl<const RX: usize> TcpConnection<RX> {
                     self.peer_window = u32::from(segment.window);
                     return Ok(Some(self.emit(self.send_next, self.receive_next, TCP_ACK, &[], output)?));
                 }
+                let una_before = self.stream_una;
                 self.accept_ack(segment.acknowledgment);
                 self.peer_window = u32::from(segment.window);
                 if self.stream_active && !self.pending {
-                    // Streaming data in flight keeps the retransmission timer running from the latest acknowledgement.
-                    self.deadline = (self.stream_una != self.send_next)
-                        .then(|| now.wrapping_add(self.retransmit_ticks));
+                    if self.stream_una == self.send_next {
+                        self.deadline = None;
+                        self.dup_acks = 0;
+                    } else if self.stream_una != una_before || self.deadline.is_none() {
+                        // New data was acknowledged: the retransmission timer runs on from this acknowledgement.
+                        self.deadline = Some(now.wrapping_add(self.retransmit_ticks));
+                        self.dup_acks = 0;
+                    } else if segment.data.is_empty() && segment.acknowledgment == self.stream_una {
+                        // The peer repeats what it has: a segment after a gap arrived. It must not push the timer out
+                        // (a stream of them would keep it from ever firing); three of them mean the oldest was lost.
+                        self.dup_acks = self.dup_acks.saturating_add(1);
+                        if self.dup_acks == 3 {
+                            self.fast_retransmit = true;
+                        }
+                    }
                 }
                 let mut response = false;
                 if !segment.data.is_empty() && segment.sequence == self.receive_next {
@@ -2153,7 +2174,7 @@ impl<const RX: usize> TcpConnection<RX> {
         if !self.stream_active || self.pending || !self.retransmission_due(now) || self.stream_in_flight() == 0 {
             return Ok(None);
         }
-        let count = unacknowledged.len().min(RX).min(self.stream_in_flight());
+        let count = unacknowledged.len().min(RX.min(1460)).min(self.stream_in_flight());
         let length = self.emit(
             self.stream_una,
             self.receive_next,
@@ -2163,6 +2184,22 @@ impl<const RX: usize> TcpConnection<RX> {
         )?;
         self.deadline = Some(now.wrapping_add(self.retransmit_ticks));
         Ok(Some(length))
+    }
+
+    /// Whether three duplicate acknowledgements asked for the oldest unacknowledged segment again (fast retransmit); true
+    /// once per loss. The caller answers with `stream_resend`.
+    pub fn take_fast_retransmit(&mut self) -> bool {
+        core::mem::take(&mut self.fast_retransmit)
+    }
+
+    /// Sends the oldest unacknowledged segment again now, without waiting for the timer (the first bytes of
+    /// `unacknowledged`, at most one segment's worth). The timer is left as it is.
+    pub fn stream_resend(&mut self, unacknowledged: &[u8], output: &mut [u8]) -> Result<Option<usize>> {
+        if !self.stream_active || self.pending || self.stream_in_flight() == 0 {
+            return Ok(None);
+        }
+        let count = unacknowledged.len().min(RX.min(1460)).min(self.stream_in_flight());
+        Ok(Some(self.emit(self.stream_una, self.receive_next, TCP_ACK | TCP_PSH, &unacknowledged[..count], output)?))
     }
 
     pub fn close(&mut self, now: u32, output: &mut [u8]) -> Result<usize> {
@@ -2879,6 +2916,49 @@ mod tests {
         let ack = TcpSegment::parse(&ack_bytes[..ack_len], IP_A, IP_B, true).unwrap();
         server.on_segment(&ack, 17, &mut out).unwrap();
         assert_eq!((server.stream_in_flight(), server.retransmission_deadline()), (0, None));
+    }
+
+    #[test]
+    fn tcp_stream_retransmits_one_segment_not_the_whole_flight() {
+        let mut server = TcpConnection::<4000>::listen(IP_B, 2000, IP_A, 1000, 90, 4);
+        let mut out = [0u8; 4200];
+        let (syn_bytes, syn_len) = segment(1000, 2000, 7, 0, TCP_SYN, &[]);
+        server.on_segment(&TcpSegment::parse(&syn_bytes[..syn_len], IP_A, IP_B, true).unwrap(), 1, &mut out).unwrap();
+        let (ack_bytes, ack_len) = segment(1000, 2000, 8, 91, TCP_ACK, &[]);
+        server.on_segment(&TcpSegment::parse(&ack_bytes[..ack_len], IP_A, IP_B, true).unwrap(), 2, &mut out).unwrap();
+        let flight = [5u8; 3000];
+        server.stream_send(&flight, 10, &mut out).unwrap();
+        let length = server.stream_retransmit(&flight, 14, &mut out).unwrap().unwrap();
+        let again = TcpSegment::parse(&out[..length], IP_B, IP_A, true).unwrap();
+        assert_eq!((again.sequence, again.data.len()), (91, 1460));
+    }
+
+    #[test]
+    fn tcp_duplicate_acks_leave_the_timer_and_the_third_asks_for_a_resend() {
+        let mut server = TcpConnection::<4000>::listen(IP_B, 2000, IP_A, 1000, 90, 100);
+        let mut out = [0u8; 4200];
+        let (syn_bytes, syn_len) = segment(1000, 2000, 7, 0, TCP_SYN, &[]);
+        server.on_segment(&TcpSegment::parse(&syn_bytes[..syn_len], IP_A, IP_B, true).unwrap(), 1, &mut out).unwrap();
+        let (ack_bytes, ack_len) = segment(1000, 2000, 8, 91, TCP_ACK, &[]);
+        server.on_segment(&TcpSegment::parse(&ack_bytes[..ack_len], IP_A, IP_B, true).unwrap(), 2, &mut out).unwrap();
+        for _ in 0..3 {
+            server.stream_send(&[9u8; 1000], 10, &mut out).unwrap();
+        }
+        let deadline = server.retransmission_deadline();
+        assert_eq!(deadline, Some(110));
+        // The peer got the first segment and then nothing in order: it repeats its acknowledgement.
+        let (ack_bytes, ack_len) = segment(1000, 2000, 8, 1091, TCP_ACK, &[]);
+        let ack = TcpSegment::parse(&ack_bytes[..ack_len], IP_A, IP_B, true).unwrap();
+        server.on_segment(&ack, 20, &mut out).unwrap();
+        assert_eq!(server.retransmission_deadline(), Some(120));
+        for (index, now) in [30, 40, 50].into_iter().enumerate() {
+            server.on_segment(&ack, now, &mut out).unwrap();
+            assert_eq!(server.take_fast_retransmit(), index == 2);
+        }
+        assert_eq!(server.retransmission_deadline(), Some(120), "duplicates do not push the timer out");
+        let length = server.stream_resend(&[9u8; 2000], &mut out).unwrap().unwrap();
+        let again = TcpSegment::parse(&out[..length], IP_B, IP_A, true).unwrap();
+        assert_eq!((again.sequence, again.data.len()), (1091, 1460));
     }
 
     #[test]

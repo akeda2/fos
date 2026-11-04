@@ -249,13 +249,19 @@ impl Share for Files {
 /// Where the time goes (shown with `log` when a connection ends): microseconds and bytes spent in file reads and in sending answers.
 static WRITE_US: AtomicU64 = AtomicU64::new(0);
 static WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// When the last write ended, and 0 once the kernel's held-open writes were committed (`vfs_sync`).
+static UNSYNCED_AT: AtomicU64 = AtomicU64::new(0);
+/// How long the writes must pause before they are committed: a stream shares one journal commit.
+const SYNC_QUIET_US: u64 = 20_000;
 
 /// Adds the time since its start to `WRITE_US` when dropped, whichever way `write` returns.
 struct Timed(u64);
 
 impl Drop for Timed {
     fn drop(&mut self) {
-        WRITE_US.fetch_add(tape_rt::micros() - self.0, Ordering::Relaxed);
+        let now = tape_rt::micros();
+        WRITE_US.fetch_add(now - self.0, Ordering::Relaxed);
+        UNSYNCED_AT.store(now, Ordering::Relaxed);
     }
 }
 static READ_US: AtomicU64 = AtomicU64::new(0);
@@ -367,13 +373,25 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                 }
             }
             serve(api, tcp, slot, request, answer, sessions[slot].as_mut().unwrap());
+            // A client that hung up leaves the slot in CloseWait; without our FIN it stays taken for the idle timeout,
+            // and a few quick connections in a row would fill all of them.
+            if tcp.peer_closed(slot) && tcp.received(slot).is_empty() {
+                tcp.finish(api, slot);
+            }
         }
         if log && SEND_BYTES.load(Ordering::Relaxed) > 0 {
             if busy {
                 last_busy = tape_rt::micros();
             } else if tape_rt::micros() - last_busy > 500_000 {
-                report();
+                report(tcp.tx_dropped());
             }
+        }
+        let unsynced = UNSYNCED_AT.load(Ordering::Relaxed);
+        if unsynced != 0 && tape_rt::micros() - unsynced > SYNC_QUIET_US {
+            let start = tape_rt::micros();
+            UNSYNCED_AT.store(0, Ordering::Relaxed);
+            let _ = tape_rt::vfs_sync();
+            WRITE_US.fetch_add(tape_rt::micros() - start, Ordering::Relaxed);
         }
         if !busy {
             tape_rt::idle();
@@ -382,13 +400,16 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
 }
 
 /// Prints and resets the counters: reading, sending, and everything else since the last report.
-fn report() {
+fn report(dropped: u32) {
     let (read_us, read_bytes) = (READ_US.swap(0, Ordering::Relaxed), READ_BYTES.swap(0, Ordering::Relaxed));
     let (send_us, send_bytes) = (SEND_US.swap(0, Ordering::Relaxed), SEND_BYTES.swap(0, Ordering::Relaxed));
     let total = tape_rt::micros() - CONNECTED_US.swap(tape_rt::micros(), Ordering::Relaxed);
     let (write_us, write_bytes) = (WRITE_US.swap(0, Ordering::Relaxed), WRITE_BYTES.swap(0, Ordering::Relaxed));
     if write_bytes > 0 {
         println!("smbd: wrote {} KB in {} ms", write_bytes / 1024, write_us / 1000);
+    }
+    if dropped > 0 {
+        println!("smbd: the card refused {dropped} frames");
     }
     println!("smbd: read {} KB in {} ms, sent {} KB in {} ms, {} ms since the last report.", read_bytes / 1024, read_us / 1000, send_bytes / 1024, send_us / 1000, total / 1000);
 }
@@ -422,7 +443,8 @@ fn serve(api: &TapeApi, tcp: &mut Tcp<RX, SLOTS>, slot: usize, request: &mut [u8
         let result = if sent > 0 { tcp.send_buffered(api, slot, &answer[..sent], SEND_TIMEOUT) } else { Ok(()) };
         SEND_US.fetch_add(tape_rt::micros() - start, Ordering::Relaxed);
         SEND_BYTES.fetch_add(sent as u64, Ordering::Relaxed);
-        if result.is_err() {
+        if let Err(reason) = result {
+            println!("smbd: sending failed: {reason}");
             return;
         }
     }

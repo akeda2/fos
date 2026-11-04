@@ -203,6 +203,7 @@ pub struct Server<const RX: usize, const N: usize> {
     rx: [u8; MAX_FRAME],
     segment: [u8; MAX_FRAME],
     tx: [u8; MAX_FRAME],
+    tx_dropped: u32,
 }
 
 impl<const RX: usize, const N: usize> Server<RX, N> {
@@ -218,6 +219,7 @@ impl<const RX: usize, const N: usize> Server<RX, N> {
             rx: [0; MAX_FRAME],
             segment: [0; MAX_FRAME],
             tx: [0; MAX_FRAME],
+            tx_dropped: 0,
         }
     }
 
@@ -262,6 +264,11 @@ impl<const RX: usize, const N: usize> Server<RX, N> {
     /// True while the peer can still be answered (the connection is established, perhaps half-closed by the peer).
     pub fn is_open(&self, slot: usize) -> bool {
         matches!(self.slots[slot].connection.state(), TcpState::Established | TcpState::CloseWait)
+    }
+
+    /// True once the peer has said goodbye (FIN): it sends nothing more, and until we `close` too the slot stays taken.
+    pub fn peer_closed(&self, slot: usize) -> bool {
+        self.slots[slot].connection.state() == TcpState::CloseWait
     }
 
     /// Gives the slot back: it listens for a new connection.
@@ -326,6 +333,16 @@ impl<const RX: usize, const N: usize> Server<RX, N> {
         if let Ok(Some(reply)) = self.slots[index].connection.on_segment(&segment, now as u32, &mut self.segment) {
             self.transmit(api, index, reply);
         }
+        // Three duplicate acknowledgements: resend the oldest kept segment at once (`send_buffered` keeps a copy).
+        if self.slots[index].connection.take_fast_retransmit() {
+            let slot = &mut self.slots[index];
+            let (kept, in_flight) = (slot.tx_len, slot.connection.stream_in_flight());
+            if in_flight > 0 && in_flight <= kept {
+                if let Ok(Some(resend)) = slot.connection.stream_resend(&slot.tx_keep[kept - in_flight..kept][..in_flight.min(SEND_CHUNK)], &mut self.segment) {
+                    self.transmit(api, index, resend);
+                }
+            }
+        }
     }
 
     fn housekeeping(&mut self, api: &TapeApi) {
@@ -351,7 +368,7 @@ impl<const RX: usize, const N: usize> Server<RX, N> {
                 let (kept, in_flight) = (self.slots[index].tx_len, self.slots[index].connection.stream_in_flight());
                 if in_flight > 0 && in_flight <= kept {
                     let slot = &mut self.slots[index];
-                    if let Ok(Some(resend)) = slot.connection.stream_retransmit(&slot.tx_keep[kept - in_flight..kept], now as u32, &mut self.segment) {
+                    if let Ok(Some(resend)) = slot.connection.stream_retransmit(&slot.tx_keep[kept - in_flight..kept][..in_flight.min(SEND_CHUNK)], now as u32, &mut self.segment) {
                         self.transmit(api, index, resend);
                     }
                 }
@@ -391,7 +408,7 @@ impl<const RX: usize, const N: usize> Server<RX, N> {
             }
             if remaining > 0 {
                 let unacknowledged = &data[sent - remaining..sent];
-                if let Ok(Some(resend)) = self.slots[slot].connection.stream_retransmit(unacknowledged, now as u32, &mut self.segment) {
+                if let Ok(Some(resend)) = self.slots[slot].connection.stream_retransmit(&unacknowledged[..unacknowledged.len().min(SEND_CHUNK)], now as u32, &mut self.segment) {
                     self.transmit(api, slot, resend);
                 }
             }
@@ -474,10 +491,33 @@ impl<const RX: usize, const N: usize> Server<RX, N> {
         }
     }
 
+    /// Answers a peer's FIN with ours and returns at once; `poll` resends it if needed and takes the slot back when it is
+    /// acknowledged. For a server with other connections waiting, unlike `close`, which waits for that acknowledgement.
+    pub fn finish(&mut self, api: &TapeApi, slot: usize) {
+        if let Ok(length) = self.slots[slot].connection.close(tape_rt::micros() as u32, &mut self.segment) {
+            self.transmit(api, slot, length);
+        }
+    }
+
     fn transmit(&mut self, api: &TapeApi, slot: usize, length: usize) {
         let (peer, _) = self.slots[slot].connection.remote();
         if let Some(total) = net::build_ip_frame(&mut self.tx, &self.config, self.slots[slot].peer_mac, peer, 6, &self.segment[..length]) {
-            net::send_frame(api, self.nic, &self.tx[..total]);
+            // A full transmit ring refuses the frame: a data segment dropped here is a loss the peer only notices as a gap,
+            // so wait for the card to take it (bounded) before counting it as lost.
+            let mut tries = 0;
+            while !net::send_frame(api, self.nic, &self.tx[..total]) {
+                tries += 1;
+                if tries > 200 {
+                    self.tx_dropped += 1;
+                    break;
+                }
+                tape_rt::idle();
+            }
         }
+    }
+
+    /// Frames the card refused even after waiting (a loss `send_buffered` then has to make good by retransmitting).
+    pub fn tx_dropped(&self) -> u32 {
+        self.tx_dropped
     }
 }

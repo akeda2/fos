@@ -153,3 +153,19 @@ is no window scaling). Time went to waiting for acknowledgements, not to buildin
 checksum and spinning instead of `idle()` changed nothing, and the I350's TCP checksum offload (`nic_tx_offload`) was slower
 (235 against 176 ms for 8 MB; the context descriptor costs a ring slot per frame). The i350 and the e1000e perform the
 same once pipelined. Reads of the volume are no longer the limit (180 MB/s).
+
+### Writes to ext4, loss recovery, slots (rack, 8 MB files on the `rackdata` ext4 partition)
+
+- **`extN` selector**: `smbd root=ext1` shares the first ext partition of any disk, also one that has a FOSFS boot
+  partition (`diskN` finds ext only on a disk with no FOSFS or FAT volume). Writes need a login: with no `smbusers` file
+  everyone is a guest, who cannot write into a root-owned ext root (`smbd user NAME 0 0 PW`, then `write smbusers LINE`).
+- **Deferred commit (ABI 36 `vfs_sync`)**: `vfs_write` keeps the ext writer open between calls and the journal commits when
+  its stage fills, on a read, or on `vfs_sync`; smbd calls `vfs_sync` after 20 ms without writes. Put: 5.7 -> about 28 MB/s.
+  A crash before the commit loses the last metadata update (file size), never the consistency of the volume.
+- **TCP**: the receive window follows the free room and an overflowing segment is answered, not dropped; a retransmission
+  is one segment (it used to be the whole flight, which the buffer refused silently); a duplicate ACK no longer pushes the
+  retransmit timer out and the third one resends the oldest segment (fast retransmit).
+- **Slots**: a client that hung up left its slot in CloseWait for the 10 s idle timeout, so the fifth quick connection in
+  a row timed out in `smbclient` (5 s). smbd now answers the client's FIN (`Server::finish`, non-blocking).
+- Result: 20 gets in a row about 120 ms each (65 MB/s), puts about 290 ms. The stalls and the slot leak only show on real
+  hardware; the QEMU suites do not reproduce them.
