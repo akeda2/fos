@@ -447,9 +447,39 @@ fn run<const RX: usize, const N: usize>(api: &TapeApi, setup: &Setup, tcp: &mut 
                     busy = true;
                     continue;
                 }
-                if tcp.is_open(slot) {
-                    let answer = unsafe { core::slice::from_raw_parts(worker.answer as *const u8, worker.answer_room) };
-                    reply(api, tcp, slot, answer, worker.length.load(Ordering::Relaxed));
+                let worker = unsafe { &mut *(workers[assigned[slot]] as *mut Worker) };
+                let total = worker.length.load(Ordering::Relaxed);
+                let mut finished = !tcp.is_open(slot);
+                if !finished {
+                    // The answer goes out as the window opens; the loop keeps serving the other connections meanwhile.
+                    let answer = unsafe { core::slice::from_raw_parts(worker.answer as *const u8, total) };
+                    let (start, now) = (tape_rt::micros(), tape_rt::micros());
+                    if worker.progress == 0 {
+                        worker.progress = now;
+                    }
+                    match tcp.send_some(api, slot, &answer[worker.sent..]) {
+                        Ok(taken) => {
+                            SEND_BYTES.fetch_add(taken as u64, Ordering::Relaxed);
+                            worker.sent += taken;
+                            if taken > 0 {
+                                worker.progress = now;
+                            }
+                            finished = worker.sent == total;
+                            if !finished && now - worker.progress > SEND_TIMEOUT {
+                                println!("smbd: sending failed: the peer did not acknowledge");
+                                finished = true;
+                            }
+                        }
+                        Err(reason) => {
+                            println!("smbd: sending failed: {reason}");
+                            finished = true;
+                        }
+                    }
+                    SEND_US.fetch_add(tape_rt::micros() - start, Ordering::Relaxed);
+                }
+                if !finished {
+                    busy = true;
+                    continue;
                 }
                 worker.state.store(IDLE, Ordering::Release);
                 assigned[slot] = usize::MAX;
@@ -499,6 +529,8 @@ fn run<const RX: usize, const N: usize>(api: &TapeApi, setup: &Setup, tcp: &mut 
                     let into = unsafe { core::slice::from_raw_parts_mut(worker.request as *mut u8, io + SLACK) };
                     take_message(api, tcp, slot, length, into);
                     worker.length.store(length, Ordering::Relaxed);
+                    worker.sent = 0;
+                    worker.progress = 0;
                     worker.session.store(sessions[slot].as_mut().unwrap() as *mut Server<Files, OPENS> as usize, Ordering::Relaxed);
                     worker.state.store(JOB, Ordering::Release);
                     tape_rt::futex_wake(&worker.state, 1);
@@ -634,6 +666,9 @@ struct Worker {
     request: usize,
     answer: usize,
     answer_room: usize,
+    /// Network thread only: how much of the answer is out, and when the peer last took some (0: not started).
+    sent: usize,
+    progress: u64,
 }
 
 extern "C" fn worker_main(address: usize) {
