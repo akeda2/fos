@@ -3,6 +3,7 @@
 `fscheck vfswrite`. The host then runs e2fsck on the image (the journal must be clean and the structures consistent) and reads the surviving files back with debugfs. Run with `make test-vfs-write`."""
 
 import shutil
+import hashlib
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,9 @@ def main():
             run("mkdir ext3/shdir")
             run("cp ext3/shell.txt ext3/shdir/copy.txt")
             outputs["shell"] = run("ls ext3/shdir")
+            outputs["label"] = run("ls @vfswrite/shdir")
+            outputs["sha_ext"] = run("sha256 ext3/shell.txt")
+            outputs["sha_label"] = run("sha256 @vfswrite/shdir/copy.txt")
 
         boot(tmp, [boot_disk, ext], scenario)
         out = outputs["write"]
@@ -72,6 +76,10 @@ def main():
         check("[keep.txt] kind 1 size 14 uid 1000" in listing and "[kdir] kind 2" in listing, "the survivors are listed", listing[-500:])
 
         check("copy.txt" in outputs["shell"], "the shell's mkdir, write and cp reach an extN volume", outputs["shell"])
+        check("copy.txt" in outputs["label"], "@LABEL reaches an ext volume", outputs["label"])
+        digest = hashlib.sha256(b"shell text").hexdigest()
+        check(digest in outputs["sha_ext"], "sha256 of an extN file", outputs["sha_ext"])
+        check(digest in outputs["sha_label"], "sha256 of an @LABEL ext file", outputs["sha_label"])
         done = subprocess.run([tool("e2fsck"), "-fn", str(ext)], capture_output=True, text=True)
         check(done.returncode == 0, "e2fsck finds the volume consistent", done.stdout + done.stderr)
         shell_cat = subprocess.run([tool("debugfs"), "-R", "cat /shdir/copy.txt", str(ext)], capture_output=True).stdout
