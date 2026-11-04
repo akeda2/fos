@@ -39,8 +39,8 @@ tests in `crates/kernel-core/tests/fosfs.rs` and `make test-mf-shell`.
 `truncate`, `remove`, `rename`, `flush`. `Writer` is ~100 KiB: box it. The superblock says "not clean" from the first
 change until `flush`. Only volumes without `uninit_bg`-only/`bigalloc`/inline data are writable; `mkfs.ext4`
 defaults (metadata_csum, orphan_file, metadata_csum_seed) are written correctly, see "metadata_csum" below. Files are limited to four
-extent leaf blocks (1360 extents at 4 KiB); beyond that `TooFragmented`. Folder hash indexes are dropped (flag
-cleared) on change; lookups scan. Tests: `crates/ext4/tests/writes.rs` (e2fsck -fn and debugfs judge the results).
+extent leaf blocks (1360 extents at 4 KiB); beyond that `TooFragmented`. Folder hash indexes are kept up to date
+(see below). Tests: `crates/ext4/tests/writes.rs` (e2fsck -fn and debugfs judge the results).
 Shell (`kernel-core/src/ext4vol.rs`): `ext4 diskN mkfs [LABEL]` (adds a Linux partition over all free space after
 the last partition, formats it; asks, then `ext4 diskN mkfs confirm` as the very next command), `mkdir`, `rm`, `mv`,
 `write PATH TEXT`. `make test-mf-shell` runs it in QEMU and lets e2fsck/debugfs judge the disk. Rack's boot disk was
@@ -77,7 +77,7 @@ group descriptors (16 bits, per group), block and inode bitmaps (in the descript
 whole inode with the generation in the seed), extent leaf blocks (4-byte tail after the 340 entries) and folder blocks
 (a 12-byte fake entry, inode 0, type 0xDE, ends each block, so a folder block holds entries in `size - 12` bytes).
 `BLOCK_UNINIT` / `INODE_UNINIT` groups (what `lazy_itable_init` leaves) get their bitmaps built on first use and the
-flags cleared; `itable_unused` is kept. A hash-tree folder (`INDEX_FL`) is made linear on its first change (the `..` entry takes back the index space, index nodes become empty blocks, leaves stay as they are). A journal Linux has mounted carries
+flags cleared; `itable_unused` is kept. A hash-tree folder (`INDEX_FL`) with one or two index levels stays a tree; deeper or odd ones are made linear on their first change (the `..` entry takes back the index space, index nodes become empty blocks, leaves stay as they are). A journal Linux has mounted carries
 `CSUM_V3`; `open` verifies and replays such a log (descriptor, revoke, commit and per-block checksums) and then clears
 the feature, so we only write plain logs and Linux sets it again at its next mount. `Writer::format` makes volumes with
 checksums (`FormatOptions.checksums`, on in the kernel shell; 32-byte descriptors, so no `64bit`). A volume with only `uninit_bg` (descriptor checksums) stays read-only. Tests: Linux-made
@@ -100,9 +100,12 @@ nodes, one leaf; names whose hashes collide continue in the following leaves). H
 the legacy hash are implemented and checked against `debugfs dx_hash` (`cargo test` in `crates/ext4`); the unsigned-char
 variants (volumes made on ARM) and anything odd in the index fall back to the linear scan. `tests/images.rs` runs
 `e2fsck -D` on the `mkfs -d` image to get real hash trees: 429 lookups in a 3060-name folder cost about 5 device reads each
-(a linear scan about 22), counting the folder map, the inode and the group descriptor, with no read cache. The writer does
-not maintain the index: it clears `INDEX_FL` on the first change of a folder (on checksummed volumes it first linearises it),
-so a folder our writer touched is scanned linearly from then on. Making the writer keep the tree is not done.
+(a linear scan about 22), counting the folder map, the inode and the group descriptor, with no read cache. The writer keeps the tree: adding a name goes
+to the probed leaf, a full leaf is split (entries sorted by hash, upper half to a new block, an entry in the node) while the node has room,
+and a removal keeps the tree. A one-block folder that fills up becomes an index (as Linux's make_indexed_dir). The folder is made linear
+only when the root or node is full, the tree is deeper than two levels, or the hash version is unknown. A multi-block linear folder stays
+linear. `format` sets dir_index (half_md4). Tests: `grown_folder_is_indexed_*`, `full_index_root_falls_back_to_linear`
+(e2fsck -fn clean). The inode bitmap's padding bits are now set when a group's bitmap is initialised.
 
 ## TRIM / discard
 
