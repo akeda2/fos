@@ -246,9 +246,21 @@ fn debug(rest: &str) {
                 core::hint::spin_loop();
             }
         }
+        Some("revert") => {
+            let mut outcome = Err("the slot metadata cannot be read or written");
+            #[cfg(target_arch = "x86_64")]
+            let updated = crate::debug::update_metadata(|m| outcome = kernel_core::slot_report::revert(m));
+            #[cfg(target_arch = "aarch64")]
+            let updated = crate::slots::update_metadata(|m| outcome = kernel_core::slot_report::revert(m));
+            match (updated, outcome) {
+                (Some(_), Ok(slot)) => crate::println!("Slot {slot} is the active slot now; `reboot` starts its kernel."),
+                (_, Err(why)) => crate::println!("debug revert: {why}."),
+                _ => crate::println!("debug revert: the slot metadata could not be written."),
+            }
+        }
         #[cfg(target_arch = "x86_64")]
         Some("video") => crate::term::debug_video(words),
-        Some(_) => crate::println!("debug: status | slots | crash | hang | video [skip|auto|size WxH]"),
+        Some(_) => crate::println!("debug: status | slots | revert | crash | hang | video [skip|auto|size WxH]"),
     }
 }
 

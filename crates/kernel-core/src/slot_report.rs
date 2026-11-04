@@ -23,6 +23,8 @@ pub fn report<E: core::fmt::Debug>(
     watchdog_seconds: Option<u64>,
 ) {
     print(format_args!("booted slot: {boot_slot}"));
+    // fosadm compares this with the tape ABI its build tapes were made for.
+    print(format_args!("tape ABI: {}", fosfor_abi::tape::TAPE_API_VERSION));
     match metadata {
         Ok(m) => {
             print(format_args!("active slot: {}, pending: {:?}, attempted: {}, confirmed: {}", m.active_slot, m.pending_slot, m.attempted, m.confirmed));
@@ -48,4 +50,16 @@ pub fn report<E: core::fmt::Debug>(
         Some(seconds) => print(format_args!("watchdog: {seconds} s")),
         None => print(format_args!("watchdog: off")),
     }
+}
+
+/// `debug revert`: makes the other slot the active one (the previous kernel, kept there by the last update) and drops any pending
+/// try. The slot must hold a kernel (its size in the metadata is non-zero). Returns the slot that boots next.
+pub fn revert(metadata: &mut SlotMetadata) -> Result<u8, &'static str> {
+    let other = 1 - metadata.active_slot.min(1);
+    if metadata.slot_sectors[other as usize] == 0 {
+        return Err("the other slot holds no kernel");
+    }
+    metadata.active_slot = other;
+    (metadata.pending_slot, metadata.attempted, metadata.confirmed) = (None, false, false);
+    Ok(other)
 }
