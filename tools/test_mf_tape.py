@@ -95,6 +95,18 @@ def run(cpu, smp):
             ok = ok and type_to_ed("tape ed note.txt\n", "ed> ")
             ok = ok and type_to_ed("p\n", "2: hello")
             type_to_ed("q\n", "exited with code 0.")
+            # ESC [ D is a cursor key for the tape, not an Escape: ed must survive it (a lone ESC kills the tape after ~30 ms).
+            ok2 = type_to_ed("tape ed note.txt\n", "ed> ")
+            qemu.stdin.write(b"\x1b[D")
+            qemu.stdin.flush()
+            time.sleep(0.5)
+            mark = len(log)
+            qemu.stdin.write(b"\n")
+            qemu.stdin.flush()
+            ok2 = ok2 and wait_for("unknown command", 10, mark)  # ed read the key as input and answered; it was not killed
+            ok2 = ok2 and type_to_ed("q\n", "exited with code 0.")
+            if not ok2:
+                failures.append("a cursor key (ESC [ D) killed or confused the foreground tape:\n" + log[-600:].decode("utf8", "replace"))
             if not ok:
                 failures.append("ed could not save and reload a file:\n" + log[-600:].decode("utf8", "replace"))
         text = log.decode("utf8", "replace")
