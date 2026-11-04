@@ -143,3 +143,13 @@ as=nas &1` (or `run ...`) owns NIC 1 from its first instruction, leaves the
 shell free, and `kill PID` (the number it prints; `threads` lists it) stops
 it. Verified in QEMU against the host `serve` example (`make test-smbmount`,
 `make test-mf-smbmount`); real servers are not yet checked.
+
+### Send path on real hardware (rack, SATA SSD, e1000e and i350)
+
+A 4 MB `smbclient get`: 7.6 MB/s at first; 23.7 after AHCI 128 KiB commands and a directory-lookup fix; about 55 MB/s
+once `Server::send_buffered` kept the flight going across messages (before, every 64 KiB message waited for all its
+acknowledgements, a round trip each); 70-87 MB/s with `FLIGHT` at 44 segments (the peer's 64 KiB window is the limit, there
+is no window scaling). Time went to waiting for acknowledgements, not to building, checksumming or sending frames: a wider
+checksum and spinning instead of `idle()` changed nothing, and the I350's TCP checksum offload (`nic_tx_offload`) was slower
+(235 against 176 ms for 8 MB; the context descriptor costs a ring slot per frame). The i350 and the e1000e perform the
+same once pipelined. Reads of the volume are no longer the limit (180 MB/s).
