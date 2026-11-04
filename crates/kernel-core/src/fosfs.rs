@@ -72,6 +72,11 @@ impl Label {
     }
 }
 
+/// Where `read_at` last found a root file (see `find_file_hinted`).
+static HINT_KEY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static HINT_SLOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+use core::sync::atomic::Ordering;
+
 /// A mounted volume: a disk and the partition on it.
 #[derive(Clone, Copy)]
 pub struct Volume {
@@ -706,10 +711,16 @@ impl Volume {
 
     fn find_child(&self, parent: u32, name: &[u8]) -> Result<Option<Entry>, Error> {
         let mut result = None;
-        self.for_each_all(|entry| {
-            if result.is_none() && entry.parent == parent && entry.name() == name {
-                result = Some(entry);
+        // Stops at the first match: a lookup need not read the rest of a large directory.
+        self.scan(|lba, index, slot| {
+            if let Some(parsed) = self.parse(slot) {
+                let entry = self.entry_from(lba, index, slot, &parsed);
+                if entry.parent == parent && entry.name() == name {
+                    result = Some(entry);
+                    return false;
+                }
             }
+            true
         })?;
         Ok(result)
     }
@@ -869,6 +880,37 @@ impl Volume {
         Ok(self.find(path)?.filter(|entry| !entry.is_dir))
     }
 
+    /// `find_file` for a root-level file read again and again (a network share reading in blocks): remembers where the
+    /// directory slot was, and next time reads only that sector. The hint is checked (a valid entry, same name, root,
+    /// not a folder), so a stale or torn one just costs the full scan; no lock is needed.
+    fn find_file_hinted(&self, path: &[u8]) -> Result<Option<Entry>, Error> {
+        if path.contains(&b'/') {
+            return self.find_file(path);
+        }
+        let key = path.iter().fold(0xcbf2_9ce4_8422_2325u64 ^ (self.disk as u64) << 56 ^ self.base, |hash, &byte| (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3));
+        let per_sector = self.entries_per_sector() as u64;
+        if HINT_KEY.load(Ordering::Relaxed) == key {
+            let slot = HINT_SLOT.load(Ordering::Relaxed);
+            let (lba, index) = (slot / per_sector, (slot % per_sector) as usize);
+            if lba >= self.dir_start() && lba < self.data_start() {
+                let sector = self.read_sector(lba)?;
+                let bytes = &sector[index * self.entry_size()..(index + 1) * self.entry_size()];
+                if let Some(parsed) = self.parse(bytes) {
+                    let entry = self.entry_from(lba, index, bytes, &parsed);
+                    if entry.parent == 0 && !entry.is_dir && entry.name() == path {
+                        return Ok(Some(entry));
+                    }
+                }
+            }
+        }
+        let found = self.find_file(path)?;
+        if let Some(entry) = &found {
+            HINT_SLOT.store(entry.directory_lba * per_sector + entry.index as u64, Ordering::Relaxed);
+            HINT_KEY.store(key, Ordering::Relaxed);
+        }
+        Ok(found)
+    }
+
     /// Reads a whole file into `buffer`; returns its length, or None if absent. A
     /// buffer that is too small is an error rather than a silent truncation.
     pub fn read(&self, name: &[u8], buffer: &mut [u8]) -> Result<Option<usize>, Error> {
@@ -889,7 +931,7 @@ impl Volume {
     /// Reads up to `buffer.len()` bytes of a file starting at byte `offset`; returns how many (0 at or past the end), or
     /// None if the file is absent. Only the sectors that hold the range are read.
     pub fn read_at(&self, name: &[u8], offset: u64, buffer: &mut [u8]) -> Result<Option<usize>, Error> {
-        let Some(entry) = self.find_file(name)? else { return Ok(None) };
+        let Some(entry) = self.find_file_hinted(name)? else { return Ok(None) };
         let wanted = entry.length.saturating_sub(offset).min(buffer.len() as u64) as usize;
         let (mut done, mut skip) = (0usize, offset);
         for &(start, count) in &entry.extents[..entry.extent_count] {

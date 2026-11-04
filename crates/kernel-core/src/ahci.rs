@@ -19,7 +19,9 @@ use crate::{memory, paging, pci, timer};
 pub const MAX_CONTROLLERS: usize = 2;
 pub const MAX_DRIVES: usize = 8;
 /// Most sectors one `read`/`write` call moves (the bounce buffer's size).
-pub const MAX_SECTORS: usize = 16;
+/// Sectors per command: 128 KiB. Each command costs a fixed latency (about 0.7 ms measured on a SATA SSD with polling), so 8 KiB
+/// commands capped a read at ~11 MB/s; 28-bit READ DMA takes at most 256 (count 0 means 256).
+pub const MAX_SECTORS: usize = 256;
 const TIMEOUT_TICKS: u64 = 500;
 
 const HBA_GHC: usize = 0x04;
@@ -62,11 +64,12 @@ const ATA_DATA_SET_MANAGEMENT: u8 = 0x06;
 const ATA_FLUSH_CACHE: u8 = 0xe7;
 const ATA_FLUSH_CACHE_EXT: u8 = 0xea;
 
-// Layout of the 16 KiB each drive gets (four contiguous frames).
+// Layout of what each drive gets: one frame of structures, then the bounce buffer (`FRAMES` contiguous frames in all).
 const OFFSET_COMMAND_LIST: usize = 0x000; // 1 KiB aligned: 32 headers of 32 bytes
 const OFFSET_RECEIVED_FIS: usize = 0x400; // 256-byte aligned
 const OFFSET_COMMAND_TABLE: usize = 0x800; // 128-byte aligned: CFIS, then the PRDT at +0x80
-const OFFSET_BOUNCE: usize = 0x1000; // MAX_SECTORS * 512 = 8 KiB
+const OFFSET_BOUNCE: usize = 0x1000; // MAX_SECTORS * 512 = 128 KiB
+const FRAMES: usize = 1 + MAX_SECTORS * 512 / 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -323,7 +326,7 @@ fn init_port(registers: usize) -> Option<Drive> {
     if !wait_until(100, || read32(registers + P_CMD) & (CMD_LIST_RUNNING | CMD_FIS_RUNNING) == 0) {
         return None;
     }
-    let frame = memory::allocate_contiguous(4, Some(1 << 32))? as usize; // zeroed
+    let frame = memory::allocate_contiguous(FRAMES as u64, Some(1 << 32))? as usize; // zeroed
     write32(registers + P_CLB, (frame + OFFSET_COMMAND_LIST) as u32);
     write32(registers + P_CLBU, 0);
     write32(registers + P_FB, (frame + OFFSET_RECEIVED_FIS) as u32);
@@ -332,7 +335,7 @@ fn init_port(registers: usize) -> Option<Drive> {
     write32(registers + P_IS, 0xffff_ffff);
     write32(registers + P_CMD, read32(registers + P_CMD) | CMD_FIS_RECEIVE);
     if !wait_until(100, || read32(registers + P_TFD) & (TFD_BUSY | TFD_DRQ) == 0) {
-        memory::free(frame as u64, 4);
+        memory::free(frame as u64, FRAMES as u64);
         return None;
     }
     write32(registers + P_CMD, read32(registers + P_CMD) | CMD_START);
