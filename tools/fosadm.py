@@ -508,10 +508,17 @@ def plan_host(iface: str, args, host: Host, parallel: bool):
         say(host, f"{host.name}: no answer, skipped", parallel)
         return None
     arch, have, files, stopped = state
+    running = arch
+    wanted = {"embedded": "x86_64", "mf": "x86_64-mf"}.get(getattr(args, "kernel", "current"))
+    if wanted and arch.startswith("x86_64"):
+        arch = wanted
     kernel, tape_dir, tapes = source_files(Path(args.source) if args.source else None, arch)
     do_kernel = kernel is not None and not args.tapes_only
     want = kernel_sectors(kernel)
-    new_kernel = do_kernel and (args.force_kernel or have != want)
+    # A different kernel type is always pushed: the sector count says nothing about which one is running.
+    new_kernel = do_kernel and (args.force_kernel or have != want or arch != running)
+    if arch != running:
+        say(host, f"{host.name}: switching {running} -> {arch}", parallel)
     states = content_states(iface, host, tape_dir, sorted(n for n in tapes if n in files)) if do_tapes and args.content else {}
     if states and set(states.values()) == {"unsupported"}:
         say(host, f"{host.name}: this kernel has no `sha256` command yet; planning by size", parallel)
@@ -703,6 +710,8 @@ def main() -> int:
     deploy.add_argument("hosts", nargs="*", help="host names or MACs (default: all)")
     deploy.add_argument("--from", dest="source", help="release folder (default: the build tree)")
     deploy.add_argument("--sizes", dest="content", action="store_false", help="plan by comparing sizes, not SHA-256 (quicker, misses same-size changes)")
+    deploy.add_argument("--kernel", choices=["current", "embedded", "mf"], default="current",
+                        help="which x86_64 kernel to put on the host: the one it runs now (default), or switch to the embedded or the server (mf) kernel")
     deploy.add_argument("--kernel-only", action="store_true")
     deploy.add_argument("--tapes-only", action="store_true")
     deploy.add_argument("--force-kernel", action="store_true", help="push the kernel even if the size matches")

@@ -23,7 +23,7 @@ python3 tools/fosadm.py --iface IFACE deploy [HOST...]      # plan, then kernel 
 ```
 `deploy` handles the hosts in parallel over Ethernet (lines are tagged `[host]`; `--one-by-one` restores the old order).
 `deploy` options: `--dry-run` (plan only), `-y` (no prompt), `--tapes-only`, `--kernel-only`,
-`--sizes` (plan by size, not SHA-256; deploy compares content by default), `--force-kernel` (size matches but push anyway), `--add-missing`, `--from DIR` (a release folder).
+`--sizes` (plan by size, not SHA-256; deploy compares content by default), `--force-kernel` (size matches but push anyway), `--kernel current|embedded|mf` (x86_64 only: switch the host to the embedded or the server kernel; default keeps the one it runs), `--add-missing`, `--from DIR` (a release folder).
 Also: `run HOST cmd...`, `put HOST FILE [NAME] [--disk N]`, `shell HOST`, `bootcode HOST [--update]`.
 
 Order: `status` (or `deploy --dry-run`) first, show the plan to the user, then deploy.
