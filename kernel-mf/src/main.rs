@@ -32,6 +32,7 @@ mod power;
 mod shell;
 mod shellhost;
 mod sysshell;
+mod top;
 mod log;
 #[path = "../../kernel/src/formatshell.rs"]
 mod formatshell;
@@ -379,6 +380,7 @@ extern "C" fn service_thread(_: usize) {
         while let Some(byte) = serial::read_byte() {
             shell::feed(byte);
         }
+        top::poll();
         net::housekeeping();
         slots::housekeeping();
         debug::pet();

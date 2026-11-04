@@ -92,6 +92,9 @@ pub fn reset() {
 
 /// One input byte: printable characters are echoed, Backspace edits, Enter runs the line.
 pub fn feed(byte: u8) {
+    if crate::top::key(byte) {
+        return;
+    }
     if feed_foreground(byte) {
         return;
     }
@@ -105,7 +108,7 @@ pub fn feed(byte: u8) {
                 if let Ok(text) = core::str::from_utf8(&line[..length]) {
                     run(text.trim());
                 }
-                if KEYS.lock().pid == 0 {
+                if KEYS.lock().pid == 0 && !crate::top::active() {
                     prompt();
                 }
             }
@@ -182,7 +185,7 @@ pub fn run(line: &str) {
     match command {
         "help" => match line.trim_start()[command.len()..].trim() {
             "" => {
-                println!("help version cpus mem pci disks nic uptime slots threads echo TEXT reboot audio usb date nic [peers|discover] tapesync gpio @HOST ...");
+                println!("help version cpus mem pci disks nic uptime slots threads top echo TEXT reboot audio usb date nic [peers|discover] tapesync gpio @HOST ...");
                 println!("ls cat write rm cp mv cmp mkdir (`help NAME` shows one; files are NAME, diskN/NAME, @LABEL/NAME)");
                 println!("keymap kup serial  recv NAME  io sleep clear memmap bootinfo cpuinfo  start dmesg sector ext4 mount umount label fsck grow shrink sha256 format install bootcode (disk commands ask first)");
                 println!("tape NAME [ARGS]  run a tape (a ring 3 process)   NAME [ARGS]  the same   kill PID");
@@ -224,6 +227,7 @@ pub fn run(line: &str) {
                 }
             }
         }
+        "top" => crate::top::start(&line.trim_start()[command.len()..]),
         "threads" => {
             sched::for_each(|id, name, state| println!("{id:3} {name:<16} {state:?}"));
             println!("{} context switches.", sched::switches());

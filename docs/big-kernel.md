@@ -360,6 +360,11 @@ flavour marker reaches `fosadm status`, and whether the batch queue needs the sc
   return, preemption of threads that never yield, sleep, the mutex and, at `-smp` 2 and 8, unpinned threads running on every
   CPU. Not yet: a wake IPI (an idle AP looks at each tick, so up to 10 ms latency), priorities, per-CPU queues, thread
   migration cost awareness. Only real hardware shows real APIC timing and cross-CPU behaviour under load.
+- `top [SECONDS] [once]` (`kernel-mf/src/top.rs`): per-CPU load bars, and per thread PID, TID, state, the CPU it runs on (`(last)` when
+  not running), pin, %CPU, CPU time and the hardware it holds (NICs, audio, screen, file streams, from the `tapenet`/`tapeaudio`/
+  `process`/`tapefs` owner tables). Accounting is tick-sampled: each timer tick charges the thread it finds running (10 ms);
+  idle threads and `service` (which polls by design) do not count as load. It is a state machine polled by the service thread, not a
+  blocking loop, so input keeps working; q, Esc or Ctrl-C ends it. Checked in QEMU only (`make test-mf-smbmount`).
 - Slice 8a (the identity alias is gone) is built: `fos_hal::memory::phys_to_virt`/`virt_to_phys` (an offset set once by the platform: 0 on the
   embedded kernel and the Pi 4 core, `DIRECT_BASE` on `kernel-mf`) and every `kernel-core` driver dereferences BARs, rings and DMA
   frames through it (about 370 sites in xhci, ehci, ohci, hda, e1000, rtl8168/8139, 3c905, ahci, nvme, virtio-blk, usb_*); addresses
