@@ -331,12 +331,15 @@ fn sha256(rest: &str) {
         return crate::println!("Usage: sha256 [diskN/]NAME...");
     }
     for reference in rest.split_whitespace() {
-        let read = crate::tape_fs::resolve_file(reference.as_bytes(), true).ok().and_then(|(volume, name)| volume.read(name, staging).ok().flatten());
-        let Some(length) = read else {
+        let whole = crate::tape_fs::resolve_file(reference.as_bytes(), true).ok().and_then(|(volume, name)| volume.read(name, staging).ok().flatten());
+        let hashed = match whole {
+            Some(length) => Some((tape_sync::sha256(&staging[..length]), length as u64)),
+            None => sha256_streamed(reference, staging),
+        };
+        let Some((digest, length)) = hashed else {
             crate::println!("sha256: {reference}: not found");
             continue;
         };
-        let digest = tape_sync::sha256(&staging[..length]);
         let mut hex = [0u8; 64];
         for (index, byte) in digest.iter().enumerate() {
             hex[index * 2] = b"0123456789abcdef"[usize::from(byte >> 4)];
@@ -344,6 +347,25 @@ fn sha256(rest: &str) {
         }
         crate::println!("{}  {length}  {reference}", core::str::from_utf8(&hex).unwrap_or(""));
     }
+}
+
+/// The digest of a file read piece by piece: what the whole-file read cannot hold (bigger than the staging buffer) or does
+/// not reach (`extN/...`, `//NAME/...`, FAT volumes).
+fn sha256_streamed(reference: &str, piece: &mut [u8]) -> Option<([u8; 32], u64)> {
+    let size = u64::try_from(crate::tape_fs::length(reference.as_bytes())).ok()?;
+    let mut hash = tape_sync::Sha256::new();
+    let mut done = 0u64;
+    while done < size {
+        let want = piece.len().min((size - done) as usize);
+        match crate::tape_fs::read_at(reference.as_bytes(), done, &mut piece[..want]) {
+            count if count > 0 => {
+                hash.update(&piece[..count as usize]);
+                done += count as u64;
+            }
+            _ => return None,
+        }
+    }
+    Some((hash.finish(), size))
 }
 
 fn sleep(rest: &str) {

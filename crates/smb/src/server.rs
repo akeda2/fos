@@ -193,6 +193,8 @@ pub struct Server<S: Share, const OPENS: usize> {
     pub guid: [u8; 16],
     /// The time now, seconds since 1970.
     pub now: u64,
+    /// Called with every request's command, the status it got and a detail (QUERY_INFO: type << 8 | class; IOCTL: the code) and the request flags (bit 2: related).
+    pub trace: Option<fn(u16, u32, u32, u32)>,
     dialect: u16,
     /// 0: nothing yet, 1: challenge sent, 2: logged in.
     auth: u8,
@@ -330,6 +332,7 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
             sign_answer: false,
             tree: false,
             opens: [Open::EMPTY; OPENS],
+            trace: None,
         }
     }
 
@@ -464,6 +467,14 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
                 (status, 9)
             }
         };
+        if let Some(trace) = self.trace {
+            let detail = match command {
+                CMD_QUERY_INFO if msg.len() > 67 => u32::from(msg[66]) << 8 | u32::from(msg[67]),
+                CMD_IOCTL if msg.len() > 71 => get32(msg, 68),
+                _ => 0,
+            };
+            trace(command, status, detail, flags);
+        }
         let granted = u32::from(credits.max(1)) | (u32::from(charge) << 16);
         let signed = self.sign_answer || (command == CMD_SESSION_SETUP && self.signing.is_some() && self.auth == 2);
         Self::write_header(head, command, flags | if signed { FLAG_SIGNED } else { 0 }, message, granted, status, chain.tree, chain.session);
@@ -1154,7 +1165,7 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
     }
 
     fn query_info(&mut self, chain: &mut Chain, related: bool, msg: &[u8], body: &mut [u8]) -> Result<usize, u32> {
-        need(msg, 41)?;
+        need(msg, 40)?;
         let kind = msg[HEADER + 2];
         let class = msg[HEADER + 3];
         let limit = (get32(msg, HEADER + 4) as usize).min(MAX_IO).min(body.len().saturating_sub(8));

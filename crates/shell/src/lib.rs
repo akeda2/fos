@@ -55,6 +55,8 @@ pub enum FsError {
     Unreadable,
     /// A file cannot be made empty here (FAT).
     Empty,
+    /// The volume or the server refused: read-only, or not allowed for the login (a Samba ACL).
+    Denied,
     Failed,
 }
 
@@ -67,6 +69,7 @@ impl fmt::Display for FsError {
             FsError::Unreadable => "cannot read the disk (it may have been unplugged)",
             FsError::NoVolume => "no such disk, or no FOSFS data partition or FAT volume on it (see `disks`)",
             FsError::Empty => "an empty file cannot be made on a FAT volume",
+            FsError::Denied => "access denied (a read-only volume, or the server does not allow it)",
             FsError::Failed => "the volume could not be read or written (no room, or damaged)",
         })
     }

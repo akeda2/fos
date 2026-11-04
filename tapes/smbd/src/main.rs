@@ -365,6 +365,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                     fresh[16..].copy_from_slice(&mixed[..8]);
                 }
                 session.challenge.copy_from_slice(&fresh[..8]);
+                if log {
+                    session.trace = Some(trace_request);
+                }
                 session.guid.copy_from_slice(&fresh[8..24]);
                 sessions[slot] = Some(session);
                 if log {
@@ -397,6 +400,12 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             tape_rt::idle();
         }
     }
+}
+
+/// `log` shows every request: the command number (2 = session setup, 3 = tree connect, 5 = create, 16 = query info), its
+/// status and a detail (QUERY_INFO: info type and class; IOCTL: the control code).
+fn trace_request(command: u16, status: u32, detail: u32, flags: u32) {
+    println!("smbd: cmd {command} -> {status:#x} ({detail:#x}) flags {flags:#x}");
 }
 
 /// Prints and resets the counters: reading, sending, and everything else since the last report.

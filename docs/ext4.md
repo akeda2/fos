@@ -47,8 +47,9 @@ the last partition, formats it; asks, then `ext4 diskN mkfs confirm` as the very
 formatted this way (243 GB, `rackdata`) after `shrink disk1 1G`. Formatting 243 GB takes minutes and blocks the shell:
 rack reset itself (60 s watchdog) once it was done; the volume was complete. The shell's `ls`, `cat`, `write`, `mkdir`,
 `rm` and `cp` reach an ext volume as `extN/path` (also from or to `//NAME` remote volumes, `tape_vfs::read_whole` and
-friends behind `tape_fs`), `make test-vfs-write`. Not yet: installer integration, `@LABEL` and `diskN` for ext on a
-disk that also has FOSFS.
+friends behind `tape_fs`), `make test-vfs-write`. `@LABEL` finds an ext volume too (only when no FOSFS or FAT volume has that
+label); `sha256` streams, so it works on ext, `@LABEL` and `//NAME` files of any size. Not yet: installer integration,
+`diskN` for ext on a disk that also has FOSFS.
 
 ## Journal (step 4)
 

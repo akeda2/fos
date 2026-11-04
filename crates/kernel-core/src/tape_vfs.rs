@@ -27,6 +27,9 @@ fn ext_ref(reference: &[u8]) -> Option<(usize, &[u8])> {
     if let Some(number) = tape_fs::ext_number(selector).filter(|&number| number > 0) {
         return Some((number - 1, path));
     }
+    if let Some(disk) = label_disk(selector) {
+        return Some((disk, path));
+    }
     let number = tape_fs::disk_number(selector).filter(|&number| number > 0)?;
     // A disk that already is the kept ext volume skips the FOSFS and FAT probes (a few reads each).
     let known = ext4vol::shared_disk() == Some(number - 1);
@@ -34,6 +37,15 @@ fn ext_ref(reference: &[u8]) -> Option<(usize, &[u8])> {
         return None;
     }
     Some((number - 1, path))
+}
+
+/// The disk of an ext volume named by `@LABEL`, when no FOSFS or FAT volume carries that label.
+fn label_disk(selector: &[u8]) -> Option<usize> {
+    let label = selector.strip_prefix(b"@").filter(|label| !label.is_empty())?;
+    if storage::volume_labelled(label).is_some() || tape_fs::fat_labelled(label).is_some() {
+        return None;
+    }
+    ext4vol::disk_labelled(label)
 }
 
 /// The kept ext volume a reference names and the path on it (changes left open are committed first).
@@ -388,10 +400,10 @@ pub extern "C" fn api_vfs_set_owner(path: *const u8, path_length: usize, uid: u3
 
 // ---- whole-file calls for the shell: `extN/path` references only (`tape_fs::read`, `write`, ... hand them over) ----
 
-/// True when `reference` names an ext volume by `extN`: the shell's file commands reach those through here.
+/// True when `reference` names an ext volume by `extN` or `@LABEL`: the shell's file commands reach those through here.
 pub fn is_ext_reference(reference: &[u8]) -> bool {
     let (selector, _) = tape_fs::split_selector(reference);
-    tape_fs::ext_number(selector).is_some_and(|number| number > 0)
+    tape_fs::ext_number(selector).is_some_and(|number| number > 0) || label_disk(selector).is_some()
 }
 
 /// What one `vfs_read` or `vfs_write` carries for the whole-file calls.
