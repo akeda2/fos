@@ -211,4 +211,11 @@ network thread keeps the NIC and every TCP slot and takes each complete request 
 a session's requests stay in order and only one thread touches its `Server`. A slow disk no longer stops frames coming in, and
 several clients no longer wait behind each other's I/O (the disk itself is still one lock). Embedded kernels have no threads
 (`tape_rt::threads_supported()`) and keep the single loop. Tested by `make test-mf-smbd` (six clients at once); throughput with
-several clients on rack is not measured yet.
+several clients on rack is measured below.
+
+**Read-ahead.** A client reading a file in 1 MiB requests waits for each answer before asking for the next, so the disk read sat
+between two stretches of wire time. After a session's second sequential full read, a worker reads the next range into a shared
+1 MiB cache (`Ahead` in `tapes/smbd/src/main.rs`) while the network thread is still sending the answer; the next request is a
+copy. Only a request the cache covers entirely is served from it, and every create, write, truncate, remove or rename throws it away
+(also a read in progress). On rack one client reading 675 MB went from 10.2 s to 7.9 s active (wire floor about 5.4 s). Two clients
+at once finish together with the writes in about 17 s. Not covered by a test of its own beyond the file checks of `make test-smbd`.

@@ -1756,6 +1756,20 @@ streams at full audio rate on a USB stick.
 **Not verified (`fs_read_at`):** a file of several FOSFS extents (v4 holds up to three) is only covered by code reading; QEMU's fresh volumes give one extent.
 Not on real hardware. phono's decode reads its raw take with it.
 
+### Tape threads on the server kernel (tape ABI 37)
+
+A tape on FOS-mf can start more threads in its own address space: `thread_spawn(entry, argument, stack_top)` (the tape allocates
+the stack), `thread_join`, and `futex_wait(address, expected)` / `futex_wake(address, count)` on a 32-bit word of the tape's
+memory; `tape_rt::threads_supported()` says whether the kernel has them (the embedded kernels answer `THREAD_UNSUPPORTED`). The
+check-and-block of `futex_wait` is atomic against a wake, so the pattern is: write the word, then wake. Threads are scheduled
+like processes (`kernel-mf/src/sched.rs`) and a process ends when its last thread does; a killed tape takes its threads with it.
+`tapes/thrcheck` and `make test-mf-threads` cover spawning, joining, futex hand-off and killing a tape with threads running;
+`smbd` is the real user (`docs/smb.md` "Worker threads"). **Not verified:** more than 8 CPUs, and long runs on real hardware beyond
+rack's SMB use.
+
+The mf shell passes ESC `[` or ESC `O` followed by a letter to the foreground tape as a cursor key; a lone ESC (nothing follows
+within `ESCAPE_WAIT_TICKS`, about 30 ms) stops the tape. `make test-mf-tape` types a cursor key to `ed` and checks it survives.
+
 ## ebb: the full-screen editor, and console SGR
 
 `tape run ebb NAME [tab=N]` (`tapes/ebb`) is an embedded cousin of the user's `ebba` editor. The text engine is `crates/edit-core`
