@@ -39,6 +39,32 @@ fn claim(index: u64) -> bool {
     }
 }
 
+/// Whether NIC `index` (0-based) exists.
+pub fn exists(index: usize) -> bool {
+    index < nic::count().min(MAX_NICS)
+}
+
+/// The pid that owns NIC `index`, 0 when nobody does.
+pub fn owner(index: usize) -> u64 {
+    OWNER[index].load(Ordering::Acquire)
+}
+
+/// A background tape (`run NAME &N`) owns the NICs in `mask` from the start; `active` then answers with the first of them.
+pub fn reserve(pid: u64, mask: u64) {
+    for index in (0..MAX_NICS).filter(|&index| mask >> index & 1 != 0) {
+        if OWNER[index].compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            let _nics = lock_nics();
+            nicctl::clear_frame_queue_nic(index);
+        }
+    }
+}
+
+/// `nic_active`: the lowest NIC this process owns (the one a background tape was started on), else 0.
+pub fn active() -> u64 {
+    let pid = sched::current_pid();
+    (0..MAX_NICS).find(|&index| OWNER[index].load(Ordering::Acquire) == pid).unwrap_or(0) as u64
+}
+
 /// `nic_owned(index)`: 1 when this process may drive the interface.
 pub fn owned(index: u64) -> u64 {
     let free_or_mine = (index as usize) < nic::count().min(MAX_NICS) && {

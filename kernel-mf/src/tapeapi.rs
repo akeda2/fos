@@ -317,7 +317,7 @@ pub fn call(frame: &mut Frame) {
         NIC_SEND => tapenet::send(a, b, c),
         NIC_RECEIVE => tapenet::receive(a, b, c),
         NIC_MAX_FRAME_LEN => tapenet::MAX_FRAME,
-        NIC_ACTIVE => 0,
+        NIC_ACTIVE => tapenet::active(),
         NIC_OWNED => tapenet::owned(a),
         NIC_SET_PROMISCUOUS => tapenet::setting(a, b, kernel_core::nicctl::nic_set_promiscuous),
         NIC_SET_MULTICAST => tapenet::setting(a, b, kernel_core::nicctl::nic_set_multicast),

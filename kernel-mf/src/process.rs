@@ -37,7 +37,7 @@ pub const SYSCALL_VECTOR: u64 = 0x1000;
 /// 32 MiB up), with one unmapped page between them, so an image can be about 32 MiB.
 pub const CODE_BASE: u64 = vm::USER_BASE;
 pub const STACK_TOP: u64 = vm::USER_BASE + 0x1ff_f000;
-const STACK_PAGES: u64 = 4;
+const STACK_PAGES: u64 = 16;
 /// The stack's size; the page below it is never mapped (the code is at the bottom of the address space, the heap a gigabyte above
 /// it), so running off the end is a page fault that kills only the process.
 pub const STACK_BYTES: u64 = STACK_PAGES * 4096;
@@ -251,6 +251,9 @@ fn map_stack(root: u64) -> Option<()> {
     Some(())
 }
 
+/// NICs (0-based mask) the next process started owns from its first instruction: a background tape (`run NAME &N`).
+pub static START_NICS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 static NEXT_PID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 fn start(name: &str, root: u64, entry: Option<(u64, u64, u64)>) -> Option<u64> {
@@ -259,9 +262,11 @@ fn start(name: &str, root: u64, entry: Option<(u64, u64, u64)>) -> Option<u64> {
         return None;
     };
     let pid = NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    crate::tapenet::reserve(pid, START_NICS.swap(0, core::sync::atomic::Ordering::AcqRel));
     let launch = Box::into_raw(Box::new(Launch { pid, entry, argument, second })) as usize;
     let id = sched::spawn_user(name, user_thread, launch, root);
     if id.is_none() {
+        crate::tapenet::process_ended(pid);
         unsafe { drop(Box::from_raw(launch as *mut Launch)) };
         vm::destroy_user_space(root);
     }
