@@ -304,7 +304,7 @@ fn answer(client: &mut Session, mount: &mut Mount, request: &RemoteRequest, buff
 }
 
 fn shape(directory: bool, size: u64) -> VfsStat {
-    VfsStat { kind: if directory { VFS_DIR } else { VFS_FILE }, mode: if directory { 0o755 } else { 0o644 }, size, links: 1, ..VfsStat::default() }
+    VfsStat { kind: if directory { VFS_DIR } else { VFS_FILE }, mode: if directory { 0o777 } else { 0o666 }, size, links: 1, ..VfsStat::default() }
 }
 
 /// (is a folder, size). A file opens as a file; a folder says so and is then opened as one.

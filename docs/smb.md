@@ -123,6 +123,12 @@ request slot, posted by the caller and taken by the provider with
 become a provider the same way. Callers yield to services while they wait
 (10 s until taken, then 60 s).
 
+Re-export: `run smbd root=//nas share=data &2` shares the mount again (FOS as a
+gateway; smbmount on one NIC, smbd on another). smbmount reports every entry
+as mode 777/666 so smbd's mode-bit checks let everything through; the real
+permissions are the upstream server's, enforced by the login smbmount made.
+`make test-smbd-reexport` (smbclient through both hops).
+
 Limits: one request in flight, 128 KiB per call (larger files are split by
 the callers), 128 entries per folder listing, `truncate` only to 0,
 `set_owner` is a no-op, `fs_stream_*` is not remote. A killed provider keeps
