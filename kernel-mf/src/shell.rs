@@ -77,7 +77,7 @@ pub fn prompt() {
 
 /// Commands `run` handles itself, outside the shared tables, for Tab completion.
 const BUILTINS: &[&str] = &[
-    "version", "cpus", "mem", "pci", "disks", "nic", "tapesync", "gpio", "top", "threads", "date", "uptime", "slots", "audio", "usb", "tape", "run", "kill",
+    "version", "cpus", "mem", "pci", "disks", "nic", "tapesync", "gpio", "top", "threads", "ps", "date", "uptime", "slots", "audio", "usb", "tape", "run", "kill",
     "echo", "debug", "start", "keymap", "kup", "recv", "dmesg", "clear", "sleep", "io", "memmap", "bootinfo", "cpuinfo", "shrink", "sector", "mount", "umount",
     "format", "label", "fsck", "grow", "install", "bootcode", "reboot", "ext4", "sha256",
 ];
@@ -142,7 +142,7 @@ pub fn run_command(line: &str) {
     match command {
         "help" => match line.trim_start()[command.len()..].trim() {
             "" => {
-                println!("help version cpus mem pci disks nic uptime slots threads top echo TEXT reboot audio usb date nic [peers|discover] tapesync gpio @HOST ...");
+                println!("help version cpus mem pci disks nic uptime slots threads ps top echo TEXT reboot audio usb date nic [peers|discover] tapesync gpio @HOST ...");
                 println!("ls cat write rm cp mv cmp mkdir (`help NAME` shows one; files are NAME, diskN/NAME, @LABEL/NAME)");
                 println!("keymap kup serial  recv NAME  io sleep clear memmap bootinfo cpuinfo  start dmesg sector ext4 mount umount label fsck grow shrink sha256 format install bootcode (disk commands ask first)");
                 println!("tape NAME [ARGS]  run a tape (a ring 3 process)   NAME [ARGS]  the same   kill PID");
@@ -188,6 +188,11 @@ pub fn run_command(line: &str) {
         "threads" => {
             sched::for_each(|id, name, state| println!("{id:3} {name:<16} {state:?}"));
             println!("{} context switches.", sched::switches());
+        }
+        "ps" => {
+            println!("PID  THREAD NAME             STATE");
+            sched::for_each_process(|pid, id, name, state| println!("{pid:<4} {id:<6} {name:<16} {state:?}"));
+            println!("`kill PID` stops one; `threads` lists the kernel threads too.");
         }
         "date" => match words.next() {
             None => match clock::now() {

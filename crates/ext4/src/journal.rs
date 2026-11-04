@@ -439,6 +439,7 @@ impl<D: Device> Journaled<D> {
 
     /// Makes the staged blocks durable as one transaction (see the module notes). Nothing staged: nothing happens.
     fn commit_stage(&mut self) -> Result<(), Error> {
+        self.dev.sync()?;
         let count = self.stage.count;
         if count == 0 {
             return Ok(());
@@ -565,6 +566,10 @@ impl<D: Device> Device for Journaled<D> {
         Ok(())
     }
 
+    fn sync(&mut self) -> Result<(), Error> {
+        self.dev.sync()
+    }
+
     fn write_data(&mut self, lba: u64, buffer: &[u8]) -> Result<(), Error> {
         if self.journal.is_some() && self.stage.count > 0 {
             let spb = self.spb();
@@ -572,7 +577,7 @@ impl<D: Device> Device for Journaled<D> {
                 self.drop_staged(block);
             }
         }
-        self.dev.write(lba, buffer)
+        self.dev.write_data(lba, buffer)
     }
 
     fn commit(&mut self) -> Result<(), Error> {

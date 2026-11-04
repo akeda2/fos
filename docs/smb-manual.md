@@ -33,7 +33,8 @@ run smbd root=ext1 share=data &2
 | `ip=A.B.C.D/N`, `gateway=` | Fixed address; otherwise DHCP. |
 | `nic=N` | NIC number from 1 (default: `nic use`). |
 | `ro` | Refuse every change. |
-| `log` | Print one line per connection and per request (command, status, detail, flags). Use it to find client problems. |
+| `log` | Print one line per connection and per request (command, status, detail, flags). Use it to find client problems. It slows a transfer a lot (a console line per request): to time one, use `stats`. |
+| `stats` | Print only totals after a transfer ends (half a second quiet): KB and ms spent in file reads, in file writes (journal commits included) and in sending, and how long the transfer was active. If the write time is most of the active time the disk is the limit; if it is small the network path is. `tools/bench_smb_write.py` runs the same in QEMU. |
 
 Which selector: on a disk that holds FOSFS, `diskN` always means the FOSFS volume. The ext volume is `extN` or `@LABEL`.
 On a disk with only ext4 (or FAT), `diskN` works.

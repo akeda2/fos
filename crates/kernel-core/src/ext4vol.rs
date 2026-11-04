@@ -54,6 +54,22 @@ impl Device for Partition {
         cache().wrote(lba, buffer);
         Ok(())
     }
+
+    /// File data goes to the drive without a cache flush each time (a flush costs milliseconds on a SATA SSD); `sync` flushes
+    /// once, before the journal commits the metadata that refers to it.
+    fn write_data(&mut self, lba: u64, buffer: &[u8]) -> Result<(), Error> {
+        if lba + (buffer.len() / 512) as u64 > self.sectors {
+            return Err(Error::Device);
+        }
+        crate::debug::pet();
+        block::write_deferred(self.disk, self.base + lba, buffer).map_err(|_| Error::Device)?;
+        cache().wrote(lba, buffer);
+        Ok(())
+    }
+
+    fn sync(&mut self) -> Result<(), Error> {
+        block::flush(self.disk).map_err(|_| Error::Device)
+    }
 }
 
 /// The one writer the shell uses at a time (about 40 KiB: too big for the stack).

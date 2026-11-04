@@ -148,8 +148,10 @@ it. Verified in QEMU against the host `serve` example (`make test-smbmount`,
 
 A 4 MB `smbclient get`: 7.6 MB/s at first; 23.7 after AHCI 128 KiB commands and a directory-lookup fix; about 55 MB/s
 once `Server::send_buffered` kept the flight going across messages (before, every 64 KiB message waited for all its
-acknowledgements, a round trip each); 70-87 MB/s with `FLIGHT` at 44 segments (the peer's 64 KiB window is the limit, there
-is no window scaling). Time went to waiting for acknowledgements, not to building, checksumming or sending frames: a wider
+acknowledgements, a round trip each); 70-87 MB/s with `FLIGHT` at 44 segments (the peer's 64 KiB window was the limit; `tape-net` now scales
+the windows it offers (RFC 7323) when a connection's buffer is over 64 KiB, smbd's buffer is 192 KiB, three requests, so a client keeps
+sending while a write is on the disk; a window much wider than the NIC's 128-frame receive ring would drop frames during a
+journal-commit stall. A put on rack averaged 23 MB/s with 40% of the time in file writes, which is what this addresses). Time went to waiting for acknowledgements, not to building, checksumming or sending frames: a wider
 checksum and spinning instead of `idle()` changed nothing, and the I350's TCP checksum offload (`nic_tx_offload`) was slower
 (235 against 176 ms for 8 MB; the context descriptor costs a ring slot per frame). The i350 and the e1000e perform the
 same once pipelined. Reads of the volume are no longer the limit (180 MB/s).
@@ -162,6 +164,10 @@ same once pipelined. Reads of the volume are no longer the limit (180 MB/s).
 - **Deferred commit (ABI 36 `vfs_sync`)**: `vfs_write` keeps the ext writer open between calls and the journal commits when
   its stage fills, on a read, or on `vfs_sync`; smbd calls `vfs_sync` after 20 ms without writes. Put: 5.7 -> about 28 MB/s.
   A crash before the commit loses the last metadata update (file size), never the consistency of the volume.
+- **Cache flushes (AHCI)**: every `Drive::write` ended with FLUSH CACHE, so each 64 KiB of file data cost one flush (about
+  1.2 ms per request on rack's M.2 SATA SSD, 12 of 14.5 s of a 680 MB put). File data now goes through `write_data` ->
+  `block::write_deferred` without the flush; `Device::sync` (`block::flush`) runs once at the start of every journal commit,
+  so data is on the drive before the metadata that refers to it. Metadata writes still flush each time.
 - **TCP**: the receive window follows the free room and an overflowing segment is answered, not dropped; a retransmission
   is one segment (it used to be the whole flight, which the buffer refused silently); a duplicate ACK no longer pushes the
   retransmit timer out and the third one resends the oldest segment (fast retransmit).
@@ -181,3 +187,14 @@ same once pipelined. Reads of the volume are no longer the limit (180 MB/s).
   request (command, status, detail, flags) to find such things. Writes through `mount.cifs` are not tried yet.
 - `4-bar-house.wav` on the NAS is access denied for the guest (`smbclient` gets NT_STATUS_ACCESS_DENIED too): a Samba
   ACL, not a fos fault. The shell now says "access denied" instead of "could not be read".
+
+## Write speed on mf (measured on rack, 676 MB put over gigabit)
+
+| Change | Active time | Rate |
+| --- | --- | --- |
+| 64 KiB TCP window | 29.3 s | ~190 Mbit/s |
+| 192 KiB window with scaling | 14.5 s | 375 Mbit/s |
+| file data written without a cache flush per request (one flush before each journal commit) | 38 s (the loop slept a tick in every gap) | 142 Mbit/s |
+| `smbd` polls for 2 ms after the last frame before it sleeps | 6.5 s | ~830 Mbit/s |
+
+On mf `idle` sleeps a whole timer tick, so a fast writer must not call it between frames. Disk writes were 1.6 s of the 6.5 s.

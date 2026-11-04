@@ -34,6 +34,15 @@ pub trait Platform: Sync {
     fn block_read(&self, disk: usize, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError>;
     /// Writes whole 512-byte sectors.
     fn block_write(&self, disk: usize, lba: u64, buffer: &[u8]) -> Result<(), BlockError>;
+    /// Like `block_write`, but the data may stay in the drive's cache until `block_flush` (file data that a later metadata
+    /// commit orders behind a flush). Defaults to a plain write.
+    fn block_write_deferred(&self, disk: usize, lba: u64, buffer: &[u8]) -> Result<(), BlockError> {
+        self.block_write(disk, lba, buffer)
+    }
+    /// Makes every write so far durable.
+    fn block_flush(&self, _disk: usize) -> Result<(), BlockError> {
+        Ok(())
+    }
     /// Tells an SSD that these (start, sectors) ranges hold nothing worth keeping (TRIM / deallocate). Contents read back
     /// afterwards are undefined. `Unsupported` when the disk cannot.
     fn block_discard(&self, _disk: usize, _ranges: &[(u64, u64)]) -> Result<(), BlockError> {
@@ -164,6 +173,15 @@ pub mod block {
 
     pub fn write(disk: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
         platform().ok_or(BlockError::NoSuchDisk)?.block_write(disk, lba, buffer)
+    }
+
+    /// A write that may stay in the drive's cache until `flush`.
+    pub fn write_deferred(disk: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
+        platform().ok_or(BlockError::NoSuchDisk)?.block_write_deferred(disk, lba, buffer)
+    }
+
+    pub fn flush(disk: usize) -> Result<(), Error> {
+        platform().ok_or(BlockError::NoSuchDisk)?.block_flush(disk)
     }
 
     /// TRIM: the ranges are free space. See [`Platform::block_discard`].

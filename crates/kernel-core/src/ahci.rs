@@ -252,9 +252,20 @@ impl Drive {
     /// Writes sectors, then flushes the drive's write cache so a completed write is on
     /// the platters.
     pub fn write(&self, lba: u64, buffer: &[u8]) -> Result<(), Error> {
+        self.write_deferred(lba, buffer)?;
+        self.flush()
+    }
+
+    /// Writes sectors without the cache flush: the data may sit in the drive's cache until `flush`. A flush costs
+    /// milliseconds on a SATA SSD, so a stream of file data is written this way and flushed once before its metadata commits.
+    pub fn write_deferred(&self, lba: u64, buffer: &[u8]) -> Result<(), Error> {
         let sectors = self.check(lba, buffer.len())?;
         unsafe { core::ptr::copy_nonoverlapping(buffer.as_ptr(), memory::phys_to_virt((self.frame + OFFSET_BOUNCE) as u64) as *mut u8, buffer.len()) };
-        self.command(if self.lba48 { ATA_WRITE_DMA_EXT } else { ATA_WRITE_DMA }, lba, sectors, true, buffer.len() as u32)?;
+        self.command(if self.lba48 { ATA_WRITE_DMA_EXT } else { ATA_WRITE_DMA }, lba, sectors, true, buffer.len() as u32)
+    }
+
+    /// Flushes the drive's write cache.
+    pub fn flush(&self) -> Result<(), Error> {
         self.command(if self.lba48 { ATA_FLUSH_CACHE_EXT } else { ATA_FLUSH_CACHE }, 0, 0, false, 0)
     }
 }
