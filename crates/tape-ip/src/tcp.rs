@@ -174,12 +174,18 @@ impl<const RX: usize> Socket<RX> {
 const HALF_OPEN_MICROS: u64 = 3_000_000;
 const IDLE_MICROS: u64 = 10_000_000;
 /// The most unacknowledged bytes `Server::send` keeps in flight (the peer's window may be larger).
-const FLIGHT: usize = 16 * SEND_CHUNK;
+const FLIGHT: usize = 44 * SEND_CHUNK;
+
+/// What `send_buffered` keeps per slot: a copy of the bytes sent and not yet acknowledged (the newest `stream_in_flight()`
+/// bytes before `tx_len`), so a send can return while its tail is still in flight and the caller reuses its buffer.
+const TX_KEEP: usize = 2 * FLIGHT;
 
 struct Slot<const RX: usize> {
     connection: TcpConnection<RX>,
     peer_mac: MacAddress,
     last: u64,
+    tx_keep: [u8; TX_KEEP],
+    tx_len: usize,
 }
 
 /// A TCP server for tapes: `N` connections at once on one port, each with an `RX`-byte receive buffer (also its window).
@@ -203,7 +209,7 @@ impl<const RX: usize, const N: usize> Server<RX, N> {
     pub const fn new() -> Self {
         const NO_ADDRESS: Ipv4Address = Ipv4Address([0; 4]);
         Server {
-            slots: [const { Slot { connection: TcpConnection::listen(NO_ADDRESS, 0, NO_ADDRESS, 0, 0, RETRANSMIT_MICROS), peer_mac: MacAddress([0; 6]), last: 0 } }; N],
+            slots: [const { Slot { connection: TcpConnection::listen(NO_ADDRESS, 0, NO_ADDRESS, 0, 0, RETRANSMIT_MICROS), peer_mac: MacAddress([0; 6]), last: 0, tx_keep: [0; TX_KEEP], tx_len: 0 } }; N],
             arp: ArpCache::new(),
             nic: 0,
             config: NetConfig { mac: MacAddress([0; 6]), ip: NO_ADDRESS, netmask: NO_ADDRESS, gateway: NO_ADDRESS },
@@ -255,6 +261,7 @@ impl<const RX: usize, const N: usize> Server<RX, N> {
         let (ip, port, sequence) = (self.config.ip, self.port, self.sequence);
         self.slots[slot].connection.reopen_listen(ip, port, sequence, RETRANSMIT_MICROS);
         self.slots[slot].last = tape_rt::micros();
+        self.slots[slot].tx_len = 0;
     }
 
     /// Handles the frames waiting (up to `budget` of them), resends what is due, takes back dead slots. Returns whether
@@ -331,6 +338,14 @@ impl<const RX: usize, const N: usize> Server<RX, N> {
                 if let Ok(Some(resend)) = self.slots[index].connection.retransmit(now as u32, &mut self.segment) {
                     self.transmit(api, index, resend);
                 }
+                // Data `send_buffered` returned from: nobody is waiting on it, so resending it is up to this pass.
+                let (kept, in_flight) = (self.slots[index].tx_len, self.slots[index].connection.stream_in_flight());
+                if in_flight > 0 && in_flight <= kept {
+                    let slot = &mut self.slots[index];
+                    if let Ok(Some(resend)) = slot.connection.stream_retransmit(&slot.tx_keep[kept - in_flight..kept], now as u32, &mut self.segment) {
+                        self.transmit(api, index, resend);
+                    }
+                }
             }
         }
     }
@@ -338,6 +353,7 @@ impl<const RX: usize, const N: usize> Server<RX, N> {
     /// Sends all of `data` and returns once the peer has acknowledged it (several segments in flight at a time).
     /// `timeout_micros` is how long the peer may go without acknowledging anything new.
     pub fn send(&mut self, api: &TapeApi, slot: usize, data: &[u8], timeout_micros: u64) -> Result<(), &'static str> {
+        self.slots[slot].tx_len = 0;
         let mut sent = 0;
         let mut progress = tape_rt::micros();
         while sent < data.len() || self.slots[slot].connection.stream_in_flight() > 0 {
@@ -378,9 +394,66 @@ impl<const RX: usize, const N: usize> Server<RX, N> {
         Ok(())
     }
 
+    /// Like `send`, but returns as soon as everything has been handed to the card, keeping a copy of what is still
+    /// unacknowledged: the next message goes out behind it without the flight draining in between (one round trip per
+    /// message otherwise, most of the time of a bulk transfer on a LAN). Retransmission of the tail happens in `poll`;
+    /// `close` waits for it. Waits only when `FLIGHT` bytes are out, or for acknowledgements to make room.
+    pub fn send_buffered(&mut self, api: &TapeApi, slot: usize, data: &[u8], timeout_micros: u64) -> Result<(), &'static str> {
+        let mut sent = 0;
+        let mut progress = tape_rt::micros();
+        while sent < data.len() {
+            if !self.is_open(slot) {
+                return Err("the connection was closed");
+            }
+            let in_flight = self.slots[slot].connection.stream_in_flight();
+            let window = self.slots[slot].connection.peer_window().min(FLIGHT).max(1);
+            if in_flight < window {
+                let chunk = (data.len() - sent).min(SEND_CHUNK).min(RX).min(window - in_flight);
+                let entry = &mut self.slots[slot];
+                // `tx_len` can be stale (older than what is in flight) after a plain `send`; with nothing in flight start over.
+                let mut kept = if in_flight == 0 || entry.tx_len < in_flight { 0 } else { entry.tx_len };
+                if kept < in_flight {
+                    return Err("the connection has data in flight that is not kept");
+                }
+                if kept + chunk > TX_KEEP {
+                    entry.tx_keep.copy_within(kept - in_flight..kept, 0);
+                    kept = in_flight;
+                }
+                entry.tx_keep[kept..kept + chunk].copy_from_slice(&data[sent..sent + chunk]);
+                entry.tx_len = kept + chunk;
+                let now = tape_rt::micros() as u32;
+                let length = entry.connection.stream_send(&data[sent..sent + chunk], now, &mut self.segment).map_err(|_| "the connection is not open")?;
+                self.transmit(api, slot, length);
+                sent += chunk;
+                progress = tape_rt::micros();
+                self.poll(api, 4);
+                continue;
+            }
+            if !self.poll(api, 8) {
+                tape_rt::idle();
+            }
+            let now = tape_rt::micros();
+            if self.slots[slot].connection.stream_in_flight() < in_flight {
+                progress = now;
+            }
+            if now > progress + timeout_micros {
+                return Err("the peer did not acknowledge");
+            }
+        }
+        self.slots[slot].last = tape_rt::micros();
+        Ok(())
+    }
+
     /// Says goodbye (FIN) and waits a moment for the acknowledgement; the slot is taken back once the peer has closed too
     /// (or by the idle timeout).
     pub fn close(&mut self, api: &TapeApi, slot: usize) {
+        // Whatever `send_buffered` left in flight goes first: a FIN in the way would stop its retransmission.
+        let drain_until = tape_rt::micros() + 2_000_000;
+        while self.is_open(slot) && self.slots[slot].connection.stream_in_flight() > 0 && tape_rt::micros() < drain_until {
+            if !self.poll(api, 8) {
+                tape_rt::idle();
+            }
+        }
         if let Ok(length) = self.slots[slot].connection.close(tape_rt::micros() as u32, &mut self.segment) {
             self.transmit(api, slot, length);
             let deadline = tape_rt::micros() + 500_000;

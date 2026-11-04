@@ -401,7 +401,7 @@ fn serve(api: &TapeApi, tcp: &mut Tcp<RX, SLOTS>, slot: usize, request: &mut [u8
         }
         let sent = session.handle(&request[4..length + 4], answer);
         let start = tape_rt::micros();
-        let result = if sent > 0 { tcp.send(api, slot, &answer[..sent], SEND_TIMEOUT) } else { Ok(()) };
+        let result = if sent > 0 { tcp.send_buffered(api, slot, &answer[..sent], SEND_TIMEOUT) } else { Ok(()) };
         SEND_US.fetch_add(tape_rt::micros() - start, Ordering::Relaxed);
         SEND_BYTES.fetch_add(sent as u64, Ordering::Relaxed);
         if result.is_err() {
