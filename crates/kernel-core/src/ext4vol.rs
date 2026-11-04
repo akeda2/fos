@@ -113,6 +113,18 @@ pub fn shared(disk: usize) -> Result<&'static mut Shared, Error> {
     }
 }
 
+/// The disk index of the ext volume labelled `label` (the kept one first, else every disk is looked at). Labels of FOSFS and
+/// FAT volumes are the callers' to try before this.
+pub fn disk_labelled(label: &[u8]) -> Option<usize> {
+    // SAFETY: reached only from the serialised file calls, like `shared`.
+    if let Some(shared) = unsafe { (*core::ptr::addr_of!(SHARED)).as_ref() } {
+        if shared.fs.label() == label {
+            return Some(shared.disk);
+        }
+    }
+    (0..block::count()).find(|&disk| mount(disk).is_ok_and(|fs| fs.label() == label))
+}
+
 /// The volume `WRITER` holds changes for that are not committed yet (`with_writer_deferred`): the disk index and partition.
 static mut OPEN: Option<(usize, Partition)> = None;
 

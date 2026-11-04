@@ -174,6 +174,10 @@ same once pipelined. Reads of the volume are no longer the limit (180 MB/s).
 
 - `smbmount //fraktal/media` (Samba on a NAS, guest) lists, reads and copies: `cp //media/sound-experiments/.../Caravan.flac
   ext1/media/` put 9 MB on rack's ext4 volume; `smbd root=ext1` shared it and the Linux desktop (gvfs, `gio mount -a
-  smb://HOST/share`) read it back with the identical SHA-256 (0.24 s). `mount.cifs` itself is not installed there.
-- One file on the NAS (`4-bar-house.wav`) cannot be read through smbmount (the shell says "could not be read"), others
-  of any size can; not yet looked into.
+  smb://HOST/share`) read it back with the identical SHA-256 (0.24 s).
+- Linux `mount.cifs` (`vers=3.0`, guest, fstab entry with `user,noauto`) failed with "get root inode failed": the client
+  sends its QUERY_INFO as the last message of a compound without the one-byte buffer (104 bytes), and the server demanded
+  105. Fixed (`query_info` needs 40); the mount lists, reads (SHA-256 identical) and unmounts. `smbd log` now prints every
+  request (command, status, detail, flags) to find such things. Writes through `mount.cifs` are not tried yet.
+- `4-bar-house.wav` on the NAS is access denied for the guest (`smbclient` gets NT_STATUS_ACCESS_DENIED too): a Samba
+  ACL, not a fos fault. The shell now says "access denied" instead of "could not be read".
