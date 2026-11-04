@@ -2039,7 +2039,11 @@ impl<const RX: usize> TcpConnection<RX> {
                 if segment.sequence == self.receive_next
                     && segment.data.len() > RX.saturating_sub(self.receive_len)
                 {
-                    return Err(Error::BufferTooSmall);
+                    // No room: take nothing, and say what is free (a window probe gets its answer, the sender's
+                    // retransmission timer is not left to find out).
+                    self.accept_ack(segment.acknowledgment);
+                    self.peer_window = u32::from(segment.window);
+                    return Ok(Some(self.emit(self.send_next, self.receive_next, TCP_ACK, &[], output)?));
                 }
                 self.accept_ack(segment.acknowledgment);
                 self.peer_window = u32::from(segment.window);
@@ -2207,6 +2211,19 @@ impl<const RX: usize> TcpConnection<RX> {
         count
     }
 
+    /// The receive window offered: the free room in the receive buffer (at most 65535, there is no window scaling). Less
+    /// than a segment's worth is offered as 0 (silly-window avoidance), so the peer waits for `window_update`.
+    pub fn advertised_window(&self) -> u16 {
+        let free = RX.saturating_sub(self.receive_len);
+        if free < RX.min(1460) { 0 } else { free.min(u16::MAX as usize) as u16 }
+    }
+
+    /// An empty ACK carrying the current window: sent after the application took data from a buffer whose window had
+    /// closed, since the peer sends nothing more until it hears it has reopened.
+    pub fn window_update(&self, output: &mut [u8]) -> Result<usize> {
+        self.emit(self.send_next, self.receive_next, TCP_ACK, &[], output)
+    }
+
     fn emit(
         &self,
         sequence: u32,
@@ -2223,7 +2240,7 @@ impl<const RX: usize> TcpConnection<RX> {
             sequence,
             acknowledgment,
             flags,
-            window: RX.min(u16::MAX as usize) as u16,
+            window: self.advertised_window(),
             checksum: 0,
             urgent: 0,
             data,
@@ -2769,6 +2786,34 @@ mod tests {
         client.on_segment(&fin_ack, 121, &mut out).unwrap();
         assert_eq!(client.state(), TcpState::Closed);
         let _ = syn_len;
+    }
+
+    #[test]
+    fn tcp_window_follows_the_free_room_and_overflow_is_answered_not_dropped() {
+        let mut client = TcpConnection::<2000>::active(IP_A, 1000, IP_B, 2000, 10, 5);
+        let mut out = [0u8; 2100];
+        client.start_connect(100, &mut out).unwrap();
+        let (bytes, length) = segment(2000, 1000, 50, 11, TCP_SYN | TCP_ACK, &[]);
+        client.on_segment(&TcpSegment::parse(&bytes[..length], IP_B, IP_A, true).unwrap(), 101, &mut out).unwrap();
+        assert_eq!(client.advertised_window(), 2000);
+
+        let first = [7u8; 1400];
+        let mut bytes = [0u8; 1600];
+        let length = TcpSegment { source_port: 2000, destination_port: 1000, sequence: 51, acknowledgment: 11, flags: TCP_ACK, window: 512, checksum: 0, urgent: 0, data: &first }.encode(&mut bytes, IP_B, IP_A).unwrap();
+        let reply = client.on_segment(&TcpSegment::parse(&bytes[..length], IP_B, IP_A, true).unwrap(), 102, &mut out).unwrap().unwrap();
+        // 600 bytes free is less than a segment: the peer is told to wait.
+        assert_eq!(TcpSegment::parse(&out[..reply], IP_A, IP_B, true).unwrap().window, 0);
+
+        let length = TcpSegment { source_port: 2000, destination_port: 1000, sequence: 1451, acknowledgment: 11, flags: TCP_ACK, window: 512, checksum: 0, urgent: 0, data: &first }.encode(&mut bytes, IP_B, IP_A).unwrap();
+        let reply = client.on_segment(&TcpSegment::parse(&bytes[..length], IP_B, IP_A, true).unwrap(), 103, &mut out).unwrap().unwrap();
+        let answer = TcpSegment::parse(&out[..reply], IP_A, IP_B, true).unwrap();
+        assert_eq!((answer.acknowledgment, answer.window), (1451, 0));
+        assert_eq!(client.received().len(), 1400);
+
+        let mut sink = [0u8; 1400];
+        assert_eq!(client.take_received(&mut sink), 1400);
+        let update = client.window_update(&mut out).unwrap();
+        assert_eq!(TcpSegment::parse(&out[..update], IP_A, IP_B, true).unwrap().window, 2000);
     }
 
     #[test]
