@@ -874,6 +874,45 @@ pub fn vfs_set_owner(path: &str, uid: u32, gid: u32, mode: u32) -> Result<(), is
     vfs_done((table.vfs_set_owner)(path.as_ptr(), path.len(), uid, gid, mode))
 }
 
+fn remote_table() -> Option<&'static fosfor_abi::tape::TapeApi> {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, remote_reply) + core::mem::size_of::<usize>();
+    (table.version >= 35 && table.size as usize >= end).then_some(table)
+}
+
+/// Serves the volume `//NAME` from this tape (ABI 35, `remote_register`); `Err` is an `FS_*` code (`FS_READ_ONLY` on a kernel
+/// older than 35). Calls that name `//NAME/path` then arrive through `remote_poll`.
+pub fn remote_register(name: &str) -> Result<(), isize> {
+    let table = remote_table().ok_or(fosfor_abi::tape::FS_READ_ONLY)?;
+    vfs_done((table.remote_register)(name.as_ptr(), name.len()))
+}
+
+/// Stops serving `//NAME` (ABI 35); a caller still waiting gets an error.
+pub fn remote_unregister(name: &str) {
+    if let Some(table) = remote_table() {
+        (table.remote_unregister)(name.as_ptr(), name.len());
+    }
+}
+
+/// The next queued request for `//NAME` (ABI 35, `remote_poll`): `Ok(true)` and `request` filled, the paths and data in
+/// `buffer` (path, second path, data); `Ok(false)` when none is queued; `Err` when the name is not registered.
+pub fn remote_poll(name: &str, request: &mut fosfor_abi::tape::RemoteRequest, buffer: &mut [u8]) -> Result<bool, isize> {
+    let table = remote_table().ok_or(fosfor_abi::tape::FS_READ_ONLY)?;
+    match (table.remote_poll)(name.as_ptr(), name.len(), request, buffer.as_mut_ptr(), buffer.len()) {
+        1 => Ok(true),
+        0 => Ok(false),
+        code => Err(code),
+    }
+}
+
+/// Answers request `id` (ABI 35, `remote_reply`); see the ABI text for what `entry` and `data` mean per operation. `false`
+/// when the caller gave up waiting.
+pub fn remote_reply(id: u64, code: isize, entry: Option<&fosfor_abi::tape::VfsEntry>, data: &[u8]) -> bool {
+    let Some(table) = remote_table() else { return false };
+    let entry = entry.map_or(core::ptr::null(), |entry| entry as *const _);
+    (table.remote_reply)(id, code, entry, data.as_ptr(), data.len()) == 0
+}
+
 /// Fills `buffer` with unpredictable bytes (ABI 33, `random`). `Some(true)` when the CPU's hardware generator contributed,
 /// `Some(false)` when only timing did (the Pi 4), `None` on a kernel older than version 33: the caller then has nothing
 /// better than `micros()`.

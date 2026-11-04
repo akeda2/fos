@@ -219,6 +219,10 @@ fn make_api(info: &BootInfo, arguments: &str) -> TapeApi {
         vfs_remove: kernel_core::tape_vfs::api_vfs_remove,
         vfs_rename: kernel_core::tape_vfs::api_vfs_rename,
         vfs_set_owner: kernel_core::tape_vfs::api_vfs_set_owner,
+        remote_register: kernel_core::remote::api_remote_register,
+        remote_unregister: kernel_core::remote::api_remote_unregister,
+        remote_poll: kernel_core::remote::api_remote_poll,
+        remote_reply: kernel_core::remote::api_remote_reply,
         random: kernel_core::random::api_random,
     }
 }

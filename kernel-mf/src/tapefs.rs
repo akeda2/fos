@@ -12,7 +12,7 @@
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
-use fosfor_abi::tape::{FS_ERROR, FS_STREAMS, FS_TOO_BIG, FileInfo, VfsEntry, VfsMake, VfsStat};
+use fosfor_abi::tape::{FS_ERROR, FS_STREAMS, FS_TOO_BIG, FileInfo, RemoteRequest, VfsEntry, VfsMake, VfsStat};
 use kernel_core::{tape_fs, tape_vfs};
 
 use crate::{process, sched};
@@ -178,6 +178,40 @@ pub fn vfs_set_owner(name_at: u64, name_len: u64, uid: u64, gid: u64, mode: u64)
     let Some(reference) = name(name_at, name_len) else { return FS_ERROR };
     let _guard = lock();
     tape_vfs::set_owner(&reference, uid as u32, gid as u32, mode as u32)
+}
+
+/// `remote_register(name, name_len)` (ABI 35): the provider side takes no file lock, the waiting caller holds it.
+pub fn remote_register(name_at: u64, name_len: u64) -> isize {
+    name(name_at, name_len).map_or(FS_ERROR, |name| kernel_core::remote::register(&name))
+}
+
+pub fn remote_unregister(name_at: u64, name_len: u64) -> isize {
+    name(name_at, name_len).map_or(FS_ERROR, |name| kernel_core::remote::unregister(&name))
+}
+
+/// `remote_poll(name, name_len, request, buffer, capacity)`: the request and its paths and data are copied out to the tape.
+pub fn remote_poll(name_at: u64, name_len: u64, request: u64, buffer: u64, capacity: u64) -> isize {
+    let Some(provider) = name(name_at, name_len) else { return FS_ERROR };
+    let mut piece = alloc::vec![0u8; capacity.min(CHUNK as u64 + 4096) as usize];
+    let mut header = RemoteRequest::default();
+    let found = kernel_core::remote::poll(&provider, &mut header, &mut piece);
+    if found != 1 {
+        return found;
+    }
+    let used = (header.path_len + header.path2_len + header.data_len) as usize;
+    if !copy_struct(request, &header) || !process::copy_to_user(buffer, &piece[..used]) { FS_ERROR } else { 1 }
+}
+
+/// `remote_reply(id, code, entry, data, len)`.
+pub fn remote_reply(id: u64, code: u64, entry: u64, data: u64, length: u64) -> isize {
+    let entry = if entry == 0 {
+        None
+    } else {
+        let Some(bytes) = copy_from_user(entry, core::mem::size_of::<VfsEntry>() as u64) else { return FS_ERROR };
+        Some(unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const VfsEntry) })
+    };
+    let Some(bytes) = copy_from_user(data, length.min(CHUNK as u64)) else { return FS_ERROR };
+    kernel_core::remote::reply(id, code as isize, entry.as_ref(), &bytes)
 }
 
 fn copy_struct<T>(to: u64, value: &T) -> bool {

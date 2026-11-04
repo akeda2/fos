@@ -9,6 +9,7 @@
 use fosfor_abi::tape::*;
 
 use crate::ext4vol::{self, Cursor, Partition, Shared};
+use crate::remote;
 use crate::tape_fs;
 use crate::volumes as storage;
 
@@ -60,6 +61,9 @@ fn plain(directory: bool, size: u64) -> VfsStat {
 
 /// `vfs_stat`: 0 and the `VfsStat`, or an `FS_*` code.
 pub fn stat(reference: &[u8], out: &mut VfsStat) -> isize {
+    if remote::is_remote(reference) {
+        return remote::stat(reference, out);
+    }
     if let Some((shared, path)) = ext(reference) {
         return match shared.fs.resolve(path) {
             Ok(Some(inode)) => {
@@ -86,6 +90,9 @@ pub fn stat(reference: &[u8], out: &mut VfsStat) -> isize {
 
 /// `vfs_read_dir`: 1 and the entry, 0 past the end, or an `FS_*` code.
 pub fn read_dir(reference: &[u8], index: usize, out: &mut VfsEntry) -> isize {
+    if remote::is_remote(reference) {
+        return remote::read_dir(reference, index, out);
+    }
     if let Some((shared, path)) = ext(reference) {
         return ext_read_dir(shared, path, index, out);
     }
@@ -146,6 +153,9 @@ fn ext_read_dir(shared: &mut Shared, path: &[u8], index: usize, out: &mut VfsEnt
 
 /// `vfs_read`: up to `buffer.len()` bytes from `offset`; the count (0 at or past the end) or an `FS_*` code.
 pub fn read(reference: &[u8], offset: u64, buffer: &mut [u8]) -> isize {
+    if remote::is_remote(reference) {
+        return remote::read(reference, offset, buffer);
+    }
     if let Some((shared, path)) = ext(reference) {
         return match shared.fs.resolve(path) {
             Ok(Some(inode)) if inode.is_file() => match shared.fs.read(&inode, offset, buffer) {
@@ -227,6 +237,9 @@ fn file_number(writer: &mut Writer, path: &[u8]) -> Result<ext4::Inode, ext4::Er
 
 /// `vfs_create`: a file or folder `make` describes at `reference`; 0 or an `FS_*` code.
 pub fn create(reference: &[u8], make: &VfsMake) -> isize {
+    if remote::is_remote(reference) {
+        return remote::create(reference, make);
+    }
     let Some((disk, partition, path)) = ext_target(reference) else { return FS_READ_ONLY };
     let (folder, name) = split_leaf(path);
     let done = ext4vol::with_writer(disk, partition, |writer| {
@@ -244,6 +257,9 @@ pub fn create(reference: &[u8], make: &VfsMake) -> isize {
 
 /// `vfs_write`: the bytes written into the existing file at `reference`, or an `FS_*` code.
 pub fn write(reference: &[u8], offset: u64, data: &[u8]) -> isize {
+    if remote::is_remote(reference) {
+        return remote::write(reference, offset, data);
+    }
     let Some((disk, partition, path)) = ext_target(reference) else { return FS_READ_ONLY };
     let done = ext4vol::with_writer(disk, partition, |writer| {
         let inode = file_number(writer, path)?;
@@ -254,6 +270,9 @@ pub fn write(reference: &[u8], offset: u64, data: &[u8]) -> isize {
 
 /// `vfs_truncate`.
 pub fn truncate(reference: &[u8], size: u64) -> isize {
+    if remote::is_remote(reference) {
+        return remote::truncate(reference, size);
+    }
     let Some((disk, partition, path)) = ext_target(reference) else { return FS_READ_ONLY };
     let done = ext4vol::with_writer(disk, partition, |writer| {
         let inode = file_number(writer, path)?;
@@ -264,6 +283,9 @@ pub fn truncate(reference: &[u8], size: u64) -> isize {
 
 /// `vfs_remove`.
 pub fn remove(reference: &[u8]) -> isize {
+    if remote::is_remote(reference) {
+        return remote::remove(reference);
+    }
     let Some((disk, partition, path)) = ext_target(reference) else { return FS_READ_ONLY };
     let (folder, name) = split_leaf(path);
     let done = ext4vol::with_writer(disk, partition, |writer| {
@@ -275,6 +297,9 @@ pub fn remove(reference: &[u8]) -> isize {
 
 /// `vfs_rename`: both references must name the same ext volume.
 pub fn rename(from: &[u8], to: &[u8]) -> isize {
+    if remote::is_remote(from) {
+        return remote::rename(from, to);
+    }
     let (Some((disk, partition, from_path)), Some((to_disk, _, to_path))) = (ext_target(from), ext_target(to)) else { return FS_READ_ONLY };
     if disk != to_disk {
         return FS_ERROR;
@@ -290,6 +315,9 @@ pub fn rename(from: &[u8], to: &[u8]) -> isize {
 
 /// `vfs_set_owner`.
 pub fn set_owner(reference: &[u8], uid: u32, gid: u32, mode: u32) -> isize {
+    if remote::is_remote(reference) {
+        return remote::set_owner(reference, uid, gid, mode);
+    }
     let Some((disk, partition, path)) = ext_target(reference) else { return FS_READ_ONLY };
     let done = ext4vol::with_writer(disk, partition, |writer| {
         let inode = file_number(writer, path)?;

@@ -26,7 +26,7 @@ fn error(code: isize) -> FsError {
 
 /// A bare name means the boot volume (`tape_fs` would also look on other disks for a tape's configuration file).
 fn pin(reference: &str) -> Vec<u8> {
-    let local = !reference.contains('/') || (tape_fs::split_selector(reference.as_bytes()).0.is_empty() && mounts::lookup(reference.as_bytes()).is_none());
+    let local = !reference.starts_with("//") && (!reference.contains('/') || (tape_fs::split_selector(reference.as_bytes()).0.is_empty() && mounts::lookup(reference.as_bytes()).is_none()));
     match storage::boot_disk().filter(|_| local) {
         Some(boot) => alloc::format!("disk{}/{reference}", boot + 1).into_bytes(),
         None => reference.as_bytes().to_vec(),

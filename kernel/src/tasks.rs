@@ -253,6 +253,15 @@ fn yield_now() {
     switch_to(next_runnable(unsafe { CURRENT }));
 }
 
+/// A file call waiting for a provider service: lets the services run (nothing to do without any).
+pub fn wait_for_service() {
+    if count() != 0 {
+        yield_now();
+    } else {
+        timer::busy_wait_ms(1);
+    }
+}
+
 /// Hands the CPU on if the running context has used its slice. Cheap enough for `micros`.
 pub fn maybe_yield() {
     if count() != 0 && timer::micros().wrapping_sub(unsafe { SLICE_START }) >= SLICE_US {

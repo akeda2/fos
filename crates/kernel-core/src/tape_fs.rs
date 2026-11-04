@@ -194,6 +194,9 @@ fn fat_error(error: fat::Error) -> isize {
 }
 
 pub fn read(reference: &[u8], buffer: &mut [u8]) -> isize {
+    if crate::remote::is_remote(reference) {
+        return crate::remote::read_whole(reference, buffer);
+    }
     if let Some((mut fs, name)) = resolve_fat(reference) {
         return match fs.find(name) {
             Ok(Some(file)) if file.size as usize > buffer.len() => FS_TOO_BIG,
@@ -219,6 +222,9 @@ pub fn read(reference: &[u8], buffer: &mut [u8]) -> isize {
 
 /// `fs_read_at`: up to `buffer.len()` bytes of a file from byte `offset`; the count (0 at or past the end) or an `FS_*` code.
 pub fn read_at(reference: &[u8], offset: u64, buffer: &mut [u8]) -> isize {
+    if crate::remote::is_remote(reference) {
+        return crate::remote::read(reference, offset, buffer);
+    }
     if let Some((mut fs, name)) = resolve_fat(reference) {
         return match fs.find(name) {
             Ok(Some(file)) => match fs.read(&file, offset, buffer) {
@@ -257,6 +263,9 @@ fn make_mount_folders(reference: &[u8], volume: &Volume, name: &[u8]) -> Result<
 }
 
 pub fn write(reference: &[u8], data: &[u8]) -> isize {
+    if crate::remote::is_remote(reference) {
+        return crate::remote::write_whole(reference, data);
+    }
     // Replace the file the way the shell's `write` does on FAT: reserve its whole length, write it, then finish (the
     // directory entry appears with the final size).
     if let Some((mut fs, file)) = resolve_fat(reference) {
@@ -301,6 +310,9 @@ pub fn replace_target<'a>(volume: &Volume, name: &'a [u8]) -> &'a [u8] {
 }
 
 pub fn remove(reference: &[u8]) -> isize {
+    if crate::remote::is_remote(reference) {
+        return crate::remote::remove(reference);
+    }
     if let Some((mut fs, file)) = resolve_fat(reference) {
         let outcome = match fs.remove(file) {
             Ok(false) if fs.kind() == fat::Kind::ExFat => fs.remove_dir(file),
@@ -334,6 +346,16 @@ pub fn remove(reference: &[u8]) -> isize {
 /// done, `Ok(false)` not possible here (another volume, FAT32, FOSFS v3, a name that exists: the caller copies instead),
 /// `Err` a code for a source that is missing.
 pub fn rename(from: &[u8], to: &[u8]) -> Result<bool, isize> {
+    if crate::remote::is_remote(from) {
+        if !crate::remote::is_remote(to) {
+            return Ok(false);
+        }
+        let code = crate::remote::rename(from, to);
+        return if code < 0 { Err(code) } else { Ok(true) };
+    }
+    if crate::remote::is_remote(to) {
+        return Ok(false);
+    }
     match (resolve_fat(from), resolve_fat(to)) {
         (None, None) => {}
         (Some((mut source, old)), Some((mut target, new))) => return rename_exfat(&mut source, old, &mut target, new),
@@ -372,6 +394,9 @@ fn rename_exfat(source: &mut crate::fatvol::Fs, old: &[u8], target: &mut crate::
 
 /// Makes a folder (FOSFS v4 and exFAT volumes only).
 pub fn mkdir(reference: &[u8]) -> isize {
+    if crate::remote::is_remote(reference) {
+        return crate::remote::make_folder(reference);
+    }
     if let Some((mut fs, name)) = resolve_fat(reference) {
         crate::fatvol::stamp(&mut fs);
         return match fs.mkdir(name) {
@@ -405,6 +430,9 @@ pub fn resolve_volume(reference: &[u8]) -> Option<Volume> {
 /// was written; the result is the kind of volume (`FOSFS`, `FAT32`, `exFAT`) or an `FS_*` code. A disk with only a
 /// FAT32/exFAT volume lists its root directory.
 pub fn each_entry(reference: &[u8], each: &mut dyn FnMut(&[u8], u64, bool, Option<fat::Time>)) -> Result<&'static str, isize> {
+    if crate::remote::is_remote(reference) {
+        return crate::remote::each_entry(reference, each);
+    }
     let (selector, path) = split_selector(reference);
     let mut folder = path;
     let mut fat = if reference == b"esp" { crate::fatvol::mount_esp() } else { disk_number(selector).and_then(fat_disk) };
@@ -459,6 +487,9 @@ pub fn list(reference: &[u8], index: usize, out: &mut FileInfo) -> isize {
 
 /// The length of a file, or an `FS_*` code.
 pub fn length(reference: &[u8]) -> isize {
+    if crate::remote::is_remote(reference) {
+        return crate::remote::length(reference);
+    }
     if let Some((mut fs, name)) = resolve_fat(reference) {
         return match fs.entry(name) {
             Ok(Some(entry)) if !entry.is_directory => entry.size as isize,

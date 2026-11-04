@@ -473,6 +473,11 @@ impl<T: Transport, const N: usize> Client<T, N> {
         self.create(path, 0x0012_0196, if replace { 5 } else { 2 }, 0x40)
     }
 
+    /// Opens an existing file for reading and writing (data written beyond its end grows it).
+    pub fn open_write(&mut self, path: &str) -> Result<Handle, Error> {
+        self.create(path, 0x0012_0196, 1, 0x40)
+    }
+
     /// Makes a folder; one that exists is an error.
     pub fn make_dir(&mut self, path: &str) -> Result<(), Error> {
         let handle = self.create(path, 0x0012_0080, 2, 0x01)?;
