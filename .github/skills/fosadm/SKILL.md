@@ -55,6 +55,7 @@ python3 tools/fosadm.py --serial PORT [--fast 921600] put serial FILE [NAME]
   use `--add-missing` to install new ones (it installs every missing tape, so check `status -v` first;
   for a single tape use `put HOST build/fosfor/tapes/NAME NAME`).
 - Per-machine files (`fosplay.cfg`, `start`, `settings`, `hostname`, `debug`) are never pushed.
+- A server-kernel (mf) host, recognised by `version` ("server kernel (mf)"), gets `fosfor-kernel-mf` (`make image-mf` or `make kernel-mf` first); status shows `x86_64-mf`. Tapes are the x86 ones.
 - aarch64 hosts (Pi 4) get `build/fosfor-aarch64/tapes` and their own kernel automatically.
 - After a tape ABI change redeploy every tape.
 
