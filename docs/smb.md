@@ -104,6 +104,11 @@ Done (ABI 32, `crates/kernel-core/src/tape_vfs.rs`, `tape_rt::vfs_stat/vfs_read_
    against the host `serve` example). Not checked: Windows, macOS, `mount.cifs` writes, and a power cut during a write on real
    disks; delete-on-close of a file that others hold open is not tracked (opens are not shared-mode checked).
 
+Performance: `smbd ... log` prints, after a transfer, how long file reads and sending took (`smbd: read 32768 KB in 385 ms, sent
+32811 KB in 2572 ms`). In QEMU (user networking, e1000) a 32 MB `smbclient get` runs at about 10 MB/s and the time is all in
+sending (reads from ext4 run at about 85 MB/s); a bigger TCP flight made no difference, so QEMU's per-frame cost is the limit
+and only real hardware can say more.
+
 Open points for later: the ext4 writer does not keep hash-tree indexes (`DEFERRED.md`), which matters for big shared folders;
 a tape runs one request at a time on the boot CPU (fine for a first server, `httpd` is the same); the tape ABI's file calls
 read into the caller's buffer, so big reads are chunked at the 1 MiB credit limit.

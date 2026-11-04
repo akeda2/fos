@@ -5,6 +5,7 @@
 #![no_std]
 #![no_main]
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use smb::ntlm::{md5, nt_hash};
 use smb::server::{Account, Fail, Identity, MAX_IO, Server, Share, Stat};
 use tape_ip::net::{self, NetConfig};
@@ -190,7 +191,11 @@ impl Share for Files {
     fn read(&mut self, path: &str, offset: u64, out: &mut [u8]) -> Result<usize, ()> {
         let mut buffer = [0u8; 512];
         let reference = self.join(path, &mut buffer).ok_or(())?;
-        tape_rt::vfs_read(reference, offset, out).map_err(|_| ())
+        let start = tape_rt::micros();
+        let result = tape_rt::vfs_read(reference, offset, out).map_err(|_| ());
+        READ_US.fetch_add(tape_rt::micros() - start, Ordering::Relaxed);
+        READ_BYTES.fetch_add(*result.as_ref().unwrap_or(&0) as u64, Ordering::Relaxed);
+        result
     }
 
     fn writable(&self) -> bool {
@@ -237,6 +242,13 @@ impl Share for Files {
         tape_rt::vfs_rename(from, to).map_err(fail)
     }
 }
+
+/// Where the time goes (shown with `log` when a connection ends): microseconds and bytes spent in file reads and in sending answers.
+static READ_US: AtomicU64 = AtomicU64::new(0);
+static READ_BYTES: AtomicU64 = AtomicU64::new(0);
+static SEND_US: AtomicU64 = AtomicU64::new(0);
+static SEND_BYTES: AtomicU64 = AtomicU64::new(0);
+static CONNECTED_US: AtomicU64 = AtomicU64::new(0);
 
 static mut TCP: Tcp<RX, SLOTS> = Tcp::new();
 static mut REQUEST: [u8; RX] = [0; RX];
@@ -300,6 +312,8 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let (mut pool, mut state) = (0u64, [0u8; 16]);
     let (pool, state) = (&mut pool, &mut state);
     tcp.start(nic, &network, port);
+    CONNECTED_US.store(tape_rt::micros(), Ordering::Relaxed);
+    let mut last_busy = 0u64;
     println!("smbd: NIC {} at {}.{}.{}.{}:{port}, sharing {} as //HOST/{share}.", nic + 1, network.ip.0[0], network.ip.0[1], network.ip.0[2], network.ip.0[3], if root.is_empty() { "the boot volume" } else { root });
     loop {
         if (api.should_abort)() != 0 {
@@ -340,10 +354,25 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             }
             serve(api, tcp, slot, request, answer, sessions[slot].as_mut().unwrap());
         }
+        if log && SEND_BYTES.load(Ordering::Relaxed) > 0 {
+            if busy {
+                last_busy = tape_rt::micros();
+            } else if tape_rt::micros() - last_busy > 500_000 {
+                report();
+            }
+        }
         if !busy {
             tape_rt::idle();
         }
     }
+}
+
+/// Prints and resets the counters: reading, sending, and everything else since the last report.
+fn report() {
+    let (read_us, read_bytes) = (READ_US.swap(0, Ordering::Relaxed), READ_BYTES.swap(0, Ordering::Relaxed));
+    let (send_us, send_bytes) = (SEND_US.swap(0, Ordering::Relaxed), SEND_BYTES.swap(0, Ordering::Relaxed));
+    let total = tape_rt::micros() - CONNECTED_US.swap(tape_rt::micros(), Ordering::Relaxed);
+    println!("smbd: read {} KB in {} ms, sent {} KB in {} ms, {} ms since the last report.", read_bytes / 1024, read_us / 1000, send_bytes / 1024, send_us / 1000, total / 1000);
 }
 
 /// Answers every complete message waiting on `slot` (a 4-byte frame header, then the SMB message).
@@ -371,7 +400,11 @@ fn serve(api: &TapeApi, tcp: &mut Tcp<RX, SLOTS>, slot: usize, request: &mut [u8
             taken += got;
         }
         let sent = session.handle(&request[4..length + 4], answer);
-        if sent > 0 && tcp.send(api, slot, &answer[..sent], SEND_TIMEOUT).is_err() {
+        let start = tape_rt::micros();
+        let result = if sent > 0 { tcp.send(api, slot, &answer[..sent], SEND_TIMEOUT) } else { Ok(()) };
+        SEND_US.fetch_add(tape_rt::micros() - start, Ordering::Relaxed);
+        SEND_BYTES.fetch_add(sent as u64, Ordering::Relaxed);
+        if result.is_err() {
             return;
         }
     }
