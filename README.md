@@ -47,6 +47,7 @@ their own.
 | Tape | What it does |
 | --- | --- |
 | `hello`, `calc`, `memtest` | The smallest example; an RPN calculator; a RAM tester and soak test. |
+| `abibad` | Server-kernel test: calls every tape-table function with hostile pointers (`abibad server`, `make test-mf-abibad`). |
 | `ed` | A line editor with cursor keys; saves to FOSFS, FAT32 or exFAT. |
 | `ebb` | A full-screen text editor (`tape run ebb NAME`): selection, undo, clipboard, mouse, colours via the console SGR support; `crates/edit-core` is its engine. |
 | `httpd` | A tiny web server like `python3 -m http.server`: GET and HEAD, `root=` on the boot volume or another one (`root=@LABEL/site`, a stick), optional `listing=on`, `index.html` for folders, `/dir` redirects to `/dir/`, config files (`settings`, `start`, `synckey`, ...) never served. Quiet; `log` prints a line per request. Run it as a service: `run httpd root=www &2` (it owns NIC 2). `crates/tape-http`, `make test-httpd`. |

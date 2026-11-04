@@ -56,7 +56,7 @@ def crash_or_hang(smp, command, expect):
         if not machine.wait_for("Watchdog armed: reset after 5 s", 1):
             return "the watchdog was not armed at the milestone"
         mark = len(machine.log)
-        machine.send(command + "\n")
+        machine.send(command + " now\n")
         if not machine.wait_for(expect, 60, mark) or not machine.wait_for("resetting in 1 s", 20, mark):
             return f"`{command}` did not report and reset:\n" + machine.since(mark)[-1500:]
         if not machine.wait_for("fos> ", 150, mark + 1):
@@ -79,7 +79,7 @@ def dead_hang():
         if not machine.wait_for("Hardware watchdog: TCO timer running", 1):
             return "the hardware watchdog was not started:\n" + "\n".join(l for l in machine.since(0).splitlines() if "atchdog" in l)
         mark = len(machine.log)
-        machine.send("debug deadhang\n")
+        machine.send("debug deadhang now\n")
         if not machine.wait_for("entering the service loop", 120, mark):
             return "the hardware watchdog never reset the machine:\n" + machine.since(mark)[-1500:]
         if not machine.wait_for("fos> ", 150, mark + 1):

@@ -182,19 +182,19 @@ fn is_data(slot: u64) -> bool {
 
 /// Where a process's code stub for table slot `slot` lives.
 fn stub_address(slot: u64) -> u64 {
-    let offset = unsafe { &tape_shim_stubs as *const u8 as usize - &tape_shim_start as *const u8 as usize };
+    let offset = unsafe { &tape_shim_stubs as *const u8 as usize - &tape_shim_start as *const u8 as usize }; // kernel-memory
     SHIM_BASE + offset as u64 + 16 * slot
 }
 
 /// Maps the shim, the table and the args page into `root`. `Some(())` on success; the frames belong to the address space.
 pub fn map_support(root: u64, args: &[u8]) -> Option<()> {
-    let shim = unsafe { core::slice::from_raw_parts(&tape_shim_start as *const u8, &tape_shim_end as *const u8 as usize - &tape_shim_start as *const u8 as usize) };
+    let shim = unsafe { core::slice::from_raw_parts(&tape_shim_start as *const u8, &tape_shim_end as *const u8 as usize - &tape_shim_start as *const u8 as usize) }; // kernel-memory
     let code = pmm::allocate(1, None)?;
-    unsafe { core::ptr::copy_nonoverlapping(shim.as_ptr(), vm::direct(code) as *mut u8, shim.len()) };
+    unsafe { core::ptr::copy_nonoverlapping(shim.as_ptr(), vm::direct(code) as *mut u8, shim.len()) }; // kernel-memory
     vm::map_user_page(root, SHIM_BASE, code, false, true).then_some(())?;
 
     let table = pmm::allocate(1, None)?;
-    let words = vm::direct(table) as *mut u64;
+    let words = vm::direct(table) as *mut u64; // kernel-memory
     unsafe {
         words.write(u64::from(TAPE_API_VERSION) | (size_of::<TapeApi>() as u64) << 32);
         for index in 1..SLOTS as u64 {
@@ -213,16 +213,16 @@ pub fn map_support(root: u64, args: &[u8]) -> Option<()> {
 
     let map = pmm::allocate(1, None)?;
     unsafe {
-        let descriptor = vm::direct(map) as *mut u8;
-        core::ptr::write_bytes(descriptor, 0, 4096);
-        (descriptor as *mut u32).write(7);
-        (descriptor.add(24) as *mut u64).write(pmm::stats().free);
+        let descriptor = vm::direct(map) as *mut u8; // kernel-memory
+        core::ptr::write_bytes(descriptor, 0, 4096); // kernel-memory
+        (descriptor as *mut u32).write(7); // kernel-memory
+        (descriptor.add(24) as *mut u64).write(pmm::stats().free); // kernel-memory
     }
     vm::map_user_page(root, MAP_BASE, map, false, false).then_some(())?;
 
     let page = pmm::allocate(1, None)?;
     let length = args.len().min(ARGS_MAX);
-    unsafe { core::ptr::copy_nonoverlapping(args.as_ptr(), vm::direct(page) as *mut u8, length) };
+    unsafe { core::ptr::copy_nonoverlapping(args.as_ptr(), vm::direct(page) as *mut u8, length) }; // kernel-memory
     vm::map_user_page(root, ARGS_BASE, page, false, false).then_some(())
 }
 
@@ -241,7 +241,8 @@ fn alloc_pages(bytes: u64) -> u64 {
         0 => HEAP_BASE,
         next => next,
     };
-    if count == 0 || start + count * 4096 > HEAP_LIMIT {
+    // `count * 4096` wraps for a size near u64::MAX, which would pass the limit and then allocate until memory runs out.
+    if count == 0 || count.checked_mul(4096).and_then(|bytes| bytes.checked_add(start)).is_none_or(|end| end > HEAP_LIMIT) {
         return 0;
     }
     for page in 0..count {
@@ -379,8 +380,13 @@ pub fn call(frame: &mut Frame) {
         REMOTE_POLL => tapefs::remote_poll(a, b, c, d, e) as u64,
         REMOTE_REPLY => tapefs::remote_reply(a, b, c, d, e) as u64,
         RANDOM => {
-            let out = unsafe { core::slice::from_raw_parts_mut(a as *mut u8, b as usize) };
-            u64::from(kernel_core::random::fill(out))
+            // Filled in kernel memory and then copied: a direct write into user pages faults under SMAP.
+            if b > 4096 {
+                return frame.rax = 0;
+            }
+            let mut bytes = alloc::vec![0u8; b as usize];
+            let strong = kernel_core::random::fill(&mut bytes);
+            u64::from(process::copy_to_user(a, &bytes) && strong)
         }
         FS_READ_AT => tapefs::read_range(a, b, c, d, e) as u64,
         FS_WRITE => tapefs::write(a, b, c, d) as u64,
@@ -441,5 +447,5 @@ fn blit(x: u32, y: u32, width: u32, height: u32, pixels: u64, stride: u64) -> u6
     if pixels % 4 != 0 || !vm::user_range_ok(sched::current_root(), pixels, bytes, false) {
         return 0;
     }
-    u64::from(process::user_access(|| unsafe { fb::gfx_blit(x, y, width, height, pixels as *const u32, stride) }))
+    u64::from(process::user_access(|| unsafe { fb::gfx_blit(x, y, width, height, pixels as *const u32, stride) })) // kernel-memory
 }
