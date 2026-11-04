@@ -43,12 +43,16 @@ Needs tape ABI 32.
 "#
 );
 
-const SLOTS: usize = 4;
+/// Connections at once: `MANY` in memory from the kernel (a server kernel has plenty), `FEW` in the tape's own image when the
+/// kernel has no room for that. When all are taken a new connection evicts the quietest idle one.
+const MANY: usize = 128;
+const FEW: usize = 8;
 const OPENS: usize = 16;
 /// Room for the largest message: a WRITE of MAX_IO bytes plus the headers.
 const RX: usize = MAX_IO + 4096;
 const ROOT_MAX: usize = 200;
 const SEND_TIMEOUT: u64 = 5_000_000;
+const IDLE_US: u64 = 600_000_000;
 
 const USERS: usize = 8;
 
@@ -270,10 +274,10 @@ static SEND_US: AtomicU64 = AtomicU64::new(0);
 static SEND_BYTES: AtomicU64 = AtomicU64::new(0);
 static CONNECTED_US: AtomicU64 = AtomicU64::new(0);
 
-static mut TCP: Tcp<RX, SLOTS> = Tcp::new();
+static mut TCP: Tcp<RX, FEW> = Tcp::new();
 static mut REQUEST: [u8; RX] = [0; RX];
 static mut ANSWER: [u8; MAX_IO + 256] = [0; MAX_IO + 256];
-static mut SESSIONS: [Option<Server<Files, OPENS>>; SLOTS] = [const { None }; SLOTS];
+static mut SESSIONS: [Option<Server<Files, OPENS>>; FEW] = [const { None }; FEW];
 
 #[unsafe(no_mangle)]
 pub extern "C" fn tape_main(api: &'static TapeApi) {
@@ -326,12 +330,57 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         },
     };
     #[allow(static_mut_refs)]
-    let (tcp, request, answer, sessions) = unsafe {
-        (&mut *core::ptr::addr_of_mut!(TCP), &mut *core::ptr::addr_of_mut!(REQUEST), &mut *core::ptr::addr_of_mut!(ANSWER), &mut *core::ptr::addr_of_mut!(SESSIONS))
-    };
+    let (request, answer) = unsafe { (&mut *core::ptr::addr_of_mut!(REQUEST), &mut *core::ptr::addr_of_mut!(ANSWER)) };
+    let setup = Setup { nic, network, port, root, share, read_only, log };
+    if let (Some(tcp), Some(sessions)) = (alloc_in_kernel::<Tcp<RX, MANY>>(api), many_sessions(api)) {
+        println!("smbd: room for {MANY} connections.");
+        run(api, &setup, tcp, request, answer, sessions);
+    } else {
+        #[allow(static_mut_refs)]
+        let (tcp, sessions) = unsafe { (&mut *core::ptr::addr_of_mut!(TCP), &mut *core::ptr::addr_of_mut!(SESSIONS)) };
+        println!("smbd: room for {FEW} connections (no memory for more).");
+        run(api, &setup, tcp, request, answer, sessions);
+    }
+}
+
+struct Setup<'a> {
+    nic: usize,
+    network: NetConfig,
+    port: u16,
+    root: &'a str,
+    share: &'a str,
+    read_only: bool,
+    log: bool,
+}
+
+/// A zeroed `T` from the kernel; all-zero is a valid `Tcp` (every slot is made a listener by `start`).
+fn alloc_in_kernel<T>(api: &TapeApi) -> Option<&'static mut T> {
+    tape_rt::alloc_zeroed::<T>(api)
+}
+
+/// Room for `MANY` sessions from the kernel, each set to `None`.
+fn many_sessions(api: &TapeApi) -> Option<&'static mut [Option<Server<Files, OPENS>>; MANY]> {
+    let bytes = MANY * core::mem::size_of::<Option<Server<Files, OPENS>>>();
+    let address = (api.alloc)(bytes);
+    if address == 0 {
+        return None;
+    }
+    let first = address as *mut Option<Server<Files, OPENS>>;
+    unsafe {
+        for index in 0..MANY {
+            first.add(index).write(None);
+        }
+        Some(&mut *(address as *mut [Option<Server<Files, OPENS>>; MANY]))
+    }
+}
+
+fn run<const N: usize>(api: &TapeApi, setup: &Setup, tcp: &mut Tcp<RX, N>, request: &mut [u8; RX], answer: &mut [u8], sessions: &mut [Option<Server<Files, OPENS>>; N]) {
+    let Setup { nic, network, port, root, share, read_only, log } = *setup;
     let (mut pool, mut state) = (0u64, [0u8; 16]);
     let (pool, state) = (&mut pool, &mut state);
     tcp.start(nic, &network, port);
+    // A mount idles between requests (the Linux client's echo is 60 s apart); do not drop it behind its back.
+    tcp.set_idle(IDLE_US);
     CONNECTED_US.store(tape_rt::micros(), Ordering::Relaxed);
     let mut last_busy = 0u64;
     println!("smbd: NIC {} at {}.{}.{}.{}:{port}, sharing {} as //HOST/{share}.", nic + 1, network.ip.0[0], network.ip.0[1], network.ip.0[2], network.ip.0[3], if root.is_empty() { "the boot volume" } else { root });
@@ -340,7 +389,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             break;
         }
         let busy = tcp.poll(api, 16);
-        for slot in 0..SLOTS {
+        for slot in 0..N {
             if !tcp.is_open(slot) {
                 sessions[slot] = None;
                 continue;
@@ -424,7 +473,7 @@ fn report(dropped: u32) {
 }
 
 /// Answers every complete message waiting on `slot` (a 4-byte frame header, then the SMB message).
-fn serve(api: &TapeApi, tcp: &mut Tcp<RX, SLOTS>, slot: usize, request: &mut [u8; RX], answer: &mut [u8], session: &mut Server<Files, OPENS>) {
+fn serve<const N: usize>(api: &TapeApi, tcp: &mut Tcp<RX, N>, slot: usize, request: &mut [u8; RX], answer: &mut [u8], session: &mut Server<Files, OPENS>) {
     loop {
         let waiting = tcp.received(slot);
         if waiting.len() < 4 {

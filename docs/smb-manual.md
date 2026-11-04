@@ -117,8 +117,10 @@ shows the CIFS error and `smbd log` shows the last request the server answered.
 
 - Reads of 4-8 MB files on rack (SATA SSD, e1000e/i350): 65-87 MB/s; puts about 28 MB/s with deferred commit. The
   limit is the peer's 64 KiB window (no window scaling) and 64 KiB per read/write message.
-- Up to 4 clients at once (4 slots), 16 open files. A client that hangs up frees its slot at once; a vanished one after the
-  10 s idle timeout.
+- Up to 128 clients at once (8 when the kernel has no memory for more; `smbd` prints which), 16 open files each. A client that hangs up frees its slot at once; a silent one is
+  kept 10 minutes (a mount idles between requests; Linux sends an echo every 60 s), and a connection beyond the last slot evicts the
+  quietest. A segment for a connection the server forgot gets an RST, so the client reconnects at once instead of
+  retransmitting for minutes ("CIFS: VFS: ... has not responded in 180 seconds").
 - Not implemented: change notify, locks and oplocks, named streams, extended attributes, symbolic-link following (links
   are listed, not followed), DFS, a `IPC$` share list (name the share explicitly).
 - A tape ABI change needs `make tapes` and a redeploy of every tape.
