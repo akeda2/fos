@@ -85,12 +85,17 @@ pub fn split_selector(reference: &[u8]) -> (&[u8], &[u8]) {
         Some(slash) => (&reference[..slash], Some(&reference[slash + 1..])),
         None => (reference, None),
     };
-    let is_selector = first == b"esp" || first.strip_prefix(b"@").is_some_and(|label| !label.is_empty()) || disk_number(first).is_some();
+    let is_selector = first == b"esp" || first.strip_prefix(b"@").is_some_and(|label| !label.is_empty()) || disk_number(first).is_some() || ext_number(first).is_some();
     match (is_selector, rest) {
         (true, Some(rest)) => (first, rest),
         (true, None) => (first, &[]),
         (false, _) => (&[], reference),
     }
+}
+
+/// `extN`: the ext volume on disk N even when the disk also holds FOSFS or FAT (`diskN` finds ext only on a disk with neither).
+pub(crate) fn ext_number(selector: &[u8]) -> Option<usize> {
+    selector.strip_prefix(b"ext").and_then(|digits| core::str::from_utf8(digits).ok()).and_then(|digits| digits.parse::<usize>().ok())
 }
 
 pub(crate) fn disk_number(selector: &[u8]) -> Option<usize> {

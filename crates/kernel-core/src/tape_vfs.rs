@@ -24,6 +24,9 @@ fn ext4_error(error: ext4::Error) -> isize {
 /// The ext volume a reference names and the path on it, or `None` when it names something else.
 fn ext(reference: &[u8]) -> Option<(&'static mut Shared, &[u8])> {
     let (selector, path) = tape_fs::split_selector(reference);
+    if let Some(number) = tape_fs::ext_number(selector).filter(|&number| number > 0) {
+        return ext4vol::shared(number - 1).ok().map(|shared| (shared, path));
+    }
     let number = tape_fs::disk_number(selector).filter(|&number| number > 0)?;
     // A disk that already is the kept ext volume skips the FOSFS and FAT probes (a few reads each).
     let known = ext4vol::shared_disk() == Some(number - 1);

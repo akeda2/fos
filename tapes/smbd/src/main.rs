@@ -22,7 +22,7 @@ Windows and macOS can browse, copy from it and, on ext volumes, write to it. It 
 a service: run smbd @SMBD.CFG &2 (the service owns NIC 2; tape run smbd takes
 the foreground and Escape stops it). Settings are key=value words on the
 command line or in the file (one per line, # for comments).
-root=   the folder shared: disk2 (a whole ext4 disk), disk2/music, @LABEL/site,
+root=   the folder shared: disk2 (a whole ext4 disk), ext1 (the ext4 partition of a disk that also has FOSFS), disk2/music, @LABEL/site,
         a FOSFS or FAT folder, or a //NAME mount (smbmount): FOS as a
         gateway. Default: the boot volume's root.
 share=  the share name clients use, //HOST/NAME (default: share).
