@@ -31,6 +31,7 @@ mod tapesync;
 mod power;
 mod shell;
 mod shellhost;
+mod script;
 mod sysshell;
 mod top;
 mod log;
