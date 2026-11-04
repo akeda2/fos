@@ -71,26 +71,31 @@ fn feed_foreground(byte: u8) -> bool {
     }
     true
 }
-static mut LINE: [u8; 128] = [0; 128];
-static mut LENGTH: usize = 0;
-/// Bytes of a UTF-8 character still to come (a `term net` or serial client sends å as two bytes).
-static mut PENDING: usize = 0;
-/// Where the character being assembled starts in `LINE`.
-static mut CHAR_START: usize = 0;
-
 pub fn prompt() {
     print!("{PROMPT}");
 }
 
-/// Forgets a half-typed line (a new terminal session starts clean).
-pub fn reset() {
-    unsafe {
-        LENGTH = 0;
-        PENDING = 0;
-    }
+/// Commands `run` handles itself, outside the shared tables, for Tab completion.
+const BUILTINS: &[&str] = &[
+    "version", "cpus", "mem", "pci", "disks", "nic", "tapesync", "gpio", "top", "threads", "date", "uptime", "slots", "audio", "usb", "tape", "run", "kill",
+    "echo", "debug", "start", "keymap", "kup", "recv", "dmesg", "clear", "sleep", "io", "memmap", "bootinfo", "cpuinfo", "shrink", "sector", "mount", "umount",
+    "format", "label", "fsck", "grow", "install", "bootcode", "reboot", "ext4", "sha256",
+];
+
+/// Installs the line editor's Tab completion (the editor itself, with history, is `kernel_core::lineedit`).
+pub fn init() {
+    kernel_core::lineedit::set_completer(|line, add| {
+        let mut host = crate::shellhost::MfHost;
+        fosfor_shell::complete::complete(&mut host, &[fosfor_shell::files::COMMANDS], BUILTINS, line, add);
+    });
 }
 
-/// One input byte: printable characters are echoed, Backspace edits, Enter runs the line.
+/// Forgets a half-typed line (a new terminal session starts clean; the history stays).
+pub fn reset() {
+    kernel_core::lineedit::reset();
+}
+
+/// One input byte: the line editor handles it (cursor keys, history, Tab); Enter runs the line.
 pub fn feed(byte: u8) {
     if crate::top::key(byte) {
         return;
@@ -98,72 +103,15 @@ pub fn feed(byte: u8) {
     if feed_foreground(byte) {
         return;
     }
-    unsafe {
-        let line = &mut *core::ptr::addr_of_mut!(LINE);
-        match byte {
-            b'\r' | b'\n' => {
-                println!();
-                let length = LENGTH;
-                LENGTH = 0;
-                if let Ok(text) = core::str::from_utf8(&line[..length]) {
-                    run(text.trim());
-                }
-                if KEYS.lock().pid == 0 && !crate::top::active() {
-                    prompt();
-                }
-            }
-            0x08 | 0x7f => {
-                PENDING = 0;
-                if LENGTH > 0 {
-                    // A multi-byte character (å) goes as a whole: drop its continuation bytes too.
-                    while LENGTH > 1 && line[LENGTH - 1] & 0xc0 == 0x80 {
-                        LENGTH -= 1;
-                    }
-                    LENGTH -= 1;
-                    print!("\x08 \x08");
-                }
-            }
-            0x80..=0xbf if PENDING > 0 => {
-                if LENGTH < line.len() {
-                    line[LENGTH] = byte;
-                    LENGTH += 1;
-                }
-                PENDING -= 1;
-                if PENDING == 0 {
-                    echo_char(&line[CHAR_START..LENGTH]);
-                }
-            }
-            0xc2..=0xf4 if LENGTH + 4 <= line.len() => {
-                PENDING = match byte {
-                    0xc2..=0xdf => 1,
-                    0xe0..=0xef => 2,
-                    _ => 3,
-                };
-                CHAR_START = LENGTH;
-                line[LENGTH] = byte;
-                LENGTH += 1;
-            }
-            // å ä ö Å Ä Ö (and the euro sign) from a local Nordic keyboard arrive as private codes.
-            _ if fosfor_abi::keymap::utf8_sequence(byte).is_some() && LENGTH + 4 <= line.len() => {
-                let sequence = fosfor_abi::keymap::utf8_sequence(byte).unwrap_or(&[]);
-                line[LENGTH..LENGTH + sequence.len()].copy_from_slice(sequence);
-                echo_char(sequence);
-                LENGTH += sequence.len();
-            }
-            0x20..=0x7e if LENGTH < line.len() => {
-                PENDING = 0;
-                line[LENGTH] = byte;
-                LENGTH += 1;
-                print!("{}", byte as char);
-            }
-            _ => {}
+    let mut line = [0u8; kernel_core::lineedit::LINE_MAX];
+    if let Some(length) = kernel_core::lineedit::feed(byte, &mut line) {
+        // A copy: running a command may reset the editor or start a session that feeds it again.
+        if let Ok(text) = core::str::from_utf8(&line[..length]) {
+            run(text.trim());
         }
-    }
-}
-
-fn echo_char(bytes: &[u8]) {
-    if let Ok(text) = core::str::from_utf8(bytes) {
-        print!("{text}");
+        if KEYS.lock().pid == 0 && !crate::top::active() {
+            prompt();
+        }
     }
 }
 

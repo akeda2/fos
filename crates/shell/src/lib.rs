@@ -5,6 +5,7 @@
 
 use core::fmt;
 
+pub mod complete;
 pub mod files;
 pub mod glob;
 
@@ -114,6 +115,8 @@ pub trait Host {
     }
     /// Calls `each` (handing it the host back, to print with) for every entry of the volume and returns its kind (`"FOSFS"`, `"FAT32"`, `"exFAT"`).
     fn list(&mut self, volume: &str, each: &mut dyn FnMut(&mut dyn Host, Entry)) -> Result<&'static str, FsError>;
+    /// Calls `each` with the name of every volume that can be listed (`disk1`, `ext1`...), for Tab completion.
+    fn volumes(&mut self, _each: &mut dyn FnMut(&str)) {}
     /// Runs `run` with a scratch buffer of `size` bytes; false if there is no memory for it.
     fn with_buffer(&mut self, size: usize, run: &mut dyn FnMut(&mut dyn Host, &mut [u8])) -> bool;
     /// Whether a file (or a tape) of that name can be run from: the boot volume first, then other volumes.

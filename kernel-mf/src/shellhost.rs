@@ -3,6 +3,7 @@
 //! references, volumes and error codes a tape sees, under the one disk lock (`tapefs::lock`). Same shape as the embedded
 //! kernel's `shellhost.rs`; every call takes the lock itself, so a command that copies holds it only per transfer.
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -119,6 +120,25 @@ impl Host for MfHost {
             each(self, Entry { name, length: *length, directory: *directory, modified: *modified });
         }
         Ok(kind)
+    }
+
+    // Probed by listing: a disk number that is not there fails at once.
+    fn volumes(&mut self, each: &mut dyn FnMut(&str)) {
+        let mut found: Vec<String> = Vec::new();
+        {
+            let _disk = tapefs::lock();
+            for kind in ["disk", "ext"] {
+                for number in 1..=8 {
+                    let name = alloc::format!("{kind}{number}");
+                    if tape_fs::each_entry(name.as_bytes(), &mut |_, _, _, _| {}).is_ok() {
+                        found.push(name);
+                    }
+                }
+            }
+        }
+        for name in &found {
+            each(name);
+        }
     }
 
     fn with_buffer(&mut self, size: usize, run: &mut dyn FnMut(&mut dyn Host, &mut [u8])) -> bool {

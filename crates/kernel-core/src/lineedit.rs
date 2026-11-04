@@ -1,7 +1,8 @@
 //! The shell's line editor: the keys a person expects at a prompt, for the local keyboard and for a `term net` client
 //! alike. Insert and delete anywhere in the line, Left/Right/Home/End, Ctrl-A/E/K/U/W/L/C, and a history of the
-//! last sixteen commands on Up/Down (the half-typed line is kept while browsing, and comes back past the newest
-//! entry). Tab completion is not done.
+//! last thirty-two commands on Up/Down (the half-typed line is kept while browsing, and comes back past the newest
+//! entry). Tab completes the word at the cursor through a hook the port installs (`set_completer`): one match is
+//! filled in, several are filled in as far as they agree, and a second Tab lists them.
 //!
 //! Input arrives a byte at a time. A `term net` client (and a serial terminal) sends arrow keys as ANSI sequences
 //! (`ESC [ A` and so on), which a small state machine here assembles; the local keyboard decoders deliver the same
@@ -15,9 +16,17 @@
 use fosfor_abi::keymap::{utf8_sequence, KEY_DELETE, KEY_DOWN, KEY_END, KEY_HOME, KEY_LEFT, KEY_RIGHT, KEY_UP};
 
 /// The longest command line.
-pub const LINE_MAX: usize = 120;
-const HISTORY: usize = 16;
+pub const LINE_MAX: usize = 240;
+const HISTORY: usize = 32;
 const PROMPT: &str = "fos> ";
+
+/// Offers every possible completion of the last word of the text so far (UTF-8, up to the cursor) by calling `add` with the
+/// whole word each time (a folder ends in `/`).
+pub type Completer = fn(line: &str, add: &mut dyn FnMut(&str));
+
+/// How many candidates one Tab considers, and how many bytes of names they may take together.
+const CANDIDATES: usize = 96;
+const CANDIDATE_BYTES: usize = 3072;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Escape {
@@ -33,6 +42,9 @@ struct Editor {
     length: usize,
     cursor: usize,
     last_was_cr: bool,
+    /// The last key was a Tab that completed nothing more: a second one lists the candidates.
+    tab_armed: bool,
+    completer: Option<Completer>,
     escape: Escape,
     parameter: u16,
     /// A UTF-8 lead byte (0xc2/0xc3) waiting for its second byte.
@@ -53,6 +65,8 @@ static mut EDITOR: Editor = Editor {
     length: 0,
     cursor: 0,
     last_was_cr: false,
+    tab_armed: false,
+    completer: None,
     escape: Escape::None,
     parameter: 0,
     lead: 0,
@@ -66,6 +80,11 @@ static mut EDITOR: Editor = Editor {
 
 fn editor() -> &'static mut Editor {
     unsafe { &mut *(&raw mut EDITOR) }
+}
+
+/// Installs the Tab completion hook.
+pub fn set_completer(completer: Completer) {
+    editor().completer = Some(completer);
 }
 
 /// A new session starts with an empty line (the history stays).
@@ -250,6 +269,77 @@ impl Editor {
         self.count += 1;
     }
 
+    /// Tab: completes the word before the cursor.
+    fn complete(&mut self, armed: bool) {
+        let Some(completer) = self.completer else { return };
+        // The line is Latin-1, one byte per character; the hook wants UTF-8.
+        let mut text = [0u8; LINE_MAX * 2];
+        let mut used = 0;
+        for &byte in &self.line[..self.cursor] {
+            used += char::from(byte).encode_utf8(&mut text[used..]).len();
+        }
+        let Ok(text) = core::str::from_utf8(&text[..used]) else { return };
+        let word = &text[text.rfind(' ').map_or(0, |at| at + 1)..];
+        let mut store = [0u8; CANDIDATE_BYTES];
+        let mut spans = [(0usize, 0usize); CANDIDATES];
+        let (mut bytes, mut count) = (0, 0);
+        completer(text, &mut |name| {
+            let fits = count < CANDIDATES && bytes + name.len() <= CANDIDATE_BYTES;
+            if !fits || !name.starts_with(word) || spans[..count].iter().any(|&(at, length)| &store[at..at + length] == name.as_bytes()) {
+                return;
+            }
+            store[bytes..bytes + name.len()].copy_from_slice(name.as_bytes());
+            spans[count] = (bytes, name.len());
+            bytes += name.len();
+            count += 1;
+        });
+        if count == 0 {
+            return;
+        }
+        let names = &mut spans[..count];
+        names.sort_unstable_by(|a, b| store[a.0..a.0 + a.1].cmp(&store[b.0..b.0 + b.1]));
+        // As much of the first candidate as every other one shares.
+        let first = &store[names[0].0..names[0].0 + names[0].1];
+        let mut common = first.len();
+        for &(at, length) in names.iter() {
+            common = common.min(first.iter().zip(&store[at..at + length]).take_while(|(a, b)| a == b).count());
+        }
+        let Ok(common) = core::str::from_utf8(&first[..common]).or_else(|error| core::str::from_utf8(&first[..error.valid_up_to()])) else { return };
+        let extra = &common[word.len()..];
+        if !extra.is_empty() || count == 1 {
+            for character in extra.chars() {
+                match u8::try_from(u32::from(character)) {
+                    Ok(byte) => self.insert(byte),
+                    Err(_) => return,
+                }
+            }
+            if count == 1 && !common.ends_with('/') {
+                self.insert(b' ');
+            }
+        } else if !armed {
+            self.tab_armed = true;
+        } else {
+            crate::println!();
+            let mut column = 0;
+            for &(at, length) in names.iter() {
+                let name = core::str::from_utf8(&store[at..at + length]).unwrap_or("?");
+                // Only the last path component is new information (a folder keeps its slash).
+                let shown = match name.trim_end_matches('/').rfind('/') {
+                    Some(slash) => &name[slash + 1..],
+                    None => name,
+                };
+                if column > 0 && column + shown.chars().count() + 2 > 78 {
+                    crate::println!();
+                    column = 0;
+                }
+                crate::print(format_args!("{shown}  "));
+                column += shown.chars().count() + 2;
+            }
+            crate::println!();
+            self.redraw();
+        }
+    }
+
     fn csi(&mut self, last: u8) {
         match last {
             b'A' => self.older(),
@@ -309,7 +399,9 @@ pub fn feed(byte: u8, out: &mut [u8; LINE_MAX]) -> Option<usize> {
         return None;
     }
     editor.last_was_cr = false;
+    let armed = core::mem::take(&mut editor.tab_armed);
     match byte {
+        0x09 => editor.complete(armed),
         0x1b => editor.escape = Escape::Esc,
         b'\r' | b'\n' => {
             editor.last_was_cr = byte == b'\r';

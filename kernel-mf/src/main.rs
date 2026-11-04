@@ -371,6 +371,7 @@ fn panic(info: &PanicInfo) -> ! {
 /// The server's housekeeping: NICs, serial input, the reset timer and the slot streak. Polls once per pass and gives way.
 extern "C" fn service_thread(_: usize) {
     // The `start` file runs here, as at the end of the embedded kernel's boot; the prompt follows it.
+    shell::init();
     config::run_start(shell::run);
     shell::prompt();
     loop {
