@@ -645,6 +645,13 @@ impl<D: Device> Fs<D> {
         if le16(root, 4) != 12 || root[20..22] != *b".." || info_length != 8 || levels > 3 {
             return None;
         }
+        // `.` and `..` live in the root block, outside every leaf the hash can lead to.
+        if name == b"." {
+            return Some(Ok(Some(le32(root, 0))));
+        }
+        if name == b".." {
+            return Some(Ok(Some(le32(root, 12))));
+        }
         let hash = dirhash::hash(version, self.hash_seed, name)?;
         let blocks = folder.size / self.block_size as u64;
         let mut offset = 32;
