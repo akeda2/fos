@@ -13,6 +13,7 @@ Prints the bytes read; a count of 0 means the offset is at or past the end.
        tape run fscheck vfs PATH              (ABI 32: stat PATH, list it if a folder, else read its first 40 bytes)
        tape run fscheck vfswrite DIR          (ABI 34: create, write, truncate, rename, remove under DIR on an ext volume)
        tape run fscheck remove NAME           (create NAME, delete it with fs_remove, check it is gone)
+       tape run fscheck info                  (hostname, peer count, disk 1, clock, console size)
 "#);
 
 #[unsafe(no_mangle)]
@@ -41,6 +42,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             None => println!("Usage: fscheck vfswrite DIR"),
         };
     }
+    if arguments == "info" {
+        return info(api);
+    }
     if arguments.starts_with("remove ") {
         words.next();
         return match words.next() {
@@ -60,6 +64,20 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         }
         Err(code) => println!("fscheck: error {code}"),
     }
+}
+
+/// The machine-information calls: each prints what it answered, so a kernel that stubs one shows up as an empty value.
+fn info(api: &'static TapeApi) {
+    let mut name = [0u8; 20];
+    let length = (api.hostname)(0, name.as_mut_ptr(), name.len()).min(name.len());
+    println!("fscheck: hostname [{}]", core::str::from_utf8(&name[..length]).unwrap_or("?"));
+    println!("fscheck: peers {}", (api.peer_info)(0, core::ptr::null_mut()));
+    let mut disk = tape_rt::DiskInfo::default();
+    let kind = (api.disk_info)(1, &mut disk);
+    println!("fscheck: disk1 kind {kind} sectors {}", disk.sectors);
+    println!("fscheck: clock {}", if tape_rt::wall_clock().is_some() { "set" } else { "not set" });
+    let (columns, rows) = tape_rt::console_size();
+    println!("fscheck: console {columns}x{rows}");
 }
 
 /// Creates NAME, deletes it with fs_remove, and checks it is gone and that a second delete fails.

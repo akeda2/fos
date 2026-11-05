@@ -58,6 +58,14 @@ fn remember(index: usize, mac: [u8; 6], name: &[u8]) {
     }
 }
 
+/// `peer_info`: how many peers are known; with `number` in 1..=count, fills `out` with that one.
+pub fn peer_info(number: usize, out: &mut fosfor_abi::tape::PeerInfo) -> usize {
+    if let Some((mac, name, length, index)) = peer_at(number) {
+        *out = fosfor_abi::tape::PeerInfo { mac, nic: index as u8, name_length: length as u8, name };
+    }
+    unsafe { PEER_COUNT }
+}
+
 fn peer_at(number: usize) -> Option<([u8; 6], [u8; 20], usize, usize)> {
     (number >= 1 && number <= unsafe { PEER_COUNT }).then(|| unsafe { (*core::ptr::addr_of!(PEERS))[number - 1] })
 }
