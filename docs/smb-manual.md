@@ -28,7 +28,7 @@ run smbd root=ext1 share=data &2
 | Setting | Meaning |
 | --- | --- |
 | `root=` | What is shared. `disk2` (whole ext4 disk), `ext1` (the ext4 partition of a disk that also has FOSFS), `disk2/music`, `@LABEL/site`, a FOSFS or FAT folder, or `//NAME` (a mounted remote share). Default: the boot volume's root. |
-| `share=` | Share name clients use: `//HOST/NAME` (default `share`). |
+| `share=` | Share name clients use: `//HOST/NAME` (default `share`). Repeat it for more shares (up to 8): `share=NAME` uses `root=`, `share=NAME=ROOT[,ro]` shares `ROOT` (`,ro` makes just that share read-only), e.g. `smbd share=data=ext1 share=music=@rackdata/media,ro | `share=` | Share name clients use: `//HOST/NAME` (default `share`). |2`. A client must still name the share (no `IPC$` list). |
 | `port=` | TCP port (445). |
 | `ip=A.B.C.D/N`, `gateway=` | Fixed address; otherwise DHCP. |
 | `nic=N` | NIC number from 1 (default: `nic use`). |
@@ -124,7 +124,7 @@ shows the CIFS error and `smbd log` shows the last request the server answered.
   quietest. A segment for a connection the server forgot gets an RST, so the client reconnects at once instead of
   retransmitting for minutes ("CIFS: VFS: ... has not responded in 180 seconds").
 - Not implemented: change notify, locks and oplocks, named streams, extended attributes, symbolic-link following (links
-  are listed, not followed), DFS, a `IPC$` share list (name the share explicitly).
+  are listed, not followed), DFS, `IPC$` unless `ipc` is given (then only `NetShareEnumAll`; other levels and calls fail).
 - A tape ABI change needs `make tapes` and a redeploy of every tape.
 
 ## 8. Troubleshooting
@@ -135,7 +135,7 @@ shows the CIFS error and `smbd log` shows the last request the server answered.
 | Write refused, "access denied" | Mode bits (guest into a root-owned folder), `ro`, or a FOSFS/FAT root. |
 | `mount.cifs`: "get root inode failed" | A server bug of the kind `smbd log` shows; fixed in `query_info` (2026-11-04). |
 | `diskN` finds FOSFS, not ext | By design on a disk with FOSFS: use `extN` or `@LABEL`. |
-| Share list empty in a GUI | Name the share: `//HOST/data`. |
+| Share list empty in a GUI | Start `smbd` with `ipc`, or name the share: `//HOST/data`. |
 | Remote read/write times out | Provider (`smbmount`) killed or its NIC unplugged; restart it. |
 
 ## 9. Tests

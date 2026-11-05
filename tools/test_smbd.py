@@ -24,10 +24,10 @@ HOST_PORT = port(28445)
 MANY = 300
 
 
-def smbclient(command, protocol="SMB3_00", attempts=4, login=("-N",)):
+def smbclient(command, protocol="SMB3_00", attempts=4, login=("-N",), share="data"):
     last = None
     for attempt in range(attempts):
-        last = subprocess.run(["smbclient", "//127.0.0.1/data", "-p", str(HOST_PORT), *login, "-m", protocol, "-c", command],
+        last = subprocess.run(["smbclient", f"//127.0.0.1/{share}", "-p", str(HOST_PORT), *login, "-m", protocol, "-c", command],
                               capture_output=True, text=True, timeout=120)
         if last.returncode == 0 or attempt == attempts - 1:
             break
@@ -62,8 +62,9 @@ def main():
         subprocess.run([mkfs, "-q", "-F", "-L", "linuxvol", "-d", str(source), str(image)], check=True, capture_output=True)
         with Guest(forward=HOST_PORT, data_disk=image, guest_port=445) as g:
             g.line("write settings no-msi")
-            screen = g.line("run smbd root=disk2 share=data log ip=10.0.2.15/24 gateway=10.0.2.2 &2", "fos> ", 40)
+            screen = g.line("run smbd root=disk2 share=data share=docs=disk2/docs,ro share=secret=disk2/drop,hidden ipc log ip=10.0.2.15/24 gateway=10.0.2.2 &2", "fos> ", 40)
             check("smbd" in screen.lower() and "disk2" in screen, "smbd starts as a service on NIC 2", screen)
+            check("//HOST/data" in screen and "//HOST/docs" in screen, "smbd names both shares", screen)
             room = [line.strip() for line in screen.splitlines() if "room for" in line]
             check(bool(room), "smbd reports how many connections it has room for", screen)
 
@@ -71,6 +72,23 @@ def main():
             check(out.returncode == 0 and "hello.txt" in out.stdout and "big.bin" in out.stdout and "docs" in out.stdout,
                   "the share root lists its files", out.stdout + out.stderr)
             check(f"{len(big)}" in out.stdout, "with the real size", out.stdout)
+            out = smbclient("ls", share="docs")
+            check(out.returncode == 0 and "deep" in out.stdout and "hello.txt" not in out.stdout, "a second share lists its own folder", out.stdout + out.stderr)
+            out = smbclient(f"get deep\\x.txt {tmp / 'x2'}", share="docs")
+            check(out.returncode == 0 and (tmp / "x2").read_text() == "deep\n", "and serves a file from it", out.stdout + out.stderr)
+            out = smbclient(f"put {tmp / 'x2'} nope.txt", share="docs", attempts=1)
+            check(out.returncode != 0 or "NT_STATUS" in out.stdout + out.stderr, "a ,ro share refuses a write", out.stdout + out.stderr)
+            out = subprocess.run(["smbclient", "-L", "127.0.0.1", "-p", str(HOST_PORT), "-N", "-m", "SMB3_00"], capture_output=True, text=True, timeout=60)
+            listing = out.stdout + out.stderr
+            check(out.returncode == 0 and "data" in out.stdout and "docs" in out.stdout and "Disk" in out.stdout, "IPC$ lists the shares (smbclient -L)", listing)
+            check("secret" not in out.stdout, "a hidden share is left out of the list", listing)
+            out = smbclient("ls", share="secret")
+            check(out.returncode == 0 and "NT_STATUS" not in out.stdout + out.stderr, "but it can still be connected to by name", out.stdout + out.stderr)
+            if shutil.which("rpcclient"):
+                out = subprocess.run(["rpcclient", "-p", str(HOST_PORT), "-N", "--option=client ipc signing=off", "--option=client signing=off", "127.0.0.1", "-c", "netshareenumall 1"], capture_output=True, text=True, timeout=60)
+                check("netname: data" in out.stdout and "netname: docs" in out.stdout and "secret" not in out.stdout, "rpcclient netshareenumall lists them", out.stdout + out.stderr)
+            out = smbclient("ls", share="nothere", attempts=1)
+            check("BAD_NETWORK_NAME" in out.stdout + out.stderr, "an unknown share name is refused", out.stdout + out.stderr)
             # A mount idles between requests (the Linux client's echo is 60 s apart): the server must not drop it.
             out = smbclient("ls hello.txt; !sleep 15; ls hello.txt")
             check(out.returncode == 0 and out.stdout.count("hello.txt") == 2, "a connection idle for 15 s still works", out.stdout + out.stderr)
