@@ -88,3 +88,29 @@ pub extern "C" fn api_audio_select(direction: u32, mode: u32) -> i32 {
 pub extern "C" fn api_audio_stop() {
     crate::audio::stop_for_tape();
 }
+
+/// Calls a kernel without the driver answers with "not available" so the `TapeApi` table stays complete (tapes call
+/// late fields without checking `size`). A kernel lists here only what it truly cannot serve.
+pub mod unsupported {
+    /// Defines the stubs for calls this port cannot serve yet; each returns the value that means "not available".
+    macro_rules! stubs {
+        ($($name:ident($($arg:ty),*) $(-> $ret:ty)? = $value:expr;)*) => {
+            $(pub extern "C" fn $name($(_: $arg),*) $(-> $ret)? { $value })*
+        };
+    }
+
+    stubs! {
+        api_nic_max_frame_len() -> usize = 1514;
+        api_nic_ts_enable(usize) -> u32 = 0;
+        api_nic_ts_clock(usize) -> u64 = 0;
+        api_nic_ts_rx(usize) -> u64 = 0;
+        api_nic_send_stamped(usize, *const u8, usize, *mut u64) -> u32 = 0;
+        api_nic_ts_adjust(usize, i32) -> u32 = 0;
+        api_nic_ts_step(usize, i64) -> u32 = 0;
+        api_nic_ts_all(usize, u32) -> u32 = 0;
+        api_nic_multicast_join(usize, *const u8, u32) -> u32 = 0;
+        api_nic_vlan_filter(usize, u32, u32) -> u32 = 0;
+        api_nic_tx_offload(usize, u32) -> u32 = 0;
+        api_nic_counters(usize, *mut u64, usize) -> usize = 0;
+    }
+}
