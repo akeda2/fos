@@ -14,6 +14,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use fosfor_abi::tape::*;
 use fosfor_abi::{BootInfo, elf};
 
+use crate::tape_common::*;
 use crate::{memory, paging, term, timer};
 
 const HUGE: u64 = 2 * 1024 * 1024;
@@ -200,7 +201,6 @@ extern "C" fn api_read_key() -> u32 {
     crate::tasks::maybe_yield();
     term::tape_key()
 }
-extern "C" fn api_set_input_mode(_mode: u32) {}
 extern "C" fn api_wait_for_event() {
     use crate::cpu::{spun, Spin};
     if crate::tasks::in_service() {
@@ -243,54 +243,8 @@ extern "C" fn api_wait_for_event() {
         spun(Spin::PolledNic, begin);
     }
 }
-extern "C" fn api_ticks() -> u64 {
-    timer::ticks()
-}
-extern "C" fn api_micros() -> u64 {
-    crate::tasks::maybe_yield();
-    timer::micros()
-}
-extern "C" fn api_phys_addr(address: usize) -> usize {
-    address
-}
-extern "C" fn api_alloc(bytes: usize) -> usize {
-    if bytes == 0 {
-        return 0;
-    }
-    memory::allocate_contiguous((bytes as u64).div_ceil(memory::FRAME), None).unwrap_or(0) as usize
-}
-extern "C" fn api_free(address: usize, bytes: usize) {
-    if address != 0 && bytes != 0 {
-        memory::free(address as u64, (bytes as u64).div_ceil(memory::FRAME));
-    }
-}
-/// FOSFS references (`NAME`, `diskN/NAME`, `@LABEL/NAME`) are resolved in `tape_fs`, shared with the aarch64 port.
-/// The tape file calls are shared with the aarch64 port: see `tape_fs`.
-extern "C" fn api_fs_read(name: *const u8, name_length: usize, buffer: *mut u8, capacity: usize) -> isize {
-    let (name, buffer) = unsafe { (core::slice::from_raw_parts(name, name_length), core::slice::from_raw_parts_mut(buffer, capacity)) };
-    crate::tape_fs::read(name, buffer)
-}
-extern "C" fn api_fs_write(name: *const u8, name_length: usize, data: *const u8, length: usize) -> isize {
-    let (name, data) = unsafe { (core::slice::from_raw_parts(name, name_length), core::slice::from_raw_parts(data, length)) };
-    crate::tape_fs::write(name, data)
-}
-extern "C" fn api_fs_stream_open(name: *const u8, name_length: usize, max_bytes: u64) -> isize {
-    crate::tape_fs::stream_open(unsafe { core::slice::from_raw_parts(name, name_length) }, max_bytes)
-}
-extern "C" fn api_fs_stream_write(offset: u64, data: *const u8, length: usize, file_length: u64) -> isize {
-    crate::tape_fs::stream_write(offset, unsafe { core::slice::from_raw_parts(data, length) }, file_length)
-}
-extern "C" fn api_fs_stream_close(file_length: u64) -> isize {
-    crate::tape_fs::stream_close(file_length)
-}
 extern "C" fn api_fs_list(volume: *const u8, volume_length: usize, index: usize, out: *mut fosfor_abi::tape::FileInfo) -> isize {
     crate::tape_fs::list(unsafe { core::slice::from_raw_parts(volume, volume_length) }, index, unsafe { &mut *out })
-}
-extern "C" fn api_fs_remove(name: *const u8, name_length: usize) -> isize {
-    crate::tape_fs::remove(unsafe { core::slice::from_raw_parts(name, name_length) })
-}
-extern "C" fn api_free_pages() -> usize {
-    memory::stats().free as usize
 }
 extern "C" fn api_hostname(index: usize, out: *mut u8, capacity: usize) -> usize {
     let mut name = [0u8; 20];
@@ -391,21 +345,6 @@ extern "C" fn api_nic_counters(index: usize, out: *mut u64, count: usize) -> usi
     }
     term::nic_counters(index, unsafe { core::slice::from_raw_parts_mut(out, count) })
 }
-extern "C" fn api_gfx_info() -> u64 {
-    crate::framebuffer::gfx_info().map_or(0, |(width, height)| u64::from(width) << 32 | u64::from(height))
-}
-extern "C" fn api_gfx_open() -> u32 {
-    u32::from(crate::framebuffer::gfx_open())
-}
-extern "C" fn api_gfx_close() {
-    crate::framebuffer::gfx_close();
-}
-extern "C" fn api_gfx_fill(x: u32, y: u32, width: u32, height: u32, rgb: u32) -> u32 {
-    u32::from(crate::framebuffer::gfx_fill(x, y, width, height, rgb))
-}
-extern "C" fn api_gfx_blit(x: u32, y: u32, width: u32, height: u32, pixels: *const u32, stride: u32) -> u32 {
-    u32::from(unsafe { crate::framebuffer::gfx_blit(x, y, width, height, pixels, stride) })
-}
 static mut FP_LEVEL: u32 = 0;
 /// Turns SSE/AVX2 off again (nothing running needs them).
 pub fn clear_fp_level() {
@@ -449,9 +388,6 @@ extern "C" fn api_nic_send_stamped(index: usize, frame: *const u8, length: usize
         unsafe { stamp.write(value) };
     }
     u32::from(sent)
-}
-extern "C" fn api_console_size() -> u32 {
-    crate::framebuffer::size().map_or(0, |(columns, rows)| ((columns as u32) << 16) | rows as u32 & 0xffff)
 }
 extern "C" fn api_serial_count() -> usize {
     crate::serialports::count()
@@ -534,9 +470,6 @@ extern "C" fn api_nic_receive(index: usize, buffer: *mut u8, capacity: usize) ->
 extern "C" fn api_audio_info(out: *mut fosfor_abi::tape::AudioInfo) -> u32 {
     u32::from(crate::audio::fill_info(unsafe { &mut *out }))
 }
-extern "C" fn api_audio_start(rate: u32, capture: u32, playback: u32) -> i32 {
-    crate::audio::start_for_tape(rate, capture != 0, playback != 0)
-}
 extern "C" fn api_audio_devices(number: u32, out: *mut fosfor_abi::tape::AudioDevice) -> u32 {
     if !out.is_null() {
         if let Some(device) = crate::audio::device_info(number as usize) {
@@ -550,20 +483,6 @@ extern "C" fn api_nic_active() -> u32 {
     crate::tasks::current_nic().unwrap_or_else(term::active_nic) as u32
 }
 
-extern "C" fn api_audio_use_device(number: u32) -> i32 {
-    crate::audio::use_device_for_tape(number)
-}
-
-extern "C" fn api_audio_use_output(number: u32) -> i32 {
-    crate::audio::use_output_for_tape(number)
-}
-
-extern "C" fn api_audio_select(direction: u32, mode: u32) -> i32 {
-    crate::audio::select_for_tape(direction == 0, mode)
-}
-extern "C" fn api_audio_stop() {
-    crate::audio::stop_for_tape();
-}
 extern "C" fn api_audio_read(buffer: *mut u8, length: usize) -> usize {
     term::tape_poll(); // drains the xHCI event ring, which is what moves USB audio
     crate::audio::read(unsafe { core::slice::from_raw_parts_mut(buffer, length) })
