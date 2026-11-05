@@ -40,8 +40,6 @@ GAPS = {
     },
     "mf": {
         "set_input_mode": "no-op: the mf shell cooks input itself",
-        **{f"serial_{name}": UNWIRED for name in ("count", "info", "open", "close", "read", "write", "lines",
-                                                  "set_lines", "break")},
         **{name: "the x86 server has no GPIO header or I2C bus (the Pi 4 has); tapes see 'no pins'"
            for name in ("gpio_pins", "gpio_read", "gpio_write", "gpio_mode", "gpio_pull", "gpio_function",
                         "gpio_pull_get", "i2c_speed", "i2c_transfer")},

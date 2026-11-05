@@ -14,6 +14,7 @@ Prints the bytes read; a count of 0 means the offset is at or past the end.
        tape run fscheck vfswrite DIR          (ABI 34: create, write, truncate, rename, remove under DIR on an ext volume)
        tape run fscheck remove NAME           (create NAME, delete it with fs_remove, check it is gone)
        tape run fscheck info                  (hostname, peer count, disk 1, clock, console size)
+       tape run fscheck serial                (ABI 7: open port 1, send "ping", wait up to 8 s for a reply)
 "#);
 
 #[unsafe(no_mangle)]
@@ -42,6 +43,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             None => println!("Usage: fscheck vfswrite DIR"),
         };
     }
+    if arguments == "serial" {
+        return serial(api);
+    }
     if arguments == "info" {
         return info(api);
     }
@@ -64,6 +68,26 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         }
         Err(code) => println!("fscheck: error {code}"),
     }
+}
+
+/// Serial port 1: the count, a refused port 9, a write, then up to 8 s for the peer's reply; closes and reopens it once.
+fn serial(api: &'static TapeApi) {
+    println!("fscheck: serial ports {}", (api.serial_count)());
+    println!("fscheck: serial open 9 -> {}", (api.serial_open)(9, 115_200, tape_rt::SERIAL_8N1));
+    let opened = (api.serial_open)(1, 115_200, tape_rt::SERIAL_8N1);
+    let written = (api.serial_write)(1, b"ping\n".as_ptr(), 5);
+    println!("fscheck: serial open {opened} wrote {written}");
+    let mut reply = [0u8; 64];
+    let mut length = 0;
+    let end = (api.micros)() + 8_000_000;
+    while (api.micros)() < end && !reply[..length].contains(&b'\n') {
+        length += (api.serial_read)(1, reply[length..].as_mut_ptr(), reply.len() - length);
+        (api.wait_for_event)();
+    }
+    println!("fscheck: serial got [{}]", core::str::from_utf8(&reply[..length]).unwrap_or("?").trim_end());
+    (api.serial_close)(1);
+    println!("fscheck: serial reopen {}", (api.serial_open)(1, 9600, tape_rt::SERIAL_8N1));
+    (api.serial_close)(1);
 }
 
 /// The machine-information calls: each prints what it answered, so a kernel that stubs one shows up as an empty value.
