@@ -629,3 +629,13 @@ use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limi
   `test-config`, `test-debug-mode`, `test-msi`, `test-fosplay`.
 - Not yet done: the `clock` host is stale (37 old tapes); the `abibad` tape is not installed on the mf hosts; the embedded
   `debug revert` and `services` setting; the 1024-frame e1000 ring on embedded hardware; a full `gb -of fos` run on landsbro.
+
+## Planned (2026-11-05)
+
+- **A better, threaded HTTP server.** `httpd` handles one request at a time. Use the tape threads (ABI 37, mf) for concurrent
+  requests; add keep-alive, Range, POST and `If-Modified-Since`, a faster file lookup and DHCP lease renewal (see "Open after
+  httpd and web").
+- **FOS-mf on aarch64** (Raspberry Pi 4 only): SMP, VM and ring-3 tapes for the server kernel, on the shared `kernel-core`
+  (`docs/big-kernel.md`, `docs/aarch64-plan.md`).
+- **mf on `rack`: USB audio interface times out during boot** (xHCI). Reproduce on the machine, read `dmesg`, fix in
+  `usb_audio`/xHCI or the mf USB init.
