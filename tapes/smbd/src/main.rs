@@ -16,7 +16,7 @@ use tape_rt::{TapeApi, arg_value as value, println};
 
 tape_rt::tape_help!(
     br#"smbd [@NAME] [root=DIR] [share=NAME] [port=445] [nic=N] [ip=A.B.C.D/N]
-      [gateway=A.B.C.D] [maxio=KIB] [log] [stats] [ro]
+      [gateway=A.B.C.D] [maxio=KIB] [log] [stats] [ro] [ipc]
 An SMB file server (SMB 2.0.2 to 3.0, no signing): Linux mount.cifs/smbclient,
 Windows and macOS can browse, copy from it and, on ext volumes, write to it. It runs as
 a service: run smbd @SMBD.CFG &2 (the service owns NIC 2; tape run smbd takes
@@ -25,7 +25,12 @@ command line or in the file (one per line, # for comments).
 root=   the folder shared: disk2 (a whole ext4 disk), ext1 (the ext4 partition of a disk that also has FOSFS), disk2/music, @LABEL/site,
         a FOSFS or FAT folder, or a //NAME mount (smbmount): FOS as a
         gateway. Default: the boot volume's root.
-share=  the share name clients use, //HOST/NAME (default: share).
+share=  the share name clients use, //HOST/NAME (default: share). Give it
+        more than once for more shares (up to 8): share=NAME uses root=,
+        share=NAME=ROOT shares ROOT. Add ,ro (this share refuses changes)
+        and/or ,hidden (left out of the share list; connect by name).
+ipc     answer IPC$ with the share list, so Explorer, Finder and smbclient -L
+        show the shares (otherwise clients must name the share).
 port=   TCP port (default 445).
 ip=     a fixed address like 192.168.1.20/24 (gateway= for the router);
         without it DHCP. nic= is the NIC number from 1 (default: nic use).
@@ -120,12 +125,31 @@ impl Users {
     }
 }
 
-struct Files {
+/// One share: the name clients use, the folder behind it and whether it refuses changes.
+#[derive(Clone, Copy)]
+struct Entry {
     root: [u8; ROOT_MAX],
     root_length: usize,
     name: [u8; 32],
     name_length: usize,
     read_only: bool,
+    /// Not in the share list of `IPC$`; clients can still connect to it by name.
+    hidden: bool,
+}
+
+/// Shares one smbd serves (the tree ids of a connection; `smb::server` allows 16).
+const SHARES: usize = 8;
+static mut SHARE_TABLE: ([Entry; SHARES], usize) = ([Entry { root: [0; ROOT_MAX], root_length: 0, name: [0; 32], name_length: 0, read_only: false, hidden: false }; SHARES], 0);
+/// `ipc` was given: `IPC$` answers with the share list.
+static IPC_ON: AtomicBool = AtomicBool::new(false);
+
+fn shares() -> &'static mut ([Entry; SHARES], usize) {
+    unsafe { &mut *core::ptr::addr_of_mut!(SHARE_TABLE) }
+}
+
+struct Files {
+    /// The share the current request is for (`Share::select`).
+    current: usize,
     /// Where this session's last read ended (hash of the file's path, offset): the next read there is sequential.
     next_hash: u64,
     next_offset: u64,
@@ -146,12 +170,13 @@ fn fail(code: isize) -> Fail {
 
 impl Files {
     const fn new() -> Self {
-        Files { root: [0; ROOT_MAX], root_length: 0, name: [0; 32], name_length: 0, read_only: false, next_hash: 0, next_offset: 0 }
+        Files { current: 0, next_hash: 0, next_offset: 0 }
     }
 
     /// `root` and `path` joined with a slash, into `out`.
     fn join<'a>(&self, path: &str, out: &'a mut [u8; 512]) -> Option<&'a str> {
-        let root = &self.root[..self.root_length];
+        let entry = &shares().0[self.current];
+        let root = &entry.root[..entry.root_length];
         if root.len() + 1 + path.len() > out.len() {
             return None;
         }
@@ -175,7 +200,27 @@ fn stat_of(stat: &tape_rt::VfsStat) -> Stat {
 
 impl Share for Files {
     fn name(&self) -> &str {
-        core::str::from_utf8(&self.name[..self.name_length]).unwrap_or("share")
+        let entry = &shares().0[self.current];
+        core::str::from_utf8(&entry.name[..entry.name_length]).unwrap_or("share")
+    }
+
+    fn find(&mut self, name: &str) -> Option<usize> {
+        let table = shares();
+        table.0[..table.1].iter().position(|entry| entry.name[..entry.name_length].eq_ignore_ascii_case(name.as_bytes()))
+    }
+
+    fn listed(&self, index: usize) -> Option<(&str, bool)> {
+        let table = shares();
+        let entry = table.0[..table.1].get(index)?;
+        Some((core::str::from_utf8(&entry.name[..entry.name_length]).unwrap_or(""), entry.hidden))
+    }
+
+    fn ipc(&self) -> bool {
+        IPC_ON.load(Ordering::Relaxed)
+    }
+
+    fn select(&mut self, index: usize) {
+        self.current = index.min(shares().1.saturating_sub(1));
     }
 
     fn stat(&mut self, path: &str) -> Option<Stat> {
@@ -228,7 +273,7 @@ impl Share for Files {
     }
 
     fn writable(&self) -> bool {
-        !self.read_only && tape_rt::vfs_can_change()
+        !shares().0[self.current].read_only && tape_rt::vfs_can_change()
     }
 
     fn create(&mut self, path: &str, dir: bool, mode: u32, owner: Identity) -> Result<(), Fail> {
@@ -325,19 +370,63 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     };
     let text = config.text();
     let root = value(text, "root").unwrap_or("").trim_end_matches('/');
-    let share = value(text, "share").unwrap_or("share");
-    if root.len() > ROOT_MAX || share.len() > 32 {
-        return println!("smbd: root= or share= is too long.");
+    let read_only = text.split_ascii_whitespace().any(|word| word == "ro");
+    // share=NAME uses root=; share=NAME=ROOT is one more folder under its own name; either takes ,ro and ,hidden after it.
+    let table = shares();
+    for word in text.split_ascii_whitespace().filter_map(|word| word.strip_prefix("share=")) {
+        let (spec, options) = word.split_once(',').unwrap_or((word, ""));
+        let (name, folder) = spec.split_once('=').unwrap_or((spec, root));
+        let folder = folder.trim_end_matches('/');
+        let (mut entry_only, mut hidden) = (false, false);
+        for option in options.split(',').filter(|option| !option.is_empty()) {
+            match option {
+                "ro" => entry_only = true,
+                "hidden" => hidden = true,
+                _ => return println!("smbd: share={word}: ,{option} is not ,ro or ,hidden."),
+            }
+        }
+        if name.is_empty() || name.len() > 32 || name.contains(['/', '\\']) || folder.len() > ROOT_MAX {
+            return println!("smbd: share={word}: a name of 1 to 32 characters without slashes and a root up to {ROOT_MAX}.");
+        }
+        if table.1 == SHARES {
+            return println!("smbd: at most {SHARES} shares.");
+        }
+        if table.0[..table.1].iter().any(|entry| entry.name[..entry.name_length].eq_ignore_ascii_case(name.as_bytes())) {
+            return println!("smbd: share {name} is given twice.");
+        }
+        let entry = &mut table.0[table.1];
+        entry.name[..name.len()].copy_from_slice(name.as_bytes());
+        entry.name_length = name.len();
+        entry.root[..folder.len()].copy_from_slice(folder.as_bytes());
+        entry.root_length = folder.len();
+        entry.read_only = read_only || entry_only;
+        entry.hidden = hidden;
+        table.1 += 1;
     }
-    if tape_rt::vfs_stat(root).map_or(true, |stat| stat.kind != tape_rt::VFS_DIR) {
-        return println!("smbd: {} is not a folder this kernel can read (needs tape ABI 32).", if root.is_empty() { "the boot volume" } else { root });
+    if table.1 == 0 {
+        if root.len() > ROOT_MAX {
+            return println!("smbd: root= is too long.");
+        }
+        let entry = &mut table.0[0];
+        entry.name[..5].copy_from_slice(b"share");
+        entry.name_length = 5;
+        entry.root[..root.len()].copy_from_slice(root.as_bytes());
+        entry.root_length = root.len();
+        entry.read_only = read_only;
+        table.1 = 1;
+    }
+    for entry in &table.0[..table.1] {
+        let folder = core::str::from_utf8(&entry.root[..entry.root_length]).unwrap_or("");
+        if tape_rt::vfs_stat(folder).map_or(true, |stat| stat.kind != tape_rt::VFS_DIR) {
+            return println!("smbd: {} is not a folder this kernel can read (needs tape ABI 32).", if folder.is_empty() { "the boot volume" } else { folder });
+        }
     }
     if users().open {
         println!("smbd: {} user(s) from smbusers{}.", users().count, if users().guest.is_some() { ", guests allowed" } else { ", no guests" });
     } else {
         println!("smbd: no smbusers file: everyone is a guest.");
     }
-    let read_only = text.split_ascii_whitespace().any(|word| word == "ro");
+    IPC_ON.store(text.split_ascii_whitespace().any(|word| word == "ipc"), Ordering::Relaxed);
     let log = text.split_ascii_whitespace().any(|word| word == "log" || word == "log=on");
     let stats = log || text.split_ascii_whitespace().any(|word| word == "stats");
     let Some(port) = value(text, "port").map_or(Some(445), |word| word.parse::<u16>().ok().filter(|&port| port != 0)) else {
@@ -370,12 +459,12 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let big = io_kib > DEFAULT_IO / 1024;
     // Each connection holds two receive buffers, so a kernel short of memory gets fewer connections, then the small tier.
     let started = if big {
-        let setup = Setup { nic, network, port, root, share, read_only, log, stats, io: io_kib * 1024 };
+        let setup = Setup { nic, network, port, log, stats, io: io_kib * 1024 };
         start::<BIG_RX, 32>(api, &setup) || start::<BIG_RX, 8>(api, &setup)
     } else {
         false
     };
-    let setup = Setup { nic, network, port, root, share, read_only, log, stats, io: DEFAULT_IO };
+    let setup = Setup { nic, network, port, log, stats, io: DEFAULT_IO };
     if !(started || start::<SMALL_RX, 128>(api, &setup) || start::<SMALL_RX, 16>(api, &setup) || start::<SMALL_RX, 4>(api, &setup)) {
         println!("smbd: no memory for the connections.");
     }
@@ -392,13 +481,10 @@ fn start<const RX: usize, const N: usize>(api: &TapeApi, setup: &Setup) -> bool 
     true
 }
 
-struct Setup<'a> {
+struct Setup {
     nic: usize,
     network: NetConfig,
     port: u16,
-    root: &'a str,
-    share: &'a str,
-    read_only: bool,
     log: bool,
     stats: bool,
     /// Largest read or write offered to the client.
@@ -439,7 +525,7 @@ fn many_sessions<const N: usize>(api: &TapeApi) -> Option<&'static mut [Option<S
 }
 
 fn run<const RX: usize, const N: usize>(api: &TapeApi, setup: &Setup, tcp: &mut Tcp<RX, N>, request: &mut [u8], answer: &mut [u8], sessions: &mut [Option<Server<Files, OPENS>>; N]) {
-    let Setup { nic, network, port, root, share, read_only, log, stats, io } = *setup;
+    let Setup { nic, network, port, log, stats, io } = *setup;
     let (mut pool, mut state) = (0u64, [0u8; 16]);
     let (pool, state) = (&mut pool, &mut state);
     tcp.start(nic, &network, port);
@@ -455,7 +541,14 @@ fn run<const RX: usize, const N: usize>(api: &TapeApi, setup: &Setup, tcp: &mut 
     if worker_count > 0 {
         println!("smbd: {worker_count} worker threads.");
     }
-    println!("smbd: NIC {} at {}.{}.{}.{}:{port}, sharing {} as //HOST/{share}.", nic + 1, network.ip.0[0], network.ip.0[1], network.ip.0[2], network.ip.0[3], if root.is_empty() { "the boot volume" } else { root });
+    println!("smbd: NIC {} at {}.{}.{}.{}:{port}.", nic + 1, network.ip.0[0], network.ip.0[1], network.ip.0[2], network.ip.0[3]);
+    for entry in &shares().0[..shares().1] {
+        let (name, folder) = (core::str::from_utf8(&entry.name[..entry.name_length]).unwrap_or(""), core::str::from_utf8(&entry.root[..entry.root_length]).unwrap_or(""));
+        println!("smbd: sharing {} as //HOST/{name}{}.", if folder.is_empty() { "the boot volume" } else { folder }, if entry.read_only { " (read-only)" } else { "" });
+    }
+    if IPC_ON.load(Ordering::Relaxed) {
+        println!("smbd: IPC$ lists the shares to clients (hidden ones left out).");
+    }
     loop {
         if (api.should_abort)() != 0 {
             break;
@@ -512,12 +605,7 @@ fn run<const RX: usize, const N: usize>(api: &TapeApi, setup: &Setup, tcp: &mut 
                 continue;
             }
             if sessions[slot].is_none() {
-                let mut files = Files::new();
-                files.root[..root.len()].copy_from_slice(root.as_bytes());
-                files.root_length = root.len();
-                files.name[..share.len()].copy_from_slice(share.as_bytes());
-                files.name_length = share.len();
-                files.read_only = read_only;
+                let files = Files::new();
                 let mut session = Server::new(files);
                 // ABI 33 `random`; a kernel without it falls back to a hash of the clock, a counter and the peer
                 // (unpredictable only to a peer that cannot guess the microsecond; docs/smb.md).

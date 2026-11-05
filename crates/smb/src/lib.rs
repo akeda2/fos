@@ -18,6 +18,7 @@
 
 pub mod ntlm;
 pub mod sign;
+pub mod ipc;
 pub mod server;
 pub mod wire;
 

@@ -1,13 +1,13 @@
 //! The server half: one SMB2 request (or a compound chain) in, the answer out. No I/O and no allocation: the caller reads
 //! a frame from its TCP connection, calls `Server::handle`, and sends what comes back. Files come from a `Share`.
 //!
-//! Scope (docs/smb.md): dialects 2.0.2, 2.1 and 3.0 (no 3.1.1, so no preauthentication hash), guest sessions, one share,
+//! Scope (docs/smb.md): dialects 2.0.2, 2.1 and 3.0 (no 3.1.1, so no preauthentication hash), guest sessions, one or several shares,
 //! read-only, no signing or encryption. NEGOTIATE, SESSION_SETUP (raw NTLMSSP or SPNEGO-wrapped), LOGOFF, TREE_CONNECT,
 //! TREE_DISCONNECT, CREATE, CLOSE, READ, QUERY_DIRECTORY, QUERY_INFO, ECHO, FLUSH and the one IOCTL a 3.0 client insists on
 //! (VALIDATE_NEGOTIATE_INFO). Writes answer ACCESS_DENIED. Compound requests are handled: a client such as Windows or
 //! Linux cifs sends CREATE+QUERY_INFO+CLOSE as one chain, with `RELATED` operations taking the previous file id.
 //!
-//! One connection carries one session and one tree; a `Server` is therefore one connection's state. Reads and directory
+//! One connection carries one session and up to `MAX_TREES` trees (one per share, `Share::find`/`select`); a `Server` is therefore one connection's state. Reads and directory
 //! answers are limited to `MAX_IO` bytes, so the output buffer should hold `MAX_IO + 4 + 64 + 16` bytes.
 
 use crate::ntlm::{hmac_md5, ntlmv2_key, ntlmv2_proof};
@@ -46,9 +46,14 @@ const DIALECT_MISMATCH: u32 = 0xC000_00BD;
 const NAME_COLLISION: u32 = 0xC000_0035;
 const DIRECTORY_NOT_EMPTY: u32 = 0xC000_0101;
 const DISK_FULL: u32 = 0xC000_007F;
+const BUFFER_OVERFLOW: u32 = 0x8000_0005;
+const FSCTL_PIPE_TRANSCEIVE: u32 = 0x0011_C017;
 
 const SESSION_ID: u64 = 0x0000_0001_0000_0001;
-const TREE_ID: u32 = 1;
+/// Shares one connection can have connected at once (tree id = share index + 1; a bit each in `Server::trees`).
+const MAX_TREES: u32 = 16;
+/// The tree id of `IPC$` (above every share's).
+const IPC_TREE: u32 = MAX_TREES + 1;
 const FLAG_SIGNED: u32 = 8;
 const NTLMSSP: &[u8; 8] = b"NTLMSSP\0";
 /// OID 1.3.6.1.4.1.311.2.2.10 (NTLMSSP) as a DER object identifier.
@@ -117,6 +122,22 @@ impl Fail {
 pub trait Share {
     /// The share name clients connect to (compared without regard to case).
     fn name(&self) -> &str;
+    /// Which share a tree connect to `name` means (compared without regard to case), `None` for an unknown name. A server with
+    /// several shares overrides this; the default knows only `name()`. Index `i` becomes tree id `i + 1`.
+    fn find(&mut self, name: &str) -> Option<usize> {
+        name.eq_ignore_ascii_case(self.name()).then_some(0)
+    }
+    /// Makes share `index` (from `find`) the one the calls below act on; called before every request of that tree.
+    fn select(&mut self, _index: usize) {}
+    /// The `index`th share for the share list of `IPC$` and whether it is hidden from it (still connectable by name); `None`
+    /// past the end. The default lists `name()` only.
+    fn listed(&self, index: usize) -> Option<(&str, bool)> {
+        (index == 0).then(|| (self.name(), false))
+    }
+    /// Whether clients may connect to `IPC$` to list the shares (`listed`). Off by default.
+    fn ipc(&self) -> bool {
+        false
+    }
     fn stat(&mut self, path: &str) -> Option<Stat>;
     /// The `index`th entry of folder `path` (without "." and ".."), its name written to `name`; `None` past the end.
     fn read_dir(&mut self, path: &str, index: usize, name: &mut [u8]) -> Option<(usize, Stat)>;
@@ -172,10 +193,14 @@ struct Open {
     delete: bool,
     /// Folder enumeration position: 0 is ".", 1 is "..", then the share's entries.
     next: usize,
+    /// The tree id it was opened on.
+    tree: u32,
+    /// The share-list pipe of `IPC$`; all of them share `Server::pipe` (clients use one at a time, request then answer).
+    pipe: bool,
 }
 
 impl Open {
-    const EMPTY: Open = Open { used: false, dir: false, length: 0, path: [0; MAX_PATH], write: false, delete: false, next: 0 };
+    const EMPTY: Open = Open { used: false, dir: false, length: 0, path: [0; MAX_PATH], write: false, delete: false, next: 0, tree: 0, pipe: false };
 
     fn path(&self) -> &str {
         core::str::from_utf8(&self.path[..self.length]).unwrap_or("")
@@ -209,7 +234,11 @@ pub struct Server<S: Share, const OPENS: usize> {
     /// The signing key once a password login succeeded; messages are signed with it (`sign`).
     signing: Option<[u8; 16]>,
     sign_answer: bool,
-    tree: bool,
+    /// Bit `id - 1` is set while tree `id` is connected.
+    trees: u32,
+    /// `IPC$` is connected.
+    ipc: bool,
+    pipe: crate::ipc::Pipe,
     opens: [Open; OPENS],
 }
 
@@ -338,7 +367,9 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
             identity: Identity { uid: 65534, gid: 65534 },
             signing: None,
             sign_answer: false,
-            tree: false,
+            trees: 0,
+            ipc: false,
+            pipe: crate::ipc::Pipe::new(),
             opens: [Open::EMPTY; OPENS],
             trace: None,
         }
@@ -512,20 +543,27 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
         match command {
             CMD_LOGOFF => {
                 self.auth = 0;
-                self.tree = false;
+                self.trees = 0;
+                self.ipc = false;
                 self.opens = [Open::EMPTY; OPENS];
                 return Self::empty(body);
             }
             CMD_TREE_CONNECT => return self.tree_connect(chain, msg, body),
             _ => {}
         }
-        if !self.tree || chain.tree != TREE_ID {
+        if chain.tree == IPC_TREE {
+            return self.pipe_command(chain, command, related, msg, body);
+        }
+        if chain.tree == 0 || chain.tree > MAX_TREES || self.trees & 1 << (chain.tree - 1) == 0 {
             return Err(NETWORK_NAME_DELETED);
         }
+        self.share.select(chain.tree as usize - 1);
         match command {
             CMD_TREE_DISCONNECT => {
-                self.tree = false;
-                self.opens = [Open::EMPTY; OPENS];
+                self.trees &= !(1 << (chain.tree - 1));
+                for open in self.opens.iter_mut().filter(|open| open.tree == chain.tree) {
+                    *open = Open::EMPTY;
+                }
                 Self::empty(body)
             }
             CMD_CREATE => self.create(chain, msg, body),
@@ -744,11 +782,19 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
         let used = name_to_utf8(name, &mut path);
         let path = &path[..used];
         let share = path.rsplit(|&c| c == b'/').next().unwrap_or(path);
-        if !share.eq_ignore_ascii_case(self.share.name().as_bytes()) {
-            return Err(BAD_NETWORK_NAME);
+        if share.eq_ignore_ascii_case(b"IPC$") && self.share.ipc() {
+            self.ipc = true;
+            chain.tree = IPC_TREE;
+            body[..16].fill(0);
+            put16(body, 0, 16);
+            body[2] = 2; // pipe
+            put32(body, 12, 0x001F_01FF);
+            return Ok(16);
         }
-        self.tree = true;
-        chain.tree = TREE_ID;
+        let index = core::str::from_utf8(share).ok().and_then(|name| self.share.find(name)).filter(|&index| (index as u32) < MAX_TREES).ok_or(BAD_NETWORK_NAME)?;
+        self.share.select(index);
+        self.trees |= 1 << index;
+        chain.tree = index as u32 + 1;
         body[..16].fill(0);
         put16(body, 0, 16);
         body[2] = 1; // disk
@@ -769,7 +815,7 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
             }
             persistent as usize - 1
         };
-        if self.opens[slot].used { Ok(slot) } else { Err(FILE_CLOSED) }
+        if self.opens[slot].used && self.opens[slot].tree == chain.tree { Ok(slot) } else { Err(FILE_CLOSED) }
     }
 
     fn stat_open(&mut self, slot: usize) -> Result<Stat, u32> {
@@ -891,6 +937,7 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
         let slot = self.opens.iter().position(|open| !open.used).ok_or(NO_RESOURCES)?;
         let mut open = Open::EMPTY;
         open.used = true;
+        open.tree = chain.tree;
         open.dir = stat.dir;
         open.write = write || delete;
         open.delete = delete;
@@ -919,7 +966,7 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
         need(msg, 24)?;
         let slot = self.slot(chain, related, msg, HEADER + 8)?;
         let flags = get16(msg, HEADER + 2);
-        let stat = if flags & 1 != 0 { self.stat_open(slot).ok() } else { None };
+        let stat = if flags & 1 != 0 && !self.opens[slot].pipe { self.stat_open(slot).ok() } else { None };
         let open = self.opens[slot];
         self.opens[slot] = Open::EMPTY;
         if open.delete {
@@ -1309,6 +1356,116 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
 
     /// FSCTL_VALIDATE_NEGOTIATE_INFO: a 3.0 client repeats what it negotiated so a man in the middle cannot have
     /// downgraded it; the answer is what this server would have said.
+    /// What `IPC$` takes: opening the `srvsvc` pipe, writing a request to it and reading the answer (or both at once with
+    /// FSCTL_PIPE_TRANSCEIVE), closing it.
+    fn pipe_command(&mut self, chain: &mut Chain, command: u16, related: bool, msg: &[u8], body: &mut [u8]) -> Result<usize, u32> {
+        if !self.ipc {
+            return Err(NETWORK_NAME_DELETED);
+        }
+        match command {
+            CMD_TREE_DISCONNECT => {
+                self.ipc = false;
+                for open in self.opens.iter_mut().filter(|open| open.tree == IPC_TREE) {
+                    *open = Open::EMPTY;
+                }
+                Self::empty(body)
+            }
+            CMD_CREATE => {
+                need(msg, 57)?;
+                let offset = get16(msg, HEADER + 44) as usize;
+                let length = get16(msg, HEADER + 46) as usize;
+                let name = if length == 0 { &[][..] } else { msg.get(offset..offset + length).ok_or(INVALID_PARAMETER)? };
+                let mut path = [0u8; MAX_PATH];
+                let used = name_to_utf8(name, &mut path);
+                if !core::str::from_utf8(&path[..used]).is_ok_and(crate::ipc::is_srvsvc) {
+                    return Err(NO_SUCH_FILE);
+                }
+                let slot = self.opens.iter().position(|open| !open.used).ok_or(NO_RESOURCES)?;
+                self.opens[slot] = Open { used: true, tree: IPC_TREE, pipe: true, ..Open::EMPTY };
+                chain.file = Some(slot);
+                if body.len() < 96 {
+                    return Err(NO_RESOURCES);
+                }
+                body[..89].fill(0);
+                put16(body, 0, 89);
+                put32(body, 4, 1);
+                put64(body, 64, slot as u64 + 1);
+                put64(body, 72, slot as u64 + 1);
+                Ok(89)
+            }
+            CMD_CLOSE => self.close(chain, related, msg, body),
+            CMD_WRITE => {
+                need(msg, 49)?;
+                let data_at = get16(msg, HEADER + 2) as usize;
+                let length = get32(msg, HEADER + 4) as usize;
+                self.slot(chain, related, msg, HEADER + 16)?;
+                let data = msg.get(data_at..data_at.checked_add(length).ok_or(INVALID_PARAMETER)?).ok_or(INVALID_PARAMETER)?;
+                self.pipe_call(data);
+                body[..16].fill(0);
+                put16(body, 0, 17);
+                put32(body, 4, length as u32);
+                Ok(16)
+            }
+            CMD_READ => {
+                need(msg, 49)?;
+                let length = get32(msg, HEADER + 4) as usize;
+                self.slot(chain, related, msg, HEADER + 16)?;
+                if self.pipe.pending() == 0 {
+                    return Err(END_OF_FILE);
+                }
+                let room = length.min(body.len().saturating_sub(16));
+                let data = self.pipe.take(room);
+                let count = data.len();
+                body[16..16 + count].copy_from_slice(data);
+                body[..16].fill(0);
+                put16(body, 0, 17);
+                body[2] = (HEADER + 16) as u8;
+                put32(body, 4, count as u32);
+                if self.pipe.pending() > 0 { Err(BUFFER_OVERFLOW) } else { Ok(16 + count) }
+            }
+            CMD_IOCTL => {
+                need(msg, 57)?;
+                if get32(msg, HEADER + 4) != FSCTL_PIPE_TRANSCEIVE {
+                    return self.ioctl(msg, body);
+                }
+                self.slot(chain, related, msg, HEADER + 8)?;
+                let at = get32(msg, HEADER + 24) as usize;
+                let count = get32(msg, HEADER + 28) as usize;
+                let wanted = get32(msg, HEADER + 44) as usize;
+                let data = msg.get(at..at.checked_add(count).ok_or(INVALID_PARAMETER)?).ok_or(INVALID_PARAMETER)?;
+                self.pipe_call(data);
+                let room = wanted.min(body.len().saturating_sub(48));
+                let pending = self.pipe.pending() > room;
+                let data = self.pipe.take(room);
+                let taken = data.len();
+                body[48..48 + taken].copy_from_slice(data);
+                body[..48].fill(0);
+                put16(body, 0, 49);
+                put32(body, 4, FSCTL_PIPE_TRANSCEIVE);
+                body[8..24].copy_from_slice(&msg[HEADER + 8..HEADER + 24]);
+                put32(body, 32, (HEADER + 48) as u32);
+                put32(body, 36, taken as u32);
+                if pending { Err(BUFFER_OVERFLOW) } else { Ok(48 + taken) }
+            }
+            CMD_FLUSH => Self::empty(body),
+            _ => Err(NOT_SUPPORTED),
+        }
+    }
+
+    /// Hands a request PDU to the share-list pipe, with the shares it may list.
+    fn pipe_call(&mut self, request: &[u8]) {
+        let mut names = [""; crate::ipc::NAMES];
+        let mut count = 0;
+        for index in 0..MAX_TREES as usize {
+            let Some((name, hidden)) = self.share.listed(index) else { break };
+            if !hidden && name.len() <= crate::ipc::NAME_MAX && count < names.len() {
+                names[count] = name;
+                count += 1;
+            }
+        }
+        crate::ipc::call(&mut self.pipe, request, &names[..count]);
+    }
+
     fn ioctl(&mut self, msg: &[u8], body: &mut [u8]) -> Result<usize, u32> {
         need(msg, 57)?;
         if get32(msg, HEADER + 4) != 0x0014_0204 {
