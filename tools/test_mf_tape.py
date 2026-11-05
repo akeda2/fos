@@ -111,6 +111,17 @@ def run(cpu, smp):
             if not wait_for("fos> ", 5, mark + 40):
                 failures.append("Escape did not end the foreground tape:\n" + log[mark:].decode("utf8", "replace"))
         if not failures:
+            # A tape that polls the USB calls in a loop must not starve the service thread: Escape still reaches it.
+            mark = len(log)
+            qemu.stdin.write(b"tape fscheck usbspin\n")
+            qemu.stdin.flush()
+            wait_for("usbspin running", 10, mark)
+            time.sleep(1)
+            qemu.stdin.write(b"\x1b")
+            qemu.stdin.flush()
+            if not wait_for("fos> ", 8, mark + 40):
+                failures.append("a tape polling USB starved the shell; Escape did not end it:\n" + log[mark:].decode("utf8", "replace"))
+        if not failures:
             # Keyboard input and fs_read/fs_write together: append a line with ed, save, and read it back in a second session.
             def type_to_ed(lines, expect):
                 mark = len(log)
