@@ -7,7 +7,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use fosfor_abi::tape::{FS_BAD_NAME, FS_NO_VOLUME, FS_NOT_FOUND, FS_TOO_BIG};
+use fosfor_abi::tape::{FS_BAD_NAME, FS_NO_VOLUME, FS_NOT_FOUND, FS_READ_ONLY, FS_TOO_BIG};
 use fosfor_shell::{Entry, FsError, Host, Owner, Stamp};
 use kernel_core::{mounts, tape_fs};
 
@@ -16,6 +16,79 @@ use crate::{storage, tapefs};
 pub struct MfHost;
 
 const STREAM_CHUNK: usize = 1 << 20;
+
+/// The shell's working folder (`cd`): a reference like `@rackdata/www-root`, empty for the boot volume's root. Relative names
+/// the file commands take are looked up under it; names with a volume (`diskN/`, `@LABEL/`, `extN/`, `esp/`, `//`) are not.
+static CWD: crate::sched::SleepMutex<String> = crate::sched::SleepMutex::new(String::new());
+/// Set by a new remote terminal session (the receive path must not take `CWD`, which can sleep): it starts at the root.
+pub static CWD_RESET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn current() -> String {
+    let mut cwd = CWD.lock();
+    if CWD_RESET.swap(false, core::sync::atomic::Ordering::Relaxed) {
+        cwd.clear();
+    }
+    cwd.clone()
+}
+
+/// The first component names a volume: `@LABEL`, `diskN`, `extN` or `esp`.
+fn names_volume(reference: &str) -> bool {
+    let first = reference.split('/').next().unwrap_or("");
+    let numbered = |prefix: &str| first.strip_prefix(prefix).is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()));
+    first == "esp" || first.strip_prefix('@').is_some_and(|label| !label.is_empty()) || numbered("disk") || numbered("ext")
+}
+
+/// `.` and `..` resolved, empty components dropped.
+fn normalize(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    parts.join("/")
+}
+
+/// `reference` as the file calls should see it: under the working folder when it is a relative name (`/NAME` is the root of the
+/// working folder's volume). An empty working folder, `//` references and names that carry a volume stay as typed.
+fn here(reference: &str) -> String {
+    let cwd = current();
+    if cwd.is_empty() || reference.starts_with("//") || names_volume(reference) {
+        return String::from(reference);
+    }
+    if let Some(absolute) = reference.strip_prefix('/') {
+        // The root of the working folder's volume: its selector, or the mount point it lies under.
+        let volume = if names_volume(&cwd) {
+            cwd.split('/').next().unwrap_or("")
+        } else {
+            mounts::lookup_dir(cwd.as_bytes()).map_or("", |(_, rest)| cwd[..cwd.len() - rest.len()].trim_end_matches('/'))
+        };
+        return normalize(&alloc::format!("{volume}/{absolute}"));
+    }
+    if reference.is_empty() {
+        return cwd;
+    }
+    normalize(&alloc::format!("{cwd}/{reference}"))
+}
+
+pub fn working_folder() -> String {
+    current()
+}
+
+/// `cd [FOLDER]`: with no name the boot volume's root. The folder must exist (a listing of it works). Returns the new folder.
+pub fn change_folder(target: &str) -> Result<String, FsError> {
+    let resolved = if target.is_empty() { String::new() } else { here(target) };
+    if !resolved.is_empty() {
+        MfHost.list(&resolved, &mut |_, _| {})?;
+    }
+    CWD_RESET.store(false, core::sync::atomic::Ordering::Relaxed);
+    *CWD.lock() = resolved.clone();
+    Ok(resolved)
+}
 
 fn error(code: isize) -> FsError {
     match code {
@@ -30,6 +103,10 @@ fn error(code: isize) -> FsError {
 
 /// A bare name means the boot volume (`tape_fs` would also look on other disks for a tape's configuration file).
 fn pin(reference: &str) -> Vec<u8> {
+    pin_raw(&here(reference))
+}
+
+fn pin_raw(reference: &str) -> Vec<u8> {
     let local = !reference.starts_with("//") && (!reference.contains('/') || (tape_fs::split_selector(reference.as_bytes()).0.is_empty() && mounts::lookup(reference.as_bytes()).is_none()));
     match storage::boot_disk().filter(|_| local) {
         Some(boot) => alloc::format!("disk{}/{reference}", boot + 1).into_bytes(),
@@ -59,6 +136,7 @@ impl Host for MfHost {
     }
 
     fn write(&mut self, reference: &str, data: &[u8]) -> Result<(), FsError> {
+        let reference = &here(reference);
         let _disk = tapefs::lock();
         let is_fat = tape_fs::is_fat(reference.as_bytes());
         match tape_fs::write(reference.as_bytes(), data) {
@@ -69,6 +147,7 @@ impl Host for MfHost {
     }
 
     fn remove(&mut self, reference: &str) -> Result<(), FsError> {
+        let reference = &here(reference);
         let _disk = tapefs::lock();
         if kernel_core::tape_vfs::is_ext_reference(reference.as_bytes()) {
             return match kernel_core::tape_vfs::remove(reference.as_bytes()) {
@@ -83,6 +162,7 @@ impl Host for MfHost {
     }
 
     fn mkdir(&mut self, reference: &str) -> Result<(), FsError> {
+        let reference = &here(reference);
         let _disk = tapefs::lock();
         match tape_fs::mkdir(reference.as_bytes()) {
             0 => Ok(()),
@@ -91,6 +171,7 @@ impl Host for MfHost {
     }
 
     fn owner_of(&mut self, reference: &str) -> Result<Owner, FsError> {
+        let reference = &here(reference);
         let _disk = tapefs::lock();
         let mut stat = fosfor_abi::tape::VfsStat::default();
         match kernel_core::tape_vfs::stat(reference.as_bytes(), &mut stat) {
@@ -100,6 +181,7 @@ impl Host for MfHost {
     }
 
     fn set_owner(&mut self, reference: &str, uid: u32, gid: u32, mode: Option<u16>) -> Result<(), FsError> {
+        let reference = &here(reference);
         let _disk = tapefs::lock();
         match kernel_core::tape_vfs::set_owner(reference.as_bytes(), uid, gid, mode.map_or(fosfor_abi::tape::VFS_KEEP_MODE, u32::from)) {
             0 => Ok(()),
@@ -108,6 +190,7 @@ impl Host for MfHost {
     }
 
     fn rename(&mut self, from: &str, to: &str) -> Result<bool, FsError> {
+        let (from, to) = (&here(from), &here(to));
         let _disk = tapefs::lock();
         if kernel_core::tape_vfs::is_ext_reference(from.as_bytes()) && kernel_core::tape_vfs::is_ext_reference(to.as_bytes()) {
             return match kernel_core::tape_vfs::rename(from.as_bytes(), to.as_bytes()) {
@@ -121,6 +204,7 @@ impl Host for MfHost {
     // The entries are collected under the lock and handed out after it is dropped: `each` prints, which may take a while on a
     // network terminal, and must not keep the disk from other CPUs.
     fn list(&mut self, volume: &str, each: &mut dyn FnMut(&mut dyn Host, Entry)) -> Result<&'static str, FsError> {
+        let volume = &here(volume);
         let mut entries: Vec<(Vec<u8>, u64, bool, Option<Stamp>)> = Vec::new();
         let kind = {
             let _disk = tapefs::lock();
@@ -170,6 +254,7 @@ impl Host for MfHost {
     fn copy_stream(&mut self, from: &str, to: &str) -> Option<Result<u64, FsError>> {
         use fosfor_abi::tape::{VFS_FILE, VfsMake, VfsStat};
         use kernel_core::tape_vfs;
+        let to = &here(to);
         if !tape_vfs::is_ext_reference(to.as_bytes()) {
             return None;
         }

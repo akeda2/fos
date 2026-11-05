@@ -450,7 +450,7 @@ pub fn resolve_volume(reference: &[u8]) -> Option<Volume> {
 /// was written; the result is the kind of volume (`FOSFS`, `FAT32`, `exFAT`) or an `FS_*` code. A disk with only a
 /// FAT32/exFAT volume lists its root directory.
 pub fn each_entry(reference: &[u8], each: &mut dyn FnMut(&[u8], u64, bool, Option<fat::Time>)) -> Result<&'static str, isize> {
-    if crate::tape_vfs::is_ext_reference(reference) {
+    if crate::tape_vfs::is_ext_folder(reference) {
         return crate::tape_vfs::each_entry(reference, each);
     }
     if crate::remote::is_remote(reference) {

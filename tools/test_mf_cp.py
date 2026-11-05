@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """`cp`, `mv` and `cmp` on the server kernel have no size limit (`make test-mf-cp`): a 40 MiB random file on an ext4 disk (over
 the 32 MiB the embedded kernel loads whole) is copied, compared and moved within the volume, and the SHA-256 the guest
-prints for the copy must equal the host's."""
+prints for the copy must equal the host's. Also `mount PATH @LABEL` of an ext volume and `cd`/`pwd`."""
 import hashlib
 import os
 import select
@@ -65,7 +65,7 @@ def main():
             qemu.stdin.flush()
             ok = wait_for(expect, timeout)
             time.sleep(0.3)
-            wait_for("fos> ", 10)
+            wait_for("> ", 10)
             return ok, log.decode("utf8", "replace")
 
         try:
@@ -82,6 +82,21 @@ def main():
             check(ok, "mv inside the volume", text[-300:])
             ok, text = command("ls @linuxvol", "moved.bin")
             check(ok and "copy.bin" not in text, "the moved file is there and the old name gone", text[-300:])
+            # A folder of the root mounted from the ext volume, and a working folder on it.
+            ok, text = command("mount data @linuxvol", "mount", 10)
+            ok, text = command("ls data", "moved.bin")
+            check(ok, "ls of a mount point backed by an ext volume", text[-300:])
+            ok, text = command("mkdir data/sub", "fos", 20)
+            ok, text = command("cd data/sub", "fos data/sub>", 20)
+            check(ok, "cd into a folder under the mount point shows it in the prompt", text[-300:])
+            ok, text = command("write note.txt hello", "fos", 20)
+            ok, text = command("cat /sub/note.txt", "hello", 20)
+            check(ok, "a relative write lands in the working folder; / is the volume's root", text[-300:])
+            ok, text = command("cd ../..", "fos", 20)
+            ok, text = command("pwd", "boot volume", 20)
+            check(ok, "cd ../.. returns to the boot volume", text[-300:])
+            ok, text = command("cd nosuch", "no such folder", 20)
+            check(ok, "cd to a missing folder fails", text[-300:])
         finally:
             qemu.kill()
     return finish()

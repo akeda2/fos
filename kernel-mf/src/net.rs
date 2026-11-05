@@ -330,6 +330,7 @@ fn handle_terminal(index: usize, source: [u8; 6], tag: u8, payload: &[u8]) -> bo
             SESSION_OPEN.store(true, Ordering::Relaxed);
             println!("Remote terminal connected from {} on interface {}.", Mac(&source), index + 1);
             println!("Type `help` for the commands.");
+            crate::shellhost::CWD_RESET.store(true, Ordering::Relaxed);
             shell::reset();
             shell::prompt();
         }

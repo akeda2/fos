@@ -65,6 +65,7 @@ pub fn mount(rest: &str) {
                 let (path, label) = (core::str::from_utf8(path).unwrap_or("?"), core::str::from_utf8(label).unwrap_or("?"));
                 match volumes::volume_labelled(label.as_bytes()) {
                     Some((number, _)) => println!("{path} -> @{label} (disk{number})"),
+                    None if kernel_core::ext4vol::disk_labelled(label.as_bytes()).is_some() => println!("{path} -> @{label} (ext volume)"),
                     None => println!("{path} -> @{label} (not present: {path}/ is the boot volume's own folder)"),
                 }
             });
@@ -77,7 +78,7 @@ pub fn mount(rest: &str) {
             println!("fstab: {set} mount(s){}.", if bad > 0 { " and lines it could not use" } else { "" });
         }
         (Some(path), Some(label), None) if label.starts_with('@') => match mounts::add(path.as_bytes(), label[1..].as_bytes()) {
-            Ok(()) => println!("{path} is now {label}{}.", if volumes::volume_labelled(label[1..].as_bytes()).is_some() { "" } else { " (not present yet: the boot volume's folder is used until it appears)" }),
+            Ok(()) => println!("{path} is now {label}{}.", if volumes::volume_labelled(label[1..].as_bytes()).is_some() || kernel_core::ext4vol::disk_labelled(label[1..].as_bytes()).is_some() { "" } else { " (not present yet: the boot volume's folder is used until it appears)" }),
             Err(mounts::Error::BadPath) => println!("mount: {path} is not a folder path (names of letters, digits, . _ - +, at most 48 characters)."),
             Err(mounts::Error::BadLabel) => println!("mount: {label} is not a volume label."),
             Err(mounts::Error::Full) => println!("mount: the table is full."),

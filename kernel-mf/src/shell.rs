@@ -106,14 +106,19 @@ pub fn poll_escape() {
     }
 }
 pub fn prompt() {
-    print!("{PROMPT}");
+    let folder = crate::shellhost::working_folder();
+    if folder.is_empty() {
+        print!("{PROMPT}");
+    } else {
+        print!("fos {folder}> ");
+    }
 }
 
 /// Commands `run` handles itself, outside the shared tables, for Tab completion.
 const BUILTINS: &[&str] = &[
     "version", "cpus", "mem", "pci", "disks", "nic", "tapesync", "gpio", "top", "threads", "ps", "date", "uptime", "slots", "audio", "usb", "tape", "run", "kill",
     "echo", "debug", "start", "keymap", "kup", "recv", "dmesg", "clear", "sleep", "io", "memmap", "bootinfo", "cpuinfo", "shrink", "sector", "mount", "umount",
-    "format", "label", "fsck", "grow", "install", "bootcode", "reboot", "shutdown", "halt", "ext4", "sha256",
+    "format", "label", "fsck", "grow", "install", "bootcode", "reboot", "shutdown", "halt", "ext4", "sha256", "cd", "pwd",
 ];
 
 /// Installs the line editor's Tab completion (the editor itself, with history, is `kernel_core::lineedit`).
@@ -177,7 +182,7 @@ pub fn run_command(line: &str) {
         "help" => match line.trim_start()[command.len()..].trim() {
             "" => {
                 println!("help version cpus mem pci disks nic uptime slots threads ps top echo TEXT reboot shutdown audio usb date nic [peers|discover] tapesync gpio @HOST ...");
-                println!("ls cat write rm cp mv cmp mkdir (`help NAME` shows one; files are NAME, diskN/NAME, @LABEL/NAME)");
+                println!("ls cat write rm cp mv cmp mkdir cd pwd (`help NAME` shows one; files are NAME, diskN/NAME, @LABEL/NAME)");
                 println!("keymap kup serial  recv NAME  io sleep clear memmap bootinfo cpuinfo  start dmesg sector ext4 mount umount label fsck grow shrink sha256 format install bootcode (disk commands ask first)");
                 println!("tape NAME [ARGS]  run a tape (a ring 3 process)   NAME [ARGS]  the same   kill PID");
             }
@@ -188,6 +193,16 @@ pub fn run_command(line: &str) {
                 }
             }
         },
+        "cd" => {
+            let target = line.trim_start()[command.len()..].trim();
+            if crate::shellhost::change_folder(target).is_err() {
+                println!("cd: {target}: no such folder.");
+            }
+        }
+        "pwd" => {
+            let folder = crate::shellhost::working_folder();
+            println!("{}", if folder.is_empty() { "/ (the boot volume)" } else { &folder });
+        }
         "version" => println!("Fosfor OS server kernel (mf), slice 8."),
         "cpus" => println!("{} CPU(s); boot CPU has taken {} timer ticks.", percpu::count(), percpu::ticks_of(0)),
         "mem" => {

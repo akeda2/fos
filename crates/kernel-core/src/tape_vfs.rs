@@ -24,6 +24,9 @@ fn ext4_error(error: ext4::Error) -> isize {
 /// The disk index (0-based) and path of the ext volume a reference names, or `None` when it names something else.
 fn ext_ref(reference: &[u8]) -> Option<(usize, &[u8])> {
     let (selector, path) = tape_fs::split_selector(reference);
+    if selector.is_empty() {
+        return mounted_ext(reference, true);
+    }
     if let Some(number) = tape_fs::ext_number(selector).filter(|&number| number > 0) {
         return Some((number - 1, path));
     }
@@ -39,9 +42,19 @@ fn ext_ref(reference: &[u8]) -> Option<(usize, &[u8])> {
     Some((number - 1, path))
 }
 
+/// A path under a mount point (`mount PATH @LABEL`, `fstab`) whose label is an ext volume's: its disk and what is left of
+/// the path. `folder`: the mount point itself counts (its root); for a file it does not, a file of that name is the boot volume's.
+fn mounted_ext(reference: &[u8], folder: bool) -> Option<(usize, &[u8])> {
+    let (label, rest) = if folder { crate::mounts::lookup_dir(reference)? } else { crate::mounts::lookup(reference)? };
+    Some((ext_disk_labelled(label.as_bytes())?, rest))
+}
+
 /// The disk of an ext volume named by `@LABEL`, when no FOSFS or FAT volume carries that label.
 fn label_disk(selector: &[u8]) -> Option<usize> {
-    let label = selector.strip_prefix(b"@").filter(|label| !label.is_empty())?;
+    ext_disk_labelled(selector.strip_prefix(b"@").filter(|label| !label.is_empty())?)
+}
+
+fn ext_disk_labelled(label: &[u8]) -> Option<usize> {
     if storage::volume_labelled(label).is_some() || tape_fs::fat_labelled(label).is_some() {
         return None;
     }
@@ -403,7 +416,15 @@ pub extern "C" fn api_vfs_set_owner(path: *const u8, path_length: usize, uid: u3
 /// True when `reference` names an ext volume by `extN` or `@LABEL`: the shell's file commands reach those through here.
 pub fn is_ext_reference(reference: &[u8]) -> bool {
     let (selector, _) = tape_fs::split_selector(reference);
+    if selector.is_empty() {
+        return mounted_ext(reference, false).is_some();
+    }
     tape_fs::ext_number(selector).is_some_and(|number| number > 0) || label_disk(selector).is_some()
+}
+
+/// Like `is_ext_reference` for a folder: the mount point itself is the ext volume's root.
+pub fn is_ext_folder(reference: &[u8]) -> bool {
+    is_ext_reference(reference) || (tape_fs::split_selector(reference).0.is_empty() && mounted_ext(reference, true).is_some())
 }
 
 /// What one `vfs_read` or `vfs_write` carries for the whole-file calls.
