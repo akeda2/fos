@@ -28,7 +28,9 @@ root=   the folder shared: disk2 (a whole ext4 disk), ext1 (the ext4 partition o
 share=  the share name clients use, //HOST/NAME (default: share). Give it
         more than once for more shares (up to 8): share=NAME uses root=,
         share=NAME=ROOT shares ROOT. Add ,ro (this share refuses changes)
-        and/or ,hidden (left out of the share list; connect by name).
+        and/or ,hidden (left out of the share list; connect by name),
+        ,guest (guests may use this share) or ,noguest (they may not),
+        otherwise a guest line in smbusers decides.
 ipc     answer IPC$ with the share list, so Explorer, Finder and smbclient -L
         show the shares (otherwise clients must name the share).
 port=   TCP port (default 445).
@@ -135,11 +137,13 @@ struct Entry {
     read_only: bool,
     /// Not in the share list of `IPC$`; clients can still connect to it by name.
     hidden: bool,
+    /// `,guest` (Some(true)) or `,noguest` (Some(false)); None follows the guest line of smbusers.
+    guest: Option<bool>,
 }
 
 /// Shares one smbd serves (the tree ids of a connection; `smb::server` allows 16).
 const SHARES: usize = 8;
-static mut SHARE_TABLE: ([Entry; SHARES], usize) = ([Entry { root: [0; ROOT_MAX], root_length: 0, name: [0; 32], name_length: 0, read_only: false, hidden: false }; SHARES], 0);
+static mut SHARE_TABLE: ([Entry; SHARES], usize) = ([Entry { root: [0; ROOT_MAX], root_length: 0, name: [0; 32], name_length: 0, read_only: false, hidden: false, guest: None }; SHARES], 0);
 /// `ipc` was given: `IPC$` answers with the share list.
 static IPC_ON: AtomicBool = AtomicBool::new(false);
 
@@ -245,7 +249,17 @@ impl Share for Files {
 
     fn guest(&mut self) -> Option<Identity> {
         let table = users();
-        if table.open { table.guest } else { Some(Identity { uid: 65534, gid: 65534 }) }
+        if !table.open {
+            return Some(Identity { uid: 65534, gid: 65534 });
+        }
+        // a share marked ,guest lets guests in even without a guest line (then as nobody)
+        let marked = shares().0[..shares().1].iter().any(|entry| entry.guest == Some(true));
+        table.guest.or(marked.then_some(Identity { uid: 65534, gid: 65534 }))
+    }
+
+    fn guest_allowed(&self, index: usize) -> bool {
+        let table = users();
+        !table.open || shares().0[..shares().1].get(index).is_some_and(|entry| entry.guest.unwrap_or(table.guest.is_some()))
     }
 
     fn read(&mut self, path: &str, offset: u64, out: &mut [u8]) -> Result<usize, ()> {
@@ -377,12 +391,14 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         let (spec, options) = word.split_once(',').unwrap_or((word, ""));
         let (name, folder) = spec.split_once('=').unwrap_or((spec, root));
         let folder = folder.trim_end_matches('/');
-        let (mut entry_only, mut hidden) = (false, false);
+        let (mut entry_only, mut hidden, mut guest) = (false, false, None);
         for option in options.split(',').filter(|option| !option.is_empty()) {
             match option {
                 "ro" => entry_only = true,
                 "hidden" => hidden = true,
-                _ => return println!("smbd: share={word}: ,{option} is not ,ro or ,hidden."),
+                "guest" => guest = Some(true),
+                "noguest" => guest = Some(false),
+                _ => return println!("smbd: share={word}: ,{option} is not ,ro, ,hidden, ,guest or ,noguest."),
             }
         }
         if name.is_empty() || name.len() > 32 || name.contains(['/', '\\']) || folder.len() > ROOT_MAX {
@@ -401,6 +417,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         entry.root_length = folder.len();
         entry.read_only = read_only || entry_only;
         entry.hidden = hidden;
+        entry.guest = guest;
         table.1 += 1;
     }
     if table.1 == 0 {

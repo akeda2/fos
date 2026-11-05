@@ -151,6 +151,11 @@ pub trait Share {
     fn guest(&mut self) -> Option<Identity> {
         Some(Identity { uid: 65534, gid: 65534 })
     }
+    /// Whether a guest session may connect to share `index` (from `find`); a logged-in user always may. `guest()` decides
+    /// whether a guest gets a session at all.
+    fn guest_allowed(&self, _index: usize) -> bool {
+        true
+    }
     /// Total and free bytes of the volume.
     fn space(&mut self) -> (u64, u64) {
         (0, 0)
@@ -231,6 +236,8 @@ pub struct Server<S: Share, const OPENS: usize> {
     /// 0: nothing yet, 1: challenge sent, 2: logged in.
     auth: u8,
     identity: Identity,
+    /// The session logged in as a guest.
+    guest_session: bool,
     /// The signing key once a password login succeeded; messages are signed with it (`sign`).
     signing: Option<[u8; 16]>,
     sign_answer: bool,
@@ -365,6 +372,7 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
             dialect: 0,
             auth: 0,
             identity: Identity { uid: 65534, gid: 65534 },
+            guest_session: false,
             signing: None,
             sign_answer: false,
             trees: 0,
@@ -674,6 +682,7 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
             3 if self.auth == 1 => {
                 let (identity, guest, key) = self.authenticate(&blob[at..])?;
                 self.identity = identity;
+                self.guest_session = guest;
                 self.signing = key.map(|session_key| if self.dialect >= 0x0300 { sign::signing_key_v3(&session_key) } else { session_key });
                 self.sign_answer = self.signing.is_some();
                 let written = if wrapped { neg_token_resp(&mut body[8..], 0, &[]) } else { 0 };
@@ -792,6 +801,9 @@ impl<S: Share, const OPENS: usize> Server<S, OPENS> {
             return Ok(16);
         }
         let index = core::str::from_utf8(share).ok().and_then(|name| self.share.find(name)).filter(|&index| (index as u32) < MAX_TREES).ok_or(BAD_NETWORK_NAME)?;
+        if self.guest_session && !self.share.guest_allowed(index) {
+            return Err(ACCESS_DENIED);
+        }
         self.share.select(index);
         self.trees |= 1 << index;
         chain.tree = index as u32 + 1;

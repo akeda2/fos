@@ -28,7 +28,7 @@ run smbd root=ext1 share=data &2
 | Setting | Meaning |
 | --- | --- |
 | `root=` | What is shared. `disk2` (whole ext4 disk), `ext1` (the ext4 partition of a disk that also has FOSFS), `disk2/music`, `@LABEL/site`, a FOSFS or FAT folder, or `//NAME` (a mounted remote share). Default: the boot volume's root. |
-| `share=` | Share name clients use: `//HOST/NAME` (default `share`). Repeat it for more shares (up to 8): `share=NAME` uses `root=`, `share=NAME=ROOT[,ro]` shares `ROOT` (`,ro` makes just that share read-only), e.g. `smbd share=data=ext1 share=music=@rackdata/media,ro | `share=` | Share name clients use: `//HOST/NAME` (default `share`). |2`. A client must still name the share (no `IPC$` list). |
+| `share=` | Share name clients use: `//HOST/NAME` (default `share`). Repeat it for more shares (up to 8): `share=NAME` uses `root=`, `share=NAME=ROOT[,OPTION...]` shares `ROOT`. Options: `ro` (read-only), `hidden` (left out of the share list, connect by name), `guest` (anonymous guests may use this share, even without a `guest:` line in `smbusers`), `noguest` (they may not; otherwise the `guest:` line decides). Example: `smbd ipc share=data=ext1 share=music=@rackdata/media,ro,guest &2`. The bare word `ipc` adds the `IPC$` share list. |
 | `port=` | TCP port (445). |
 | `ip=A.B.C.D/N`, `gateway=` | Fixed address; otherwise DHCP. |
 | `nic=N` | NIC number from 1 (default: `nic use`). |
