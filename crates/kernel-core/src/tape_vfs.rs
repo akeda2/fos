@@ -54,7 +54,38 @@ fn label_disk(selector: &[u8]) -> Option<usize> {
     ext_disk_labelled(selector.strip_prefix(b"@").filter(|label| !label.is_empty())?)
 }
 
+/// Labels recently found to be ext volumes': label, length, disk, and the disk count then (0: free slot). Finding out costs reads
+/// of every FOSFS and FAT volume's label, and a share rooted at `@LABEL` asks for every request. An entry stays good while the
+/// disk count is the same and, when that disk is the kept volume, it still has the label; the oldest is replaced first.
+static mut LABEL_CACHE: [([u8; 32], usize, usize, usize); 4] = [([0; 32], 0, 0, 0); 4];
+static mut LABEL_NEXT: usize = 0;
+
 fn ext_disk_labelled(label: &[u8]) -> Option<usize> {
+    // SAFETY: reached only from the serialised file calls, like `ext4vol::shared`.
+    let cache = unsafe { &mut *core::ptr::addr_of_mut!(LABEL_CACHE) };
+    let count = crate::block::count();
+    for entry in cache.iter_mut().filter(|entry| entry.3 != 0) {
+        if entry.1 == label.len() && entry.0[..entry.1] == *label {
+            if entry.3 == count && ext4vol::kept_label_is(entry.2, label) != Some(false) {
+                return Some(entry.2);
+            }
+            entry.3 = 0;
+        }
+    }
+    let disk = ext_disk_probe(label)?;
+    if label.len() <= 32 {
+        let next = core::ptr::addr_of_mut!(LABEL_NEXT);
+        let slot = unsafe { *next };
+        unsafe { *next = (slot + 1) % cache.len() };
+        cache[slot].0[..label.len()].copy_from_slice(label);
+        cache[slot].1 = label.len();
+        cache[slot].2 = disk;
+        cache[slot].3 = count.max(1);
+    }
+    Some(disk)
+}
+
+fn ext_disk_probe(label: &[u8]) -> Option<usize> {
     if storage::volume_labelled(label).is_some() || tape_fs::fat_labelled(label).is_some() {
         return None;
     }
