@@ -358,6 +358,7 @@ run: image
 test: image
 	python3 tools/check_hal.py
 	python3 tools/check_user_pointers.py
+	python3 tools/check_abi_support.py
 	cargo +nightly-2026-09-13 test --manifest-path abi/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/fat/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/ext4/Cargo.toml
