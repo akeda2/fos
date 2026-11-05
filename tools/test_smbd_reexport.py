@@ -4,6 +4,7 @@ and `smbd root=//nas` (NIC 2) shares it again, so smbclient on the host reads an
 The smbd service waits on the remote-volume mailbox from inside a service."""
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,9 @@ def smbclient(command):
 
 
 def main():
+    if not shutil.which("smbclient"):
+        print("SKIP smbd-reexport: needs smbclient")
+        return
     root = Path(__file__).resolve().parent.parent
     built = subprocess.run(["cargo", "build", "--release", "--example", "serve", "--target-dir", "target"], cwd=root / "crates" / "smb", capture_output=True, text=True)
     if built.returncode != 0:
