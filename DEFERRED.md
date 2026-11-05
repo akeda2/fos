@@ -660,3 +660,44 @@ Windows needs WS-Discovery (UDP 3702) or NetBIOS instead: a later step, same sha
 - **Tests:** host unit tests for packet building/parsing and name compression; an end-to-end test on a user-mode NIC is awkward
   (multicast does not cross QEMU slirp), so use a tap/bridge `Guest` option if one exists, else `avahi-browse -r` by hand on
   `rack` (hardware only) and say so in the commit message.
+
+## Planned: virtual NICs on the server kernel (2026-11-05)
+
+Several services on one physical NIC (rack: smbd, httpd, ... on the RTL8168; the i350s stay reserved for audio with direct
+access). A vNIC is a NIC number with its own MAC; the physical NIC does layer 2 and a small switch demuxes by destination MAC.
+Tapes see just another NIC, so `tape-ip`, DHCP, `smbd`, `httpd` and `router` need no change. mf only (no ABI change).
+
+- **A vNIC is a `Nic` variant** (`kernel-core/src/nic.rs`, `Nic::Virtual { parent, mac }`), so `nicctl` and `kernel-mf/src/tapenet.rs`
+  (claim/owner/reserve, FIFOs, `nic_mac`, `nic_send`) work on it unchanged. `family()` says `vnic`; `link_up` follows the parent.
+  `MAX_NICS` (8) rises (16); the frame FIFOs are static (`1600 * FRAME_FIFO` bytes per NIC), so check the memory cost.
+- **Receive demux** in `nicctl::drain_nic_to_fifo(parent)`: a frame whose destination is a vNIC's MAC goes to that vNIC's FIFO,
+  broadcast and multicast to the parent and every vNIC (each drops what it does not want, the queues are bounded and counted per
+  NIC so a busy `httpd` cannot starve `smbd`), anything else to the parent. The kernel's own frames (0x88b6, terminal, KUP) stay
+  with the parent only.
+- **Transmit:** `nic_send(vnic)` forwards to the parent's send path under the existing `lock_nics`. Offloads follow the parent.
+- **Hardware filter:** a vNIC MAC must be received. Simplest: parent promiscuous while it has a vNIC (cheap at these rates,
+  RTL8168 only has one exact-match MAC); later per-driver unicast filter entries (e1000 RAL/RAH has 16). Parent promiscuous
+  counts as the parent's owner state, so `claim`/release must not clear it while vNICs exist.
+- **Not on timestamping NICs:** `nic_ts_*`, `rx_arrival_us`, `nic_tx_offload` and the PTP calls stay physical-only; a vNIC
+  refuses them (`nic_ts_enable` returns 0), and `vnic add` refuses a parent a tape owns for audio/PTP.
+- **MAC:** locally administered (bit 1 of byte 0 set, bit 0 clear), derived from the parent MAC, the vNIC name and an index
+  (hash), so DHCP leases and names survive reboots; `mac=` overrides. Collisions with a peer in the table are reported.
+- **Persistent: `vnic` shell command.** `vnic` (list), `vnic add NAME on NICN [mac=...]`, `vnic del NAME`. Persisted by
+  `vnic NAME on NICN [mac=...]` lines in `settings`, created at boot before `start` runs, so `run smbd ... &5` can use it. Numbers
+  are the next free above the physical ones, and are stable by order in `settings`; `NAME` is also usable where a NIC number is
+  (`&web`).
+- **Ephemeral: `&&N`.** `run smbd @smbd.cfg &&2` = create a vNIC on NIC 2 (MAC from the tape name + instance), run the tape on
+  it, delete it when the tape ends (normal exit, ESC, crash: in the process-exit path next to `tapenet` release). Same code as the
+  persistent one; `&&NAME` is not needed. Tape name and instance feed the MAC so a restart keeps the DHCP lease.
+- **Peer announcements:** `hostname` broadcasts go out per NIC today; a vNIC announces as `hostname`+its number only when a
+  tape runs on it (so peers see `rack7`, not an idle vNIC); `fosadm` groups by hostname already (check it ignores vNICs when
+  deploying: it should reach the host through any NIC).
+- **Order:** (1) `Nic::Virtual`, demux and send with host unit tests for the demux (MAC, broadcast, multicast, queue full);
+  (2) `vnic` command and `settings` lines; (3) `&&N` and cleanup on exit; (4) docs (`NETWORKING.md`, `docs/big-kernel.md`, README
+  command table); (5) real hardware: rack, RTL8168 nic4 with smbd and httpd on two vNICs with different DHCP leases.
+- **Tests:** a Guest-based test on QEMU with two user-mode `-nic` or a tap/socket netdev: vNIC gets its own DHCP lease and MAC,
+  two tapes on two vNICs of one NIC talk at once (`test-mf-vnic`), the vNIC disappears when the tape ends, and a physical NIC
+  tape still gets no foreign frames. slirp hands out one lease per MAC, so DHCP on two vNICs should work; broadcast demux check
+  needs the socket netdev.
+- **Open:** a tape that runs on a vNIC and calls `nic_use`/`nic_active` (works by number); the shared-IP mode (several tapes,
+  one IP, split by port) is a separate, larger design (netd/tape sockets) and not part of this.
