@@ -109,17 +109,64 @@ pub fn drain_nics_to_fifo() {
     }
 }
 
+/// Where a received frame goes when virtual interfaces share the card.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Target {
+    /// The physical interface (its own MAC, or a unicast address nobody here owns: a bridging tape may want it).
+    Parent,
+    /// The virtual interface with that MAC.
+    Child(usize),
+    /// Broadcast and multicast: the parent and every virtual interface.
+    Everyone,
+}
+
+/// Picks the receiver of `frame` from its destination MAC; `children` are the virtual interfaces (index, MAC).
+pub fn classify(frame: &[u8], children: &[(usize, [u8; 6])]) -> Target {
+    let Some(destination) = frame.get(..6) else { return Target::Parent };
+    if destination[0] & 1 != 0 {
+        return Target::Everyone;
+    }
+    children.iter().find(|(_, mac)| mac[..] == *destination).map_or(Target::Parent, |&(index, _)| Target::Child(index))
+}
+
+fn count_virtual_received(child: usize) {
+    if let Some(nic::Nic::Virtual(nic)) = nic::at(child) {
+        nic.frames_received += 1;
+    }
+}
+
+/// Moves the frames waiting in interface `index`'s hardware ring into the FIFOs. A virtual interface drains its parent, which
+/// splits the traffic by destination MAC (`classify`); a frame the handler consumes (the kernel's own) is never copied.
 pub fn drain_nic_to_fifo(index: usize) {
+    if let Some(parent) = nic::virtual_parent(index) {
+        return drain_nic_to_fifo(parent);
+    }
+    let mut found = [(0usize, [0u8; 6]); MAX_NICS];
+    let count = nic::virtual_children(index, &mut found);
+    let children = &found[..count];
     let mut buffer = [0u8; 1600];
     // At most one ring's worth per call: under a line-rate flood the ring never stays empty, and an
     // unbounded loop here would starve the tape that is supposed to consume (and send) the traffic.
     for _ in 0..256 {
         let Some(length) = nic::at(index).and_then(|nic| nic.receive(&mut buffer)) else { break };
         let stamp = nic::at(index).map_or(0, |nic| nic.take_stamp());
-        if handle_frame(index, &buffer[..length]) {
+        let frame = &buffer[..length];
+        let target = classify(frame, children);
+        if let Target::Child(child) = target {
+            count_virtual_received(child);
+            queue_frame(child, frame, stamp);
             continue;
         }
-        queue_frame(index, &buffer[..length], stamp);
+        if handle_frame(index, frame) {
+            continue;
+        }
+        queue_frame(index, frame, stamp);
+        if target == Target::Everyone {
+            for &(child, _) in children {
+                count_virtual_received(child);
+                queue_frame(child, frame, 0);
+            }
+        }
     }
 }
 
@@ -222,6 +269,9 @@ pub fn nic_send(index: usize, frame: &[u8]) -> bool {
 }
 
 pub fn nic_set_promiscuous(index: usize, on: bool) -> bool {
+    if !on && nic::has_virtual(index) {
+        return true; // the virtual interfaces need it
+    }
     match nic::at(index) {
         Some(nic) => {
             nic.set_promiscuous(on);
@@ -300,5 +350,43 @@ pub fn nic_set_multicast(index: usize, on: bool) -> bool {
             true
         }
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const A: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
+    const B: [u8; 6] = [0x02, 0, 0, 0, 0, 2];
+
+    fn frame(destination: [u8; 6]) -> [u8; 60] {
+        let mut bytes = [0u8; 60];
+        bytes[..6].copy_from_slice(&destination);
+        bytes
+    }
+
+    #[test]
+    fn unicast_goes_to_the_owner_of_the_mac() {
+        let children = [(4, A), (5, B)];
+        assert_eq!(classify(&frame(A), &children), Target::Child(4));
+        assert_eq!(classify(&frame(B), &children), Target::Child(5));
+    }
+
+    #[test]
+    fn unknown_unicast_stays_with_the_parent() {
+        assert_eq!(classify(&frame([0x02, 0, 0, 0, 0, 9]), &[(4, A)]), Target::Parent);
+        assert_eq!(classify(&frame(A), &[]), Target::Parent);
+    }
+
+    #[test]
+    fn broadcast_and_multicast_reach_everyone() {
+        assert_eq!(classify(&frame([0xff; 6]), &[(4, A)]), Target::Everyone);
+        assert_eq!(classify(&frame([0x01, 0, 0x5e, 0, 0, 0xfb]), &[(4, A)]), Target::Everyone);
+    }
+
+    #[test]
+    fn a_runt_frame_goes_to_the_parent() {
+        assert_eq!(classify(&[0xff; 3], &[(4, A)]), Target::Parent);
     }
 }

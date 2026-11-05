@@ -302,7 +302,7 @@ fn discover() {
         if apic::micros() >= next_probe {
             next_probe += 1_000_000;
             for index in 0..nic::count() {
-                if net::link_up(index) {
+                if net::link_up(index) && !nic::is_virtual(index) {
                     let mut name = [0u8; 20];
                     let length = net::hostname(index, &mut name);
                     net::send_frame(index, &[0xff; 6], TAG_DISCOVER_REQUEST, &name[..length]);
