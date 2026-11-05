@@ -69,6 +69,14 @@ pub fn print_list() {
     let _nics = lock_nics();
     for index in 0..nic::count() {
         let Some(nic) = nic::at(index) else { continue };
+        if nic::is_virtual(index) {
+            if let (Some(parent), Some(name)) = (nic::virtual_parent(index), crate::vnic::name(index)) {
+                println!("nic{}: vnic {name} on nic{} {} link {}", index + 1, parent + 1, Mac(&nic.mac()), if nic.link_up() { "up" } else { "DOWN" });
+                let (received, sent, _) = nic.counters();
+                println!("   frames: {received} received, {sent} sent");
+            }
+            continue;
+        }
         let (bus, device, function, id) = unsafe { (*core::ptr::addr_of!(LOCATIONS))[index] };
         println!("nic{}: {} at {bus:02x}:{device:02x}.{function} (device {id:#06x}) {} link {}", index + 1, nic.family(), Mac(&nic.mac()), if nic.link_up() { "up" } else { "DOWN" });
         if let Some((speed, full)) = nic.link_speed() {

@@ -30,6 +30,7 @@ mod hwwd;
 mod net;
 mod netfs;
 mod netclient;
+mod vnic;
 mod tapesync;
 mod power;
 mod shell;
@@ -313,6 +314,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     }
     slots::confirm_boot();
     net::init();
+    vnic::apply();
     ps2::init();
     sched_selftest();
     sched::spawn("service", service_thread, 0).expect("the service thread");

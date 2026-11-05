@@ -938,6 +938,25 @@ This is the original, unedited text of AGENTS.md's `tapes/router/` bullet.
   late (`make test-tape-router-arp`). The tape deliberately has no dynamic routing,
   ICMP errors, fragmentation, or IPv6.
 
+## Virtual NICs (server kernel)
+
+Several services on one physical NIC while other NICs stay reserved for tapes with direct access (audio, PTP). A virtual
+interface is a NIC number with its own MAC on a physical NIC; the card does layer 2 and `nicctl::drain_nic_to_fifo` hands each
+interface the frames addressed to it (unicast by destination MAC, broadcast and multicast to all, the kernel's own frames to the
+physical NIC only). A tape on one sees an ordinary NIC: its own DHCP lease, ARP and ports. Works on every driver: the parent just
+goes promiscuous for as long as it has virtual interfaces.
+
+- `vnic` lists them, `vnic add NAME on N [mac=02:..]` makes one, `vnic del NAME` removes it (refused while a tape runs on it).
+  `settings` line `vnic NAME on N [mac=...]` creates it at boot, before `start`. `run TAPE &NAME` (or the number, 1 + physical
+  count and up) runs the tape on it.
+- The default MAC is `02:` plus five bytes hashed from the parent's MAC and the name, so DHCP leases and names survive reboots.
+- Names are 1-15 letters, digits or `-`, not a number. A removed interface leaves a dead slot that the next one reuses, so
+  numbers never shift. At most 16 NICs in all (`vnic` feature of `kernel-core`).
+- Not on a NIC a tape owns; no timestamps, PTP or offload calls on a virtual interface (physical NICs only). They do not
+  announce hostnames or answer `nic discover`: the host is known through its physical NIC.
+- `make test-mf-vnic` (two `httpd` on two interfaces of one e1000, each with its own lease); host tests in `nicctl.rs`.
+  Only real hardware shows the cards' own address filters (RTL8168, i350): promiscuous mode is assumed to deliver them.
+
 ## Hostname announcements
 
 Each machine broadcasts its name (tag 0x03, the discovery reply) on every interface with a link: four times in the first

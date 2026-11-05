@@ -90,7 +90,7 @@ fn lookup(host: &str) -> Option<([u8; 6], usize)> {
     (1..=count).filter_map(peer_at).find(|peer| core::str::from_utf8(&peer.1[..peer.2]).is_ok_and(|name| name.eq_ignore_ascii_case(host))).map(|peer| (peer.0, peer.3))
 }
 
-fn parse_mac(text: &str) -> Option<[u8; 6]> {
+pub(crate) fn parse_mac(text: &str) -> Option<[u8; 6]> {
     let mut mac = [0u8; 6];
     let mut parts = text.split(':');
     for byte in mac.iter_mut() {
