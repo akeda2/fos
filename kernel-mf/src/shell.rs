@@ -258,8 +258,18 @@ pub fn run_command(line: &str) {
         "audio" => crate::audioshell::command(words),
         "usb" => crate::usbshell::command(words),
         "tape" | "run" => {
-            let Some(name) = words.next() else { return println!("usage: tape NAME [ARGS] [&N]") };
-            let args = line.trim_start()[command.len()..].trim_start()[name.len()..].trim_start();
+            // `run` is the verb; `tape NAME` and `tape run NAME` (the embedded kernels' older spelling) stay accepted.
+            let mut rest = line.trim_start()[command.len()..].trim_start();
+            if command == "tape" {
+                if let Some(after) = rest.strip_prefix("run").filter(|after| after.is_empty() || after.starts_with(char::is_whitespace)) {
+                    rest = after.trim_start();
+                }
+            }
+            let (name, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+            if name.is_empty() {
+                return println!("usage: run NAME [ARGS] [&N]");
+            }
+            let args = args.trim_start();
             run_tape(name, args);
         }
         "kill" => match words.next().and_then(|word| word.parse::<u64>().ok()) {

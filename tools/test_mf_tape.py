@@ -72,7 +72,7 @@ def run(cpu, smp):
             # serial_*: port 1 is the second UART (COM2), a TCP socket on the host.
             mark = len(log)
             peer = socket.create_connection(("127.0.0.1", PEER_PORT), timeout=5)
-            qemu.stdin.write(b"tape fscheck serial\n")
+            qemu.stdin.write(b"tape run fscheck serial\n")
             qemu.stdin.flush()
             if wait_for("wrote 5", 20, mark):
                 peer.settimeout(5)
