@@ -29,6 +29,7 @@ CASES = [
     ("fscheck streams s1.bin s2.bin", ["streams 0: 20000 bytes, 0 wrong", "streams 1: 19900 bytes, 0 wrong"]),
     ("fscheck remove gone.tmp", ["fscheck: remove ok"]),
     ("fscheck info", ["hostname [fos-", "disk1 kind ", "console ", "clock set"]),
+    ("fscheck stack", ["fscheck: stack ok "]),
     ("netcheck", ["lease: address", "4/4 replies."]),
     ("gpiopanel", ["gpiopanel: this machine has no GPIO pins"]),
     ("memtest size=8 passes=1", ["memtest: PASS"]),
