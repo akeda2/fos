@@ -14,6 +14,7 @@ Prints the bytes read; a count of 0 means the offset is at or past the end.
        tape run fscheck vfswrite DIR          (ABI 34: create, write, truncate, rename, remove under DIR on an ext volume)
        tape run fscheck remove NAME           (create NAME, delete it with fs_remove, check it is gone)
        tape run fscheck info                  (hostname, peer count, disk 1, clock, console size)
+       tape run fscheck usbspin               (poll the USB calls until Escape; the shell must stay alive)
        tape run fscheck stack                 (touch 768 KiB of stack)
        tape run fscheck serial                (ABI 7: open port 1, send "ping", wait up to 8 s for a reply)
 "#);
@@ -46,6 +47,13 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     }
     if arguments == "serial" {
         return serial(api);
+    }
+    if arguments == "usbspin" {
+        println!("fscheck: usbspin running");
+        // Takes the kernel's USB lock on every call, like a tape polling MIDI or audio; only Escape ends it.
+        loop {
+            tape_rt::midi_devices();
+        }
     }
     if arguments == "stack" {
         return stack();

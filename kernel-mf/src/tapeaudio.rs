@@ -43,7 +43,12 @@ pub fn start(rate: u64, capture: u64, playback: u64) -> i64 {
     if OWNER.compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire).is_err() && OWNER.load(Ordering::Acquire) != pid {
         return i64::from(AUDIO_BUSY);
     }
+    // The drivers build a stream with interrupts enabled (control transfers wait on timer ticks), as the shell does; a
+    // system call arrives with them off, which hung the first stream start of a tape on EHCI audio.
+    let was_on = crate::cpu::interrupts_save_and_disable();
+    crate::cpu::interrupts_enable();
     let result = audio::start_for_tape(rate as u32, capture != 0, playback != 0);
+    crate::cpu::interrupts_restore(was_on);
     if result != 0 {
         OWNER.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Acquire).ok();
     }
