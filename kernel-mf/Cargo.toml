@@ -16,7 +16,7 @@ opt-level = "z"
 fosfor-abi = { path = "../abi" }
 fosfor-hal = { path = "../crates/fos-hal" }
 fosfor-fat = { path = "../crates/fat" }
-fosfor-kernel-core = { path = "../crates/kernel-core" }
+fosfor-kernel-core = { path = "../crates/kernel-core", features = ["vnic"] }
 fosfor-shell = { path = "../crates/shell" }
 fosfor-script = { path = "../crates/script" }
 fosfor-tape-sync = { path = "../crates/tape-sync" }

@@ -247,7 +247,8 @@ fn announce() {
         NEXT_ANNOUNCE = apic::ticks() + if ANNOUNCE_COUNT <= 4 { 1 } else { 10 } * TICK_HZ;
     }
     for index in 0..nic::count() {
-        if link_up(index) {
+        // virtual interfaces do not announce: their host is already known through its physical NIC
+        if link_up(index) && !nic::is_virtual(index) {
             let mut name = [0u8; 20];
             let length = hostname(index, &mut name);
             send(index, &[0xff; 6], TAG_DISCOVER_REPLY, &name[..length]);

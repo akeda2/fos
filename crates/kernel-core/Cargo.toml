@@ -17,3 +17,7 @@ fosfor-fat = { path = "../fat" }
 fosfor-ext4 = { path = "../ext4" }
 fosfor-hid = { path = "../hid" }
 fosfor-tape-sync = { path = "../tape-sync" }
+
+[features]
+# Virtual network interfaces (server kernel): room for 16 interfaces instead of 8.
+vnic = []
