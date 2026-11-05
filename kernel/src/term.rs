@@ -626,88 +626,11 @@ fn execute(command: &str) {
     if word != "bootcode" {
         crate::bootcode::cancel(); // and a boot-code update
     }
-    // The file commands and the common ones (shellcmds.rs) are the shared shell's (`crates/shell`, docs/shell.md); `copy` (other machines too) stays here.
-    if matches!(word, "help" | "ls" | "cat" | "write" | "mkdir" | "stat" | "chmod" | "chown" | "rm" | "cp" | "mv" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill" | "about" | "version" | "hexdump" | "sha256" | "fsck" | "kup" | "recv" | "audio" | "label" | "shrink" | "ext4" | "mount" | "umount" | "format" | "debug" | "tapesync" | "gpio" | "copy" | "pci" | "cpuinfo" | "bootinfo" | "memmap" | "irqstat" | "mmio" | "io") || (word == "usb" && !matches!(words.clone().next(), Some("try" | "abort-test"))) || (word == "nic" && matches!(words.clone().next(), None | Some("list" | "sniff" | "promisc" | "peers" | "discover" | "use" | "map" | "send" | "recv"))) {
-        fosfor_shell::execute(&mut crate::shellhost::KernelHost, &[crate::shellcmds::COMMANDS, fosfor_shell::files::COMMANDS], command);
-        return;
-    }
-    match word {
-        "nic" if matches!(words.clone().next(), Some("park" | "unpark")) => {
-            let park = words.next() == Some("park");
-            let Some(index) = words.next().and_then(|word| word.parse::<usize>().ok()).filter(|n| (1..=nic_count()).contains(n)) else {
-                crate::println!("nic park|unpark N: power the PHY of an unplugged interface down (see `nic`).");
-                return;
-            };
-            match if park { crate::nicpark::park(index - 1) } else { crate::nicpark::unpark(index - 1) } {
-                Ok(()) => crate::println!("nic {index}: {}.", if park { "parked, checked for a cable every 30 s" } else { "unparked, negotiating" }),
-                Err(why) => crate::println!("nic {index}: {why}."),
-            }
-        }
-        "nic" if matches!(words.clone().next(), Some("phy")) => {
-            words.next();
-            nic_phy(words.next());
-        }
-        "nic" if matches!(words.clone().next(), Some("ts")) => {
-            words.next();
-            nic_timestamp_test(words.next(), words.next(), words.next());
-        }
-        "nic" if matches!(words.clone().next(), Some("csum")) => {
-            words.next();
-            nic_checksum_test(words.next());
-        }
-        "nic" if matches!(words.clone().next(), Some("vlan")) => {
-            words.next();
-            nic_vlan_test(words.next(), words.next(), words.next());
-        }
-        "nic" if matches!(words.clone().next(), Some("mcast")) => {
-            words.next();
-            nic_multicast_test(words.next(), words.next(), words.next());
-        }
-        "gpu" => crate::gpu::command(),
-        "nic" if matches!(words.clone().next(), Some("regs")) => {
-            words.next();
-            let wanted = words.next().and_then(|word| word.parse::<usize>().ok());
-            for index in 0..nic_count() {
-                if wanted.is_some_and(|number| number != index + 1) {
-                    continue;
-                }
-                if let Some(nic) = nic_at(index) {
-                    crate::println!("{}: {} {}", index + 1, nic.family(), Mac(&nic.mac()));
-                    nic.dump_registers();
-                }
-            }
-        }
-        "tape" => crate::tape::command(command.strip_prefix("tape").unwrap_or("")),
-        "hda" => crate::hda::describe(),
-        "install" => crate::install::command(words),
-        "bootcode" => crate::bootcode::command(words),
-        "videomodes" => videomodes_command(),
-        "usb" => match words.next() {
-            Some("abort-test") => {
-                // A hidden test hook: see `Controller::abort_self_test`.
-                match crate::xhci::controller(0) {
-                    Some(controller) => crate::println!("xHCI command abort self-test: {}.", if controller.abort_self_test() { "passed (the ring carries on)" } else { "FAILED" }),
-                    None => crate::println!("xHCI command abort self-test: no xHCI controller."),
-                }
-            }
-            Some("try") => match words.next().and_then(|word| word.parse::<u8>().ok()) {
-                Some(port) => crate::usb_hid::try_port(port, words.next()),
-                None => crate::println!("Usage: usb try PORT [hot|warm]   (a diagnostic: reset the port by hand, then enumerate it once)"),
-            },
-            _ => {}
-        },
-        "midi" => crate::midishell::command(&mut words),
-        "touch" => crate::usb_pointer::command(&mut words),
-        "cpufreq" | "temp" => power_command(None),
-        "power" => match words.next() {
-            Some("hwp") => hwp_command(words.next()),
-            word => power_command(word.and_then(|word| word.parse::<u64>().ok())),
-        },
-        other => {
-            if !fosfor_shell::external(&mut crate::shellhost::KernelHost, command) {
-                crate::println!("Unknown command: {other} (try `help`).");
-            }
-        }
+    // Every command is in a table (docs/shell.md): the x86-only ones (shellx86.rs), the common ones (shellcmds.rs) and the file commands.
+    let tables = [crate::shellx86::COMMANDS, crate::shellcmds::COMMANDS, fosfor_shell::files::COMMANDS];
+    let mut host = crate::shellhost::KernelHost;
+    if !fosfor_shell::execute(&mut host, &tables, command) && !fosfor_shell::external(&mut host, command) {
+        crate::println!("Unknown command: {word} (try `help`).");
     }
 }
 
@@ -787,7 +710,7 @@ fn fat_error_text(error: fat::Error) -> &'static str {
 /// 0x3600, the number of modes at 0x3604, then one 8-byte record per mode from 0x3608 (mode number, width, height, bits per pixel,
 /// usable flag); the DDC (monitor data channel) results sit at 0x35f0 (capabilities AX, BX; EDID AX) and the native size read from
 /// the EDID at 0x35f8/0x35fc. Nothing there on a UEFI boot (the magic is missing).
-fn videomodes_command() {
+pub(crate) fn videomodes_command() {
     let read16 = |address: u64| unsafe { (address as *const u16).read_unaligned() };
     let read32 = |address: u64| unsafe { (address as *const u32).read_unaligned() };
     if !crate::paging::is_mapped(0x3000) || !crate::paging::is_mapped(0x3600) || read32(0x3600) != 0x5445_4256 {
@@ -1102,44 +1025,11 @@ pub(crate) fn debug_video(mut words: core::str::SplitWhitespace) {
 
 /// The x86 commands that are not in the shared tables yet (docs/shell.md), listed by `help` after the shared ones.
 pub(crate) fn help_extra() {
-    crate::println!("nic       the network interfaces (list); nic use|park|unpark|sniff|discover|peers|map|regs|send|recv");
-    crate::println!("videomodes   the screen modes the BIOS boot path's video BIOS offered (and what the monitor told)");
-    crate::println!("bootcode [update] [diskN]   show or replace the BIOS boot code and the UEFI loader (files on disk1)");
-    crate::println!("install diskN     copy the boot disk (ESP, kernel, files) onto another disk");
     crate::println!("date [set YYYY-MM-DD HH:MM]   the clock (local time; the RTC)");
-    crate::println!("tape ...  load NAME|net, run [ARGS], save NAME, status");
     crate::println!("NAME [ARGS]   a command that is not built in runs the script NAME.sh ($1..$9, $*, # comments) or the tape NAME");
-    crate::println!("usb       USB controllers, devices, keyboards (usb rescan)");
     crate::println!("keymap    [us|sv]  the local keyboard layout (sv: Swedish/Finnish; `keymap sv` in settings keeps it)");
     crate::println!("uptime    time since the timer started; sleep N waits N seconds");
-    crate::println!("cpufreq  (alias temp) temperature, speed and power now; same as plain `power`");
-    crate::println!("power    [N]  how much of the time the CPU slept in hlt (N: sample N s at the prompt)");
-    crate::println!("power hwp [performance|balanced|power]  CPU frequency scaling (Intel HWP)");
     crate::println!("Remote: term net, and tools/term_net.py, devloop.py, foscopy.py from a PC.");
-}
-
-/// Usage and summary of the x86 commands `execute` handles itself, for `help NAME`.
-const BUILTIN_HELP: &[(&str, &str, &str)] = &[
-    ("help", "help [NAME]", "lists the commands; with a name: its usage, or a tape's help screen."),
-    ("tape", "tape load NAME|net | run [ARGS] | save NAME | status", "loads a tape into memory, runs it, saves it, or shows what is loaded."),
-    ("install", "install diskN [LABEL] [bare] [force]   (then: install diskN confirm)", "copies the boot disk (ESP, kernel, files, folders) onto another disk."),
-    ("bootcode", "bootcode [diskN] | bootcode update [diskN]   (then: ... confirm)", "shows or replaces the BIOS boot code and the UEFI loader from files on disk1."),
-    ("videomodes", "videomodes", "the screen modes the BIOS video BIOS offered, and what the monitor told."),
-    ("hda", "hda", "describes the Intel HD Audio controllers and their codecs."),
-    ("gpu", "gpu", "reads (never writes) what the firmware left running on an Intel display engine."),
-    ("midi", "midi | midi monitor | midi send [#N] HEX HEX [HEX]", "USB-MIDI devices: list them, watch what they send, send a message."),
-    ("touch", "touch | touch monitor", "USB touch panels: list them, or watch finger events."),
-    ("power", "power [N] | power hwp [performance|balanced|power]", "how much the CPU slept in hlt; HWP frequency scaling."),
-    ("cpufreq", "cpufreq", "temperature, speed and power now; the same as plain `power`."),
-    ("temp", "temp", "temperature, speed and power now; the same as plain `power`."),
-];
-
-/// `help NAME` for the commands in `BUILTIN_HELP`; false for any other name.
-pub(crate) fn builtin_help(topic: &str) -> bool {
-    let Some((_, usage, summary)) = BUILTIN_HELP.iter().find(|(name, _, _)| *name == topic) else { return false };
-    crate::println!("{usage}");
-    crate::println!("  {summary}");
-    true
 }
 
 fn parse_number(word: &str) -> Option<u64> {
@@ -1163,7 +1053,7 @@ pub fn active_nic() -> usize {
 /// `nic use N`: the interface the other nic subcommands, and a tape's single-interface network calls, use.
 /// `nic phy N`: what the copper PHY and its link partner advertise. A gigabit pair that links at 100 with a partner
 /// offering 1000 has a cable fault (a bad pair); a partner that never offers 1000 is the far port or its settings.
-fn nic_phy(arg: Option<&str>) {
+pub(crate) fn nic_phy(arg: Option<&str>) {
     let Some(index) = arg.and_then(|word| word.parse::<usize>().ok()).filter(|n| (1..=nic_count()).contains(n)) else {
         crate::println!("nic phy N: show the copper PHY's advertised and partner abilities.");
         return;
@@ -1211,7 +1101,7 @@ pub(crate) fn drain_nics(mut visit: impl FnMut(usize, &[u8])) {
 /// `nic csum N`: turns transmit checksum offload on for interface N and broadcasts three IPv4 UDP frames (payloads of 5,
 /// 26 and 27 bytes: a padded short frame, even and odd lengths) whose UDP checksum field is 0, so the card must fill it
 /// in. A host on the same segment can check the sums (`tools/test_tx_offload.py`). Offload goes off again afterwards.
-fn nic_checksum_test(number: Option<&str>) {
+pub(crate) fn nic_checksum_test(number: Option<&str>) {
     let Some(index) = number.and_then(|word| word.parse::<usize>().ok()).filter(|n| (1..=nic_count()).contains(n)) else {
         return crate::println!("nic csum N: sends UDP frames with checksum 0 through the card's checksum offload (I350, RTL8168G/H).");
     };
@@ -1256,7 +1146,7 @@ fn nic_checksum_test(number: Option<&str>) {
 
 /// `nic vlan N add|del VID | clear`: registers or drops VLAN ids in the card's VLAN filter by hand (the call tapes make,
 /// `nic_vlan_filter`). With one id the card drops tagged frames of other ids; untagged frames always arrive.
-fn nic_vlan_test(index: Option<&str>, action: Option<&str>, vid: Option<&str>) {
+pub(crate) fn nic_vlan_test(index: Option<&str>, action: Option<&str>, vid: Option<&str>) {
     let usage = "nic vlan N add|del VID | clear: the card's VLAN filter (E1000 family); VID 0-4095.";
     let Some(index) = index.and_then(|word| word.parse::<usize>().ok()).filter(|n| (1..=nic_count()).contains(n)) else {
         return crate::println!("{usage}");
@@ -1281,7 +1171,7 @@ fn nic_vlan_test(index: Option<&str>, action: Option<&str>, vid: Option<&str>) {
 
 /// `nic mcast N join|leave MAC | clear`: joins or leaves one multicast group in the card's hash filter by hand, the
 /// call tapes make (`nic_multicast_join`), so a test can see that only the joined groups arrive.
-fn nic_multicast_test(index: Option<&str>, action: Option<&str>, address: Option<&str>) {
+pub(crate) fn nic_multicast_test(index: Option<&str>, action: Option<&str>, address: Option<&str>) {
     let usage = "nic mcast N join|leave MAC | clear: the card's multicast hash filter (E1000 family); MAC like 01:00:5e:01:02:03.";
     let Some(index) = index.and_then(|word| word.parse::<usize>().ok()).filter(|n| (1..=nic_count()).contains(n)) else {
         return crate::println!("{usage}");
@@ -1315,7 +1205,7 @@ fn nic_multicast_test(index: Option<&str>, action: Option<&str>, address: Option
 /// `nic ts N [send|listen]`: checks the card's IEEE 1588 hardware timestamps (I350). Plain: is SYSTIM running at
 /// 1 ns a tick? `send`: transmit a PTP Sync frame and print its stamp against SYSTIM just before and after.
 /// `listen`: for 10 s print the stamp of each PTP frame that arrives against SYSTIM when it was noticed.
-fn nic_timestamp_test(number: Option<&str>, action: Option<&str>, value: Option<&str>) {
+pub(crate) fn nic_timestamp_test(number: Option<&str>, action: Option<&str>, value: Option<&str>) {
     let Some(index) = number.and_then(|word| word.parse::<usize>().ok()).filter(|n| (1..=nic_count()).contains(n)) else {
         crate::println!("nic ts N [send|listen|all|adjust PPB|step NS]: IEEE 1588 hardware timestamps of interface N (I350).");
         return;
@@ -1456,6 +1346,40 @@ fn nic_timestamp_test(number: Option<&str>, action: Option<&str>, value: Option<
 /// Previous `power` reading: (micros, halted, wakeups, spun per reason), so the next call reports the time in between
 /// (for instance while a tape ran).
 static mut POWER_MARK: (u64, u64, u64, [u64; crate::cpu::SPIN_REASONS]) = (0, 0, 0, [0; crate::cpu::SPIN_REASONS]);
+
+/// `power [N]` and `power hwp [PREFERENCE]`; the words after `power`.
+pub(crate) fn power(rest: &str) {
+    let mut words = rest.split_whitespace();
+    match words.next() {
+        Some("hwp") => hwp_command(words.next()),
+        word => power_command(word.and_then(|word| word.parse::<u64>().ok())),
+    }
+}
+
+/// `nic park|unpark N`: power the PHY of an unplugged interface down or up.
+pub(crate) fn nic_park(park: bool, number: Option<&str>) {
+    let Some(index) = number.and_then(|word| word.parse::<usize>().ok()).filter(|n| (1..=nic_count()).contains(n)) else {
+        crate::println!("nic park|unpark N: power the PHY of an unplugged interface down (see `nic`).");
+        return;
+    };
+    match if park { crate::nicpark::park(index - 1) } else { crate::nicpark::unpark(index - 1) } {
+        Ok(()) => crate::println!("nic {index}: {}.", if park { "parked, checked for a cable every 30 s" } else { "unparked, negotiating" }),
+        Err(why) => crate::println!("nic {index}: {why}."),
+    }
+}
+
+/// `nic regs [N]`: every interface's (or interface N's) register dump.
+pub(crate) fn nic_regs(wanted: Option<usize>) {
+    for index in 0..nic_count() {
+        if wanted.is_some_and(|number| number != index + 1) {
+            continue;
+        }
+        if let Some(nic) = nic_at(index) {
+            crate::println!("{}: {} {}", index + 1, nic.family(), Mac(&nic.mac()));
+            nic.dump_registers();
+        }
+    }
+}
 
 /// `power [N]`: the share of time the CPU slept in `hlt` (it draws and heats least there) and, for the rest, whether
 /// it was polling on purpose (and why) or simply busy. With N it first idles at the prompt for N seconds.

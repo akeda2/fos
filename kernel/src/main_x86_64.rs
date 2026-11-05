@@ -25,6 +25,7 @@ mod tape;
 mod service_host;
 mod tasks;
 mod shellcmds;
+mod shellx86;
 mod shellhost;
 mod mounts;
 mod tapesync;
