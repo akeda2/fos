@@ -639,3 +639,24 @@ use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limi
   (`docs/big-kernel.md`, `docs/aarch64-plan.md`).
 - **mf on `rack`: USB audio interface times out during boot** (xHCI). Reproduce on the machine, read `dmesg`, fix in
   `usb_audio`/xHCI or the mf USB init.
+
+## Planned: smbd announces itself with mDNS (2026-11-05)
+
+So Linux (Avahi/Nautilus) and macOS (Finder) list `rack` under Network; `IPC$` (`ipc`) only lists shares after connecting.
+Windows needs WS-Discovery (UDP 3702) or NetBIOS instead: a later step, same shape.
+
+- **Opt-in `mdns` word** in `smbd.cfg`, off by default. Name from the `hostname` file (as the peer announcement), `.local`.
+- **`crates/tape-ip/src/mdns.rs`** (`no_std`, host-tested): build the records (PTR `_smb._tcp.local` -> `NAME._smb._tcp.local`,
+  SRV to port and `NAME.local`, TXT empty, A with the NIC's address), answer a query for them (unicast bit honoured), send
+  the announcement twice at start (1 s apart) and a goodbye (TTL 0) when smbd stops; refresh at 75 % of the TTL (120 s).
+  Probe first (three queries 250 ms apart); a conflicting answer stops the announcement with a message, no renaming.
+- **Transport:** UDP 5353, group 224.0.0.251 (MAC 01:00:5e:00:00:fb), TTL 255. Join with `tape_ip::igmp::Igmp::new([224,0,0,251])`
+  (also needed behind an IGMP-snooping switch); `leave` on exit. The group goes through the NIC's hash filter; where a driver
+  opens all multicast instead, that is a cost on the audio NIC, so note it in the log line.
+- **smbd integration:** the network thread polls the responder in its loop between TCP polls (no worker involvement, no
+  blocking). Print one line: name, NIC, whether the multicast filter was narrow. Share list is not in mDNS, only the host.
+- **Open:** `tape-ip::net` must hand UDP frames to the responder while `Tcp` owns the NIC receive path (see how DHCP renewal in
+  httpd takes its frames); check `tapes/router` (5353 mentioned) so it neither forwards nor eats the packets.
+- **Tests:** host unit tests for packet building/parsing and name compression; an end-to-end test on a user-mode NIC is awkward
+  (multicast does not cross QEMU slirp), so use a tap/bridge `Guest` option if one exists, else `avahi-browse -r` by hand on
+  `rack` (hardware only) and say so in the commit message.
