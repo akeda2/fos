@@ -820,6 +820,8 @@ pub const DHCP_OPTION_PAD: u8 = 0;
 pub const DHCP_OPTION_SUBNET_MASK: u8 = 1;
 pub const DHCP_OPTION_ROUTER: u8 = 3;
 pub const DHCP_OPTION_HOST_NAME: u8 = 12;
+/// Client FQDN (RFC 4702): flags, two obsolete RCODE bytes, then the name; dnsmasq (Pi-hole) files it in DNS.
+pub const DHCP_OPTION_CLIENT_FQDN: u8 = 81;
 pub const DHCP_OPTION_DNS: u8 = 6;
 pub const DHCP_OPTION_NTP: u8 = 42;
 pub const DHCP_OPTION_BROADCAST_ADDRESS: u8 = 28;
@@ -1546,6 +1548,9 @@ impl<const OPTION_CAP: usize> DhcpClient<OPTION_CAP> {
             }
             if self.host_name_len > 0 {
                 writer.push(DHCP_OPTION_HOST_NAME, &self.host_name[..self.host_name_len])?;
+                let mut fqdn = [0u8; 3 + DHCP_HOST_NAME_MAX];
+                fqdn[3..3 + self.host_name_len].copy_from_slice(&self.host_name[..self.host_name_len]);
+                writer.push(DHCP_OPTION_CLIENT_FQDN, &fqdn[..3 + self.host_name_len])?;
             }
             writer.push(
                 DHCP_OPTION_PARAMETER_REQUEST_LIST,
@@ -2793,6 +2798,18 @@ mod tests {
         assert!(client.poll(10, &mut output).unwrap().is_none());
         assert_eq!(client.state(), DhcpClientState::Failed);
         assert_eq!(client.retransmission_deadline(), None);
+    }
+
+    #[test]
+    fn dhcp_request_carries_the_name_as_host_name_and_fqdn() {
+        let mut client = DhcpClient::<64>::new(MAC_A, 2, 5, 2);
+        client.set_host_name(b"rack4");
+        let mut output = [0u8; 320];
+        let length = client.poll(0, &mut output).unwrap().unwrap();
+        let bytes = &output[..length];
+        let has = |needle: &[u8]| bytes.windows(needle.len()).any(|window| window == needle);
+        assert!(has(&[DHCP_OPTION_HOST_NAME, 5, b'r', b'a', b'c', b'k', b'4']));
+        assert!(has(&[DHCP_OPTION_CLIENT_FQDN, 8, 0, 0, 0, b'r', b'a', b'c', b'k', b'4']));
     }
 
     #[test]

@@ -12,6 +12,7 @@ import http.client
 import os
 import select
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -113,6 +114,24 @@ def get(method, path, body=None, attempts=5):
             time.sleep(1)
 
 
+def raw(data, want_responses=1, timeout=15):
+    """Sends `data` on a fresh connection and reads until the server closes it (or, for one answer, until its body is in)."""
+    with socket.create_connection(("127.0.0.1", HOST_PORT), timeout=timeout) as sock:
+        sock.sendall(data)
+        got = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            got += chunk
+            if want_responses == 1 and b"\r\n\r\n" in got:
+                head, _, rest = got.partition(b"\r\n\r\n")
+                length = [int(line.split(b":")[1]) for line in head.split(b"\r\n") if line.lower().startswith(b"content-length")]
+                if length and len(rest) >= length[0]:
+                    break
+        return got
+
+
 def main():
     tape = Path(__file__).resolve().parent.parent / "build" / "fosfor" / "tapes" / "fosplay"
     with Guest(forward=HOST_PORT, data_disk=True) as g:
@@ -161,6 +180,57 @@ def main():
         status, _, body = get("GET", "/big.bin")
         check(status == 200 and hashlib.sha256(body).digest() == hashlib.sha256(tape.read_bytes()).digest(),
               "a large file arrives intact (SHA-256 matches the tape)", f"{status} {len(body)} bytes")
+
+        # Keep-alive, ranges, pipelining.
+        connection = http.client.HTTPConnection("127.0.0.1", HOST_PORT, timeout=15)
+        connection.request("GET", "/a.txt")
+        first = connection.getresponse()
+        first_body = first.read()
+        connection.request("GET", "/docs/b.html")
+        second = connection.getresponse()
+        second_body = second.read()
+        check(first_body == b"plain text here" and second_body == b"<p>bee</p>" and first.version == 11
+              and (first.getheader("Connection") or "").lower() == "keep-alive", "two requests share one connection (keep-alive)", f"{first_body!r} {second_body!r}")
+        connection.close()
+        answers = raw(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\nGET /docs/b.html HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 2)
+        check(answers.count(b"HTTP/1.1 200") == 2 and answers.index(b"plain text here") < answers.index(b"<p>bee</p>"),
+              "pipelined requests are answered in order", repr(answers))
+        answer = raw(b"GET /a.txt HTTP/1.0\r\n\r\n")
+        check(answer.startswith(b"HTTP/1.1 200") and b"Connection: close" in answer and answer.endswith(b"plain text here"),
+              "HTTP/1.0 gets Connection: close and the body", repr(answer))
+        for header, want_status, want_body, want_range in (("bytes=6-9", 206, b"text", "bytes 6-9/15"), ("bytes=-4", 206, b"here", "bytes 11-14/15"),
+                                                           ("bytes=11-", 206, b"here", "bytes 11-14/15"), ("bytes=0-1000", 206, b"plain text here", "bytes 0-14/15"),
+                                                           ("bytes=15-", 416, None, "bytes */15"), ("bytes=0-1,3-4", 200, b"plain text here", None)):
+            connection = http.client.HTTPConnection("127.0.0.1", HOST_PORT, timeout=15)
+            connection.request("GET", "/a.txt", headers={"Range": header})
+            response = connection.getresponse()
+            data = response.read()
+            connection.close()
+            check(response.status == want_status and (want_body is None or data == want_body) and response.getheader("Content-Range") == want_range,
+                  f"Range: {header} -> {want_status}", f"{response.status} {data!r} {response.getheader('Content-Range')}")
+        status, headers, _ = get("HEAD", "/a.txt")
+        check(headers.get("Accept-Ranges") == "bytes", "files advertise Accept-Ranges", str(headers))
+        big = tape.read_bytes()
+        start = 300_000
+        connection = http.client.HTTPConnection("127.0.0.1", HOST_PORT, timeout=30)
+        connection.request("GET", "/big.bin", headers={"Range": f"bytes={start}-"})
+        response = connection.getresponse()
+        data = response.read()
+        connection.close()
+        check(response.status == 206 and data == big[start:], "a ranged download of a large file resumes mid-chunk", f"{response.status} {len(data)} of {len(big) - start}")
+
+        # A client that sends half a request and stalls must not hold up the others.
+        slow = socket.create_connection(("127.0.0.1", HOST_PORT), timeout=15)
+        slow.sendall(b"GET /a.tx")
+        status, _, body = get("GET", "/a.txt")
+        check(status == 200 and body == b"plain text here", "a stalled half request does not block another client", f"{status} {body!r}")
+        slow.sendall(b"t HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        slow.settimeout(15)
+        reply = b""
+        while chunk := slow.recv(4096):
+            reply += chunk
+        slow.close()
+        check(reply.startswith(b"HTTP/1.1 200") and reply.endswith(b"plain text here"), "and finishes once the rest arrives", repr(reply))
 
         g.line("kill httpd")
         g.line("run httpd root=@data ip=10.0.2.15/24 gateway=10.0.2.2 &2", "fos> ", 40)
