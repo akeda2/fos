@@ -113,7 +113,7 @@ pub fn prompt() {
 const BUILTINS: &[&str] = &[
     "version", "cpus", "mem", "pci", "disks", "nic", "tapesync", "gpio", "top", "threads", "ps", "date", "uptime", "slots", "audio", "usb", "tape", "run", "kill",
     "echo", "debug", "start", "keymap", "kup", "recv", "dmesg", "clear", "sleep", "io", "memmap", "bootinfo", "cpuinfo", "shrink", "sector", "mount", "umount",
-    "format", "label", "fsck", "grow", "install", "bootcode", "reboot", "ext4", "sha256",
+    "format", "label", "fsck", "grow", "install", "bootcode", "reboot", "shutdown", "halt", "ext4", "sha256",
 ];
 
 /// Installs the line editor's Tab completion (the editor itself, with history, is `kernel_core::lineedit`).
@@ -176,7 +176,7 @@ pub fn run_command(line: &str) {
     match command {
         "help" => match line.trim_start()[command.len()..].trim() {
             "" => {
-                println!("help version cpus mem pci disks nic uptime slots threads ps top echo TEXT reboot audio usb date nic [peers|discover] tapesync gpio @HOST ...");
+                println!("help version cpus mem pci disks nic uptime slots threads ps top echo TEXT reboot shutdown audio usb date nic [peers|discover] tapesync gpio @HOST ...");
                 println!("ls cat write rm cp mv cmp mkdir (`help NAME` shows one; files are NAME, diskN/NAME, @LABEL/NAME)");
                 println!("keymap kup serial  recv NAME  io sleep clear memmap bootinfo cpuinfo  start dmesg sector ext4 mount umount label fsck grow shrink sha256 format install bootcode (disk commands ask first)");
                 println!("tape NAME [ARGS]  run a tape (a ring 3 process)   NAME [ARGS]  the same   kill PID");
@@ -211,13 +211,7 @@ pub fn run_command(line: &str) {
         "nic" if matches!(words.clone().next(), Some("discover")) => crate::netclient::nic_discover(),
         "tapesync" => crate::netclient::tapesync(words),
         "gpio" => crate::netclient::gpio(line.trim_start().strip_prefix("gpio").unwrap_or("")),
-        "nic" => {
-            for index in 0..nic::count() {
-                if let Some(mac) = net::mac(index) {
-                    println!("nic{}: {} link {}", index + 1, Mac(&mac), if net::link_up(index) { "up" } else { "down" });
-                }
-            }
-        }
+        "nic" => net::print_list(),
         "top" => crate::top::start(&line.trim_start()[command.len()..]),
         "threads" => {
             sched::for_each(|id, name, state| println!("{id:3} {name:<16} {state:?}"));
@@ -338,6 +332,12 @@ pub fn run_command(line: &str) {
         "sha256" => crate::sysshell::sha256(&mut crate::shellhost::MfHost, &line.trim_start()[command.len()..]),
         "install" => crate::install::command(words),
         "bootcode" => crate::bootcode::command(words),
+        "shutdown" | "halt" => {
+            println!("Powering off.");
+            slots::mark_clean_stop();
+            power::shutdown();
+            println!("shutdown: the machine did not power off (no ACPI _S5_ or the chipset ignored it).");
+        }
         "reboot" => {
             println!("Restarting.");
             slots::mark_clean_stop();
