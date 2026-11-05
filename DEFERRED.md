@@ -661,7 +661,7 @@ Windows needs WS-Discovery (UDP 3702) or NetBIOS instead: a later step, same sha
   (multicast does not cross QEMU slirp), so use a tap/bridge `Guest` option if one exists, else `avahi-browse -r` by hand on
   `rack` (hardware only) and say so in the commit message.
 
-## Planned: virtual NICs on the server kernel (2026-11-05; steps 1-2 done: core, demux, `vnic` command, settings, `make test-mf-vnic`, see NETWORKING.md; `&&N` and rack remain)
+## Planned: virtual NICs on the server kernel (2026-11-05; steps 1-3 done: core, demux, `vnic` command, settings, `make test-mf-vnic`, see NETWORKING.md; rack remains)
 
 Several services on one physical NIC (rack: smbd, httpd, ... on the RTL8168; the i350s stay reserved for audio with direct
 access). A vNIC is a NIC number with its own MAC; the physical NIC does layer 2 and a small switch demuxes by destination MAC.
@@ -686,14 +686,14 @@ Tapes see just another NIC, so `tape-ip`, DHCP, `smbd`, `httpd` and `router` nee
   `vnic NAME on NICN [mac=...]` lines in `settings`, created at boot before `start` runs, so `run smbd ... &5` can use it. Numbers
   are the next free above the physical ones, and are stable by order in `settings`; `NAME` is also usable where a NIC number is
   (`&web`).
-- **Ephemeral: `&&N`.** `run smbd @smbd.cfg &&2` = create a vNIC on NIC 2 (MAC from the tape name + instance), run the tape on
+- **Ephemeral: `&+N` (`&&` is the shell AND).** `run smbd @smbd.cfg &+2` = create a vNIC on NIC 2 (MAC from the tape name + instance), run the tape on
   it, delete it when the tape ends (normal exit, ESC, crash: in the process-exit path next to `tapenet` release). Same code as the
-  persistent one; `&&NAME` is not needed. Tape name and instance feed the MAC so a restart keeps the DHCP lease.
+  persistent one; `&+NAME` is not needed. Tape name and instance feed the MAC so a restart keeps the DHCP lease.
 - **Peer announcements:** `hostname` broadcasts go out per NIC today; a vNIC announces as `hostname`+its number only when a
   tape runs on it (so peers see `rack7`, not an idle vNIC); `fosadm` groups by hostname already (check it ignores vNICs when
   deploying: it should reach the host through any NIC).
 - **Order:** (1) `Nic::Virtual`, demux and send with host unit tests for the demux (MAC, broadcast, multicast, queue full);
-  (2) `vnic` command and `settings` lines; (3) `&&N` and cleanup on exit; (4) docs (`NETWORKING.md`, `docs/big-kernel.md`, README
+  (2) `vnic` command and `settings` lines; (3) `&+N` and cleanup on exit; (4) docs (`NETWORKING.md`, `docs/big-kernel.md`, README
   command table); (5) real hardware: rack, RTL8168 nic4 with smbd and httpd on two vNICs with different DHCP leases.
 - **Tests:** a Guest-based test on QEMU with two user-mode `-nic` or a tap/socket netdev: vNIC gets its own DHCP lease and MAC,
   two tapes on two vNICs of one NIC talk at once (`test-mf-vnic`), the vNIC disappears when the tape ends, and a physical NIC

@@ -93,11 +93,95 @@ fn remove(name: &str) -> Result<(), &'static str> {
     if crate::tapenet::owner(index) != 0 {
         return Err("a tape is running on it (`kill` it first)");
     }
+    drop_index(index);
+    Ok(())
+}
+
+fn drop_index(index: usize) {
     let _nics = net::lock_nics();
     nic::remove_virtual(index);
     kernel_core::nicctl::clear_frame_queue_nic(index);
-    unsafe { (*core::ptr::addr_of_mut!(NAMES))[index].1 = 0 };
-    Ok(())
+    unsafe {
+        (*core::ptr::addr_of_mut!(NAMES))[index].1 = 0;
+        (*core::ptr::addr_of_mut!(EPHEMERAL))[index] = false;
+    }
+}
+
+/// `run TAPE ... &+N`: the virtual interfaces that exist only for one tape (removed when it ends).
+static mut EPHEMERAL: [bool; MAX_NICS] = [false; MAX_NICS];
+
+/// The name for a tape's own interface: the tape's name (letters, digits, `-`), then `-2`, `-3` ... while taken, so the MAC
+/// (hashed from the name) is the same every time the tape runs alone.
+fn ephemeral_name(tape: &str) -> ([u8; NAME_MAX], usize) {
+    let mut base = [0u8; NAME_MAX];
+    let mut length = 0;
+    for byte in tape.bytes().filter(|byte| byte.is_ascii_alphanumeric() || *byte == b'-').take(NAME_MAX - 3) {
+        base[length] = byte.to_ascii_lowercase();
+        length += 1;
+    }
+    if length == 0 || core::str::from_utf8(&base[..length]).is_ok_and(|name| name.parse::<u64>().is_ok()) {
+        base[..4].copy_from_slice(b"tape");
+        length = 4;
+    }
+    for instance in 1..100usize {
+        let mut name = base;
+        let mut taken = length;
+        if instance > 1 {
+            name[taken] = b'-';
+            taken += 1;
+            if instance >= 10 {
+                name[taken] = b'0' + (instance / 10) as u8;
+                taken += 1;
+            }
+            name[taken] = b'0' + (instance % 10) as u8;
+            taken += 1;
+        }
+        if lookup(core::str::from_utf8(&name[..taken]).unwrap_or("")).is_none() {
+            return (name, taken);
+        }
+    }
+    (base, length)
+}
+
+/// A virtual interface made for one tape that is not running yet: dropped again unless `keep` is called (the tape did not start).
+pub struct Fresh(usize);
+
+impl Fresh {
+    /// The interface's NIC index.
+    pub fn index(&self) -> usize {
+        self.0
+    }
+
+    /// The tape runs: its end removes the interface (`tape_ended`).
+    pub fn keep(self) {
+        core::mem::forget(self);
+    }
+}
+
+impl Drop for Fresh {
+    fn drop(&mut self) {
+        drop_index(self.0);
+    }
+}
+
+/// `run TAPE ... &+N`: makes an interface on physical NIC `parent` (1-based) for `tape`.
+pub fn add_ephemeral(tape: &str, parent: usize) -> Result<Fresh, &'static str> {
+    if parent == 0 {
+        return Err("`&+N` takes the physical NIC number, from 1");
+    }
+    let (bytes, length) = ephemeral_name(tape);
+    let name = core::str::from_utf8(&bytes[..length]).unwrap_or("tape");
+    let index = add(name, parent - 1, None)?;
+    unsafe { (*core::ptr::addr_of_mut!(EPHEMERAL))[index] = true };
+    println!("vnic {name}: nic{} on nic{parent} (MAC {}), removed when the tape ends.", index + 1, Mac(&nic::at(index).map_or([0; 6], |card| card.mac())));
+    Ok(Fresh(index))
+}
+
+/// The process that owned NIC `index` ended: an interface made for it by `&+N` goes with it.
+pub fn tape_ended(index: usize) {
+    if index < MAX_NICS && unsafe { (*core::ptr::addr_of!(EPHEMERAL))[index] } {
+        drop_index(index);
+    }
 }
 
 fn parse_options<'a>(words: impl Iterator<Item = &'a str>) -> Result<Option<[u8; 6]>, &'static str> {

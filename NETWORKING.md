@@ -949,6 +949,8 @@ goes promiscuous for as long as it has virtual interfaces.
 - `vnic` lists them, `vnic add NAME on N [mac=02:..]` makes one, `vnic del NAME` removes it (refused while a tape runs on it).
   `settings` line `vnic NAME on N [mac=...]` creates it at boot, before `start`. `run TAPE &NAME` (or the number, 1 + physical
   count and up) runs the tape on it.
+- `run TAPE ... &+N` makes a throw-away interface on physical NIC N named after the tape (`httpd`, `httpd-2`, ...), runs the tape
+  on it and removes it when the tape ends. (`&&` is the shell's AND, hence `&+`.)
 - The default MAC is `02:` plus five bytes hashed from the parent's MAC and the name, so DHCP leases and names survive reboots.
 - Names are 1-15 letters, digits or `-`, not a number. A removed interface leaves a dead slot that the next one reuses, so
   numbers never shift. At most 16 NICs in all (`vnic` feature of `kernel-core`).

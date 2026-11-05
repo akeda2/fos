@@ -394,7 +394,24 @@ fn split_background(args: &str) -> (&str, Option<Result<u64, ()>>) {
 /// `run NAME ARGS`: the tape becomes the foreground process (Escape stops it). With `&N` it is a background tape (a service):
 /// it owns NIC N, keeps running while the shell takes commands, and ends with `kill PID`.
 pub fn run_tape(name: &str, args: &str) {
-    let (args, background) = split_background(args);
+    // `&+N`: a virtual interface on physical NIC N made for this tape alone and removed when it ends.
+    let mut fresh = None;
+    let mut args = args;
+    let mut background = None;
+    if let Some((before, last)) = Some(args.trim()).map(|text| text.rsplit_once(char::is_whitespace).unwrap_or(("", text))).filter(|(_, last)| last.starts_with("&+")) {
+        match last[2..].parse::<usize>().map_err(|_| "`&+N` takes the physical NIC number, from 1").and_then(|parent| crate::vnic::add_ephemeral(name, parent)) {
+            Ok(interface) => {
+                background = Some(Ok(1u64 << interface.index()));
+                fresh = Some(interface);
+                args = before;
+            }
+            Err(reason) => return println!("run: {reason}."),
+        }
+    }
+    let (args, background) = match background {
+        Some(background) => (args.trim(), Some(background)),
+        None => split_background(args),
+    };
     let nics = match background {
         Some(Err(())) => return println!("run: `&N` or `&N,M` names the NICs the background tape owns (`&0` for none)."),
         Some(Ok(mask)) => {
@@ -433,6 +450,9 @@ pub fn run_tape(name: &str, args: &str) {
     crate::process::START_NICS.store(nics.unwrap_or(0), core::sync::atomic::Ordering::Release);
     let started = crate::process::spawn_elf(name, &image, args.as_bytes());
     crate::process::START_NICS.store(0, core::sync::atomic::Ordering::Release);
+    if let (Some(interface), Ok(_)) = (fresh.take(), &started) {
+        interface.keep();
+    }
     match started {
         Ok(pid) => match nics {
             Some(_) => {
