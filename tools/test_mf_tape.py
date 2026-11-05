@@ -8,10 +8,15 @@ import re
 import select
 import subprocess
 import sys
+import socket
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import testslot  # noqa: E402
+
+PEER_PORT = testslot.port(5873)
 IMAGE = Path(os.environ.get("FOSFOR_IMAGE_MF_TAPES", ROOT / "build" / "fosfor-mf" / "fosfor-tapes.img"))
 CODE = next(p for p in ["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_CODE.fd",
                         "/usr/share/edk2/ovmf/OVMF_CODE.fd"] if Path(p).exists())
@@ -34,7 +39,7 @@ CASES = [
 def run(cpu, smp):
     qemu = subprocess.Popen(
         ["qemu-system-x86_64", "-cpu", cpu, "-machine", "q35", "-m", "512", "-smp", str(smp), "-display", "none",
-         "-nic", "user,model=e1000", "-serial", "stdio", "-monitor", "none", "-no-reboot",
+         "-nic", "user,model=e1000", "-serial", "stdio", "-serial", f"tcp:127.0.0.1:{PEER_PORT},server=on,wait=off", "-monitor", "none", "-no-reboot",
          "-drive", f"if=pflash,format=raw,readonly=on,file={CODE}", "-drive", f"format=raw,file={IMAGE},snapshot=on"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     log = b""
@@ -63,6 +68,27 @@ def run(cpu, smp):
                 if not done or "exited with code 0." not in new:
                     failures.append(f"`tape {command}` did not finish cleanly:\n{new}")
                     break
+        if not failures:
+            # serial_*: port 1 is the second UART (COM2), a TCP socket on the host.
+            mark = len(log)
+            peer = socket.create_connection(("127.0.0.1", PEER_PORT), timeout=5)
+            qemu.stdin.write(b"tape fscheck serial\n")
+            qemu.stdin.flush()
+            if wait_for("wrote 5", 20, mark):
+                peer.settimeout(5)
+                heard = peer.recv(64)
+                peer.sendall(b"pong\n")
+            else:
+                heard = b""
+            wait_for("exited with code 0.", 20, mark)
+            new = log[mark:].decode("utf8", "replace")
+            for expected in ["serial ports 1", "serial open 9 -> -1", "serial open 0 wrote 5", "serial got [pong]", "serial reopen 0"]:
+                if expected not in new:
+                    failures.append(f"serial: missing {expected!r}:\n{new}")
+                    break
+            if b"ping" not in heard:
+                failures.append(f"serial: the peer heard {heard!r}, not ping")
+            peer.close()
         if not failures:
             # memtest reports a failing word at its physical address (ABI 31 `phys_addr`), not the process's virtual one.
             mark = len(log)

@@ -17,7 +17,7 @@ use core::mem::{offset_of, size_of};
 use fosfor_abi::tape::{KEY_BASE, KEY_NONE, TAPE_API_VERSION, TapeApi};
 
 use crate::trap::Frame;
-use crate::{threads, apic, fb, fpu, pmm, process, sched, tapeaudio, tapefs, tapenet, tapesys, vm};
+use crate::{threads, apic, fb, fpu, pmm, process, sched, tapeaudio, tapefs, tapenet, tapeserial, tapesys, vm};
 
 pub const SHIM_BASE: u64 = vm::USER_BASE + 0x200_0000;
 pub const TABLE_BASE: u64 = SHIM_BASE + 0x1000;
@@ -101,6 +101,15 @@ const DISK_INFO: u64 = slot(offset_of!(TapeApi, disk_info));
 const DISK_FORMAT_EXFAT: u64 = slot(offset_of!(TapeApi, disk_format_exfat));
 const WALL_CLOCK: u64 = slot(offset_of!(TapeApi, wall_clock));
 const WALL_CLOCK_SET: u64 = slot(offset_of!(TapeApi, wall_clock_set));
+const SERIAL_COUNT: u64 = slot(offset_of!(TapeApi, serial_count));
+const SERIAL_INFO: u64 = slot(offset_of!(TapeApi, serial_info));
+const SERIAL_OPEN: u64 = slot(offset_of!(TapeApi, serial_open));
+const SERIAL_CLOSE: u64 = slot(offset_of!(TapeApi, serial_close));
+const SERIAL_READ: u64 = slot(offset_of!(TapeApi, serial_read));
+const SERIAL_WRITE: u64 = slot(offset_of!(TapeApi, serial_write));
+const SERIAL_LINES: u64 = slot(offset_of!(TapeApi, serial_lines));
+const SERIAL_SET_LINES: u64 = slot(offset_of!(TapeApi, serial_set_lines));
+const SERIAL_BREAK: u64 = slot(offset_of!(TapeApi, serial_break));
 const NIC_COUNT: u64 = slot(offset_of!(TapeApi, nic_count));
 const NIC_MAC: u64 = slot(offset_of!(TapeApi, nic_mac));
 const NIC_SEND: u64 = slot(offset_of!(TapeApi, nic_send));
@@ -439,6 +448,24 @@ pub fn call(frame: &mut Frame) {
         FS_STREAM_WRITE2 => tapefs::stream_write2(a, b, c, d, e) as u64,
         PHYS_ADDR => vm::user_physical(sched::current_root(), a).unwrap_or(0),
         FS_STREAM_CLOSE2 => tapefs::stream_close2(a, b) as u64,
+        SERIAL_COUNT => tapeserial::count(),
+        SERIAL_INFO => tapeserial::info(a, b),
+        SERIAL_OPEN => tapeserial::open(a, b, c) as u64,
+        SERIAL_CLOSE => {
+            tapeserial::close(a);
+            0
+        }
+        SERIAL_READ => tapeserial::read(a, b, c),
+        SERIAL_WRITE => tapeserial::write(a, b, c),
+        SERIAL_LINES => tapeserial::lines(a),
+        SERIAL_SET_LINES => {
+            tapeserial::set_lines(a, b);
+            0
+        }
+        SERIAL_BREAK => {
+            tapeserial::set_break(a, b);
+            0
+        }
         CONSOLE_SIZE => tapesys::console_size(),
         HOSTNAME => tapesys::hostname(a, b, c),
         PEER_INFO => tapesys::peer_info(a, b),

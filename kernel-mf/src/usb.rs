@@ -20,7 +20,7 @@ pub struct UsbGuard {
 }
 
 /// The lock for a tape call. The drivers and their interrupt handlers are CPU-0 oriented, so the tape moves there first.
-fn tape_lock() -> UsbGuard {
+pub fn tape_lock() -> UsbGuard {
     crate::sched::pin_current(0);
     lock()
 }

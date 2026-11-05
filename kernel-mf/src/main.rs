@@ -16,6 +16,7 @@ mod threads;
 mod tapeaudio;
 mod tapefs;
 mod tapenet;
+mod tapeserial;
 mod tapesys;
 mod audioshell;
 mod usbshell;
