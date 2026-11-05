@@ -141,6 +141,13 @@ pub fn disk_labelled(label: &[u8]) -> Option<usize> {
     (0..block::count()).find(|&disk| mount(disk).is_ok_and(|fs| fs.label() == label))
 }
 
+/// Whether the kept volume is on `disk` and carries `label`; `None` when the kept volume is on another disk (or none is kept).
+pub fn kept_label_is(disk: usize, label: &[u8]) -> Option<bool> {
+    // SAFETY: reached only from the serialised file calls, like `shared`.
+    let shared = unsafe { (*core::ptr::addr_of!(SHARED)).as_ref() }?;
+    (shared.disk == disk).then(|| shared.fs.label() == label)
+}
+
 /// The volume `WRITER` holds changes for that are not committed yet (`with_writer_deferred`): the disk index and partition.
 static mut OPEN: Option<(usize, Partition)> = None;
 
