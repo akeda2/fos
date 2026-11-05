@@ -34,8 +34,20 @@ pub static COMMANDS: &[Command] = &[
         }
     }),
     Command::new("fsck", "fsck [repair] [diskN|@LABEL]", "checks a FOSFS volume's directory, repair fixes what it can (default: the boot volume).", |_, rest| fsck(rest)),
-    Command::new("nic", "nic [list|sniff [N]|promisc N on|off|peers|discover|use N|map|send|recv]", "the network interfaces: list, watch the frames, promiscuous mode, the other fos machines.", |_, rest| crate::nicshell::command(rest)),
-    Command::new("usb", "usb [rescan|debug [off]]", "the USB controllers and what is plugged in; `rescan` looks again; `debug` adds PORTSC and port events.", |_, rest| crate::usbshell::command(rest)),
+    Command::new("nic", "nic [list|sniff [N]|promisc N on|off|peers|discover|use N|map|send|recv]", "the network interfaces: list, watch the frames, promiscuous mode, the other fos machines.", |_, rest| {
+        #[cfg(target_arch = "x86_64")]
+        if crate::shellx86::nic(rest) {
+            return;
+        }
+        crate::nicshell::command(rest)
+    }),
+    Command::new("usb", "usb [rescan|debug [off]]", "the USB controllers and what is plugged in; `rescan` looks again; `debug` adds PORTSC and port events.", |_, rest| {
+        #[cfg(target_arch = "x86_64")]
+        if crate::shellx86::usb(rest) {
+            return;
+        }
+        crate::usbshell::command(rest)
+    }),
     Command::new("kup", "kup serial [BAUD]", "takes a kernel update over the console serial port.", |_, rest| crate::kupshell::command(rest)),
     #[cfg(target_arch = "x86_64")]
     Command::new("recv", "recv NAME", "receives a file over the console serial port (tools/send_file_serial.py).", |_, rest| crate::kupshell::recv(rest)),

@@ -66,7 +66,11 @@ pub fn wall_clock(out: u64) -> u64 {
 /// `wall_clock_set(time)`: 1 if the date was valid and the clock and RTC were set.
 pub fn wall_clock_set(address: u64) -> u64 {
     let Some(bytes) = process::user_bytes_up_to(address, core::mem::size_of::<WallClock>() as u64, 64) else { return 0 };
-    let value = unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<WallClock>()) };
+    if bytes.len() < core::mem::size_of::<WallClock>() {
+        return 0;
+    }
+    // `bytes` is the kernel's copy of the tape's struct, at least as long as `WallClock`.
+    let value = unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<WallClock>()) }; // kernel-memory
     let time = fat::Time { year: value.year, month: value.month, day: value.day, hour: value.hour, minute: value.minute, second: value.second };
     u64::from(clock::set(&time).is_ok())
 }
