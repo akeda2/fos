@@ -55,6 +55,34 @@ fn report(delivery: Result<impl core::fmt::Debug, &str>) {
     }
 }
 
+/// PCI location (bus, device, function) and device id per interface, for `nic`.
+static mut LOCATIONS: [(u8, u8, u8, u16); nic::MAX_NICS] = [(0, 0, 0, 0); nic::MAX_NICS];
+
+fn locate(index: usize, device: &pci::Device) {
+    if index < nic::MAX_NICS {
+        unsafe { (*core::ptr::addr_of_mut!(LOCATIONS))[index] = (device.bus, device.device, device.function, device.id) };
+    }
+}
+
+/// `nic`: one block per interface: driver, PCI location, MAC, link, speed, frame counts and the driver's own line.
+pub fn print_list() {
+    let _nics = lock_nics();
+    for index in 0..nic::count() {
+        let Some(nic) = nic::at(index) else { continue };
+        let (bus, device, function, id) = unsafe { (*core::ptr::addr_of!(LOCATIONS))[index] };
+        println!("nic{}: {} at {bus:02x}:{device:02x}.{function} (device {id:#06x}) {} link {}", index + 1, nic.family(), Mac(&nic.mac()), if nic.link_up() { "up" } else { "DOWN" });
+        if let Some((speed, full)) = nic.link_speed() {
+            println!("   negotiated {speed} Mbit/s {}", if full { "full duplex" } else { "half duplex" });
+        }
+        let (received, sent, dropped) = nic.counters();
+        println!("   frames: {received} received, {sent} sent{}", if dropped != 0 { " (some dropped: no link)" } else { "" });
+        nic.describe();
+    }
+    if nic::count() == 0 {
+        println!("No network interface.");
+    }
+}
+
 /// Starts every NIC the drivers know and puts it in the table. Needs interrupts on (the drivers prove their interrupt path).
 pub fn init() {
     nicctl::set_frame_handler(frame_hook);
@@ -65,6 +93,7 @@ pub fn init() {
                 println!("e1000 ({:?}) at {:02x}:{:02x}.{}: MAC {}, link {}.", nic.variant, device.bus, device.device, device.function, Mac(&nic.mac), if nic.link_up() { "up" } else { "down" });
                 report(nic.enable_interrupts(&device, false));
                 if nic::install(Nic::E1000(nic)).is_some() {
+                    locate(interfaces, &device);
                     interfaces += 1;
                 }
             }
@@ -77,6 +106,7 @@ pub fn init() {
                 println!("rtl8168 at {:02x}:{:02x}.{} (chip version {:#05x}): MAC {}.", device.bus, device.device, device.function, nic.version, Mac(&nic.mac));
                 report(nic.enable_interrupts(&device));
                 if nic::install(Nic::Rtl8168(nic)).is_some() {
+                    locate(interfaces, &device);
                     interfaces += 1;
                 }
             }
@@ -89,6 +119,7 @@ pub fn init() {
                 println!("rtl8139 at {:02x}:{:02x}.{}: MAC {}, link {}.", device.bus, device.device, device.function, Mac(&nic.mac), if nic.link_up() { "up" } else { "down" });
                 report(nic.enable_interrupts(&device));
                 if nic::install(Nic::Rtl8139(nic)).is_some() {
+                    locate(interfaces, &device);
                     interfaces += 1;
                 }
             }
@@ -101,6 +132,7 @@ pub fn init() {
                 println!("3c905 at {:02x}:{:02x}.{}: MAC {}, link {}.", device.bus, device.device, device.function, Mac(&nic.mac), if nic.link_up() { "up" } else { "down" });
                 report(nic.enable_interrupts(&device));
                 if nic::install(Nic::ThreeCom(nic)).is_some() {
+                    locate(interfaces, &device);
                     interfaces += 1;
                 }
             }

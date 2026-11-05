@@ -236,6 +236,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     };
     println!("ACPI: revision {}, local APIC at {:#x}, {} CPU(s), {} I/O APIC(s), PM timer port {:#x}.", tables.revision, madt.local_apic_address, madt.cpu_count, madt.io_apics, fadt.pm_timer_port);
     power::set_acpi_reset(fadt.reset);
+    power::set_acpi_s5(fadt.pm1a_control, fadt.pm1b_control, fadt.s5);
     let srat = acpi::srat(&tables);
     match &srat {
         Some(srat) => {
