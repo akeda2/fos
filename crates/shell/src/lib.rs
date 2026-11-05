@@ -119,6 +119,15 @@ pub trait Host {
     fn volumes(&mut self, _each: &mut dyn FnMut(&str)) {}
     /// Runs `run` with a scratch buffer of `size` bytes; false if there is no memory for it.
     fn with_buffer(&mut self, size: usize, run: &mut dyn FnMut(&mut dyn Host, &mut [u8])) -> bool;
+    /// Copies a file of any size without holding it in memory (a port that can: the server kernel, to an ext volume).
+    /// `None`: this host cannot, so `cp` and `mv` load the file whole and refuse one over 32 MiB.
+    fn copy_stream(&mut self, _from: &str, _to: &str) -> Option<Result<u64, FsError>> {
+        None
+    }
+    /// Compares two files of any size a piece at a time; `None` as for `copy_stream`. `Ok(true)`: identical.
+    fn compare_stream(&mut self, _a: &str, _b: &str) -> Option<Result<bool, FsError>> {
+        None
+    }
     /// Whether a file (or a tape) of that name can be run from: the boot volume first, then other volumes.
     fn exists(&mut self, reference: &str) -> bool {
         self.length(reference).is_ok()

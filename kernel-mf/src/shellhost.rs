@@ -15,6 +15,8 @@ use crate::{storage, tapefs};
 
 pub struct MfHost;
 
+const STREAM_CHUNK: usize = 1 << 20;
+
 fn error(code: isize) -> FsError {
     match code {
         FS_NOT_FOUND => FsError::NotFound,
@@ -68,6 +70,12 @@ impl Host for MfHost {
 
     fn remove(&mut self, reference: &str) -> Result<(), FsError> {
         let _disk = tapefs::lock();
+        if kernel_core::tape_vfs::is_ext_reference(reference.as_bytes()) {
+            return match kernel_core::tape_vfs::remove(reference.as_bytes()) {
+                0 => Ok(()),
+                code => Err(error(code)),
+            };
+        }
         match tape_fs::remove(reference.as_bytes()) {
             0 => Ok(()),
             code => Err(error(code)),
@@ -101,6 +109,12 @@ impl Host for MfHost {
 
     fn rename(&mut self, from: &str, to: &str) -> Result<bool, FsError> {
         let _disk = tapefs::lock();
+        if kernel_core::tape_vfs::is_ext_reference(from.as_bytes()) && kernel_core::tape_vfs::is_ext_reference(to.as_bytes()) {
+            return match kernel_core::tape_vfs::rename(from.as_bytes(), to.as_bytes()) {
+                0 => Ok(true),
+                code => Err(error(code)),
+            };
+        }
         tape_fs::rename(from.as_bytes(), to.as_bytes()).map_err(error)
     }
 
@@ -149,6 +163,84 @@ impl Host for MfHost {
         buffer.resize(size, 0);
         run(self, &mut buffer);
         true
+    }
+
+    // Big files go piece by piece (1 MiB), the disk lock taken per piece. The destination must be an ext volume (the only
+    // one `vfs_write` reaches); the source can be on any volume `vfs_read` serves.
+    fn copy_stream(&mut self, from: &str, to: &str) -> Option<Result<u64, FsError>> {
+        use fosfor_abi::tape::{VFS_FILE, VfsMake, VfsStat};
+        use kernel_core::tape_vfs;
+        if !tape_vfs::is_ext_reference(to.as_bytes()) {
+            return None;
+        }
+        let from = pin(from);
+        let mut chunk: Vec<u8> = Vec::new();
+        if chunk.try_reserve_exact(STREAM_CHUNK).is_err() {
+            return Some(Err(FsError::Failed));
+        }
+        chunk.resize(STREAM_CHUNK, 0);
+        let prepared = {
+            let _disk = tapefs::lock();
+            let mut info = VfsStat::default();
+            match tape_vfs::stat(to.as_bytes(), &mut info) {
+                0 if info.kind == VFS_FILE => tape_vfs::truncate(to.as_bytes(), 0),
+                0 => fosfor_abi::tape::FS_ERROR,
+                FS_NOT_FOUND => tape_vfs::create(to.as_bytes(), &VfsMake { kind: VFS_FILE, mode: 0o644, uid: 0, gid: 0 }),
+                code => code,
+            }
+        };
+        if prepared < 0 {
+            return Some(Err(error(prepared)));
+        }
+        let mut offset = 0u64;
+        loop {
+            let _disk = tapefs::lock();
+            let count = match tape_vfs::read(&from, offset, &mut chunk) {
+                count if count < 0 => return Some(Err(error(count))),
+                0 => break,
+                count => count as usize,
+            };
+            let mut done = 0;
+            while done < count {
+                match tape_vfs::write(to.as_bytes(), offset + done as u64, &chunk[done..count]) {
+                    written if written <= 0 => return Some(Err(if written < 0 { error(written) } else { FsError::Failed })),
+                    written => done += written as usize,
+                }
+            }
+            offset += count as u64;
+        }
+        let _disk = tapefs::lock();
+        match tape_vfs::api_vfs_sync() {
+            code if code < 0 => Some(Err(error(code))),
+            _ => Some(Ok(offset)),
+        }
+    }
+
+    fn compare_stream(&mut self, a: &str, b: &str) -> Option<Result<bool, FsError>> {
+        use kernel_core::tape_vfs;
+        let (a, b) = (pin(a), pin(b));
+        let mut left: Vec<u8> = Vec::new();
+        let mut right: Vec<u8> = Vec::new();
+        if left.try_reserve_exact(STREAM_CHUNK).is_err() || right.try_reserve_exact(STREAM_CHUNK).is_err() {
+            return Some(Err(FsError::Failed));
+        }
+        left.resize(STREAM_CHUNK, 0);
+        right.resize(STREAM_CHUNK, 0);
+        let mut offset = 0u64;
+        loop {
+            let _disk = tapefs::lock();
+            let (x, y) = (tape_vfs::read(&a, offset, &mut left), tape_vfs::read(&b, offset, &mut right));
+            if x < 0 || y < 0 {
+                return Some(Err(error(x.min(y))));
+            }
+            if x != y || left[..x as usize] != right[..y as usize] {
+                return Some(Ok(false));
+            }
+            if x == 0 {
+                return Some(Ok(true));
+            }
+            offset += x as u64;
+        }
     }
 
     fn exists(&mut self, reference: &str) -> bool {

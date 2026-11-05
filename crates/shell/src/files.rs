@@ -165,7 +165,7 @@ const COPY_LIMIT: u64 = 32 << 20;
 
 /// A volume word: `diskN`, `@LABEL` or `esp`.
 pub fn is_volume(word: &str) -> bool {
-    word == "esp" || word.strip_prefix('@').is_some_and(|label| !label.is_empty()) || word.strip_prefix("disk").is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+    word == "esp" || word.strip_prefix('@').is_some_and(|label| !label.is_empty() && !label.contains('/')) || word.strip_prefix("disk").is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// `diskN NAME ...` (the older spelling) as `diskN/NAME ...`, written into `out`; anything else comes back unchanged.
@@ -387,7 +387,24 @@ fn transfer(host: &mut dyn Host, from: &str, to: &str, moving: bool) -> bool {
     }
     let length = match host.length(from) {
         Ok(length) if length > COPY_LIMIT => {
-            sayln!(host, "{verb}: {from} is {} MiB; the limit is {} MiB.", length >> 20, COPY_LIMIT >> 20);
+            match host.copy_stream(from, to) {
+                Some(Ok(copied)) if moving => match host.length(to) {
+                    Ok(now) if now == copied => match host.remove(from) {
+                        Ok(()) => {
+                            sayln!(host, "Moved {from} ({copied} bytes) to {to}.");
+                            return true;
+                        }
+                        Err(error) => sayln!(host, "mv: copied to {to}, but {from} was not removed: {error}."),
+                    },
+                    _ => sayln!(host, "mv: {to} has the wrong length; {from} is kept."),
+                },
+                Some(Ok(copied)) => {
+                    sayln!(host, "Copied {from} ({copied} bytes) to {to}.");
+                    return true;
+                }
+                Some(Err(error)) => sayln!(host, "{verb}: {to}: {error}."),
+                None => sayln!(host, "{verb}: {from} is {} MiB; the limit is {} MiB.", length >> 20, COPY_LIMIT >> 20),
+            }
             return false;
         }
         Ok(length) => length as usize,
@@ -769,7 +786,15 @@ fn cmp(host: &mut dyn Host, rest: &str) {
     }
     let lengths = (host.length(first), host.length(second));
     let (a, b) = match lengths {
-        (Ok(a), Ok(b)) if a > COPY_LIMIT || b > COPY_LIMIT => return sayln!(host, "cmp: only files up to {} MiB are compared.", COPY_LIMIT >> 20),
+        (Ok(a), Ok(b)) if a > COPY_LIMIT || b > COPY_LIMIT => {
+            return match host.compare_stream(first, second) {
+                Some(Ok(true)) => sayln!(host, "cmp: identical, {a} bytes."),
+                Some(Ok(false)) if a != b => sayln!(host, "cmp: DIFFER ({a} and {b} bytes)."),
+                Some(Ok(false)) => sayln!(host, "cmp: DIFFER (same length, {a} bytes, different contents)."),
+                Some(Err(_)) => sayln!(host, "cmp: cannot read both files."),
+                None => sayln!(host, "cmp: only files up to {} MiB are compared.", COPY_LIMIT >> 20),
+            };
+        }
         (Ok(a), Ok(b)) => (a as usize, b as usize),
         (Err(error), _) => return sayln!(host, "cmp: {first}: {error}."),
         (_, Err(error)) => return sayln!(host, "cmp: {second}: {error}."),
