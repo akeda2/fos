@@ -98,6 +98,20 @@ fn execute(line: &str) {
     if line.split_whitespace().next() != Some("bootcode") {
         crate::bootcode::cancel();
     }
+    // The x86 kernel's older spelling: "tape run NAME" and "tape NAME" mean "run NAME".
+    if let Some(after) = line.strip_prefix("tape").filter(|after| after.starts_with(char::is_whitespace)) {
+        let after = after.trim_start();
+        let name = match after.strip_prefix("run").filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace)) {
+            Some(rest) => rest.trim_start(),
+            None => after,
+        };
+        if name.is_empty() {
+            crate::println!("run: which tape? (run NAME [ARGS])");
+        } else {
+            fosfor_shell::Host::run_tape(&mut KernelHost, name);
+        }
+        return;
+    }
     if line.is_empty() || fosfor_shell::execute(&mut KernelHost, &[COMMANDS, crate::shellcmds::COMMANDS, fosfor_shell::files::COMMANDS], line) {
         return;
     }
