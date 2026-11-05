@@ -217,5 +217,6 @@ pub fn process_ended(pid: u64) {
         nicctl::nic_set_promiscuous(index, false);
         nicctl::nic_set_multicast(index, false);
         nicctl::clear_frame_queue_nic(index);
+        crate::vnic::tape_ended(index);
     }
 }

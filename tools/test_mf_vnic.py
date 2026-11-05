@@ -22,6 +22,7 @@ CODE = next(p for p in ["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF
                         "/usr/share/edk2/ovmf/OVMF_CODE.fd"] if Path(p).exists())
 PORT_A = port(28091)
 PORT_B = port(28092)
+PORT_C = port(28093)
 failures = []
 
 
@@ -47,7 +48,7 @@ def get(host_port):
 def main():
     qemu = subprocess.Popen(
         ["qemu-system-x86_64", "-cpu", "max", "-machine", "q35", "-m", "1024", "-smp", "2", "-display", "none",
-         "-nic", f"user,model=e1000,hostfwd=tcp:127.0.0.1:{PORT_A}-10.0.2.15:80,hostfwd=tcp:127.0.0.1:{PORT_B}-10.0.2.16:80",
+         "-nic", f"user,model=e1000,hostfwd=tcp:127.0.0.1:{PORT_A}-10.0.2.15:80,hostfwd=tcp:127.0.0.1:{PORT_B}-10.0.2.16:80,hostfwd=tcp:127.0.0.1:{PORT_C}-10.0.2.17:80",
          "-serial", "stdio", "-monitor", "none", "-no-reboot",
          "-drive", f"if=pflash,format=raw,readonly=on,file={CODE}", "-drive", f"format=raw,file={IMAGE},snapshot=on"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -114,6 +115,34 @@ def main():
             check(ok, "`vnic del` works after the tape ended", out)
             ok, out = command("vnic add again on 1", "nic3 on nic1", 10)
             check(ok, "the freed number is reused", out)
+
+        # &+N: an interface for one tape, named after it, gone when it ends
+        mark = len(log)
+        ok, out = command("run httpd @httpd.cfg &+1", "process", 30)
+        check(ok and "vnic httpd: nic4 on nic1" in out, "`&+1` makes nic4 named httpd for the tape", out)
+        if not wait_for("worker threads", 40, mark):
+            failures.append("httpd on &+1 did not start:\n" + log[mark:].decode("utf8", "replace")[-800:])
+            return finish()
+        time.sleep(2)
+        check(get(PORT_C) == 200, "the tape on its own interface answers (10.0.2.17)", str(get(PORT_C)))
+        ok, out = command("vnic del httpd", "kill", 10)
+        check(ok, "its interface cannot be deleted while it runs", out)
+        ok, out = command("ps", "httpd", 10)
+        pids = re.findall(r"^(\d+)\s+\d+\s+httpd", out, re.M)
+        check(len(pids) == 2, "web's httpd and the new one are running", out)
+        if len(pids) == 2:
+            command(f"kill {pids[-1]}", "", 3)
+            time.sleep(1)
+            ok, out = command("vnic", "web", 10)
+            check(ok and "httpd:" not in out and "web: nic2" in out, "the interface went with the tape, web stays", out)
+            mark = len(log)
+            ok, out = command("run httpd @httpd.cfg &+1", "process", 30)
+            check(ok and "vnic httpd: nic4 on nic1" in out, "the number and name are reused", out)
+        ok, out = command("run nosuchtape &+1", "no file", 10)
+        ok2, listing = command("vnic", "web", 10)
+        check(ok and "nosuchtape" not in listing and listing.count("nic1 MAC") == 3, "a tape that cannot start leaves no interface behind", out + listing)
+        ok, out = command("run httpd &+9", "physical NIC", 10)
+        check(ok, "&+N on a missing NIC is refused", out)
         check(b"CPU exception" not in log, "the kernel did not fault", log[-1200:].decode("utf8", "replace"))
     finally:
         qemu.kill()
