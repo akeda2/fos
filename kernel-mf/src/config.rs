@@ -254,7 +254,7 @@ pub fn start(run: impl FnMut(&str)) {
 fn load_fstab() {
     let (mounted, _) = kernel_core::mounts::load_from(volumes::boot_volume());
     let absent = || {
-        kernel_core::mounts::absent_with(|label| volumes::volume_labelled(label).is_some() || kernel_core::tape_fs::fat_labelled(label).is_some())
+        kernel_core::mounts::absent_with(|label| volumes::volume_labelled(label).is_some() || kernel_core::tape_fs::fat_labelled(label).is_some() || kernel_core::ext4vol::disk_labelled(label).is_some())
     };
     if mounted == 0 || absent() == 0 {
         return;

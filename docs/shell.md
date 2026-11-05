@@ -9,7 +9,13 @@ One shell core for every port: `crates/shell` (`fosfor_shell`, `no_std`, host-te
   looks a line up (a port's table first, so it may override) and builds `help` / `help NAME` from the tables; for a name
   that is no command `help NAME` shows a tape's `.fos_help`.
 - **Shared commands** (`files.rs`): `ls cat write rm cp (copy) mv cmp mkdir stat chmod chown` (the last three show or set owner, group and mode on ext volumes: `chown -R 1000:100 ext1/media`, `chmod 755 ext1/media`, `stat ext1/media`); `ls`, `cp`, `mv` and `rm` take `* ? [a-z]` patterns (`glob.rs`, docs/fosfs-v4.md). The older `cat diskN NAME` spelling still means `diskN/NAME`.
-  `cp SRC DST` accepts a bare volume as DST (keeps the name); files up to 32 MiB.
+  `cp SRC DST` accepts a bare volume as DST (keeps the name); files up to 32 MiB on the embedded kernels. The server kernel (mf) has no limit when the
+  destination is an ext volume: `Host::copy_stream`/`compare_stream` move 1 MiB at a time (`make test-mf-cp`).
+- **Working folder (mf only)**: `cd [FOLDER]` and `pwd`. Relative names of the file commands (`ls cp cat ...`) are looked up under it;
+  names with a volume (`@LABEL/`, `diskN/`, `extN/`, `esp/`, `//`) are not, `/NAME` is the root of the working folder's volume (or
+  mount point), `..` works, and a bare `cd` returns to the boot volume. The prompt shows it (`fos @rackdata/www-root> `); a new remote
+  terminal session starts at the root. Tapes and scripts are still found as typed. A mount point may be an ext volume
+  (`mount rackdata @rackdata`, or `fstab`).
 - **A port** keeps only what is hardware- or port-specific, as its own table (Pi: `kernel/src/shell.rs`), plus what to do with
   a line that is no command (tape names, `PATH/NAME`).
 
