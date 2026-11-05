@@ -116,7 +116,7 @@ pub fn prompt() {
 
 /// Commands `run` handles itself, outside the shared tables, for Tab completion.
 const BUILTINS: &[&str] = &[
-    "version", "cpus", "mem", "pci", "disks", "nic", "tapesync", "gpio", "top", "threads", "ps", "date", "uptime", "slots", "audio", "usb", "tape", "run", "kill",
+    "version", "cpus", "mem", "pci", "disks", "nic", "vnic", "tapesync", "gpio", "top", "threads", "ps", "date", "uptime", "slots", "audio", "usb", "tape", "run", "kill",
     "echo", "debug", "start", "keymap", "kup", "recv", "dmesg", "clear", "sleep", "io", "memmap", "bootinfo", "cpuinfo", "shrink", "sector", "mount", "umount",
     "format", "label", "fsck", "grow", "install", "bootcode", "reboot", "reset", "shutdown", "halt", "ext4", "sha256", "cd", "pwd",
 ];
@@ -227,6 +227,7 @@ pub fn run_command(line: &str) {
         "tapesync" => crate::netclient::tapesync(words),
         "gpio" => crate::netclient::gpio(line.trim_start().strip_prefix("gpio").unwrap_or("")),
         "nic" => net::print_list(),
+        "vnic" => crate::vnic::command(words),
         "top" => crate::top::start(&line.trim_start()[command.len()..]),
         "threads" => {
             sched::for_each(|id, name, state| println!("{id:3} {name:<16} {state:?}"));
@@ -377,6 +378,10 @@ fn split_background(args: &str) -> (&str, Option<Result<u64, ()>>) {
     };
     let mut mask = 0u64;
     for number in last[1..].split(',') {
+        if let Some(index) = crate::vnic::lookup(number) {
+            mask |= 1 << index;
+            continue;
+        }
         match number.parse::<usize>() {
             Ok(0) => {}
             Ok(n) if n <= 64 => mask |= 1 << (n - 1),

@@ -199,6 +199,9 @@ pub fn load() {
             if let Some(key @ ("hwp" | "park-idle" | "rotate" | "serial-shell" | "gpio-remote" | "gpio-sim" | "gpio-deny" | "prefer-msix" | "replace-in-place")) = line.split_whitespace().next() {
                 println!("settings: {key} is not supported by the server kernel yet; ignored.");
             }
+            if line.split_whitespace().next() == Some("vnic") {
+                crate::vnic::queue(line);
+            }
             if line.split_whitespace().next() == Some("deny-term-net") {
                 unsafe { DENY_TERM_NET = true };
                 println!("settings: deny-term-net -- the network terminal is closed.");

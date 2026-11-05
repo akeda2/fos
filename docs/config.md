@@ -33,6 +33,7 @@ unknown line is reported on the console ("unknown line ... ignored") and skipped
 | `gpio-remote` | Other machines may change this machine's GPIO pins (with the `synckey`); reads need only the key. |
 | `gpio-deny N..` | Forbid GPIO pins (numbers 0-57), locally and remotely. |
 | `gpio-sim` | A RAM-backed GPIO bank, for tests (`make test-gpio`). |
+| `vnic NAME on N [mac=02:..]` | Server kernel only: a virtual interface `NAME` on physical NIC N, created at boot (`vnic` command, `run TAPE &NAME`, `NETWORKING.md` "Virtual NICs"). |
 
 ## `debug`
 

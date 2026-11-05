@@ -661,7 +661,7 @@ Windows needs WS-Discovery (UDP 3702) or NetBIOS instead: a later step, same sha
   (multicast does not cross QEMU slirp), so use a tap/bridge `Guest` option if one exists, else `avahi-browse -r` by hand on
   `rack` (hardware only) and say so in the commit message.
 
-## Planned: virtual NICs on the server kernel (2026-11-05)
+## Planned: virtual NICs on the server kernel (2026-11-05; steps 1-2 done: core, demux, `vnic` command, settings, `make test-mf-vnic`, see NETWORKING.md; `&&N` and rack remain)
 
 Several services on one physical NIC (rack: smbd, httpd, ... on the RTL8168; the i350s stay reserved for audio with direct
 access). A vNIC is a NIC number with its own MAC; the physical NIC does layer 2 and a small switch demuxes by destination MAC.
