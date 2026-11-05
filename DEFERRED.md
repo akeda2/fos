@@ -614,3 +614,18 @@ use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limi
   written is scanned linearly again. For big folders under an SMB server: insert into the right leaf, split full leaves and
   index nodes, checksum index blocks (`dx_tail`), and rebuild the tree when a folder is first indexed (a linear folder past
   one block). Also the unsigned-char hash variants (versions 3-5), which `debugfs dx_hash` cannot check. `docs/ext4.md`.
+
+## Open after the shared-shell / mf-audio session (2026-11-05)
+
+- **Tape ABI and shell sharing** is done (shared tape table, common stub table, `tools/check_abi_support.py` with its `GAPS`
+  dict, one shell command table in `shellcmds.rs`, x86-only verbs in `shellx86.rs`). Open: on x86 `tape run ARGS` runs the
+  *staged* tape, while on the Pi and mf `tape run NAME` is an alias for `run NAME`; decide whether x86 should match.
+- **mf tape calls only hardware can check**: `serial_*` (USB serial adapters, FIFO overruns at 115200 baud: mf has no serial
+  IRQ), `disk_format_exfat`, power-cut flush ordering, mf USB audio xHCI timeouts on `rack`.
+- **mf audio start**: a tape's system call arrives with interrupts off; `tapeaudio::start` turns them on around the driver
+  call (a cold EHCI start hung `piano` otherwise). QEMU does not reproduce it, so no test covers a cold EHCI start; other
+  tape calls that make a driver wait on timer ticks may need the same.
+- `test-mf-tape` at `-smp 8` failed once at the `remove` case (probably the load flake); landsbro also flakes on
+  `test-config`, `test-debug-mode`, `test-msi`, `test-fosplay`.
+- Not yet done: the `clock` host is stale (37 old tapes); the `abibad` tape is not installed on the mf hosts; the embedded
+  `debug revert` and `services` setting; the 1024-frame e1000 ring on embedded hardware; a full `gb -of fos` run on landsbro.
