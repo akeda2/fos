@@ -40,8 +40,6 @@ GAPS = {
     },
     "mf": {
         "set_input_mode": "no-op: the mf shell cooks input itself",
-        **{name: UNWIRED for name in ("hostname", "disk_info", "disk_format_exfat", "wall_clock", "wall_clock_set",
-                                      "peer_info", "console_size")},
         **{f"serial_{name}": UNWIRED for name in ("count", "info", "open", "close", "read", "write", "lines",
                                                   "set_lines", "break")},
         **{name: "the x86 server has no GPIO header or I2C bus (the Pi 4 has); tapes see 'no pins'"

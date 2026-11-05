@@ -458,6 +458,11 @@ fn flush_writes() {
 /// network terminal go on); `gfx_close` clears the screen and the text starts again at the top. One screen, no rotation.
 static GFX_OPEN: AtomicBool = AtomicBool::new(false);
 
+/// Columns and rows of the text console (`console_size`), or None before it exists.
+pub fn console_size() -> Option<(usize, usize)> {
+    unsafe { (*core::ptr::addr_of!(CONSOLE)).as_ref() }.map(|console| (console.columns, console.rows))
+}
+
 /// Width and height of the pixel screen, or None without one.
 pub fn gfx_info() -> Option<(u32, u32)> {
     let console = unsafe { (*core::ptr::addr_of!(CONSOLE)).as_ref() }.filter(|console| !console.text)?;
