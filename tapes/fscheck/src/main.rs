@@ -14,6 +14,7 @@ Prints the bytes read; a count of 0 means the offset is at or past the end.
        tape run fscheck vfswrite DIR          (ABI 34: create, write, truncate, rename, remove under DIR on an ext volume)
        tape run fscheck remove NAME           (create NAME, delete it with fs_remove, check it is gone)
        tape run fscheck info                  (hostname, peer count, disk 1, clock, console size)
+       tape run fscheck stack                 (touch 768 KiB of stack)
        tape run fscheck serial                (ABI 7: open port 1, send "ping", wait up to 8 s for a reply)
 "#);
 
@@ -46,6 +47,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     if arguments == "serial" {
         return serial(api);
     }
+    if arguments == "stack" {
+        return stack();
+    }
     if arguments == "info" {
         return info(api);
     }
@@ -68,6 +72,17 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         }
         Err(code) => println!("fscheck: error {code}"),
     }
+}
+
+/// A 768 KiB array on the stack, every page touched: the audio tapes need about this much (the mf stack once held 64 KiB).
+#[inline(never)]
+fn stack() {
+    let mut buffer = [0u8; 768 * 1024];
+    for (index, byte) in buffer.iter_mut().enumerate().step_by(4096) {
+        *byte = index as u8;
+    }
+    let sum: u32 = core::hint::black_box(&buffer).iter().step_by(4096).map(|&byte| u32::from(byte)).sum();
+    println!("fscheck: stack ok {sum}");
 }
 
 /// Serial port 1: the count, a refused port 9, a write, then up to 8 s for the peer's reply; closes and reopens it once.

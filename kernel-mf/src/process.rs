@@ -37,7 +37,8 @@ pub const SYSCALL_VECTOR: u64 = 0x1000;
 /// 32 MiB up), with one unmapped page between them, so an image can be about 32 MiB.
 pub const CODE_BASE: u64 = vm::USER_BASE;
 pub const STACK_TOP: u64 = vm::USER_BASE + 0x1ff_f000;
-const STACK_PAGES: u64 = 16;
+/// 1 MiB, as on the embedded kernels: the audio tapes (organ, strings, epiano) keep large buffers on the stack.
+const STACK_PAGES: u64 = 256;
 /// The stack's size; the page below it is never mapped (the code is at the bottom of the address space, the heap a gigabyte above
 /// it), so running off the end is a page fault that kills only the process.
 pub const STACK_BYTES: u64 = STACK_PAGES * 4096;
