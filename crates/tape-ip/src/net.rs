@@ -230,7 +230,70 @@ impl DhcpTask {
     }
 }
 
+/// What `DhcpTask::maintain` saw happen to a bound lease.
+#[derive(Clone, Copy)]
+pub enum Lease {
+    Held,
+    Renewed,
+    /// The lease ran out and a new one named another address (or none could be had yet: `None`).
+    Replaced(Option<NetConfig>),
+}
+
 impl DhcpTask {
+    /// Runs the exchange to the end (like `dhcp`) and keeps the task, so `maintain` can renew the lease later.
+    pub fn bind(api: &TapeApi, nic: usize, mac: MacAddress) -> Option<(DhcpTask, NetConfig)> {
+        let mut task = DhcpTask::new(api, nic, mac);
+        loop {
+            match task.step(api) {
+                DhcpStep::Bound(config) => return Some((task, config)),
+                DhcpStep::Failed => return None,
+                DhcpStep::Waiting => tape_rt::idle(),
+            }
+        }
+    }
+
+    /// Keeps a bound lease alive: sends the renewal (T1) or rebinding (T2) request when due and feeds in `reply`, a frame
+    /// the tape set aside (UDP to port 68). Call it every pass of the main loop; it does nothing most of the time. If
+    /// the lease runs out it starts over from DISCOVER, and reports the address a new lease names.
+    pub fn maintain(&mut self, api: &TapeApi, reply: Option<&[u8]>) -> Lease {
+        let now = (api.ticks)() as u32 / 100;
+        let before = self.client.lease().map(|lease| (lease.address, lease.acquired_at));
+        if let Some(frame) = reply {
+            frames::feed_dhcp(frame, &mut self.client, now);
+        }
+        let mut payload = [0u8; 600];
+        let mut frame = [0u8; MAX_FRAME];
+        if let Ok(Some(length)) = self.client.poll(now, &mut payload) {
+            let transmit = self.client.transmit();
+            if let Some(total) = frames::dhcp_client_frame(&mut frame, self.mac, transmit.source, transmit.destination, &payload[..length]) {
+                send_frame(api, self.nic, &frame[..total]);
+            }
+        }
+        match self.client.state() {
+            DhcpClientState::Bound => {
+                let after = self.client.lease().map(|lease| (lease.address, lease.acquired_at));
+                match (before, after) {
+                    (Some((old, _)), Some((new, _))) if old != new => Lease::Replaced(self.config()),
+                    (None, Some(_)) => Lease::Replaced(self.config()),
+                    (a, b) if a != b => Lease::Renewed,
+                    _ => Lease::Held,
+                }
+            }
+            DhcpClientState::Expired | DhcpClientState::Failed => {
+                *self = DhcpTask::new(api, self.nic, self.mac);
+                Lease::Replaced(None)
+            }
+            _ => Lease::Held,
+        }
+    }
+}
+
+impl DhcpTask {
+    /// The address, mask and router of the lease held now.
+    pub fn config(&self) -> Option<NetConfig> {
+        self.client.lease().filter(|lease| lease.subnet_mask != Ipv4Address([0; 4])).map(|lease| NetConfig { mac: self.mac, ip: lease.address, netmask: lease.subnet_mask, gateway: lease.router })
+    }
+
     /// The first NTP server the lease named (option 42), once bound.
     pub fn ntp_server(&self) -> Option<Ipv4Address> {
         self.ntp_server

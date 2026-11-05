@@ -209,6 +209,8 @@ pub struct Server<const RX: usize, const N: usize> {
     tx: [u8; MAX_FRAME],
     tx_dropped: u32,
     idle_micros: u64,
+    dhcp: [u8; MAX_FRAME],
+    dhcp_len: usize,
 }
 
 impl<const RX: usize, const N: usize> Server<RX, N> {
@@ -226,6 +228,8 @@ impl<const RX: usize, const N: usize> Server<RX, N> {
             tx: [0; MAX_FRAME],
             tx_dropped: 0,
             idle_micros: IDLE_MICROS,
+            dhcp: [0; MAX_FRAME],
+            dhcp_len: 0,
         }
     }
 
@@ -284,6 +288,12 @@ impl<const RX: usize, const N: usize> Server<RX, N> {
         self.slots[slot].connection.state() == TcpState::CloseWait
     }
 
+    /// Bytes `send_some` or `send_buffered` handed out that the peer has not acknowledged yet. A server that ends a
+    /// connection with `finish` waits for this to reach 0 first: a FIN in the way stops the retransmission of that tail.
+    pub fn in_flight(&self, slot: usize) -> usize {
+        self.slots[slot].connection.stream_in_flight()
+    }
+
     /// Gives the slot back: it listens for a new connection.
     pub fn recycle(&mut self, slot: usize) {
         self.sequence = self.sequence.wrapping_add(64_000);
@@ -291,6 +301,12 @@ impl<const RX: usize, const N: usize> Server<RX, N> {
         self.slots[slot].connection.reopen_listen(ip, port, sequence, RETRANSMIT_MICROS);
         self.slots[slot].last = tape_rt::micros();
         self.slots[slot].tx_len = 0;
+    }
+
+    /// The DHCP reply frame (UDP to port 68) `poll` set aside since the last call, for a tape that keeps its lease renewed.
+    pub fn take_dhcp(&mut self) -> Option<&[u8]> {
+        let length = core::mem::take(&mut self.dhcp_len);
+        (length > 0).then(|| &self.dhcp[..length])
     }
 
     /// Handles the frames waiting (up to `budget` of them), resends what is due, takes back dead slots. Returns whether
@@ -318,6 +334,12 @@ impl<const RX: usize, const N: usize> Server<RX, N> {
         }
         let source_mac = ethernet.source;
         let Ok(packet) = Ipv4Packet::parse(ethernet.payload, true) else { return };
+        if packet.header.protocol == 17 && packet.payload.len() >= 4 && packet.payload[2..4] == [0, 68] {
+            // A DHCP reply (UDP to port 68) for the tape's lease renewal; the newest one is kept.
+            self.dhcp[..length].copy_from_slice(&self.rx[..length]);
+            self.dhcp_len = length;
+            return;
+        }
         if packet.header.protocol != 6 || packet.header.destination != self.config.ip {
             return;
         }

@@ -1798,13 +1798,20 @@ skipped, entities including å ä ö decoded). `tape-ip::tcp::Server` is the ser
 in listen-any mode (`tape-net` `reopen_listen`/`accept_from`), replies go to the MAC the frames came from, 3 s for half-open and
 closing connections and 10 s idle.
 
-`httpd` (`tapes/httpd`) answers GET and HEAD with HTTP/1.0 and closes after each answer, so nothing is kept between requests. The files
+`httpd` (`tapes/httpd`) answers GET and HEAD with HTTP/1.1: keep-alive and pipelining, `Range` (206, 416, `If-Range`) and, on ext
+volumes (the only ones with an mtime), `ETag`/`Last-Modified` with 304 for `If-None-Match`/`If-Modified-Since`. Every connection is a
+non-blocking state machine (request, head, body, drain), up to `slots=4|8|16` at once. Files are read with `vfs_*` (ABI 32+), so an ext4
+web root works, in 128 KiB chunks; where tape threads exist (mf) four worker threads read the next chunk ahead of the send (double
+buffering, as in `smbd`), elsewhere the same binary reads inline. TLS, authentication and POST are not in httpd: a reverse proxy in front
+does https and login. A DHCP lease is renewed (T1/T2) from the main loop (`DhcpTask::maintain`; `Server::take_dhcp` hands it the replies),
+and a new address after expiry restarts the listener on it, and requests carry the name as option 12 and option 81 so a dnsmasq/Pi-hole knows the machine. `make test-httpd`, `make test-mf-httpd`
+(ext4 root, concurrent large downloads checked by SHA-256). The files
 come from `root=` (`www` by default; `diskN/...`, `@LABEL/...` and a bare volume work, so a USB stick is a web root). The head is placed in
 the same buffer just before the body so both leave in the same segments (a separate small head segment meets the peer's 40 ms delayed
 ACK). A folder without a slash gets a 301 to the slash; with a slash it serves `index=` (default `index.html`), else a listing when
 `listing=on`, else 404. `settings`, `start`, `hostname`, `debug`, `fstab`, `synckey`, `password` and `config/` are 404 whatever `root` is,
 because the web root may be the whole boot volume. Quiet unless `log`. As a service (`run httpd root=www &2`) it owns that NIC, so a
-machine with one NIC cannot run the browser at the same time; DHCP leases are not renewed while it runs.
+machine with one NIC cannot run the browser at the same time.
 
 `web` (`tapes/web`): `-c` modes print and exit; the text screen uses the console escapes of the ebb section, a changed-cells renderer
 and a wrapped line table over `Page`. The first link on the screen starts selected (as in lynx), the selected link's address is on the

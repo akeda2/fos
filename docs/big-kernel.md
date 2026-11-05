@@ -159,7 +159,7 @@ Left for 1b: `netfs` -> `fosfs`/`tape_fs`/`config`/`netservice` and `nicshell` -
 the USB attach path; turning `hal` into a trait with the embedded core as its implementation; the library crate itself. Not covered
 by any test: USB serial adapters, the Pi 4 console and GIC paths (hardware only).
 
-## Stage 1b status (branch `kernel-core-1b`)
+## Stage 1b status (branch `kernel-core-1b`, merged into main)
 
 - `crates/fos-hal`: the `Platform` trait (block read/write, wall clock, console print), installed once by `kernel/src/platform.rs`
   at the start of `kmain`. Slow paths only; port I/O and `micros` stay inline in the platform.

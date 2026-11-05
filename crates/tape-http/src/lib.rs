@@ -1,7 +1,7 @@
 //! The parts of HTTP the `httpd` server and the `web` browser share, as plain `no_std` code with no allocation and host
-//! tests. Only what a small GET-only server and a text browser need: HTTP/1.0 style (`Connection: close`, no chunking,
-//! no keep-alive), request/response heads, a safe request path, MIME types, directory listings, URLs, and a rough
-//! HTML-to-text renderer that numbers the links.
+//! tests. Only what a small GET-only server and a text browser need: request/response heads (the server speaks HTTP/1.1
+//! with keep-alive, `Range` and conditional requests; the browser asks HTTP/1.0 and gets no chunking), a safe request
+//! path, MIME types, directory listings, URLs, and a rough HTML-to-text renderer that numbers the links.
 #![cfg_attr(not(test), no_std)]
 
 use core::fmt::{self, Write};
@@ -45,10 +45,20 @@ impl Write for Out<'_> {
 
 // ---------------------------------------------------------------- server side
 
-/// A parsed request line. The head of a request ends at a blank line; a body (we serve GET and HEAD only) is ignored.
+/// A parsed request head: the request line and the few headers a file server acts on. The head ends at a blank line; a body
+/// (we serve GET and HEAD only) is never read, so a request that announces one is answered and then closed.
 pub struct Request<'a> {
     pub method: &'a [u8],
     pub target: &'a [u8],
+    /// Bytes the head takes, blank line included: what to take off the connection before the next request starts.
+    pub head_len: usize,
+    pub http11: bool,
+    /// Whether the connection stays open after the answer (HTTP/1.1 unless `Connection: close`; 1.0 only with `keep-alive`).
+    pub keep_alive: bool,
+    pub range: Option<&'a [u8]>,
+    pub if_range: Option<&'a [u8]>,
+    pub if_none_match: Option<&'a [u8]>,
+    pub if_modified_since: Option<&'a [u8]>,
 }
 
 pub enum Parse<'a> {
@@ -63,7 +73,11 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 pub fn parse_request(buf: &[u8]) -> Parse<'_> {
-    let Some(end) = find(buf, b"\r\n\r\n").or_else(|| find(buf, b"\n\n")) else { return Parse::Incomplete };
+    let (end, head_len) = match (find(buf, b"\r\n\r\n").map(|at| (at, at + 4)), find(buf, b"\n\n").map(|at| (at, at + 2))) {
+        (Some(a), Some(b)) => if a.0 <= b.0 { a } else { b },
+        (Some(a), None) | (None, Some(a)) => a,
+        (None, None) => return Parse::Incomplete,
+    };
     let line_end = buf.iter().position(|&b| b == b'\n').unwrap_or(end);
     let line = buf[..line_end].strip_suffix(b"\r").unwrap_or(&buf[..line_end]);
     let mut parts = line.split(|&b| b == b' ').filter(|part| !part.is_empty());
@@ -71,7 +85,190 @@ pub fn parse_request(buf: &[u8]) -> Parse<'_> {
     if !version.starts_with(b"HTTP/") || parts.next().is_some() {
         return Parse::Bad;
     }
-    Parse::Done(Request { method, target })
+    let http11 = version == b"HTTP/1.1";
+    let headers = &buf[(line_end + 1).min(end)..end];
+    let connection = header(headers, b"connection");
+    let wants = |token: &[u8]| connection.is_some_and(|value| value.split(|&b| b == b',').any(|part| trim(part).eq_ignore_ascii_case(token)));
+    let mut keep_alive = if http11 { !wants(b"close") } else { wants(b"keep-alive") };
+    // A body would be read as the next request: answer, then hang up.
+    if header(headers, b"transfer-encoding").is_some() || header(headers, b"content-length").is_some_and(|value| trim(value) != b"0") {
+        keep_alive = false;
+    }
+    Parse::Done(Request {
+        method,
+        target,
+        head_len,
+        http11,
+        keep_alive,
+        range: header(headers, b"range"),
+        if_range: header(headers, b"if-range"),
+        if_none_match: header(headers, b"if-none-match"),
+        if_modified_since: header(headers, b"if-modified-since"),
+    })
+}
+
+fn trim(mut text: &[u8]) -> &[u8] {
+    while let [b' ' | b'\t', rest @ ..] = text {
+        text = rest;
+    }
+    while let [rest @ .., b' ' | b'\t' | b'\r'] = text {
+        text = rest;
+    }
+    text
+}
+
+/// The value of the header `name` (lower case) in `headers` (the lines after the request line), trimmed.
+fn header<'a>(headers: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    headers.split(|&b| b == b'\n').find_map(|line| {
+        let colon = line.iter().position(|&b| b == b':')?;
+        line[..colon].eq_ignore_ascii_case(name).then(|| trim(&line[colon + 1..]))
+    })
+}
+
+/// What a `Range` header asks of a file of `length` bytes.
+#[derive(Debug, PartialEq)]
+pub enum RangeOutcome {
+    /// No usable range (absent, malformed or several ranges: all allowed to be ignored): send the whole file.
+    Whole,
+    /// First and last byte, both included.
+    Partial(u64, u64),
+    /// Starts past the end: 416.
+    Unsatisfiable,
+}
+
+pub fn parse_range(value: &[u8], length: u64) -> RangeOutcome {
+    let Some(spec) = value.get(..6).filter(|unit| unit.eq_ignore_ascii_case(b"bytes=")).map(|_| trim(&value[6..])) else { return RangeOutcome::Whole };
+    if spec.contains(&b',') {
+        return RangeOutcome::Whole;
+    }
+    let number = |text: &[u8]| -> Option<u64> {
+        if text.is_empty() || !text.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        text.iter().try_fold(0u64, |total, &digit| total.checked_mul(10)?.checked_add(u64::from(digit - b'0')))
+    };
+    let Some(dash) = spec.iter().position(|&b| b == b'-') else { return RangeOutcome::Whole };
+    let (first, last) = (&spec[..dash], &spec[dash + 1..]);
+    if first.is_empty() {
+        // The last N bytes.
+        let Some(count) = number(last) else { return RangeOutcome::Whole };
+        return if count == 0 || length == 0 { RangeOutcome::Unsatisfiable } else { RangeOutcome::Partial(length.saturating_sub(count), length - 1) };
+    }
+    let Some(start) = number(first) else { return RangeOutcome::Whole };
+    let end = if last.is_empty() {
+        u64::MAX
+    } else {
+        match number(last) {
+            Some(end) if end >= start => end,
+            _ => return RangeOutcome::Whole,
+        }
+    };
+    if start >= length { RangeOutcome::Unsatisfiable } else { RangeOutcome::Partial(start, end.min(length - 1)) }
+}
+
+/// Seconds since 1970 as an HTTP date (`Sun, 06 Nov 1994 08:49:37 GMT`) when displayed.
+pub struct HttpDate(pub u64);
+
+const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/// (year, month 1-12, day) of a day count since 1970-01-01 (Howard Hinnant's civil-from-days).
+fn civil(days: i64) -> (i64, usize, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted + 2) / 5 + 1;
+    let month = if shifted < 10 { shifted + 3 } else { shifted - 9 };
+    (year_of_era + era * 400 + i64::from(month <= 2), month as usize, day)
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year.rem_euclid(400);
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+impl fmt::Display for HttpDate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (days, rest) = ((self.0 / 86_400) as i64, self.0 % 86_400);
+        let (year, month, day) = civil(days);
+        write!(f, "{}, {:02} {} {} {:02}:{:02}:{:02} GMT", DAYS[(days % 7) as usize], day, MONTHS[month - 1], year, rest / 3600, rest / 60 % 60, rest % 60)
+    }
+}
+
+/// Parses the date form every client sends (`Sun, 06 Nov 1994 08:49:37 GMT`); anything else is `None`.
+pub fn parse_http_date(text: &[u8]) -> Option<u64> {
+    let text = core::str::from_utf8(trim(text)).ok()?;
+    let mut words = text.split(' ').filter(|word| !word.is_empty());
+    let weekday = words.next()?;
+    let (day, month, year, time, zone) = (words.next()?, words.next()?, words.next()?, words.next()?, words.next()?);
+    if !weekday.ends_with(',') || zone != "GMT" || words.next().is_some() {
+        return None;
+    }
+    let month = MONTHS.iter().position(|name| *name == month)? as i64 + 1;
+    let mut clock = time.split(':');
+    let (hour, minute, second) = (clock.next()?.parse::<u64>().ok()?, clock.next()?.parse::<u64>().ok()?, clock.next()?.parse::<u64>().ok()?);
+    let (day, year) = (day.parse::<i64>().ok()?, year.parse::<i64>().ok()?);
+    if clock.next().is_some() || hour > 23 || minute > 59 || second > 60 || !(1..=31).contains(&day) || year < 1970 {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    u64::try_from(days).ok()?.checked_mul(86_400)?.checked_add(hour * 3600 + minute * 60 + second)
+}
+
+/// The entity tag of a file: its size and modification time, which change when its contents do.
+struct Etag(u64, u64);
+
+impl fmt::Display for Etag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "\"{:x}-{:x}\"", self.0, self.1)
+    }
+}
+
+fn etag_text(size: u64, mtime: u64, out: &mut [u8; 40]) -> usize {
+    let mut writer = Out::new(out);
+    let _ = write!(writer, "{}", Etag(size, mtime));
+    writer.len()
+}
+
+/// Whether an `If-None-Match` value (`*` or a list of tags, weak ones compared as strong) names this file's tag.
+fn etag_listed(value: &[u8], size: u64, mtime: u64) -> bool {
+    let mut mine = [0u8; 40];
+    let length = etag_text(size, mtime, &mut mine);
+    let value = trim(value);
+    value == b"*" || value.split(|&b| b == b',').any(|tag| trim(tag).strip_prefix(b"W/").unwrap_or(trim(tag)) == &mine[..length])
+}
+
+/// Whether a GET or HEAD for a file of `size` bytes and `mtime` (0: unknown, no validators) is answered 304: `If-None-Match`
+/// decides when present, else `If-Modified-Since`.
+pub fn not_modified(request: &Request, size: u64, mtime: u64) -> bool {
+    if mtime == 0 {
+        return false;
+    }
+    if let Some(tags) = request.if_none_match {
+        return etag_listed(tags, size, mtime);
+    }
+    request.if_modified_since.and_then(parse_http_date).is_some_and(|since| mtime <= since)
+}
+
+/// Whether a `Range` may be honoured: no `If-Range`, or its tag or date still names this version of the file.
+pub fn range_applies(request: &Request, size: u64, mtime: u64) -> bool {
+    let Some(value) = request.if_range else { return true };
+    if mtime == 0 {
+        return false;
+    }
+    if value.starts_with(b"\"") {
+        let mut mine = [0u8; 40];
+        let length = etag_text(size, mtime, &mut mine);
+        return value == &mine[..length];
+    }
+    parse_http_date(value) == Some(mtime)
 }
 
 /// The request target as a path relative to the web root: percent-decoded into `out`, the query and fragment cut off.
@@ -170,22 +367,62 @@ pub fn mime(name: &[u8]) -> &'static str {
 pub fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        206 => "Partial Content",
         301 => "Moved Permanently",
+        304 => "Not Modified",
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         414 => "URI Too Long",
+        416 => "Range Not Satisfiable",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "Status",
     }
 }
 
-/// Writes a response head (status line, headers, blank line). `location` makes a redirect.
-pub fn response_head(out: &mut Out, status: u16, content_type: &str, length: u64, location: Option<&[u8]>) -> fmt::Result {
-    write!(out, "HTTP/1.0 {} {}\r\nServer: fos-httpd\r\nConnection: close\r\nContent-Type: {}\r\nContent-Length: {}\r\n", status, reason(status), content_type, length)?;
-    if let Some(location) = location {
+/// What a response head says. `length` is the body's length (0 and no `Content-Length` for 304).
+pub struct Response<'a> {
+    pub status: u16,
+    pub content_type: &'a str,
+    pub length: u64,
+    pub location: Option<&'a [u8]>,
+    pub keep_alive: bool,
+    /// A file's size and modification time (0: unknown): `Last-Modified` and `ETag`, and `Accept-Ranges` for a file.
+    pub file: Option<(u64, u64)>,
+    /// 206: first byte, last byte, file size.
+    pub content_range: Option<(u64, u64, u64)>,
+}
+
+impl<'a> Response<'a> {
+    pub fn new(status: u16, content_type: &'a str, length: u64, keep_alive: bool) -> Self {
+        Response { status, content_type, length, location: None, keep_alive, file: None, content_range: None }
+    }
+}
+
+/// Writes a response head (status line, headers, blank line).
+pub fn write_response(out: &mut Out, response: &Response) -> fmt::Result {
+    let status = response.status;
+    write!(out, "HTTP/1.1 {} {}\r\nServer: fos-httpd\r\nConnection: {}\r\n", status, reason(status), if response.keep_alive { "keep-alive" } else { "close" })?;
+    if status != 304 {
+        write!(out, "Content-Type: {}\r\nContent-Length: {}\r\n", response.content_type, response.length)?;
+    }
+    if let Some((size, mtime)) = response.file {
+        out.write_str("Accept-Ranges: bytes\r\n")?;
+        if mtime != 0 {
+            write!(out, "Last-Modified: {}\r\nETag: {}\r\n", HttpDate(mtime), Etag(size, mtime))?;
+        }
+    }
+    if let Some((first, last, size)) = response.content_range {
+        write!(out, "Content-Range: bytes {first}-{last}/{size}\r\n")?;
+    }
+    if status == 416 {
+        if let Some((size, _)) = response.file {
+            write!(out, "Content-Range: bytes */{size}\r\n")?;
+        }
+    }
+    if let Some(location) = response.location {
         out.write_str("Location: ")?;
         out.write_str(core::str::from_utf8(location).map_err(|_| fmt::Error)?)?;
         out.write_str("\r\n")?;
@@ -794,6 +1031,104 @@ mod tests {
         assert!(matches!(parse_request(b"GET /\n\n"), Parse::Bad));
     }
 
+    fn request(text: &str) -> Request<'_> {
+        let Parse::Done(request) = parse_request(text.as_bytes()) else { panic!() };
+        request
+    }
+
+    #[test]
+    fn keep_alive_follows_the_version_and_connection_header() {
+        assert!(request("GET / HTTP/1.1\r\nHost: x\r\n\r\n").keep_alive);
+        assert!(!request("GET / HTTP/1.1\r\nConnection: Close\r\n\r\n").keep_alive);
+        assert!(!request("GET / HTTP/1.0\r\n\r\n").keep_alive);
+        assert!(request("GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n").keep_alive);
+        // A body we do not read would be taken for the next request.
+        assert!(!request("GET / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello").keep_alive);
+        assert!(request("GET / HTTP/1.1\r\nContent-Length: 0\r\n\r\n").keep_alive);
+        assert!(!request("GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n").keep_alive);
+        let head = request("GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\n\r\n");
+        assert_eq!(head.head_len, "GET /a HTTP/1.1\r\nHost: x\r\n\r\n".len());
+    }
+
+    #[test]
+    fn ranges() {
+        use RangeOutcome::*;
+        assert_eq!(parse_range(b"bytes=0-99", 1000), Partial(0, 99));
+        assert_eq!(parse_range(b"bytes=900-", 1000), Partial(900, 999));
+        assert_eq!(parse_range(b"bytes=990-5000", 1000), Partial(990, 999));
+        assert_eq!(parse_range(b"bytes=-100", 1000), Partial(900, 999));
+        assert_eq!(parse_range(b"bytes=-5000", 1000), Partial(0, 999));
+        assert_eq!(parse_range(b"bytes=1000-", 1000), Unsatisfiable);
+        assert_eq!(parse_range(b"bytes=-0", 1000), Unsatisfiable);
+        assert_eq!(parse_range(b"bytes=0-", 0), Unsatisfiable);
+        // Several ranges, other units and nonsense are ignored (the whole file is a valid answer).
+        assert_eq!(parse_range(b"bytes=0-1,5-6", 1000), Whole);
+        assert_eq!(parse_range(b"items=0-1", 1000), Whole);
+        assert_eq!(parse_range(b"bytes=5-2", 1000), Whole);
+        assert_eq!(parse_range(b"bytes=a-b", 1000), Whole);
+        assert_eq!(parse_range(b"bytes=0-99999999999999999999999", 1000), Whole);
+    }
+
+    #[test]
+    fn dates_round_trip() {
+        assert_eq!(HttpDate(784_111_777).to_string(), "Sun, 06 Nov 1994 08:49:37 GMT");
+        assert_eq!(HttpDate(0).to_string(), "Thu, 01 Jan 1970 00:00:00 GMT");
+        assert_eq!(HttpDate(951_782_400).to_string(), "Tue, 29 Feb 2000 00:00:00 GMT");
+        for seconds in [0, 784_111_777, 951_782_400, 1_762_345_678, 4_102_444_799] {
+            assert_eq!(parse_http_date(HttpDate(seconds).to_string().as_bytes()), Some(seconds));
+        }
+        assert_eq!(parse_http_date(b"Sunday, 06-Nov-94 08:49:37 GMT"), None);
+        assert_eq!(parse_http_date(b"Sun, 06 Nov 1994 08:49:37 PST"), None);
+    }
+
+    #[test]
+    fn conditional_requests() {
+        let (size, mtime) = (4096, 784_111_777);
+        let tag = format!("\"{size:x}-{mtime:x}\"");
+        let get = |headers: &str| format!("GET /f HTTP/1.1\r\n{headers}\r\n");
+        let text = get(&format!("If-None-Match: W/\"x\", {tag}\r\n"));
+        assert!(not_modified(&request(&text), size, mtime));
+        assert!(!not_modified(&request(&get("If-None-Match: \"other\"\r\n")), size, mtime));
+        assert!(not_modified(&request(&get("If-None-Match: *\r\n")), size, mtime));
+        assert!(not_modified(&request(&get("If-Modified-Since: Sun, 06 Nov 1994 08:49:37 GMT\r\n")), size, mtime));
+        assert!(!not_modified(&request(&get("If-Modified-Since: Sun, 06 Nov 1994 08:49:36 GMT\r\n")), size, mtime));
+        // The tag wins over the date, and a file with no time has no validators.
+        assert!(!not_modified(&request(&get("If-None-Match: \"other\"\r\nIf-Modified-Since: Sun, 06 Nov 1994 08:49:37 GMT\r\n")), size, mtime));
+        assert!(!not_modified(&request(&get("If-None-Match: *\r\n")), size, 0));
+        // If-Range: the range applies only to the version the client has.
+        assert!(range_applies(&request(&get("Range: bytes=0-1\r\n")), size, mtime));
+        assert!(range_applies(&request(&get(&format!("If-Range: {tag}\r\n"))), size, mtime));
+        assert!(!range_applies(&request(&get("If-Range: \"old\"\r\n")), size, mtime));
+        assert!(range_applies(&request(&get("If-Range: Sun, 06 Nov 1994 08:49:37 GMT\r\n")), size, mtime));
+        assert!(!range_applies(&request(&get("If-Range: Sun, 06 Nov 1994 08:49:36 GMT\r\n")), size, mtime));
+    }
+
+    #[test]
+    fn partial_and_validated_heads() {
+        let mut buffer = [0u8; 512];
+        let mut out = Out::new(&mut buffer);
+        let mut response = Response::new(206, "audio/flac", 100, true);
+        response.file = Some((4096, 784_111_777));
+        response.content_range = Some((0, 99, 4096));
+        write_response(&mut out, &response).unwrap();
+        let head = core::str::from_utf8(out.bytes()).unwrap();
+        for line in ["HTTP/1.1 206 Partial Content", "Connection: keep-alive", "Content-Length: 100", "Accept-Ranges: bytes", "Content-Range: bytes 0-99/4096",
+                     "Last-Modified: Sun, 06 Nov 1994 08:49:37 GMT", "ETag: \"1000-2ebc98a1\""] {
+            assert!(head.contains(&format!("{line}\r\n")), "{line} in {head}");
+        }
+        let mut buffer = [0u8; 512];
+        let mut out = Out::new(&mut buffer);
+        let mut response = Response::new(416, "text/html", 5, true);
+        response.file = Some((4096, 0));
+        write_response(&mut out, &response).unwrap();
+        assert!(core::str::from_utf8(out.bytes()).unwrap().contains("Content-Range: bytes */4096\r\n"));
+        let mut buffer = [0u8; 512];
+        let mut out = Out::new(&mut buffer);
+        write_response(&mut out, &Response::new(304, "text/html", 0, true)).unwrap();
+        let head = core::str::from_utf8(out.bytes()).unwrap();
+        assert!(!head.contains("Content-Length") && head.starts_with("HTTP/1.1 304 Not Modified\r\n"));
+    }
+
     #[test]
     fn paths_are_cleaned_and_traversal_refused() {
         assert_eq!(path("/"), Some((String::new(), true)));
@@ -833,9 +1168,11 @@ mod tests {
     fn heads_and_listing() {
         let mut buffer = [0u8; 512];
         let mut out = Out::new(&mut buffer);
-        response_head(&mut out, 301, "text/html", 0, Some(b"/docs/")).unwrap();
+        let mut response = Response::new(301, "text/html", 0, false);
+        response.location = Some(b"/docs/");
+        write_response(&mut out, &response).unwrap();
         let head = core::str::from_utf8(out.bytes()).unwrap();
-        assert!(head.starts_with("HTTP/1.0 301 Moved Permanently\r\n"));
+        assert!(head.starts_with("HTTP/1.1 301 Moved Permanently\r\n") && head.contains("Connection: close\r\n"));
         assert!(head.contains("Location: /docs/\r\n") && head.ends_with("\r\n\r\n"));
         let mut buffer = [0u8; 512];
         let mut out = Out::new(&mut buffer);

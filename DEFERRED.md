@@ -597,8 +597,9 @@ use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limi
   - Plumbing: a TLS stream wrapping `tape_ip::tcp::Socket` with the same `send`/`recv`/`close`; `parse_url` accepts https (port 443, SNI); TLS records need up to 16 KB buffers each way.
   - Tests: host `ssl` or `openssl s_server` with a self-signed cert on slirp, a test CA for validation, known-answer vectors on the host.
   - Size: encrypted but unverified a few days; verified with a trust store a week or more; TLS in `httpd` (keys, certificate) is a larger separate step.
-- TLS (https) for httpd; POST, keep-alive, Range requests and `If-Modified-Since` in httpd; forms, cookies, images and a mouse in the browser; a gfx-canvas browser.
-- httpd does not renew its DHCP lease (give it `ip=` for a long run) and a service owns its NIC, so a one-NIC machine cannot run httpd and the browser together.
+- TLS (https) and login stay out of httpd (a reverse proxy does them); POST in httpd; forms, cookies, images and a mouse in the browser; a gfx-canvas browser; https in `web`.
+- A service owns its NIC, so a one-NIC machine cannot run httpd and the browser together. Other long-running tapes (smbd, ...) still do not renew their DHCP lease: `DhcpTask::maintain` plus `Server::take_dhcp` (see httpd) is the pattern.
+- httpd listens again on its own when a lease renewal changes the address (open connections are dropped); not tested against a real DHCP server.
 - httpd looks a file up by listing its folder (O(n) per request, O(n²) for a listing); fine for small folders. A FAT32 subfolder lists the root in the kernel, so a missing FAT32 subfolder looks like a folder.
 - The browser reads a page whole (1 MiB at most), does not decode `Transfer-Encoding: chunked` (it asks with HTTP/1.0), and treats non-UTF-8 pages as Latin-1.
 - `web` could save a page to a file (`-o`), and `tape-http`'s MIME list is short.
@@ -607,7 +608,7 @@ use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limi
 
 - Built and in use (slices 1-8 and the gaps/side items in `docs/big-kernel.md`; runs on `piano`): SMP, preemption, a real VM, ring-3 tapes, NETFS and the tapesync manifest, the `tapesync` and `gpio @HOST` clients (shared code), an Intel TCO hardware watchdog (`hwwd.rs`), a BIOS text-mode console fallback (`fb::init_text`) and a pixel-console caret.
 - QEMU-tested only: the TCO watchdog on chipsets other than ICH9/10 and the 5-8 series PCHs (the others have the software watchdog only), the BIOS text console (its ANSI colour mapping has no automated check; the serial shell drops ESC), the iso underrun fix on hardware other than `piano`.
-- Not done: tape ABI 31 needs `make image` and a tape redeploy; the branch `kernel-core-1b` is not merged to main.
+- The branches `kernel-core` and `kernel-core-1b` are merged into main. After any ABI change (now version 37) `make image` and a tape redeploy are needed.
 
 - **ext4 writer: keep the hash-tree index** (2026-11-03). The reader looks names up through the htree (`Fs::lookup`), but the
   writer clears `INDEX_FL` on a folder's first change (on checksummed volumes after linearising it), so every folder we have
@@ -632,9 +633,8 @@ use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limi
 
 ## Planned (2026-11-05)
 
-- **A better, threaded HTTP server.** `httpd` handles one request at a time. Use the tape threads (ABI 37, mf) for concurrent
-  requests; add keep-alive, Range, POST and `If-Modified-Since`, a faster file lookup and DHCP lease renewal (see "Open after
-  httpd and web").
+- **httpd on rack: measure.** The threaded httpd (keep-alive, Range, ETag, read-ahead workers, ext4 root, DHCP renewal) passes
+  `make test-httpd test-mf-httpd`; still to do: deploy to `rack`, time large FLAC downloads and check Pi-hole shows the name.
 - **FOS-mf on aarch64** (Raspberry Pi 4 only): SMP, VM and ring-3 tapes for the server kernel, on the shared `kernel-core`
   (`docs/big-kernel.md`, `docs/aarch64-plan.md`).
 - **mf on `rack`: USB audio interface times out during boot** (xHCI). Reproduce on the machine, read `dmesg`, fix in
