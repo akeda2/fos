@@ -121,6 +121,7 @@ A tape is a position-independent ELF64 executable whose entry is
   `DiskInfo`, ...): a tape built earlier passes a smaller struct and the kernel writes
   past it. New information gets a new call and a new struct (`audio_buffer`,
   `audio_devices` are examples).
+- **Which kernel serves which call** (x86, Pi 4, mf): `tools/check_abi_support.py` (`--table` prints the matrix) fails `make test` on a stubbed call not listed in its `GAPS`. Calls the embedded kernels share are in `kernel/src/tape_common.rs`; the Pi's stubs in `tape_common::unsupported`.
 - **After any ABI change rebuild and redeploy every tape** (`make tapes`, then copy to the
   machines); a running tape also blocks NETFS serving.
 - `read_key` and `should_abort` drain the same input: use one or the other.
