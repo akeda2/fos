@@ -634,7 +634,8 @@ use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limi
 ## Planned (2026-11-05)
 
 - **httpd on rack: measure.** The threaded httpd (keep-alive, Range, ETag, read-ahead workers, ext4 root, DHCP renewal) passes
-  `make test-httpd test-mf-httpd`; still to do: deploy to `rack`, time large FLAC downloads and check Pi-hole shows the name.
+  `make test-httpd test-mf-httpd`. Measured on `rack` 2026-11-06 (mf, RTL8168 through a vNIC, 698 MB from ext4): 100-103 MB/s,
+  near gigabit line rate. Still to do: check Pi-hole shows the name.
 - **FOS-mf on aarch64** (Raspberry Pi 4 only): SMP, VM and ring-3 tapes for the server kernel, on the shared `kernel-core`
   (`docs/big-kernel.md`, `docs/aarch64-plan.md`).
 - **mf on `rack`: USB audio interface times out during boot** (xHCI). Reproduce on the machine, read `dmesg`, fix in
