@@ -137,10 +137,13 @@ const TD1_TRANSPORT_SHIFT: u32 = 18;
 
 const DESCRIPTOR_BYTES: usize = 16;
 /// v1's lesson: with only 8-16 descriptors a tape forwarding a gigabit stream overran constantly.
-const RX_COUNT: usize = 64;
+/// Deep enough to ride out a consumer that is off the CPU for a few milliseconds while the peer bursts a full TCP window
+/// (a 64-entry ring, 0.8 ms at 1 Gb/s, overflowed under an SFTP upload and wedged the receiver).
+const RX_COUNT: usize = 256;
 const TX_COUNT: usize = 32;
 const BUFFER_BYTES: usize = 2048;
 const TX_RING_OFFSET: u64 = (RX_COUNT * DESCRIPTOR_BYTES) as u64;
+const RING_FRAMES: u64 = ((RX_COUNT + TX_COUNT) * DESCRIPTOR_BYTES).div_ceil(4096) as u64;
 const RX_BUFFER_FRAMES: u64 = (RX_COUNT * BUFFER_BYTES / 4096) as u64;
 const TX_BUFFER_FRAMES: u64 = (TX_COUNT * BUFFER_BYTES / 4096) as u64;
 
@@ -255,7 +258,7 @@ impl Rtl8168 {
             return Err(Error::ResetTimedOut);
         }
         let below = Some(1u64 << 32); // descriptors carry 64-bit addresses, but low memory is simplest
-        let rings = memory::allocate_contiguous(1, below).ok_or(Error::OutOfMemory)?;
+        let rings = memory::allocate_contiguous(RING_FRAMES, below).ok_or(Error::OutOfMemory)?;
         let rx_buffers = memory::allocate_contiguous(RX_BUFFER_FRAMES, below).ok_or(Error::OutOfMemory)?;
         let tx_buffers = memory::allocate_contiguous(TX_BUFFER_FRAMES, below).ok_or(Error::OutOfMemory)?;
         init_rings(rings, rx_buffers, tx_buffers);
@@ -424,18 +427,18 @@ impl Rtl8168 {
             read16(io, REG_CPLUSCMD)
         );
         crate::println!("TxConfig={:08x} RxConfig={:08x} RMS={:04x}", read32(io, REG_TXCONFIG), read32(io, REG_RXCONFIG), read16(io, REG_RMS));
-        let (mut rx_card, mut tx_card) = (0u64, 0u64);
+        let (mut rx_card, mut tx_card) = (0usize, 0usize);
         for index in 0..RX_COUNT {
             if read_opts1(self.rings, index) & DESC_OWN != 0 {
-                rx_card |= 1 << index;
+                rx_card += 1;
             }
         }
         for index in 0..TX_COUNT {
             if read_opts1(self.rings + TX_RING_OFFSET, index) & DESC_OWN != 0 {
-                tx_card |= 1 << index;
+                tx_card += 1;
             }
         }
-        crate::println!("rx next {} (card owns {rx_card:016x}), tx next {} (card owns {tx_card:08x})", self.rx_next, self.tx_next);
+        crate::println!("rx next {} (card owns {rx_card} of {RX_COUNT}), tx next {} (card owns {tx_card} of {TX_COUNT})", self.rx_next, self.tx_next);
         crate::println!(
             "rx[next] opts1 {:08x}; recoveries {}, pending {}, interrupts {:?}",
             read_opts1(self.rings, self.rx_next),
