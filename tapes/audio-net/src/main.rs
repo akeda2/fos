@@ -1410,7 +1410,7 @@ pub const MAX_WORDS: usize = 64;
 
 fn load_config(api: &TapeApi, name: &str, words: &mut [&'static str; MAX_WORDS], count: &mut usize) -> Result<(), &'static str> {
     let text = unsafe { &mut *(&raw mut CONFIG_TEXT) };
-    let length = (api.fs_read)(name.as_ptr(), name.len(), text.as_mut_ptr(), text.len());
+    let length = tape_rt::config::read_named(api, name, text);
     if length < 0 {
         return Err(if length == tape_rt::FS_NOT_FOUND { "the configuration file does not exist" } else { "the configuration file cannot be read (is it over 4096 bytes?)" });
     }

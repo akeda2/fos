@@ -609,7 +609,7 @@ fn save_settings(api: &TapeApi) {
     if !share.is_empty() {
         let _ = write!(body, "share={share}\n");
     }
-    if (api.fs_write)(CONFIG_FILE.as_ptr(), CONFIG_FILE.len(), body.as_str().as_ptr(), body.as_str().len()) == 0 {
+    if tape_rt::config::write_named(api, CONFIG_FILE, body.as_str().as_bytes()) == 0 {
         unsafe { DIRTY = false };
     }
 }
@@ -621,7 +621,7 @@ fn load_settings(api: &TapeApi) {
     if buffer == 0 {
         return;
     }
-    let length = (api.fs_read)(CONFIG_FILE.as_ptr(), CONFIG_FILE.len(), buffer as *mut u8, capacity);
+    let length = tape_rt::config::read_named(api, CONFIG_FILE, unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, capacity) });
     if length > 0 {
         let text = unsafe { core::slice::from_raw_parts(buffer as *const u8, length as usize) };
         for line in core::str::from_utf8(text).unwrap_or("").lines() {

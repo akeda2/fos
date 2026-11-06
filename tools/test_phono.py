@@ -57,7 +57,7 @@ def main():
             guest.process.stdin.flush()
             guest.wait_for("phono: stopped.", 10, mark)
 
-            mark = guest.send("cat phono.cfg")
+            mark = guest.send("cat settings/phono.cfg")
             guest.wait_for("fos> ", 10, mark)
             text = guest.text()[mark:]
             check("curve=iec" in text and "mono=on" in text, "Save wrote phono.cfg with the changed settings", text[-300:])

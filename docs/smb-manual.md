@@ -59,7 +59,7 @@ run smbd user alice 1000 1000 secretpw
 ```
 
 It prints a line like `alice:1000:1000:a08576c2...` (the NT hash, no plaintext). Put the lines in the file `smbusers`
-(`write smbusers LINE`, or `ebb smbusers`; at most 8 users). Restart `smbd` to read it.
+(`write settings/smbusers LINE`, or `ebb settings/smbusers`; at most 8 users; a root `smbusers` still works). Restart `smbd` to read it.
 
 - `guest:UID:GID:` (empty hash) lets anonymous and unknown logins in as that uid/gid. With the file present and no such
   line, guests are refused.

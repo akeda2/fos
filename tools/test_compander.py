@@ -60,7 +60,7 @@ def main():
             guest.wait_for("compander: stopped", 10, mark)
             text = guest.text()[mark:]
             check("overrun" not in text.lower(), "no errors while it ran", text[-500:])
-            mark = guest.send("cat compander.cfg")
+            mark = guest.send("cat settings/compander.cfg")
             guest.wait_for("fos> ", 10, mark)
             text = guest.text()[mark:]
             check("type=2" in text and "mode=encode" in text and "speed=30" in text and "view=meters" in text and "style=bars" in text, "Save wrote compander.cfg with the settings", text[-300:])

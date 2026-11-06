@@ -45,7 +45,7 @@ def main():
         try:
             guest.wait_for("M3 complete")
             guest.wait_for("fos> ")
-            guest.send("rm kaffe.cfg")
+            guest.send("rm settings/kaffe.cfg")
             guest.send("date set 2026-10-21 09:15:00")
             mark = guest.send("run kaffe")
             guest.wait_for("kaffe: Enter or Space", 20, mark)
@@ -62,7 +62,7 @@ def main():
             _, _, pixel = screenshot(monitor, "kaffe_stamp.ppm")
             check(count(pixel, YELLOW, 0, height // 2, width, height) > 20, "Enter stamps the time (yellow digits)")
             stop(guest, mark)
-            mark = guest.send("cat kaffe.cfg")
+            mark = guest.send("cat settings/kaffe.cfg")
             guest.wait_for("last=2026-10-21T09:", 10, mark)
 
             mark = guest.send("run kaffe")
@@ -76,7 +76,7 @@ def main():
             _, _, pixel = screenshot(monitor, "kaffe_clear.ppm")
             check(count(pixel, YELLOW, 0, height // 2, width, height) == 0, "c clears the stamp")
             stop(guest, mark)
-            mark = guest.send("cat kaffe.cfg")
+            mark = guest.send("cat settings/kaffe.cfg")
             time.sleep(1)
             check("last=" not in guest.text()[mark:], "the cleared stamp is saved too")
         finally:

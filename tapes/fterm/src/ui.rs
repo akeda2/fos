@@ -127,7 +127,7 @@ fn next_key(decoder: &mut KeyDecoder) -> Option<Key> {
 fn load() -> Form {
     let api = tape_rt::api();
     let mut buffer = [0u8; 200];
-    let length = (api.fs_read)(CONFIG_FILE.as_ptr(), CONFIG_FILE.len(), buffer.as_mut_ptr(), buffer.len());
+    let length = tape_rt::config::read_named(api, CONFIG_FILE, &mut buffer);
     if length > 0 {
         if let Ok(text) = core::str::from_utf8(&buffer[..length as usize]) {
             if let Some(form) = Form::from_args(text) {
@@ -145,7 +145,7 @@ fn save(form: &Form) -> &'static str {
     let mut text = form.args();
     text.push(b'\n');
     let api = tape_rt::api();
-    if (api.fs_write)(CONFIG_FILE.as_ptr(), CONFIG_FILE.len(), text.as_str().as_ptr(), text.len()) == 0 {
+    if tape_rt::config::write_named(api, CONFIG_FILE, text.as_str().as_bytes()) == 0 {
         "Saved fterm.cfg. `run fterm @fterm.cfg` connects exactly like this."
     } else {
         "Could not write fterm.cfg (is the volume full?)."
