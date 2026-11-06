@@ -236,7 +236,7 @@ fn list() {
     if table.is_empty() {
         return println!("No services. A line `NAME [restart] TAPE ARGS... &NIC` in `services` defines one (docs/config.md).");
     }
-    println!("NAME             STATE                  PID  COMMAND");
+    println!("NAME             STATE                  PID  ADDRESS          COMMAND");
     for service in table.iter() {
         let state = if service.pid != 0 {
             String::from("running")
@@ -246,7 +246,8 @@ fn list() {
             String::from("stopped")
         };
         let flag = if service.restart { " [restart]" } else { "" };
-        println!("{:<16} {:<18} {:>6}  {} {}{flag}", service.name, state, service.pid, service.tape, service.args);
+        let address = crate::tapenet::address_of_owner(service.pid).map_or(String::from("-"), |ip| alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]));
+        println!("{:<16} {:<18} {:>6}  {:<15}  {} {}{flag}", service.name, state, service.pid, address, service.tape, service.args);
     }
 }
 

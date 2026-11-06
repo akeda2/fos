@@ -82,6 +82,23 @@ fn here(reference: &str) -> String {
     normalize(&alloc::format!("{cwd}/{reference}"))
 }
 
+/// Lists a folder named in full (already resolved against the working folder).
+fn list_resolved(host: &mut MfHost, volume: &str, each: &mut dyn FnMut(&mut dyn Host, Entry)) -> Result<&'static str, FsError> {
+    let mut entries: Vec<(Vec<u8>, u64, bool, Option<Stamp>)> = Vec::new();
+    let kind = {
+        let _disk = tapefs::lock();
+        tape_fs::each_entry(volume.as_bytes(), &mut |name, length, directory, modified| {
+            let modified = modified.map(|time| Stamp { year: time.year, month: time.month, day: time.day, hour: time.hour, minute: time.minute, second: time.second });
+            entries.push((name.to_vec(), length, directory, modified));
+        })
+        .map_err(error)?
+    };
+    for (name, length, directory, modified) in &entries {
+        each(host, Entry { name, length: *length, directory: *directory, modified: *modified });
+    }
+    Ok(kind)
+}
+
 pub fn working_folder() -> String {
     current()
 }
@@ -90,7 +107,7 @@ pub fn working_folder() -> String {
 pub fn change_folder(target: &str) -> Result<String, FsError> {
     let resolved = if target.is_empty() { String::new() } else { here(target) };
     if !resolved.is_empty() {
-        MfHost.list(&resolved, &mut |_, _| {})?;
+        list_resolved(&mut MfHost, &resolved, &mut |_, _| {})?;
     }
     let id = crate::session::current_or_console();
     CWD_RESET[id].store(false, core::sync::atomic::Ordering::Relaxed);
@@ -212,20 +229,7 @@ impl Host for MfHost {
     // The entries are collected under the lock and handed out after it is dropped: `each` prints, which may take a while on a
     // network terminal, and must not keep the disk from other CPUs.
     fn list(&mut self, volume: &str, each: &mut dyn FnMut(&mut dyn Host, Entry)) -> Result<&'static str, FsError> {
-        let volume = &here(volume);
-        let mut entries: Vec<(Vec<u8>, u64, bool, Option<Stamp>)> = Vec::new();
-        let kind = {
-            let _disk = tapefs::lock();
-            tape_fs::each_entry(volume.as_bytes(), &mut |name, length, directory, modified| {
-                let modified = modified.map(|time| Stamp { year: time.year, month: time.month, day: time.day, hour: time.hour, minute: time.minute, second: time.second });
-                entries.push((name.to_vec(), length, directory, modified));
-            })
-            .map_err(error)?
-        };
-        for (name, length, directory, modified) in &entries {
-            each(self, Entry { name, length: *length, directory: *directory, modified: *modified });
-        }
-        Ok(kind)
+        list_resolved(self, &here(volume), each)
     }
 
     // Probed by listing: a disk number that is not there fails at once.

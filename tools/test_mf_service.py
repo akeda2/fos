@@ -93,6 +93,8 @@ def main():
         check(answers(PORT_A) and answers(PORT_B), "both services answer")
         table, out = pids()
         check(table.get("web", 0) > 0 and table.get("files", 0) > 0, "`service` lists both as running", out)
+        check(len(re.findall(r"^\w+\s+running\s+\d+\s+\d+\.\d+\.\d+\.\d+\s", out, re.M)) == 2,
+              "`service` shows the address each one got", out)
         ok, out = command("service start web", "already running", 10)
         check(ok, "starting a running service is refused politely", out)
 
