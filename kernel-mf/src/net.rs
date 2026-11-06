@@ -13,7 +13,7 @@
 //!
 //! Not served yet: GPIO and the `tapesync` client command (`DEFERRED.md`). Everything runs on the boot CPU.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kernel_core::nic::{self, Nic};
 use kernel_core::nicctl;
@@ -264,97 +264,154 @@ fn announce() {
     }
 }
 
-// ---- the terminal session ----
+// ---- the terminal sessions ----
 
-static mut PEER: Option<[u8; 6]> = None;
-/// The interface the open session's HELLO arrived on: console output goes out of it.
-static mut SESSION_NIC: usize = 0;
-static mut PEER_ACTIVITY: u64 = 0;
-/// Console output waiting for the client; `println!` fills it from any CPU, `flush` empties it on the boot CPU.
+/// A `term net` client. Slot `n` of `TERMINALS` is shell session `n + 1` (`session.rs`; session 0 is the console).
+#[derive(Clone, Copy)]
+struct Terminal {
+    peer: Option<[u8; 6]>,
+    /// The interface the client's HELLO arrived on: its output goes out of it.
+    nic: usize,
+    activity: u64,
+}
+const TERMINAL_SLOTS: usize = crate::session::MAX - 1;
+static TERMINALS: SpinLock<[Terminal; TERMINAL_SLOTS]> = SpinLock::new([Terminal { peer: None, nic: 0, activity: 0 }; TERMINAL_SLOTS]);
+
+/// Console output waiting for a client; `println!` fills it from any CPU, `flush` empties it on the boot CPU.
 struct Relay {
     bytes: [u8; 16384],
     length: usize,
 }
-static RELAY: SpinLock<Relay> = SpinLock::new(Relay { bytes: [0; 16384], length: 0 });
-static SESSION_OPEN: AtomicBool = AtomicBool::new(false);
+static RELAYS: [SpinLock<Relay>; TERMINAL_SLOTS] = [const { SpinLock::new(Relay { bytes: [0; 16384], length: 0 }) }; TERMINAL_SLOTS];
+/// How many sessions are open (a cheap test for the console's output path).
+static OPEN: AtomicUsize = AtomicUsize::new(0);
 
 /// True while a remote terminal session is open.
 pub fn session_open() -> bool {
-    SESSION_OPEN.load(Ordering::Relaxed)
+    OPEN.load(Ordering::Relaxed) != 0
 }
 
-/// Called by the console for every piece of text; queues it for the client. Never transmits: output that does not fit is
-/// dropped (a terminal can tolerate a torn screen; a stuck NIC must not stall the kernel).
-pub fn relay(text: &str) {
-    if !session_open() {
-        return;
-    }
-    let mut ring = RELAY.lock();
+fn queue(slot: usize, text: &str) {
+    let mut ring = RELAYS[slot].lock();
     let take = text.len().min(ring.bytes.len() - ring.length);
     let start = ring.length;
     ring.bytes[start..start + take].copy_from_slice(&text.as_bytes()[..take]);
     ring.length += take;
 }
 
-/// Sends everything queued as DATA frames.
-fn flush() {
-    let Some(peer) = (unsafe { *core::ptr::addr_of!(PEER) }) else { return };
-    loop {
-        let mut chunk = [0u8; DATA_CAPACITY];
-        let take = {
-            let mut ring = RELAY.lock();
-            let take = ring.length.min(DATA_CAPACITY);
-            chunk[..take].copy_from_slice(&ring.bytes[..take]);
-            let length = ring.length;
-            ring.bytes.copy_within(take..length, 0);
-            ring.length -= take;
-            take
-        };
-        if take == 0 {
-            return;
+/// Called by the console for every piece of text; queues it for the clients. Text that belongs to one session goes to that
+/// session only (the console still shows it); text that belongs to none goes to every open one. Never transmits: output that
+/// does not fit is dropped (a terminal can tolerate a torn screen; a stuck NIC must not stall the kernel).
+pub fn relay(text: &str) {
+    if !session_open() {
+        return;
+    }
+    match crate::session::current() {
+        Some(0) => {}
+        Some(session) => queue(session - 1, text),
+        None => {
+            let open = TERMINALS.lock().map(|terminal| terminal.peer.is_some());
+            for (slot, _) in open.iter().enumerate().filter(|(_, open)| **open) {
+                queue(slot, text);
+            }
         }
-        send(unsafe { SESSION_NIC }, &peer, TAG_DATA, &chunk[..take]);
     }
 }
 
-fn close_session() {
-    unsafe { *core::ptr::addr_of_mut!(PEER) = None };
-    SESSION_OPEN.store(false, Ordering::Relaxed);
-    RELAY.lock().length = 0;
+/// Sends everything queued as DATA frames.
+fn flush() {
+    for slot in 0..TERMINAL_SLOTS {
+        let (peer, nic) = {
+            let terminals = TERMINALS.lock();
+            match terminals[slot].peer {
+                Some(peer) => (peer, terminals[slot].nic),
+                None => continue,
+            }
+        };
+        loop {
+            let mut chunk = [0u8; DATA_CAPACITY];
+            let take = {
+                let mut ring = RELAYS[slot].lock();
+                let take = ring.length.min(DATA_CAPACITY);
+                chunk[..take].copy_from_slice(&ring.bytes[..take]);
+                let length = ring.length;
+                ring.bytes.copy_within(take..length, 0);
+                ring.length -= take;
+                take
+            };
+            if take == 0 {
+                break;
+            }
+            send(nic, &peer, TAG_DATA, &chunk[..take]);
+        }
+    }
+}
+
+fn close_terminal(slot: usize) {
+    {
+        let mut terminals = TERMINALS.lock();
+        if terminals[slot].peer.take().is_some() {
+            OPEN.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    RELAYS[slot].lock().length = 0;
+    shell::detach(slot + 1);
+}
+
+fn find_terminal(index: usize, source: [u8; 6]) -> Option<usize> {
+    TERMINALS.lock().iter().position(|terminal| terminal.peer == Some(source) && terminal.nic == index)
+}
+
+/// The slot a new HELLO gets: the client's own (it reconnects), else a free one, else the one silent longest if it has been
+/// silent for five minutes. None when every slot is in use.
+fn claim_terminal(index: usize, source: [u8; 6]) -> Option<usize> {
+    if let Some(slot) = find_terminal(index, source) {
+        return Some(slot);
+    }
+    let now = apic::ticks();
+    let mut terminals = TERMINALS.lock();
+    let slot = terminals.iter().position(|terminal| terminal.peer.is_none()).or_else(|| {
+        let (slot, oldest) = terminals.iter().enumerate().min_by_key(|(_, terminal)| terminal.activity)?;
+        (now.wrapping_sub(oldest.activity) >= STALE_TICKS).then_some(slot)
+    })?;
+    if terminals[slot].peer.is_none() {
+        OPEN.fetch_add(1, Ordering::Relaxed);
+    }
+    terminals[slot] = Terminal { peer: Some(source), nic: index, activity: now };
+    drop(terminals);
+    RELAYS[slot].lock().length = 0;
+    shell::detach(slot + 1);
+    Some(slot)
 }
 
 fn handle_terminal(index: usize, source: [u8; 6], tag: u8, payload: &[u8]) -> bool {
-    let peer = unsafe { *core::ptr::addr_of!(PEER) };
     match tag {
-        TAG_HELLO if config::deny_term_net() => {}
-        // A session is open: another client's HELLO does not steal it, unless the owner has been silent for five minutes.
-        TAG_HELLO if peer.is_some() && peer != Some(source) && apic::ticks().wrapping_sub(unsafe { PEER_ACTIVITY }) < STALE_TICKS => {}
+        TAG_HELLO if config::deny_term_net() || !config::term_net_allowed(index) => {}
         TAG_HELLO => {
-            unsafe {
-                *core::ptr::addr_of_mut!(PEER) = Some(source);
-                SESSION_NIC = index;
-                PEER_ACTIVITY = apic::ticks();
-            }
-            RELAY.lock().length = 0;
-            SESSION_OPEN.store(true, Ordering::Relaxed);
-            println!("Remote terminal connected from {} on interface {}.", Mac(&source), index + 1);
-            println!("Type `help` for the commands.");
-            crate::shellhost::CWD_RESET.store(true, Ordering::Relaxed);
-            shell::reset();
-            shell::prompt();
+            let Some(slot) = claim_terminal(index, source) else { return true };
+            let session = slot + 1;
+            crate::session::with(session, || {
+                println!("Remote terminal connected from {} on interface {}.", Mac(&source), index + 1);
+                println!("Type `help` for the commands.");
+            });
+            crate::shellhost::reset_folder(session);
+            shell::reset(session);
+            crate::session::with(session, shell::prompt);
         }
-        TAG_DATA if peer == Some(source) && unsafe { SESSION_NIC } == index => {
+        TAG_DATA => {
+            let Some(slot) = find_terminal(index, source) else { return false };
             // The frame has no length field and Ethernet pads a short frame with zeros: drop the trailing zero bytes.
             let end = payload.iter().rposition(|&byte| byte != 0).map_or(0, |last| last + 1);
-            unsafe { PEER_ACTIVITY = apic::ticks() };
+            TERMINALS.lock()[slot].activity = apic::ticks();
             for &byte in &payload[..end] {
-                shell::feed(byte);
+                shell::feed_session(slot + 1, byte);
             }
         }
-        TAG_BYE if peer == Some(source) => {
+        TAG_BYE => {
+            let Some(slot) = find_terminal(index, source) else { return false };
             flush();
-            close_session();
-            println!("Remote terminal disconnected.");
+            close_terminal(slot);
+            println!("Remote terminal {} disconnected.", slot + 1);
         }
         _ => return false,
     }

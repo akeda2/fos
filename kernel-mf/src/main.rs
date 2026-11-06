@@ -8,6 +8,7 @@ extern crate alloc;
 
 #[macro_use]
 mod serial;
+mod session;
 mod fpu;
 mod process;
 mod sched;

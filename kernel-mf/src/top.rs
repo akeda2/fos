@@ -27,7 +27,8 @@ struct Top {
     busy: Vec<u64>,
 }
 
-static TOP: crate::sync::SpinLock<Option<Top>> = crate::sync::SpinLock::new(None);
+/// One per shell session.
+static TOP: [crate::sync::SpinLock<Option<Top>>; crate::session::MAX] = [const { crate::sync::SpinLock::new(None) }; crate::session::MAX];
 
 struct Row {
     id: usize,
@@ -63,7 +64,7 @@ pub fn start(rest: &str) {
         }
     }
     let now = apic::ticks();
-    *TOP.lock() = Some(Top { interval: interval * apic::TICK_HZ, next: now + interval * apic::TICK_HZ, once, drawn: false, wall: now, switches: sched::switches(), threads: threads_now(), busy: busy_now() });
+    *TOP[crate::session::current_or_console()].lock() = Some(Top { interval: interval * apic::TICK_HZ, next: now + interval * apic::TICK_HZ, once, drawn: false, wall: now, switches: sched::switches(), threads: threads_now(), busy: busy_now() });
     if !once {
         print!("\x1b[?25l\x1b[2J\x1b[H(collecting for {interval} s...)");
     }
@@ -71,12 +72,20 @@ pub fn start(rest: &str) {
 
 /// Whether `top` is running (the shell then leaves the prompt to it).
 pub fn active() -> bool {
-    TOP.lock().is_some()
+    TOP[crate::session::current_or_console()].lock().is_some()
 }
 
 /// Called every pass of the service loop: redraws when the interval is over.
 pub fn poll() {
-    let mut guard = TOP.lock();
+    for id in 0..crate::session::MAX {
+        if TOP[id].lock().is_some() {
+            crate::session::with(id, || poll_session(id));
+        }
+    }
+}
+
+fn poll_session(id: usize) {
+    let mut guard = TOP[id].lock();
     let Some(top) = guard.as_mut() else { return };
     let now = apic::ticks();
     if now < top.next {
@@ -104,7 +113,7 @@ pub fn poll() {
 
 /// A typed byte while `top` runs: q, Escape or Ctrl-C end it. True when `top` took the byte.
 pub fn key(byte: u8) -> bool {
-    let mut guard = TOP.lock();
+    let mut guard = TOP[crate::session::current_or_console()].lock();
     if guard.is_none() {
         return false;
     }

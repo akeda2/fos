@@ -19,13 +19,20 @@ const STREAM_CHUNK: usize = 1 << 20;
 
 /// The shell's working folder (`cd`): a reference like `@rackdata/www-root`, empty for the boot volume's root. Relative names
 /// the file commands take are looked up under it; names with a volume (`diskN/`, `@LABEL/`, `extN/`, `esp/`, `//`) are not.
-static CWD: crate::sched::SleepMutex<String> = crate::sched::SleepMutex::new(String::new());
+/// One per session (`session.rs`); code that belongs to no session uses the console's.
+static CWD: [crate::sched::SleepMutex<String>; crate::session::MAX] = [const { crate::sched::SleepMutex::new(String::new()) }; crate::session::MAX];
 /// Set by a new remote terminal session (the receive path must not take `CWD`, which can sleep): it starts at the root.
-pub static CWD_RESET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static CWD_RESET: [core::sync::atomic::AtomicBool; crate::session::MAX] = [const { core::sync::atomic::AtomicBool::new(false) }; crate::session::MAX];
+
+/// Session `id` starts at the root again, at its next look at the folder.
+pub fn reset_folder(id: usize) {
+    CWD_RESET[id].store(true, core::sync::atomic::Ordering::Relaxed);
+}
 
 fn current() -> String {
-    let mut cwd = CWD.lock();
-    if CWD_RESET.swap(false, core::sync::atomic::Ordering::Relaxed) {
+    let id = crate::session::current_or_console();
+    let mut cwd = CWD[id].lock();
+    if CWD_RESET[id].swap(false, core::sync::atomic::Ordering::Relaxed) {
         cwd.clear();
     }
     cwd.clone()
@@ -85,8 +92,9 @@ pub fn change_folder(target: &str) -> Result<String, FsError> {
     if !resolved.is_empty() {
         MfHost.list(&resolved, &mut |_, _| {})?;
     }
-    CWD_RESET.store(false, core::sync::atomic::Ordering::Relaxed);
-    *CWD.lock() = resolved.clone();
+    let id = crate::session::current_or_console();
+    CWD_RESET[id].store(false, core::sync::atomic::Ordering::Relaxed);
+    *CWD[id].lock() = resolved.clone();
     Ok(resolved)
 }
 

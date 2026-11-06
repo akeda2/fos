@@ -10,7 +10,8 @@ use fosfor_shell::{Entry, Host};
 
 use crate::shellhost::MfHost;
 
-static SESSION: SpinLock<Option<Interp>> = SpinLock::new(None);
+/// One interpreter per shell session.
+static SESSION: [SpinLock<Option<Interp>>; crate::session::MAX] = [const { SpinLock::new(None) }; crate::session::MAX];
 
 /// A prompt line that needs the interpreter: a keyword, an assignment, `;` `&&` `||` `$` `>` or a comment. Everything else
 /// keeps the plain command path (`run A | B`, `run NAME ARGS &2` and a `write` of text with quotes are unchanged).
@@ -22,9 +23,10 @@ pub fn wants(line: &str) -> bool {
 }
 
 pub fn interactive(line: &str) {
-    let mut interp = SESSION.lock().take().unwrap_or_default();
+    let id = crate::session::current_or_console();
+    let mut interp = SESSION[id].lock().take().unwrap_or_default();
     interp.run(&mut MfEnv, line);
-    *SESSION.lock() = Some(interp);
+    *SESSION[id].lock() = Some(interp);
 }
 
 /// `NAME.sh ARGS`: false when the file cannot be read.
