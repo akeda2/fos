@@ -1,0 +1,16 @@
+[package]
+name = "ssh-tape"
+version = "0.1.0"
+edition = "2024"
+description = "What the SSH client tapes (sshmount, ssh) share: the login key, known_hosts, DHCP + DNS + TCP to the server, and the Link over a tape socket"
+license = "MIT"
+
+[lib]
+name = "ssh_tape"
+path = "src/lib.rs"
+
+[dependencies]
+ssh = { path = "../ssh" }
+tape-ip = { path = "../tape-ip" }
+tape-net = { path = "../tape-net" }
+tape-rt = { path = "../tape-rt" }

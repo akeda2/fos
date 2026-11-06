@@ -1,6 +1,6 @@
 //! The client against a real OpenSSH `sshd` run as the current user on a loopback port (skipped when there is none).
 use ssh::authorized::public_line;
-use ssh::client::{CLIENT_ARENA, Client, Error, Link, OPEN_CREATE, OPEN_READ, OPEN_TRUNCATE, OPEN_WRITE};
+use ssh::client::{CLIENT_ARENA, Client, Error, Link, OPEN_CREATE, OPEN_READ, OPEN_TRUNCATE, OPEN_WRITE, SHELL_CHUNK, Start};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
@@ -13,7 +13,7 @@ impl Link for Tcp {
         self.0.write_all(data).map_err(|_| Error::Link)
     }
     fn recv(&mut self, out: &mut [u8]) -> Result<usize, Error> {
-        self.0.read(out).map_err(|_| Error::Link)
+        self.0.read(out).map_err(|error| if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) { Error::Timeout } else { Error::Link })
     }
     fn random(&mut self, out: &mut [u8]) {
         std::fs::File::open("/dev/urandom").unwrap().read_exact(out).unwrap();
@@ -29,15 +29,26 @@ impl Drop for Sshd {
     }
 }
 
-#[test]
-fn talks_to_openssh() {
+struct Running {
+    _server: Sshd,
+    stream: TcpStream,
+    dir: std::path::PathBuf,
+    user: String,
+    seed: [u8; 32],
+}
+
+/// An OpenSSH `sshd` on a loopback port that accepts the test key, and a connection to it; None when there is no sshd.
+fn start() -> Option<Running> {
     let (sshd, sftp) = ("/usr/sbin/sshd", "/usr/lib/openssh/sftp-server");
     if !std::path::Path::new(sshd).exists() || !std::path::Path::new(sftp).exists() {
         eprintln!("no OpenSSH sshd here: skipped");
-        return;
+        return None;
     }
     let user = std::env::var("USER").unwrap_or_else(|_| "root".into());
-    let dir = std::env::temp_dir().join(format!("ssh-openssh-{}", std::process::id()));
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    // The tests run in parallel: every server gets its own folder and port.
+    let number = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("ssh-openssh-{}-{number}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let seed = [9u8; 32];
@@ -47,7 +58,7 @@ fn talks_to_openssh() {
     std::fs::write(&keys, &line[..length]).unwrap();
     let host_key = dir.join("host_key");
     assert!(Command::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&host_key).status().unwrap().success());
-    let port = (20000 + std::process::id() % 20000) as u16;
+    let port = (20000 + (std::process::id() % 20000 + number * 7) % 20000) as u16;
     let config = format!(
         "Port {port}\nListenAddress 127.0.0.1\nHostKey {}\nAuthorizedKeysFile {}\nPidFile {}/pid\nUsePAM no\nStrictModes no\nPasswordAuthentication no\nSubsystem sftp {sftp}\n",
         host_key.display(),
@@ -65,6 +76,12 @@ fn talks_to_openssh() {
         })
         .expect("sshd did not start");
     stream.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    Some(Running { _server, stream, dir, user, seed })
+}
+
+#[test]
+fn talks_to_openssh() {
+    let Some(Running { stream, dir, user, seed, _server }) = start() else { return };
     let mut arena = vec![0u8; CLIENT_ARENA].into_boxed_slice();
     let mut client = Client::connect(Tcp(stream), &mut arena, &user, &seed, &mut |_| true).unwrap();
 
@@ -98,4 +115,43 @@ fn talks_to_openssh() {
     client.remove_dir(&format!("{root}/sub")).unwrap();
     drop(client);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Runs a session until the server ends it; the output and the exit status.
+fn collect(client: &mut Client<Tcp>, mut input: &[u8]) -> (String, Option<u32>) {
+    let (mut text, mut chunk) = (Vec::new(), vec![0u8; SHELL_CHUNK]);
+    for _ in 0..200 {
+        if !input.is_empty() {
+            let taken = client.write_input(input).unwrap();
+            input = &input[taken..];
+        }
+        match client.read_output(&mut chunk) {
+            Ok(Some(count)) => text.extend_from_slice(&chunk[..count]),
+            Ok(None) => {}
+            Err(Error::Closed) => break,
+            Err(error) => panic!("{error:?}"),
+        }
+    }
+    (String::from_utf8_lossy(&text).into_owned(), client.exit_status())
+}
+
+#[test]
+fn runs_a_command_and_a_shell_on_openssh() {
+    for exec in [true, false] {
+        let Some(Running { stream, dir, user, seed, _server }) = start() else { return };
+        stream.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        let mut arena = vec![0u8; CLIENT_ARENA].into_boxed_slice();
+        let start = if exec { Start::Exec("echo out$((20+3)); echo err >&2; exit 3") } else { Start::Shell { cols: 80, rows: 25 } };
+        let mut client = Client::connect_shell(Tcp(stream), &mut arena, &user, &seed, &mut |_| true, start).unwrap();
+        let (text, status) = collect(&mut client, if exec { b"" } else { b"echo shell$((20+3))\nexit 4\n" });
+        if exec {
+            assert!(text.contains("out23") && text.contains("err"), "{text:?}");
+            assert_eq!(status, Some(3));
+        } else {
+            assert!(text.contains("shell23"), "{text:?}");
+            assert_eq!(status, Some(4));
+        }
+        client.hang_up();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

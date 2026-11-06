@@ -8,15 +8,13 @@
 #![no_std]
 #![no_main]
 
-use ssh::authorized::{fingerprint_public, parse_seed, public_line, seed_text};
+use ssh::authorized::public_line;
 use ssh::client::{
-    Attrs, CLIENT_ARENA, Client, Error, Handle, Link, OPEN_CREATE, OPEN_EXCLUSIVE, OPEN_READ, OPEN_WRITE, STATUS_NO_SUCH_FILE,
+    Attrs, CLIENT_ARENA, Client, Error, Handle, OPEN_CREATE, OPEN_EXCLUSIVE, OPEN_READ, OPEN_WRITE, STATUS_NO_SUCH_FILE,
     STATUS_PERMISSION_DENIED,
 };
-use tape_ip::net;
+use ssh_tape::{Trust, Wire, load_seed, parse_target};
 use tape_ip::tcp::Socket;
-use tape_net::{ArpCache, MacAddress};
-use tape_rt::config::{read_named, write_named};
 use tape_rt::*;
 
 tape_rt::tape_help!(
@@ -47,30 +45,6 @@ const MODE_FILE: u32 = 0o644;
 const MODE_DIR: u32 = 0o755;
 const STATUS_NO_CONNECTION: u32 = 6;
 const STATUS_CONNECTION_LOST: u32 = 7;
-
-struct Wire {
-    socket: Socket<16384>,
-    api: &'static TapeApi,
-}
-
-impl Link for Wire {
-    fn send(&mut self, data: &[u8]) -> Result<(), Error> {
-        self.socket.send(self.api, data, TIMEOUT_MICROS).map_err(|_| Error::Link)
-    }
-
-    fn recv(&mut self, out: &mut [u8]) -> Result<usize, Error> {
-        self.socket.recv(self.api, out, TIMEOUT_MICROS).map_err(|_| Error::Link)
-    }
-
-    fn random(&mut self, out: &mut [u8]) {
-        if tape_rt::random(out) != Some(true) {
-            for chunk in out.chunks_mut(8) {
-                let value = tape_rt::micros().to_le_bytes();
-                chunk.copy_from_slice(&value[..chunk.len()]);
-            }
-        }
-    }
-}
 
 type Session = Client<'static, Wire>;
 
@@ -159,26 +133,16 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             target = Some(word);
         }
     }
-    let Some(seed) = load_seed(api, key_file, keygen) else { return };
+    let Some(seed) = load_seed("sshmount", api, key_file, keygen) else { return };
     if keygen {
         let mut line = [0u8; 80];
         let length = public_line(&seed, &mut line);
         println!("sshmount: add this line to ~/.ssh/authorized_keys on the server:");
         return println!("{}", core::str::from_utf8(&line[..length]).unwrap_or(""));
     }
-    let Some((user, rest)) = target.and_then(|target| target.split_once('@')) else {
+    let Some((user, host, port)) = target.and_then(|target| parse_target("sshmount", target)) else {
         return println!("usage: run sshmount USER@HOST[:PORT] [as=NAME] [path=/DIR] [key=NAME] &N  (help sshmount)");
     };
-    let (host, port) = match rest.split_once(':') {
-        Some((host, port)) => match port.parse::<u16>() {
-            Ok(port) if port != 0 => (host, port),
-            _ => return println!("sshmount: the port is a number from 1 to 65535."),
-        },
-        None => (rest, 22),
-    };
-    if user.is_empty() || host.is_empty() {
-        return println!("sshmount: write USER@HOST.");
-    }
     let mut default = [0u8; 16];
     let label = host.split('.').next().unwrap_or(host);
     let shown = label.len().min(16);
@@ -210,123 +174,14 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     println!("sshmount: //{name} unmounted.");
 }
 
-/// The key seed from settings (64 hex digits); `make` creates it when there is none (`keygen`).
-fn load_seed(api: &TapeApi, file: &str, make: bool) -> Option<[u8; 32]> {
-    let mut text = [0u8; 128];
-    let length = read_named(api, file, &mut text);
-    if length > 0 {
-        let seed = core::str::from_utf8(&text[..length as usize]).ok().and_then(parse_seed);
-        if seed.is_none() {
-            println!("sshmount: settings/{file} is not 64 hex digits.");
-        }
-        return seed;
-    }
-    if !make {
-        println!("sshmount: no settings/{file}: run `sshmount keygen` first and put its line on the server.");
-        return None;
-    }
-    let mut seed = [0u8; 32];
-    if tape_rt::random(&mut seed) != Some(true) {
-        println!("sshmount: this kernel has no random numbers for a key (needs tape ABI 33).");
-        return None;
-    }
-    let mut body = [0u8; 65];
-    seed_text(&seed, &mut body);
-    if write_named(api, file, &body) != 0 {
-        println!("sshmount: could not write settings/{file}.");
-        return None;
-    }
-    println!("sshmount: made settings/{file}.");
-    Some(seed)
-}
-
-/// `settings/known_hosts`: lines `HOST SHA256:fingerprint`. Unknown hosts are added, a different key is refused.
-fn check_host(api: &TapeApi, host: &str, port: u16, public: &[u8; 32]) -> bool {
-    let mut print = [0u8; 50];
-    fingerprint_public(public, &mut print);
-    let print = core::str::from_utf8(&print).unwrap_or("");
-    let mut label = [0u8; 64];
-    let mut written = host.len().min(40);
-    label[..written].copy_from_slice(&host.as_bytes()[..written]);
-    if port != 22 {
-        label[written] = b':';
-        let mut digits = [0u8; 5];
-        let mut at = 5;
-        let mut rest = port;
-        while rest > 0 {
-            at -= 1;
-            digits[at] = b'0' + (rest % 10) as u8;
-            rest /= 10;
-        }
-        label[written + 1..written + 1 + 5 - at].copy_from_slice(&digits[at..]);
-        written += 1 + 5 - at;
-    }
-    let label = core::str::from_utf8(&label[..written]).unwrap_or(host);
-    let mut file = [0u8; 4096];
-    let length = read_named(api, "known_hosts", &mut file[..4000]).max(0) as usize;
-    let known = core::str::from_utf8(&file[..length]).unwrap_or("");
-    for line in known.lines() {
-        let mut words = line.split_ascii_whitespace();
-        if words.next() == Some(label) {
-            if words.next() == Some(print) {
-                return true;
-            }
-            println!("sshmount: THE KEY OF {label} CHANGED. Refusing to log in.");
-            println!("sshmount: it was meant to be {print}; if that is right, remove its line from settings/known_hosts.");
-            return false;
-        }
-    }
-    let mut at = length;
-    if at > 0 && file[at - 1] != b'\n' {
-        file[at] = b'\n';
-        at += 1;
-    }
-    for part in [label.as_bytes(), b" ", print.as_bytes(), b"\n"] {
-        file[at..at + part.len()].copy_from_slice(part);
-        at += part.len();
-    }
-    if write_named(api, "known_hosts", &file[..at]) != 0 {
-        println!("sshmount: could not write settings/known_hosts; not trusting {label}.");
-        return false;
-    }
-    println!("sshmount: {label} is new: remembered its key {print}.");
-    true
-}
-
+/// The mount's connection: SFTP over the shared TCP link.
 fn connect(api: &'static TapeApi, socket: Socket<16384>, arena: &'static mut [u8], user: &str, host: &str, port: u16, seed: &[u8; 32]) -> Option<Session> {
-    let nic = tape_rt::active_nic();
-    if nic >= (api.nic_count)() as usize {
-        println!("sshmount: no network interface.");
-        return None;
-    }
-    let mut mac = [0u8; 6];
-    (api.nic_mac)(nic, mac.as_mut_ptr());
-    let Some((config, _, dns_server)) = net::dhcp_with_servers(api, nic, MacAddress(mac)) else {
-        println!("sshmount: no DHCP lease on NIC {}.", nic + 1);
-        return None;
-    };
-    let address = match tape_ip::dns::lookup(api, nic, &config, &mut ArpCache::<8>::new(), dns_server.unwrap_or(config.gateway), tape_net::dns::PORT, host) {
-        Ok(address) => address,
-        Err(why) => {
-            println!("sshmount: {host}: {why}.");
-            return None;
-        }
-    };
-    let mut wire = Wire { socket, api };
-    if let Err(why) = wire.socket.connect(api, nic, &config, address, port, 3_000_000) {
-        println!("sshmount: {host}: {why}.");
-        return None;
-    }
-    let mut refused = false;
-    let result = Client::connect(wire, arena, user, seed, &mut |public| {
-        let trusted = check_host(api, host, port, public);
-        refused = !trusted;
-        trusted
-    });
-    match result {
+    let wire = ssh_tape::dial("sshmount", api, socket, host, port, TIMEOUT_MICROS)?;
+    let mut trust = Trust { tool: "sshmount", api, host, port, refused: false };
+    match Client::connect(wire, arena, user, seed, &mut |public| trust.check(public)) {
         Ok(client) => Some(client),
         Err(error) => {
-            if !refused {
+            if !trust.refused {
                 println!("sshmount: {user}@{host}: {}.", error.describe());
             }
             None

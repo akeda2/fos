@@ -247,12 +247,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "sshmount-tape"
+name = "ssh-tape"
 version = "0.1.0"
 dependencies = [
  "ssh",
  "tape-ip",
  "tape-net",
+ "tape-rt",
+]
+
+[[package]]
+name = "sshmount-tape"
+version = "0.1.0"
+dependencies = [
+ "ssh",
+ "ssh-tape",
+ "tape-ip",
  "tape-rt",
 ]
 

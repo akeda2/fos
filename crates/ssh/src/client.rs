@@ -6,6 +6,9 @@
 //! (`connect` takes a function; known_hosts is the tape's business). One SFTP request is in flight at a time: simple, and
 //! correct against any server; throughput on a long link is bounded by the round trip, not by the cipher.
 //!
+//! `Client::connect_shell` opens a terminal (or runs one command) instead of SFTP: `write_input` sends typed bytes,
+//! `read_output` returns what the server printed. The link's `recv` may then answer `Error::Timeout` after a short wait.
+//!
 //! Packets go through the server's `Tx`/`Rx` (framing, cipher, MAC), so both ends are tested against each other.
 
 use crate::session::*;
@@ -22,6 +25,19 @@ pub const CLIENT_ARENA: usize = PACKET + OUT + INBUF + 2 * MAX_PACKET;
 /// Bytes of file data in one SFTP read or write (every server takes this much).
 pub const IO: usize = 32 * 1024;
 const WINDOW: u32 = 128 * 1024;
+/// The largest piece of terminal output the server sends in one packet, and the smallest buffer `read_output` takes.
+pub const SHELL_CHUNK: usize = 4096;
+
+/// What the session channel is for.
+#[derive(Clone, Copy)]
+pub enum Start<'s> {
+    /// The `sftp` subsystem.
+    Sftp,
+    /// A login shell on a terminal of this size.
+    Shell { cols: u32, rows: u32 },
+    /// One command, no terminal.
+    Exec(&'s str),
+}
 const MSG_USERAUTH_BANNER: u8 = 53;
 const MSG_EXT_INFO: u8 = 7;
 
@@ -29,6 +45,8 @@ const MSG_EXT_INFO: u8 = 7;
 pub enum Error {
     /// The byte stream failed or timed out.
     Link,
+    /// Nothing arrived within the link's (short) wait; an interactive session asks again. Never ends a connection.
+    Timeout,
     /// The server hung up.
     Closed,
     Protocol(&'static str),
@@ -49,6 +67,7 @@ impl Error {
     pub fn describe(&self) -> &'static str {
         match self {
             Error::Link => "the connection failed",
+            Error::Timeout => "timed out",
             Error::Closed => "the server closed the connection",
             Error::Protocol(why) => why,
             Error::HostKey => "the host key is not the one on record",
@@ -64,7 +83,8 @@ impl Error {
 pub trait Link {
     /// Sends all of `data`.
     fn send(&mut self, data: &[u8]) -> Result<(), Error>;
-    /// Waits for at least one byte (the link has its own timeout); 0 means the server closed.
+    /// Waits for at least one byte (the link has its own timeout); 0 means the server closed. A session that polls
+    /// (`read_output`) has a short wait and answers `Error::Timeout` when nothing came: bytes already read are kept.
     fn recv(&mut self, out: &mut [u8]) -> Result<usize, Error>;
     fn random(&mut self, out: &mut [u8]);
 }
@@ -167,6 +187,8 @@ pub struct Client<'a, L: Link> {
     consumed: u32,
     next_id: u32,
     posix_rename: bool,
+    eof: bool,
+    exit: Option<u32>,
 }
 
 fn fail<T>(why: &'static str) -> Result<T, Error> {
@@ -177,13 +199,27 @@ impl<'a, L: Link> Client<'a, L> {
     /// Connects, checks the host key with `trust` (its 32 public key bytes), logs `user` in with `seed`'s ed25519 key, opens
     /// the `sftp` subsystem. `arena` is at least `CLIENT_ARENA` bytes.
     pub fn connect(link: L, arena: &'a mut [u8], user: &str, seed: &[u8; 32], trust: &mut dyn FnMut(&[u8; 32]) -> bool) -> Result<Client<'a, L>, Error> {
+        let mut client = Self::new(link, arena);
+        client.handshake(user, seed, trust, Start::Sftp)?;
+        Ok(client)
+    }
+
+    /// Like `connect`, but opens a shell on a terminal (`Start::Shell`) or runs one command (`Start::Exec`) instead of
+    /// SFTP; the file calls do not work on such a connection.
+    pub fn connect_shell(link: L, arena: &'a mut [u8], user: &str, seed: &[u8; 32], trust: &mut dyn FnMut(&[u8; 32]) -> bool, start: Start) -> Result<Client<'a, L>, Error> {
+        let mut client = Self::new(link, arena);
+        client.handshake(user, seed, trust, start)?;
+        Ok(client)
+    }
+
+    fn new(link: L, arena: &'a mut [u8]) -> Client<'a, L> {
         assert!(arena.len() >= CLIENT_ARENA);
         let (packet, rest) = arena.split_at_mut(PACKET);
         let (out, rest) = rest.split_at_mut(OUT);
         let (inbuf, rest) = rest.split_at_mut(INBUF);
         let (response, rest) = rest.split_at_mut(MAX_PACKET);
         let request = &mut rest[..MAX_PACKET];
-        let mut client = Client {
+        Client {
             link,
             tx: Tx { buffer: out, length: 0, sent: 0, keys: None, sequence: 0 },
             rx: Rx { buffer: packet, keys: None, sequence: 0 },
@@ -198,9 +234,9 @@ impl<'a, L: Link> Client<'a, L> {
             consumed: 0,
             next_id: 1,
             posix_rename: false,
-        };
-        client.handshake(user, seed, trust)?;
-        Ok(client)
+            eof: false,
+            exit: None,
+        }
     }
 
     fn flush(&mut self) -> Result<(), Error> {
@@ -261,7 +297,7 @@ impl<'a, L: Link> Client<'a, L> {
         Ok(length)
     }
 
-    fn handshake(&mut self, user: &str, seed: &[u8; 32], trust: &mut dyn FnMut(&[u8; 32]) -> bool) -> Result<(), Error> {
+    fn handshake(&mut self, user: &str, seed: &[u8; 32], trust: &mut dyn FnMut(&[u8; 32]) -> bool, start: Start) -> Result<(), Error> {
         // Identification lines.
         let mut line = [0u8; 40];
         line[..VERSION_LINE.len()].copy_from_slice(VERSION_LINE);
@@ -432,9 +468,10 @@ impl<'a, L: Link> Client<'a, L> {
             }
         }
 
-        // The sftp subsystem on a session channel.
+        // A session channel for sftp, a shell or one command.
+        let max_packet = if matches!(start, Start::Sftp) { MAX_DATA } else { SHELL_CHUNK };
         self.send(|out| {
-            out.u8(MSG_CHANNEL_OPEN).string(b"session").u32(0).u32(WINDOW).u32(MAX_DATA as u32);
+            out.u8(MSG_CHANNEL_OPEN).string(b"session").u32(0).u32(WINDOW).u32(max_packet as u32);
         })?;
         // OpenSSH announces its host keys with a global request first.
         let length = loop {
@@ -457,19 +494,153 @@ impl<'a, L: Link> Client<'a, L> {
             return fail("the server allows no channel data");
         }
         let peer = self.peer;
-        self.send(|out| {
-            out.u8(MSG_CHANNEL_REQUEST).u32(peer).string(b"subsystem").bool(true).string(b"sftp");
-        })?;
+        match start {
+            Start::Sftp => {
+                if !self.channel_request(|out| {
+                    out.u8(MSG_CHANNEL_REQUEST).u32(peer).string(b"subsystem").bool(true).string(b"sftp");
+                })? {
+                    return fail("the server has no sftp subsystem");
+                }
+                self.sftp_start()
+            }
+            Start::Shell { cols, rows } => {
+                // A refused terminal is not fatal: the shell then runs without one (our own sshd has none).
+                let _ = self.channel_request(|out| {
+                    out.u8(MSG_CHANNEL_REQUEST).u32(peer).string(b"pty-req").bool(true).string(b"vt100").u32(cols).u32(rows).u32(0).u32(0).string(&[0]);
+                })?;
+                if !self.channel_request(|out| {
+                    out.u8(MSG_CHANNEL_REQUEST).u32(peer).string(b"shell").bool(true);
+                })? {
+                    return fail("the server refused to start a shell");
+                }
+                Ok(())
+            }
+            Start::Exec(command) => {
+                if !self.channel_request(|out| {
+                    out.u8(MSG_CHANNEL_REQUEST).u32(peer).string(b"exec").bool(true).string(command.as_bytes());
+                })? {
+                    return fail("the server refused to run the command");
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Sends a channel request that wants an answer (`build` writes it) and waits for it: true for success.
+    fn channel_request(&mut self, build: impl FnOnce(&mut Writer)) -> Result<bool, Error> {
+        self.send(build)?;
         loop {
             self.read_packet(false)?;
             match self.rx.buffer[0] {
-                MSG_CHANNEL_SUCCESS => break,
-                MSG_CHANNEL_FAILURE => return fail("the server has no sftp subsystem"),
+                MSG_CHANNEL_SUCCESS => return Ok(true),
+                MSG_CHANNEL_FAILURE => return Ok(false),
                 MSG_CHANNEL_WINDOW_ADJUST | MSG_GLOBAL_REQUEST => self.connection_message(true)?,
-                _ => return fail("an unexpected message starting sftp"),
+                _ => return fail("an unexpected message answering a channel request"),
             }
         }
-        self.sftp_start()
+    }
+
+    /// Sends as much of `data` as the server's window and packet size allow, as terminal input; how many bytes went. 0
+    /// means the window is full: `read_output` takes the window changes in, then ask again.
+    pub fn write_input(&mut self, data: &[u8]) -> Result<usize, Error> {
+        let count = data.len().min(self.peer_max).min(self.peer_window.min(u64::from(u32::MAX)) as usize);
+        if count == 0 {
+            return Ok(0);
+        }
+        let peer = self.peer;
+        self.send(|out| {
+            out.u8(MSG_CHANNEL_DATA).u32(peer).string(&data[..count]);
+        })?;
+        self.peer_window -= count as u64;
+        Ok(count)
+    }
+
+    /// Waits one link timeout for what the shell or command printed (stdout and stderr alike, the terminal merges them):
+    /// `Some(count)` bytes in `out` (at least `SHELL_CHUNK` long), `None` when nothing came. The end of the session is
+    /// `Err(Error::Closed)`; `exit_status` then says how the command ended.
+    pub fn read_output(&mut self, out: &mut [u8]) -> Result<Option<usize>, Error> {
+        assert!(out.len() >= SHELL_CHUNK);
+        loop {
+            let length = match self.read_packet(false) {
+                Ok(length) => length,
+                Err(Error::Timeout) if self.eof => return Err(Error::Closed),
+                Err(Error::Timeout) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let bad = Error::Protocol("a bad channel message");
+            let mut reader = Reader::new(&self.rx.buffer[1..length]);
+            match self.rx.buffer[0] {
+                MSG_CHANNEL_WINDOW_ADJUST => {
+                    reader.u32();
+                    self.peer_window += u64::from(reader.u32().ok_or(bad)?);
+                }
+                kind @ (MSG_CHANNEL_DATA | MSG_CHANNEL_EXTENDED_DATA) => {
+                    reader.u32().ok_or(bad)?;
+                    if kind == MSG_CHANNEL_EXTENDED_DATA {
+                        reader.u32().ok_or(bad)?;
+                    }
+                    let data = reader.string().ok_or(bad)?;
+                    if data.len() > out.len() {
+                        return fail("the server sent more than one packet allows");
+                    }
+                    out[..data.len()].copy_from_slice(data);
+                    let count = data.len();
+                    self.consumed += count as u32;
+                    if self.consumed >= WINDOW / 4 {
+                        let (peer, consumed) = (self.peer, self.consumed);
+                        self.consumed = 0;
+                        self.send(|out| {
+                            out.u8(MSG_CHANNEL_WINDOW_ADJUST).u32(peer).u32(consumed);
+                        })?;
+                    }
+                    if count > 0 {
+                        return Ok(Some(count));
+                    }
+                }
+                MSG_CHANNEL_REQUEST => {
+                    reader.u32().ok_or(bad)?;
+                    let kind = reader.string().ok_or(bad)?;
+                    let wants_reply = reader.bool().ok_or(bad)?;
+                    if kind == b"exit-status" {
+                        self.exit = reader.u32();
+                    } else if wants_reply {
+                        let peer = self.peer;
+                        self.send(|out| {
+                            out.u8(MSG_CHANNEL_FAILURE).u32(peer);
+                        })?;
+                    }
+                }
+                MSG_CHANNEL_EOF => self.eof = true,
+                MSG_CHANNEL_CLOSE => {
+                    let peer = self.peer;
+                    let _ = self.send(|out| {
+                        out.u8(MSG_CHANNEL_CLOSE).u32(peer);
+                    });
+                    return Err(Error::Closed);
+                }
+                MSG_GLOBAL_REQUEST => self.connection_message(true)?,
+                _ => {}
+            }
+        }
+    }
+
+    /// The command's exit status, once the server has sent it.
+    pub fn exit_status(&self) -> Option<u32> {
+        self.exit
+    }
+
+    /// Says goodbye: end of input, close the channel, disconnect. Best effort.
+    pub fn hang_up(&mut self) {
+        let peer = self.peer;
+        let _ = self.send(|out| {
+            out.u8(MSG_CHANNEL_EOF).u32(peer);
+        });
+        let _ = self.send(|out| {
+            out.u8(MSG_CHANNEL_CLOSE).u32(peer);
+        });
+        let _ = self.send(|out| {
+            out.u8(MSG_DISCONNECT).u32(11).string(b"bye").string(b"");
+        });
     }
 
     /// A connection-layer message that is not the answer being waited for: window changes, data, end of channel.

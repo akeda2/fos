@@ -10,7 +10,7 @@ path = "src/main.rs"
 [dependencies]
 ssh = { path = "../../crates/ssh" }
 tape-ip = { path = "../../crates/tape-ip" }
-tape-net = { path = "../../crates/tape-net" }
+ssh-tape = { path = "../../crates/ssh-tape" }
 tape-rt = { path = "../../crates/tape-rt" }
 
 [profile.release]

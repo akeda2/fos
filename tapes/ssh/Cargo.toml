@@ -1,0 +1,25 @@
+[package]
+name = "ssh-client-tape"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ssh"
+path = "src/main.rs"
+
+[dependencies]
+ssh = { path = "../../crates/ssh" }
+ssh-tape = { path = "../../crates/ssh-tape" }
+tape-ip = { path = "../../crates/tape-ip" }
+tape-rt = { path = "../../crates/tape-rt" }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "z"
+strip = "symbols"
+
+# The ciphers and curves are the hot path of a transfer; size matters less than speed here.
+[profile.release.package."*"]
+opt-level = 3
