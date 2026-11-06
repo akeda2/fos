@@ -219,6 +219,12 @@ pub struct Rtl8168 {
     recovery_pending: bool,
     /// Tick at which `receive` first found the ring empty with an overflow cause still latched (0: not seen).
     stall_since: u64,
+    /// `send` reads the PHY status only every 16th frame (a port read per frame is slow); a link that went down is
+    /// noticed within 16 frames, and every frame sent while it is believed down re-reads it.
+    link_checks: u32,
+    link_ok: bool,
+    /// Empty polls since `receiver_stalled` last read ISR (a port read, too slow for every poll).
+    idle_polls: u8,
     /// Set when `enable_interrupts` found no link, so its self-test (which needs a frame to go out) could not run: the
     /// PCI device to try again with once the link is up, and the tick before which not to try (`retry_interrupts`).
     retry: Option<pci::Device>,
@@ -288,6 +294,9 @@ impl Rtl8168 {
             recoveries: 0,
             recovery_pending: false,
             stall_since: 0,
+            link_checks: 0,
+            link_ok: true,
+            idle_polls: 0,
             retry: None,
             retry_after: 0,
             retry_attempts: 0,
@@ -568,7 +577,11 @@ impl Rtl8168 {
         if frame.len() > MAX_FRAME {
             return false;
         }
-        if !self.link_up() {
+        self.link_checks = self.link_checks.wrapping_add(1);
+        if self.link_checks % 16 == 1 || !self.link_ok {
+            self.link_ok = self.link_up();
+        }
+        if !self.link_ok {
             self.frames_dropped_no_link += 1;
             return true;
         }
@@ -604,6 +617,10 @@ impl Rtl8168 {
     /// so finding one still latched with an empty ring for `STALL_TICKS` means the receiver is wedged; the caller
     /// resets the chip, as for a system error.
     fn receiver_stalled(&mut self) -> bool {
+        self.idle_polls = self.idle_polls.wrapping_add(1);
+        if self.idle_polls % 32 != 0 {
+            return false;
+        }
         if read16(self.io_base, REG_ISR) & SOFT_MASK == 0 {
             self.stall_since = 0;
             return false;
