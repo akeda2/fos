@@ -91,6 +91,15 @@ pub fn print_list() {
     }
 }
 
+/// `nic regs N`: the chip's registers and ring state, for a link or interrupt that misbehaves.
+pub fn print_registers(number: usize) {
+    let _nics = lock_nics();
+    match number.checked_sub(1).and_then(nic::at) {
+        Some(nic) if !nic::is_virtual(number - 1) => nic.dump_registers(),
+        _ => println!("nic regs: no physical interface {number}."),
+    }
+}
+
 /// Starts every NIC the drivers know and puts it in the table. Needs interrupts on (the drivers prove their interrupt path).
 pub fn init() {
     nicctl::set_frame_handler(frame_hook);

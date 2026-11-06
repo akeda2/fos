@@ -260,7 +260,14 @@ pub fn run_command(line: &str) {
         "nic" if matches!(words.clone().next(), Some("discover")) => crate::netclient::nic_discover(),
         "tapesync" => crate::netclient::tapesync(words),
         "gpio" => crate::netclient::gpio(line.trim_start().strip_prefix("gpio").unwrap_or("")),
-        "nic" => net::print_list(),
+        "nic" => match words.next() {
+            None => net::print_list(),
+            Some("regs") => match words.next().and_then(|word| word.parse().ok()) {
+                Some(number) => net::print_registers(number),
+                None => println!("usage: nic regs N"),
+            },
+            Some(_) => println!("usage: nic [regs N]"),
+        },
         "vnic" => crate::vnic::command(words),
         "service" => crate::service::command(words),
         "settings" => match words.next() {
