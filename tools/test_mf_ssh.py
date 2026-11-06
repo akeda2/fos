@@ -96,6 +96,15 @@ def main():
             hosts = line("cat known_hosts")
             check("10.0.2.100 SHA256:" in hosts, "the host key was remembered in known_hosts", hosts)
 
+            # The sshd of this test cannot verify a password (no PAM): what is checked is the prompt, that the typed
+            # password is not echoed, and that a refusal ends the tape cleanly.
+            mark = len(log)
+            qemu.stdin.write(f"tape ssh password {user}@10.0.2.100 true\n".encode())
+            qemu.stdin.flush()
+            check(wait_for("password: ", 30, mark), "password login asks for the password", log[mark:].decode("utf8", "replace"))
+            out = line("hunter2zz", "fos> ", 60)
+            check("hunter2zz" not in out and "did not accept the login" in out, "the password is not echoed; a refusal is reported", out)
+
             mark = len(log)
             qemu.stdin.write(f"tape ssh {user}@10.0.2.100\n".encode())
             qemu.stdin.flush()

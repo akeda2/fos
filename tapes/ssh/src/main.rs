@@ -10,23 +10,24 @@
 #![no_std]
 #![no_main]
 
-use ssh::client::{CLIENT_ARENA, Client, Error, SHELL_CHUNK, Start};
+use ssh::client::{CLIENT_ARENA, Client, Error, Login, SHELL_CHUNK, Start};
 use ssh_tape::{Trust, Wire, load_seed, parse_target};
 use tape_ip::tcp::Socket;
 use tape_rt::*;
 
 tape_rt::tape_help!(
-    br#"ssh USER@HOST[:PORT] [key=NAME]
-ssh USER@HOST[:PORT] [key=NAME] COMMAND...
+    br#"ssh USER@HOST[:PORT] [key=NAME | password] [COMMAND...]
 ssh keygen [key=NAME]
 Opens a login shell on another machine over SSH, on this console, or runs
 COMMAND there and prints its output (then the exit status, if it is not 0).
 Esc ends the session. Everything else you type goes to the server, which does
 the echo and the line editing; the console understands ANSI colours and
 cursor movement, so a full-screen program may not look right.
-Login is by key only: `ssh keygen` makes settings/ssh_key (key=NAME: another
-file, shared with sshmount) and prints its line; put that line in
-~/.ssh/authorized_keys on the server.
+Login is by key: `ssh keygen` makes settings/ssh_key (key=NAME: another file,
+shared with sshmount) and prints its line; put that line in
+~/.ssh/authorized_keys on the server. With `password` the tape asks for the
+account's password instead (typed blind, Esc cancels): for a first login on a
+machine that does not have the key yet.
 The server's key is remembered in settings/known_hosts the first time and
 checked afterwards: a changed key is refused (edit the file to accept it).
 The tape takes its address from DHCP on the active NIC (`nic use N`).
@@ -48,12 +49,14 @@ static mut SOCKET: Socket<16384> = Socket::new();
 pub extern "C" fn tape_main(api: &'static TapeApi) {
     tape_rt::init(api);
     let mut rest = core::str::from_utf8(tape_rt::args()).unwrap_or("").trim();
-    let (mut key_file, mut keygen, mut target, mut command) = ("ssh_key", false, None, "");
+    let (mut key_file, mut keygen, mut password, mut target, mut command) = ("ssh_key", false, false, None, "");
     while !rest.is_empty() {
         let (word, after) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
         rest = after.trim_start();
         if let Some(value) = word.strip_prefix("key=") {
             key_file = value;
+        } else if word == "password" && target.is_none() {
+            password = true;
         } else if word == "keygen" && target.is_none() {
             keygen = true;
         } else {
@@ -63,7 +66,8 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             break;
         }
     }
-    let Some(seed) = load_seed("ssh", api, key_file, keygen) else { return };
+    let seed = if password { Some([0u8; 32]) } else { load_seed("ssh", api, key_file, keygen) };
+    let Some(seed) = seed else { return };
     if keygen {
         let mut line = [0u8; 80];
         let length = ssh::authorized::public_line(&seed, &mut line);
@@ -73,6 +77,17 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let Some((user, host, port)) = target.and_then(|target| parse_target("ssh", target)) else {
         return println!("usage: ssh USER@HOST[:PORT] [key=NAME] [COMMAND...]  (help ssh)");
     };
+
+    let mut typed_password = [0u8; 128];
+    let password_length = if password {
+        match ask_password(api, user, host, &mut typed_password) {
+            Some(length) => length,
+            None => return println!("ssh: cancelled."),
+        }
+    } else {
+        0
+    };
+    let login = if password { Login::Password(&typed_password[..password_length]) } else { Login::Key(&seed) };
 
     let start = if command.is_empty() {
         let (cols, rows) = tape_rt::console_size();
@@ -84,11 +99,14 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let (arena, socket) = unsafe { (&mut *core::ptr::addr_of_mut!(ARENA), core::ptr::replace(core::ptr::addr_of_mut!(SOCKET), Socket::new())) };
     let Some(wire) = ssh_tape::dial("ssh", api, socket, host, port, LOGIN_WAIT_MICROS) else { return };
     let mut trust = Trust { tool: "ssh", api, host, port, refused: false };
-    let mut client = match Client::connect_shell(wire, arena, user, &seed, &mut |public| trust.check(public), start) {
+    let mut client = match Client::connect_as(wire, arena, user, login, &mut |public| trust.check(public), start) {
         Ok(client) => client,
         Err(error) => {
             if !trust.refused {
                 println!("ssh: {user}@{host}: {}.", error.describe());
+                if password && matches!(error, Error::Auth) {
+                    println!("ssh: the server may not allow password login.");
+                }
             }
             return;
         }
@@ -109,6 +127,34 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     }
     client.hang_up();
     client.link().socket.close(api);
+}
+
+/// Reads a password from the keyboard without showing it; None when Esc cancels.
+fn ask_password(api: &TapeApi, user: &str, host: &str, out: &mut [u8]) -> Option<usize> {
+    print!("{user}@{host}'s password: ");
+    let mut length = 0;
+    loop {
+        match (api.read_key)() {
+            KEY_NONE => tape_rt::idle(),
+            KEY_ABORT => {
+                println!();
+                return None;
+            }
+            key if key >= KEY_BASE => match (key - KEY_BASE) as u8 {
+                b'\r' | b'\n' => {
+                    println!();
+                    return Some(length);
+                }
+                8 | 127 => length = length.saturating_sub(1),
+                byte if length < out.len() => {
+                    out[length] = byte;
+                    length += 1;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
 }
 
 enum Ended {
