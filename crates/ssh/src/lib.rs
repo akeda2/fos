@@ -4,6 +4,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod authorized;
+pub mod client;
 pub mod session;
 pub mod sftp;
 pub mod wire;

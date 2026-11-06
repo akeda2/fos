@@ -130,17 +130,34 @@ pub fn seed_text(seed: &[u8; 32], out: &mut [u8; 65]) {
     out[64] = b'\n';
 }
 
-/// The public key blob (RFC 4253 section 6.6) of the host key, and OpenSSH's fingerprint of it, `SHA256:` and 43 base64 characters.
-pub fn fingerprint(seed: &[u8; 32], out: &mut [u8; 50]) {
-    let public = ed25519_dalek::SigningKey::from_bytes(seed).verifying_key();
+/// OpenSSH's fingerprint of a host's or user's public key (`SHA256:` and 43 base64 characters).
+pub fn fingerprint_public(public: &[u8; 32], out: &mut [u8; 50]) {
     let mut blob = [0u8; 64];
     let mut writer = Writer::new(&mut blob);
-    writer.string(b"ssh-ed25519").string(public.as_bytes());
+    writer.string(b"ssh-ed25519").string(public);
     let digest: [u8; 32] = Sha256::digest(writer.written()).into();
     out[..7].copy_from_slice(b"SHA256:");
     let mut text = [0u8; 44];
     base64_encode(&digest, &mut text);
     out[7..].copy_from_slice(&text[..43]);
+}
+
+/// The fingerprint of the key a seed makes.
+pub fn fingerprint(seed: &[u8; 32], out: &mut [u8; 50]) {
+    fingerprint_public(ed25519_dalek::SigningKey::from_bytes(seed).verifying_key().as_bytes(), out);
+}
+
+/// The `authorized_keys` form of the key a seed makes, `ssh-ed25519 BASE64` (80 bytes).
+pub fn public_line(seed: &[u8; 32], out: &mut [u8; 80]) -> usize {
+    let public = ed25519_dalek::SigningKey::from_bytes(seed).verifying_key();
+    let mut blob = [0u8; 51];
+    let mut writer = Writer::new(&mut blob);
+    writer.string(b"ssh-ed25519").string(public.as_bytes());
+    let mut text = [0u8; 68];
+    base64_encode(writer.written(), &mut text);
+    out[..12].copy_from_slice(b"ssh-ed25519 ");
+    out[12..].copy_from_slice(&text);
+    80
 }
 
 #[cfg(test)]
