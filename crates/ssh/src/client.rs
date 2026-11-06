@@ -28,6 +28,13 @@ const WINDOW: u32 = 128 * 1024;
 /// The largest piece of terminal output the server sends in one packet, and the smallest buffer `read_output` takes.
 pub const SHELL_CHUNK: usize = 4096;
 
+/// How the client proves who it is: an ed25519 key seed, or the account's password.
+#[derive(Clone, Copy)]
+pub enum Login<'s> {
+    Key(&'s [u8; 32]),
+    Password(&'s [u8]),
+}
+
 /// What the session channel is for.
 #[derive(Clone, Copy)]
 pub enum Start<'s> {
@@ -71,7 +78,7 @@ impl Error {
             Error::Closed => "the server closed the connection",
             Error::Protocol(why) => why,
             Error::HostKey => "the host key is not the one on record",
-            Error::Auth => "the server did not accept the key",
+            Error::Auth => "the server did not accept the login",
             Error::Status(STATUS_NO_SUCH_FILE) => "no such file",
             Error::Status(STATUS_PERMISSION_DENIED) => "permission denied",
             Error::Status(_) => "the server refused",
@@ -199,16 +206,19 @@ impl<'a, L: Link> Client<'a, L> {
     /// Connects, checks the host key with `trust` (its 32 public key bytes), logs `user` in with `seed`'s ed25519 key, opens
     /// the `sftp` subsystem. `arena` is at least `CLIENT_ARENA` bytes.
     pub fn connect(link: L, arena: &'a mut [u8], user: &str, seed: &[u8; 32], trust: &mut dyn FnMut(&[u8; 32]) -> bool) -> Result<Client<'a, L>, Error> {
-        let mut client = Self::new(link, arena);
-        client.handshake(user, seed, trust, Start::Sftp)?;
-        Ok(client)
+        Self::connect_as(link, arena, user, Login::Key(seed), trust, Start::Sftp)
     }
 
     /// Like `connect`, but opens a shell on a terminal (`Start::Shell`) or runs one command (`Start::Exec`) instead of
     /// SFTP; the file calls do not work on such a connection.
     pub fn connect_shell(link: L, arena: &'a mut [u8], user: &str, seed: &[u8; 32], trust: &mut dyn FnMut(&[u8; 32]) -> bool, start: Start) -> Result<Client<'a, L>, Error> {
+        Self::connect_as(link, arena, user, Login::Key(seed), trust, start)
+    }
+
+    /// The general form: log in with a key or a password, then open what `start` says.
+    pub fn connect_as(link: L, arena: &'a mut [u8], user: &str, login: Login, trust: &mut dyn FnMut(&[u8; 32]) -> bool, start: Start) -> Result<Client<'a, L>, Error> {
         let mut client = Self::new(link, arena);
-        client.handshake(user, seed, trust, start)?;
+        client.handshake(user, login, trust, start)?;
         Ok(client)
     }
 
@@ -297,7 +307,7 @@ impl<'a, L: Link> Client<'a, L> {
         Ok(length)
     }
 
-    fn handshake(&mut self, user: &str, seed: &[u8; 32], trust: &mut dyn FnMut(&[u8; 32]) -> bool, start: Start) -> Result<(), Error> {
+    fn handshake(&mut self, user: &str, login: Login, trust: &mut dyn FnMut(&[u8; 32]) -> bool, start: Start) -> Result<(), Error> {
         // Identification lines.
         let mut line = [0u8; 40];
         line[..VERSION_LINE.len()].copy_from_slice(VERSION_LINE);
@@ -437,26 +447,34 @@ impl<'a, L: Link> Client<'a, L> {
             out.u8(MSG_SERVICE_REQUEST).string(b"ssh-userauth");
         })?;
         self.expect(MSG_SERVICE_ACCEPT, false)?;
-        let signing = SigningKey::from_bytes(seed);
-        let mut blob = [0u8; 64];
-        let mut writer = Writer::new(&mut blob);
-        writer.string(b"ssh-ed25519").string(signing.verifying_key().as_bytes());
-        let blob_length = writer.len();
-        let mut signed = [0u8; 512];
-        let mut writer = Writer::new(&mut signed);
-        writer.string(&exchange_hash).u8(MSG_USERAUTH_REQUEST).string(user.as_bytes()).string(b"ssh-connection").string(b"publickey");
-        writer.bool(true).string(b"ssh-ed25519").string(&blob[..blob_length]);
-        if !writer.ok() {
-            return fail("the user name is too long");
+        match login {
+            Login::Password(password) => self.send(|out| {
+                out.u8(MSG_USERAUTH_REQUEST).string(user.as_bytes()).string(b"ssh-connection").string(b"password");
+                out.bool(false).string(password);
+            })?,
+            Login::Key(seed) => {
+            let signing = SigningKey::from_bytes(seed);
+            let mut blob = [0u8; 64];
+            let mut writer = Writer::new(&mut blob);
+            writer.string(b"ssh-ed25519").string(signing.verifying_key().as_bytes());
+            let blob_length = writer.len();
+            let mut signed = [0u8; 512];
+            let mut writer = Writer::new(&mut signed);
+            writer.string(&exchange_hash).u8(MSG_USERAUTH_REQUEST).string(user.as_bytes()).string(b"ssh-connection").string(b"publickey");
+            writer.bool(true).string(b"ssh-ed25519").string(&blob[..blob_length]);
+            if !writer.ok() {
+                return fail("the user name is too long");
+            }
+            let signature = signing.sign(writer.written()).to_bytes();
+            self.send(|out| {
+                let mut inner = [0u8; 96];
+                let mut inner_writer = Writer::new(&mut inner);
+                inner_writer.string(b"ssh-ed25519").string(&signature);
+                out.u8(MSG_USERAUTH_REQUEST).string(user.as_bytes()).string(b"ssh-connection").string(b"publickey");
+                out.bool(true).string(b"ssh-ed25519").string(&blob[..blob_length]).string(inner_writer.written());
+            })?;
+            }
         }
-        let signature = signing.sign(writer.written()).to_bytes();
-        self.send(|out| {
-            let mut inner = [0u8; 96];
-            let mut inner_writer = Writer::new(&mut inner);
-            inner_writer.string(b"ssh-ed25519").string(&signature);
-            out.u8(MSG_USERAUTH_REQUEST).string(user.as_bytes()).string(b"ssh-connection").string(b"publickey");
-            out.bool(true).string(b"ssh-ed25519").string(&blob[..blob_length]).string(inner_writer.written());
-        })?;
         loop {
             self.read_packet(false)?;
             match self.rx.buffer[0] {
