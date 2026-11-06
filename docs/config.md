@@ -60,3 +60,9 @@ lists its words.
 ## Where the files live
 
 Every machine-specific file (start, services, settings, hostname, debug, smbusers, tape configs such as phono.cfg, smbd.cfg, httpd.cfg and @NAME files) belongs in `settings/`. A tape looks for `settings/NAME`, then `config/NAME`, then the bare name in the root (`tape_rt::config::locate`); a save goes where the file was found, a new file goes to `settings/` (the root on a volume without folders). `fstab` stays in the root because it builds the mount table. The mf shell command `settings migrate` moves the root *.cfg files, smbusers and services into `settings/`.
+
+## sshd (`settings/sshd.cfg`, `settings/authorized_keys`, `settings/ssh_host_key`)
+
+`sshd.cfg` (or the command line) takes `root=DIR`, `export=NAME[=ROOT][,ro]` (up to 8; one export shows as `/`, several as folders), `port=22`, `nic=N`, `ip=A.B.C.D/N`, `gateway=`, `ro` and `log`. Without `ip=` the NIC asks DHCP.
+`authorized_keys`: one line per key, `user=NAME[,uid=N][,gid=N][,ro] ssh-ed25519 BASE64 [comment]` (at most 16, ssh-ed25519 only). `uid`/`gid` default to 0, which sees everything: give real users real ids. `ro` refuses every change for that key.
+`ssh_host_key`: 64 hex digits, the seed of the host key; sshd makes it at the first start and prints the `SHA256:` fingerprint at every start. Delete the file to change the host key.

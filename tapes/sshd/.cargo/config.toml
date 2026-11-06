@@ -1,0 +1,3 @@
+# A hard-float tape: SSE2 in the baseline, AVX2/FMA by runtime check (see tapes/.cargo/config.toml).
+[build]
+target = "../../targets/x86_64-fos-tape-fp.json"

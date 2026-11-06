@@ -1,0 +1,17 @@
+[package]
+name = "vfs-export"
+version = "0.1.0"
+edition = "2024"
+description = "A folder tree offered to remote clients (SMB shares, SFTP exports): path joining and cleaning, stat, listing and changes over the tape vfs_* calls, shared by smbd and sshd"
+license = "MIT"
+
+[lib]
+name = "vfs_export"
+path = "src/lib.rs"
+
+[dependencies]
+tape-rt = { path = "../tape-rt" }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
