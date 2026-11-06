@@ -108,6 +108,8 @@ fn isr(index: usize) {
 /// Deferred interrupt setup: ticks (100 Hz) between attempts, and how many attempts in all.
 const RETRY_TICKS: u64 = 300;
 const RETRY_LIMIT: u8 = 3;
+/// Ticks (100 Hz) an overflow cause may stay latched with an empty receive ring before the chip is reset.
+const STALL_TICKS: u64 = 5;
 
 const TXCONFIG_VALUE: u32 = (3 << 24) | (7 << 8) | (1 << 7); // standard IFG, max DMA burst
 const RX_ACCEPT_ALL_PHYS: u32 = 0x01;
@@ -212,6 +214,8 @@ pub struct Rtl8168 {
     pub frames_dropped_no_link: u64,
     pub recoveries: u32,
     recovery_pending: bool,
+    /// Tick at which `receive` first found the ring empty with an overflow cause still latched (0: not seen).
+    stall_since: u64,
     /// Set when `enable_interrupts` found no link, so its self-test (which needs a frame to go out) could not run: the
     /// PCI device to try again with once the link is up, and the tick before which not to try (`retry_interrupts`).
     retry: Option<pci::Device>,
@@ -225,7 +229,8 @@ fn wait_reset(base: u16) -> bool {
     write8(base, REG_CR, CR_RST);
     for _ in 0..1_000_000u32 {
         if read8(base, REG_CR) & CR_RST == 0 {
-            timer::wait_ticks(1);
+            // Not wait_ticks: the reset also runs from `receive` with interrupts off, where no tick ever arrives.
+            timer::busy_wait_ms(10);
             return true;
         }
         core::hint::spin_loop();
@@ -279,6 +284,7 @@ impl Rtl8168 {
             frames_dropped_no_link: 0,
             recoveries: 0,
             recovery_pending: false,
+            stall_since: 0,
             retry: None,
             retry_after: 0,
             retry_attempts: 0,
@@ -589,6 +595,28 @@ impl Rtl8168 {
         true
     }
 
+    /// The 8168H can stop receiving after an overflow burst: every descriptor is back in the card's hands, yet
+    /// RDU/FOVW stay latched in ISR and no frame arrives (seen on a rack machine under an SFTP upload; `nic regs`
+    /// showed rx owned by the card, ISR=00d5). The interrupt handler acknowledges these causes within microseconds,
+    /// so finding one still latched with an empty ring for `STALL_TICKS` means the receiver is wedged; the caller
+    /// resets the chip, as for a system error.
+    fn receiver_stalled(&mut self) -> bool {
+        if read16(self.io_base, REG_ISR) & SOFT_MASK == 0 {
+            self.stall_since = 0;
+            return false;
+        }
+        let now = timer::ticks().max(1);
+        if self.stall_since == 0 {
+            self.stall_since = now;
+            return false;
+        }
+        if now.wrapping_sub(self.stall_since) < STALL_TICKS {
+            return false;
+        }
+        self.stall_since = 0;
+        true
+    }
+
     /// Copies the next received frame (without the FCS) into `out`; `None` if the ring is empty.
     pub fn receive(&mut self, out: &mut [u8]) -> Option<usize> {
         if self.retry.is_some() {
@@ -608,6 +636,10 @@ impl Rtl8168 {
             if SOFT_MASKED[self.index].swap(false, Ordering::AcqRel) {
                 write16(self.io_base, REG_ISR, SOFT_MASK);
                 write16(self.io_base, REG_IMR, INTERRUPT_MASK);
+            }
+            if self.interrupts_enabled && self.receiver_stalled() {
+                self.recover();
+                write16(self.io_base, REG_ISR, 0xffff);
             }
             return None;
         }
