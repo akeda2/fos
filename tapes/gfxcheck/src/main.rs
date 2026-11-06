@@ -70,3 +70,11 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     }
     println!("gfxcheck: done");
 }
+
+tape_rt::tape_help!(br#"gfxcheck: checks the tape graphics calls (gfx_*).
+
+  gfxcheck [secs=N] [screen=N]
+
+Draws colour bars, a ramp and a clipped block, holds N seconds (default 10,
+Escape ends it). The tape for `make test-gfx`.
+"#);

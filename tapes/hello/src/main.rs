@@ -47,3 +47,8 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     println!("primes up to {LIMIT}: {primes} (in {elapsed} us)");
     (api.free)(memory, bytes);
 }
+
+tape_rt::tape_help!(br#"hello: the smallest tape.
+
+  hello [WORDS]     prints its arguments, counts primes, reports the clock
+"#);

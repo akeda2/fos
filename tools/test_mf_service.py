@@ -96,6 +96,11 @@ def main():
         ok, out = command("service start web", "already running", 10)
         check(ok, "starting a running service is refused politely", out)
 
+        ok, out = command("help httpd", "httpd", 15)
+        check(ok and "root=" in out, "`help TAPE` prints a tape's usage without running it", out)
+        ok, out = command("httpd help", "root=", 15)
+        check(ok and "runs in the background" not in out, "`TAPE help` prints the usage too", out)
+
         ok, out = command("service stop files", "stopped", 15)
         check(ok, "`service stop files`", out)
         time.sleep(1)

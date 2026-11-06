@@ -42,6 +42,7 @@ mod top;
 mod log;
 #[path = "../../kernel/src/formatshell.rs"]
 mod formatshell;
+mod helptext;
 /// The embedded kernel's `install` and `bootcode` use physical memory as pointers (identity map); here a buffer's
 /// "address" is its direct-map address and `free` takes it back to the physical frame.
 mod memory {

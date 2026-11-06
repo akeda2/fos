@@ -343,7 +343,7 @@ impl Host for MfHost {
     }
 
     fn tape_help(&mut self, reference: &str) -> bool {
-        const SIZE: usize = 512 * 1024;
+        const SIZE: usize = 4 * 1024 * 1024;
         let mut shown = false;
         self.with_buffer(SIZE, &mut |host, image| {
             let Ok(length) = host.read(reference, image) else { return };

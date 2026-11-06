@@ -112,3 +112,10 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         println!("thrcheck: FAILED {failures} check(s)");
     }
 }
+
+tape_rt::tape_help!(br#"thrcheck: threads inside one tape (ABI 37).
+
+  thrcheck          runs four counting threads, futex wake and page churn
+
+On the server kernel only; embedded kernels say so and pass. `make test-mf-threads`.
+"#);
