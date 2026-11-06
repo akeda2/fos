@@ -116,7 +116,7 @@ pub fn prompt() {
 
 /// Commands `run` handles itself, outside the shared tables, for Tab completion.
 const BUILTINS: &[&str] = &[
-    "version", "cpus", "mem", "pci", "disks", "nic", "vnic", "tapesync", "gpio", "top", "threads", "ps", "date", "uptime", "slots", "audio", "usb", "tape", "run", "kill",
+    "version", "cpus", "mem", "pci", "disks", "nic", "vnic", "service", "tapesync", "gpio", "top", "threads", "ps", "date", "uptime", "slots", "audio", "usb", "tape", "run", "kill",
     "echo", "debug", "start", "keymap", "kup", "recv", "dmesg", "clear", "sleep", "io", "memmap", "bootinfo", "cpuinfo", "shrink", "sector", "mount", "umount",
     "format", "label", "fsck", "grow", "install", "bootcode", "reboot", "reset", "shutdown", "halt", "ext4", "sha256", "cd", "pwd",
 ];
@@ -228,6 +228,7 @@ pub fn run_command(line: &str) {
         "gpio" => crate::netclient::gpio(line.trim_start().strip_prefix("gpio").unwrap_or("")),
         "nic" => net::print_list(),
         "vnic" => crate::vnic::command(words),
+        "service" => crate::service::command(words),
         "top" => crate::top::start(&line.trim_start()[command.len()..]),
         "threads" => {
             sched::for_each(|id, name, state| println!("{id:3} {name:<16} {state:?}"));
@@ -393,7 +394,11 @@ fn split_background(args: &str) -> (&str, Option<Result<u64, ()>>) {
 
 /// `run NAME ARGS`: the tape becomes the foreground process (Escape stops it). With `&N` it is a background tape (a service):
 /// it owns NIC N, keeps running while the shell takes commands, and ends with `kill PID`.
+/// The pid the last `run_tape` started, 0 when it did not start anything (`service` reads it).
+pub static LAST_STARTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 pub fn run_tape(name: &str, args: &str) {
+    LAST_STARTED.store(0, core::sync::atomic::Ordering::Release);
     // `&+N`: a virtual interface on physical NIC N made for this tape alone and removed when it ends.
     let mut fresh = None;
     let mut args = args;
@@ -452,6 +457,9 @@ pub fn run_tape(name: &str, args: &str) {
     crate::process::START_NICS.store(0, core::sync::atomic::Ordering::Release);
     if let (Some(interface), Ok(_)) = (fresh.take(), &started) {
         interface.keep();
+    }
+    if let Ok(pid) = &started {
+        LAST_STARTED.store(*pid, core::sync::atomic::Ordering::Release);
     }
     match started {
         Ok(pid) => match nics {

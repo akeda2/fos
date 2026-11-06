@@ -74,7 +74,7 @@ pub fn watchdog_seconds() -> Option<u32> {
 
 /// Reads `name` into the shared buffer: from the boot volume (`settings/NAME`, then the root), else any other FOSFS volume,
 /// else the root of the first FAT32/exFAT disk that has it (a stick a PC can edit), as the embedded kernel does.
-fn read(name: &str) -> Option<&'static str> {
+pub(crate) fn read(name: &str) -> Option<&'static str> {
     let buffer = unsafe { &mut *core::ptr::addr_of_mut!(BUFFER) };
     let mut path = [0u8; 40];
     let length = name.len().min(31);
@@ -148,7 +148,7 @@ fn read_fat(name: &str, buffer: &'static mut [u8; 4096]) -> Option<&'static str>
     None
 }
 
-fn lines(text: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn lines(text: &str) -> impl Iterator<Item = &str> {
     text.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#'))
 }
 

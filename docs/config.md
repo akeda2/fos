@@ -12,6 +12,7 @@ unknown line is reported on the console ("unknown line ... ignored") and skipped
 | `settings` | Machine behaviour, below. |
 | `debug` | Crash, watchdog and kernel-update behaviour, below. `tools/default-debug.txt` is installed on every built image. |
 | `start` | A command script run once at boot (up to 4096 bytes; blank lines and `#` lines skipped). The shell command `start` reruns it. |
+| `services` | Server kernel only: named services, one per line, `NAME [restart] TAPE ARGS... &NIC` (the line ends in `&N`, `&NAME` or `&+N`). `service start\|stop\|restart NAME\|all` acts on one or all without touching the others, `service` lists them, `service reload` rereads the file. A `start` file of `service start all` starts them at boot. `restart`: started again after 2, 4, 8 ... at most 60 s when the process ends without `service stop`. |
 | `synckey` | First line: the shared secret (at most 128 bytes) that signs `tapesync`, the manifest check of `tools/fosadm.py`, and GPIO over Ethernet (`gpio @HOST`, `tools/gpio.py`, `gpiopanel host=`). The same on every machine that should trust each other. NETFS will not read or replace it. |
 | `moxa-1110.fw` | Firmware for the Moxa UPort 1110 USB serial adapter (needs a `usb rescan`). |
 
