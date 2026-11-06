@@ -8,7 +8,7 @@ unknown line is reported on the console ("unknown line ... ignored") and skipped
 
 | File | What |
 | --- | --- |
-| `hostname` | First line: the base name this machine announces; the interface number is appended (`lab` becomes `lab1`, `lab2`). Without it the name is `fos-` plus the last three MAC bytes. |
+| `hostname` | First line: the base name this machine announces; the interface number is appended (`lab` becomes `lab1`, `lab2`); a virtual interface (server kernel) gets its vnic name instead, which does not change between boots (`lab` + vnic `web` = `labweb`). Without it the name is `fos-` plus the last three MAC bytes. |
 | `settings` | Machine behaviour, below. |
 | `debug` | Crash, watchdog and kernel-update behaviour, below. `tools/default-debug.txt` is installed on every built image. |
 | `start` | A command script run once at boot (up to 4096 bytes; blank lines and `#` lines skipped). The shell command `start` reruns it. |

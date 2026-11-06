@@ -235,7 +235,7 @@ pub fn kup_busy() -> bool {
     kup.active && apic::ticks().wrapping_sub(kup.last_activity) < KUP_STALE_TICKS
 }
 
-/// The name announced for interface `index`: `NAME<n>` from the `hostname` file (n is the one-based interface number), or
+/// The name announced for interface `index`: `NAMEvnic` on a virtual interface, else `NAME<n>` from the `hostname` file (n is the one-based interface number), or
 /// without that file `fos-` and the last three bytes of the interface's MAC address.
 pub fn hostname(index: usize, out: &mut [u8; 20]) -> usize {
     use core::fmt::Write;
@@ -249,10 +249,13 @@ pub fn hostname(index: usize, out: &mut [u8; 20]) -> usize {
         }
     }
     let mut cursor = Cursor(out, 0);
-    let _ = match (config::hostname(), mac(index)) {
-        (Some(base), _) => write!(cursor, "{base}{}", index + 1),
-        (None, Some(mac)) => write!(cursor, "fos-{:02x}{:02x}{:02x}", mac[3], mac[4], mac[5]),
-        (None, None) => write!(cursor, "fos"),
+    // A virtual interface is named after its vnic (`rack` + `web` = `rackweb`): its NIC number can change between boots.
+    let own = if nic::virtual_parent(index).is_some() { crate::vnic::name_of(index) } else { None };
+    let _ = match (config::hostname(), own, mac(index)) {
+        (base, Some(own), _) => write!(cursor, "{}{own}", base.as_deref().unwrap_or("fos-")),
+        (Some(base), None, _) => write!(cursor, "{base}{}", index + 1),
+        (None, None, Some(mac)) => write!(cursor, "fos-{:02x}{:02x}{:02x}", mac[3], mac[4], mac[5]),
+        (None, None, None) => write!(cursor, "fos"),
     };
     cursor.1
 }
