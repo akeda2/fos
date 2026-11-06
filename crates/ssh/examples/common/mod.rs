@@ -93,7 +93,8 @@ impl Host for Server {
         self.random.read_exact(out).unwrap();
     }
     fn host_seed(&self) -> [u8; 32] {
-        [42; 32]
+        // SERVE_SEED=N picks another host key (a test of the client's changed-key refusal).
+        [std::env::var("SERVE_SEED").ok().and_then(|n| n.parse().ok()).unwrap_or(42); 32]
     }
     fn authorize(&mut self, user: &str, key: &[u8; 32]) -> Option<Account> {
         self.keys.lookup(user, key)
