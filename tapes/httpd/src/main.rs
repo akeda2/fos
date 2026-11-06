@@ -664,6 +664,10 @@ impl Shared<'_> {
         if conn.ahead == 0 || conn.ahead_state != EMPTY || conn.next >= conn.end {
             return;
         }
+        // The first chunk is read right here (`refill`): a worker's wake-up costs more than reading a small file.
+        if self.bufs[conn.cur as usize - 1].len == 0 {
+            return;
+        }
         let Some(index) = self.workers[..self.worker_count].iter().position(|&address| unsafe { &*(address as *const Worker) }.state.load(Ordering::Acquire) == IDLE) else { return };
         let want = (conn.end - conn.next).min(CHUNK as u64) as usize;
         let worker = unsafe { &mut *(self.workers[index] as *mut Worker) };
