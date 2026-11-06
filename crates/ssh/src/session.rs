@@ -25,51 +25,51 @@ use vfs_export::Files;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 const VERSION: &[u8] = b"SSH-2.0-fos_sshd";
-const PACKET: usize = 36 * 1024;
-const OUT: usize = 40 * 1024;
+pub(crate) const PACKET: usize = 36 * 1024;
+pub(crate) const OUT: usize = 40 * 1024;
 const SFTP_IN: usize = 256 * 1024;
 /// The memory one session needs, given by the caller.
 pub const ARENA: usize = PACKET + OUT + SFTP_IN + sftp::MAX_PACKET;
 /// The largest data field of a CHANNEL_DATA packet either way.
-const MAX_DATA: usize = 32 * 1024;
-const KEXINIT_MAX: usize = 4096;
-const TAG: usize = 16;
+pub(crate) const MAX_DATA: usize = 32 * 1024;
+pub(crate) const KEXINIT_MAX: usize = 4096;
+pub(crate) const TAG: usize = 16;
 const AUTH_REQUESTS: u32 = 20;
 const AUTH_FAILURES: u32 = 3;
 
-const MSG_DISCONNECT: u8 = 1;
-const MSG_IGNORE: u8 = 2;
-const MSG_UNIMPLEMENTED: u8 = 3;
-const MSG_DEBUG: u8 = 4;
-const MSG_SERVICE_REQUEST: u8 = 5;
-const MSG_SERVICE_ACCEPT: u8 = 6;
-const MSG_KEXINIT: u8 = 20;
-const MSG_NEWKEYS: u8 = 21;
-const MSG_KEX_ECDH_INIT: u8 = 30;
-const MSG_KEX_ECDH_REPLY: u8 = 31;
-const MSG_USERAUTH_REQUEST: u8 = 50;
-const MSG_USERAUTH_FAILURE: u8 = 51;
-const MSG_USERAUTH_SUCCESS: u8 = 52;
-const MSG_USERAUTH_PK_OK: u8 = 60;
-const MSG_GLOBAL_REQUEST: u8 = 80;
-const MSG_REQUEST_FAILURE: u8 = 82;
-const MSG_CHANNEL_OPEN: u8 = 90;
-const MSG_CHANNEL_OPEN_CONFIRMATION: u8 = 91;
-const MSG_CHANNEL_OPEN_FAILURE: u8 = 92;
-const MSG_CHANNEL_WINDOW_ADJUST: u8 = 93;
-const MSG_CHANNEL_DATA: u8 = 94;
-const MSG_CHANNEL_EXTENDED_DATA: u8 = 95;
-const MSG_CHANNEL_EOF: u8 = 96;
-const MSG_CHANNEL_CLOSE: u8 = 97;
-const MSG_CHANNEL_REQUEST: u8 = 98;
-const MSG_CHANNEL_SUCCESS: u8 = 99;
-const MSG_CHANNEL_FAILURE: u8 = 100;
+pub(crate) const MSG_DISCONNECT: u8 = 1;
+pub(crate) const MSG_IGNORE: u8 = 2;
+pub(crate) const MSG_UNIMPLEMENTED: u8 = 3;
+pub(crate) const MSG_DEBUG: u8 = 4;
+pub(crate) const MSG_SERVICE_REQUEST: u8 = 5;
+pub(crate) const MSG_SERVICE_ACCEPT: u8 = 6;
+pub(crate) const MSG_KEXINIT: u8 = 20;
+pub(crate) const MSG_NEWKEYS: u8 = 21;
+pub(crate) const MSG_KEX_ECDH_INIT: u8 = 30;
+pub(crate) const MSG_KEX_ECDH_REPLY: u8 = 31;
+pub(crate) const MSG_USERAUTH_REQUEST: u8 = 50;
+pub(crate) const MSG_USERAUTH_FAILURE: u8 = 51;
+pub(crate) const MSG_USERAUTH_SUCCESS: u8 = 52;
+pub(crate) const MSG_USERAUTH_PK_OK: u8 = 60;
+pub(crate) const MSG_GLOBAL_REQUEST: u8 = 80;
+pub(crate) const MSG_REQUEST_FAILURE: u8 = 82;
+pub(crate) const MSG_CHANNEL_OPEN: u8 = 90;
+pub(crate) const MSG_CHANNEL_OPEN_CONFIRMATION: u8 = 91;
+pub(crate) const MSG_CHANNEL_OPEN_FAILURE: u8 = 92;
+pub(crate) const MSG_CHANNEL_WINDOW_ADJUST: u8 = 93;
+pub(crate) const MSG_CHANNEL_DATA: u8 = 94;
+pub(crate) const MSG_CHANNEL_EXTENDED_DATA: u8 = 95;
+pub(crate) const MSG_CHANNEL_EOF: u8 = 96;
+pub(crate) const MSG_CHANNEL_CLOSE: u8 = 97;
+pub(crate) const MSG_CHANNEL_REQUEST: u8 = 98;
+pub(crate) const MSG_CHANNEL_SUCCESS: u8 = 99;
+pub(crate) const MSG_CHANNEL_FAILURE: u8 = 100;
 
-const REASON_PROTOCOL_ERROR: u32 = 2;
-const REASON_KEY_EXCHANGE_FAILED: u32 = 3;
-const REASON_MAC_ERROR: u32 = 5;
-const REASON_SERVICE_NOT_AVAILABLE: u32 = 7;
-const REASON_NO_MORE_AUTH_METHODS: u32 = 14;
+pub(crate) const REASON_PROTOCOL_ERROR: u32 = 2;
+pub(crate) const REASON_KEY_EXCHANGE_FAILED: u32 = 3;
+pub(crate) const REASON_MAC_ERROR: u32 = 5;
+pub(crate) const REASON_SERVICE_NOT_AVAILABLE: u32 = 7;
+pub(crate) const REASON_NO_MORE_AUTH_METHODS: u32 = 14;
 
 /// Who a key logs in as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,11 +108,11 @@ enum Phase {
 }
 
 #[derive(Clone, Copy)]
-struct Keys {
+pub(crate) struct Keys {
     /// K_2 of the OpenSSH chacha20-poly1305: the packet body and the Poly1305 key.
-    main: [u8; 32],
+    pub(crate) main: [u8; 32],
     /// K_1: the packet length.
-    header: [u8; 32],
+    pub(crate) header: [u8; 32],
 }
 
 fn nonce(sequence: u32) -> [u8; 12] {
@@ -135,21 +135,21 @@ fn tag_of(key: &[u8; 32], data: &[u8]) -> [u8; TAG] {
     Poly1305::new(key.into()).compute_unpadded(data).into()
 }
 
-struct Tx<'a> {
-    buffer: &'a mut [u8],
-    length: usize,
-    sent: usize,
-    keys: Option<Keys>,
-    sequence: u32,
+pub(crate) struct Tx<'a> {
+    pub(crate) buffer: &'a mut [u8],
+    pub(crate) length: usize,
+    pub(crate) sent: usize,
+    pub(crate) keys: Option<Keys>,
+    pub(crate) sequence: u32,
 }
 
 impl Tx<'_> {
-    fn pending(&self) -> usize {
+    pub(crate) fn pending(&self) -> usize {
         self.length - self.sent
     }
 
     /// Queues one packet whose payload `build` writes; false when it does not fit (nothing is queued).
-    fn packet(&mut self, build: impl FnOnce(&mut Writer)) -> bool {
+    pub(crate) fn packet(&mut self, build: impl FnOnce(&mut Writer)) -> bool {
         let at = self.length;
         let overhead = 5 + 8 + TAG;
         if self.buffer.len() < at + overhead {
@@ -186,7 +186,7 @@ impl Tx<'_> {
         true
     }
 
-    fn raw(&mut self, data: &[u8]) {
+    pub(crate) fn raw(&mut self, data: &[u8]) {
         if self.buffer.len() >= self.length + data.len() {
             self.buffer[self.length..self.length + data.len()].copy_from_slice(data);
             self.length += data.len();
@@ -194,13 +194,13 @@ impl Tx<'_> {
     }
 }
 
-struct Rx<'a> {
-    buffer: &'a mut [u8],
-    keys: Option<Keys>,
-    sequence: u32,
+pub(crate) struct Rx<'a> {
+    pub(crate) buffer: &'a mut [u8],
+    pub(crate) keys: Option<Keys>,
+    pub(crate) sequence: u32,
 }
 
-enum Read {
+pub(crate) enum Read {
     /// Not all of the packet is here.
     More,
     /// A packet of `used` bytes arrived; its payload is the first `payload` bytes of the buffer.
@@ -209,7 +209,7 @@ enum Read {
 }
 
 impl Rx<'_> {
-    fn read(&mut self, input: &[u8]) -> Read {
+    pub(crate) fn read(&mut self, input: &[u8]) -> Read {
         let Some(head) = input.get(..4) else { return Read::More };
         let mut length_bytes = [head[0], head[1], head[2], head[3]];
         if let Some(keys) = &self.keys {
@@ -290,21 +290,21 @@ pub struct Session<'a> {
     sftp: Sftp,
 }
 
-fn has(list: &[u8], name: &str) -> bool {
+pub(crate) fn has(list: &[u8], name: &str) -> bool {
     list.split(|&byte| byte == b',').any(|item| item == name.as_bytes())
 }
 
-fn first(list: &[u8]) -> &[u8] {
+pub(crate) fn first(list: &[u8]) -> &[u8] {
     list.split(|&byte| byte == b',').next().unwrap_or(&[])
 }
 
-fn hash_string(hasher: &mut Sha256, data: &[u8]) {
+pub(crate) fn hash_string(hasher: &mut Sha256, data: &[u8]) {
     hasher.update((data.len() as u32).to_be_bytes());
     hasher.update(data);
 }
 
 /// The 64 key bytes of RFC 4253 section 7.2 for `letter` (C: client to server, D: server to client).
-fn derive(secret: &[u8], exchange_hash: &[u8; 32], letter: u8, session_id: &[u8; 32]) -> Keys {
+pub(crate) fn derive(secret: &[u8], exchange_hash: &[u8; 32], letter: u8, session_id: &[u8; 32]) -> Keys {
     let mut hasher = Sha256::new();
     hasher.update(secret);
     hasher.update(exchange_hash);
