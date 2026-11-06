@@ -103,6 +103,11 @@ pub fn working_folder() -> String {
     current()
 }
 
+/// `resolve_path` for tapes: the name under the working folder of the session the calling tape is in the foreground of.
+pub fn resolve_for_tape(name: &str) -> String {
+    here(name)
+}
+
 /// `cd [FOLDER]`: with no name the boot volume's root. The folder must exist (a listing of it works). Returns the new folder.
 pub fn change_folder(target: &str) -> Result<String, FsError> {
     let resolved = if target.is_empty() { String::new() } else { here(target) };

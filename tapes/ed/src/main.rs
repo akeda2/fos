@@ -60,6 +60,8 @@ pub extern "C" fn tape_main(api: &'static tape_rt::TapeApi) {
         print_bytes(putc, b"Usage: tape run ed NAME (or diskN/NAME, @LABEL/NAME for another volume)\n");
         return;
     };
+    let mut resolved = [0u8; 256];
+    let name = tape_rt::resolve_path(name, &mut resolved);
 
     let mut file_length = 0u64;
     let length_status = fs_file_length(name.as_ptr() as usize, name.len() as u32, &mut file_length as *mut u64 as usize);

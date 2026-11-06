@@ -985,6 +985,21 @@ pub fn session_close(session: u32) {
     }
 }
 
+/// `name` as the shell's working folder sees it (ABI 39): for a file name the user typed, so `ed NAME` after `cd FOLDER` opens
+/// `FOLDER/NAME`. Fixed configuration names should not go through this. The result lives in `out` (the name as typed where the
+/// kernel has no working folder, or `out` is too small).
+pub fn resolve_path<'a>(name: &'a [u8], out: &'a mut [u8]) -> &'a [u8] {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, resolve_path) + core::mem::size_of::<usize>();
+    if table.version >= 39 && table.size as usize >= end {
+        let length = (table.resolve_path)(name.as_ptr(), name.len(), out.as_mut_ptr(), out.len());
+        if length >= 0 && length as usize <= out.len() {
+            return &out[..length as usize];
+        }
+    }
+    name
+}
+
 fn remote_table() -> Option<&'static fosfor_abi::tape::TapeApi> {
     let table = api();
     let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, remote_reply) + core::mem::size_of::<usize>();

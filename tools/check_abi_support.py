@@ -29,6 +29,7 @@ THREADS = {name: "the embedded kernels run one tape at a time on one CPU; thread
            for name in ("thread_spawn", "thread_join", "futex_wait", "futex_wake")}
 SESSIONS = {name: "the embedded kernels have one console and no login sessions; sessions are a server-kernel feature"
             for name in ("session_open", "session_write", "session_read", "session_close")}
+SESSIONS["resolve_path"] = "the embedded kernels have no working folder (cd); tapes use the name as typed"
 UNWIRED = "not wired into mf yet (the call answers 0, so a tape sees no such device)"
 
 # Calls a kernel stubs, and why. Field name -> reason, per kernel. Keep it honest: an entry is either a hardware fact
