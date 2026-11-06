@@ -212,6 +212,7 @@ fn make_api(info: &BootInfo, arguments: &str) -> TapeApi {
         session_write: crate::tape_common::unsupported::api_session_write,
         session_read: crate::tape_common::unsupported::api_session_read,
         session_close: crate::tape_common::unsupported::api_session_close,
+        resolve_path: crate::tape_common::unsupported::api_resolve_path,
         random: kernel_core::random::api_random,
     }
 }

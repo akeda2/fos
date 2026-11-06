@@ -238,6 +238,8 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         println!("usage: tape run ebb NAME [tab=N]   (help: ebb --help)");
         return;
     }
+    let mut resolved = [0u8; 256];
+    let name = core::str::from_utf8(tape_rt::resolve_path(name.as_bytes(), &mut resolved)).unwrap_or(name);
     let (columns, rows) = tape_rt::console_size();
     let (columns, rows) = (columns.clamp(20, 256), rows.clamp(4, 100));
 

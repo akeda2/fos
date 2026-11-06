@@ -183,6 +183,7 @@ const SESSION_OPEN: u64 = slot(offset_of!(TapeApi, session_open));
 const SESSION_WRITE: u64 = slot(offset_of!(TapeApi, session_write));
 const SESSION_READ: u64 = slot(offset_of!(TapeApi, session_read));
 const SESSION_CLOSE: u64 = slot(offset_of!(TapeApi, session_close));
+const RESOLVE_PATH: u64 = slot(offset_of!(TapeApi, resolve_path));
 const REMOTE_REGISTER: u64 = slot(offset_of!(TapeApi, remote_register));
 const REMOTE_UNREGISTER: u64 = slot(offset_of!(TapeApi, remote_unregister));
 const REMOTE_POLL: u64 = slot(offset_of!(TapeApi, remote_poll));
@@ -443,6 +444,19 @@ pub fn call(frame: &mut Frame) {
             }
         }
         SESSION_CLOSE => crate::net::tape_session_close(sched::current_pid(), a) as u64,
+        RESOLVE_PATH => match user_bytes(a, b.min(256)) {
+            Some(bytes) if b <= 256 => {
+                let resolved = crate::shellhost::resolve_for_tape(core::str::from_utf8(&bytes).unwrap_or(""));
+                if resolved.len() as u64 > d {
+                    (-2i64) as u64
+                } else if process::copy_to_user(c, resolved.as_bytes()) {
+                    resolved.len() as u64
+                } else {
+                    (-2i64) as u64
+                }
+            }
+            _ => (-2i64) as u64,
+        },
         REMOTE_REGISTER => tapefs::remote_register(a, b) as u64,
         REMOTE_UNREGISTER => tapefs::remote_unregister(a, b) as u64,
         REMOTE_POLL => tapefs::remote_poll(a, b, c, d, e) as u64,

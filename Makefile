@@ -241,8 +241,10 @@ test-mf-ssh: image-mf image
 		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin --file ssh=$(BUILD)/fosfor/tapes/ssh
 	python3 tools/test_mf_ssh.py
 
-test-mf-cp: image-mf
-	python3 tools/test_mf_cp.py
+test-mf-cp: image-mf image
+	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_MF_ELF) --output $(BUILD)/fosfor-mf/fosfor-cp.img \
+		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin --file ebb=$(BUILD)/fosfor/tapes/ebb
+	FOSFOR_IMAGE_MF=$(BUILD)/fosfor-mf/fosfor-cp.img python3 tools/test_mf_cp.py
 
 test-mf-httpd: image-mf image
 	printf 'root=disk2/www\nlisting=on\n' > $(BUILD)/fosfor-mf/httpd.cfg

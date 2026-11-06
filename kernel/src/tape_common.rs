@@ -105,6 +105,7 @@ pub mod unsupported {
         api_session_write(isize, *const u8, usize) -> isize = -1;
         api_session_read(isize, *mut u8, usize) -> isize = -1;
         api_session_close(isize) -> isize = -1;
+        api_resolve_path(*const u8, usize, *mut u8, usize) -> isize = -1;
         api_nic_ts_enable(usize) -> u32 = 0;
         api_nic_ts_clock(usize) -> u64 = 0;
         api_nic_ts_rx(usize) -> u64 = 0;

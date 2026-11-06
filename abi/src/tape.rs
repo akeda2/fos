@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`. Version 20 added `gfx_screens` and the `gfx_*_on` calls (a screen number). Version 21 added `audio_float`. Version 22 added the `gpio_*` calls. Version 23 added `i2c_speed` and `i2c_transfer`. Version 24 added `touch_info` and `touch_read`. Version 25 added `midi_read` and `midi_send`. Version 26 added `midi_devices`. Version 27 added `nic_owned`. Version 28 added `gpio_pull_get`. Version 32 added the `vfs_*` calls. Version 33 added `random`. Version 34 added the `vfs_*` change calls (`vfs_create`, `vfs_write`, `vfs_truncate`, `vfs_remove`, `vfs_rename`, `vfs_set_owner`). Version 35 added the `remote_*` calls (a tape serves a volume named `//NAME`). Version 36 added `vfs_sync`. Version 37 added the thread calls (`thread_spawn`, `thread_join`, `futex_wait`, `futex_wake`). Version 38 added the shell session calls (`session_open`, `session_write`, `session_read`, `session_close`).
-pub const TAPE_API_VERSION: u32 = 38;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`. Version 20 added `gfx_screens` and the `gfx_*_on` calls (a screen number). Version 21 added `audio_float`. Version 22 added the `gpio_*` calls. Version 23 added `i2c_speed` and `i2c_transfer`. Version 24 added `touch_info` and `touch_read`. Version 25 added `midi_read` and `midi_send`. Version 26 added `midi_devices`. Version 27 added `nic_owned`. Version 28 added `gpio_pull_get`. Version 32 added the `vfs_*` calls. Version 33 added `random`. Version 34 added the `vfs_*` change calls (`vfs_create`, `vfs_write`, `vfs_truncate`, `vfs_remove`, `vfs_rename`, `vfs_set_owner`). Version 35 added the `remote_*` calls (a tape serves a volume named `//NAME`). Version 36 added `vfs_sync`. Version 37 added the thread calls (`thread_spawn`, `thread_join`, `futex_wait`, `futex_wake`). Version 38 added the shell session calls (`session_open`, `session_write`, `session_read`, `session_close`). Version 39 added `resolve_path`.
+pub const TAPE_API_VERSION: u32 = 39;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -472,7 +472,17 @@ pub struct TapeApi {
     pub session_read: extern "C" fn(isize, *mut u8, usize) -> isize,
     /// `session_close(session)` (version 38): ends the session. Its foreground tape keeps running without keys.
     pub session_close: extern "C" fn(isize) -> isize,
+    /// `resolve_path(name, name_length, out, capacity)` (version 39): `name` as the shell's working folder (`cd`) would see it,
+    /// for a tape that takes a file name the user typed (`ed settings` after `cd settings`). Returns the byte count written to
+    /// `out` (the name unchanged when there is no folder, or it names a volume or starts with `//`), `RESOLVE_UNSUPPORTED`
+    /// (the embedded kernels have no working folder: use the name as typed) or `RESOLVE_TOO_LONG`. The file calls themselves
+    /// do not apply the folder, so configuration files a tape reads by fixed name stay where they are.
+    pub resolve_path: extern "C" fn(*const u8, usize, *mut u8, usize) -> isize,
 }
+
+/// `resolve_path` results (version 39), all negative.
+pub const RESOLVE_UNSUPPORTED: isize = -1;
+pub const RESOLVE_TOO_LONG: isize = -2;
 
 /// Shell session call results (version 38), all negative.
 pub const SESSION_UNSUPPORTED: isize = -1;
