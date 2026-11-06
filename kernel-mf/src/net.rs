@@ -72,6 +72,9 @@ pub fn print_list() {
         if nic::is_virtual(index) {
             if let (Some(parent), Some(name)) = (nic::virtual_parent(index), crate::vnic::name(index)) {
                 println!("nic{}: vnic {name} on nic{} {} link {}", index + 1, parent + 1, Mac(&nic.mac()), if nic.link_up() { "up" } else { "DOWN" });
+                if let Some(ip) = crate::tapenet::address(index) {
+                    println!("   address {}.{}.{}.{} (seen in frames the tape sent)", ip[0], ip[1], ip[2], ip[3]);
+                }
                 let (received, sent, _) = nic.counters();
                 println!("   frames: {received} received, {sent} sent");
             }
@@ -81,6 +84,9 @@ pub fn print_list() {
         println!("nic{}: {} at {bus:02x}:{device:02x}.{function} (device {id:#06x}) {} link {}", index + 1, nic.family(), Mac(&nic.mac()), if nic.link_up() { "up" } else { "DOWN" });
         if let Some((speed, full)) = nic.link_speed() {
             println!("   negotiated {speed} Mbit/s {}", if full { "full duplex" } else { "half duplex" });
+        }
+        if let Some(ip) = crate::tapenet::address(index) {
+            println!("   address {}.{}.{}.{} (seen in frames the tape sent)", ip[0], ip[1], ip[2], ip[3]);
         }
         let (received, sent, dropped) = nic.counters();
         println!("   frames: {received} received, {sent} sent{}", if dropped != 0 { " (some dropped: no link)" } else { "" });

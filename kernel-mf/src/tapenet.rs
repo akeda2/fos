@@ -9,7 +9,7 @@
 //! owner ends, the interface goes back to the state a tape leaves it in (no promiscuous or multicast mode, no VLAN filter or
 //! offload, timestamps for PTP events only) and its queued frames are dropped.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use kernel_core::nic::{self, MAX_NICS};
 use kernel_core::nicctl;
 
@@ -20,6 +20,41 @@ use crate::{process, sched};
 pub const MAX_FRAME: u64 = 1518;
 const OWNERS_FREE: AtomicU64 = AtomicU64::new(0);
 static OWNER: [AtomicU64; MAX_NICS] = [OWNERS_FREE; MAX_NICS];
+
+const NO_ADDRESS: AtomicU32 = AtomicU32::new(0);
+/// The IPv4 address the tape on each interface sends from (network byte order as a big-endian number), 0 while unknown. The
+/// kernel does not run IP: a tape does its own DHCP, so the address is read off the frames it sends (an IPv4 source address
+/// or the sender of an ARP packet) to let `nic` and `service` say which address a service got.
+static SEEN_ADDRESS: [AtomicU32; MAX_NICS] = [NO_ADDRESS; MAX_NICS];
+
+fn note_address(index: usize, frame: &[u8]) {
+    let ethertype = frame.get(12..14).map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]));
+    let source = match ethertype {
+        Some(0x0800) => frame.get(26..30),
+        Some(0x0806) => frame.get(28..32),
+        _ => None,
+    };
+    let Some(source) = source else { return };
+    let address = u32::from_be_bytes([source[0], source[1], source[2], source[3]]);
+    // 0.0.0.0 is a DHCP client or an ARP probe that has no address yet.
+    if address != 0 && SEEN_ADDRESS[index].load(Ordering::Relaxed) != address {
+        SEEN_ADDRESS[index].store(address, Ordering::Relaxed);
+    }
+}
+
+/// The address a tape was seen to send from on interface `index`.
+pub fn address(index: usize) -> Option<[u8; 4]> {
+    let address = SEEN_ADDRESS.get(index)?.load(Ordering::Relaxed);
+    (address != 0).then(|| address.to_be_bytes())
+}
+
+/// The address of the interface the process `pid` owns, if it has sent from one.
+pub fn address_of_owner(pid: u64) -> Option<[u8; 4]> {
+    if pid == 0 {
+        return None;
+    }
+    (0..MAX_NICS).filter(|&index| OWNER[index].load(Ordering::Acquire) == pid).find_map(address)
+}
 
 /// Makes the calling process the owner of NIC `index` (or confirms it); false if it does not exist or another process owns it.
 fn claim(index: u64) -> bool {
@@ -93,6 +128,7 @@ pub fn send(index: u64, frame: u64, length: u64) -> u64 {
         return 0;
     }
     let Some(bytes) = process::user_bytes_up_to(frame, length, MAX_FRAME) else { return 0 };
+    note_address(index as usize, &bytes);
     let _nics = lock_nics();
     u64::from(nicctl::nic_send(index as usize, &bytes))
 }
@@ -196,6 +232,7 @@ pub fn send_stamped(index: u64, frame: u64, length: u64, stamp_out: u64) -> u64 
         return 0;
     }
     let Some(bytes) = process::user_bytes_up_to(frame, length, MAX_FRAME) else { return 0 };
+    note_address(index as usize, &bytes);
     let (sent, stamp) = {
         let _nics = lock_nics();
         nicctl::nic_send_stamped(index as usize, &bytes)
@@ -218,5 +255,6 @@ pub fn process_ended(pid: u64) {
         nicctl::nic_set_multicast(index, false);
         nicctl::clear_frame_queue_nic(index);
         crate::vnic::tape_ended(index);
+        SEEN_ADDRESS[index].store(0, Ordering::Relaxed);
     }
 }

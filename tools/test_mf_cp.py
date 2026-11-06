@@ -95,6 +95,10 @@ def main():
             ok, text = command("cd ../..", "fos", 20)
             ok, text = command("pwd", "boot volume", 20)
             check(ok, "cd ../.. returns to the boot volume", text[-300:])
+            ok, text = command("cd data", "fos data>", 20)
+            ok, text = command("cd sub", "fos data/sub>", 20)
+            check(ok, "cd into a subfolder of the working folder (a name relative to it)", text[-300:])
+            ok, text = command("cd ../..", "fos", 20)
             ok, text = command("cd nosuch", "no such folder", 20)
             check(ok, "cd to a missing folder fails", text[-300:])
         finally:
