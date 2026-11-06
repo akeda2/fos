@@ -4,6 +4,7 @@
 write/cat/cp/cmp/mv/rm/mkdir round-trip through the disk, help NAME comes from the shared table, and an unknown command is reported.
 QEMU only."""
 
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -275,6 +276,15 @@ def main():
             check("ls [" in out, "help NAME shows the shared usage line", out[-300:])
             out = machine.run("help")
             check("ls cat write" in out, "help lists the file commands", out[-400:])
+            out = machine.run("help")
+            check(all(group in out for group in ("Files", "System", "Network", "Disks")) and all(len(line) <= 79 for line in out.splitlines()),
+                  "help groups the commands in lines that fit 79 columns", out[-900:])
+            shell_source = (ROOT / "kernel-mf/src/shell.rs").read_text()
+            builtins = re.search(r"const BUILTINS: &\[&str\] = &\[(.*?)\];", shell_source, re.S).group(1)
+            missing = [name for name in re.findall(r'"(\w+)"', builtins) if "no help screen" in machine.run("help " + name) or machine.run("help " + name).count("\n") < 2]
+            check(not missing, "help NAME works for every builtin", str(missing))
+            out = machine.run("help nosuchthing")
+            check("no help screen" in out, "help of an unknown name says so", out[-300:])
             out = machine.run("dmesg")
             check("kernel" in out.lower() and len(out) > 500, "dmesg replays the boot log", out[-300:])
             out = machine.run("sector disk1 1")

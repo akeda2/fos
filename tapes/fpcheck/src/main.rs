@@ -75,3 +75,10 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     }
     println!("{}", if ok { "fpcheck: ok" } else { "fpcheck: FAIL" });
 }
+
+tape_rt::tape_help!(br#"fpcheck: checks that a hard-float tape runs (SSE/AVX2 enabled before start).
+
+  fpcheck           prints the FP level and "fpcheck: ok" when all checks hold
+
+The tape for `make test-fp`.
+"#);

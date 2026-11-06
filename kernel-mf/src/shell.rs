@@ -180,16 +180,13 @@ pub fn run_command(line: &str) {
     let _disk = matches!(command, "format" | "label" | "fsck" | "grow" | "shrink" | "install" | "bootcode").then(crate::tapefs::lock);
     match command {
         "help" => match line.trim_start()[command.len()..].trim() {
-            "" => {
-                println!("help version cpus mem pci disks nic uptime slots threads ps top echo TEXT reboot shutdown audio usb date nic [peers|discover] tapesync gpio @HOST ...");
-                println!("ls cat write rm cp mv cmp mkdir cd pwd (`help NAME` shows one; files are NAME, diskN/NAME, @LABEL/NAME)");
-                println!("keymap kup serial  recv NAME  io sleep clear memmap bootinfo cpuinfo  start dmesg sector ext4 mount umount label fsck grow shrink sha256 format install bootcode (disk commands ask first)");
-                println!("tape NAME [ARGS]  run a tape (a ring 3 process)   NAME [ARGS]  the same   kill PID");
-            }
+            "" => crate::helptext::overview(fosfor_shell::files::COMMANDS),
             topic => {
                 let mut host = crate::shellhost::MfHost;
-                if !fosfor_shell::execute(&mut host, &[fosfor_shell::files::COMMANDS], line) {
-                    println!("help: {topic} has no help screen here (try the tape's own `{topic} help`).");
+                if let Some(builtin) = crate::helptext::find(topic) {
+                    crate::helptext::show(builtin);
+                } else if !fosfor_shell::execute(&mut host, &[fosfor_shell::files::COMMANDS], line) {
+                    println!("help: {topic} has no help screen (and is no command).");
                 }
             }
         },
@@ -428,6 +425,10 @@ fn migrate_settings() {
 pub static LAST_STARTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub fn run_tape(name: &str, args: &str) {
+    // `NAME help` and `NAME --help` print the tape's usage (its `.fos_help` section) without running it.
+    if matches!(args.trim(), "help" | "--help") && fosfor_shell::Host::tape_help(&mut crate::shellhost::MfHost, name) {
+        return;
+    }
     LAST_STARTED.store(0, core::sync::atomic::Ordering::Release);
     // `&+N`: a virtual interface on physical NIC N made for this tape alone and removed when it ends.
     let mut fresh = None;

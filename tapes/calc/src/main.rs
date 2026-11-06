@@ -123,3 +123,11 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         }
     }
 }
+
+tape_rt::tape_help!(br#"calc: reverse-Polish integer calculator.
+
+  calc 3 4 +        evaluate the words once and print the result
+  calc              line-at-a-time REPL, Escape quits
+
+Words are signed integers or + - * / %; 64-bit checked arithmetic, stack of 32.
+"#);

@@ -723,3 +723,10 @@ fn parse_number(bytes: &[u8]) -> Option<usize> {
     }
     Some(value)
 }
+
+tape_rt::tape_help!(br#"ed: small line-oriented text editor (see `ebb` for the full-screen one).
+
+  ed NAME           edit the file NAME (up to 4 MiB); w or x writes it back
+
+Commands are read from the keyboard or the term net session.
+"#);
