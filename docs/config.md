@@ -66,6 +66,8 @@ Every machine-specific file (start, services, settings, hostname, debug, smbuser
 
 `sshd.cfg` (or the command line) takes `root=DIR`, `export=NAME[=ROOT][,ro]` (up to 8; one export shows as `/`, several as folders), `port=22`, `nic=N`, `ip=A.B.C.D/N`, `gateway=`, `ro` and `log`. Without `ip=` the NIC asks DHCP.
 `authorized_keys`: one line per key, `user=NAME[,uid=N][,gid=N][,ro] ssh-ed25519 BASE64 [comment]` (at most 16, ssh-ed25519 only). `uid`/`gid` default to 0, which sees everything: give real users real ids. `ro` refuses every change for that key.
+`authorized_keys` options: `user=NAME`, `uid=N`, `gid=N`, `ro`, `shell` (opt-in: the account may open a shell channel, a full login with its own folder; `exit` or `logout` ends it; it shares the four `term net` session slots).
+
 `ssh_host_key`: 64 hex digits, the seed of the host key; sshd makes it at the first start and prints the `SHA256:` fingerprint at every start. Delete the file to change the host key.
 
 ## sshmount (`settings/ssh_key`, `settings/known_hosts`)

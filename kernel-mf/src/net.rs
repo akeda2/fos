@@ -273,9 +273,25 @@ struct Terminal {
     /// The interface the client's HELLO arrived on: its output goes out of it.
     nic: usize,
     activity: u64,
+    /// Non-zero: a tape (this process) holds the session instead of a client on the wire (`session_open`, ABI 38).
+    owner: u64,
+    /// The shell's `exit` ended it: the tape reads `SESSION_CLOSED` once the output is drained.
+    exited: bool,
+}
+impl Terminal {
+    const FREE: Terminal = Terminal { peer: None, nic: 0, activity: 0, owner: 0, exited: false };
+    fn open(&self) -> bool {
+        self.peer.is_some() || self.owner != 0
+    }
 }
 const TERMINAL_SLOTS: usize = crate::session::MAX - 1;
-static TERMINALS: SpinLock<[Terminal; TERMINAL_SLOTS]> = SpinLock::new([Terminal { peer: None, nic: 0, activity: 0 }; TERMINAL_SLOTS]);
+static TERMINALS: SpinLock<[Terminal; TERMINAL_SLOTS]> = SpinLock::new([Terminal::FREE; TERMINAL_SLOTS]);
+/// Bytes a tape typed into its session, fed to the shell by the service loop (the shell runs on that thread only).
+struct Input {
+    bytes: [u8; 1024],
+    length: usize,
+}
+static INPUTS: [SpinLock<Input>; TERMINAL_SLOTS] = [const { SpinLock::new(Input { bytes: [0; 1024], length: 0 }) }; TERMINAL_SLOTS];
 
 /// Console output waiting for a client; `println!` fills it from any CPU, `flush` empties it on the boot CPU.
 struct Relay {
@@ -310,7 +326,7 @@ pub fn relay(text: &str) {
         Some(0) => {}
         Some(session) => queue(session - 1, text),
         None => {
-            let open = TERMINALS.lock().map(|terminal| terminal.peer.is_some());
+            let open = TERMINALS.lock().map(|terminal| terminal.peer.is_some() && terminal.owner == 0);
             for (slot, _) in open.iter().enumerate().filter(|(_, open)| **open) {
                 queue(slot, text);
             }
@@ -350,16 +366,18 @@ fn flush() {
 fn close_terminal(slot: usize) {
     {
         let mut terminals = TERMINALS.lock();
-        if terminals[slot].peer.take().is_some() {
+        if terminals[slot].open() {
             OPEN.fetch_sub(1, Ordering::Relaxed);
         }
+        terminals[slot] = Terminal::FREE;
     }
     RELAYS[slot].lock().length = 0;
+    INPUTS[slot].lock().length = 0;
     shell::detach(slot + 1);
 }
 
 fn find_terminal(index: usize, source: [u8; 6]) -> Option<usize> {
-    TERMINALS.lock().iter().position(|terminal| terminal.peer == Some(source) && terminal.nic == index)
+    TERMINALS.lock().iter().position(|terminal| terminal.owner == 0 && terminal.peer == Some(source) && terminal.nic == index)
 }
 
 /// The slot a new HELLO gets: the client's own (it reconnects), else a free one, else the one silent longest if it has been
@@ -370,14 +388,14 @@ fn claim_terminal(index: usize, source: [u8; 6]) -> Option<usize> {
     }
     let now = apic::ticks();
     let mut terminals = TERMINALS.lock();
-    let slot = terminals.iter().position(|terminal| terminal.peer.is_none()).or_else(|| {
-        let (slot, oldest) = terminals.iter().enumerate().min_by_key(|(_, terminal)| terminal.activity)?;
+    let slot = terminals.iter().position(|terminal| !terminal.open()).or_else(|| {
+        let (slot, oldest) = terminals.iter().enumerate().filter(|(_, terminal)| terminal.owner == 0).min_by_key(|(_, terminal)| terminal.activity)?;
         (now.wrapping_sub(oldest.activity) >= STALE_TICKS).then_some(slot)
     })?;
-    if terminals[slot].peer.is_none() {
+    if !terminals[slot].open() {
         OPEN.fetch_add(1, Ordering::Relaxed);
     }
-    terminals[slot] = Terminal { peer: Some(source), nic: index, activity: now };
+    terminals[slot] = Terminal { peer: Some(source), nic: index, activity: now, owner: 0, exited: false };
     drop(terminals);
     RELAYS[slot].lock().length = 0;
     shell::detach(slot + 1);
@@ -416,6 +434,127 @@ fn handle_terminal(index: usize, source: [u8; 6], tag: u8, payload: &[u8]) -> bo
         _ => return false,
     }
     true
+}
+
+/// `session_open` for process `pid`: a free slot becomes a shell session with a prompt waiting. Session number or `SESSION_LIMIT`.
+pub fn tape_session_open(pid: u64) -> isize {
+    let slot = {
+        let mut terminals = TERMINALS.lock();
+        let Some(slot) = terminals.iter().position(|terminal| !terminal.open()) else { return -2 };
+        terminals[slot] = Terminal { peer: None, nic: 0, activity: apic::ticks(), owner: pid, exited: false };
+        OPEN.fetch_add(1, Ordering::Relaxed);
+        slot
+    };
+    RELAYS[slot].lock().length = 0;
+    INPUTS[slot].lock().length = 0;
+    shell::detach(slot + 1);
+    // The shell runs on the service thread only; the greeting is queued there with the next input pass.
+    TERMINALS.lock()[slot].activity = 0;
+    (slot + 1) as isize
+}
+
+fn owned_slot(pid: u64, session: u64) -> Option<usize> {
+    let slot = (session as usize).checked_sub(1).filter(|&slot| slot < TERMINAL_SLOTS)?;
+    (TERMINALS.lock()[slot].owner == pid).then_some(slot)
+}
+
+/// `session_write`: queues typed bytes; how many were taken.
+pub fn tape_session_write(pid: u64, session: u64, bytes: &[u8]) -> isize {
+    let Some(slot) = owned_slot(pid, session) else { return -4 };
+    let mut input = INPUTS[slot].lock();
+    let take = bytes.len().min(input.bytes.len() - input.length);
+    let start = input.length;
+    input.bytes[start..start + take].copy_from_slice(&bytes[..take]);
+    input.length += take;
+    take as isize
+}
+
+/// `session_read`: output waiting, `SESSION_CLOSED` (-3) after `exit` once it is drained.
+pub fn tape_session_read(pid: u64, session: u64, buffer: &mut [u8]) -> isize {
+    let Some(slot) = owned_slot(pid, session) else { return -4 };
+    let take = {
+        let mut ring = RELAYS[slot].lock();
+        let take = ring.length.min(buffer.len());
+        buffer[..take].copy_from_slice(&ring.bytes[..take]);
+        let length = ring.length;
+        ring.bytes.copy_within(take..length, 0);
+        ring.length -= take;
+        take
+    };
+    if take == 0 && TERMINALS.lock()[slot].exited {
+        return -3;
+    }
+    take as isize
+}
+
+pub fn tape_session_close(pid: u64, session: u64) -> isize {
+    match owned_slot(pid, session) {
+        Some(slot) => {
+            close_terminal(slot);
+            0
+        }
+        None => -4,
+    }
+}
+
+/// A process ended: its sessions end with it.
+pub fn tape_sessions_ended(pid: u64) {
+    for slot in 0..TERMINAL_SLOTS {
+        if TERMINALS.lock()[slot].owner == pid {
+            close_terminal(slot);
+        }
+    }
+}
+
+/// The shell's `exit`: ends a tape's session (the tape sees it on its next read). False for the console and network clients.
+pub fn exit_session(session: usize) -> bool {
+    let Some(slot) = session.checked_sub(1).filter(|&slot| slot < TERMINAL_SLOTS) else { return false };
+    let mut terminals = TERMINALS.lock();
+    if terminals[slot].owner == 0 {
+        return false;
+    }
+    terminals[slot].exited = true;
+    true
+}
+
+/// Service loop: feeds what tapes typed into their sessions to the shell, and greets a session just opened.
+fn feed_tape_sessions() {
+    for slot in 0..TERMINAL_SLOTS {
+        let (owner, fresh, exited) = {
+            let terminals = TERMINALS.lock();
+            (terminals[slot].owner, terminals[slot].activity == 0, terminals[slot].exited)
+        };
+        if owner == 0 || exited {
+            continue;
+        }
+        let session = slot + 1;
+        if fresh {
+            TERMINALS.lock()[slot].activity = apic::ticks().max(1);
+            crate::shellhost::reset_folder(session);
+            shell::reset(session);
+            crate::session::with(session, || {
+                println!("Type `help` for the commands.");
+                shell::prompt();
+            });
+        }
+        loop {
+            let (byte, more) = {
+                let mut input = INPUTS[slot].lock();
+                if input.length == 0 {
+                    break;
+                }
+                let byte = input.bytes[0];
+                let length = input.length;
+                input.bytes.copy_within(1..length, 0);
+                input.length -= 1;
+                (byte, input.length != 0)
+            };
+            shell::feed_session(session, byte);
+            if !more || TERMINALS.lock()[slot].exited {
+                break;
+            }
+        }
+    }
 }
 
 // ---- KUP ----
@@ -594,6 +733,7 @@ pub fn poll() {
     netfs::serve();
     announce();
     if session_open() {
+        feed_tape_sessions();
         flush();
     }
 }

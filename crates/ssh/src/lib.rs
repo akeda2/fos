@@ -9,5 +9,5 @@ pub mod session;
 pub mod sftp;
 pub mod wire;
 
-pub use session::{ARENA, Account, Host, Session};
+pub use session::{ARENA, Account, Host, Session, ShellRead};
 pub use sftp::{Exports, Step};

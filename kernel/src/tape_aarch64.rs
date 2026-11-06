@@ -208,6 +208,10 @@ fn make_api(info: &BootInfo, arguments: &str) -> TapeApi {
         thread_join: kernel_core::tape_threads::api_thread_join,
         futex_wait: kernel_core::tape_threads::api_futex_wait,
         futex_wake: kernel_core::tape_threads::api_futex_wake,
+        session_open: crate::tape_common::unsupported::api_session_open,
+        session_write: crate::tape_common::unsupported::api_session_write,
+        session_read: crate::tape_common::unsupported::api_session_read,
+        session_close: crate::tape_common::unsupported::api_session_close,
         random: kernel_core::random::api_random,
     }
 }

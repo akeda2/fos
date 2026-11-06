@@ -5,7 +5,7 @@
 #![no_main]
 
 use ssh::authorized::{AuthorizedKeys, fingerprint, parse_seed, seed_text};
-use ssh::{ARENA, Account, Exports, Host, Session};
+use ssh::{ARENA, Account, Exports, Host, Session, ShellRead};
 use tape_ip::net::{self, NetConfig};
 use tape_ip::tcp::Server as Tcp;
 use tape_net::MacAddress;
@@ -56,6 +56,21 @@ impl Host for Node {
     }
     fn split(&mut self) -> (&Exports, &mut dyn Files) {
         (&self.exports, &mut self.files)
+    }
+    fn shell_open(&mut self) -> Option<u32> {
+        tape_rt::session_open().ok()
+    }
+    fn shell_write(&mut self, shell: u32, data: &[u8]) -> usize {
+        tape_rt::session_write(shell, data)
+    }
+    fn shell_read(&mut self, shell: u32, out: &mut [u8]) -> ShellRead {
+        match tape_rt::session_read(shell, out) {
+            Ok(count) => ShellRead::Data(count),
+            Err(_) => ShellRead::Closed,
+        }
+    }
+    fn shell_close(&mut self, shell: u32) {
+        tape_rt::session_close(shell);
     }
     fn log(&mut self, text: core::fmt::Arguments) {
         if self.log {
@@ -193,7 +208,8 @@ fn run(api: &TapeApi, node: &mut Node, tcp: &mut Tcp<RX, SLOTS>, arenas: &[usize
         let mut busy = tcp.poll(api, 16);
         for slot in 0..SLOTS {
             if !tcp.is_open(slot) {
-                if sessions[slot].take().is_some() {
+                if let Some(mut gone) = sessions[slot].take() {
+                    gone.shutdown(node);
                     node.log(format_args!("connection closed"));
                 }
                 continue;

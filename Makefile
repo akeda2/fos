@@ -225,7 +225,7 @@ test-mf-smbd: image-mf image
 test-mf-sshd: image-mf image
 	rm -f $(BUILD)/fosfor-mf/sshkey $(BUILD)/fosfor-mf/sshkey.pub
 	ssh-keygen -q -t ed25519 -N '' -f $(BUILD)/fosfor-mf/sshkey
-	printf 'user=anna,uid=0,gid=0 %s anna\n' "$$(cut -d' ' -f1,2 $(BUILD)/fosfor-mf/sshkey.pub)" > $(BUILD)/fosfor-mf/authorized_keys
+	printf 'user=anna,uid=0,gid=0 %s anna\nuser=admin,shell %s admin\n' "$$(cut -d' ' -f1,2 $(BUILD)/fosfor-mf/sshkey.pub)" "$$(cut -d' ' -f1,2 $(BUILD)/fosfor-mf/sshkey.pub)" > $(BUILD)/fosfor-mf/authorized_keys
 	printf 'root=disk2\nlog\n' > $(BUILD)/fosfor-mf/sshd.cfg
 	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_MF_ELF) --output $(BUILD)/fosfor-mf/fosfor-sshd.img \
 		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin --file sshd=$(BUILD)/fosfor/tapes/sshd --file sshd.cfg=$(BUILD)/fosfor-mf/sshd.cfg --file authorized_keys=$(BUILD)/fosfor-mf/authorized_keys

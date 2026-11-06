@@ -337,6 +337,7 @@ fn leave(how: Option<How>) -> ! {
     crate::tapenet::process_ended(thread);
     crate::tapeaudio::process_ended(thread);
     crate::tapeserial::process_ended(thread);
+    crate::net::tape_sessions_ended(thread);
     crate::shell::end_foreground(thread);
     sched::exit()
 }

@@ -139,7 +139,7 @@ pub fn prompt() {
 const BUILTINS: &[&str] = &[
     "version", "cpus", "mem", "pci", "disks", "nic", "vnic", "service", "settings", "tapesync", "gpio", "top", "threads", "ps", "date", "uptime", "slots", "audio", "usb", "tape", "run", "kill",
     "echo", "debug", "start", "keymap", "kup", "recv", "dmesg", "clear", "sleep", "io", "memmap", "bootinfo", "cpuinfo", "shrink", "sector", "mount", "umount",
-    "format", "label", "fsck", "grow", "install", "bootcode", "reboot", "reset", "shutdown", "halt", "ext4", "sha256", "cd", "pwd",
+    "format", "label", "fsck", "grow", "install", "bootcode", "reboot", "reset", "shutdown", "halt", "ext4", "sha256", "cd", "pwd", "exit",
 ];
 
 /// Installs the line editor's Tab completion (the editor itself, with history, is `kernel_core::lineedit`).
@@ -226,6 +226,11 @@ pub fn run_command(line: &str) {
             let target = line.trim_start()[command.len()..].trim();
             if crate::shellhost::change_folder(target).is_err() {
                 println!("cd: {target}: no such folder.");
+            }
+        }
+        "exit" | "logout" => {
+            if !crate::net::exit_session(crate::session::current_or_console()) {
+                println!("exit: this is not a login session (a network terminal ends with its client, the console never).");
             }
         }
         "pwd" => {

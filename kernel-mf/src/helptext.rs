@@ -17,6 +17,7 @@ pub const GROUPS: &[&str] = &["Files", "System", "Network", "Disks", "Tapes and 
 
 pub const TOPICS: &[Topic] = &[
     t("cd", "Files", "cd [FOLDER|..|/]", "Change the working folder; `cd /` returns to the volume root."),
+    t("exit", "System", "exit", "End a login session (ssh); also `logout`. Not for the console or `term net`."),
     t("pwd", "Files", "pwd", "Show the working folder."),
     t("sha256", "Files", "sha256 [diskN/]NAME...", "SHA-256 of each file."),
     t("echo", "Files", "echo TEXT", "Print TEXT (useful in scripts, e.g. `echo hi` in `start`)."),

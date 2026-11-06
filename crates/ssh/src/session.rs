@@ -25,6 +25,8 @@ use vfs_export::Files;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 const VERSION: &[u8] = b"SSH-2.0-fos_sshd";
+/// The most shell output taken per pass.
+const SHELL_CHUNK: usize = 4096;
 pub(crate) const PACKET: usize = 36 * 1024;
 pub(crate) const OUT: usize = 40 * 1024;
 const SFTP_IN: usize = 256 * 1024;
@@ -78,6 +80,16 @@ pub struct Account {
     pub gid: u32,
     /// Refuses every change, whatever the files allow.
     pub read_only: bool,
+    /// May open a shell channel (the `shell` option): that is a login on the machine, not just files.
+    pub shell: bool,
+}
+
+/// What a shell session answers a read with.
+pub enum ShellRead {
+    /// This many bytes of output were copied.
+    Data(usize),
+    /// The shell ended the session (its output is drained).
+    Closed,
 }
 
 /// What a connection needs from its surroundings.
@@ -90,6 +102,19 @@ pub trait Host {
     /// The exports and the files behind them.
     fn split(&mut self) -> (&Exports, &mut dyn Files);
     fn log(&mut self, _text: core::fmt::Arguments) {}
+    /// Opens a shell for a `shell` channel request (a terminal without a pty: typed bytes in, console output back). None
+    /// refuses it. The returned number names the shell in the calls below.
+    fn shell_open(&mut self) -> Option<u32> {
+        None
+    }
+    /// Typed bytes for the shell; how many it took (it may take fewer: the rest is offered again).
+    fn shell_write(&mut self, _shell: u32, _data: &[u8]) -> usize {
+        0
+    }
+    fn shell_read(&mut self, _shell: u32, _out: &mut [u8]) -> ShellRead {
+        ShellRead::Closed
+    }
+    fn shell_close(&mut self, _shell: u32) {}
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -255,6 +280,8 @@ struct Channel {
     /// Consumed request bytes not yet given back as window.
     to_return: usize,
     sftp: bool,
+    /// The shell serving this channel (`Host::shell_open`).
+    shell: Option<u32>,
     peer_eof: bool,
     closing: bool,
 }
@@ -421,6 +448,10 @@ impl<'a> Session<'a> {
             }
             self.sftp_out_length = 0;
             self.sftp_out_sent = 0;
+            if let Some(shell) = self.channel.as_ref().and_then(|channel| channel.shell) {
+                self.poll_shell(host, shell);
+                break;
+            }
             let Some(channel) = self.channel.as_mut().filter(|channel| channel.sftp) else { break };
             let Some(account) = self.account else { break };
             if self.sftp_in_length == 0 {
@@ -736,6 +767,46 @@ impl<'a> Session<'a> {
         name == b"ssh-ed25519" && key.verify(message, &Signature::from_bytes(&signature)).is_ok()
     }
 
+    /// One pass for a shell channel: typed bytes to the shell, its output into the reply buffer, the end of the session.
+    fn poll_shell<H: Host>(&mut self, host: &mut H, shell: u32) {
+        let Some(channel) = self.channel.as_mut() else { return };
+        if channel.closing {
+            return;
+        }
+        if self.sftp_in_length > 0 {
+            let taken = host.shell_write(shell, &self.sftp_in[..self.sftp_in_length]).min(self.sftp_in_length);
+            self.sftp_in.copy_within(taken..self.sftp_in_length, 0);
+            self.sftp_in_length -= taken;
+            channel.to_return += taken;
+        }
+        let room = self.sftp_out.len().min(SHELL_CHUNK);
+        match host.shell_read(shell, &mut self.sftp_out[..room]) {
+            ShellRead::Data(count) => self.sftp_out_length = count.min(room),
+            ShellRead::Closed => {
+                let peer = channel.peer;
+                channel.shell = None;
+                channel.closing = true;
+                host.shell_close(shell);
+                self.tx.packet(|out| {
+                    out.u8(MSG_CHANNEL_REQUEST).u32(peer).string(b"exit-status").bool(false).u32(0);
+                });
+                self.tx.packet(|out| {
+                    out.u8(MSG_CHANNEL_EOF).u32(peer);
+                });
+                self.tx.packet(|out| {
+                    out.u8(MSG_CHANNEL_CLOSE).u32(peer);
+                });
+            }
+        }
+    }
+
+    /// The connection is going away: end the shell it holds, if any.
+    pub fn shutdown<H: Host>(&mut self, host: &mut H) {
+        if let Some(shell) = self.channel.as_mut().and_then(|channel| channel.shell.take()) {
+            host.shell_close(shell);
+        }
+    }
+
     fn on_connection<H: Host>(&mut self, host: &mut H, payload: &[u8]) -> Result<(), (u32, &'static str)> {
         let bad = (REASON_PROTOCOL_ERROR, "bad connection message");
         let mut reader = Reader::new(&payload[1..]);
@@ -762,7 +833,7 @@ impl<'a> Session<'a> {
                 self.sftp_out_sent = 0;
                 self.sftp.reset();
                 let granted = self.sftp_in.len();
-                self.channel = Some(Channel { peer, peer_window: window as u64, peer_max: max.max(1), granted, to_return: 0, sftp: false, peer_eof: false, closing: false });
+                self.channel = Some(Channel { peer, peer_window: window as u64, peer_max: max.max(1), granted, to_return: 0, sftp: false, shell: None, peer_eof: false, closing: false });
                 self.tx.packet(|out| {
                     out.u8(MSG_CHANNEL_OPEN_CONFIRMATION).u32(peer).u32(0).u32(granted as u32).u32(MAX_DATA as u32);
                 });
@@ -782,7 +853,7 @@ impl<'a> Session<'a> {
                     return Err((REASON_PROTOCOL_ERROR, "more data than the window allows"));
                 }
                 channel.granted -= data.len();
-                if channel.sftp {
+                if channel.sftp || channel.shell.is_some() {
                     self.sftp_in[self.sftp_in_length..self.sftp_in_length + data.len()].copy_from_slice(data);
                     self.sftp_in_length += data.len();
                 } else {
@@ -806,11 +877,29 @@ impl<'a> Session<'a> {
                 let want_reply = reader.bool().ok_or(bad)?;
                 let channel = self.channel.as_mut().ok_or(bad)?;
                 let peer = channel.peer;
-                let ok = kind == b"subsystem" && reader.string() == Some(b"sftp") && !channel.sftp;
-                if ok {
-                    channel.sftp = true;
-                    host.log(format_args!("sftp session"));
-                }
+                let allowed = self.account.is_some_and(|account| account.shell);
+                let ok = match kind {
+                    b"subsystem" => {
+                        let ok = reader.string() == Some(b"sftp") && !channel.sftp && channel.shell.is_none();
+                        if ok {
+                            channel.sftp = true;
+                            host.log(format_args!("sftp session"));
+                        }
+                        ok
+                    }
+                    // There is no pty: the shell echoes and edits the line itself, so the terminal's size and modes are
+                    // accepted and ignored.
+                    b"pty-req" | b"env" | b"window-change" => allowed && !channel.sftp,
+                    b"shell" if allowed && !channel.sftp && channel.shell.is_none() => match host.shell_open() {
+                        Some(number) => {
+                            channel.shell = Some(number);
+                            host.log(format_args!("shell session"));
+                            true
+                        }
+                        None => false,
+                    },
+                    _ => false,
+                };
                 if want_reply {
                     self.tx.packet(|out| {
                         out.u8(if ok { MSG_CHANNEL_SUCCESS } else { MSG_CHANNEL_FAILURE }).u32(peer);
@@ -826,6 +915,9 @@ impl<'a> Session<'a> {
             MSG_CHANNEL_CLOSE => {
                 reader.u32().ok_or(bad)?;
                 if let Some(channel) = self.channel.take() {
+                    if let Some(shell) = channel.shell {
+                        host.shell_close(shell);
+                    }
                     if !channel.closing {
                         self.tx.packet(|out| {
                             out.u8(MSG_CHANNEL_CLOSE).u32(channel.peer);
@@ -890,7 +982,7 @@ impl<'a> Session<'a> {
     /// The client is done sending: close the channel once every reply has gone out.
     fn finish_channel<H: Host>(&mut self, host: &mut H) {
         let Some(channel) = self.channel.as_mut() else { return };
-        if channel.peer_eof && !channel.closing && self.sftp_in_length == 0 && self.sftp_out_length == self.sftp_out_sent {
+        if channel.peer_eof && !channel.closing && channel.shell.is_none() && self.sftp_in_length == 0 && self.sftp_out_length == self.sftp_out_sent {
             let peer = channel.peer;
             if self.tx.packet(|out| {
                 out.u8(MSG_CHANNEL_CLOSE).u32(peer);

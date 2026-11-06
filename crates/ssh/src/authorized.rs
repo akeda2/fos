@@ -38,7 +38,7 @@ impl Default for AuthorizedKeys {
 
 impl AuthorizedKeys {
     pub const fn new() -> AuthorizedKeys {
-        let empty = Entry { user: [0; NAME_MAX], user_length: 0, key: [0; 32], account: Account { uid: 0, gid: 0, read_only: false } };
+        let empty = Entry { user: [0; NAME_MAX], user_length: 0, key: [0; 32], account: Account { uid: 0, gid: 0, read_only: false, shell: false } };
         AuthorizedKeys { entries: [empty; KEYS], count: 0 }
     }
 
@@ -55,7 +55,7 @@ impl AuthorizedKeys {
         for line in text.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
             let mut words = line.split_ascii_whitespace();
             let mut word = words.next().ok_or("an empty line")?;
-            let mut entry = Entry { user: [0; NAME_MAX], user_length: 0, key: [0; 32], account: Account { uid: 0, gid: 0, read_only: false } };
+            let mut entry = Entry { user: [0; NAME_MAX], user_length: 0, key: [0; 32], account: Account { uid: 0, gid: 0, read_only: false, shell: false } };
             if word != "ssh-ed25519" {
                 if word.starts_with("ssh-") || word.starts_with("ecdsa-") {
                     return Err("authorized_keys: only ssh-ed25519 keys are accepted");
@@ -69,7 +69,8 @@ impl AuthorizedKeys {
                         Some(("uid", number)) => entry.account.uid = number.parse().map_err(|_| "authorized_keys: uid= takes a number")?,
                         Some(("gid", number)) => entry.account.gid = number.parse().map_err(|_| "authorized_keys: gid= takes a number")?,
                         None if option == "ro" => entry.account.read_only = true,
-                        _ => return Err("authorized_keys: options are user=NAME, uid=N, gid=N and ro"),
+                        None if option == "shell" => entry.account.shell = true,
+                        _ => return Err("authorized_keys: options are user=NAME, uid=N, gid=N, ro and shell"),
                     }
                 }
                 word = words.next().ok_or("authorized_keys: a line has options but no key")?;
@@ -175,8 +176,8 @@ mod tests {
         let mut blob = [0u8; 80];
         let length = base64_decode(KEY, &mut blob).unwrap();
         let key: [u8; 32] = blob[length - 32..length].try_into().unwrap();
-        assert_eq!(keys.lookup("anna", &key), Some(Account { uid: 1000, gid: 100, read_only: false }));
-        assert_eq!(keys.lookup("bob", &key), Some(Account { uid: 0, gid: 0, read_only: true }));
+        assert_eq!(keys.lookup("anna", &key), Some(Account { uid: 1000, gid: 100, read_only: false, shell: false }));
+        assert_eq!(keys.lookup("bob", &key), Some(Account { uid: 0, gid: 0, read_only: true, shell: false }));
         assert_eq!(keys.lookup("eve", &key), None);
         assert_eq!(keys.lookup("anna", &[0; 32]), None);
     }
