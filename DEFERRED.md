@@ -702,3 +702,10 @@ Tapes see just another NIC, so `tape-ip`, DHCP, `smbd`, `httpd` and `router` nee
   needs the socket netdev.
 - **Open:** a tape that runs on a vNIC and calls `nic_use`/`nic_active` (works by number); the shared-IP mode (several tapes,
   one IP, split by port) is a separate, larger design (netd/tape sockets) and not part of this.
+
+## sshd: what is not there yet (2026-11-06)
+
+- **Shell channel and `ssh` client.** sshd serves the `sftp` subsystem only. Next: tape ABI 38 sessions (a kernel `Session` struct, several `term net` sessions, a `term-net` NIC-list setting) and a pty-less shell channel; then an `ssh` client tape (`ssh-ed25519` key from `settings/`, exec and shell, plus an SFTP client behind `remote_*` like `smbmount`).
+- **AES-GCM** (`aes256-gcm@openssh.com`, AES-NI/PCLMUL from user mode) next to chacha20-poly1305; measure on rack first.
+- SFTP has no symlinks, no statvfs and ignores times; password logins and other key types are deliberately absent.
+- smbd still has its own copy of the file backend; moving it to `crates/vfs-export` is optional.
