@@ -70,6 +70,6 @@ Every machine-specific file (start, services, settings, hostname, debug, smbuser
 
 `ssh_host_key`: 64 hex digits, the seed of the host key; sshd makes it at the first start and prints the `SHA256:` fingerprint at every start. Delete the file to change the host key.
 
-## sshmount (`settings/ssh_key`, `settings/known_hosts`)
+## sshmount and ssh (`settings/ssh_key`, `settings/known_hosts`)
 
-`ssh_key`: 64 hex digits, the seed of the client's ed25519 key; `sshmount keygen` makes it (`key=NAME` uses another file, so one machine can hold several identities) and prints the `ssh-ed25519 BASE64` line to put in the server's `authorized_keys`. `known_hosts`: one `HOST[:PORT] SHA256:FINGERPRINT` line per server; a host that is not there is added at the first login, a different key is refused until its line is removed.
+`ssh_key`: 64 hex digits, the seed of the client's ed25519 key; `sshmount keygen` or `ssh keygen` makes it (`key=NAME` uses another file, so one machine can hold several identities) and prints the `ssh-ed25519 BASE64` line to put in the server's `authorized_keys`. `known_hosts`: one `HOST[:PORT] SHA256:FINGERPRINT` line per server; a host that is not there is added at the first login, a different key is refused until its line is removed.
