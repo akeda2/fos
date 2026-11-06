@@ -240,7 +240,7 @@ test-mf-cp: image-mf
 	python3 tools/test_mf_cp.py
 
 test-mf-httpd: image-mf image
-	printf 'root=disk2/www\nlisting=on\nlog\n' > $(BUILD)/fosfor-mf/httpd.cfg
+	printf 'root=disk2/www\nlisting=on\n' > $(BUILD)/fosfor-mf/httpd.cfg
 	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_MF_ELF) --output $(BUILD)/fosfor-mf/fosfor-httpd.img \
 		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin --file httpd=$(BUILD)/fosfor/tapes/httpd --file httpd.cfg=$(BUILD)/fosfor-mf/httpd.cfg
 	python3 tools/test_mf_httpd.py
