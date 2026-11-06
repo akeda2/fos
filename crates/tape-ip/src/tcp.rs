@@ -361,10 +361,15 @@ impl<const RX: usize, const N: usize> Server<RX, N> {
                     index
                 }
                 None => {
+                    // A LastAck slot has sent its FIN after the peer's: only the peer's final ACK is missing, and a
+                    // Linux client often answers our FIN only on its retransmit, ~300 ms later. Reclaim it at once
+                    // (a slot silent for EVICT_MICROS in Established/CloseWait is the fallback).
+                    let last_ack = (0..N).find(|&i| self.slots[i].connection.state() == TcpState::LastAck);
                     let quietest = (0..N)
                         .filter(|&i| matches!(self.slots[i].connection.state(), TcpState::Established | TcpState::CloseWait))
-                        .max_by_key(|&i| now.saturating_sub(self.slots[i].last));
-                    match quietest.filter(|&i| now.saturating_sub(self.slots[i].last) > EVICT_MICROS) {
+                        .max_by_key(|&i| now.saturating_sub(self.slots[i].last))
+                        .filter(|&i| now.saturating_sub(self.slots[i].last) > EVICT_MICROS);
+                    match last_ack.or(quietest) {
                         Some(index) => {
                             // `recycle` inline: `segment` still borrows `self.rx`.
                             self.sequence = self.sequence.wrapping_add(64_000);

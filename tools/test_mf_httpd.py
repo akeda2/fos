@@ -131,6 +131,21 @@ def main():
             response, second = request("GET", "/albums/side0.flac", {"Range": "bytes=0-99"}, connection=connection)
             check(first == b"hello from ext4\n" and second == big[0][:100], "keep-alive: two requests on one connection", f"{first!r} {len(second)}")
             connection.close()
+
+            # Clients that hang up between requests must free their slots at once (a SYN otherwise waits 1 s to retry).
+            def flood():
+                for _ in range(25):
+                    t = time.time()
+                    request("GET", "/hello.txt")
+                    lats.append(time.time() - t)
+            lats = []
+            started = time.time()
+            workers = [threading.Thread(target=flood) for _ in range(8)]
+            [worker.start() for worker in workers]
+            [worker.join() for worker in workers]
+            elapsed = time.time() - started
+            lats.sort()
+            check(elapsed < 6, "200 requests on new connections, 8 at a time, do not stall on busy slots", f"{elapsed:.1f} s")
             if b"CPU exception" in log:
                 failures.append("the kernel faulted:\n" + log[-1200:].decode("utf8", "replace"))
         finally:
