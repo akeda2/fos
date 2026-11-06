@@ -115,6 +115,8 @@ pub fn compose(
             let mut text = crate::Line::<MAX_NAME>::new();
             let _ = write!(text, "{tape}.cfg");
             default_name[..text.length].copy_from_slice(text.as_str().as_bytes());
+            // FOSFS names are lower case; the server kernel refuses `HTTPD.cfg` as a bad name instead of calling it missing
+            default_name[..text.length].make_ascii_lowercase();
             core::str::from_utf8(&default_name[..text.length]).unwrap_or("")
         }
     };
@@ -209,6 +211,18 @@ mod tests {
         assert_eq!(words, ["law=log", "scale=dbfs", "range=50"]);
         let (text, file) = run("", &[]).unwrap();
         assert_eq!((text.trim(), file.as_str()), ("", "gonio.cfg"));
+    }
+
+    #[test]
+    fn default_file_name_is_lower_case() {
+        let mut out = [0u8; 64];
+        let mut asked = String::new();
+        let mut read = |name: &str, _: &mut [u8]| -> Result<Option<usize>, &'static str> {
+            asked = name.into();
+            Ok(None)
+        };
+        let (_, file, length) = compose(&mut out, "HTTPD", "", &mut read).unwrap();
+        assert_eq!((asked.as_str(), &file[..length]), ("httpd.cfg", b"httpd.cfg".as_slice()));
     }
 
     #[test]
