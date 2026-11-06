@@ -42,6 +42,25 @@ fn note_address(index: usize, frame: &[u8]) {
     }
 }
 
+/// A quiet service (an idle sshd) sends nothing after its DHCP lease, so a unicast frame that arrives also tells: it was
+/// addressed to this interface's MAC (broadcasts and multicasts say nothing about it), so its IPv4 destination or the target
+/// of a unicast ARP is the interface's address.
+fn note_received_address(index: usize, frame: &[u8]) {
+    if frame.first().is_none_or(|byte| byte & 1 != 0) {
+        return;
+    }
+    let target = match frame.get(12..14) {
+        Some([0x08, 0x00]) => frame.get(30..34),
+        Some([0x08, 0x06]) => frame.get(38..42),
+        _ => None,
+    };
+    let Some(target) = target else { return };
+    let address = u32::from_be_bytes([target[0], target[1], target[2], target[3]]);
+    if address != 0 && address != u32::MAX && target[0] < 224 && SEEN_ADDRESS[index].load(Ordering::Relaxed) != address {
+        SEEN_ADDRESS[index].store(address, Ordering::Relaxed);
+    }
+}
+
 /// The address a tape was seen to send from on interface `index`.
 pub fn address(index: usize) -> Option<[u8; 4]> {
     let address = SEEN_ADDRESS.get(index)?.load(Ordering::Relaxed);
@@ -148,6 +167,9 @@ pub fn receive(index: u64, buffer: u64, capacity: u64) -> u64 {
         nicctl::pop_frame(index, &mut frame)
     };
     let length = length.min(capacity as usize);
+    if length > 0 {
+        note_received_address(index as usize, &frame[..length]);
+    }
     if length > 0 && !process::copy_to_user(buffer, &frame[..length]) {
         return 0;
     }
