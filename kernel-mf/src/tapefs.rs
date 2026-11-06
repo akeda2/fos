@@ -52,7 +52,7 @@ impl Drop for DiskGuard {
 
 const CHUNK: usize = 1 << 20;
 const WRITE_LIMIT: usize = 8 << 20;
-const NAME_LIMIT: u64 = 128;
+const NAME_LIMIT: u64 = 512;
 static STREAM_OWNER: AtomicU64 = AtomicU64::new(0);
 
 /// The pid that has file streams open, 0 when nobody does (`top`).

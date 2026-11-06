@@ -95,7 +95,13 @@ fn ext_disk_probe(label: &[u8]) -> Option<usize> {
 /// The kept ext volume a reference names and the path on it (changes left open are committed first).
 fn ext(reference: &[u8]) -> Option<(&'static mut Shared, &[u8])> {
     let (disk, path) = ext_ref(reference)?;
-    ext4vol::shared(disk).ok().map(|shared| (shared, path))
+    match ext4vol::shared(disk) {
+        Ok(shared) => Some((shared, path)),
+        Err(error) => {
+            crate::println!("ext: the volume could not be opened for a tape call: {error:?}");
+            None
+        }
+    }
 }
 
 fn stat_of(inode: &ext4::Inode) -> VfsStat {
@@ -275,7 +281,10 @@ fn change_error(error: ext4::Error) -> isize {
         ext4::Error::NotEmpty => FS_NOT_EMPTY,
         ext4::Error::IsADirectory => FS_IS_DIR,
         ext4::Error::ReadOnly | ext4::Error::Unsupported => FS_READ_ONLY,
-        _ => FS_ERROR,
+        other => {
+            crate::println!("ext: a change failed: {other:?}");
+            FS_ERROR
+        }
     }
 }
 

@@ -38,7 +38,8 @@ ip=     a fixed address like 192.168.1.20/24 (gateway= for the router);
         without it DHCP. nic= is the NIC number from 1 (default: nic use).
 maxio=  largest read or write in KiB, 64 to 1024 (default 1024; SMB 2.1+
         clients use it, 2.0.2 stays at 64). 64 is the low-memory mode.
-log     print one line per request (slows a transfer: use stats to time one).
+log     print one line per request, except reads and writes that succeed (slows
+        a transfer: use stats to time one).
 stats   print only the totals after a transfer: KB and ms in file reads, writes
         and sends, and the ms the transfer lasted.
 ro      refuse all changes (otherwise ext volumes can be written).
@@ -295,7 +296,13 @@ impl Share for Files {
         let mut buffer = [0u8; 512];
         let reference = self.join(path, &mut buffer).ok_or(Fail::Io)?;
         let kind = if dir { tape_rt::VFS_DIR } else { tape_rt::VFS_FILE };
-        tape_rt::vfs_create(reference, kind, mode, owner.uid, owner.gid).map_err(fail)
+        let made = tape_rt::vfs_create(reference, kind, mode, owner.uid, owner.gid);
+        if let Err(code) = made {
+            println!("smbd: create {reference} failed with code {code}");
+        } else if let Err(code) = tape_rt::vfs_stat(reference) {
+            println!("smbd: {reference} was created but stat says code {code}");
+        }
+        made.map_err(fail)
     }
 
     fn write(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<(), Fail> {
@@ -703,6 +710,10 @@ fn run<const RX: usize, const N: usize>(api: &TapeApi, setup: &Setup, tcp: &mut 
 /// `log` shows every request: the command number (2 = session setup, 3 = tree connect, 5 = create, 16 = query info), its
 /// status and a detail (QUERY_INFO: info type and class; IOCTL: the control code).
 fn trace_request(command: u16, status: u32, detail: u32, flags: u32) {
+    // A transfer is thousands of reads and writes: only their failures are worth a line.
+    if matches!(command, 8 | 9) && status == 0 {
+        return;
+    }
     println!("smbd: cmd {command} -> {status:#x} ({detail:#x}) flags {flags:#x}");
 }
 
