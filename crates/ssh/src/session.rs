@@ -779,9 +779,11 @@ impl<'a> Session<'a> {
             self.sftp_in_length -= taken;
             channel.to_return += taken;
         }
-        let room = self.sftp_out.len().min(SHELL_CHUNK);
+        // A terminal client runs raw and expects the line ending a pty would make: every LF leaves as CR LF. Read into the
+        // first half of the buffer so the expansion fits behind it.
+        let room = self.sftp_out.len().min(SHELL_CHUNK) / 2;
         match host.shell_read(shell, &mut self.sftp_out[..room]) {
-            ShellRead::Data(count) => self.sftp_out_length = count.min(room),
+            ShellRead::Data(count) => self.sftp_out_length = crlf(&mut self.sftp_out, count.min(room)),
             ShellRead::Closed => {
                 let peer = channel.peer;
                 channel.shell = None;
@@ -1003,5 +1005,37 @@ struct SignedData {
 impl SignedData {
     fn written(&self) -> &[u8] {
         &self.bytes[..self.length]
+    }
+}
+
+/// Turns every bare LF in `buffer[..count]` into CR LF in place (there must be room for twice `count`); an LF that already
+/// follows a CR stays as it is. Returns the new length. Works from the back so nothing is overwritten before it is moved.
+fn crlf(buffer: &mut [u8], count: usize) -> usize {
+    let bare = |at: usize, buffer: &[u8]| buffer[at] == b'\n' && (at == 0 || buffer[at - 1] != b'\r');
+    let extra = (0..count).filter(|&at| bare(at, buffer)).count();
+    let mut to = count + extra;
+    for from in (0..count).rev() {
+        let add = bare(from, buffer);
+        to -= 1;
+        buffer[to] = buffer[from];
+        if add {
+            to -= 1;
+            buffer[to] = b'\r';
+        }
+    }
+    count + extra
+}
+
+#[cfg(test)]
+mod crlf_tests {
+    use super::crlf;
+
+    #[test]
+    fn bare_line_feeds_become_crlf() {
+        let mut buffer = [0u8; 32];
+        let text = b"a\nb\r\nc\n\n";
+        buffer[..text.len()].copy_from_slice(text);
+        let length = crlf(&mut buffer, text.len());
+        assert_eq!(&buffer[..length], b"a\r\nb\r\nc\r\n\r\n");
     }
 }

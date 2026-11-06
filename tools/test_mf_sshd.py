@@ -91,6 +91,9 @@ def main():
                                       input=script, capture_output=True, text=True, timeout=60)
             result = shell("admin", "echo hi-from-ssh\ncd esp\npwd\nexit\n")
             check("hi-from-ssh" in result.stdout and "esp" in result.stdout, "ssh gives a shell: commands run and answer", result.stdout + result.stderr)
+            raw = subprocess.run(["ssh", "-T", *[o if o != "-P" else "-p" for o in OPTIONS], "-i", str(KEY), "admin@127.0.0.1"],
+                                 input=b"echo one\necho two\nexit\n", capture_output=True, timeout=60).stdout
+            check(b"\r\n" in raw and b"\n" not in raw.replace(b"\r\n", b""), "shell output ends its lines with CR LF", repr(raw))
             check(result.returncode == 0, "and `exit` ends the session cleanly", f"{result.returncode} {result.stderr}")
             second = shell("admin", "pwd\nexit\n")
             check("(the boot volume)" in second.stdout, "a second login starts at the root with its own folder", second.stdout + second.stderr)
