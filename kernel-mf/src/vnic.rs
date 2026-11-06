@@ -31,7 +31,7 @@ static mut PENDING: [Option<Spec>; QUEUE] = [None; QUEUE];
 /// The name of each virtual interface by NIC index (length 0: none).
 static mut NAMES: [([u8; NAME_MAX], usize); MAX_NICS] = [([0; NAME_MAX], 0); MAX_NICS];
 
-fn name_of(index: usize) -> Option<&'static str> {
+pub fn name_of(index: usize) -> Option<&'static str> {
     let (bytes, length) = unsafe { &(*core::ptr::addr_of!(NAMES))[index] };
     (*length != 0).then(|| core::str::from_utf8(&bytes[..*length]).unwrap_or("?"))
 }
