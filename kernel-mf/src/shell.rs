@@ -19,17 +19,32 @@ struct Keys {
     /// Tick at which an Escape arrived that may start a cursor-key sequence (`ESC [ D`); 0 when none is pending.
     escape_tick: u64,
 }
-static KEYS: crate::sync::SpinLock<Keys> = crate::sync::SpinLock::new(Keys { pid: 0, buffer: [0; 64], head: 0, count: 0, escape_tick: 0 });
+/// One per session (`session.rs`).
+static KEYS: [crate::sync::SpinLock<Keys>; crate::session::MAX] = [const { crate::sync::SpinLock::new(Keys { pid: 0, buffer: [0; 64], head: 0, count: 0, escape_tick: 0 }) }; crate::session::MAX];
+
+/// The foreground tape of session `id` (0 when none).
+pub fn foreground(id: usize) -> u64 {
+    KEYS[id].lock().pid
+}
+
+/// The session leaves: its foreground tape keeps running but no longer gets keys.
+pub fn detach(id: usize) {
+    let mut keys = KEYS[id].lock();
+    keys.pid = 0;
+    keys.head = 0;
+    keys.count = 0;
+    keys.escape_tick = 0;
+}
 
 /// How long an Escape waits for the `[` of a sequence; a terminal sends the bytes back to back, a person never types that fast.
 const ESCAPE_WAIT_TICKS: u64 = 3;
 
-/// Makes `pid` the tape that receives typed bytes. Gives up at once if it already ended.
+/// Makes `pid` the tape that receives the current session's typed bytes. Gives up at once if it already ended.
 pub fn set_foreground(pid: u64) {
     if crate::process::outcomes().iter().any(|outcome| outcome.pid == pid) {
         return;
     }
-    let mut keys = KEYS.lock();
+    let mut keys = KEYS[crate::session::current_or_console()].lock();
     keys.pid = pid;
     keys.head = 0;
     keys.count = 0;
@@ -38,17 +53,21 @@ pub fn set_foreground(pid: u64) {
 
 /// The tape `pid` ended: the shell takes the keyboard back (and says so with a fresh prompt).
 pub fn end_foreground(pid: u64) {
-    let mut keys = KEYS.lock();
-    if keys.pid == pid {
-        keys.pid = 0;
-        drop(keys);
-        prompt();
+    for id in 0..crate::session::MAX {
+        let mut keys = KEYS[id].lock();
+        if keys.pid == pid {
+            keys.pid = 0;
+            drop(keys);
+            crate::session::with(id, prompt);
+            return;
+        }
     }
 }
 
 /// `read_key` for process `pid`: the next typed byte, if it is the foreground tape.
 pub fn take_key(pid: u64) -> Option<u8> {
-    let mut keys = KEYS.lock();
+    let id = (0..crate::session::MAX).find(|&id| foreground(id) == pid)?;
+    let mut keys = KEYS[id].lock();
     if keys.pid != pid || keys.count == 0 {
         return None;
     }
@@ -68,8 +87,8 @@ fn push_key(keys: &mut Keys, byte: u8) {
 
 /// Routes a byte to the foreground tape; false when there is none. A lone Escape kills the tape, but Escape followed at once
 /// by `[` or `O` is a cursor key and goes to the tape as typed (the embedded kernel does the same).
-fn feed_foreground(byte: u8) -> bool {
-    let mut keys = KEYS.lock();
+fn feed_foreground(id: usize, byte: u8) -> bool {
+    let mut keys = KEYS[id].lock();
     let pid = keys.pid;
     if pid == 0 {
         return false;
@@ -95,13 +114,15 @@ fn feed_foreground(byte: u8) -> bool {
 
 /// A lone Escape that nothing followed in time stops the foreground tape; called from the service loop.
 pub fn poll_escape() {
-    let mut keys = KEYS.lock();
-    if keys.escape_tick != 0 && apic::ticks().saturating_sub(keys.escape_tick) >= ESCAPE_WAIT_TICKS {
-        keys.escape_tick = 0;
-        let pid = keys.pid;
-        drop(keys);
-        if pid != 0 {
-            sched::kill(pid);
+    for id in 0..crate::session::MAX {
+        let mut keys = KEYS[id].lock();
+        if keys.escape_tick != 0 && apic::ticks().saturating_sub(keys.escape_tick) >= ESCAPE_WAIT_TICKS {
+            keys.escape_tick = 0;
+            let pid = keys.pid;
+            drop(keys);
+            if pid != 0 {
+                sched::kill(pid);
+            }
         }
     }
 }
@@ -129,26 +150,37 @@ pub fn init() {
     });
 }
 
-/// Forgets a half-typed line (a new terminal session starts clean; the history stays).
-pub fn reset() {
+/// Forgets session `id`'s half-typed line (a new terminal session starts clean; the history stays).
+pub fn reset(id: usize) {
+    kernel_core::lineedit::select(id);
     kernel_core::lineedit::reset();
 }
 
-/// One input byte: the line editor handles it (cursor keys, history, Tab); Enter runs the line.
+/// One byte typed on the console.
 pub fn feed(byte: u8) {
+    feed_session(0, byte);
+}
+
+/// One input byte for session `id`: the line editor handles it (cursor keys, history, Tab); Enter runs the line.
+pub fn feed_session(id: usize, byte: u8) {
+    crate::session::with(id, || feed_in(id, byte));
+}
+
+fn feed_in(id: usize, byte: u8) {
     if crate::top::key(byte) {
         return;
     }
-    if feed_foreground(byte) {
+    if feed_foreground(id, byte) {
         return;
     }
+    kernel_core::lineedit::select(id);
     let mut line = [0u8; kernel_core::lineedit::LINE_MAX];
     if let Some(length) = kernel_core::lineedit::feed(byte, &mut line) {
         // A copy: running a command may reset the editor or start a session that feeds it again.
         if let Ok(text) = core::str::from_utf8(&line[..length]) {
             run(text.trim());
         }
-        if KEYS.lock().pid == 0 && !crate::top::active() {
+        if foreground(id) == 0 && !crate::top::active() {
             prompt();
         }
     }

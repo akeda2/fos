@@ -185,7 +185,7 @@ kernel:
 
 # The server kernel (kernel-mf/, docs/big-kernel.md): same loaders, same image layout, its own crate.
 KERNEL_MF_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel-mf
-.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-tape test-mf-usb test-mf-debug test-mf-audio test-mf-netfs test-mf-tapesync test-mf-gpio test-mf-bios-video test-mf-shell test-mf-kup-serial test-mf-smbmount test-mf-smbd test-mf-sshd test-mf-sshmount test-mf-httpd test-mf-vnic test-mf-service test-mf-cp test-mf-abibad test-mf-threads
+.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-sessions test-mf-tape test-mf-usb test-mf-debug test-mf-audio test-mf-netfs test-mf-tapesync test-mf-gpio test-mf-bios-video test-mf-shell test-mf-kup-serial test-mf-smbmount test-mf-smbd test-mf-sshd test-mf-sshmount test-mf-httpd test-mf-vnic test-mf-service test-mf-cp test-mf-abibad test-mf-threads
 kernel-mf:
 	cd kernel-mf && cargo +nightly-2026-09-13 build --release
 
@@ -298,6 +298,10 @@ test-mf-boot: image-mf $(BIOS_OUT)/shim/qemu-system-x86_64
 # The server kernel's network console, discovery and KUP with the loader's A/B promotion (the harness is test_debug_mode's).
 test-mf-net: image-mf
 	python3 tools/test_mf_net.py
+
+# Several `term net` sessions at once, each with its own folder, variables and top; the `term-net` NIC list.
+test-mf-sessions: image-mf
+	python3 tools/test_mf_sessions.py
 
 test-mf-netfs: image-mf
 	python3 tools/test_mf_netfs.py

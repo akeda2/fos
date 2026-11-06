@@ -1,5 +1,5 @@
 //! The per-machine text files on the boot volume that the server kernel honours so far: `hostname`, `settings`
-//! (`deny-term-net`, `no-msi`, `keymap`, `irq-cpu N`), `start` (the boot script, rerun by the `start` command) and `debug` (`kernel-update`, `reboot-on-crash`, `reboot-delay`, `watchdog`, `crash-on-boot`). Same files and names as the embedded kernel (docs/config.md); a FOSFS v4
+//! (`deny-term-net`, `term-net`, `no-msi`, `keymap`, `irq-cpu N`), `start` (the boot script, rerun by the `start` command) and `debug` (`kernel-update`, `reboot-on-crash`, `reboot-delay`, `watchdog`, `crash-on-boot`). Same files and names as the embedded kernel (docs/config.md); a FOSFS v4
 //! volume keeps them in `settings/`, the bare name in the root stays valid. Options the server kernel has no use for yet are
 //! ignored silently.
 
@@ -9,6 +9,8 @@ static mut BUFFER: [u8; 4096] = [0; 4096];
 static mut HOSTNAME: [u8; 15] = [0; 15];
 static mut HOSTNAME_LENGTH: usize = 0;
 static mut DENY_TERM_NET: bool = false;
+/// Bit n set: NIC n+1 accepts `term net` (`term-net 1,2` in `settings`); 0 means every NIC.
+static mut TERM_NET_NICS: u32 = 0;
 static mut KERNEL_UPDATE: bool = false;
 static mut IRQ_CPU: usize = 0;
 static mut REBOOT_ON_CRASH: bool = false;
@@ -40,6 +42,12 @@ pub fn hostname() -> Option<&'static str> {
 
 pub fn deny_term_net() -> bool {
     unsafe { DENY_TERM_NET }
+}
+
+/// Whether the NIC with this index (0-based) accepts a `term net` session.
+pub fn term_net_allowed(index: usize) -> bool {
+    let mask = unsafe { TERM_NET_NICS };
+    mask == 0 || (index < 32 && mask & (1 << index) != 0)
 }
 
 /// `kernel-update` in the `debug` file: KUP is answered only when it is there.
@@ -201,6 +209,22 @@ pub fn load() {
             }
             if line.split_whitespace().next() == Some("vnic") {
                 crate::vnic::queue(line);
+            }
+            if line.split_whitespace().next() == Some("term-net") {
+                let mut mask = 0u32;
+                let mut valid = true;
+                for number in line.split(|c: char| c == ',' || c.is_whitespace()).skip(1).filter(|word| !word.is_empty()) {
+                    match number.parse::<u32>() {
+                        Ok(nic @ 1..=32) => mask |= 1 << (nic - 1),
+                        _ => valid = false,
+                    }
+                }
+                if valid && mask != 0 {
+                    unsafe { TERM_NET_NICS = mask };
+                    println!("settings: term-net -- the network terminal is open on those interfaces only.");
+                } else {
+                    println!("settings: `{line}` ignored (term-net NIC[,NIC...], numbered from 1).");
+                }
             }
             if line.split_whitespace().next() == Some("deny-term-net") {
                 unsafe { DENY_TERM_NET = true };

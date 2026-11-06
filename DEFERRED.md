@@ -705,7 +705,7 @@ Tapes see just another NIC, so `tape-ip`, DHCP, `smbd`, `httpd` and `router` nee
 
 ## sshd: what is not there yet (2026-11-06)
 
-- **Shell channel and `ssh` client.** sshd serves the `sftp` subsystem only. Next: tape ABI 38 sessions (a kernel `Session` struct, several `term net` sessions, a `term-net` NIC-list setting) and a pty-less shell channel; then an `ssh` exec/shell client tape. `crates/ssh` `client` (connect, publickey login, SFTP) and the `sshmount` tape are done; an interactive client would reuse its handshake and add a shell channel.
+- **Shell channel and `ssh` client.** sshd serves the `sftp` subsystem only. Several `term net` sessions and the `term-net` NIC list are done (`kernel-mf/src/session.rs`). Next: tape ABI 38 sessions and a pty-less shell channel (a transport for `session.rs`); then an `ssh` exec/shell client tape. `crates/ssh` `client` (connect, publickey login, SFTP) and the `sshmount` tape are done; an interactive client would reuse its handshake and add a shell channel.
 - **sshmount**: one connection, one request in flight; reads and writes go in 32 KiB SFTP requests, so throughput on a long link is round-trip bound (pipelining would fix it). Folders list their first 128 entries. SFTP v3 has no "exists" status, so a taken name is told apart from other failures with a `stat`.
 - **AES-GCM** (`aes256-gcm@openssh.com`, AES-NI/PCLMUL from user mode) next to chacha20-poly1305; measure on rack first.
 - SFTP has no symlinks, no statvfs and ignores times; password logins and other key types are deliberately absent.

@@ -60,7 +60,11 @@ struct Editor {
     draft_length: usize,
 }
 
-static mut EDITOR: Editor = Editor {
+/// How many editors exist: one per shell session (the server kernel's console and its terminal sessions; the embedded
+/// kernels only use the first).
+pub const EDITORS: usize = 5;
+
+const EMPTY: Editor = Editor {
     line: [0; LINE_MAX],
     length: 0,
     cursor: 0,
@@ -78,13 +82,24 @@ static mut EDITOR: Editor = Editor {
     draft_length: 0,
 };
 
+static mut EDITORS_STATE: [Editor; EDITORS] = [EMPTY; EDITORS];
+static mut SELECTED: usize = 0;
+
 fn editor() -> &'static mut Editor {
-    unsafe { &mut *(&raw mut EDITOR) }
+    unsafe { &mut (*(&raw mut EDITORS_STATE))[SELECTED] }
 }
 
-/// Installs the Tab completion hook.
+/// Makes editor `index` (line, cursor, history) the one `feed` and `reset` work on. Call it before each byte when several
+/// sessions share the shell; it is a plain index, so the caller must be the only one typing at that moment.
+pub fn select(index: usize) {
+    unsafe { SELECTED = index.min(EDITORS - 1) };
+}
+
+/// Installs the Tab completion hook (for every editor).
 pub fn set_completer(completer: Completer) {
-    editor().completer = Some(completer);
+    for editor in unsafe { &mut *(&raw mut EDITORS_STATE) }.iter_mut() {
+        editor.completer = Some(completer);
+    }
 }
 
 /// A new session starts with an empty line (the history stays).
