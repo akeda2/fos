@@ -508,7 +508,7 @@ fn copy_or_move(host: &mut dyn Host, rest: &str, moving: bool) {
     sayln!(host, "{} {worked} of {sources} file(s){}.", if moving { "Moved" } else { "Copied" }, if failed > 0 { ", some failed" } else { "" });
 }
 
-const RECORD: usize = 64;
+const RECORD: usize = 128;
 const NAME_MAX: usize = RECORD - 10;
 /// Pattern depth: folders with a pattern of their own (`rec/*/lp1.flac` has one).
 const DEPTH: usize = 6;
@@ -552,7 +552,7 @@ fn walk(host: &mut dyn Host, scratch: &mut [u8], path: &mut [u8; 192], length: u
     }
     // A component without a pattern (a volume, a mount point, a folder) is followed as it stands.
     if let Some(tail) = tail.filter(|_| !has_wildcards(component)) {
-        let mut name = [0u8; 64];
+        let mut name = [0u8; RECORD];
         let used = unescape(component, &mut name).ok_or(FsError::BadName)?;
         let length = push(path, length, &name[..used]).ok_or(FsError::BadName)?;
         return walk(host, scratch, path, length, tail, depth, visit);
@@ -1036,6 +1036,15 @@ mod tests {
         // one match needs no confirmation; none is an error
         assert!(run(&mut host, "rm disk2/*.log").contains("Removed 1 of 1."));
         assert_eq!(run(&mut host, "rm disk2/*.log"), "rm: no match for disk2/*.log.\n");
+    }
+
+    #[test]
+    fn a_pattern_matches_names_of_ext_length() {
+        let mut host = Mock::default();
+        let long = "Star.Trek.TNG.S06E20.The.ChaseBluray.1080p.AV1.OPUS.5.1-DH.mkv";
+        put(&mut host, &[&std::format!("disk2/{long}")]);
+        let out = run(&mut host, "rm disk2/Star.Trek.TNG.S06E2*");
+        assert!(out.contains("Removed 1 of 1."), "{out}");
     }
 
     #[test]
