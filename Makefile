@@ -141,9 +141,9 @@ LOADER_EFI := $(CARGO_TARGET_DIR)/x86_64-unknown-uefi/release/fosfor-loader.efi
 KERNEL_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel
 IMAGE := $(OUT)/fosfor.img
 # tapes: one crate each under tapes/ (shared libraries live in crates/), each built to build/cargo-target/x86_64-fos-tape/release/NAME.
-TAPES := fosplay netcheck hello abibad thrcheck fscheck calc memtest nettest bridge router ip-chat telnet net-chat ed ebb httpd smbd sshd smb smbmount web record recorder play audio-net ptp fterm fpcheck gfxcheck ltas gonio clock kaffe organ strings tape-echo epiano phono gpiopanel miccal frt60 compander
+TAPES := fosplay netcheck hello abibad thrcheck fscheck calc memtest nettest bridge router ip-chat telnet net-chat ed ebb httpd smbd sshd smb smbmount sshmount web record recorder play audio-net ptp fterm fpcheck gfxcheck ltas gonio clock kaffe organ strings tape-echo epiano phono gpiopanel miccal frt60 compander
 # Hard-float tapes (target x86_64-fos-tape-fp, SSE2/AVX2; the kernel enables SSE before they start) build into their own directory.
-FP_TAPES := sshd fosplay fpcheck ltas gonio clock kaffe audio-net organ strings tape-echo epiano phono gpiopanel miccal frt60 compander
+FP_TAPES := sshd sshmount fosplay fpcheck ltas gonio clock kaffe audio-net organ strings tape-echo epiano phono gpiopanel miccal frt60 compander
 tape_dir = x86_64-fos-tape$(if $(filter $(1),$(FP_TAPES)),-fp)
 TAPE_BINS := $(foreach tape,$(TAPES),$(CARGO_TARGET_DIR)/$(call tape_dir,$(tape))/release/$(tape))
 # The image and deployments use the stamped copies (tools/stamp_tape.py: the `.fos_build` section `tapesync` compares).
@@ -185,7 +185,7 @@ kernel:
 
 # The server kernel (kernel-mf/, docs/big-kernel.md): same loaders, same image layout, its own crate.
 KERNEL_MF_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel-mf
-.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-tape test-mf-usb test-mf-debug test-mf-audio test-mf-netfs test-mf-tapesync test-mf-gpio test-mf-bios-video test-mf-shell test-mf-kup-serial test-mf-smbmount test-mf-smbd test-mf-sshd test-mf-httpd test-mf-vnic test-mf-service test-mf-cp test-mf-abibad test-mf-threads
+.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-tape test-mf-usb test-mf-debug test-mf-audio test-mf-netfs test-mf-tapesync test-mf-gpio test-mf-bios-video test-mf-shell test-mf-kup-serial test-mf-smbmount test-mf-smbd test-mf-sshd test-mf-sshmount test-mf-httpd test-mf-vnic test-mf-service test-mf-cp test-mf-abibad test-mf-threads
 kernel-mf:
 	cd kernel-mf && cargo +nightly-2026-09-13 build --release
 
@@ -230,6 +230,11 @@ test-mf-sshd: image-mf image
 	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_MF_ELF) --output $(BUILD)/fosfor-mf/fosfor-sshd.img \
 		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin --file sshd=$(BUILD)/fosfor/tapes/sshd --file sshd.cfg=$(BUILD)/fosfor-mf/sshd.cfg --file authorized_keys=$(BUILD)/fosfor-mf/authorized_keys
 	python3 tools/test_mf_sshd.py
+
+test-mf-sshmount: image-mf image
+	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_MF_ELF) --output $(BUILD)/fosfor-mf/fosfor-sshmount.img \
+		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin --file sshmount=$(BUILD)/fosfor/tapes/sshmount
+	python3 tools/test_mf_sshmount.py
 
 test-mf-cp: image-mf
 	python3 tools/test_mf_cp.py

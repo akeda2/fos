@@ -127,6 +127,8 @@ pub const OPEN_READ: u32 = 1;
 pub const OPEN_WRITE: u32 = 2;
 pub const OPEN_CREATE: u32 = 8;
 pub const OPEN_TRUNCATE: u32 = 16;
+/// With `OPEN_CREATE`: fail when the file exists.
+pub const OPEN_EXCLUSIVE: u32 = 32;
 
 const FXP_INIT: u8 = 1;
 const FXP_VERSION: u8 = 2;
@@ -509,6 +511,11 @@ impl<'a, L: Link> Client<'a, L> {
         self.response_length += data.len();
         self.consumed += data.len() as u32;
         Ok(())
+    }
+
+    /// The byte stream, for closing it when the session is over.
+    pub fn link(&mut self) -> &mut L {
+        &mut self.link
     }
 
     /// Sends the SFTP request in `self.request[..length]` as channel data, as the server's window allows.
