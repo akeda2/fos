@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """`sshd` as a background tape on the server kernel (`make test-mf-sshd`): the real OpenSSH `sftp` on the host, through a
 forwarded port, logs in with a key, lists and fetches a file and writes one back; a key that is not in authorized_keys is
-refused, and `help sshd` answers without running the tape."""
+refused, and `help sshd` answers without running the tape. A `shell` account gets the kernel's shell over a shell channel
+(its own session: `cd`, a command's output, `exit` ends it); an account without `shell` is refused one."""
 import os
 import select
 import shutil
@@ -85,6 +86,16 @@ def main():
             check("lost+found" in result.stdout and "moved" in result.stdout, "sftp lists the volume, makes and renames a folder", result.stdout + result.stderr)
             wrote = (Path(tmp) / "payload.back").exists() and (Path(tmp) / "payload.back").read_bytes() == payload.read_bytes()
             check(wrote, "a 300 kB file written and read back is intact", result.stdout + result.stderr)
+            def shell(user, script):
+                return subprocess.run(["ssh", "-T", *[o if o != "-P" else "-p" for o in OPTIONS], "-i", str(KEY), f"{user}@127.0.0.1"],
+                                      input=script, capture_output=True, text=True, timeout=60)
+            result = shell("admin", "echo hi-from-ssh\ncd esp\npwd\nexit\n")
+            check("hi-from-ssh" in result.stdout and "esp" in result.stdout, "ssh gives a shell: commands run and answer", result.stdout + result.stderr)
+            check(result.returncode == 0, "and `exit` ends the session cleanly", f"{result.returncode} {result.stderr}")
+            second = shell("admin", "pwd\nexit\n")
+            check("(the boot volume)" in second.stdout, "a second login starts at the root with its own folder", second.stdout + second.stderr)
+            denied = shell("anna", "echo should-not-run\nexit\n")
+            check("should-not-run" not in denied.stdout and denied.returncode != 0, "an account without `shell` gets no shell channel", denied.stdout + denied.stderr)
             bad = Path(tmp) / "bad"
             subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(bad)], check=True)
             refused = sftp(bad, "ls\nbye\n")

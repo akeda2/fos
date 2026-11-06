@@ -27,14 +27,17 @@ NIC_EXTRAS = ("nic_max_frame_len nic_ts_enable nic_ts_clock nic_ts_rx nic_send_s
 
 THREADS = {name: "the embedded kernels run one tape at a time on one CPU; threads and futexes are an mf feature"
            for name in ("thread_spawn", "thread_join", "futex_wait", "futex_wake")}
+SESSIONS = {name: "the embedded kernels have one console and no login sessions; sessions are a server-kernel feature"
+            for name in ("session_open", "session_write", "session_read", "session_close")}
 UNWIRED = "not wired into mf yet (the call answers 0, so a tape sees no such device)"
 
 # Calls a kernel stubs, and why. Field name -> reason, per kernel. Keep it honest: an entry is either a hardware fact
 # or a to-do, and says which.
 GAPS = {
-    "x86": dict(THREADS),
+    "x86": {**THREADS, **SESSIONS},
     "pi4": {
         **THREADS,
+        **SESSIONS,
         **{name: "the Pi 4 NIC driver has no timestamp, offload, VLAN, multicast-hash or counter support yet"
            for name in NIC_EXTRAS},
     },

@@ -949,6 +949,42 @@ pub fn futex_wake(word: &core::sync::atomic::AtomicU32, count: usize) -> usize {
     }
 }
 
+fn session_table() -> Option<&'static fosfor_abi::tape::TapeApi> {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, session_close) + core::mem::size_of::<usize>();
+    (table.version >= 38 && table.size as usize >= end).then_some(table)
+}
+
+/// Opens a shell session for this tape (ABI 38): the server kernel's shell with its own history and folder. `Err` is a
+/// `SESSION_*` code (`SESSION_UNSUPPORTED` on the embedded kernels and on kernels older than 38).
+pub fn session_open() -> Result<u32, isize> {
+    let table = session_table().ok_or(fosfor_abi::tape::SESSION_UNSUPPORTED)?;
+    match (table.session_open)() {
+        number if number > 0 => Ok(number as u32),
+        code => Err(code),
+    }
+}
+
+/// Types `data` into the session; how many bytes the kernel took.
+pub fn session_write(session: u32, data: &[u8]) -> usize {
+    session_table().map_or(0, |table| (table.session_write)(session as isize, data.as_ptr(), data.len()).max(0) as usize)
+}
+
+/// The session's output, without blocking: `Ok(n)` bytes (0 when none), `Err` a `SESSION_*` code (`SESSION_CLOSED` after `exit`).
+pub fn session_read(session: u32, out: &mut [u8]) -> Result<usize, isize> {
+    let table = session_table().ok_or(fosfor_abi::tape::SESSION_UNSUPPORTED)?;
+    match (table.session_read)(session as isize, out.as_mut_ptr(), out.len()) {
+        count if count >= 0 => Ok(count as usize),
+        code => Err(code),
+    }
+}
+
+pub fn session_close(session: u32) {
+    if let Some(table) = session_table() {
+        (table.session_close)(session as isize);
+    }
+}
+
 fn remote_table() -> Option<&'static fosfor_abi::tape::TapeApi> {
     let table = api();
     let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, remote_reply) + core::mem::size_of::<usize>();

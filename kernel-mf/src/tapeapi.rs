@@ -179,6 +179,10 @@ const THREAD_SPAWN: u64 = slot(offset_of!(TapeApi, thread_spawn));
 const THREAD_JOIN: u64 = slot(offset_of!(TapeApi, thread_join));
 const FUTEX_WAIT: u64 = slot(offset_of!(TapeApi, futex_wait));
 const FUTEX_WAKE: u64 = slot(offset_of!(TapeApi, futex_wake));
+const SESSION_OPEN: u64 = slot(offset_of!(TapeApi, session_open));
+const SESSION_WRITE: u64 = slot(offset_of!(TapeApi, session_write));
+const SESSION_READ: u64 = slot(offset_of!(TapeApi, session_read));
+const SESSION_CLOSE: u64 = slot(offset_of!(TapeApi, session_close));
 const REMOTE_REGISTER: u64 = slot(offset_of!(TapeApi, remote_register));
 const REMOTE_UNREGISTER: u64 = slot(offset_of!(TapeApi, remote_unregister));
 const REMOTE_POLL: u64 = slot(offset_of!(TapeApi, remote_poll));
@@ -424,6 +428,21 @@ pub fn call(frame: &mut Frame) {
         THREAD_JOIN => threads::join(a) as u64,
         FUTEX_WAIT => threads::futex_wait(a, b) as u64,
         FUTEX_WAKE => threads::futex_wake(a, b) as u64,
+        SESSION_OPEN => crate::net::tape_session_open(sched::current_pid()) as u64,
+        SESSION_WRITE => match user_bytes(b, c.min(4096)) {
+            Some(bytes) => crate::net::tape_session_write(sched::current_pid(), a, &bytes) as u64,
+            None => (-4i64) as u64,
+        },
+        SESSION_READ => {
+            let mut bytes = alloc::vec![0u8; c.min(4096) as usize];
+            let got = crate::net::tape_session_read(sched::current_pid(), a, &mut bytes);
+            if got > 0 && !process::copy_to_user(b, &bytes[..got as usize]) {
+                (-4i64) as u64
+            } else {
+                got as u64
+            }
+        }
+        SESSION_CLOSE => crate::net::tape_session_close(sched::current_pid(), a) as u64,
         REMOTE_REGISTER => tapefs::remote_register(a, b) as u64,
         REMOTE_UNREGISTER => tapefs::remote_unregister(a, b) as u64,
         REMOTE_POLL => tapefs::remote_poll(a, b, c, d, e) as u64,

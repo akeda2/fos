@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`. Version 20 added `gfx_screens` and the `gfx_*_on` calls (a screen number). Version 21 added `audio_float`. Version 22 added the `gpio_*` calls. Version 23 added `i2c_speed` and `i2c_transfer`. Version 24 added `touch_info` and `touch_read`. Version 25 added `midi_read` and `midi_send`. Version 26 added `midi_devices`. Version 27 added `nic_owned`. Version 28 added `gpio_pull_get`. Version 32 added the `vfs_*` calls. Version 33 added `random`. Version 34 added the `vfs_*` change calls (`vfs_create`, `vfs_write`, `vfs_truncate`, `vfs_remove`, `vfs_rename`, `vfs_set_owner`). Version 35 added the `remote_*` calls (a tape serves a volume named `//NAME`). Version 36 added `vfs_sync`. Version 37 added the thread calls (`thread_spawn`, `thread_join`, `futex_wait`, `futex_wake`).
-pub const TAPE_API_VERSION: u32 = 37;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`. Version 20 added `gfx_screens` and the `gfx_*_on` calls (a screen number). Version 21 added `audio_float`. Version 22 added the `gpio_*` calls. Version 23 added `i2c_speed` and `i2c_transfer`. Version 24 added `touch_info` and `touch_read`. Version 25 added `midi_read` and `midi_send`. Version 26 added `midi_devices`. Version 27 added `nic_owned`. Version 28 added `gpio_pull_get`. Version 32 added the `vfs_*` calls. Version 33 added `random`. Version 34 added the `vfs_*` change calls (`vfs_create`, `vfs_write`, `vfs_truncate`, `vfs_remove`, `vfs_rename`, `vfs_set_owner`). Version 35 added the `remote_*` calls (a tape serves a volume named `//NAME`). Version 36 added `vfs_sync`. Version 37 added the thread calls (`thread_spawn`, `thread_join`, `futex_wait`, `futex_wake`). Version 38 added the shell session calls (`session_open`, `session_write`, `session_read`, `session_close`).
+pub const TAPE_API_VERSION: u32 = 38;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -456,7 +456,29 @@ pub struct TapeApi {
     /// `futex_wake(address, count)` (version 37): wakes up to `count` threads of this tape waiting on `address`. Returns how
     /// many it woke (0 where there are no threads).
     pub futex_wake: extern "C" fn(usize, usize) -> isize,
+    /// `session_open()` (version 38): opens a shell session for this tape (a remote login such as sshd's shell channel): the
+    /// same shell as `term net`, with its own history, working folder and foreground tape, and a prompt waiting in the output.
+    /// Returns the session number (> 0), `SESSION_UNSUPPORTED` (the embedded kernels have one console) or `SESSION_LIMIT`
+    /// (the server shares four sessions between `term net` clients and tapes). Sessions end with `session_close`, with the
+    /// shell's `exit` command, or when the tape ends.
+    pub session_open: extern "C" fn() -> isize,
+    /// `session_write(session, bytes, length)` (version 38): typed bytes for the shell (it echoes and edits like a terminal:
+    /// send what the user types, Enter as CR or LF). Never blocks; returns how many bytes were taken (less than `length` when
+    /// the kernel's queue is full: offer the rest later), or `SESSION_BAD`.
+    pub session_write: extern "C" fn(isize, *const u8, usize) -> isize,
+    /// `session_read(session, buffer, capacity)` (version 38): console output of the session, without blocking. Returns the
+    /// byte count (0 when none is waiting), `SESSION_CLOSED` once the shell has ended the session and its output is drained,
+    /// or `SESSION_BAD`. Output arrives as the terminal would show it, with escape sequences; lines end in LF.
+    pub session_read: extern "C" fn(isize, *mut u8, usize) -> isize,
+    /// `session_close(session)` (version 38): ends the session. Its foreground tape keeps running without keys.
+    pub session_close: extern "C" fn(isize) -> isize,
 }
+
+/// Shell session call results (version 38), all negative.
+pub const SESSION_UNSUPPORTED: isize = -1;
+pub const SESSION_LIMIT: isize = -2;
+pub const SESSION_CLOSED: isize = -3;
+pub const SESSION_BAD: isize = -4;
 
 /// Thread call results (version 37), all negative.
 pub const THREAD_UNSUPPORTED: isize = -1;
