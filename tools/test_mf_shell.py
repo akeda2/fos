@@ -87,6 +87,10 @@ def ext4_scenario():
             check("not found" in out, "a missing file is reported", out[-300:])
             out = machine.run("ext4 disk1")
             check("no ext2/3/4" in out, "the FOSFS boot disk is not ext", out[-300:])
+            out = machine.run("ps")
+            check("PID  THREAD NAME" in out and "kill PID" in out, "ps lists processes (it once deadlocked on the scheduler lock)", out[-300:])
+            out = machine.run("threads")
+            check("context switches" in out, "threads lists the kernel threads", out[-300:])
         finally:
             machine.stop()
 

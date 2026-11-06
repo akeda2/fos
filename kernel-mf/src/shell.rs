@@ -269,12 +269,21 @@ pub fn run_command(line: &str) {
         },
         "top" => crate::top::start(&line.trim_start()[command.len()..]),
         "threads" => {
-            sched::for_each(|id, name, state| println!("{id:3} {name:<16} {state:?}"));
+            // Print after the scheduler lock is released: println! asks the scheduler which session is running.
+            let mut rows = alloc::vec::Vec::new();
+            sched::for_each(|id, name, state| rows.push((id, alloc::string::String::from(name), state)));
+            for (id, name, state) in rows {
+                println!("{id:3} {name:<16} {state:?}");
+            }
             println!("{} context switches.", sched::switches());
         }
         "ps" => {
             println!("PID  THREAD NAME             STATE");
-            sched::for_each_process(|pid, id, name, state| println!("{pid:<4} {id:<6} {name:<16} {state:?}"));
+            let mut rows = alloc::vec::Vec::new();
+            sched::for_each_process(|pid, id, name, state| rows.push((pid, id, alloc::string::String::from(name), state)));
+            for (pid, id, name, state) in rows {
+                println!("{pid:<4} {id:<6} {name:<16} {state:?}");
+            }
             println!("`kill PID` stops one; `threads` lists the kernel threads too.");
         }
         "date" => match words.next() {
