@@ -185,7 +185,7 @@ kernel:
 
 # The server kernel (kernel-mf/, docs/big-kernel.md): same loaders, same image layout, its own crate.
 KERNEL_MF_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel-mf
-.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-tape test-mf-usb test-mf-debug test-mf-audio test-mf-netfs test-mf-tapesync test-mf-gpio test-mf-bios-video test-mf-shell test-mf-kup-serial test-mf-smbmount test-mf-smbd test-mf-httpd test-mf-vnic test-mf-cp test-mf-abibad test-mf-threads
+.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-tape test-mf-usb test-mf-debug test-mf-audio test-mf-netfs test-mf-tapesync test-mf-gpio test-mf-bios-video test-mf-shell test-mf-kup-serial test-mf-smbmount test-mf-smbd test-mf-httpd test-mf-vnic test-mf-service test-mf-cp test-mf-abibad test-mf-threads
 kernel-mf:
 	cd kernel-mf && cargo +nightly-2026-09-13 build --release
 
@@ -239,6 +239,18 @@ test-mf-vnic: image-mf image
 		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin --file httpd=$(BUILD)/fosfor/tapes/httpd \
 		--file httpd.cfg=$(BUILD)/fosfor-mf/vnic-httpd.cfg --file settings=$(BUILD)/fosfor-mf/vnic-settings.txt
 	python3 tools/test_mf_vnic.py
+
+# Named services: `services` and `start` files, two httpd services on two virtual interfaces, stop/start/restart one, restart after a kill.
+test-mf-service: image-mf image
+	printf 'root=disk1\nlisting=on\n' > $(BUILD)/fosfor-mf/service-httpd.cfg
+	printf 'vnic web on 1\nvnic files on 1\n' > $(BUILD)/fosfor-mf/service-settings.txt
+	printf 'web restart httpd @httpd.cfg &web\nfiles httpd @httpd.cfg &files\n' > $(BUILD)/fosfor-mf/service-services.txt
+	printf 'service start all\n' > $(BUILD)/fosfor-mf/service-start.txt
+	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_MF_ELF) --output $(BUILD)/fosfor-mf/fosfor-service.img \
+		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin --file httpd=$(BUILD)/fosfor/tapes/httpd \
+		--file httpd.cfg=$(BUILD)/fosfor-mf/service-httpd.cfg --file settings=$(BUILD)/fosfor-mf/service-settings.txt \
+		--file services=$(BUILD)/fosfor-mf/service-services.txt --file start=$(BUILD)/fosfor-mf/service-start.txt
+	python3 tools/test_mf_service.py
 
 test-mf-smbmount: image-mf image
 	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_MF_ELF) --output $(BUILD)/fosfor-mf/fosfor-smbmount.img \

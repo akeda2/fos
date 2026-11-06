@@ -30,6 +30,7 @@ mod hwwd;
 mod net;
 mod netfs;
 mod netclient;
+mod service;
 mod vnic;
 mod tapesync;
 mod power;
@@ -391,6 +392,7 @@ extern "C" fn service_thread(_: usize) {
         shell::poll_escape();
         top::poll();
         net::housekeeping();
+        service::poll();
         slots::housekeeping();
         debug::pet();
         sched::yield_now();
