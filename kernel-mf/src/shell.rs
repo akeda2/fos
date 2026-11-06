@@ -116,7 +116,7 @@ pub fn prompt() {
 
 /// Commands `run` handles itself, outside the shared tables, for Tab completion.
 const BUILTINS: &[&str] = &[
-    "version", "cpus", "mem", "pci", "disks", "nic", "vnic", "service", "tapesync", "gpio", "top", "threads", "ps", "date", "uptime", "slots", "audio", "usb", "tape", "run", "kill",
+    "version", "cpus", "mem", "pci", "disks", "nic", "vnic", "service", "settings", "tapesync", "gpio", "top", "threads", "ps", "date", "uptime", "slots", "audio", "usb", "tape", "run", "kill",
     "echo", "debug", "start", "keymap", "kup", "recv", "dmesg", "clear", "sleep", "io", "memmap", "bootinfo", "cpuinfo", "shrink", "sector", "mount", "umount",
     "format", "label", "fsck", "grow", "install", "bootcode", "reboot", "reset", "shutdown", "halt", "ext4", "sha256", "cd", "pwd",
 ];
@@ -229,6 +229,10 @@ pub fn run_command(line: &str) {
         "nic" => net::print_list(),
         "vnic" => crate::vnic::command(words),
         "service" => crate::service::command(words),
+        "settings" => match words.next() {
+            Some("migrate") => migrate_settings(),
+            _ => println!("usage: settings migrate   (moves the root's *.cfg and smbusers into settings/)"),
+        },
         "top" => crate::top::start(&line.trim_start()[command.len()..]),
         "threads" => {
             sched::for_each(|id, name, state| println!("{id:3} {name:<16} {state:?}"));
@@ -394,6 +398,32 @@ fn split_background(args: &str) -> (&str, Option<Result<u64, ()>>) {
 
 /// `run NAME ARGS`: the tape becomes the foreground process (Escape stops it). With `&N` it is a background tape (a service):
 /// it owns NIC N, keeps running while the shell takes commands, and ends with `kill PID`.
+/// `settings migrate`: machine-specific files that lie in the root move into `settings/`, where tapes and `service` look first.
+fn migrate_settings() {
+    let mut names = alloc::vec::Vec::new();
+    {
+        let _disk = crate::tapefs::lock();
+        let mut info = fosfor_abi::tape::FileInfo { length: 0, flags: 0, name_length: 0, name: [0; 64] };
+        let mut index = 0;
+        while kernel_core::tape_fs::list(b"", index, &mut info) == 1 {
+            index += 1;
+            if info.flags & fosfor_abi::tape::FILE_DIRECTORY != 0 {
+                continue;
+            }
+            let name = alloc::string::String::from_utf8_lossy(&info.name[..info.name_length as usize]).into_owned();
+            if name.ends_with(".cfg") || name == "smbusers" || name == "services" {
+                names.push(name);
+            }
+        }
+    }
+    for name in &names {
+        run(&alloc::format!("mv {name} settings/"));
+    }
+    if names.is_empty() {
+        println!("settings: nothing to move (the root has no *.cfg, smbusers or services).");
+    }
+}
+
 /// The pid the last `run_tape` started, 0 when it did not start anything (`service` reads it).
 pub static LAST_STARTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 

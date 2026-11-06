@@ -688,7 +688,7 @@ def panel_test():
             check("Saved audio.cfg" in b.text(), "W saves audio.cfg", b.text()[-400:])
             keys(b, "q")
             b.wait_for("fos> ", 30)
-            mark = b.send("cat audio.cfg")
+            mark = b.send("cat settings/audio.cfg")
             b.pump(1.5)
             config = b.text()[mark:]
             check("mode send" in config and "ip 192.168.50.1/24" in config and "to fos-1234b1" in config and "ptp l2" in config and "src tone" not in config, "the saved cfg holds the settings (and not the test tone)", config)
@@ -790,7 +790,7 @@ def layer_2_panel_test():
             keys(b, "w")
             keys(b, "q")
             b.wait_for("fos> ", 30)
-            mark = b.send("cat audio.cfg")
+            mark = b.send("cat settings/audio.cfg")
             b.pump(1.5)
             config = b.text()[mark:]
             check("proto raw" in config and "to fos-1234b1" in config, "the saved cfg holds the raw network and the peer's name", config)

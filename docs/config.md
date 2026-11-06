@@ -56,3 +56,7 @@ A tape that keeps settings reads a text file of the same words it takes on its c
 Examples: `fterm.cfg` (the panel's W, repeated by `run fterm @fterm.cfg`), `gonio.cfg`, `phono.cfg` (also read by `phono service`),
 `fosplay.cfg`, `audio.cfg`, `bench.cfg`, and `ROUTER.CFG` for the router (at most 4096 bytes, `NETWORKING.md`). Each tape's `help NAME`
 lists its words.
+
+## Where the files live
+
+Every machine-specific file (start, services, settings, hostname, debug, smbusers, tape configs such as phono.cfg, smbd.cfg, httpd.cfg and @NAME files) belongs in `settings/`. A tape looks for `settings/NAME`, then `config/NAME`, then the bare name in the root (`tape_rt::config::locate`); a save goes where the file was found, a new file goes to `settings/` (the root on a volume without folders). `fstab` stays in the root because it builds the mount table. The mf shell command `settings migrate` moves the root *.cfg files, smbusers and services into `settings/`.

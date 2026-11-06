@@ -190,7 +190,7 @@ fn expand<'a>(api: &TapeApi, text: &'a str) -> Result<&'a str, &'static str> {
     let Some(rest) = trimmed.strip_prefix('@') else { return Ok(text) };
     let (name, after) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
     let buffer: &'static mut [u8; 320] = unsafe { &mut *(&raw mut EXPANDED) };
-    let length = (api.fs_read)(name.as_ptr(), name.len(), buffer.as_mut_ptr(), 200);
+    let length = tape_rt::config::read_named(api, name, &mut buffer[..200]);
     if length <= 0 {
         return Err("cannot read that configuration file");
     }

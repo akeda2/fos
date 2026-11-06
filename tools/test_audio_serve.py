@@ -250,7 +250,7 @@ def panel_test():
             check("Saved audio.cfg" in guest.text(), "W saves audio.cfg", guest.text()[-400:])
             keys("q")
             guest.wait_for("fos> ", 30, mark)
-            cat = guest.send("cat audio.cfg")
+            cat = guest.send("cat settings/audio.cfg")
             guest.pump(1.5)
             config = guest.text()[cat:]
             check("mode serve" in config and "http 8080" in config and "proto rtp" in config and "codec opus" in config and "\nto " not in config, "the saved cfg holds mode serve and the port", config)

@@ -247,9 +247,9 @@ test-mf-service: image-mf image
 	printf 'web restart httpd @httpd.cfg &web\nfiles httpd @httpd.cfg &files\n' > $(BUILD)/fosfor-mf/service-services.txt
 	printf 'service start all\n' > $(BUILD)/fosfor-mf/service-start.txt
 	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_MF_ELF) --output $(BUILD)/fosfor-mf/fosfor-service.img \
-		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin --file httpd=$(BUILD)/fosfor/tapes/httpd \
-		--file httpd.cfg=$(BUILD)/fosfor-mf/service-httpd.cfg --file settings=$(BUILD)/fosfor-mf/service-settings.txt \
-		--file services=$(BUILD)/fosfor-mf/service-services.txt --file start=$(BUILD)/fosfor-mf/service-start.txt
+		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin --file bin/httpd=$(BUILD)/fosfor/tapes/httpd \
+		--fosfs 4 --file httpd.cfg=$(BUILD)/fosfor-mf/service-httpd.cfg --file settings/settings=$(BUILD)/fosfor-mf/service-settings.txt \
+		--file settings/services=$(BUILD)/fosfor-mf/service-services.txt --file settings/start=$(BUILD)/fosfor-mf/service-start.txt
 	python3 tools/test_mf_service.py
 
 test-mf-smbmount: image-mf image

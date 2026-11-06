@@ -597,7 +597,7 @@ fn load_settings(settings: &mut Settings) {
     let mut count = 0;
     let api = tape_rt::api();
     let mut buffer = [0u8; 1024];
-    let length = (api.fs_read)(CONFIG_FILE.as_ptr(), CONFIG_FILE.len(), buffer.as_mut_ptr(), buffer.len());
+    let length = tape_rt::config::read_named(api, CONFIG_FILE, &mut buffer);
     if length > 0 {
         if let Ok(text) = core::str::from_utf8(&buffer[..length as usize]) {
             if crate::normalize(text, &mut words, &mut count).is_ok() {
@@ -610,7 +610,7 @@ fn load_settings(settings: &mut Settings) {
 fn save_settings(settings: &Settings) -> &'static str {
     let text = cfg_text(settings, false);
     let api = tape_rt::api();
-    if (api.fs_write)(CONFIG_FILE.as_ptr(), CONFIG_FILE.len(), text.as_ptr(), text.len()) == 0 {
+    if tape_rt::config::write_named(api, CONFIG_FILE, text.as_bytes()) == 0 {
         "Saved audio.cfg. `audio-net @audio.cfg` starts exactly this."
     } else {
         "Could not write audio.cfg (is the volume full?)."
@@ -655,7 +655,7 @@ fn run_bench(settings: &mut Settings, decoder: &mut KeyDecoder) -> &'static str 
                 let Some(found) = outcome else { break };
                 let mut text = Text::<100>::new();
                 let _ = write!(text, "ptime={} target={}\n", found.ptime_us, found.target_ms);
-                saved = if (real.fs_write)(BENCH_FILE.as_ptr(), BENCH_FILE.len(), text.as_str().as_ptr(), text.as_str().len()) == 0 { "Saved bench.cfg: `audio-net @audio.cfg @bench.cfg` uses it." } else { "Could not write bench.cfg." };
+                saved = if tape_rt::config::write_named(real, BENCH_FILE, text.as_str().as_bytes()) == 0 { "Saved bench.cfg: `audio-net @audio.cfg @bench.cfg` uses it." } else { "Could not write bench.cfg." };
                 break;
             }
             Some(_) => break,

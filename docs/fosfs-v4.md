@@ -43,7 +43,7 @@ bite sooner than the clutter does. Folders alone would not fix the limits.
 | --- | --- | --- |
 | `bin/` | tapes | root (can be rewritten at will) |
 | `doc/` | help and documentation files | root |
-| `config/` | per-tape configs (`phono.cfg`, `TAPE.cfg`, `@NAME` files) | a small USB stick, or the root |
+| `config/` | legacy home of per-tape configs; still read as a fallback | a small USB stick, or the root |
 | `settings/` | FOS configs: `settings`, `start`, `hostname`, `debug` | the config volume, or the root |
 | `rec/` | recordings | an exFAT disk (readable on other systems) |
 

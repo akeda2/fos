@@ -102,7 +102,7 @@ fn hex_hash(text: &str) -> Option<[u8; 16]> {
 impl Users {
     fn load(&mut self) -> Result<(), &'static str> {
         let mut buffer = [0u8; 1024];
-        let Ok(length) = tape_rt::read_file_at("smbusers", 0, &mut buffer) else { return Ok(()) };
+        let Ok(length) = tape_rt::read_file_at(tape_rt::config::locate(tape_rt::api(), "smbusers").path(), 0, &mut buffer) else { return Ok(()) };
         let text = core::str::from_utf8(&buffer[..length]).map_err(|_| "smbusers is not text")?;
         self.open = true;
         for line in text.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
