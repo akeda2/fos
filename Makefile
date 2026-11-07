@@ -417,6 +417,7 @@ test: image
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-rec/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/tape-net/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/tape-http/Cargo.toml
+	cargo +nightly-2026-09-13 test --manifest-path crates/tape-sip/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/vfs-export/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/ssh/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/kernel-core/Cargo.toml
