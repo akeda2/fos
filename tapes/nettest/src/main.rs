@@ -2713,8 +2713,6 @@ struct Check {
     flags: u8,
 }
 
-const CHECK_STAGES: u8 = 3;
-
 fn check_params(stage: u8, rate: u32, via: u8, here: u8) -> TestParams {
     let mut params = TestParams::new();
     (params.rate_kbit, params.seconds, params.size, params.via, params.here) = (rate, 10, 1400, via, here);

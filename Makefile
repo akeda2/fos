@@ -75,10 +75,6 @@ test-serial-shell: image
 test-midi: image
 	python3 tools/test_midi.py
 
-# The `midi` shell command without a USB MIDI device (QEMU has none; real-hardware loopback is manual).
-test-midi: image
-	python3 tools/test_midi.py
-
 # The telnet tape against a host-side Telnet server (QEMU user-mode network).
 test-telnet: image
 	python3 tools/test_telnet.py
