@@ -102,6 +102,11 @@ pub fn set_completer(completer: Completer) {
     }
 }
 
+/// Whether the selected editor's line is empty (Ctrl-D on an empty line means end of input).
+pub fn is_empty() -> bool {
+    editor().length == 0
+}
+
 /// A new session starts with an empty line (the history stays).
 pub fn reset() {
     let editor = editor();

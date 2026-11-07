@@ -5,7 +5,9 @@
  2. The working folder and script variables are per session.
  3. `top` running in one session does not stop the other from using its shell, and its screen output stays in its session.
  4. A client that says BYE frees its slot and leaves the others alone; a fifth client is refused while four are connected.
- 5. `term-net N` in `settings` limits the interfaces: a machine that only allows NIC 2 gives a HELLO on NIC 1 no session.
+ 5. A client's BYE, or a client that pinged and then went silent, ends its session's foreground tape (`ed`); a client that keeps pinging
+    keeps it, and one that never pings is not expired.
+ 6. `term-net N` in `settings` limits the interfaces: a machine that only allows NIC 2 gives a HELLO on NIC 1 no session.
 QEMU only: real NICs and a person at two terminals are for hardware."""
 
 import sys
@@ -20,6 +22,7 @@ from test_boot import BROADCAST, ETHERTYPE, ROOT, TAG_BYE, TAG_DATA, TAG_DISCOVE
 
 base.KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fosfor-kernel-mf"
 READY = "entering the service loop"
+TAG_PING = 0x23
 
 
 class Client:
@@ -149,6 +152,44 @@ def main():
             client = Client(0xa1, guest)
             check(not client.hello(), "term-net 2: a HELLO on NIC 1 gets no session", client.seen.decode(errors="replace"))
             check("Remote terminal connected" not in machine.text(), "and the console says nothing", machine.text()[-800:])
+        finally:
+            machine.stop()
+    with tempfile.TemporaryDirectory() as tmp:
+        ed = ROOT / "build/cargo-target/x86_64-fos-tape/release/ed"
+        machine = base.Machine(tmp, {"settings": "term-net 1\n"}, {"ed": ed})
+        machine.start()
+        try:
+            machine.wait_for(READY)
+            guest = discover(machine)
+            a, b, c, d = (Client(number, guest) for number in (0xa1, 0xb2, 0xc3, 0xd4))
+            for client in (a, b, c, d):
+                check(client.hello(), "a client gets a prompt", client.seen.decode(errors="replace"))
+
+            def editing():
+                out = b.run("ps") or ""
+                return out.count(" ed ")
+
+            a.send(TAG_DATA, b"ed\n")
+            time.sleep(2)
+            check(editing() == 1, "ed started in A's session is running", b.seen.decode(errors="replace"))
+            a.send(TAG_BYE)
+            time.sleep(1)
+            check(editing() == 0, "A's BYE stops the ed it left waiting for keys", b.seen.decode(errors="replace"))
+
+            c.send(TAG_DATA, b"ed\n")
+            time.sleep(2)
+            for _ in range(4):
+                c.send(TAG_PING)
+                time.sleep(10)
+            check(editing() == 1, "a client that keeps pinging keeps its idle ed", b.seen.decode(errors="replace"))
+            time.sleep(35)
+            check(editing() == 0, "a client that pinged and went silent loses its ed", b.seen.decode(errors="replace"))
+            machine.pump(1)
+            check("Remote terminal 3 timed out." in machine.text(), "and the console says so", machine.text()[-800:])
+
+            d.send(TAG_DATA, b"ed\n")
+            time.sleep(40)
+            check(editing() == 1, "a client that never pinged is not expired", b.seen.decode(errors="replace"))
         finally:
             machine.stop()
     print("test-mf-sessions: all checks passed")

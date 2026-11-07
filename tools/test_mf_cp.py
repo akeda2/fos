@@ -2,6 +2,7 @@
 """`cp`, `mv` and `cmp` on the server kernel have no size limit (`make test-mf-cp`): a 40 MiB random file on an ext4 disk (over
 the 32 MiB the embedded kernel loads whole) is copied, compared and moved within the volume, and the SHA-256 the guest
 prints for the copy must equal the host's. Also `mount PATH @LABEL` of an ext volume and `cd`/`pwd`."""
+import re
 import hashlib
 import os
 import select
@@ -82,6 +83,8 @@ def main():
             check(ok, "mv inside the volume", text[-300:])
             ok, text = command("ls @linuxvol", "moved.bin")
             check(ok and "copy.bin" not in text, "the moved file is there and the old name gone", text[-300:])
+            ok, text = command("ls -l @linuxvol", "moved.bin")
+            check(ok and re.search(r"-[r-][w-][x-][r-][w-][x-][r-][w-][x-] +\d+ +\d+ +moved\.bin", text) is not None, "ls -l shows mode, uid and gid on an ext volume", text[-300:])
             # A folder of the root mounted from the ext volume, and a working folder on it.
             ok, text = command("mount data @linuxvol", "mount", 10)
             ok, text = command("ls data", "moved.bin")
