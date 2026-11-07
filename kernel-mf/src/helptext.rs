@@ -65,7 +65,7 @@ pub const TOPICS: &[Topic] = &[
     t("service", "Tapes and services", "service | service start|stop|restart NAME|all | service reload", "Named background tapes from `settings/services` (lines `NAME [restart] TAPE ARGS... &NIC`). `restart` ones come back after a crash."),
     t("start", "Tapes and services", "start", "Run the boot script `settings/start` again."),
     t("settings", "Tapes and services", "settings migrate", "Move machine-specific files (*.cfg, smbusers, services) from the root into settings/."),
-    t("debug", "Debug", "debug slots|revert|colors|crash now|hang now|deadhang now", "Test hooks: slot report, undo a kernel update, console colours; crash, hang and deadhang stop the machine on purpose."),
+    t("debug", "Debug", "debug slots|revert|colors|crash now|hang now|deadhang now|deadlock now", "Test hooks: slot report, undo a kernel update, console colours; crash, hang, deadhang and deadlock stop the machine on purpose."),
     t("reboot", "Machine", "reboot", "Restart the machine."),
     t("reset", "Machine", "reset", "Same as `reboot`."),
     t("shutdown", "Machine", "shutdown", "Power off (ACPI)."),

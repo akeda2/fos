@@ -53,6 +53,8 @@ pub fn exception_name(vector: u64) -> &'static str {
         18 => "#MC machine check",
         19 => "#XM SIMD floating-point error",
         20 => "#VE virtualization exception",
+        crate::debug::DEADLOCK_VECTOR => "lock deadlock (a spinlock was waited for for seconds)",
+        crate::debug::PANIC_VECTOR => "kernel panic",
         crate::debug::WATCHDOG_VECTOR => "watchdog timeout (the service thread made no progress)",
         _ => "reserved exception",
     }
