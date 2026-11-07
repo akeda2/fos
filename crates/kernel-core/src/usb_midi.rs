@@ -14,6 +14,7 @@
 //! 2381:0100 cable; the QEMU `usb-host` passthrough is the only way to run it without the real device on the machine.
 
 use crate::memory;
+use core::sync::atomic::{AtomicBool, Ordering};
 use crate::xhci::{self, Controller, Device, Trb};
 
 const MAX_DEVICES: usize = 4;
@@ -46,6 +47,9 @@ struct Midi {
     received: u64,
     sent: u64,
 }
+
+/// False while the boot-time enumeration runs: see `start_listening`.
+static LISTENING: AtomicBool = AtomicBool::new(false);
 
 static mut DEVICES: [Option<Midi>; MAX_DEVICES] = [None; MAX_DEVICES];
 /// (device index, cable, three MIDI bytes of an event packet's payload, how many are real).
@@ -127,7 +131,9 @@ pub fn attach(controller: &mut Controller, device: Device, endpoints: &Endpoints
         sent: 0,
     });
     let length = u32::from(endpoints.in_max_packet.clamp(4, 64));
-    controller.queue_interrupt_in(device.slot, in_dci, buffer, length); // a Normal TRB with IOC and ISP: right for a bulk IN as well
+    if LISTENING.load(Ordering::Acquire) {
+        controller.queue_interrupt_in(device.slot, in_dci, buffer, length); // a Normal TRB with IOC and ISP: right for a bulk IN as well
+    }
     crate::println!(
         "USB MIDI {vendor:04x}:{product:04x} on port {} of xHCI {:02x}:{:02x}.{} ({}): 1 input, 1 output, {}-byte packets. `midi monitor` shows what it sends.",
         device.path(),
@@ -138,6 +144,19 @@ pub fn attach(controller: &mut Controller, device: Device, endpoints: &Endpoints
         endpoints.in_max_packet
     );
     true
+}
+
+/// Arms the IN transfers of the devices found so far; devices attached later are armed at once. Not before the first
+/// enumeration is over: a MIDI interface that sends all the time (RME Fireface UFX) keeps its bulk IN completing, and with
+/// that running the Intel Sunrise Point xHCI never answered Address Device for the low- and full-speed devices behind it
+/// (rack: the touch panel and both keyboards timed out three times each at boot, then worked after a later `usb rescan`).
+pub fn start_listening() {
+    LISTENING.store(true, Ordering::Release);
+    let entries = unsafe { &*core::ptr::addr_of!(DEVICES) };
+    for midi in entries.iter().flatten() {
+        let Some(controller) = (0..xhci::count()).filter_map(xhci::controller).find(|c| (c.pci.bus, c.pci.device, c.pci.function) == (midi.bus, midi.device_number, midi.function)) else { continue };
+        controller.queue_interrupt_in(midi.device.slot, midi.in_dci, midi.buffer, u32::from(midi.in_max_packet));
+    }
 }
 
 fn queue_push(index: usize, cable: u8, bytes: &[u8]) {

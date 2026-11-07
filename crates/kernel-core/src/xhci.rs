@@ -527,6 +527,7 @@ pub fn enable_interrupts_all(no_msi: bool) {
             Err(reason) => crate::println!("xHCI {:02x}:{:02x}.{}: events polled ({reason}).", controller.pci.bus, controller.pci.device, controller.pci.function),
         }
     }
+    crate::usb_midi::start_listening();
 }
 
 pub fn count() -> usize {
@@ -829,6 +830,28 @@ impl Controller {
         }
     }
 
+    /// Diagnostics for a command that got no answer: where the driver's event ring position is, what the controller's ERDP says
+    /// and what sits at our position (a completion we missed would show the other cycle bit there).
+    fn event_ring_debug(&self) -> (usize, bool, u64, u32, u64) {
+        use core::sync::atomic::Ordering;
+        let state = unsafe { &(*core::ptr::addr_of!(EVENTS))[self.index] };
+        let trb = read_trb(state.base + state.index as u64 * TRB_BYTES);
+        let dropped = unsafe { (*core::ptr::addr_of!(SOFT))[self.index].dropped.load(Ordering::Relaxed) };
+        (state.index, state.cycle, u64::from(read32(state.erdp)) | u64::from(read32(state.erdp + 4)) << 32, trb.control, dropped)
+    }
+
+    fn dump_recent_events(&self) {
+        let state = unsafe { &(*core::ptr::addr_of!(EVENTS))[self.index] };
+        for back in 1..=6usize {
+            let at = (state.index + EVENT_TRBS - back) % EVENT_TRBS;
+            let trb = read_trb(state.base + at as u64 * TRB_BYTES);
+            crate::println!("  event -{back}: type {} slot {} ep {} code {} parameter {:#x} status {:#x}", trb.control >> 10 & 0x3f, trb.control >> 24, trb.control >> 16 & 0x1f, trb.status >> 24, trb.parameter, trb.status & 0xff_ffff);
+        }
+        for port in 3..=7u8 {
+            crate::println!("  port {port} PORTSC {:#x}", read32(self.port_register(port)));
+        }
+    }
+
     fn command(&mut self, parameter: u64, status: u32, control: u32) -> Result<Trb, Error> {
         // Address Device sends SET_ADDRESS to the device, and a controller keeps retrying a
         // silent device for up to ~5 s before it reports failure: give it longer than that,
@@ -841,6 +864,19 @@ impl Controller {
             Ok(event) => event,
             Err(error) => {
                 if matches!(error, Error::Timeout) {
+                    crate::println!(
+                        "USB: xHCI {:02x}:{:02x}.{}: command type {} (slot {}) got no completion: USBSTS {:#x}, CRCR {:#x}, ring at {:#x}, event ring (index, cycle, ERDP, TRB at index, soft dropped) {:x?}.",
+                        self.pci.bus,
+                        self.pci.device,
+                        self.pci.function,
+                        control >> 10 & 0x3f,
+                        control >> 24,
+                        read32(self.operational + OP_USBSTS),
+                        read32(self.operational + OP_CRCR),
+                        at,
+                        self.event_ring_debug(),
+                    );
+                    self.dump_recent_events();
                     self.abort_command_ring(at, cycle);
                 }
                 return Err(error);
