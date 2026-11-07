@@ -375,7 +375,9 @@ fn heap_self_test() {
 fn panic(info: &PanicInfo) -> ! {
     serial::break_lock();
     println!("\nFosfor OS server kernel PANIC: {info}");
-    halt()
+    let mut frame: trap::Frame = unsafe { core::mem::zeroed() };
+    frame.vector = debug::PANIC_VECTOR;
+    trap::fatal_reset(&frame)
 }
 
 /// The server's housekeeping: NICs, serial input, the reset timer and the slot streak. Polls once per pass and gives way.

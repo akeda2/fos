@@ -6,11 +6,17 @@
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::panic::Location;
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+
+/// TSC cycles a CPU may wait for one lock before it is called a deadlock (several seconds on any real CPU: a lock is held for microseconds).
+const DEADLOCK_CYCLES: u64 = 20_000_000_000;
+static REPORTED: AtomicBool = AtomicBool::new(false);
 
 pub struct SpinLock<T> {
     next: AtomicU32,
     serving: AtomicU32,
+    holder: AtomicPtr<Location<'static>>,
     data: UnsafeCell<T>,
 }
 
@@ -29,16 +35,31 @@ fn interrupts_on() -> bool {
 
 impl<T> SpinLock<T> {
     pub const fn new(value: T) -> Self {
-        SpinLock { next: AtomicU32::new(0), serving: AtomicU32::new(0), data: UnsafeCell::new(value) }
+        SpinLock { next: AtomicU32::new(0), serving: AtomicU32::new(0), holder: AtomicPtr::new(core::ptr::null_mut()), data: UnsafeCell::new(value) }
     }
 
+    #[track_caller]
     pub fn lock(&self) -> Guard<'_, T> {
         let interrupts_were_on = interrupts_on();
         unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
         let ticket = self.next.fetch_add(1, Ordering::Relaxed);
-        while self.serving.load(Ordering::Acquire) != ticket {
-            core::hint::spin_loop();
+        if self.serving.load(Ordering::Acquire) != ticket {
+            let mut spins = 0u32;
+            let mut since = 0u64;
+            while self.serving.load(Ordering::Acquire) != ticket {
+                core::hint::spin_loop();
+                spins = spins.wrapping_add(1);
+                if spins & 0xffff == 0 {
+                    let now = crate::cpu::rdtsc();
+                    if since == 0 {
+                        since = now;
+                    } else if now.wrapping_sub(since) > DEADLOCK_CYCLES {
+                        deadlock(Location::caller(), self.holder.load(Ordering::Relaxed));
+                    }
+                }
+            }
         }
+        self.holder.store(Location::caller() as *const _ as *mut _, Ordering::Relaxed);
         Guard { lock: self, interrupts_were_on }
     }
 
@@ -71,4 +92,25 @@ impl<T> Drop for Guard<'_, T> {
             unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
         }
     }
+}
+
+/// A lock has been waited for too long. Interrupts are off on this CPU, so the watchdog (a timer tick) can never fire: say who
+/// waits and who holds, write a crash record and reset, instead of freezing the machine for good.
+#[cold]
+fn deadlock(waiter: &Location<'static>, holder: *mut Location<'static>) -> ! {
+    if REPORTED.swap(true, Ordering::AcqRel) {
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    crate::serial::break_lock();
+    crate::println!("\n*** lock deadlock: a CPU waited for a lock at {waiter}");
+    match unsafe { holder.as_ref() } {
+        Some(place) => crate::println!("*** the lock was taken at {place} and never released"),
+        None => crate::println!("*** the lock has no recorded holder"),
+    }
+    let mut frame: crate::trap::Frame = unsafe { core::mem::zeroed() };
+    frame.vector = crate::debug::DEADLOCK_VECTOR;
+    frame.rip = waiter.line() as u64;
+    crate::trap::fatal_reset(&frame)
 }

@@ -17,6 +17,8 @@ use crate::trap::Frame;
 pub const CRASH_RECORD_ADDRESS: u64 = 0x5000;
 const CRASH_MAGIC: u64 = u64::from_le_bytes(*b"FOSCRASH");
 pub const WATCHDOG_VECTOR: u64 = 240;
+pub const DEADLOCK_VECTOR: u64 = 241;
+pub const PANIC_VECTOR: u64 = 242;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

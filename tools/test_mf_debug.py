@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Unattended operation on the server kernel (`make test-mf-debug`): `debug crash` with reboot-on-crash writes a crash record,
-resets, and the next boot prints the record; `debug hang` (the service thread spins) is caught by the watchdog the same way, at
+resets, and the next boot prints the record; `debug hang` (the service thread spins) is caught by the watchdog the same way, a spinlock waited for several seconds (`debug deadlock`) is reported with both call sites and resets, at
 -smp 1 and 4; crash-on-boot ends in the crash-loop guard (five resets, then a halt). QEMU runs without -no-reboot: the point is
 what happens across resets."""
 import os
@@ -108,6 +108,7 @@ for name, problem in [
     ("-smp 4 debug crash", lambda: crash_or_hang(4, "debug crash", "#UD")),
     ("-smp 1 debug hang (watchdog)", lambda: crash_or_hang(1, "debug hang", "watchdog timeout")),
     ("-smp 4 debug hang (watchdog)", lambda: crash_or_hang(4, "debug hang", "watchdog timeout")),
+    ("-smp 2 debug deadlock (spinlock detector)", lambda: crash_or_hang(2, "debug deadlock", "lock deadlock")),
     ("debug deadhang (hardware watchdog)", dead_hang),
     ("crash-on-boot (crash-loop guard)", crash_loop),
 ]:
