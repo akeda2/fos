@@ -15,6 +15,8 @@ all riding `CHAT_ETHERTYPE` like `chat`/`tape`): `TERM_TAG_HELLO` (no
 payload) opens a session, `TERM_TAG_DATA` (raw byte payload, either
 direction) carries keystrokes one way and shell output the other, and
 `TERM_TAG_BYE` (no payload) closes it from whichever side sends it first.
+`TERM_TAG_PING` (no payload, client to server, every 10 s in --interactive) is a keep-alive: the server kernel (mf) ends the
+session of a client that pinged and then stayed silent for 30 s, and stops the tape in its foreground.
 
 This tool's primary mode is non-interactive: give it one or more command
 lines on the argument list (or on stdin, one per line, with --stdin), and
@@ -62,6 +64,9 @@ CHAT_ETHERTYPE = send_tape.CHAT_ETHERTYPE
 TERM_TAG_HELLO = 0x20
 TERM_TAG_DATA = 0x21
 TERM_TAG_BYE = 0x22
+TERM_TAG_PING = 0x23
+# An interactive session pings this often so the server can tell a client that is just waiting from one that is gone.
+PING_SECONDS = 10
 
 # Must match kernel/src/shell.rs's TERM_DATA_CAPACITY: the payload of one
 # TERM_TAG_DATA frame this tool sends is capped there, though (unlike
@@ -259,9 +264,13 @@ def run_interactive(raw: socket.socket, source: bytes, peer: bytes, initial_wait
     submitted_at: float | None = None
     warned_stall = False
 
+    last_ping = time.monotonic()
     try:
         while True:
             events = selector.select(timeout=0.2)
+            if connected and time.monotonic() - last_ping >= PING_SECONDS:
+                send_control(raw, peer, source, TERM_TAG_PING)
+                last_ping = time.monotonic()
             if not events:
                 if (
                     submitted_at is not None

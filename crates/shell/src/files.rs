@@ -6,7 +6,7 @@ use crate::glob::{has_wildcards, matches, unescape};
 use crate::{Command, Entry, FsError, Host, Owner, say, sayln, split_word};
 
 pub static COMMANDS: &[Command] = &[
-    Command::new("ls", "ls [diskN|@LABEL|esp][/FOLDER|PATTERN]", "lists the files of a volume or folder, or the matches of a pattern (* ? [a-z]).", ls),
+    Command::new("ls", "ls [-l] [diskN|@LABEL|esp][/FOLDER|PATTERN]", "lists the files of a volume or folder, or the matches of a pattern (* ? [a-z]); -l adds the mode, uid and gid on ext volumes.", ls),
     Command::new("cat", "cat NAME", "shows a file as text (NAME, diskN/NAME, @LABEL/NAME or esp/NAME); other bytes show as dots.", cat),
     Command::new("write", "write NAME TEXT", "makes or replaces a small text file (NAME, diskN/NAME, @LABEL/NAME or esp/NAME).", write),
     Command::new("rm", "rm NAME|PATTERN [confirm]", "removes a file, or every match of a pattern (more than one needs `confirm` at the end).", rm),
@@ -180,12 +180,32 @@ fn join_volume<'a>(rest: &'a str, out: &'a mut [u8; 192]) -> &'a str {
     core::str::from_utf8(&out[..first.len() + 1 + after.len()]).unwrap_or(rest)
 }
 
+/// The start of an `ls -l` line: type and permission bits, uid, gid. Blank where the volume keeps no owners (everything but ext).
+fn long_prefix(host: &mut dyn Host, reference: Option<&str>) {
+    let owner = reference.and_then(|reference| host.owner_of(reference).ok());
+    match owner {
+        Some(Owner { uid, gid, mode, directory, .. }) => {
+            let text = rwx(mode);
+            say!(host, "{}{} {uid:>5} {gid:>5} ", if directory { 'd' } else { '-' }, core::str::from_utf8(&text).unwrap_or("?"));
+        }
+        None => say!(host, "{:23}", ""),
+    }
+}
+
 fn ls(host: &mut dyn Host, rest: &str) {
-    let volume = rest.trim().trim_end_matches('/');
+    let rest = rest.trim();
+    let (long, rest) = match rest.strip_prefix("-l") {
+        Some(after) if after.is_empty() || after.starts_with(' ') => (true, after.trim_start()),
+        _ => (false, rest),
+    };
+    let volume = rest.trim_end_matches('/');
     if has_wildcards(volume) {
         let mut any = false;
         let outcome = expand(host, volume, &mut |host, reference, directory, length| {
             any = true;
+            if long {
+                long_prefix(host, Some(reference));
+            }
             if directory {
                 sayln!(host, "{reference:<24} {:>10}", "<dir>");
             } else {
@@ -202,6 +222,20 @@ fn ls(host: &mut dyn Host, rest: &str) {
     let outcome = host.list(volume, &mut |host, entry: Entry| {
         any = true;
         let name = core::str::from_utf8(entry.name).unwrap_or("?");
+        if long {
+            let mut joined = [0u8; 192];
+            let reference = if volume.is_empty() {
+                Some(name)
+            } else if volume.len() + 1 + name.len() <= joined.len() {
+                joined[..volume.len()].copy_from_slice(volume.as_bytes());
+                joined[volume.len()] = b'/';
+                joined[volume.len() + 1..volume.len() + 1 + name.len()].copy_from_slice(name.as_bytes());
+                core::str::from_utf8(&joined[..volume.len() + 1 + name.len()]).ok()
+            } else {
+                None
+            };
+            long_prefix(host, reference);
+        }
         if entry.directory {
             say!(host, "{name:<16} {:>10}", "<dir>");
         } else {

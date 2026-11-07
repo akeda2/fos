@@ -21,7 +21,7 @@ use kernel_core::{e1000, netdump::Mac, pci, rtl8139, rtl8168, threecom};
 
 use crate::apic::{self, TICK_HZ};
 use crate::sync::SpinLock;
-use crate::{config, netfs, pmm, power, shell, slots, vm};
+use crate::{config, netfs, pmm, power, sched, shell, slots, vm};
 
 const ETHERTYPE: [u8; 2] = [0x88, 0xb6];
 const TAG_DISCOVER_REQUEST: u8 = 0x02;
@@ -29,6 +29,8 @@ const TAG_DISCOVER_REPLY: u8 = 0x03;
 const TAG_HELLO: u8 = 0x20;
 const TAG_DATA: u8 = 0x21;
 const TAG_BYE: u8 = 0x22;
+/// Keep-alive from a client (no payload): it says the client is still there while a tape waits for input.
+const TAG_PING: u8 = 0x23;
 const TAG_KUP_REQUEST: u8 = 0x3a;
 const TAG_KUP_DATA: u8 = 0x3b;
 const TAG_KUP_STOP: u8 = 0x3c;
@@ -43,6 +45,9 @@ const KUP_BUSY: u8 = 4;
 const DATA_CAPACITY: usize = 1024;
 /// A session whose client has been silent this long can be taken over by another HELLO.
 const STALE_TICKS: u64 = 5 * 60 * TICK_HZ;
+/// A client that has sent PINGs and then stays silent this long is gone: its session ends and its foreground tape is killed.
+/// `term_net.py` pings every 10 s; a client that never pings (older ones) is never expired this way.
+const PING_TIMEOUT_TICKS: u64 = 30 * TICK_HZ;
 /// A KUP transfer that has been silent this long is dead.
 const KUP_STALE_TICKS: u64 = 5 * TICK_HZ;
 
@@ -295,9 +300,11 @@ struct Terminal {
     owner: u64,
     /// The shell's `exit` ended it: the tape reads `SESSION_CLOSED` once the output is drained.
     exited: bool,
+    /// The client has sent a PING, so silence means it is gone.
+    pings: bool,
 }
 impl Terminal {
-    const FREE: Terminal = Terminal { peer: None, nic: 0, activity: 0, owner: 0, exited: false };
+    const FREE: Terminal = Terminal { peer: None, nic: 0, activity: 0, owner: 0, exited: false, pings: false };
     fn open(&self) -> bool {
         self.peer.is_some() || self.owner != 0
     }
@@ -391,7 +398,34 @@ fn close_terminal(slot: usize) {
     }
     RELAYS[slot].lock().length = 0;
     INPUTS[slot].lock().length = 0;
+    end_foreground_tape(slot);
+}
+
+/// The session in `slot` is over: its foreground tape (an `ed` waiting for keys, say) would never get another key and is killed
+/// rather than left running with its files.
+fn end_foreground_tape(slot: usize) {
+    let pid = shell::foreground(slot + 1);
     shell::detach(slot + 1);
+    if pid != 0 {
+        println!("Session {} ended; stopping its tape (process {pid}).", slot + 1);
+        sched::kill(pid);
+    }
+}
+
+/// Service loop: closes the sessions of clients that pinged and then went silent.
+fn expire_silent_clients() {
+    let now = apic::ticks();
+    for slot in 0..TERMINAL_SLOTS {
+        let gone = {
+            let terminals = TERMINALS.lock();
+            let terminal = &terminals[slot];
+            terminal.owner == 0 && terminal.peer.is_some() && terminal.pings && now.wrapping_sub(terminal.activity) >= PING_TIMEOUT_TICKS
+        };
+        if gone {
+            close_terminal(slot);
+            println!("Remote terminal {} timed out.", slot + 1);
+        }
+    }
 }
 
 fn find_terminal(index: usize, source: [u8; 6]) -> Option<usize> {
@@ -413,10 +447,10 @@ fn claim_terminal(index: usize, source: [u8; 6]) -> Option<usize> {
     if !terminals[slot].open() {
         OPEN.fetch_add(1, Ordering::Relaxed);
     }
-    terminals[slot] = Terminal { peer: Some(source), nic: index, activity: now, owner: 0, exited: false };
+    terminals[slot] = Terminal { peer: Some(source), nic: index, activity: now, owner: 0, exited: false, pings: false };
     drop(terminals);
     RELAYS[slot].lock().length = 0;
-    shell::detach(slot + 1);
+    end_foreground_tape(slot);
     Some(slot)
 }
 
@@ -443,6 +477,12 @@ fn handle_terminal(index: usize, source: [u8; 6], tag: u8, payload: &[u8]) -> bo
                 shell::feed_session(slot + 1, byte);
             }
         }
+        TAG_PING => {
+            let Some(slot) = find_terminal(index, source) else { return false };
+            let mut terminals = TERMINALS.lock();
+            terminals[slot].activity = apic::ticks();
+            terminals[slot].pings = true;
+        }
         TAG_BYE => {
             let Some(slot) = find_terminal(index, source) else { return false };
             flush();
@@ -459,7 +499,7 @@ pub fn tape_session_open(pid: u64) -> isize {
     let slot = {
         let mut terminals = TERMINALS.lock();
         let Some(slot) = terminals.iter().position(|terminal| !terminal.open()) else { return -2 };
-        terminals[slot] = Terminal { peer: None, nic: 0, activity: apic::ticks(), owner: pid, exited: false };
+        terminals[slot] = Terminal { peer: None, nic: 0, activity: apic::ticks(), owner: pid, exited: false, pings: false };
         OPEN.fetch_add(1, Ordering::Relaxed);
         slot
     };
@@ -750,6 +790,7 @@ pub fn poll() {
     }
     netfs::serve();
     announce();
+    expire_silent_clients();
     if session_open() {
         feed_tape_sessions();
         flush();

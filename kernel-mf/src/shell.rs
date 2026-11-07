@@ -174,6 +174,11 @@ fn feed_in(id: usize, byte: u8) {
         return;
     }
     kernel_core::lineedit::select(id);
+    // Ctrl-D on an empty line is end of input: it ends a login session (ssh) like `exit`. A network terminal's client ends itself on it.
+    if byte == 0x04 && kernel_core::lineedit::is_empty() && crate::net::exit_session(id) {
+        println!("logout");
+        return;
+    }
     let mut line = [0u8; kernel_core::lineedit::LINE_MAX];
     if let Some(length) = kernel_core::lineedit::feed(byte, &mut line) {
         // A copy: running a command may reset the editor or start a session that feeds it again.

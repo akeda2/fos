@@ -95,6 +95,18 @@ def main():
                                  input=b"echo one\necho two\nexit\n", capture_output=True, timeout=60).stdout
             check(b"\r\n" in raw and b"\n" not in raw.replace(b"\r\n", b""), "shell output ends its lines with CR LF", repr(raw))
             check(result.returncode == 0, "and `exit` ends the session cleanly", f"{result.returncode} {result.stderr}")
+            # Ctrl-D on an empty line ends the session although the client keeps its input open.
+            eof = subprocess.Popen(["ssh", "-T", *[o if o != "-P" else "-p" for o in OPTIONS], "-i", str(KEY), "admin@127.0.0.1"],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            eof.stdin.write(b"echo before-eof\n"); eof.stdin.flush(); time.sleep(2)
+            eof.stdin.write(b"\x04"); eof.stdin.flush()
+            try:
+                eof.wait(timeout=20)
+                ended = True
+            except subprocess.TimeoutExpired:
+                eof.kill()
+                ended = False
+            check(ended, "Ctrl-D on an empty line ends an ssh shell session", "the session stayed open")
             second = shell("admin", "pwd\nexit\n")
             check("(the boot volume)" in second.stdout, "a second login starts at the root with its own folder", second.stdout + second.stderr)
             denied = shell("anna", "echo should-not-run\nexit\n")
