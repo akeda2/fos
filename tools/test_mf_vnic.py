@@ -100,7 +100,7 @@ def main():
         check(get(PORT_A) == 200, "the first lease (10.0.2.15) answers", str(get(PORT_A)))
         check(get(PORT_B) == 200, "the second lease (10.0.2.16) answers", str(get(PORT_B)))
         ok, out = command("nic", "frames", 10)
-        counts = [int(n) for n in re.findall(r"vnic \w+ on nic1.*\n\s+frames: (\d+) received", out)]
+        counts = [int(n) for n in re.findall(r"vnic \w+ on nic1.*\n(?:\s+address .*\n)?\s+frames: (\d+) received", out)]
         check(len(counts) == 2 and all(n > 0 for n in counts), "both virtual interfaces counted received frames", out)
 
         ok, out = command("vnic del files", "kill", 10)
