@@ -47,9 +47,9 @@ def main():
                 guest.pump(1.5)
                 text = guest.text()[mark:]
                 check("ptp: PTPv2 (IEEE 1588)" in text and "settime" in text and "Tape returned" not in text, f"`{line}` shows the tape's help screen without running it", text)
-            mark = guest.send("help hello")
+            mark = guest.send("help opus-bench")
             guest.pump(1.0)
-            check("hello has no help screen" in guest.text()[mark:], "`help` on a tape without a help screen says so", guest.text()[mark:])
+            check("opus-bench has no help screen" in guest.text()[mark:], "`help` on a tape without a help screen says so", guest.text()[mark:])
 
             mark = guest.send("args a b c")
             guest.pump(1.0)
