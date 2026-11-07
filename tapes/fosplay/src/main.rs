@@ -18,7 +18,7 @@ use audio_decode::{Decode, Source, SourceError, ape, flac, mp3, opus, resample::
 use smb::{Client, Error, Handle, Transport};
 use tape_ip::net;
 use tape_ip::tcp::Socket;
-use tape_net::{ArpCache, Ipv4Address, MacAddress};
+use tape_net::{ArpCache, MacAddress};
 use tape_rt::{AudioInfo, AudioStats, KEY_ABORT, KEY_BASE, KEY_NONE, Line, TapeApi, println};
 
 const SMB_PORT: u16 = 445;

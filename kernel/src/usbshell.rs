@@ -4,7 +4,7 @@
 //! What only one kernel has (x86: EHCI, OHCI, MIDI, serial adapters, the boot-disk check; the Pi: nothing more) is in `imp`.
 //! x86-only diagnostics (`usb try`, `usb abort-test`) stay in `term.rs`.
 
-use crate::{usb_hub, xhci};
+use crate::xhci;
 
 pub fn command(rest: &str) {
     match rest.split_whitespace().next() {
