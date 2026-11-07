@@ -66,6 +66,7 @@ pub const TOPICS: &[Topic] = &[
     t("start", "Tapes and services", "start", "Run the boot script `settings/start` again."),
     t("settings", "Tapes and services", "settings migrate", "Move machine-specific files (*.cfg, smbusers, services) from the root into settings/."),
     t("debug", "Debug", "debug slots|revert|colors|crash now|hang now|deadhang now|deadlock now", "Test hooks: slot report, undo a kernel update, console colours; crash, hang, deadhang and deadlock stop the machine on purpose."),
+    t("help", "System", "help [NAME]", "List the commands, or show the usage of a command or tape."),
     t("reboot", "Machine", "reboot", "Restart the machine."),
     t("reset", "Machine", "reset", "Same as `reboot`."),
     t("shutdown", "Machine", "shutdown", "Power off (ACPI)."),
