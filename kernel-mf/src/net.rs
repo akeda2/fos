@@ -114,6 +114,10 @@ pub fn print_registers(number: usize) {
 /// Starts every NIC the drivers know and puts it in the table. Needs interrupts on (the drivers prove their interrupt path).
 pub fn init() {
     nicctl::set_frame_handler(frame_hook);
+    nicctl::set_frame_allocator(|bytes| match pmm::allocate((bytes as u64).div_ceil(pmm::FRAME), None) {
+        Some(address) => vm::direct(address) as *mut u8,
+        None => core::ptr::null_mut(),
+    });
     let mut interfaces = 0;
     for device in pci::devices().filter(|d| d.vendor == e1000::VENDOR_INTEL && e1000::DEVICE_IDS.contains(&d.id)) {
         match e1000::E1000::init(&device, interfaces) {

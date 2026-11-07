@@ -7,7 +7,38 @@ use crate::nic::{self, MAX_NICS};
 /// (a FIFO twice the hardware ring: a tape that does not poll loses the oldest traffic, like a NIC ring
 /// overrun; 64 slots made `nettest` lose small frames long before the NIC did).
 const FRAME_FIFO: usize = 256;
+/// The FIFO storage. The embedded kernels keep it in .bss. With `vnic` (the server kernel, 16 interfaces) .bss would grow by
+/// 6 MiB and the BIOS loader only reserves 8 MiB for a kernel image (`KERNEL_SPAN`, stage2.S), so each interface's FIFO is
+/// taken from the kernel's `set_frame_allocator` function on its first frame instead.
+#[cfg(not(feature = "vnic"))]
 static mut FRAMES: [[u8; 1600]; MAX_NICS * FRAME_FIFO] = [[0; 1600]; MAX_NICS * FRAME_FIFO];
+#[cfg(feature = "vnic")]
+static mut FRAME_STORE: [*mut u8; MAX_NICS] = [core::ptr::null_mut(); MAX_NICS];
+#[cfg(feature = "vnic")]
+static mut FRAME_ALLOCATOR: fn(usize) -> *mut u8 = |_| core::ptr::null_mut();
+
+/// Registers the function that returns `bytes` of writable memory (never freed) for an interface's frame FIFO, or null.
+#[cfg(feature = "vnic")]
+pub fn set_frame_allocator(allocator: fn(usize) -> *mut u8) {
+    unsafe { FRAME_ALLOCATOR = allocator };
+}
+
+/// Where frame slot `position` of interface `index` lives; null when the FIFO could not be allocated (`create` false: not yet).
+#[cfg(not(feature = "vnic"))]
+unsafe fn frame_slot(index: usize, position: usize, _create: bool) -> *mut u8 {
+    unsafe { (core::ptr::addr_of_mut!(FRAMES) as *mut u8).add((index * FRAME_FIFO + position) * 1600) }
+}
+#[cfg(feature = "vnic")]
+unsafe fn frame_slot(index: usize, position: usize, create: bool) -> *mut u8 {
+    unsafe {
+        let store = core::ptr::addr_of_mut!(FRAME_STORE) as *mut *mut u8;
+        if (*store.add(index)).is_null() && create {
+            *store.add(index) = (FRAME_ALLOCATOR)(FRAME_FIFO * 1600);
+        }
+        let base = *store.add(index);
+        if base.is_null() { base } else { base.add(position * 1600) }
+    }
+}
 static mut FRAME_LENGTHS: [usize; MAX_NICS * FRAME_FIFO] = [0; MAX_NICS * FRAME_FIFO];
 /// Hardware receive stamp of each queued frame (0: none), and of the frame `pop_frame` handed out last.
 static mut FRAME_STAMPS: [u64; MAX_NICS * FRAME_FIFO] = [0; MAX_NICS * FRAME_FIFO];
@@ -39,7 +70,12 @@ pub fn queue_frame(index: usize, frame: &[u8], stamp: u64) {
             FRAMES_DROPPED[index] += 1;
         }
         let slot = index * FRAME_FIFO + head;
-        core::slice::from_raw_parts_mut((core::ptr::addr_of_mut!(FRAMES) as *mut u8).add(slot * 1600), frame.len()).copy_from_slice(frame);
+        let storage = frame_slot(index, head, true);
+        if storage.is_null() {
+            FRAMES_DROPPED[index] += 1;
+            return;
+        }
+        core::slice::from_raw_parts_mut(storage, frame.len()).copy_from_slice(frame);
         FRAME_LENGTHS[slot] = frame.len();
         FRAME_STAMPS[slot] = stamp;
         FRAME_HEAD[index] = next;
@@ -76,7 +112,7 @@ pub fn pop_frame(index: usize, out: &mut [u8]) -> usize {
         }
         let slot = index * FRAME_FIFO + FRAME_TAIL[index];
         let length = FRAME_LENGTHS[slot].min(out.len());
-        out[..length].copy_from_slice(core::slice::from_raw_parts((core::ptr::addr_of!(FRAMES) as *const u8).add(slot * 1600), length));
+        out[..length].copy_from_slice(core::slice::from_raw_parts(frame_slot(index, FRAME_TAIL[index], false), length));
         LAST_STAMP[index] = FRAME_STAMPS[slot];
         FRAME_TAIL[index] = (FRAME_TAIL[index] + 1) % FRAME_FIFO;
         length
