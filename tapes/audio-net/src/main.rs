@@ -65,6 +65,7 @@
 #![no_main]
 
 mod bench;
+mod sip;
 mod clock;
 mod duplex;
 use tape_ip::{igmp, net};
@@ -208,6 +209,11 @@ pub struct Options<'a> {
     ptp: bool,
     /// `ptp=l2`: PTP over Ethernet even for RTP.
     ptp_l2: bool,
+    /// `sip`: `call=IP[:PORT]` places a call (empty: wait for one), `sipport=`, `dir=recv` (the caller listens), `require-ptp=`.
+    sip_call: &'a str,
+    sip_port: u16,
+    sip_recv: bool,
+    require_ptp: bool,
     /// `bench`: the machine running `benchserve` (a MAC or an announced name), the tolerated late-or-lost share in ppm,
     /// and the seconds each step streams.
     peer: &'a str,
@@ -238,7 +244,7 @@ pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'
     let mut options = Options {
         proto: Proto::Raw, proto_explicit: false, nic: 0, to: "", rate: 48_000, channels: None, chan: 2, bits: 24, tone: None, target_ms: 6, priority: None, ptime_us: 1000, target_given: false, ptime_given: false, seconds: 0, verbose: false, latency: false,
         ip: "", gateway: "", port: 5004, payload_type: 96, from: None, resample: true, ptp_seed: false, skew_ppm: 0,
-        opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5, group: "", name: "", source: "", adopted_send: false, adopted_receive: false, in_mode: 0, out_mode: 0, in_channels: None, out_channels: None, http: 8000, prebuffer_ms: 0, ptp: true, ptp_l2: false, peer: "", tol_ppm: 100, step_secs: 10,
+        opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5, group: "", name: "", source: "", adopted_send: false, adopted_receive: false, in_mode: 0, out_mode: 0, in_channels: None, out_channels: None, http: 8000, prebuffer_ms: 0, ptp: true, ptp_l2: false, sip_call: "", sip_port: 5060, sip_recv: false, require_ptp: true, peer: "", tol_ppm: 100, step_secs: 10,
     };
     for word in words {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
@@ -297,6 +303,10 @@ pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'
             "peer" => options.peer = value,
             "tol" => options.tol_ppm = bench::parse_percent_ppm(value).ok_or("tol= is a percentage from 0 to 5, like 0.01")?,
             "stepsecs" => options.step_secs = value.parse().ok().filter(|&s| (2..=60).contains(&s)).ok_or("stepsecs= is 2 to 60 seconds")?,
+            "call" => options.sip_call = value,
+            "sipport" => options.sip_port = value.parse().ok().filter(|&p| p != 0).ok_or("sipport= is a UDP port, 1 to 65535")?,
+            "dir" => options.sip_recv = match value { "send" => false, "recv" => true, _ => return Err("dir= is send or recv") },
+            "require-ptp" => options.require_ptp = match value { "on" => true, "off" => false, _ => return Err("require-ptp= is on or off") },
             "verbose" => options.verbose = true,
             "latency" => options.latency = true,
             "ptp" => {
@@ -472,6 +482,9 @@ impl Transport {
 
     /// Per loop pass: sends a due IGMP answer and, given a frame, consumes it if it is IGMP. True if consumed.
     pub fn igmp_service(&mut self, api: &TapeApi, nic: usize, frame: Option<&[u8]>) -> bool {
+        if sip::service(api, frame) {
+            return true;
+        }
         match frame {
             None => {
                 self.announce_service(api, nic);
@@ -656,8 +669,8 @@ pub fn send(api: &'static TapeApi, options: &Options) {
             break;
         }
         transport.announce_service(api, options.nic);
-        if transport.ptp {
-            if duplex::shared() { clock::poll(api) } else { clock::pump(api, &mut ptp_frame) }
+        if transport.ptp || sip::active() {
+            if sip::active() { sip::pump(api, &mut ptp_frame) } else if duplex::shared() { clock::poll(api) } else { clock::pump(api, &mut ptp_frame) }
         }
         let have_packet = if let Some(frequency) = tone {
             // Paced by the clock: packet number `sent` is due at started + sent * packet time.
@@ -1562,6 +1575,7 @@ pub fn run_once(api: &'static TapeApi, mode: &str, options: &Options<'static>) {
     match mode {
         "duplex" => duplex::run(api, options),
         "serve" => serve::serve(api, options),
+        "sip" => sip::run(api, options),
         "benchserve" => bench::serve(api, options),
         "bench" => {
             bench::master(api, options, false);
@@ -1593,7 +1607,7 @@ pub extern "C" fn tape_main(real: &'static TapeApi) {
     let mut kept = 0;
     for &word in &words[..count] {
         match word.strip_prefix("mode=").unwrap_or(word) {
-            "send" | "recv" | "duplex" | "list" | "serve" | "bench" | "benchserve" => mode = word.strip_prefix("mode=").unwrap_or(word),
+            "send" | "recv" | "duplex" | "list" | "serve" | "bench" | "benchserve" | "sip" => mode = word.strip_prefix("mode=").unwrap_or(word),
             _ => {
                 options_words[kept] = word;
                 kept += 1;
@@ -1681,6 +1695,10 @@ tape_rt::tape_help!(br#"audio-net: audio over the network (raw Ethernet, RTP or 
   tape run audio-net bench peer=NAME|MAC|IP [proto=avtp|rtp] [rate=48000] [bits=24]
                     [ch=1-2] [tol=0.01] [stepsecs=10]   find the lowest
                     ptime/target both directions carry; only this one runs
+  tape run audio-net sip ip=A.B.C.D/N [call=IP[:PORT]] [dir=send|recv]
+                    [require-ptp=on|off] [sipport=5060]   SIP/SDP call control
+                    (AES67): wait for a call, or place one; the call sets the
+                    stream, then send/recv options (src=, ch=, secs=) apply
   tape run audio-net @audio.cfg     options from a file
   device=N picks the audio device. Escape stops. See AUDIO.md.
 "#);
