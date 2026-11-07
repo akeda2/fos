@@ -10,6 +10,7 @@ audio-bench = { path = "../../crates/audio-bench" }
 tape-panel = { path = "../../crates/tape-panel" }
 tape-net = { path = "../../crates/tape-net" }
 tape-ip = { path = "../../crates/tape-ip" }
+tape-sip = { path = "../../crates/tape-sip" }
 opus-codec = { path = "../../crates/opus-codec" }
 ptp-tape = { path = "../ptp" }
 

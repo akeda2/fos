@@ -18,6 +18,7 @@ dependencies = [
  "tape-net",
  "tape-panel",
  "tape-rt",
+ "tape-sip",
 ]
 
 [[package]]
@@ -78,4 +79,11 @@ name = "tape-rt"
 version = "0.1.0"
 dependencies = [
  "fosfor-abi",
+]
+
+[[package]]
+name = "tape-sip"
+version = "0.1.0"
+dependencies = [
+ "audio-wire",
 ]

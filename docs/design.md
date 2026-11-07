@@ -1770,6 +1770,19 @@ rack's SMB use.
 The mf shell passes ESC `[` or ESC `O` followed by a letter to the foreground tape as a cursor key; a lone ESC (nothing follows
 within `ESCAPE_WAIT_TICKS`, about 30 ms) stops the tape. `make test-mf-tape` types a cursor key to `ed` and checks it survives.
 
+## SIP and SDP for AES67 streams: `audio-net sip`
+
+`crates/tape-sip` (`no_std`, host tests) holds SIP over UDP (RFC 3261 subset), an SDP reader for AES67 streams (L16/L24,
+`ptime`, `ts-refclk` PTP grandmaster, `a=sendonly/recvonly`) and a one-call user agent (INVITE/ACK/BYE/OPTIONS, 486 when
+busy, 488 with a `Warning:` text for a bad format or PTP refusal, T1 retransmission). `tapes/audio-net/src/sip.rs` runs it:
+`audio-net sip ip=A.B.C.D/N` waits for a call, `call=IP[:PORT]` places one (`dir=send` default, `dir=recv` listens).
+Unless `require-ptp=off`, a stream not on the grandmaster this machine is locked to is refused (the AES67 default). A
+call that comes up runs the ordinary RTP `send` or `receive` loop with the negotiated address, port, payload type,
+channels, bits and packet time; those loops pass every frame to `sip::service`, so BYE, OPTIONS and retransmissions are
+handled while audio flows and a BYE ends the loop. No registration, proxies, authentication or re-INVITE; one call
+at a time. `make test-sip` runs it between two guests (488 refusal, a tone call, BYE, a second call). Not checked against
+a real SIP or AES67 device yet.
+
 ## ebb: the full-screen editor, and console SGR
 
 `tape run ebb NAME [tab=N]` (`tapes/ebb`) is an embedded cousin of the user's `ebba` editor. The text engine is `crates/edit-core`
