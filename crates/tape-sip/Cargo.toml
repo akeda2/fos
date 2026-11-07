@@ -1,0 +1,17 @@
+[package]
+name = "tape-sip"
+version = "0.1.0"
+edition = "2024"
+description = "SIP (RFC 3261, UDP) and SDP for AES67 audio streams: message parsing, an SDP offer/answer reader and a one-call user agent"
+license = "MIT"
+
+[lib]
+name = "tape_sip"
+path = "src/lib.rs"
+
+[dependencies]
+audio-wire = { path = "../audio-wire" }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
