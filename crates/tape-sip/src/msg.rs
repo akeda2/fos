@@ -84,6 +84,11 @@ impl<'a> Message<'a> {
         })
     }
 
+    /// The header lines as written, in order (for a proxy that copies a message with a few changes).
+    pub fn lines(&self) -> impl Iterator<Item = &'a str> {
+        self.headers.split("\r\n").filter(|line| !line.is_empty())
+    }
+
     pub fn header(&self, name: &'a str) -> Option<&'a str> {
         self.headers(name).next()
     }
@@ -114,6 +119,12 @@ pub fn reason(code: u16) -> &'static str {
         100 => "Trying",
         180 => "Ringing",
         200 => "OK",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        480 => "Temporarily Unavailable",
+        483 => "Too Many Hops",
+        503 => "Service Unavailable",
         400 => "Bad Request",
         405 => "Method Not Allowed",
         415 => "Unsupported Media Type",

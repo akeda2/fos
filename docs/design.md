@@ -1783,6 +1783,18 @@ handled while audio flows and a BYE ends the loop. No registration, proxies, aut
 at a time. `make test-sip` runs it between two guests (488 refusal, a tone call, BYE, a second call). Not checked against
 a real SIP or AES67 device yet.
 
+**`sipd`: registrar and stateless proxy.** `tapes/sipd` is a service (`run sipd users=sipusers ip=A.B.C.D/N &2`) on
+`crates/tape-sip` `registrar`. REGISTER is answered with a Digest challenge (`qop=auth`, MD5; nonces are stateless: the time
+plus MD5 of a boot secret, the time and the client IP, valid 120 s); `users=` is a file of `user:password` lines (`#`
+comments), read again every 30 s. A binding keeps the address the REGISTER came from (NAT) and the advertised Contact, expires
+in at most an hour, and the table holds 16. Requests from an address with a live binding are proxied: a request URI naming
+the server's own address is looked up by user and sent to the binding, others go where the URI says; the proxy adds its Via
+(deterministic branch) and, on INVITE, Record-Route, so that mid-dialog requests (BYE) come back through it and keep NAT
+bindings open; responses lose the top Via and follow the next one's `received`/`rport`. Max-Forwards 0 gives 483. Limits:
+signalling only (SDP and RTP pass untouched, so media is end to end and NAT in the media path needs a relay), UDP and IPv4
+only, no forking, no nonce-count replay check, and the proxy trusts a registered IP (not port). `make test-sipd` runs it
+with two host sockets as phones; not checked with a real SIP phone yet.
+
 ## ebb: the full-screen editor, and console SGR
 
 `tape run ebb NAME [tab=N]` (`tapes/ebb`) is an embedded cousin of the user's `ebba` editor. The text engine is `crates/edit-core`

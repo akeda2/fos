@@ -137,7 +137,7 @@ LOADER_EFI := $(CARGO_TARGET_DIR)/x86_64-unknown-uefi/release/fosfor-loader.efi
 KERNEL_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel
 IMAGE := $(OUT)/fosfor.img
 # tapes: one crate each under tapes/ (shared libraries live in crates/), each built to build/cargo-target/x86_64-fos-tape/release/NAME.
-TAPES := fosplay netcheck hello abibad thrcheck fscheck calc memtest nettest bridge router ip-chat telnet net-chat ed ebb httpd smbd sshd smb smbmount sshmount ssh web record recorder play audio-net ptp fterm fpcheck gfxcheck ltas gonio clock kaffe organ strings tape-echo epiano phono gpiopanel miccal frt60 compander
+TAPES := fosplay netcheck hello abibad thrcheck fscheck calc memtest nettest bridge router ip-chat telnet net-chat ed ebb httpd sipd smbd sshd smb smbmount sshmount ssh web record recorder play audio-net ptp fterm fpcheck gfxcheck ltas gonio clock kaffe organ strings tape-echo epiano phono gpiopanel miccal frt60 compander
 # Hard-float tapes (target x86_64-fos-tape-fp, SSE2/AVX2; the kernel enables SSE before they start) build into their own directory.
 FP_TAPES := sshd sshmount ssh fosplay fpcheck ltas gonio clock kaffe audio-net organ strings tape-echo epiano phono gpiopanel miccal frt60 compander
 tape_dir = x86_64-fos-tape$(if $(filter $(1),$(FP_TAPES)),-fp)
@@ -167,7 +167,7 @@ OPUS_A64_CFLAGS := --target=aarch64-unknown-none-elf -isystem crates/opus-codec/
 TAPE_LINK := -C link-arg=-T../tape.ld -C relocation-model=pic -C link-arg=-pie -C link-arg=--no-dynamic-linker -C link-arg=-znorelro
 
 
-.PHONY: opus-lib-aarch64 image-pi4 tapes-aarch64 loader-aarch64 kernel-aarch64 image-aarch64 test-aarch64-boot test-aarch64-faults test-aarch64-kup test-kup-serial opus-lib tape-opus-bench loader kernel image run test test-faults test-keyboard test-usb-boot test-config test-tapes test-nettest test-debug-mode test-msi test-router test-nettapes test-hub test-disks test-stick-guids test-format test-fosfs4 test-wildcards test-v4-boot test-mounts test-ed test-ebb test-httpd test-smbd test-smb-client test-smbmount test-smbd-reexport test-web test-diag test-fp test-fs-read-at test-vfs test-vfs-write test-gfx test-ltas test-gonio test-clock test-kaffe test-organ test-strings test-tape-echo test-epiano test-phono test-split test-usb-audio test-hda test-audio-net test-sip test-services test-audio-services test-loopback test-ptp test-ptp-l2 test-ptp-e1000e test-peers release test-fosadm test-fosadm-serial test-ptp-both test-ptp-ntp test-audio-ptp test-audio-ptp-raw test-audio-ptp-avtp test-audio-serve test-record test-recorder test-recorder-fat test-fat-shell test-format-exfat test-recorder-format test-grow test-install test-lineedit test-scripts test-nic test-netfs test-tapesync test-gpio test-gpiopanel test-miccal test-frt60 test-compander test-mouse test-fosplay test-flac test-rtl8139
+.PHONY: opus-lib-aarch64 image-pi4 tapes-aarch64 loader-aarch64 kernel-aarch64 image-aarch64 test-aarch64-boot test-aarch64-faults test-aarch64-kup test-kup-serial opus-lib tape-opus-bench loader kernel image run test test-faults test-keyboard test-usb-boot test-config test-tapes test-nettest test-debug-mode test-msi test-router test-nettapes test-hub test-disks test-stick-guids test-format test-fosfs4 test-wildcards test-v4-boot test-mounts test-ed test-ebb test-httpd test-smbd test-smb-client test-smbmount test-smbd-reexport test-web test-diag test-fp test-fs-read-at test-vfs test-vfs-write test-gfx test-ltas test-gonio test-clock test-kaffe test-organ test-strings test-tape-echo test-epiano test-phono test-split test-usb-audio test-hda test-audio-net test-sip test-sipd test-services test-audio-services test-loopback test-ptp test-ptp-l2 test-ptp-e1000e test-peers release test-fosadm test-fosadm-serial test-ptp-both test-ptp-ntp test-audio-ptp test-audio-ptp-raw test-audio-ptp-avtp test-audio-serve test-record test-recorder test-recorder-fat test-fat-shell test-format-exfat test-recorder-format test-grow test-install test-lineedit test-scripts test-nic test-netfs test-tapesync test-gpio test-gpiopanel test-miccal test-frt60 test-compander test-mouse test-fosplay test-flac test-rtl8139
 
 # The loader: a PE/COFF UEFI application (x86_64-unknown-uefi), built with the same
 # pinned nightly and -Z build-std as everything else here.
@@ -609,6 +609,10 @@ test-audio-net: image
 # audio-net sip: SIP/SDP call control (AES67 style) between two guests; PTP-required refusal, a call with a tone, a second call.
 test-sip: image
 	python3 tools/test_sip.py
+
+# sipd: a SIP registrar and proxy service on a user-mode NIC; digest REGISTER, a proxied INVITE and its answer.
+test-sipd: image
+	python3 tools/test_sipd.py
 
 # ptp: a master and a slave guest; the slave must lock on, measure a small offset and lose no Sync.
 test-ptp: image

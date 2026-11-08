@@ -8,6 +8,9 @@
 //! owns the clock; nothing here touches a socket.
 #![cfg_attr(not(test), no_std)]
 
+pub mod auth;
+pub mod md5;
 pub mod msg;
+pub mod registrar;
 pub mod sdp;
 pub mod ua;
