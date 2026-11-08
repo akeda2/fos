@@ -46,6 +46,8 @@ pub enum Start<'s> {
     Exec(&'s str),
 }
 const MSG_USERAUTH_BANNER: u8 = 53;
+const MSG_USERAUTH_INFO_REQUEST: u8 = 60;
+const MSG_USERAUTH_INFO_RESPONSE: u8 = 61;
 const MSG_EXT_INFO: u8 = 7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,8 +61,10 @@ pub enum Error {
     Protocol(&'static str),
     /// `connect`'s function did not trust the server's host key.
     HostKey,
-    /// The server refused the key.
+    /// The server refused the key or password.
     Auth,
+    /// Refused, and the server offers neither a password nor keyboard-interactive login.
+    AuthNoPassword,
     /// An SFTP status other than OK (`NO_SUCH_FILE` and friends, see the `STATUS_*` constants).
     Status(u32),
 }
@@ -79,6 +83,7 @@ impl Error {
             Error::Protocol(why) => why,
             Error::HostKey => "the host key is not the one on record",
             Error::Auth => "the server did not accept the login",
+            Error::AuthNoPassword => "the server does not allow password login (public key only)",
             Error::Status(STATUS_NO_SUCH_FILE) => "no such file",
             Error::Status(STATUS_PERMISSION_DENIED) => "permission denied",
             Error::Status(_) => "the server refused",
@@ -475,11 +480,44 @@ impl<'a, L: Link> Client<'a, L> {
             })?;
             }
         }
+        let mut interactive_tried = false;
         loop {
-            self.read_packet(false)?;
+            let length = self.read_packet(false)?;
             match self.rx.buffer[0] {
                 MSG_USERAUTH_SUCCESS => break,
-                MSG_USERAUTH_FAILURE => return Err(Error::Auth),
+                MSG_USERAUTH_FAILURE => {
+                    if !matches!(login, Login::Password(_)) {
+                        return Err(Error::Auth);
+                    }
+                    let mut reader = Reader::new(&self.rx.buffer[1..length]);
+                    let methods = reader.string().unwrap_or(b"");
+                    let has = |name: &[u8]| methods.split(|&byte| byte == b',').any(|method| method == name);
+                    // Many servers (PAM) offer the password only as keyboard-interactive.
+                    if has(b"keyboard-interactive") && !interactive_tried {
+                        interactive_tried = true;
+                        self.send(|out| {
+                            out.u8(MSG_USERAUTH_REQUEST).string(user.as_bytes()).string(b"ssh-connection").string(b"keyboard-interactive");
+                            out.string(b"").string(b"");
+                        })?;
+                        continue;
+                    }
+                    return Err(if has(b"password") || has(b"keyboard-interactive") { Error::Auth } else { Error::AuthNoPassword });
+                }
+                // Keyboard-interactive: answer every prompt with the password.
+                MSG_USERAUTH_INFO_REQUEST => {
+                    let Login::Password(password) = login else { return fail("an unexpected message while logging in") };
+                    let mut reader = Reader::new(&self.rx.buffer[1..length]);
+                    reader.string().ok_or(bad)?;
+                    reader.string().ok_or(bad)?;
+                    reader.string().ok_or(bad)?;
+                    let count = reader.u32().ok_or(bad)?;
+                    self.send(|out| {
+                        out.u8(MSG_USERAUTH_INFO_RESPONSE).u32(count);
+                        for _ in 0..count {
+                            out.string(password);
+                        }
+                    })?;
+                }
                 // A banner, or the extension list OpenSSH sends before the answer.
                 MSG_USERAUTH_BANNER | MSG_EXT_INFO => {}
                 _ => return fail("an unexpected message while logging in"),

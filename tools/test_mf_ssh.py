@@ -106,6 +106,12 @@ def main():
             check("hunter2zz" not in out and "did not accept the login" in out, "the password is not echoed; a refusal is reported", out)
 
             mark = len(log)
+            qemu.stdin.write(f"tape ssh {user}@10.0.2.100 pw true\n".encode())
+            qemu.stdin.flush()
+            check(wait_for("password: ", 30, mark), "`USER@HOST password` asks for the password too", log[mark:].decode("utf8", "replace"))
+            line("x", "fos> ", 60)
+
+            mark = len(log)
             qemu.stdin.write(f"tape ssh {user}@10.0.2.100\n".encode())
             qemu.stdin.flush()
             time.sleep(6)
