@@ -1794,6 +1794,7 @@ bindings open; responses lose the top Via and follow the next one's `received`/`
 signalling only (SDP and RTP pass untouched, so media is end to end and NAT in the media path needs a relay), UDP and IPv4
 only, no forking, no nonce-count replay check, and the proxy trusts a registered IP (not port). `make test-sipd` runs it
 with two host sockets as phones; not checked with a real SIP phone yet.
+Examples: `tapes/sipd/sipd.cfg` (settings) and `tapes/sipd/sipusers.example` (users file).
 
 ## ebb: the full-screen editor, and console SGR
 

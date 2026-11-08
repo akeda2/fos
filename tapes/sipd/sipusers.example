@@ -1,0 +1,6 @@
+# sipd users file: user:password per line, # starts a comment.
+# Install as settings/sipusers (it holds plain passwords: keep it off shared disks).
+# sipd reads it again every 30 s, so users can be added while it runs.
+studio-a:change-me-1
+studio-b:change-me-2
+reporter:a password may contain: colons
