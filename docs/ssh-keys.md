@@ -36,7 +36,7 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...
 * **More than one identity:** `tape ssh keygen key=work` makes and prints `settings/work` instead; use it with
   `tape ssh key=work user@host`. (Any file name works; `ssh_key` is the default.)
 * The line printed has no comment. The Linux side does not need one; if you want to tell keys apart in
-  `authorized_keys`, add a word after the key when you paste it, for example `... AAAAC3...xyz fos-rack`.
+  `authorized_keys`, add a word after the key when you paste it, for example `... AAAAC3...xyz fos-box`.
 
 Get the line to the Linux host by selecting it in a terminal that shows the fos console (a `term net` or serial session)
 and pasting it as in part 2. Do not fetch `settings/ssh_key` to read the public line: that file is the secret, and
@@ -44,12 +44,12 @@ and pasting it as in part 2. Do not fetch `settings/ssh_key` to read the public 
 
 ## 2. Import the key on the Linux host
 
-On the Linux host, logged in as the account that fos should become (here `akeda`):
+On the Linux host, logged in as the account that fos should become (here `alice`):
 
 ```
 mkdir -p ~/.ssh
 chmod 700 ~/.ssh
-echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...paste-the-whole-line... fos-rack' >> ~/.ssh/authorized_keys
+echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...paste-the-whole-line... fos-box' >> ~/.ssh/authorized_keys
 chmod 600 ~/.ssh/authorized_keys
 ```
 
@@ -59,9 +59,9 @@ chmod 600 ~/.ssh/authorized_keys
 * sshd on Linux ignores the file if the permissions are loose: `~/.ssh` 700 (or tighter), `authorized_keys` 600 (or 644)
   and your home directory not group- or world-writable (`StrictModes yes`, the default).
 * To limit what the key may do, put options in front of the key, for example
-  `restrict,command="/usr/bin/uptime" ssh-ed25519 AAAA... fos-rack` (see `man sshd`, section AUTHORIZED_KEYS FILE FORMAT).
+  `restrict,command="/usr/bin/uptime" ssh-ed25519 AAAA... fos-box` (see `man sshd`, section AUTHORIZED_KEYS FILE FORMAT).
   `from="192.168.0.0/24"` ties the key to an address range.
-* Check the file has the line: `grep -c fos-rack ~/.ssh/authorized_keys` (1) and
+* Check the file has the line: `grep -c fos-box ~/.ssh/authorized_keys` (1) and
   `ssh-keygen -lf ~/.ssh/authorized_keys` (one fingerprint per key line).
 * The Linux server must allow public keys: `PubkeyAuthentication yes` (the default) and, if `PubkeyAcceptedAlgorithms` is
   set in `/etc/ssh/sshd_config`, it has to include `ssh-ed25519`. Check with `sudo sshd -T | grep -i pubkey`.
@@ -73,10 +73,10 @@ is in a file there: `ssh-copy-id -f -i fos_pub.txt user@host` (`-f` forces it wi
 ## 3. Log in from fos
 
 ```
-tape ssh akeda@192.168.0.10 uptime         # run one command
-tape ssh akeda@192.168.0.10                # a login shell on the fos console; Esc leaves
-tape ssh akeda@192.168.0.10:2222           # another port
-run sshmount akeda@192.168.0.10 as=nas path=/srv/music &1   # a folder as the volume //nas
+tape ssh alice@192.168.0.10 uptime         # run one command
+tape ssh alice@192.168.0.10                # a login shell on the fos console; Esc leaves
+tape ssh alice@192.168.0.10:2222           # another port
+run sshmount alice@192.168.0.10 as=nas path=/srv/music &1   # a folder as the volume //nas
 ```
 
 The first time fos meets a server it remembers the server's host key in `settings/known_hosts` (trust on first use) and
@@ -92,7 +92,7 @@ line of that host) or somebody sits between you and it (then do not). To compare
 `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`: the `SHA256:...` must be the one in fos's `known_hosts`. Servers
 that have no ed25519 host key cannot be reached; `ssh-keyscan -t ed25519 host` tells you if there is one.
 
-**No key on the Linux side yet?** `tape ssh password akeda@192.168.0.10` asks for the account's password (typed blind,
+**No key on the Linux side yet?** `tape ssh pw alice@192.168.0.10` (or `password`) asks for the account's password (typed blind,
 Esc cancels) and opens a shell on the server. That works only if the server has `PasswordAuthentication yes`. Use it
 once to do part 2 from fos itself: in that shell run the commands of part 2 with the line `tape ssh keygen` printed.
 (Do not give them as a command on the fos shell line: the fos shell would take the `>>` itself.)
@@ -114,7 +114,7 @@ that the fos machines already trust, so look before you replace it (`ssh-keygen 
 **On fos**, add the public line to `settings/authorized_keys` (one line per key, at most 16):
 
 ```
-echo 'user=akeda,uid=0,gid=0,shell ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...' >> settings/authorized_keys
+echo 'user=alice,uid=0,gid=0,shell ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...' >> settings/authorized_keys
 ```
 
 * `user=NAME` is the name you type in `ssh NAME@host`; `uid=`/`gid=` decide which files the account may see (`0` sees
@@ -125,22 +125,22 @@ echo 'user=akeda,uid=0,gid=0,shell ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...' >> s
   `tools/foscopy.py --iface IF HOST:disk1/settings/authorized_keys .`, edit, and `tools/foscopy.py ... FILE :disk1/settings/authorized_keys`
   (`fosadm put` cannot write into folders).
 * sshd reads the file when it starts: **restart the service** after a change. On a machine that runs it as a service
-  (`settings/services`) that is `service restart NAME`, NAME being the first word of its line (`ssh` on rack, from
+  (`settings/services`) that is `service restart NAME`, NAME being the first word of its line (`ssh` on one machine, from
   `ssh restart sshd @sshd.cfg &ssh`); otherwise stop it with `kill PID` and run `run sshd @sshd.cfg &N` again.
 
 **Log in**, naming the key so the client does not offer others first:
 
 ```
-ssh -i ~/.ssh/fos_ed25519 -o IdentitiesOnly=yes akeda@rack7
-sftp -i ~/.ssh/fos_ed25519 -o IdentitiesOnly=yes akeda@rack7
-sshfs -o IdentityFile=~/.ssh/fos_ed25519,IdentitiesOnly=yes akeda@rack7:/ /mnt/fos
+ssh -i ~/.ssh/fos_ed25519 -o IdentitiesOnly=yes alice@fosbox
+sftp -i ~/.ssh/fos_ed25519 -o IdentitiesOnly=yes alice@fosbox
+sshfs -o IdentityFile=~/.ssh/fos_ed25519,IdentitiesOnly=yes alice@fosbox:/ /mnt/fos
 ```
 
 or once and for all in `~/.ssh/config`:
 
 ```
-Host rack7
-    User akeda
+Host fosbox
+    User alice
     IdentityFile ~/.ssh/fos_ed25519
     IdentitiesOnly yes
 ```
@@ -154,7 +154,7 @@ sshd (and its `ssh`) offer `curve25519-sha256` and no post-quantum exchange yet.
 The first time you connect, the client asks whether to trust the host key. The fingerprint sshd prints in its start
 message (and `settings/ssh_host_key` keeps) is the one to compare with; after the question OpenSSH stores it in
 `~/.ssh/known_hosts`. If fos's host key file is deleted, sshd makes a new key and every client then warns about a changed
-key (`ssh-keygen -R rack7` removes the old line on the Linux side).
+key (`ssh-keygen -R fosbox` removes the old line on the Linux side).
 
 ## 5. Are these the same key?
 

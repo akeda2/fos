@@ -16,7 +16,7 @@ use tape_ip::tcp::Socket;
 use tape_rt::*;
 
 tape_rt::tape_help!(
-    br#"ssh USER@HOST[:PORT] [key=NAME | password] [COMMAND...]
+    br#"ssh USER@HOST[:PORT] [key=NAME | password|pw] [COMMAND...]
 ssh keygen [key=NAME]
 Opens a login shell on another machine over SSH, on this console, or runs
 COMMAND there and prints its output (then the exit status, if it is not 0).
@@ -25,9 +25,9 @@ the echo and the line editing; the console understands ANSI colours and
 cursor movement, so a full-screen program may not look right.
 Login is by key: `ssh keygen` makes settings/ssh_key (key=NAME: another file,
 shared with sshmount) and prints its line; put that line in
-~/.ssh/authorized_keys on the server. With `password` the tape asks for the
-account's password instead (typed blind, Esc cancels): for a first login on a
-machine that does not have the key yet.
+~/.ssh/authorized_keys on the server. With `password` (or `pw`) the tape asks
+for the account's password instead (typed blind, Esc cancels): for a first
+login on a machine that does not have the key yet.
 The server's key is remembered in settings/known_hosts the first time and
 checked afterwards: a changed key is refused (edit the file to accept it).
 The tape takes its address from DHCP on the active NIC (`nic use N`).
@@ -51,18 +51,20 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let mut rest = core::str::from_utf8(tape_rt::args()).unwrap_or("").trim();
     let (mut key_file, mut keygen, mut password, mut target, mut command) = ("ssh_key", false, false, None, "");
     while !rest.is_empty() {
+        let whole = rest;
         let (word, after) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
         rest = after.trim_start();
         if let Some(value) = word.strip_prefix("key=") {
             key_file = value;
-        } else if word == "password" && target.is_none() {
+        } else if word == "password" || word == "pw" {
             password = true;
         } else if word == "keygen" && target.is_none() {
             keygen = true;
-        } else {
-            // The first other word is the target, everything after it the command.
+        } else if target.is_none() {
             target = Some(word);
-            command = rest.trim_end();
+        } else {
+            // The first word after the target that is not an option starts the command.
+            command = whole.trim_end();
             break;
         }
     }
@@ -105,7 +107,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             if !trust.refused {
                 println!("ssh: {user}@{host}: {}.", error.describe());
                 if password && matches!(error, Error::Auth) {
-                    println!("ssh: the server may not allow password login.");
+                    println!("ssh: wrong password, or the server does not allow password login.");
                 }
             }
             return;
