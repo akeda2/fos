@@ -18,8 +18,16 @@ through the `Members` trait. Stages:
    (`mdadm --bitmap=none` when creating; mdadm adds a bitmap by default only on large arrays). Nothing here resyncs a
    dirty or degraded array or re-adds a returned member; use Linux for that.
 3. RAID 0 and RAID 10 (striping arithmetic), 4. RAID 5/6 (parity; the write hole needs the journal or a bitmap).
-5. Kernel glue: an `md` volume in `kernel-core` giving `ext4vol` a `Device` over the array; `mdinfo`/`assemble` shell
-   commands. Not started.
+5. **Kernel glue** (done in kernel-mf, `kernel-mf/src/mdvol.rs`): the assembled array is registered as one more disk
+   (`block::Backend::Md`), so `disks`, `ext4 diskN`, `fstab`, `mount` and `@LABEL` work on it unchanged. Members are whole
+   disks or GPT "Linux RAID" partitions. `md auto` in `settings` starts the `md-assemble` thread at boot; boot never waits
+   for it. It waits up to `md wait N` seconds (default 10) for every member, then assembles with what it has (degraded:
+   loud warning), retrying with a 1, 2, 4 ... 30 s pause (and at once when a disk appears) until it succeeds. The array is
+   opened for writing on the first write and closed clean after 3 idle seconds, on `md stop`, `shutdown` and `reboot`;
+   only a crash during a write leaves it dirty. A dirty array is read-only until `md force-rw`. A failing member costs a
+   failed transfer, never a stall (reads fall back, writes drop the member). Commands: `md`, `md assemble`, `md stop`,
+   `md force-rw`. One array per machine for now. `make test-mf-md` boots QEMU with a hand-built mirror, reads and writes
+   ext4 on it, checks the superblocks and mirrors on the host and boots again with one member (degraded).
 
 `cargo run --example probe -- DISK1 DISK2 [--dump FILE]` (in `crates/md`) assembles real members read-only, prints what
 `mdadm --examine` should agree with and compares the mirrors; `--dump` writes the array so `fsck.ext4 -n` can check it. `--write-test` (members opened read-write) starts the array,

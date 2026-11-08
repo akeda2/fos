@@ -19,6 +19,18 @@ static mut CRASH_ON_BOOT: bool = false;
 static mut WATCHDOG: Option<u32> = None;
 static mut SWEDISH: bool = false;
 static mut NO_MSI: bool = false;
+static mut MD_AUTO: bool = false;
+static mut MD_WAIT: u64 = 10;
+
+/// `md auto` in `settings`: a thread assembles a Linux md array at boot (see `mdvol`).
+pub fn md_auto() -> bool {
+    unsafe { MD_AUTO }
+}
+
+/// `md wait N` in `settings`: seconds to wait for all members before assembling degraded (default 10).
+pub fn md_wait() -> u64 {
+    unsafe { MD_WAIT }
+}
 
 /// `keymap sv` (or `se`, `fi`) in `settings`: what USB keyboards type. US otherwise.
 pub fn swedish() -> bool {
@@ -187,6 +199,17 @@ pub fn load() {
             if line.split_whitespace().next() == Some("no-msi") {
                 unsafe { NO_MSI = true };
                 println!("settings: no-msi -- devices are polled.");
+            }
+            if line.split_whitespace().next() == Some("md") {
+                let mut parts = line.split_whitespace().skip(1);
+                match (parts.next(), parts.next().and_then(|word| word.parse::<u64>().ok())) {
+                    (Some("auto"), _) => {
+                        unsafe { MD_AUTO = true };
+                        println!("settings: md auto -- a Linux md array is assembled in the background.");
+                    }
+                    (Some("wait"), Some(seconds)) => unsafe { MD_WAIT = seconds },
+                    _ => println!("settings: `{line}` ignored (md auto | md wait SECONDS)."),
+                }
             }
             if let Some(key @ ("foreground" | "background")) = line.split_whitespace().next() {
                 let name = line.split_whitespace().nth(1).unwrap_or("");
