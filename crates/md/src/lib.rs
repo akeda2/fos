@@ -6,8 +6,8 @@
 //! mirror and reads from it. The caller supplies the members through [`Members`], so the same code serves the kernel's
 //! block layer and host tests over byte vectors.
 //!
-//! Stage one is read-only RAID 1. Writes (which must bump the event count and the superblock in the right order),
-//! RAID 0/10 and RAID 5/6 come later; see `docs/md.md`.
+//! RAID 1 reads and writes are done (writes follow md's order: dirty mark, data, clean mark); RAID 0/10 and RAID 5/6
+//! come later; see `docs/md.md`.
 #![cfg_attr(not(test), no_std)]
 
 pub mod raid1;
@@ -28,8 +28,10 @@ pub enum Error {
     NoMembers,
     /// The array has fewer members than it needs to be read (or the members disagree about the array).
     Degraded,
-    /// A read beyond the array's end, or a buffer that is not whole sectors.
+    /// A read or write beyond the array's end, or a buffer that is not whole sectors.
     Range,
+    /// The array is not open for writing (or is already).
+    NotWritable,
 }
 
 /// The disks an array is assembled from, numbered by the caller from 0.
@@ -40,4 +42,12 @@ pub trait Members {
     fn sectors(&self, member: usize) -> u64;
     /// Reads whole sectors from `member`, addressed from its first sector.
     fn read(&mut self, member: usize, lba: u64, buffer: &mut [u8]) -> Result<(), Error>;
+    /// Writes whole sectors to `member`. Read-only users need not provide it.
+    fn write(&mut self, _member: usize, _lba: u64, _buffer: &[u8]) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    /// Returns once everything written to `member` is on the medium (a cache flush).
+    fn flush(&mut self, _member: usize) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
 }

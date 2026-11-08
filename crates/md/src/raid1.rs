@@ -6,18 +6,20 @@
 //! flagged as still recovering is left out too. Reads come from the first usable member and fall back to the next when
 //! one fails. Nothing is written, so an array in the middle of a resync (`dirty`) is read but never repaired here.
 
-use crate::superblock::{self, Superblock, FEATURE_BAD_BLOCKS, FEATURE_BITMAP, FEATURE_RECOVERY_OFFSET, LEVEL_RAID1, READ_BYTES, ROLE_FAULTY};
+use crate::superblock::{self, Superblock, FEATURE_BAD_BLOCKS, FEATURE_BITMAP, FEATURE_RECOVERY_OFFSET, LEVEL_RAID1, READ_BYTES, ROLE_FAULTY, SYNCED};
 use crate::{Error, Members, SECTOR};
 
 pub const MAX_MEMBERS: usize = 8;
 
-#[derive(Clone, Copy, Debug)]
+/// A member in use: where its data starts and its superblock as read, patched in place when the array writes.
 struct Slot {
     member: usize,
     data_offset: u64,
+    dev_number: u32,
+    super_sector: u64,
+    block: [u8; READ_BYTES],
 }
 
-#[derive(Debug)]
 pub struct Array {
     slots: [Option<Slot>; MAX_MEMBERS],
     used: usize,
@@ -27,6 +29,14 @@ pub struct Array {
     events: u64,
     raid_disks: u32,
     dirty: bool,
+    /// Open for writing: the superblocks say the array is in use (not clean) until `stop`.
+    writing: bool,
+    /// What the superblocks carry as `resync_offset`: 0 while in use, `SYNCED` when stopped clean.
+    resync: u64,
+    /// Slots (`dev_number`s) that failed since assembly; the survivors' role tables say so.
+    faulty: [u32; MAX_MEMBERS],
+    faulty_count: usize,
+    features: u32,
 }
 
 /// Finds the superblock on `member`, trying minor versions 1.2, 1.1 and 1.0 in the order mdadm prefers.
@@ -85,22 +95,28 @@ impl Array {
         let (lead, lead_block) = found[best_member].as_ref().unwrap();
         let (_, roles) = Superblock::parse(lead_block, lead.minor)?;
         let mut array = Array {
-            slots: [None; MAX_MEMBERS],
+            slots: core::array::from_fn(|_| None),
             used: 0,
             sectors: lead.size,
             uuid: lead.set_uuid,
             name: lead.set_name,
             events: best,
             raid_disks: lead.raid_disks,
-            dirty: lead.resync_offset != superblock::SYNCED,
+            dirty: lead.resync_offset != SYNCED,
+            writing: false,
+            resync: lead.resync_offset,
+            faulty: [0; MAX_MEMBERS],
+            faulty_count: 0,
+            features: lead.feature_map,
         };
         for (member, entry) in found.iter().enumerate() {
-            let Some((sb, _)) = entry else { continue };
+            let Some((sb, block)) = entry else { continue };
             let active = roles.get(sb.dev_number as usize).is_some_and(|role| role < ROLE_FAULTY && (role as u32) < lead.raid_disks);
             let in_step = sb.events == best && sb.feature_map & FEATURE_RECOVERY_OFFSET == 0;
             let fits = sb.data_offset.checked_add(sb.size).is_some_and(|end| end <= members.sectors(member));
             if active && in_step && fits && sb.size == lead.size {
-                array.slots[array.used] = Some(Slot { member, data_offset: sb.data_offset });
+                let super_sector = superblock::super_sector(sb.minor, members.sectors(member)).unwrap_or(0);
+                array.slots[array.used] = Some(Slot { member, data_offset: sb.data_offset, dev_number: sb.dev_number, super_sector, block: *block });
                 array.used += 1;
             }
         }
@@ -162,6 +178,137 @@ impl Array {
             }
         }
         Err(last)
+    }
+
+    /// Opens the array for writing: every member's superblock is rewritten with the event count one higher and
+    /// `resync_offset` 0 ("not known to be in step"), and flushed, before any data write may follow. A crash after
+    /// this makes Linux resync the whole array (there is no write-intent bitmap to narrow it); a clean `stop` marks it
+    /// in step again. `now` is the time in seconds since 1970 (0 if unknown). Refused for arrays with a bitmap or a
+    /// bad-block log, which this code would leave stale (create with `mdadm --bitmap=none`).
+    pub fn start<M: Members>(&mut self, members: &mut M, now: u64) -> Result<(), Error> {
+        if self.writing {
+            return Err(Error::NotWritable);
+        }
+        if self.features & (FEATURE_BITMAP | FEATURE_BAD_BLOCKS) != 0 {
+            return Err(Error::Unsupported);
+        }
+        if !self.dirty {
+            self.resync = 0;
+        }
+        self.writing = true;
+        self.commit(members, now)
+    }
+
+    /// Writes whole sectors to every member in use. A member whose write fails is dropped: the others' superblocks
+    /// are rewritten (flushed) saying so, with a higher event count, before this returns, so the dropped member can
+    /// never be mistaken for current again. It fails only when no member took the data.
+    pub fn write<M: Members>(&mut self, members: &mut M, lba: u64, buffer: &[u8], now: u64) -> Result<(), Error> {
+        if !self.writing {
+            return Err(Error::NotWritable);
+        }
+        if buffer.len() % SECTOR != 0 {
+            return Err(Error::Range);
+        }
+        let count = (buffer.len() / SECTOR) as u64;
+        if lba.checked_add(count).is_none_or(|end| end > self.sectors) {
+            return Err(Error::Range);
+        }
+        let mut failed = [false; MAX_MEMBERS];
+        let mut done = 0;
+        for (index, slot) in self.slots[..self.used].iter().flatten().enumerate() {
+            match members.write(slot.member, slot.data_offset + lba, buffer) {
+                Ok(()) => done += 1,
+                Err(_) => failed[index] = true,
+            }
+        }
+        if done == 0 {
+            return Err(Error::Device);
+        }
+        if self.drop_failed(&failed) {
+            self.commit(members, now)?;
+        }
+        Ok(())
+    }
+
+    /// Makes everything written so far durable on every member in use (members that fail to flush are dropped).
+    pub fn flush<M: Members>(&mut self, members: &mut M, now: u64) -> Result<(), Error> {
+        let mut failed = [false; MAX_MEMBERS];
+        let mut done = 0;
+        for (index, slot) in self.slots[..self.used].iter().flatten().enumerate() {
+            match members.flush(slot.member) {
+                Ok(()) => done += 1,
+                Err(_) => failed[index] = true,
+            }
+        }
+        if done == 0 {
+            return Err(Error::Device);
+        }
+        if self.drop_failed(&failed) {
+            self.commit(members, now)?;
+        }
+        Ok(())
+    }
+
+    /// Closes the array: flushes the data, then records "in step" (`resync_offset` back to `SYNCED`, one more event)
+    /// in every superblock. An array that was already dirty when assembled stays dirty: nothing here resyncs it.
+    pub fn stop<M: Members>(&mut self, members: &mut M, now: u64) -> Result<(), Error> {
+        if !self.writing {
+            return Err(Error::NotWritable);
+        }
+        self.flush(members, now)?;
+        if !self.dirty {
+            self.resync = SYNCED;
+        }
+        self.writing = false;
+        self.commit(members, now)
+    }
+
+    /// Removes the members flagged in `failed` (indexes into the used slots) and remembers their slots as faulty.
+    fn drop_failed(&mut self, failed: &[bool; MAX_MEMBERS]) -> bool {
+        let mut any = false;
+        for index in (0..self.used).rev() {
+            if failed[index] {
+                let slot = self.slots[index].take().unwrap();
+                self.faulty[self.faulty_count] = slot.dev_number;
+                self.faulty_count += 1;
+                self.slots[index..self.used].rotate_left(1);
+                self.used -= 1;
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// Writes every used member's superblock with a higher event count, the current `resync_offset` and the faulty
+    /// slots marked, and flushes it. A member that cannot take it is dropped, which needs another round (the survivors
+    /// must record the loss), so this repeats until a round loses nobody.
+    fn commit<M: Members>(&mut self, members: &mut M, now: u64) -> Result<(), Error> {
+        loop {
+            if self.used == 0 {
+                return Err(Error::Device);
+            }
+            self.events += 1;
+            let (events, resync, faulty, faulty_count) = (self.events, self.resync, self.faulty, self.faulty_count);
+            let mut failed = [false; MAX_MEMBERS];
+            for (index, slot) in self.slots[..self.used].iter_mut().flatten().enumerate() {
+                let block = &mut slot.block;
+                superblock::set_events(block, events);
+                superblock::set_utime(block, now);
+                superblock::set_resync(block, resync);
+                let max_dev = u32::from_le_bytes(block[220..224].try_into().unwrap()) as usize;
+                for &dev in &faulty[..faulty_count] {
+                    if (dev as usize) < max_dev {
+                        superblock::set_role(block, dev as usize, ROLE_FAULTY);
+                    }
+                }
+                let sectors = superblock::reseal(block).div_ceil(SECTOR);
+                let written = members.write(slot.member, slot.super_sector, &block[..sectors * SECTOR]);
+                failed[index] = written.is_err() || members.flush(slot.member).is_err();
+            }
+            if !self.drop_failed(&failed) {
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -310,5 +457,156 @@ mod tests {
         (block.level, block.super_offset) = (5, 8);
         block.build(&[0, 1], &mut raid5[8 * SECTOR..]);
         assert_eq!(Array::assemble(&mut Disks(vec![raid5], vec![false]), None).err(), Some(Error::Unsupported));
+    }
+
+    /// Disks that take writes, can be told to fail them, and log every operation in order.
+    struct Rw {
+        disks: Disks,
+        write_fail: Vec<bool>,
+        log: Vec<String>,
+    }
+
+    impl Rw {
+        fn new(disks: Vec<Vec<u8>>) -> Rw {
+            let n = disks.len();
+            Rw { disks: Disks(disks, vec![false; n]), write_fail: vec![false; n], log: Vec::new() }
+        }
+    }
+
+    impl Members for Rw {
+        fn count(&self) -> usize {
+            self.disks.count()
+        }
+        fn sectors(&self, member: usize) -> u64 {
+            self.disks.sectors(member)
+        }
+        fn read(&mut self, member: usize, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
+            self.disks.read(member, lba, buffer)
+        }
+        fn write(&mut self, member: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
+            if self.write_fail[member] {
+                return Err(Error::Device);
+            }
+            self.log.push(format!("w{member}@{lba}"));
+            let start = lba as usize * SECTOR;
+            self.disks.0[member][start..start + buffer.len()].copy_from_slice(buffer);
+            Ok(())
+        }
+        fn flush(&mut self, member: usize) -> Result<(), Error> {
+            self.log.push(format!("f{member}"));
+            Ok(())
+        }
+    }
+
+    fn super_of(rw: &mut Rw, member: usize) -> Superblock {
+        find_superblock(rw, member).unwrap().0
+    }
+
+    fn pair() -> Rw {
+        Rw::new(vec![member(2, 0, 10, &[0, 1], 1), member(2, 1, 10, &[0, 1], 1)])
+    }
+
+    #[test]
+    fn a_write_marks_dirty_first_and_clean_last() {
+        let mut rw = pair();
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        array.start(&mut rw, 1000).unwrap();
+        for m in 0..2 {
+            let sb = super_of(&mut rw, m);
+            assert_eq!((sb.events, sb.resync_offset, sb.utime), (11, 0, 1000), "member {m}");
+        }
+        let first_data = rw.log.len();
+        array.write(&mut rw, 5, &[0xab; 2 * SECTOR], 1001).unwrap();
+        // the superblock writes and flushes (8 sectors in: 1.2) all precede the first data write
+        assert!(rw.log[..first_data].iter().all(|op| !op.contains(&format!("@{DATA_OFFSET}")) && !op.contains("@2053")));
+        assert_eq!(&rw.log[first_data..], &[format!("w0@{}", DATA_OFFSET + 5), format!("w1@{}", DATA_OFFSET + 5)]);
+        array.stop(&mut rw, 1002).unwrap();
+        for m in 0..2 {
+            let sb = super_of(&mut rw, m);
+            assert_eq!((sb.events, sb.resync_offset), (12, SYNCED), "member {m}");
+        }
+        // the data is on both members and a fresh assembly sees a clean, whole array
+        let again = Array::assemble(&mut rw, None).unwrap();
+        assert!(!again.dirty() && !again.degraded());
+        let mut buf = [0u8; 2 * SECTOR];
+        for m in 0..2 {
+            rw.disks.0[m].len();
+            again.read(&mut rw, 5, &mut buf).unwrap();
+            assert!(buf.iter().all(|&b| b == 0xab));
+        }
+    }
+
+    #[test]
+    fn a_crash_between_start_and_stop_leaves_the_array_dirty() {
+        let mut rw = pair();
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        array.start(&mut rw, 1).unwrap();
+        array.write(&mut rw, 0, &[1; SECTOR], 1).unwrap();
+        let after_crash = Array::assemble(&mut rw, None).unwrap();
+        assert!(after_crash.dirty() && !after_crash.degraded());
+        // writing to a dirty array keeps it dirty (this code never resyncs)
+        let mut again = after_crash;
+        again.start(&mut rw, 2).unwrap();
+        again.stop(&mut rw, 3).unwrap();
+        assert!(Array::assemble(&mut rw, None).unwrap().dirty());
+    }
+
+    #[test]
+    fn a_failing_member_is_dropped_and_recorded_before_the_write_returns() {
+        let mut rw = pair();
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        array.start(&mut rw, 1).unwrap();
+        rw.write_fail[1] = true;
+        array.write(&mut rw, 0, &[7; SECTOR], 2).unwrap();
+        assert_eq!((array.present(), array.degraded()), (1, true));
+        let sb = super_of(&mut rw, 0);
+        assert_eq!(sb.events, 12);
+        let block = find_superblock(&mut rw, 0).unwrap().1;
+        let (_, roles) = Superblock::parse(&block, 2).unwrap();
+        assert_eq!((roles.get(0), roles.get(1)), (Some(0), Some(ROLE_FAULTY)));
+        array.stop(&mut rw, 3).unwrap();
+        // the dropped member comes back later: its old superblock is stale, so it stays out
+        rw.write_fail[1] = false;
+        let again = Array::assemble(&mut rw, None).unwrap();
+        assert_eq!((again.present(), again.events()), (1, 13));
+        let mut buf = [0u8; SECTOR];
+        again.read(&mut rw, 0, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 7));
+    }
+
+    #[test]
+    fn losing_a_member_at_the_superblock_update_is_handled() {
+        let mut rw = pair();
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        rw.write_fail[0] = true;
+        array.start(&mut rw, 1).unwrap();
+        assert_eq!(array.present(), 1);
+        assert_eq!(array.used_members().collect::<Vec<_>>(), vec![1]);
+        // member 0 never got the dirty mark; member 1 records it as faulty and is ahead by two events
+        assert_eq!(super_of(&mut rw, 1).events, 12);
+        rw.write_fail[1] = true;
+        assert_eq!(array.write(&mut rw, 0, &[1; SECTOR], 2), Err(Error::Device));
+    }
+
+    #[test]
+    fn writes_need_start_and_refuse_bitmaps() {
+        let mut rw = pair();
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        assert_eq!(array.write(&mut rw, 0, &[0; SECTOR], 1), Err(Error::NotWritable));
+        assert_eq!(array.stop(&mut rw, 1), Err(Error::NotWritable));
+        array.start(&mut rw, 1).unwrap();
+        assert_eq!(array.start(&mut rw, 1), Err(Error::NotWritable));
+        assert_eq!(array.write(&mut rw, ARRAY_SECTORS, &[0; SECTOR], 1), Err(Error::Range));
+        assert_eq!(array.write(&mut rw, 0, &[0; 100], 1), Err(Error::Range));
+
+        let mut bitmapped = pair();
+        for m in 0..2 {
+            let mut block = sb(2, m as u32, 10);
+            block.feature_map = superblock::FEATURE_BITMAP;
+            block.super_offset = 8;
+            block.build(&[0, 1], &mut bitmapped.disks.0[m][8 * SECTOR..]);
+        }
+        let mut array = Array::assemble(&mut bitmapped, None).unwrap();
+        assert_eq!(array.start(&mut bitmapped, 1), Err(Error::Unsupported));
     }
 }

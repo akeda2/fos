@@ -185,6 +185,28 @@ impl Superblock {
     }
 }
 
+/// In-place updates of a superblock read earlier (`block` is the bytes `parse` was given): everything the code does not
+/// know about, the bitmap and bad-block fields included, stays as the array's writer left it. Call `reseal` last.
+pub fn set_events(block: &mut [u8], events: u64) {
+    block[200..208].copy_from_slice(&events.to_le_bytes());
+}
+/// `utime` holds seconds in its low 40 bits and microseconds in the high 24.
+pub fn set_utime(block: &mut [u8], seconds: u64) {
+    block[192..200].copy_from_slice(&(seconds & 0xff_ffff_ffff).to_le_bytes());
+}
+pub fn set_resync(block: &mut [u8], offset: u64) {
+    block[208..216].copy_from_slice(&offset.to_le_bytes());
+}
+pub fn set_role(block: &mut [u8], slot: usize, role: u16) {
+    block[HEADER + slot * 2..HEADER + slot * 2 + 2].copy_from_slice(&role.to_le_bytes());
+}
+/// Recomputes `sb_csum`. Returns the bytes the superblock covers (header and role table).
+pub fn reseal(block: &mut [u8]) -> usize {
+    let sum = checksum(block);
+    block[216..220].copy_from_slice(&sum.to_le_bytes());
+    HEADER + u32_at(block, 220) as usize * 2
+}
+
 /// The role table: slot `n` holds the role of the member that has `dev_number == n`.
 #[derive(Clone, Copy)]
 pub struct Roles<'a> {
