@@ -130,6 +130,22 @@ def main():
             serial_line("cat k.txt", "Jelpo")
             check("Jelpo" in text(), "the saved file reads back", text()[-500:])
 
+            # A line wider than the screen row scrolls sideways instead of being refused.
+            long_line = "word " * 30 + "end"
+            serial_line(f"write wide.txt {long_line}", "Wrote")
+            serial_line("run ed wide.txt", "ed> ")
+            del output[:]
+            keys("e", "1", "ret")
+            wait_for("edit: ")
+            keys("j", "ret")
+            wait_for("ed> ")
+            del output[:]
+            keys("p", "ret")
+            wait_for("ed> ")
+            check("too long" not in text() and f"1: {long_line}j" in text(), "a line longer than 72 columns can be edited with the cursor", text()[-800:])
+            keys("q", "ret")
+            wait_for("fos> ", 20)
+
             # The framebuffer: cursor editing must leave the screen as the tape intended. Edit a line and
             # put it back exactly as it was; the final prompt screen then matches a screen that never had
             # the edit (compare against typing the same line serially is not possible, so check pixel change).
