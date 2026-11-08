@@ -29,10 +29,8 @@ const EDITOR_MIN_CAPACITY: u32 = 1024 * 1024;
 const EDITOR_MAX_CAPACITY: u32 = 4 * 1024 * 1024;
 const INPUT_CAPACITY: usize = 256;
 const PAGE_LINES: usize = 20;
-/// Longest line the cursor editor handles: it must fit in one 80-column screen
-/// row after the 6-column "edit: " prompt, because the cursor-left sequence
-/// does not wrap to the row above.
-const EDIT_WIDTH: usize = 72;
+/// Longest line the cursor editor takes (longer ones: `cLINE/OLD/NEW`).
+const EDIT_CAPACITY: usize = 1024;
 
 // Small files must work on the default `make run` QEMU configuration, whose
 // RAM ends at the big allocator's 128 MiB starting address. Keeping the
@@ -65,6 +63,12 @@ pub extern "C" fn tape_main(api: &'static tape_rt::TapeApi) {
 
     let mut file_length = 0u64;
     let length_status = fs_file_length(name.as_ptr() as usize, name.len() as u32, &mut file_length as *mut u64 as usize);
+    if length_status == tape_rt::FS_BAD_NAME as u32 {
+        print_bytes(putc, b"ed: bad file name (or volume): ");
+        print_bytes(putc, name);
+        print_bytes(putc, b"\n");
+        return;
+    }
     if length_status != FS_OK && length_status != FS_NOT_FOUND {
         print_bytes(putc, b"ed: cannot inspect file (status ");
         print_u32(putc, length_status);
@@ -157,58 +161,12 @@ fn parse_filename<'a>(args_ptr: usize, args_len: u32) -> Option<&'a [u8]> {
     // Both work; a file literally named `ed` must be written `ed ed`.
     let first = words.next()?;
     let name = if first == b"ed" { words.next()? } else { first };
-    if words.next().is_some() || !valid_reference(name) {
+    // Only the shape of the command line is checked: which names are valid depends on the volume (FOSFS v3 is lowercase and
+    // 16 characters, v4 and ext are not), so the kernel decides and `ed` reports its answer.
+    if words.next().is_some() {
         return None;
     }
     Some(name)
-}
-
-/// A bare FOSFS name means the boot disk, exactly as before; a `diskN/NAME`
-/// reference selects an attached secondary disk instead, matching the
-/// kernel's own `tape_fs_*` callback convention (see
-/// `kernel/src/shell.rs`'s `tape_fs_reference`) and `tape run`'s own
-/// `@diskN/NAME` syntax. `ed` itself never needs to know which disk a
-/// reference resolves to -- it just validates the shape locally (so a
-/// malformed reference is rejected with a usage message instead of an
-/// opaque filesystem error) and passes the whole string through to
-/// `fs_file_length`/`fs_read`/`fs_write` unchanged, letting the kernel do
-/// the actual disk selection.
-fn valid_reference(reference: &[u8]) -> bool {
-    match reference.iter().position(|&byte| byte == b'/') {
-        Some(slash) => {
-            let name = &reference[slash + 1..];
-            // `esp/NAME` is a FAT volume: its names may be upper case (config.txt, RPI_EFI.fd).
-            (is_disk_selector(&reference[..slash]) && valid_name(name))
-                || (!name.is_empty()
-                    && name.len() <= 16
-                    && name.iter().all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'-')))
-        }
-        None => valid_name(reference),
-    }
-}
-
-/// A loose, tape-side shape check only -- `diskN` for any digit string,
-/// without knowing which disks are actually attached (the kernel rejects an
-/// unattached or malformed selector once the reference reaches it).
-fn is_disk_selector(word: &[u8]) -> bool {
-    if let Some(label) = word.strip_prefix(b"@") {
-        return valid_name(label); // a volume label has the same shape as a file name
-    }
-    if word == b"esp" {
-        return true;
-    }
-    match word.strip_prefix(b"disk") {
-        Some(suffix) => !suffix.is_empty() && suffix.iter().all(u8::is_ascii_digit),
-        None => false,
-    }
-}
-
-fn valid_name(name: &[u8]) -> bool {
-    !name.is_empty()
-        && name.len() <= 16
-        && name.iter().all(|byte| {
-            matches!(*byte, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-')
-        })
 }
 
 fn trim_ascii(bytes: &[u8]) -> &[u8] {
@@ -410,18 +368,25 @@ fn cursor_move(putc: Putc, count: usize, direction: u8) {
 /// Reads one line with a real cursor: `initial` is pre-filled and editable with
 /// Left/Right, Home/End (or Ctrl-A/Ctrl-E), Backspace and Delete; typed
 /// characters insert at the cursor. The tape asks the kernel for raw keys so
-/// it controls every character on screen, and redraws only the tail of the
-/// line after each change. `output` must be short enough to fit one screen row.
+/// it controls every character on screen. After each key the one screen row
+/// is redrawn from its start: a line longer than the row scrolls sideways
+/// (`<` and `>` mark the hidden ends), because the cursor-left sequence does
+/// not wrap to the row above.
 fn read_line_cursor(
     putc: Putc,
     read_key: ReadKey,
+    prompt: &[u8],
     output: &mut [u8],
     initial: &[u8],
 ) -> Option<usize> {
     let mut length = initial.len().min(output.len());
     output[..length].copy_from_slice(&initial[..length]);
     let mut cursor = length;
-    print_bytes(putc, &output[..length]);
+    let columns = tape_rt::console_size().0;
+    // One column is left free so that a full row never makes the console wrap.
+    let width = columns.saturating_sub(prompt.len() + 1).max(8);
+    let mut first = 0usize;
+    redraw_row(putc, prompt, &output[..length], cursor, width, &mut first);
     let mut decoder = KeyDecoder::new();
     set_raw_keys(true);
     let result = loop {
@@ -442,64 +407,69 @@ fn read_line_cursor(
         };
         match key {
             Key::Enter => {
-                // Park the cursor at the end so the newline lands below the line.
-                cursor_move(putc, length - cursor, b'C');
                 putc(u32::from(b'\n'));
                 break Some(length);
             }
-            Key::Left => {
-                if cursor > 0 {
-                    cursor -= 1;
-                    cursor_move(putc, 1, b'D');
-                }
-            }
-            Key::Right => {
-                if cursor < length {
-                    cursor += 1;
-                    cursor_move(putc, 1, b'C');
-                }
-            }
-            Key::Home | Key::Control(1) => {
-                cursor_move(putc, cursor, b'D');
-                cursor = 0;
-            }
-            Key::End | Key::Control(5) => {
-                cursor_move(putc, length - cursor, b'C');
-                cursor = length;
-            }
+            Key::Left if cursor > 0 => cursor -= 1,
+            Key::Right if cursor < length => cursor += 1,
+            Key::Home | Key::Control(1) => cursor = 0,
+            Key::End | Key::Control(5) => cursor = length,
             Key::Backspace if cursor > 0 => {
                 output.copy_within(cursor..length, cursor - 1);
                 cursor -= 1;
                 length -= 1;
-                cursor_move(putc, 1, b'D');
-                redraw_tail(putc, &output[cursor..length]);
             }
             Key::Delete if cursor < length => {
                 output.copy_within(cursor + 1..length, cursor);
                 length -= 1;
-                redraw_tail(putc, &output[cursor..length]);
             }
             Key::Char(byte) if length < output.len() => {
                 output.copy_within(cursor..length, cursor + 1);
                 output[cursor] = byte;
                 length += 1;
                 cursor += 1;
-                putc(u32::from(byte));
-                redraw_tail(putc, &output[cursor..length]);
             }
-            _ => {}
+            _ => continue,
         }
+        redraw_row(putc, prompt, &output[..length], cursor, width, &mut first);
     };
     set_raw_keys(false);
     result
 }
 
-/// Reprints the text right of the cursor, blanks the character that may have
-/// been left behind by a deletion, and returns the cursor to where it was.
-fn redraw_tail(putc: Putc, tail: &[u8]) {
-    print_bytes(putc, tail);
-    putc(u32::from(b' '));
-    cursor_move(putc, tail.len() + 1, b'D');
+/// Redraws the prompt and the part of `line` that fits `width` columns, then
+/// puts the cursor where `cursor` is. `first` is the leftmost visible byte; it
+/// only moves when the cursor would leave the window.
+fn redraw_row(putc: Putc, prompt: &[u8], line: &[u8], cursor: usize, width: usize, first: &mut usize) {
+    if cursor < *first {
+        *first = cursor;
+    } else if cursor >= *first + width {
+        *first = cursor + 1 - width;
+    }
+    let left_hidden = *first > 0;
+    let right_hidden = line.len() > *first + width;
+    // A marker takes the place of the edge character, so it is never the cursor's.
+    let mut start = *first;
+    let mut end = (*first + width).min(line.len());
+    if left_hidden && cursor > start {
+        start += 1;
+    }
+    if right_hidden && cursor < end {
+        end -= 1;
+    }
+    putc(u32::from(b'\r'));
+    print_bytes(putc, prompt);
+    if left_hidden && cursor > *first {
+        putc(u32::from(b'<'));
+    }
+    print_bytes(putc, &line[start..end]);
+    if right_hidden && cursor < end + 1 {
+        putc(u32::from(b'>'));
+    }
+    putc(0x1b);
+    print_bytes(putc, b"[K");
+    putc(u32::from(b'\r'));
+    cursor_move(putc, prompt.len() + (cursor - *first), b'C');
 }
 
 fn append_lines(
@@ -533,13 +503,12 @@ fn edit_line(putc: Putc, read_key: ReadKey, text: &mut TextBuffer<'_>, line: usi
     };
     // The old text is pre-filled after the prompt and edited with the cursor
     // keys; Enter keeps whatever is on screen.
-    print_bytes(putc, b"edit: ");
-    let mut input = [0u8; INPUT_CAPACITY];
-    if current.len() > EDIT_WIDTH {
-        print_bytes(putc, b"\ned: line too long for cursor editing; use cLINE/OLD/NEW\n");
+    let mut input = [0u8; EDIT_CAPACITY];
+    if current.len() > EDIT_CAPACITY {
+        print_bytes(putc, b"ed: line too long to edit; use cLINE/OLD/NEW\n");
         return false;
     }
-    let Some(length) = read_line_cursor(putc, read_key, &mut input[..EDIT_WIDTH], current) else {
+    let Some(length) = read_line_cursor(putc, read_key, b"edit: ", &mut input, current) else {
         return true;
     };
     if text.replace_line(line, &input[..length]).is_err() {
