@@ -1,0 +1,14 @@
+[package]
+name = "md"
+version = "0.1.0"
+edition = "2024"
+description = "Linux md (mdadm) v1.x superblocks and array assembly: read-only RAID 1 first"
+license = "MIT"
+
+[lib]
+name = "md"
+path = "src/lib.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
