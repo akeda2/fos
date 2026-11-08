@@ -139,7 +139,7 @@ pub fn prompt() {
 const BUILTINS: &[&str] = &[
     "version", "cpus", "mem", "pci", "disks", "nic", "vnic", "service", "settings", "tapesync", "gpio", "top", "threads", "ps", "date", "uptime", "slots", "audio", "usb", "tape", "run", "kill",
     "echo", "debug", "start", "keymap", "kup", "recv", "dmesg", "clear", "sleep", "io", "memmap", "bootinfo", "cpuinfo", "shrink", "sector", "mount", "umount",
-    "format", "label", "fsck", "grow", "install", "bootcode", "reboot", "reset", "shutdown", "halt", "ext4", "sha256", "cd", "pwd", "exit",
+    "format", "label", "fsck", "grow", "install", "bootcode", "reboot", "reset", "shutdown", "halt", "ext4", "md", "sha256", "cd", "pwd", "exit",
 ];
 
 /// Installs the line editor's Tab completion (the editor itself, with history, is `kernel_core::lineedit`).
@@ -414,14 +414,17 @@ pub fn run_command(line: &str) {
         "sha256" => crate::sysshell::sha256(&mut crate::shellhost::MfHost, &line.trim_start()[command.len()..]),
         "install" => crate::install::command(words),
         "bootcode" => crate::bootcode::command(words),
+        "md" => crate::mdvol::command(words),
         "shutdown" | "halt" => {
             println!("Powering off.");
+            crate::mdvol::stop_all();
             slots::mark_clean_stop();
             power::shutdown();
             println!("shutdown: the machine did not power off (no ACPI _S5_ or the chipset ignored it).");
         }
         "reboot" | "reset" => {
             println!("Restarting.");
+            crate::mdvol::stop_all();
             slots::mark_clean_stop();
             power::reset();
         }

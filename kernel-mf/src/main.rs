@@ -39,6 +39,7 @@ mod shell;
 mod shellhost;
 mod script;
 mod sysshell;
+mod mdvol;
 mod top;
 mod log;
 #[path = "../../kernel/src/formatshell.rs"]
@@ -320,6 +321,9 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     vnic::apply();
     ps2::init();
     sched_selftest();
+    if config::md_auto() {
+        sched::spawn("md-assemble", mdvol::assemble_thread, 0);
+    }
     sched::spawn("service", service_thread, 0).expect("the service thread");
     println!("kernel-mf: slice 8 reached the end of boot; entering the service loop.");
     // The boot context is the idle thread: it runs when nothing else is ready and sleeps until the next interrupt.

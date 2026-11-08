@@ -181,7 +181,7 @@ kernel:
 
 # The server kernel (kernel-mf/, docs/big-kernel.md): same loaders, same image layout, its own crate.
 KERNEL_MF_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel-mf
-.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-sessions test-mf-tape test-mf-usb test-mf-debug test-mf-audio test-mf-netfs test-mf-tapesync test-mf-gpio test-mf-bios-video test-mf-shell test-mf-kup-serial test-mf-smbmount test-mf-smbd test-mf-sshd test-mf-sshmount test-mf-ssh test-mf-httpd test-mf-vnic test-mf-service test-mf-cp test-mf-abibad test-mf-threads
+.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-sessions test-mf-tape test-mf-usb test-mf-debug test-mf-audio test-mf-netfs test-mf-tapesync test-mf-gpio test-mf-bios-video test-mf-shell test-mf-kup-serial test-mf-smbmount test-mf-smbd test-mf-sshd test-mf-sshmount test-mf-ssh test-mf-httpd test-mf-vnic test-mf-service test-mf-cp test-mf-abibad test-mf-threads test-mf-md
 kernel-mf:
 	cd kernel-mf && cargo +nightly-2026-09-13 build --release
 
@@ -241,6 +241,9 @@ test-mf-cp: image-mf image
 	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_MF_ELF) --output $(BUILD)/fosfor-mf/fosfor-cp.img \
 		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin --file ebb=$(BUILD)/fosfor/tapes/ebb
 	FOSFOR_IMAGE_MF=$(BUILD)/fosfor-mf/fosfor-cp.img python3 tools/test_mf_cp.py
+
+test-mf-md: image-mf image
+	LOADER_EFI=$(LOADER_EFI) KERNEL_MF_ELF=$(KERNEL_MF_ELF) BIOS_STAGE1=$(BIOS_OUT)/stage1.bin BIOS_STAGE2=$(BIOS_OUT)/stage2.bin python3 tools/test_mf_md.py
 
 test-mf-httpd: image-mf image
 	printf 'root=disk2/www\nlisting=on\n' > $(BUILD)/fosfor-mf/httpd.cfg

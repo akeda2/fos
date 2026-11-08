@@ -157,6 +157,11 @@ impl Array {
         self.dirty
     }
     /// The member numbers in use, in the order reads try them.
+    /// Whether the array is open for writing (between `start` and `stop`).
+    pub fn is_writing(&self) -> bool {
+        self.writing
+    }
+
     pub fn used_members(&self) -> impl Iterator<Item = usize> + '_ {
         self.slots[..self.used].iter().flatten().map(|slot| slot.member)
     }

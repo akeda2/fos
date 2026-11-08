@@ -45,6 +45,7 @@ dependencies = [
  "fosfor-script",
  "fosfor-shell",
  "fosfor-tape-sync",
+ "md",
 ]
 
 [[package]]
@@ -57,4 +58,8 @@ version = "0.1.0"
 
 [[package]]
 name = "fosfor-tape-sync"
+version = "0.1.0"
+
+[[package]]
+name = "md"
 version = "0.1.0"
