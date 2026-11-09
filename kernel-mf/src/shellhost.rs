@@ -60,21 +60,16 @@ fn normalize(path: &str) -> String {
     parts.join("/")
 }
 
-/// `reference` as the file calls should see it: under the working folder when it is a relative name (`/NAME` is the root of the
-/// working folder's volume). An empty working folder, `//` references and names that carry a volume stay as typed.
+/// `reference` as the file calls should see it: under the working folder when it is a relative name (`/NAME` is under the boot volume's
+/// root, wherever the working folder is). An empty working folder, `//` references and names that carry a volume stay as typed.
 fn here(reference: &str) -> String {
     let cwd = current();
     if cwd.is_empty() || reference.starts_with("//") || names_volume(reference) {
         return String::from(reference);
     }
     if let Some(absolute) = reference.strip_prefix('/') {
-        // The root of the working folder's volume: its selector, or the mount point it lies under.
-        let volume = if names_volume(&cwd) {
-            cwd.split('/').next().unwrap_or("")
-        } else {
-            mounts::lookup_dir(cwd.as_bytes()).map_or("", |(_, rest)| cwd[..cwd.len() - rest.len()].trim_end_matches('/'))
-        };
-        return normalize(&alloc::format!("{volume}/{absolute}"));
+        // `/` is the boot volume's root from anywhere; mounts are folders in it.
+        return normalize(absolute);
     }
     if reference.is_empty() {
         return cwd;
@@ -108,9 +103,20 @@ pub fn resolve_for_tape(name: &str) -> String {
     here(name)
 }
 
-/// `cd [FOLDER]`: with no name the boot volume's root. The folder must exist (a listing of it works). Returns the new folder.
+/// The root of the working folder's volume: its selector (`@LABEL`, `diskN`), or the mount point it lies under; empty on the boot volume.
+fn volume_root(cwd: &str) -> String {
+    let root = if names_volume(cwd) {
+        cwd.split('/').next().unwrap_or("")
+    } else {
+        mounts::lookup_dir(cwd.as_bytes()).map_or("", |(_, rest)| cwd[..cwd.len() - rest.len()].trim_end_matches('/'))
+    };
+    String::from(root)
+}
+
+/// `cd [FOLDER]`: with no name the root of the volume the working folder is on (`cd /` is the boot volume's root). The folder
+/// must exist (a listing of it works). Returns the new folder.
 pub fn change_folder(target: &str) -> Result<String, FsError> {
-    let resolved = if target.is_empty() { String::new() } else { here(target) };
+    let resolved = if target.is_empty() { volume_root(&current()) } else { here(target) };
     if !resolved.is_empty() {
         list_resolved(&mut MfHost, &resolved, &mut |_, _| {})?;
     }
