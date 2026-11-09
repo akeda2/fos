@@ -76,7 +76,7 @@ through the `Members` trait. Stages:
    recomputed as the current data XOR the partial parity, skipped when a data member is missing; with at least one entry and
    none unusable the array counts as clean (as in Linux), otherwise the resync stays. A dirty degraded RAID 5 with a log
    assembles. A log that overlaps data or the superblock keeps the array read-only. Host tests, `make test-mf-md` (a torn
-   parity repaired at boot) and `check_md_mdadm.sh raid5-ppl` (needs a root run; not yet run) cover it. Cost: one extra
+   parity repaired at boot) and `check_md_mdadm.sh raid5-ppl` (passes against mdadm 4.5: assembles, fscks, `check` finds 0 mismatches after a torn write and our replay, rebuild works) cover it. Cost: one extra
    flushed write per 8 KiB piece.
 6. **Kernel glue** (done in kernel-mf, `kernel-mf/src/mdvol.rs`): the assembled array is registered as one more disk
    (`block::Backend::Md`), so `disks`, `ext4 diskN`, `fstab`, `mount` and `@LABEL` work on it unchanged. Members are whole
