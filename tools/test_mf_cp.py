@@ -117,6 +117,13 @@ def main():
             ok, text = command("mount rec @stick", "mount", 10)
             ok, text = command("mount", "(disk3)", 10)
             check("rec -> @stick (disk3)" in text and "not present" not in text.split("rec ->")[-1], "mount lists an exFAT volume as present", text[-300:])
+            # A file over 32 MiB goes from the ext volume to the exFAT one, and back, streamed.
+            ok, text = command("mv @linuxvol/moved.bin @stick/back.bin", "Moved", 180)
+            check(ok and "the limit" not in text, "mv of a file over 32 MiB from ext to exFAT", text[-300:])
+            ok, text = command("sha256 @stick/back.bin", digest, 120)
+            check(ok, "the file on the exFAT volume has the host's SHA-256", text[-300:])
+            ok, text = command("mv @stick/back.bin @linuxvol/again.bin", "Moved", 180)
+            check(ok, "mv of a file over 32 MiB from exFAT to ext", text[-300:])
         finally:
             qemu.kill()
     return finish()
