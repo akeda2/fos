@@ -14,8 +14,8 @@ through the `Members` trait. Stages:
    recorded as faulty (role `0xfffe`, events +1) in the survivors' superblocks before the write returns, so it cannot
    return as current; `stop` flushes the data and then records `resync_offset` = in step with events +1. A crash between
    `start` and `stop` leaves the array dirty, and Linux then resyncs all of it. Superblocks are patched in place, so
-   unknown fields survive. Arrays with a write-intent bitmap or a bad-block log are refused for writing
-   (`mdadm --bitmap=none` when creating; mdadm adds a bitmap by default only on large arrays).
+   unknown fields survive. Arrays with a bad-block log are refused for writing; so are ones with a bitmap this code
+   does not trust (see 5c).
 3. **RAID 0 and RAID 10** (done in the library, same `Array`): chunk `k` of the array is copy `c` at position
    `p = k * near + c`, which is member role `p % raid_disks`, row `p / raid_disks`, physical sector `row * chunk + offset`
    (Linux `raid10.c`'s near layout; RAID 0 is `near = 1`). RAID 10 reads the layout from the superblock (`near` copies in
@@ -26,7 +26,7 @@ through the `Members` trait. Stages:
    `gcd(near, raid_disks)`); a member whose loss would leave a chunk with no copy stays and the write fails. Assembly
    needs the same coverage.
 4. **Resync and re-add** (done in the library, RAID 1 and 10): `begin_resync` + `step` compare every piece of a dirty array
-   across its copies and write the first readable copy over the others (no bitmap, so the whole array; what Linux does
+   across its copies and write the first readable copy over the others (the whole array unless there is a bitmap, see 5c; what Linux does
    after an unclean stop); at the end the array counts as clean and `stop` records it. `begin_rebuild(member)` +
    `step` fill a blank or stale disk in as the missing member: its superblock (cloned from a member's, new `dev_number`
    and device UUID, `FEATURE_RECOVERY_OFFSET`, `recovery_offset` 0) is written first, so a crash leaves it flagged and
@@ -43,7 +43,7 @@ through the `Members` trait. Stages:
    be missing; a second failure fails the write. During a rebuild every write also reaches the target, parity
    included. The write hole is the same as in Linux without a journal: a crash during a write leaves the array dirty
    and the resync recomputes parity. A dirty array that is also degraded is not assembled (Linux refuses it too:
-   the parity cannot be trusted to rebuild the missing member). No journal, no bitmap, no reshape.
+   the parity cannot be trusted to rebuild the missing member). No journal, no PPL, no reshape.
    Job cursors count sectors of one member here (`job()` reports array sectors).
 5b. **RAID 6** (`crates/md/src/array/raid6.rs`, GF(2^8) in `gf.rs`, polynomial 0x11d, generator 2): the same four layouts,
    array size `(disks - 2) * (size / chunk * chunk)`, at least 4 members. P sits where RAID 5 puts parity, Q on the next
@@ -53,6 +53,18 @@ through the `Members` trait. Stages:
    of data, P and Q when all three are there, else the row is read whole, rebuilt and P and Q recomputed; the resync
    rewrites a P or Q that differs; a rebuild fills one target while another member may still be missing. Pieces are 8
    sectors (the row buffers live on the stack). A dirty array missing two members is not assembled.
+5c. **Write-intent bitmap** (`crates/md/src/bitmap.rs`, RAID 1, 5 and 6; `mdadm --bitmap=internal`): the 256-byte header
+   and the bits sit at `super_sector + bitmap_offset` on every member (layout checked against bytes mdadm 4.5 wrote).
+   One bit covers `chunk` sectors of the resync cursor space (array sectors for RAID 1, member sectors for RAID 5/6),
+   `sync_size` must equal that span. With a trusted bitmap `start` leaves the superblocks in step (no `resync_offset` 0,
+   no event bump); every `write` first sets the bits of the chunks it touches and flushes them on all members;
+   `commit` keeps the bitmap's events level with the array's (Linux distrusts an older bitmap); a clean `stop` (and a
+   finished resync) clears the bits, and the kernel's idle stop does so after a few quiet seconds. After a crash the
+   superblocks say "in step" but set bits make the array dirty, and `begin_resync` then compares only those chunks.
+   A stale or failed bitmap, a foreign uuid, a different `sync_size`, one that overlaps data or the superblock, or one
+   over 16 KiB keeps the array read-only; RAID 10 with a bitmap too. The union of all members' bits is used. A rebuilt
+   member gets the bitmap written first. The bitmap narrows the resync, it does not close the write hole (a stripe
+   torn by the crash is repaired by the resync, but a degraded array still refuses to assemble while dirty).
 6. **Kernel glue** (done in kernel-mf, `kernel-mf/src/mdvol.rs`): the assembled array is registered as one more disk
    (`block::Backend::Md`), so `disks`, `ext4 diskN`, `fstab`, `mount` and `@LABEL` work on it unchanged. Members are whole
    disks or GPT "Linux RAID" partitions. `md auto` in `settings` starts the `md-assemble` thread at boot; boot never waits
@@ -82,5 +94,5 @@ the same checks as RAID 5; one blank member was rebuilt, the double-loss paths a
 RAID 5 (all four layouts, 3 and 4 members): our dump fscks clean, mdadm assembles and fscks the array after our write, and a blank
 member rebuilt by `probe --rebuild` makes `mdadm` check report 0 mismatches. It found two real-mdadm differences, both fixed:
 RAID 0 carries feature bit `RAID0_LAYOUT` and `size` 0 (the length is the members' `data_size`). Not verified: RAID 0 members of
-unequal size (several zones, refused), arrays with a bitmap (refused for writing), real disks (timings, a pulled USB disk), and
+unequal size (several zones, refused), the bitmap against real mdadm until `check_md_mdadm.sh raid1-bm raid5-bm raid6-bm` has run, real disks (timings, a pulled USB disk), and
 the kernel glue against an mdadm-made array on real hardware.

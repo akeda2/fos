@@ -12,6 +12,11 @@
 //! the event count two higher, and `mdadm --assemble --scan` must still work. Use test disks, or an array whose last
 //! sectors are free (ext4 puts nothing user-visible there, but never run it on a mounted array).
 //!
+//!     cargo run --example probe -- --crash-test|--resync DISK1 DISK2 ...
+//!
+//! `--crash-test` writes like `--write-test` but never stops the array (a crash while writing: with a bitmap its bits
+//! stay set); `--resync` resyncs a dirty array (the bitmap's chunks, or all of it) and stops it clean.
+//!
 //!     cargo run --example probe -- --rebuild N DISK1 DISK2 ...
 //!
 //! `--rebuild N` (members read-write) fills member number N (0-based, as listed; it may be blank) in as the array's
@@ -50,10 +55,15 @@ fn main() {
     let mut dump = None;
     let mut write_test = false;
     let mut rebuild: Option<usize> = None;
+    let (mut crash, mut resync) = (false, false);
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--write-test" {
             write_test = true;
+        } else if arg == "--crash-test" {
+            crash = true;
+        } else if arg == "--resync" {
+            resync = true;
         } else if arg == "--rebuild" {
             rebuild = args.next().and_then(|n| n.parse().ok());
         } else if arg == "--dump" {
@@ -64,7 +74,7 @@ fn main() {
     }
     let mut disks = Disks(Vec::new());
     for path in &paths {
-        let mut file = OpenOptions::new().read(true).write(write_test || rebuild.is_some()).open(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let mut file = OpenOptions::new().read(true).write(write_test || crash || resync || rebuild.is_some()).open(path).unwrap_or_else(|e| panic!("{path}: {e}"));
         let bytes = file.seek(SeekFrom::End(0)).unwrap();
         disks.0.push((file, bytes / SECTOR as u64));
     }
@@ -93,7 +103,20 @@ fn main() {
         println!("rebuild ok: {} of {} members, events now {}, array stopped clean", array.present(), array.expected(), array.events());
         return;
     }
-    if write_test {
+    if resync {
+        let mut array = array;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        if !array.dirty() {
+            return println!("resync: nothing to do");
+        }
+        array.start(&mut disks, now).expect("start");
+        array.begin_resync().expect("begin resync");
+        while let md::array::Step::Running(_) = array.step(&mut disks, 4096, now).expect("step") {}
+        array.stop(&mut disks, now).expect("stop");
+        println!("resync ok: events now {}, array stopped clean", array.events());
+        return;
+    }
+    if write_test || crash {
         let mut array = array;
         let at = array.sectors() - 8;
         let (mut saved, mut check) = (vec![0u8; 8 * SECTOR], vec![0u8; 8 * SECTOR]);
@@ -105,6 +128,9 @@ fn main() {
         array.read(&mut disks, at, &mut check).expect("read back");
         assert_eq!(check, pattern, "read-back differs");
         array.write(&mut disks, at, &saved, now).expect("restore");
+        if crash {
+            return println!("crash test ok: wrote and restored, array left open (not stopped)");
+        }
         array.stop(&mut disks, now).expect("stop");
         println!("write test ok: events now {}, array stopped clean", array.events());
         return;
