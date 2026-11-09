@@ -24,6 +24,9 @@
 //!
 //! `--rebuild N` (members read-write) fills member number N (0-based, as listed; it may be blank) in as the array's
 //! missing member, from the others, and stops the array clean. Mirrors (RAID 1) are compared; striped levels are not.
+//!
+//! `--rebuild-part N` starts that rebuild, stops it after a few steps and closes the array (progress is recorded in the
+//! member); `--rebuild-resume` assembles the array again, goes on from the recorded offset and stops it clean.
 
 use md::{Error, Members, SECTOR, array::Array};
 use std::fs::{File, OpenOptions};
@@ -62,6 +65,7 @@ fn main() {
     let mut dump = None;
     let mut write_test = false;
     let mut rebuild: Option<usize> = None;
+    let (mut part, mut resume) = (false, false);
     let (mut crash, mut resync, mut tear, mut recover) = (false, false, false, false);
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -77,6 +81,11 @@ fn main() {
             resync = true;
         } else if arg == "--rebuild" {
             rebuild = args.next().and_then(|n| n.parse().ok());
+        } else if arg == "--rebuild-part" {
+            rebuild = args.next().and_then(|n| n.parse().ok());
+            part = true;
+        } else if arg == "--rebuild-resume" {
+            resume = true;
         } else if arg == "--dump" {
             dump = args.next();
         } else {
@@ -85,7 +94,7 @@ fn main() {
     }
     let mut disks = Disks(Vec::new(), None);
     for path in &paths {
-        let mut file = OpenOptions::new().read(true).write(write_test || crash || tear || recover || resync || rebuild.is_some()).open(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let mut file = OpenOptions::new().read(true).write(write_test || crash || tear || recover || resync || rebuild.is_some() || resume).open(path).unwrap_or_else(|e| panic!("{path}: {e}"));
         let bytes = file.seek(SeekFrom::End(0)).unwrap();
         disks.0.push((file, bytes / SECTOR as u64));
     }
@@ -110,14 +119,29 @@ fn main() {
         array.present(), array.expected(), if array.degraded() { ", DEGRADED" } else { "" }, if array.dirty() { ", dirty" } else { "" });
     let used: Vec<usize> = array.used_members().collect();
     println!("in use: {}", used.iter().map(|&m| paths[m].as_str()).collect::<Vec<_>>().join(" "));
+    if resume {
+        let mut array = array;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        assert!(array.rebuild_pending(), "no interrupted rebuild found");
+        println!("resuming at {:?}", array.job());
+        array.start(&mut disks, now).expect("start");
+        while let md::array::Step::Running(_) = array.step(&mut disks, 4096, now).expect("step") {}
+        array.stop(&mut disks, now).expect("stop");
+        return println!("resume ok: {} of {} members, events now {}, array stopped clean", array.present(), array.expected(), array.events());
+    }
     if let Some(member) = rebuild {
         let mut array = array;
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         array.start(&mut disks, now).expect("start");
         array.begin_rebuild(&mut disks, member, [0x5a; 16]).expect("begin rebuild");
+        let mut steps = 0;
         loop {
             match array.step(&mut disks, 4096, now).expect("step") {
-                md::array::Step::Running(_) => {}
+                md::array::Step::Running(_) if part && steps >= 20 => {
+                    array.stop(&mut disks, now).expect("stop");
+                    return println!("rebuild stopped part way: {:?}", array.job());
+                }
+                md::array::Step::Running(_) => steps += 1,
                 _ => break,
             }
         }

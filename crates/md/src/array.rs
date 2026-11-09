@@ -86,7 +86,12 @@ pub struct Array {
 struct Rebuild {
     slot: Slot,
     cursor: u64,
+    /// The cursor last recorded in the target's superblock.
+    saved: u64,
 }
+
+/// How many member sectors a rebuild copies between two records of its progress (64 MiB).
+const SAVE_EVERY: u64 = 131072;
 
 /// What `Array::step` worked on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,6 +110,9 @@ pub enum Step {
 
 /// Sectors compared or copied per piece (the stack buffers are this big).
 const PIECE: u64 = 16;
+/// The longest stretch one partial parity log entry covers when the log area has room (32 KiB): fewer flushed log
+/// writes for a sequential write. Parity ranges of pieces in one stripe overlap, so pieces cannot share a flush.
+const PPL_RUN: u64 = 64;
 
 /// Finds the superblock on `member`, trying minor versions 1.2, 1.1 and 1.0 in the order mdadm prefers.
 pub fn find_superblock<M: Members>(members: &mut M, member: usize) -> Option<(Superblock, [u8; READ_BYTES])> {
@@ -237,6 +245,7 @@ impl Array {
                 array.used += 1;
             }
         }
+        array.find_resumable(members, &found, best);
         if lead.feature_map & FEATURE_BITMAP != 0 {
             array.attach_bitmap(members, lead.resync_offset);
         }
@@ -257,6 +266,68 @@ impl Array {
             return Err(Error::Degraded);
         }
         Ok(array)
+    }
+
+    /// A member that was being filled in when the array was last closed (`FEATURE_RECOVERY_OFFSET`, as many events as
+    /// the array) goes on from its recorded offset instead of starting over. One that missed an event is left out and
+    /// rebuilt from 0 by `begin_rebuild`. `step` does the work once the array is open for writing.
+    fn find_resumable<M: Members>(&mut self, members: &M, found: &[Option<(Superblock, [u8; READ_BYTES])>; MAX_MEMBERS], best: u64) {
+        if self.level == LEVEL_RAID0 || self.used >= self.raid_disks as usize || self.used == 0 {
+            return;
+        }
+        let header = (READ_BYTES / SECTOR) as u64;
+        for (member, entry) in found.iter().enumerate() {
+            let Some((sb, block)) = entry else { continue };
+            if sb.feature_map & FEATURE_RECOVERY_OFFSET == 0 || sb.events != best || sb.size != self.member_size || sb.level != self.level {
+                continue;
+            }
+            let Ok((_, own)) = Superblock::parse(block, sb.minor) else { continue };
+            let Some(role) = own.get(sb.dev_number as usize).filter(|&r| r < ROLE_FAULTY && (r as u32) < self.raid_disks) else { continue };
+            let Some(super_sector) = superblock::super_sector(sb.minor, members.sectors(member)) else { continue };
+            let clear = super_sector + header <= sb.data_offset || super_sector >= sb.data_offset + sb.size;
+            let taken = self.role_mask() & (1 << role) != 0 || self.slots[..self.used].iter().flatten().any(|slot| slot.member == member);
+            if taken || !clear || sb.data_offset + sb.size > members.sectors(member) || sb.recovery_offset > self.span() {
+                continue;
+            }
+            let slot = Slot { member, data_offset: sb.data_offset, dev_number: sb.dev_number, minor: sb.minor, role, super_sector, block: *block };
+            self.rebuild = Some(Rebuild { slot, cursor: sb.recovery_offset, saved: sb.recovery_offset });
+            return;
+        }
+    }
+
+    /// Whether a rebuild is waiting to go on (found at assembly); it runs once the array is open for writing.
+    pub fn rebuild_pending(&self) -> bool {
+        self.rebuild.is_some() && !self.writing
+    }
+
+    /// Records how far the rebuild got in its target's superblock, level with the array's events, after flushing the
+    /// data below that point. A target that cannot take it is abandoned (it restarts from 0 next time).
+    fn save_rebuild<M: Members>(&mut self, members: &mut M, now: u64) {
+        let (events, resync) = (self.events, self.resync);
+        let head = self.bitmap.as_mut().map(|bitmap| {
+            bitmap.set_events(events);
+            let mut head = [0u8; SECTOR];
+            head.copy_from_slice(&bitmap.data[..SECTOR]);
+            head
+        });
+        let bitmap_offset = self.bitmap_offset;
+        let Some(r) = self.rebuild.as_mut() else { return };
+        let (member, super_sector) = (r.slot.member, r.slot.super_sector);
+        let block = &mut r.slot.block;
+        superblock::set_events(block, events);
+        superblock::set_utime(block, now);
+        superblock::set_resync(block, resync);
+        superblock::set_recovery_offset(block, r.cursor);
+        let sectors = superblock::reseal(block).div_ceil(SECTOR);
+        let done = members.flush(member).is_ok()
+            && head.is_none_or(|head| members.write(member, (super_sector as i64 + bitmap_offset as i64) as u64, &head).is_ok())
+            && members.write(member, super_sector, &block[..sectors * SECTOR]).is_ok()
+            && members.flush(member).is_ok();
+        if done {
+            r.saved = r.cursor;
+        } else {
+            self.rebuild = None;
+        }
     }
 
     /// Where the bitmap starts on a member.
@@ -461,11 +532,16 @@ impl Array {
         let bytes = out.len();
         for role in (0..self.raid_disks as u16).filter(|r| !skip.contains(r)) {
             let (member, base) = self.usable(role, *failed).ok_or(Error::Device)?;
-            if let Err(error) = members.read(member, base + at, &mut other[..bytes]) {
-                *failed |= 1 << role;
-                return Err(error);
+            let mut done = 0;
+            while done < bytes {
+                let n = (bytes - done).min(other.len());
+                if let Err(error) = members.read(member, base + at + (done / SECTOR) as u64, &mut other[..n]) {
+                    *failed |= 1 << role;
+                    return Err(error);
+                }
+                xor(&mut out[done..done + n], &other[..n]);
+                done += n;
             }
-            xor(out, &other[..bytes]);
         }
         Ok(())
     }
@@ -495,9 +571,15 @@ impl Array {
         let (mut done, mut failed, mut lost) = (0, 0u32, false);
         while done < count {
             let (run, data, parity, at) = self.locate5(lba + done);
-            let run = run.min(count - done).min(PIECE);
+            let big = self.ppl_run() > PIECE;
+            let run = run.min(count - done).min(if big { PPL_RUN } else { PIECE });
             let new = &buffer[done as usize * SECTOR..(done + run) as usize * SECTOR];
-            if self.write_piece5(members, data, parity, at, lba + done, new, &mut failed).is_err() {
+            let result = if big {
+                self.write_piece5::<M, { PPL_RUN as usize * SECTOR }>(members, data, parity, at, lba + done, new, &mut failed)
+            } else {
+                self.write_piece5::<M, { PIECE as usize * SECTOR }>(members, data, parity, at, lba + done, new, &mut failed)
+            };
+            if result.is_err() {
                 lost = true;
                 break;
             }
@@ -509,9 +591,9 @@ impl Array {
         if lost { Err(Error::Device) } else { Ok(()) }
     }
 
-    fn write_piece5<M: Members>(&mut self, members: &mut M, data: u16, parity: u16, at: u64, v: u64, new: &[u8], failed: &mut u32) -> Result<(), Error> {
+    fn write_piece5<M: Members, const BYTES: usize>(&mut self, members: &mut M, data: u16, parity: u16, at: u64, v: u64, new: &[u8], failed: &mut u32) -> Result<(), Error> {
         let bytes = new.len();
-        let (mut fresh, mut old) = ([0u8; PIECE as usize * SECTOR], [0u8; PIECE as usize * SECTOR]);
+        let (mut fresh, mut old) = ([0u8; BYTES], [0u8; BYTES]);
         let mut have_parity = false;
         if let (Some((dm, db)), Some((pm, pb))) = (self.usable(data, *failed), self.usable(parity, *failed)) {
             if members.read(dm, db + at, &mut old[..bytes]).is_err() {
@@ -877,17 +959,20 @@ impl Array {
             return Err(Error::NotWritable);
         }
         self.sync_cursor = None;
-        self.rebuild = None;
         self.flush(members, now)?;
         self.writing = false;
         if self.level == LEVEL_RAID0 {
+            self.rebuild = None;
             return Ok(());
         }
         if !self.dirty {
             self.bitmap_clear(members, now)?;
             self.resync = SYNCED;
         }
-        self.commit(members, now)
+        // the commit records the rebuild's progress in its target, so the next assembly can go on from there
+        let result = self.commit(members, now);
+        self.rebuild = None;
+        result
     }
 
     /// The running job and how far it is, in array sectors out of `sectors()`.
@@ -969,7 +1054,7 @@ impl Array {
         }
         self.ppl_add_member(members, member, super_sector, data_offset)?;
         members.flush(member)?;
-        self.rebuild = Some(Rebuild { slot: Slot { member, data_offset, dev_number: dev, minor, role, super_sector, block }, cursor: 0 });
+        self.rebuild = Some(Rebuild { slot: Slot { member, data_offset, dev_number: dev, minor, role, super_sector, block }, cursor: 0, saved: 0 });
         Ok(())
     }
 
@@ -979,7 +1064,6 @@ impl Array {
     pub fn step<M: Members>(&mut self, members: &mut M, budget: u64, now: u64) -> Result<Step, Error> {
         if !self.writing {
             self.sync_cursor = None;
-            self.rebuild = None;
             return Ok(Step::Idle);
         }
         if let Some(mut cursor) = self.sync_cursor {
@@ -1019,8 +1103,12 @@ impl Array {
                 cursor = self.rebuild_piece(members, cursor, end, now)?;
             }
             if cursor < total {
-                if let Some(r) = self.rebuild.as_mut() {
+                let due = self.rebuild.as_mut().is_some_and(|r| {
                     r.cursor = cursor;
+                    cursor - r.saved >= SAVE_EVERY
+                });
+                if due {
+                    self.save_rebuild(members, now);
                 }
                 return Ok(Step::Running(Job::Rebuild));
             }
@@ -1179,6 +1267,7 @@ impl Array {
                 failed[index] = !bitmap_ok || written.is_err() || members.flush(slot.member).is_err();
             }
             if !self.drop_failed(&failed) {
+                self.save_rebuild(members, now);
                 return Ok(());
             }
         }
@@ -1485,6 +1574,10 @@ mod tests {
 
     /// `disks` members of a striped array: `level`, `layout`, chunk of 8 sectors, member data 1024 sectors.
     fn striped(level: i32, layout: u32, disks: u32) -> Rw {
+        striped_chunk(level, layout, disks, 8)
+    }
+
+    fn striped_chunk(level: i32, layout: u32, disks: u32, chunk: u32) -> Rw {
         let roles: Vec<u16> = (0..disks as u16).collect();
         let members = (0..disks)
             .map(|slot| {
@@ -1492,7 +1585,7 @@ mod tests {
                 let mut block = sb(2, slot, 10);
                 block.level = level;
                 block.layout = layout;
-                block.chunk_sectors = 8;
+                block.chunk_sectors = chunk;
                 block.raid_disks = disks;
                 block.max_dev = disks;
                 block.super_offset = 8;
@@ -1884,6 +1977,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_stopped_rebuild_goes_on_from_where_it_was() {
+        for layout in [0, 2] {
+            let mut rw = striped(LEVEL_RAID5, layout, 4);
+            let mut array = Array::assemble(&mut rw, None).unwrap();
+            array.start(&mut rw, 1).unwrap();
+            let mut data = pattern(array.sectors());
+            array.write(&mut rw, 0, &data, 2).unwrap();
+            array.stop(&mut rw, 3).unwrap();
+            rw.disks.0[1] = vec![0; DISK_SECTORS * SECTOR];
+            let mut array = Array::assemble(&mut rw, None).unwrap();
+            array.start(&mut rw, 4).unwrap();
+            array.begin_rebuild(&mut rw, 1, [9; 16]).unwrap();
+            assert_eq!(array.step(&mut rw, 1200, 5).unwrap(), Step::Running(Job::Rebuild));
+            let (_, done) = array.job().unwrap();
+            assert!(done > 0);
+            array.stop(&mut rw, 6).unwrap();
+
+            let mut array = Array::assemble(&mut rw, None).unwrap();
+            assert!(array.rebuild_pending() && array.degraded());
+            assert_eq!(array.job(), Some((Job::Rebuild, done)));
+            array.start(&mut rw, 7).unwrap();
+            let fresh: Vec<u8> = (0..20 * SECTOR).map(|i| (i * 7) as u8).collect();
+            array.write(&mut rw, 2000, &fresh, 8).unwrap();
+            data[2000 * SECTOR..2020 * SECTOR].copy_from_slice(&fresh);
+            assert_eq!(run_job(&mut array, &mut rw), Job::Rebuild);
+            assert_eq!(array.present(), 4);
+            array.stop(&mut rw, 9).unwrap();
+            check_raid5(&rw, layout, 4, array.sectors(), &data);
+            let again = Array::assemble(&mut rw, None).unwrap();
+            assert_eq!((again.present(), again.rebuild_pending(), again.dirty()), (4, false, false));
+        }
+    }
+
     /// Multiplication in GF(2^8) by shift and add, polynomial 0x11d: independent of the table-driven `gf`.
     fn gmul(mut a: u8, mut b: u8) -> u8 {
         let mut product = 0u8;
@@ -2241,6 +2368,26 @@ mod tests {
         assert!(again.dirty());
         // one entry per member: each holds the last write whose parity it carries
         assert_eq!(again.recover_ppl(&mut rw).unwrap(), PplReport { entries: 4, mismatched: 0 });
+        assert!(!again.dirty());
+        assert!(stripes_xor_to_zero(&rw, 4));
+    }
+
+    #[test]
+    fn a_long_write_logs_in_runs_of_64_sectors_and_replays_the_last_one() {
+        let mut rw = striped_chunk(LEVEL_RAID5, 2, 4, 128);
+        add_ppl(&mut rw, 128);
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        array.start(&mut rw, 1).unwrap();
+        array.write(&mut rw, 0, &pattern(array.sectors()), 2).unwrap();
+        let parity_before = rw.disks.0[3][DATA_OFFSET as usize * SECTOR..][..128 * SECTOR].to_vec();
+        let fresh: Vec<u8> = (0..100 * SECTOR).map(|i| (i * 11 + 3) as u8).collect();
+        array.write(&mut rw, 3, &fresh, 3).unwrap();
+        // the log holds the last run (sectors 67..103 of the chunk); its parity is lost, the first run's landed
+        let torn = (DATA_OFFSET as usize + 67) * SECTOR..(DATA_OFFSET as usize + 103) * SECTOR;
+        rw.disks.0[3][torn.clone()].copy_from_slice(&parity_before[67 * SECTOR..103 * SECTOR]);
+        assert!(!stripes_xor_to_zero(&rw, 4));
+        let mut again = Array::assemble(&mut rw, None).unwrap();
+        assert_eq!(again.recover_ppl(&mut rw).unwrap().mismatched, 0);
         assert!(!again.dirty());
         assert!(stripes_xor_to_zero(&rw, 4));
     }

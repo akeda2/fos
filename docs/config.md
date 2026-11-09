@@ -35,7 +35,7 @@ unknown line is reported on the console ("unknown line ... ignored") and skipped
 | `gpio-remote` | Other machines may change this machine's GPIO pins (with the `synckey`); reads need only the key. |
 | `gpio-deny N..` | Forbid GPIO pins (numbers 0-57), locally and remotely. |
 | `gpio-sim` | A RAM-backed GPIO bank, for tests (`make test-gpio`). |
-| `md auto`, `md wait SECONDS` | Server kernel only: assemble a Linux md RAID 0, 1, 5, 6 or 10 array (mdadm v1.x) in a background thread at boot; wait up to SECONDS (default 10) for all members before running degraded. Off by default. `docs/md.md`. |
+| `md auto`, `md wait SECONDS` | Server kernel only: assemble a Linux md RAID 0, 1, 5, 6 or 10 array (mdadm v1.x) in a background thread at boot; wait up to SECONDS (default 10) for all members before running degraded. Off by default. Internal write-intent bitmaps and RAID 5 partial parity logs are honoured as mdadm made them; `md resume` goes on with an interrupted rebuild. `docs/md.md`, `docs/md-tutorial.md`. |
 | `vnic NAME on N [mac=02:..]` | Server kernel only: a virtual interface `NAME` on physical NIC N, created at boot (`vnic` command, `run TAPE &NAME`, `NETWORKING.md` "Virtual NICs"). |
 
 ## `debug`

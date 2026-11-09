@@ -34,7 +34,13 @@ through the `Members` trait. Stages:
    write also goes to it; at the end the flag is cleared, the role tables name it and every superblock gets events +1,
    the new member's last. The dev number is the member's old one when the array lists it as gone, else the one the role
    table gives the missing role. A failed write to the target abandons the rebuild, never an active member. Progress is
-   not saved: a rebuild interrupted by `stop` or a crash starts again from sector 0. RAID 0 has neither.
+   saved (as Linux does): every commit, `stop` and each 64 MiB copied records `recovery_offset` in the target's superblock
+   (its data flushed first, its events kept level with the array's, its bitmap copy too). At the next assembly a flagged
+   member with the array's event count, a role of its own that no active member holds and an offset inside the array
+   becomes a pending rebuild (`rebuild_pending`, `job` shows where it stands); `start` + `step` go on from the offset
+   (kernel: `md resume`). One that missed an event (a write without it) is left out as before and `begin_rebuild` starts it
+   from 0. mdadm does the same with such a member (`check_md_mdadm.sh` finishes a half rebuild both ways). RAID 0 has no
+   rebuild.
 5. **RAID 5** (done in the library, same `Array`; RAID 6 is item 5b): the four md layouts (left/right, symmetric/asymmetric;
    mdadm's default is left-symmetric), chunk size from the superblock, array size `(disks - 1) * (size / chunk * chunk)`.
    Any member of a stripe row is the XOR of the others, so one rule serves reads of a missing or failing member,
@@ -77,7 +83,9 @@ through the `Members` trait. Stages:
    none unusable the array counts as clean (as in Linux), otherwise the resync stays. A dirty degraded RAID 5 with a log
    assembles. A log that overlaps data or the superblock keeps the array read-only. Host tests, `make test-mf-md` (a torn
    parity repaired at boot) and `check_md_mdadm.sh raid5-ppl` (passes against mdadm 4.5: assembles, fscks, `check` finds 0 mismatches after a torn write and our replay, rebuild works) cover it. Cost: one extra
-   flushed write per 8 KiB piece.
+   flushed write per piece, a piece being up to 32 KiB (`PPL_RUN`, 8 KiB when the log area is smaller than 36 KiB). Entries
+   cannot share a flush: pieces of one stripe update overlapping parity, so the partial parity of the second depends on
+   the first one's write; Linux gets the same effect by covering a whole stripe range per entry.
 6. **Kernel glue** (done in kernel-mf, `kernel-mf/src/mdvol.rs`): the assembled array is registered as one more disk
    (`block::Backend::Md`), so `disks`, `ext4 diskN`, `fstab`, `mount` and `@LABEL` work on it unchanged. Members are whole
    disks or GPT "Linux RAID" partitions. `md auto` in `settings` starts the `md-assemble` thread at boot; boot never waits
@@ -86,7 +94,7 @@ through the `Members` trait. Stages:
    opened for writing on the first write and closed clean after 3 idle seconds, on `md stop`, `shutdown` and `reboot`;
    only a crash during a write leaves it dirty. A dirty array is read-only until `md force-rw`. A failing member costs a
    failed transfer, never a stall (reads fall back, writes drop the member). Commands: `md`, `md assemble`, `md stop`,
-   `md force-rw`, `md resync` (opens a dirty array and resyncs it in the background thread `md-job`; progress in `md`, which
+   `md force-rw`, `md resume` (goes on with a rebuild an earlier stop or crash interrupted; `md assemble` says when one waits), `md resync` (opens a dirty array and resyncs it in the background thread `md-job`; progress in `md`, which
    also reports a rebuild) and `md add diskN` then `md add diskN confirm` (erases that whole disk and rebuilds onto it; refuses
    the boot disk, a disk that is already a member and a dirty array: resync first). An idle close waits for a running job.
    One array per machine for now. `make test-mf-md` boots QEMU with a hand-built mirror, reads and writes

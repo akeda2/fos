@@ -86,7 +86,7 @@ their own.
 **USB MIDI** (kernel, class-compliant devices on xHCI): `midi` lists devices, `midi monitor` prints incoming messages until Escape, `midi send [#N] 90 3c 64` sends one 1-3 byte message. Verified on real hardware with a cable looped out to in; QEMU has no USB-MIDI model, so `make test-midi` only covers the no-device paths.
 
 Reference documents: [`NETWORKING.md`](NETWORKING.md), [`AUDIO.md`](AUDIO.md),
-[`docs/recorder.md`](docs/recorder.md), [`docs/nettest.md`](docs/nettest.md),
+[`docs/md-tutorial.md`](docs/md-tutorial.md) (software RAID for new users), [`docs/recorder.md`](docs/recorder.md), [`docs/nettest.md`](docs/nettest.md),
 [`docs/rust-tapes-for-dummies.md`](docs/rust-tapes-for-dummies.md) (write your own tape).
 
 ## Driving a machine from another
