@@ -108,7 +108,7 @@ run() {
         f="$work/m$i.img"; truncate -s $SIZE "$f"; files+=("$f")
     done
     attach "${files[@]}"
-    mdadm --create $MD --run --metadata=1.2 --bitmap=$bm $bmopt --level=$level --raid-devices=$n $extra "${loops[@]}" >/dev/null 2>&1 || { bad "mdadm --create"; detach; return; }
+    mdadm --create $MD --run --metadata=1.2 --bitmap=$bm $bmopt --level=$level --raid-devices=$n $extra "${loops[@]}" >/dev/null 2>"$work/create.err" || { bad "mdadm --create"; sed "s/^/      /" "$work/create.err"; detach; return; }
     mdadm --wait $MD >/dev/null 2>&1
     mkfs.ext4 -q -F $MD
     mount $MD "$work/mnt"
