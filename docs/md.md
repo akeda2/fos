@@ -69,9 +69,9 @@ through the `Members` trait. Stages:
 writes and reads back a pattern in its last 8 sectors, restores them and stops it clean: afterwards `mdadm --examine`
 must show a clean array with events +2 and `mdadm --assemble --scan` must still work.
 
-**Verification status.** The superblock layout and checksum come from the kernel's `md_p.h` and mdadm's description and are
-tested against an independent Python builder, not yet against a superblock written by real `mdadm`. First real check:
-`mdadm --create /dev/md0 --level=1 --raid-devices=2 --metadata=1.2 /dev/sdX /dev/sdY`, then `probe` on the members and
-compare with `mdadm --examine`. The RAID 0 and 10 placement is from `raid10.c` and tested against the test's own striping,
-so check it against real members as well (`mdadm --create ... --level=10 --layout=n2 --raid-devices=4`, `--level=0`);
-RAID 0 members of unequal size (several zones) are not read, a rebuild has never been run on disks of a real array, and the `sb->size` a real RAID 0 stores is unverified.
+**Verification status.** `tools/check_md_mdadm.sh` (mdadm 4.5, loop devices, 2026-11-09) passed for RAID 1, 0, 10 (near 2) and
+RAID 5 (all four layouts, 3 and 4 members): our dump fscks clean, mdadm assembles and fscks the array after our write, and a blank
+member rebuilt by `probe --rebuild` makes `mdadm` check report 0 mismatches. It found two real-mdadm differences, both fixed:
+RAID 0 carries feature bit `RAID0_LAYOUT` and `size` 0 (the length is the members' `data_size`). Not verified: RAID 0 members of
+unequal size (several zones, refused), arrays with a bitmap (refused for writing), real disks (timings, a pulled USB disk), and
+the kernel glue against an mdadm-made array on real hardware.
