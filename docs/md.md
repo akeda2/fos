@@ -77,8 +77,8 @@ through the `Members` trait. Stages:
 writes and reads back a pattern in its last 8 sectors, restores them and stops it clean: afterwards `mdadm --examine`
 must show a clean array with events +2 and `mdadm --assemble --scan` must still work.
 
-**Verification status.** RAID 6 is checked against an independent model in the host tests and the QEMU test, and not yet
-against mdadm (`tools/check_md_mdadm.sh raid6-ls raid6-la raid6-rs raid6-ra raid6-5`). `tools/check_md_mdadm.sh` (mdadm 4.5, loop devices, 2026-11-09) passed for RAID 1, 0, 10 (near 2) and
+**Verification status.** RAID 6 (all four layouts, 4 and 5 members) passed `tools/check_md_mdadm.sh` too (2026-11-09), with
+the same checks as RAID 5; one blank member was rebuilt, the double-loss paths are covered by the host and QEMU tests only. `tools/check_md_mdadm.sh` (mdadm 4.5, loop devices, 2026-11-09) passed for RAID 1, 0, 10 (near 2) and
 RAID 5 (all four layouts, 3 and 4 members): our dump fscks clean, mdadm assembles and fscks the array after our write, and a blank
 member rebuilt by `probe --rebuild` makes `mdadm` check report 0 mismatches. It found two real-mdadm differences, both fixed:
 RAID 0 carries feature bit `RAID0_LAYOUT` and `size` 0 (the length is the members' `data_size`). Not verified: RAID 0 members of
