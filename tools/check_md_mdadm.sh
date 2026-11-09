@@ -5,7 +5,7 @@
 #     (cd crates/md && cargo build --example probe) && sudo tools/check_md_mdadm.sh [CONFIG...]
 #
 # CONFIG is one of: raid1 raid0 raid10 raid5-ls raid5-la raid5-rs raid5-ra raid5-3 raid6-ls raid6-la raid6-rs raid6-ra raid6-5 raid1-bm raid5-bm raid6-bm (an internal
-# write-intent bitmap, 1 MiB chunks). Default: all of them.
+# write-intent bitmap, 1 MiB chunks) raid5-ppl (a partial parity log). Default: all of them.
 # For each, mdadm creates the array and an ext4 with a known file; then
 #   1. probe assembles the members read-only: the dump must fsck clean and hold the file;
 #   2. probe --write-test starts, writes and stops the array; mdadm must assemble it and fsck it clean;
@@ -14,6 +14,9 @@
 # With a bitmap, between 2 and 3: the write-test leaves 0 dirty bits and the bitmap's events level with the array's;
 # probe --crash-test leaves the array open, mdadm must see dirty bits, and probe --resync (and, on another crash,
 # mdadm's own resync of just those chunks) must bring them back to 0.
+# With a partial parity log: probe --tear loses the parity write of a write and leaves the array open; probe --recover
+# must replay the log (entries, 0 mismatched) and stop clean, then mdadm assembles it, "check" finds 0 mismatches and
+# the file system is clean.
 set -u
 cd "$(dirname "$0")/.."
 PROBE=${PROBE:-crates/md/target/debug/examples/probe}
@@ -80,6 +83,22 @@ bitmap_steps() {
     detach
 }
 
+ppl_steps() {
+    "$PROBE" --tear "${files[@]}" | tail -1 | sed 's/^/    /'
+    out=$("$PROBE" --recover "${files[@]}")
+    echo "$out" | sed 's/^/    /'
+    echo "$out" | grep -q "^ppl: [1-9][0-9]* entries replayed, 0 mismatched, array clean" && ok "probe replays the log and the array is clean" || bad "probe --recover"
+    attach "${files[@]}"
+    mdadm --assemble $MD "${loops[@]}" >/dev/null 2>&1 && ok "mdadm assembles after the recovery" || bad "mdadm --assemble after recovery"
+    echo check >/sys/block/md199/md/sync_action
+    mdadm --wait $MD >/dev/null 2>&1
+    mm=$(cat /sys/block/md199/md/mismatch_cnt)
+    [ "$mm" = 0 ] && ok "mdadm check after the torn write: 0 mismatches" || bad "mdadm check after the torn write: $mm mismatches"
+    fsck_ok $MD "after the torn write"
+    mdadm --stop $MD >/dev/null
+    detach
+}
+
 run() {
     name=$1
     case $name in
@@ -91,6 +110,7 @@ run() {
         raid5-rs) level=5; n=4; extra="--chunk=64 --layout=right-symmetric" ;;
         raid5-ra) level=5; n=4; extra="--chunk=64 --layout=right-asymmetric" ;;
         raid5-3) level=5; n=3; extra="--chunk=128" ;;
+        raid5-ppl) level=5; n=3; extra="--chunk=64 --layout=left-symmetric --consistency-policy=ppl" ;;
         raid5-bm) level=5; n=3; extra="--chunk=64 --layout=left-symmetric" ;;
         raid6-ls) level=6; n=4; extra="--chunk=64 --layout=left-symmetric" ;;
         raid6-la) level=6; n=4; extra="--chunk=64 --layout=left-asymmetric" ;;
@@ -137,6 +157,7 @@ run() {
     detach
 
     [ "$bm" = none ] || bitmap_steps
+    case $name in *-ppl) ppl_steps ;; esac
     [ "$level" = 0 ] && return
     : >"${files[1]}"; truncate -s $SIZE "${files[1]}"
     out=$("$PROBE" "${files[@]}" | head -2)

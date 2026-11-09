@@ -43,7 +43,7 @@ through the `Members` trait. Stages:
    be missing; a second failure fails the write. During a rebuild every write also reaches the target, parity
    included. The write hole is the same as in Linux without a journal: a crash during a write leaves the array dirty
    and the resync recomputes parity. A dirty array that is also degraded is not assembled (Linux refuses it too:
-   the parity cannot be trusted to rebuild the missing member). No journal, no PPL, no reshape.
+   the parity cannot be trusted to rebuild the missing member) unless it has a partial parity log (5d). No journal, no reshape.
    Job cursors count sectors of one member here (`job()` reports array sectors).
 5b. **RAID 6** (`crates/md/src/array/raid6.rs`, GF(2^8) in `gf.rs`, polynomial 0x11d, generator 2): the same four layouts,
    array size `(disks - 2) * (size / chunk * chunk)`, at least 4 members. P sits where RAID 5 puts parity, Q on the next
@@ -65,6 +65,19 @@ through the `Members` trait. Stages:
    over 16 KiB keeps the array read-only; RAID 10 with a bitmap too. The union of all members' bits is used. A rebuilt
    member gets the bitmap written first. The bitmap narrows the resync, it does not close the write hole (a stripe
    torn by the crash is repaired by the resync, but a degraded array still refuses to assemble while dirty).
+5d. **Partial parity log** (`crates/md/src/array/ppl.rs`, RAID 5 only; `mdadm --consistency-policy=ppl`, mutually exclusive with a
+   bitmap): closes the write hole. Format from Linux's `raid5-ppl.c`: per member a log area (`ppl.offset` i16 and
+   `ppl.size` u16 in the bytes of `bitmap_offset`, feature 0x400, or 0x800 for a ring of headers that is read the same way) holding a
+   4 KiB header (signature = CRC-32C of the array uuid, generation, entries, CRC-32C) and the partial parity: the old
+   parity with the old data taken out. Each write piece logs its partial parity on the parity member and flushes it before
+   the data and parity writes (one header and entry at the area start, a higher generation each time). `start` empties every
+   log before the superblocks go "in use", so no old header can be replayed. `Array::recover_ppl` runs on a dirty
+   array before anything is read (the kernel glue does it at assembly and prints the count): each entry's parity is
+   recomputed as the current data XOR the partial parity, skipped when a data member is missing; with at least one entry and
+   none unusable the array counts as clean (as in Linux), otherwise the resync stays. A dirty degraded RAID 5 with a log
+   assembles. A log that overlaps data or the superblock keeps the array read-only. Host tests, `make test-mf-md` (a torn
+   parity repaired at boot) and `check_md_mdadm.sh raid5-ppl` (needs a root run; not yet run) cover it. Cost: one extra
+   flushed write per 8 KiB piece.
 6. **Kernel glue** (done in kernel-mf, `kernel-mf/src/mdvol.rs`): the assembled array is registered as one more disk
    (`block::Backend::Md`), so `disks`, `ext4 diskN`, `fstab`, `mount` and `@LABEL` work on it unchanged. Members are whole
    disks or GPT "Linux RAID" partitions. `md auto` in `settings` starts the `md-assemble` thread at boot; boot never waits

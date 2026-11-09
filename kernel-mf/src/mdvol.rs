@@ -177,7 +177,7 @@ fn try_assemble(wait_over: bool) -> Outcome {
         state.status.set(format_args!("no member found yet"));
         return Outcome::NoMembers;
     }
-    let array = match Array::assemble(&mut members, None) {
+    let mut array = match Array::assemble(&mut members, None) {
         Ok(array) => array,
         Err(error) => {
             state.status.set(format_args!("members found, cannot assemble: {error:?}"));
@@ -187,6 +187,13 @@ fn try_assemble(wait_over: bool) -> Outcome {
     if array.degraded() && !wait_over {
         state.status.set(format_args!("waiting for members ({} of {})", array.present(), array.expected()));
         return Outcome::Waiting(array.present(), array.expected());
+    }
+    // a partial parity log repairs what a crash left half written, before anything reads the array
+    if array.has_ppl() && array.dirty() {
+        match array.recover_ppl(&mut members) {
+            Ok(report) => crate::println!("md: partial parity log: {} entries replayed, {} not usable.", report.entries, report.mismatched),
+            Err(error) => crate::println!("md: partial parity log not replayed: {error:?}"),
+        }
     }
     let (present, expected, sectors, dirty) = (array.present(), array.expected(), array.sectors(), array.dirty());
     let mut model = [b' '; 40];

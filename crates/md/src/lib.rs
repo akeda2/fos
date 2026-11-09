@@ -12,6 +12,7 @@
 
 pub mod array;
 pub mod bitmap;
+pub mod crc32c;
 pub mod gf;
 pub mod superblock;
 
