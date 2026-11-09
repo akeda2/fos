@@ -11,6 +11,11 @@
 //! back, restores the original bytes and stops cleanly. Afterwards `mdadm --examine` should show the array clean with
 //! the event count two higher, and `mdadm --assemble --scan` must still work. Use test disks, or an array whose last
 //! sectors are free (ext4 puts nothing user-visible there, but never run it on a mounted array).
+//!
+//!     cargo run --example probe -- --rebuild N DISK1 DISK2 ...
+//!
+//! `--rebuild N` (members read-write) fills member number N (0-based, as listed; it may be blank) in as the array's
+//! missing member, from the others, and stops the array clean. Mirrors (RAID 1) are compared; striped levels are not.
 
 use md::{Error, Members, SECTOR, array::Array};
 use std::fs::{File, OpenOptions};
@@ -44,10 +49,13 @@ fn main() {
     let mut paths = Vec::new();
     let mut dump = None;
     let mut write_test = false;
+    let mut rebuild: Option<usize> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--write-test" {
             write_test = true;
+        } else if arg == "--rebuild" {
+            rebuild = args.next().and_then(|n| n.parse().ok());
         } else if arg == "--dump" {
             dump = args.next();
         } else {
@@ -56,7 +64,7 @@ fn main() {
     }
     let mut disks = Disks(Vec::new());
     for path in &paths {
-        let mut file = OpenOptions::new().read(true).write(write_test).open(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let mut file = OpenOptions::new().read(true).write(write_test || rebuild.is_some()).open(path).unwrap_or_else(|e| panic!("{path}: {e}"));
         let bytes = file.seek(SeekFrom::End(0)).unwrap();
         disks.0.push((file, bytes / SECTOR as u64));
     }
@@ -70,6 +78,21 @@ fn main() {
         array.present(), array.expected(), if array.degraded() { ", DEGRADED" } else { "" }, if array.dirty() { ", dirty" } else { "" });
     let used: Vec<usize> = array.used_members().collect();
     println!("in use: {}", used.iter().map(|&m| paths[m].as_str()).collect::<Vec<_>>().join(" "));
+    if let Some(member) = rebuild {
+        let mut array = array;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        array.start(&mut disks, now).expect("start");
+        array.begin_rebuild(&mut disks, member, [0x5a; 16]).expect("begin rebuild");
+        loop {
+            match array.step(&mut disks, 4096, now).expect("step") {
+                md::array::Step::Running(_) => {}
+                _ => break,
+            }
+        }
+        array.stop(&mut disks, now).expect("stop");
+        println!("rebuild ok: {} of {} members, events now {}, array stopped clean", array.present(), array.expected(), array.events());
+        return;
+    }
     if write_test {
         let mut array = array;
         let at = array.sectors() - 8;
@@ -98,7 +121,7 @@ fn main() {
             out.write_all(a).unwrap();
         }
         // read each other member directly at the same array address, to compare the mirrors
-        for &member in used.iter().skip(1) {
+        for &member in used.iter().skip(1).filter(|_| array.level() == 1) {
             if let Some(offset) = array_offset(&mut disks, member) {
                 disks.read(member, offset + lba, b).expect("read mirror");
                 mismatches += (0..count).filter(|&s| a[s * SECTOR..(s + 1) * SECTOR] != b[s * SECTOR..(s + 1) * SECTOR]).count() as u64;
@@ -106,7 +129,9 @@ fn main() {
         }
         lba += count as u64;
     }
-    println!("{mismatches} sectors differ between mirrors");
+    if array.level() == 1 {
+        println!("{mismatches} sectors differ between mirrors");
+    }
 }
 
 fn array_offset(disks: &mut Disks, member: usize) -> Option<u64> {

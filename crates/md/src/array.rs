@@ -1,4 +1,4 @@
-//! An md array assembled from v1.x members: RAID 1 (mirror), RAID 0 (stripe) and RAID 10 in the "near" layout.
+//! An md array assembled from v1.x members: RAID 1 (mirror), RAID 0 (stripe) and RAID 10 in the "near" layout and RAID 5.
 //!
 //! Assembly follows what the Linux kernel's md does: look for a superblock on every member, keep those of one array
 //! (same `set_uuid`), take the highest event count as the truth and use only the members that reached it and whose slot
@@ -12,10 +12,16 @@
 //! has no redundancy and no resync, so it is never marked dirty and a member that fails a write fails the write. RAID 10
 //! needs one copy of every chunk: a member that fails is dropped as long as that holds.
 
-use crate::superblock::{self, Superblock, FEATURE_BAD_BLOCKS, FEATURE_BITMAP, FEATURE_RECOVERY_OFFSET, LEVEL_RAID0, LEVEL_RAID1, LEVEL_RAID10, READ_BYTES, ROLE_FAULTY, SYNCED};
+use crate::superblock::{self, Superblock, FEATURE_BAD_BLOCKS, FEATURE_BITMAP, FEATURE_RECOVERY_OFFSET, LEVEL_RAID0, LEVEL_RAID1, LEVEL_RAID10, LEVEL_RAID5, READ_BYTES, ROLE_FAULTY, SYNCED};
 use crate::{Error, Members, SECTOR};
 
 pub const MAX_MEMBERS: usize = 8;
+
+fn xor(into: &mut [u8], from: &[u8]) {
+    for (a, b) in into.iter_mut().zip(from) {
+        *a ^= b;
+    }
+}
 
 /// A member in use: where its data starts and its superblock as read, patched in place when the array writes.
 struct Slot {
@@ -47,6 +53,8 @@ pub struct Array {
     faulty_count: usize,
     features: u32,
     level: i32,
+    /// The RAID 5 parity layout (0 left-asymmetric, 1 right-asymmetric, 2 left-symmetric, 3 right-symmetric).
+    layout: u32,
     /// Chunk size in sectors (RAID 0 and 10), and copies of each chunk (1 for RAID 0, `raid_disks` for RAID 1).
     chunk: u64,
     near: u32,
@@ -111,6 +119,7 @@ fn geometry(lead: &Superblock) -> Result<(u64, u32, u64), Error> {
     }
     match lead.level {
         LEVEL_RAID1 => Ok((0, disks, lead.size)),
+        LEVEL_RAID5 if chunk > 0 && disks >= 2 && lead.layout <= 3 => Ok((chunk, 1, lead.size / chunk * chunk * (disks as u64 - 1))),
         LEVEL_RAID0 if chunk > 0 && disks > 0 => Ok((chunk, 1, lead.size / chunk * chunk * disks as u64)),
         LEVEL_RAID10 => {
             let (near, far, offset) = (lead.layout & 0xff, (lead.layout >> 8) & 0xff, lead.layout & 0x1_0000);
@@ -148,7 +157,7 @@ impl Array {
         let (mut best, mut best_member) = (0u64, usize::MAX);
         for (member, entry) in found.iter().enumerate() {
             if let Some((sb, _)) = entry {
-                if !matches!(sb.level, LEVEL_RAID0 | LEVEL_RAID1 | LEVEL_RAID10) {
+                if !matches!(sb.level, LEVEL_RAID0 | LEVEL_RAID1 | LEVEL_RAID5 | LEVEL_RAID10) {
                     return Err(Error::Unsupported);
                 }
                 if sb.feature_map & !(FEATURE_BITMAP | FEATURE_RECOVERY_OFFSET | FEATURE_BAD_BLOCKS) != 0 {
@@ -178,6 +187,7 @@ impl Array {
             faulty_count: 0,
             features: lead.feature_map,
             level: lead.level,
+            layout: lead.layout,
             chunk,
             near,
             sync_cursor: None,
@@ -196,10 +206,26 @@ impl Array {
                 array.used += 1;
             }
         }
+        // parity of a dirty array cannot be trusted to rebuild a missing member (Linux refuses this too)
+        if array.level == LEVEL_RAID5 && array.dirty && array.degraded() {
+            return Err(Error::Degraded);
+        }
         if array.used == 0 || (array.level != LEVEL_RAID1 && !array.covered(array.role_mask())) {
             return Err(Error::Degraded);
         }
         Ok(array)
+    }
+
+    /// Units a job's cursor counts: array sectors, but sectors of one member for RAID 5 (a stripe row is one unit of
+    /// work there). `job()` reports it scaled back to array sectors.
+    fn span(&self) -> u64 {
+        if self.level == LEVEL_RAID5 { self.sectors / (self.raid_disks as u64 - 1) } else { self.sectors }
+    }
+    fn scale(&self) -> u64 {
+        if self.level == LEVEL_RAID5 { self.raid_disks as u64 - 1 } else { 1 }
+    }
+    fn unit_budget(&self, budget: u64) -> u64 {
+        (budget / self.scale()).max(1)
     }
 
     /// The array's size in 512-byte sectors.
@@ -261,6 +287,9 @@ impl Array {
         if self.level == LEVEL_RAID1 {
             return mask != 0;
         }
+        if self.level == LEVEL_RAID5 {
+            return (mask & ((1u32 << n) - 1)).count_ones() + 1 >= n;
+        }
         (0..n).step_by(gcd(self.near, n) as usize).all(|start| (0..self.near).any(|c| mask & (1 << ((start + c) % n)) != 0))
     }
 
@@ -281,6 +310,157 @@ impl Array {
             copies[c as usize] = ((position % n) as u16, position / n * self.chunk + offset);
         }
         (self.chunk - offset, copies, self.near as usize)
+    }
+
+    /// RAID 5: the sectors left in the chunk, the data role, the parity role and the member sector of array sector
+    /// `v` (the four layouts of Linux's `raid5_compute_sector`).
+    fn locate5(&self, v: u64) -> (u64, u16, u16, u64) {
+        let (n, d) = (self.raid_disks as u64, self.raid_disks as u64 - 1);
+        let (k, offset) = (v / self.chunk, v % self.chunk);
+        let (row, mut data) = (k / d, k % d);
+        let parity = self.parity_role(row);
+        let pd = parity as u64;
+        data = if self.layout & 2 != 0 { (pd + 1 + data) % n } else if data >= pd { data + 1 } else { data };
+        (self.chunk - offset, data as u16, parity, row * self.chunk + offset)
+    }
+
+    /// The role holding the parity of stripe row `row`: it walks backwards (left) or forwards (right) one member per row.
+    fn parity_role(&self, row: u64) -> u16 {
+        let n = self.raid_disks as u64;
+        (if self.layout & 1 != 0 { row % n } else { n - 1 - row % n }) as u16
+    }
+
+    /// The member and data offset behind `role`, if it is in use and has not failed in the current operation.
+    fn usable(&self, role: u16, failed: u32) -> Option<(usize, u64)> {
+        self.slot_of_role(role).filter(|_| failed & (1 << role) == 0).map(|slot| (slot.member, slot.data_offset))
+    }
+
+    /// The member being rebuilt, if it holds `role`: it takes writes but is never read.
+    fn target(&self, role: u16) -> Option<(usize, u64)> {
+        self.rebuild.as_ref().filter(|r| r.slot.role == role).map(|r| (r.slot.member, r.slot.data_offset))
+    }
+
+    /// Every role but those in `skip` at member sector `at`, XORed into `out`: what is missing from a stripe is always that.
+    fn xor_others<M: Members>(&self, members: &mut M, skip: &[u16], at: u64, out: &mut [u8], failed: &mut u32) -> Result<(), Error> {
+        let mut other = [0u8; PIECE as usize * SECTOR];
+        let bytes = out.len();
+        for role in (0..self.raid_disks as u16).filter(|r| !skip.contains(r)) {
+            let (member, base) = self.usable(role, *failed).ok_or(Error::Device)?;
+            if let Err(error) = members.read(member, base + at, &mut other[..bytes]) {
+                *failed |= 1 << role;
+                return Err(error);
+            }
+            xor(out, &other[..bytes]);
+        }
+        Ok(())
+    }
+
+    fn read_parity<M: Members>(&self, members: &mut M, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
+        let count = (buffer.len() / SECTOR) as u64;
+        let mut done = 0;
+        while done < count {
+            let (run, data, _, at) = self.locate5(lba + done);
+            let run = run.min(count - done).min(PIECE);
+            let piece = &mut buffer[done as usize * SECTOR..(done + run) as usize * SECTOR];
+            let direct = self.usable(data, 0).is_some_and(|(member, base)| members.read(member, base + at, piece).is_ok());
+            if !direct {
+                piece.fill(0);
+                self.xor_others(members, &[data], at, piece, &mut 0)?;
+            }
+            done += run;
+        }
+        Ok(())
+    }
+
+    /// Writes a RAID 5 array one piece (inside one chunk) at a time. The new parity is the old one with the old data
+    /// taken out and the new data put in; when the data or the parity member is gone it is the XOR of all the data.
+    /// A member that fails is dropped when the array stays whole enough (one missing), else the write fails.
+    fn write_parity<M: Members>(&mut self, members: &mut M, lba: u64, buffer: &[u8], now: u64) -> Result<(), Error> {
+        let count = (buffer.len() / SECTOR) as u64;
+        let (mut done, mut failed, mut lost) = (0, 0u32, false);
+        while done < count {
+            let (run, data, parity, at) = self.locate5(lba + done);
+            let run = run.min(count - done).min(PIECE);
+            let new = &buffer[done as usize * SECTOR..(done + run) as usize * SECTOR];
+            if self.write_piece5(members, data, parity, at, new, &mut failed).is_err() {
+                lost = true;
+                break;
+            }
+            done += run;
+        }
+        if self.drop_roles(members, failed, now)? {
+            lost = true;
+        }
+        if lost { Err(Error::Device) } else { Ok(()) }
+    }
+
+    fn write_piece5<M: Members>(&mut self, members: &mut M, data: u16, parity: u16, at: u64, new: &[u8], failed: &mut u32) -> Result<(), Error> {
+        let bytes = new.len();
+        let (mut fresh, mut old) = ([0u8; PIECE as usize * SECTOR], [0u8; PIECE as usize * SECTOR]);
+        let mut have_parity = false;
+        if let (Some((dm, db)), Some((pm, pb))) = (self.usable(data, *failed), self.usable(parity, *failed)) {
+            if members.read(dm, db + at, &mut old[..bytes]).is_err() {
+                *failed |= 1 << data;
+            } else if members.read(pm, pb + at, &mut fresh[..bytes]).is_err() {
+                *failed |= 1 << parity;
+            } else {
+                xor(&mut fresh[..bytes], &old[..bytes]);
+                xor(&mut fresh[..bytes], new);
+                have_parity = true;
+            }
+        }
+        let wanted = self.usable(parity, *failed).is_some() || self.target(parity).is_some();
+        if !have_parity && wanted {
+            fresh[..bytes].copy_from_slice(new);
+            self.xor_others(members, &[data, parity], at, &mut fresh[..bytes], failed)?;
+            have_parity = true;
+        }
+        let mut wrote = 0;
+        for (role, buffer) in [(data, Some(new)), (parity, have_parity.then_some(&fresh[..bytes]))] {
+            let Some(buffer) = buffer else { continue };
+            if let Some((member, base)) = self.usable(role, *failed) {
+                match members.write(member, base + at, buffer) {
+                    Ok(()) => wrote += 1,
+                    Err(_) => *failed |= 1 << role,
+                }
+            } else if let Some((member, base)) = self.target(role) {
+                if members.write(member, base + at, buffer).is_err() {
+                    self.rebuild = None;
+                }
+            }
+        }
+        if wrote == 0 { Err(Error::Device) } else { Ok(()) }
+    }
+
+    /// Makes the parity of one piece at member sector `m` agree with the data.
+    fn resync_piece5<M: Members>(&mut self, members: &mut M, m: u64, end: u64) -> Result<u64, Error> {
+        let (offset, parity) = (m % self.chunk, self.parity_role(m / self.chunk));
+        let length = (self.chunk - offset).min(end - m).min(PIECE);
+        let bytes = length as usize * SECTOR;
+        let (mut sum, mut stored) = ([0u8; PIECE as usize * SECTOR], [0u8; PIECE as usize * SECTOR]);
+        self.xor_others(members, &[parity], m, &mut sum[..bytes], &mut 0)?;
+        let (member, base) = self.usable(parity, 0).ok_or(Error::Device)?;
+        members.read(member, base + m, &mut stored[..bytes])?;
+        if stored[..bytes] != sum[..bytes] {
+            members.write(member, base + m, &sum[..bytes])?;
+        }
+        Ok(m + length)
+    }
+
+    /// Fills the rebuild target's piece at member sector `m`: whatever role it has in that row, it is the XOR of the rest.
+    fn rebuild_piece5<M: Members>(&mut self, members: &mut M, m: u64, end: u64) -> Result<u64, Error> {
+        let length = (self.chunk - m % self.chunk).min(end - m).min(PIECE);
+        let bytes = length as usize * SECTOR;
+        let (role, member, base) = self.rebuild.as_ref().map(|r| (r.slot.role, r.slot.member, r.slot.data_offset)).ok_or(Error::Busy)?;
+        let mut buffer = [0u8; PIECE as usize * SECTOR];
+        let done = self.xor_others(members, &[role], m, &mut buffer[..bytes], &mut 0).and_then(|()| members.write(member, base + m, &buffer[..bytes]));
+        match done {
+            Ok(()) => Ok(m + length),
+            Err(error) => {
+                self.rebuild = None;
+                Err(error)
+            }
+        }
     }
 
     fn slot_of_role(&self, role: u16) -> Option<&Slot> {
@@ -381,6 +561,9 @@ impl Array {
         if lba.checked_add(count).is_none_or(|end| end > self.sectors) {
             return Err(Error::Range);
         }
+        if self.level == LEVEL_RAID5 {
+            return self.read_parity(members, lba, buffer);
+        }
         if self.level != LEVEL_RAID1 {
             return self.read_striped(members, lba, buffer);
         }
@@ -430,6 +613,9 @@ impl Array {
         let count = (buffer.len() / SECTOR) as u64;
         if lba.checked_add(count).is_none_or(|end| end > self.sectors) {
             return Err(Error::Range);
+        }
+        if self.level == LEVEL_RAID5 {
+            return self.write_parity(members, lba, buffer, now);
         }
         if self.level != LEVEL_RAID1 {
             return self.write_striped(members, lba, buffer, now);
@@ -498,8 +684,8 @@ impl Array {
     /// The running job and how far it is, in array sectors out of `sectors()`.
     pub fn job(&self) -> Option<(Job, u64)> {
         match (self.sync_cursor, &self.rebuild) {
-            (Some(cursor), _) => Some((Job::Resync, cursor)),
-            (None, Some(r)) => Some((Job::Rebuild, r.cursor)),
+            (Some(cursor), _) => Some((Job::Resync, cursor * self.scale())),
+            (None, Some(r)) => Some((Job::Rebuild, r.cursor * self.scale())),
             _ => None,
         }
     }
@@ -576,7 +762,8 @@ impl Array {
             return Ok(Step::Idle);
         }
         if let Some(mut cursor) = self.sync_cursor {
-            let end = (cursor + budget).min(self.sectors);
+            let (total, budget) = (self.span(), self.unit_budget(budget));
+            let end = (cursor + budget).min(total);
             while cursor < end {
                 cursor = match self.resync_piece(members, cursor, end, now) {
                     Ok(next) => next,
@@ -586,7 +773,7 @@ impl Array {
                     }
                 };
             }
-            if cursor < self.sectors {
+            if cursor < total {
                 self.sync_cursor = Some(cursor);
                 return Ok(Step::Running(Job::Resync));
             }
@@ -596,11 +783,12 @@ impl Array {
             return Ok(Step::Done(Job::Resync));
         }
         if let Some(cursor) = self.rebuild.as_ref().map(|r| r.cursor) {
-            let (mut cursor, end) = (cursor, (cursor + budget).min(self.sectors));
+            let (total, budget) = (self.span(), self.unit_budget(budget));
+            let (mut cursor, end) = (cursor, (cursor + budget).min(total));
             while cursor < end {
                 cursor = self.rebuild_piece(members, cursor, end, now)?;
             }
-            if cursor < self.sectors {
+            if cursor < total {
                 if let Some(r) = self.rebuild.as_mut() {
                     r.cursor = cursor;
                 }
@@ -613,6 +801,9 @@ impl Array {
     }
 
     fn resync_piece<M: Members>(&mut self, members: &mut M, cursor: u64, end: u64, now: u64) -> Result<u64, Error> {
+        if self.level == LEVEL_RAID5 {
+            return self.resync_piece5(members, cursor, end);
+        }
         let (run, copies, n) = self.locate(cursor);
         let length = run.min(end - cursor).min(PIECE);
         let bytes = length as usize * SECTOR;
@@ -642,6 +833,9 @@ impl Array {
     }
 
     fn rebuild_piece<M: Members>(&mut self, members: &mut M, cursor: u64, end: u64, now: u64) -> Result<u64, Error> {
+        if self.level == LEVEL_RAID5 {
+            return self.rebuild_piece5(members, cursor, end);
+        }
         let (run, copies, n) = self.locate(cursor);
         let length = run.min(end - cursor).min(PIECE);
         let bytes = length as usize * SECTOR;
@@ -1277,5 +1471,177 @@ mod tests {
         let mut back = vec![0u8; 200 * SECTOR];
         again.read(&mut rw, 0, &mut back).unwrap();
         assert_eq!(back, pattern(200));
+    }
+
+    /// Where the independent model puts data chunk `i` of stripe row `row`: (data member, parity member), written out
+    /// per layout from the description in Linux's md documentation rather than the formulas of `locate5`.
+    fn model5(layout: u32, n: usize, row: usize, i: usize) -> (usize, usize) {
+        let parity = if layout & 1 == 0 { n - 1 - row % n } else { row % n };
+        let order: Vec<usize> = if layout & 2 == 0 {
+            (0..n).filter(|&d| d != parity).collect()
+        } else {
+            (1..n).map(|k| (parity + k) % n).collect()
+        };
+        (order[i], parity)
+    }
+
+    fn check_raid5(rw: &Rw, layout: u32, n: usize, array_sectors: u64, expect: &[u8]) {
+        // data where the model says, and every stripe XORs to zero
+        for v in 0..array_sectors as usize {
+            let (k, off) = (v / 8, v % 8);
+            let (row, i) = (k / (n - 1), k % (n - 1));
+            let (disk, _) = model5(layout, n, row, i);
+            assert_eq!(sector_of(rw, disk, (row * 8 + off) as u64), &expect[v * SECTOR..(v + 1) * SECTOR], "layout {layout} sector {v}");
+        }
+        for sector in 0..1024 {
+            let mut sum = vec![0u8; SECTOR];
+            for disk in 0..n {
+                xor(&mut sum, sector_of(rw, disk, sector));
+            }
+            assert!(sum.iter().all(|&b| b == 0), "layout {layout} stripe at {sector}");
+        }
+    }
+
+    #[test]
+    fn raid5_layouts_place_data_and_parity_like_linux() {
+        for layout in 0..4 {
+            for n in [3u32, 4] {
+                let mut rw = striped(LEVEL_RAID5, layout, n);
+                let mut array = Array::assemble(&mut rw, None).unwrap();
+                assert_eq!(array.sectors(), 1024 / 8 * 8 * (n as u64 - 1));
+                array.start(&mut rw, 1).unwrap();
+                // in odd-sized writes, so that read-modify-write sees partial chunks
+                let data = pattern(array.sectors());
+                let mut at = 0;
+                for len in [1usize, 7, 9, 30, 100].iter().cycle() {
+                    if at >= array.sectors() as usize {
+                        break;
+                    }
+                    let len = (*len).min(array.sectors() as usize - at);
+                    array.write(&mut rw, at as u64, &data[at * SECTOR..(at + len) * SECTOR], 2).unwrap();
+                    at += len;
+                }
+                array.stop(&mut rw, 3).unwrap();
+                check_raid5(&rw, layout, n as usize, array.sectors(), &data);
+                let mut back = vec![0u8; data.len()];
+                array.read(&mut rw, 0, &mut back).unwrap();
+                assert_eq!(back, data);
+            }
+        }
+    }
+
+    #[test]
+    fn raid5_reads_around_a_missing_or_failing_member() {
+        let mut rw = striped(LEVEL_RAID5, 2, 4);
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        array.start(&mut rw, 1).unwrap();
+        let data = pattern(array.sectors());
+        array.write(&mut rw, 0, &data, 2).unwrap();
+        array.stop(&mut rw, 3).unwrap();
+        for lost in 0..4 {
+            let mut gone = Rw::new(rw.disks.0.clone());
+            gone.disks.1[lost] = true;
+            let degraded = Array::assemble(&mut gone, None).unwrap();
+            let mut back = vec![0u8; data.len()];
+            degraded.read(&mut gone, 0, &mut back).unwrap();
+            assert_eq!(back, data, "member {lost} failing reads");
+            // really absent: a blank disk
+            let mut absent = Rw::new(rw.disks.0.clone());
+            absent.disks.0[lost] = vec![0; DISK_SECTORS * SECTOR];
+            let degraded = Array::assemble(&mut absent, None).unwrap();
+            assert_eq!((degraded.present(), degraded.degraded()), (3, true));
+            degraded.read(&mut absent, 0, &mut back).unwrap();
+            assert_eq!(back, data, "member {lost} absent");
+        }
+        let mut two = Rw::new(rw.disks.0.clone());
+        two.disks.0[0] = vec![0; DISK_SECTORS * SECTOR];
+        two.disks.0[1] = vec![0; DISK_SECTORS * SECTOR];
+        assert_eq!(Array::assemble(&mut two, None).err(), Some(Error::Degraded));
+    }
+
+    #[test]
+    fn raid5_writes_on_a_degraded_array_keep_the_stripes_reconstructible() {
+        for lost in 0..4 {
+            let mut rw = striped(LEVEL_RAID5, 2, 4);
+            let mut array = Array::assemble(&mut rw, None).unwrap();
+            array.start(&mut rw, 1).unwrap();
+            let mut data = pattern(array.sectors());
+            array.write(&mut rw, 0, &data, 2).unwrap();
+            // the member fails at the next write; the write still completes and the stripes stay right
+            rw.write_fail[lost] = true;
+            let fresh: Vec<u8> = (0..60 * SECTOR).map(|i| (i * 7 + 3) as u8).collect();
+            array.write(&mut rw, 5, &fresh, 3).unwrap();
+            data[5 * SECTOR..65 * SECTOR].copy_from_slice(&fresh);
+            assert_eq!((array.present(), array.degraded()), (3, true));
+            // and more writes on the degraded array
+            let more: Vec<u8> = (0..40 * SECTOR).map(|i| (i * 11 + 1) as u8).collect();
+            array.write(&mut rw, 100, &more, 4).unwrap();
+            data[100 * SECTOR..140 * SECTOR].copy_from_slice(&more);
+            array.stop(&mut rw, 5).unwrap();
+            let mut again = Array::assemble(&mut rw, None).unwrap();
+            assert_eq!(again.present(), 3);
+            let mut back = vec![0u8; data.len()];
+            again.read(&mut rw, 0, &mut back).unwrap();
+            assert_eq!(back, data, "member {lost}");
+            // a second member failing is refused
+            again.start(&mut rw, 6).unwrap();
+            let other = (lost + 1) % 4;
+            rw.write_fail[other] = true;
+            assert_eq!(again.write(&mut rw, 0, &[1; SECTOR * 40], 7), Err(Error::Device));
+        }
+    }
+
+    #[test]
+    fn raid5_rebuilds_a_member_while_writes_continue_and_resync_repairs_parity() {
+        for layout in [0, 2, 3] {
+            let mut rw = striped(LEVEL_RAID5, layout, 4);
+            let mut array = Array::assemble(&mut rw, None).unwrap();
+            array.start(&mut rw, 1).unwrap();
+            let mut data = pattern(array.sectors());
+            array.write(&mut rw, 0, &data, 2).unwrap();
+            array.stop(&mut rw, 3).unwrap();
+            let lost = data_of(&rw, 1, 1024);
+            rw.disks.0[1] = vec![0; DISK_SECTORS * SECTOR];
+            let mut array = Array::assemble(&mut rw, None).unwrap();
+            array.start(&mut rw, 4).unwrap();
+            array.begin_rebuild(&mut rw, 1, [9; 16]).unwrap();
+            // half the rebuild, then writes land on both sides of the cursor
+            assert_eq!(array.step(&mut rw, 1200, 5).unwrap(), Step::Running(Job::Rebuild));
+            for at in [3u64, 400, 2000, 3000] {
+                let fresh: Vec<u8> = (0..20 * SECTOR).map(|i| (i as u64 * 13 + at) as u8).collect();
+                array.write(&mut rw, at, &fresh, 6).unwrap();
+                data[at as usize * SECTOR..(at as usize + 20) * SECTOR].copy_from_slice(&fresh);
+            }
+            assert_eq!(run_job(&mut array, &mut rw), Job::Rebuild);
+            assert_eq!(array.present(), 4);
+            array.stop(&mut rw, 7).unwrap();
+            check_raid5(&rw, layout, 4, array.sectors(), &data);
+            assert_eq!(data_of(&rw, 1, 1024).len(), lost.len());
+            let again = Array::assemble(&mut rw, None).unwrap();
+            assert_eq!((again.present(), again.degraded(), again.dirty()), (4, false, false));
+
+            // a crash leaves the parity of a row stale: resync repairs it
+            let mut array = Array::assemble(&mut rw, None).unwrap();
+            array.start(&mut rw, 8).unwrap();
+            let (_, parity) = model5(layout, 4, 5, 0);
+            let at = (DATA_OFFSET + 5 * 8 + 3) as usize * SECTOR;
+            rw.disks.0[parity][at] ^= 0xff;
+            let mut crashed = Array::assemble(&mut rw, None).unwrap();
+            assert!(crashed.dirty());
+            crashed.start(&mut rw, 9).unwrap();
+            crashed.begin_resync().unwrap();
+            assert_eq!(run_job(&mut crashed, &mut rw), Job::Resync);
+            crashed.stop(&mut rw, 10).unwrap();
+            check_raid5(&rw, layout, 4, crashed.sectors(), &data);
+        }
+    }
+
+    #[test]
+    fn a_dirty_degraded_raid5_is_not_assembled() {
+        let mut rw = striped(LEVEL_RAID5, 2, 4);
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        array.start(&mut rw, 1).unwrap();
+        rw.disks.0[2] = vec![0; DISK_SECTORS * SECTOR];
+        assert_eq!(Array::assemble(&mut rw, None).err(), Some(Error::Degraded));
     }
 }
