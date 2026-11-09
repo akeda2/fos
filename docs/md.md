@@ -20,7 +20,7 @@ through the `Members` trait. Stages:
    `p = k * near + c`, which is member role `p % raid_disks`, row `p / raid_disks`, physical sector `row * chunk + offset`
    (Linux `raid10.c`'s near layout; RAID 0 is `near = 1`). RAID 10 reads the layout from the superblock (`near` copies in
    the low byte); "far" and "offset" layouts are refused (`Unsupported`), and so is a RAID 0 or 10 with more than
-   `MAX_MEMBERS` members. RAID 0 needs equal-sized members (one zone) and every one of them, writes no superblocks on
+   `MAX_MEMBERS` members. RAID 0 needs equal-sized members (one zone; mdadm's `RAID0_LAYOUT` feature bit is accepted then) and every one of them, writes no superblocks on
    `start`/`stop` (it has no resync state) and fails a write instead of dropping a member. RAID 10 drops a failed member
    as long as every chunk keeps a copy (copies sit on `near` consecutive roles starting at a multiple of
    `gcd(near, raid_disks)`); a member whose loss would leave a chunk with no copy stays and the write fails. Assembly
