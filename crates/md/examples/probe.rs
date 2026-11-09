@@ -17,6 +17,9 @@
 //! `--crash-test` writes like `--write-test` but never stops the array (a crash while writing: with a bitmap its bits
 //! stay set); `--resync` resyncs a dirty array (the bitmap's chunks, or all of it) and stops it clean.
 //!
+//! `--tear` (RAID 5 with a partial parity log) does that and loses the parity write of the last write: the parity no
+//! longer matches the data. `--recover` replays the log (`recover_ppl`) on a dirty array and stops it clean.
+//!
 //!     cargo run --example probe -- --rebuild N DISK1 DISK2 ...
 //!
 //! `--rebuild N` (members read-write) fills member number N (0-based, as listed; it may be blank) in as the array's
@@ -26,7 +29,8 @@ use md::{Error, Members, SECTOR, array::Array};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 
-struct Disks(Vec<(File, u64)>);
+/// `tear`: from this member and sector on, writes are swallowed (power lost between two member writes).
+struct Disks(Vec<(File, u64)>, Option<(usize, u64)>);
 
 impl Members for Disks {
     fn count(&self) -> usize {
@@ -41,6 +45,9 @@ impl Members for Disks {
         file.read_exact(buffer).map_err(|_| Error::Device)
     }
     fn write(&mut self, member: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
+        if self.1.is_some_and(|(m, from)| m == member && lba >= from) {
+            return Ok(());
+        }
         let file = &mut self.0[member].0;
         file.seek(SeekFrom::Start(lba * SECTOR as u64)).map_err(|_| Error::Device)?;
         file.write_all(buffer).map_err(|_| Error::Device)
@@ -55,13 +62,17 @@ fn main() {
     let mut dump = None;
     let mut write_test = false;
     let mut rebuild: Option<usize> = None;
-    let (mut crash, mut resync) = (false, false);
+    let (mut crash, mut resync, mut tear, mut recover) = (false, false, false, false);
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--write-test" {
             write_test = true;
         } else if arg == "--crash-test" {
             crash = true;
+        } else if arg == "--tear" {
+            tear = true;
+        } else if arg == "--recover" {
+            recover = true;
         } else if arg == "--resync" {
             resync = true;
         } else if arg == "--rebuild" {
@@ -72,16 +83,27 @@ fn main() {
             paths.push(arg);
         }
     }
-    let mut disks = Disks(Vec::new());
+    let mut disks = Disks(Vec::new(), None);
     for path in &paths {
-        let mut file = OpenOptions::new().read(true).write(write_test || crash || resync || rebuild.is_some()).open(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let mut file = OpenOptions::new().read(true).write(write_test || crash || tear || recover || resync || rebuild.is_some()).open(path).unwrap_or_else(|e| panic!("{path}: {e}"));
         let bytes = file.seek(SeekFrom::End(0)).unwrap();
         disks.0.push((file, bytes / SECTOR as u64));
     }
-    let array = match Array::assemble(&mut disks, None) {
+    let mut array = match Array::assemble(&mut disks, None) {
         Ok(array) => array,
         Err(error) => return println!("not assembled: {error:?}"),
     };
+    if recover {
+        let report = array.recover_ppl(&mut disks).expect("recover");
+        println!("ppl: {} entries replayed, {} mismatched, array {}", report.entries, report.mismatched, if array.dirty() { "still dirty" } else { "clean" });
+        if !array.dirty() && report.entries > 0 {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            array.start(&mut disks, now).expect("start");
+            array.stop(&mut disks, now).expect("stop");
+            println!("recovered: stopped clean, events now {}", array.events());
+        }
+        return;
+    }
     let uuid: Vec<String> = array.uuid().iter().map(|b| format!("{b:02x}")).collect();
     println!("name {:?}  uuid {}", array.name(), uuid.join(""));
     println!("{} sectors ({} MiB), events {}, members {} of {}{}{}", array.sectors(), array.sectors() / 2048, array.events(),
@@ -116,7 +138,7 @@ fn main() {
         println!("resync ok: events now {}, array stopped clean", array.events());
         return;
     }
-    if write_test || crash {
+    if write_test || crash || tear {
         let mut array = array;
         let at = array.sectors() - 8;
         let (mut saved, mut check) = (vec![0u8; 8 * SECTOR], vec![0u8; 8 * SECTOR]);
@@ -127,7 +149,14 @@ fn main() {
         array.write(&mut disks, at, &pattern, now).expect("write");
         array.read(&mut disks, at, &mut check).expect("read back");
         assert_eq!(check, pattern, "read-back differs");
+        if tear {
+            // the restore reaches the data member but not the parity: what a power cut between the two leaves
+            disks.1 = Some(array.parity_member(at).expect("parity member (RAID 5 with a log only)"));
+        }
         array.write(&mut disks, at, &saved, now).expect("restore");
+        if tear {
+            return println!("tear test ok: data restored, its parity write lost, array left open");
+        }
         if crash {
             return println!("crash test ok: wrote and restored, array left open (not stopped)");
         }

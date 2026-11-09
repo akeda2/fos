@@ -12,10 +12,13 @@
 //! has no redundancy and no resync, so it is never marked dirty and a member that fails a write fails the write. RAID 10
 //! needs one copy of every chunk: a member that fails is dropped as long as that holds.
 
-use crate::superblock::{self, Superblock, FEATURE_BAD_BLOCKS, FEATURE_BITMAP, FEATURE_RAID0_LAYOUT, FEATURE_RECOVERY_OFFSET, LEVEL_RAID0, LEVEL_RAID1, LEVEL_RAID10, LEVEL_RAID5, LEVEL_RAID6, READ_BYTES, ROLE_FAULTY, SYNCED};
+use crate::superblock::{self, Superblock, FEATURE_BAD_BLOCKS, FEATURE_BITMAP, FEATURE_MULTIPLE_PPLS, FEATURE_PPL, FEATURE_RAID0_LAYOUT, FEATURE_RECOVERY_OFFSET, LEVEL_RAID0, LEVEL_RAID1, LEVEL_RAID10, LEVEL_RAID5, LEVEL_RAID6, READ_BYTES, ROLE_FAULTY, SYNCED};
 use crate::{Error, Members, SECTOR};
 
+mod ppl;
 mod raid6;
+
+pub use ppl::PplReport;
 
 use crate::bitmap::Bitmap;
 
@@ -75,6 +78,9 @@ pub struct Array {
     bitmap_bad: bool,
     /// The running resync compares only the chunks the bitmap marks.
     partial: bool,
+    /// The RAID 5 partial parity log (`ppl.rs`); `ppl_bad` is a log this code cannot vouch for or place.
+    ppl: Option<ppl::Ppl>,
+    ppl_bad: bool,
 }
 
 struct Rebuild {
@@ -173,7 +179,11 @@ impl Array {
                 if !matches!(sb.level, LEVEL_RAID0 | LEVEL_RAID1 | LEVEL_RAID5 | LEVEL_RAID6 | LEVEL_RAID10) {
                     return Err(Error::Unsupported);
                 }
-                if sb.feature_map & !(FEATURE_BITMAP | FEATURE_RECOVERY_OFFSET | FEATURE_BAD_BLOCKS | FEATURE_RAID0_LAYOUT) != 0 {
+                if sb.feature_map & !(FEATURE_BITMAP | FEATURE_RECOVERY_OFFSET | FEATURE_BAD_BLOCKS | FEATURE_RAID0_LAYOUT | FEATURE_PPL | FEATURE_MULTIPLE_PPLS) != 0 {
+                    return Err(Error::Unsupported);
+                }
+                let ppl = sb.feature_map & (FEATURE_PPL | FEATURE_MULTIPLE_PPLS);
+                if ppl != 0 && (sb.level != LEVEL_RAID5 || sb.feature_map & FEATURE_BITMAP != 0 || ppl == FEATURE_PPL | FEATURE_MULTIPLE_PPLS) {
                     return Err(Error::Unsupported);
                 }
                 if best_member == usize::MAX || sb.events > best {
@@ -210,6 +220,8 @@ impl Array {
             bitmap_offset: lead.bitmap_offset,
             bitmap_bad: false,
             partial: false,
+            ppl: None,
+            ppl_bad: false,
         };
         for (member, entry) in found.iter().enumerate() {
             let Some((sb, block)) = entry else { continue };
@@ -228,8 +240,13 @@ impl Array {
         if lead.feature_map & FEATURE_BITMAP != 0 {
             array.attach_bitmap(members, lead.resync_offset);
         }
-        // parity of a dirty array cannot be trusted to rebuild a missing member (Linux refuses this too)
-        if array.level == LEVEL_RAID5 && array.dirty && array.degraded() {
+        if Array::wants_ppl(lead.feature_map) {
+            array.attach_ppl(members);
+            array.ppl_bad = array.ppl.is_none();
+        }
+        // parity of a dirty array cannot be trusted to rebuild a missing member (Linux refuses this too), unless a
+        // partial parity log can still repair it (`recover_ppl`)
+        if array.level == LEVEL_RAID5 && array.dirty && array.degraded() && array.ppl.is_none() {
             return Err(Error::Degraded);
         }
         // a RAID 6 can lose one member and still trust its syndromes, two it cannot
@@ -414,6 +431,14 @@ impl Array {
         (self.chunk - offset, data as u16, parity, row * self.chunk + offset)
     }
 
+    /// RAID 5: the member holding the parity of array sector `lba` and where its data area starts, if it is in use.
+    pub fn parity_member(&self, lba: u64) -> Option<(usize, u64)> {
+        if self.level != LEVEL_RAID5 || lba >= self.sectors {
+            return None;
+        }
+        self.usable(self.locate5(lba).2, 0)
+    }
+
     /// The role holding the parity of stripe row `row`: it walks backwards (left) or forwards (right) one member per row.
     fn parity_role(&self, row: u64) -> u16 {
         let n = self.raid_disks as u64;
@@ -472,7 +497,7 @@ impl Array {
             let (run, data, parity, at) = self.locate5(lba + done);
             let run = run.min(count - done).min(PIECE);
             let new = &buffer[done as usize * SECTOR..(done + run) as usize * SECTOR];
-            if self.write_piece5(members, data, parity, at, new, &mut failed).is_err() {
+            if self.write_piece5(members, data, parity, at, lba + done, new, &mut failed).is_err() {
                 lost = true;
                 break;
             }
@@ -484,7 +509,7 @@ impl Array {
         if lost { Err(Error::Device) } else { Ok(()) }
     }
 
-    fn write_piece5<M: Members>(&mut self, members: &mut M, data: u16, parity: u16, at: u64, new: &[u8], failed: &mut u32) -> Result<(), Error> {
+    fn write_piece5<M: Members>(&mut self, members: &mut M, data: u16, parity: u16, at: u64, v: u64, new: &[u8], failed: &mut u32) -> Result<(), Error> {
         let bytes = new.len();
         let (mut fresh, mut old) = ([0u8; PIECE as usize * SECTOR], [0u8; PIECE as usize * SECTOR]);
         let mut have_parity = false;
@@ -495,15 +520,24 @@ impl Array {
                 *failed |= 1 << parity;
             } else {
                 xor(&mut fresh[..bytes], &old[..bytes]);
-                xor(&mut fresh[..bytes], new);
-                have_parity = true;
+                if self.ppl_logged(members, parity, v, &fresh[..bytes]) {
+                    xor(&mut fresh[..bytes], new);
+                    have_parity = true;
+                } else {
+                    *failed |= 1 << parity;
+                }
             }
         }
         let wanted = self.usable(parity, *failed).is_some() || self.target(parity).is_some();
         if !have_parity && wanted {
-            fresh[..bytes].copy_from_slice(new);
+            fresh[..bytes].fill(0);
             self.xor_others(members, &[data, parity], at, &mut fresh[..bytes], failed)?;
-            have_parity = true;
+            if self.usable(parity, *failed).is_none() || self.ppl_logged(members, parity, v, &fresh[..bytes]) {
+                xor(&mut fresh[..bytes], new);
+                have_parity = true;
+            } else {
+                *failed |= 1 << parity;
+            }
         }
         let mut wrote = 0;
         for (role, buffer) in [(data, Some(new)), (parity, have_parity.then_some(&fresh[..bytes]))] {
@@ -681,7 +715,7 @@ impl Array {
         if self.writing {
             return Err(Error::NotWritable);
         }
-        if self.bitmap_bad || self.features & FEATURE_BAD_BLOCKS != 0 || (self.features & FEATURE_BITMAP != 0 && self.bitmap.is_none()) {
+        if self.ppl_bad || self.bitmap_bad || self.features & FEATURE_BAD_BLOCKS != 0 || (self.features & FEATURE_BITMAP != 0 && self.bitmap.is_none()) {
             return Err(Error::Unsupported);
         }
         if self.level == LEVEL_RAID0 {
@@ -693,6 +727,7 @@ impl Array {
             self.writing = true;
             return Ok(());
         }
+        self.ppl_start(members)?;
         if !self.dirty {
             self.resync = 0;
         }
@@ -932,6 +967,7 @@ impl Array {
             }
             members.write(member, start as u64, &bitmap.data[..bitmap.sectors * SECTOR])?;
         }
+        self.ppl_add_member(members, member, super_sector, data_offset)?;
         members.flush(member)?;
         self.rebuild = Some(Rebuild { slot: Slot { member, data_offset, dev_number: dev, minor, role, super_sector, block }, cursor: 0 });
         Ok(())
@@ -1553,7 +1589,7 @@ mod tests {
         assert_eq!(back, data);
 
         // the survivors recorded the losses, so a fresh assemble leaves the dead members out
-        let mut again = Array::assemble(&mut rw, None).unwrap();
+        let again = Array::assemble(&mut rw, None).unwrap();
         assert_eq!(again.present(), 2);
         let mut back = vec![0u8; 64 * SECTOR];
         again.read(&mut rw, 0, &mut back).unwrap();
@@ -2162,5 +2198,95 @@ mod tests {
         assert_eq!(xor_at(&rw, 75), 0);
         assert_ne!(xor_at(&rw, 323), 0);
         assert_eq!(bits_on(&rw, 1), 0);
+    }
+
+    /// Gives every member of a `striped` RAID 5 a partial parity log of `size` sectors 8 sectors past its superblock.
+    fn add_ppl(rw: &mut Rw, size: u16) {
+        for disk in rw.disks.0.iter_mut() {
+            let block = &mut disk[8 * SECTOR..8 * SECTOR + READ_BYTES];
+            block[96..100].copy_from_slice(&(8u32 | (size as u32) << 16).to_le_bytes());
+            superblock::set_feature_map(block, superblock::FEATURE_PPL);
+            superblock::reseal(block);
+        }
+    }
+
+    fn stripes_xor_to_zero(rw: &Rw, disks: usize) -> bool {
+        (0..1024).all(|sector| {
+            let mut sum = vec![0u8; SECTOR];
+            for disk in 0..disks {
+                xor(&mut sum, sector_of(rw, disk, sector));
+            }
+            sum.iter().all(|&b| b == 0)
+        })
+    }
+
+    #[test]
+    fn a_partial_parity_log_repairs_the_parity_a_torn_write_left() {
+        let mut rw = striped(LEVEL_RAID5, 2, 4);
+        add_ppl(&mut rw, 128);
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        assert!(array.has_ppl());
+        array.start(&mut rw, 1).unwrap();
+        let data = pattern(array.sectors());
+        array.write(&mut rw, 0, &data, 2).unwrap();
+        assert!(stripes_xor_to_zero(&rw, 4));
+        // the data of the next write lands, its parity does not (parity of row 0 is on member 3)
+        let parity_before = rw.disks.0[3][DATA_OFFSET as usize * SECTOR..][..8 * SECTOR].to_vec();
+        let fresh: Vec<u8> = (0..2 * SECTOR).map(|i| (i * 5 + 9) as u8).collect();
+        array.write(&mut rw, 3, &fresh, 3).unwrap();
+        rw.disks.0[3][DATA_OFFSET as usize * SECTOR..][..8 * SECTOR].copy_from_slice(&parity_before);
+        assert!(!stripes_xor_to_zero(&rw, 4));
+        // power cut: no stop
+        let mut again = Array::assemble(&mut rw, None).unwrap();
+        assert!(again.dirty());
+        // one entry per member: each holds the last write whose parity it carries
+        assert_eq!(again.recover_ppl(&mut rw).unwrap(), PplReport { entries: 4, mismatched: 0 });
+        assert!(!again.dirty());
+        assert!(stripes_xor_to_zero(&rw, 4));
+    }
+
+    #[test]
+    fn a_log_with_a_missing_data_member_leaves_the_array_usable_and_excludes_a_bitmap() {
+        let mut rw = striped(LEVEL_RAID5, 2, 4);
+        add_ppl(&mut rw, 128);
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        array.start(&mut rw, 1).unwrap();
+        array.write(&mut rw, 3, &pattern(2), 2).unwrap();
+        rw.disks.0[0] = vec![0; DISK_SECTORS * SECTOR];
+        let mut again = Array::assemble(&mut rw, None).unwrap();
+        assert_eq!((again.present(), again.dirty()), (3, true));
+        assert_eq!(again.recover_ppl(&mut rw).unwrap().mismatched, 0);
+
+        let mut both = striped(LEVEL_RAID5, 2, 4);
+        add_bitmap(&mut both, ARRAY_SECTORS, 10);
+        for disk in both.disks.0.iter_mut() {
+            let block = &mut disk[8 * SECTOR..8 * SECTOR + READ_BYTES];
+            superblock::set_feature_map(block, superblock::FEATURE_BITMAP | superblock::FEATURE_PPL);
+            superblock::reseal(block);
+        }
+        assert_eq!(Array::assemble(&mut both, None).err(), Some(Error::Unsupported));
+    }
+
+    #[test]
+    fn starting_empties_every_log_and_an_unplaceable_log_keeps_the_array_read_only() {
+        let mut rw = striped(LEVEL_RAID5, 2, 4);
+        add_ppl(&mut rw, 128);
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        array.start(&mut rw, 1).unwrap();
+        array.write(&mut rw, 0, &pattern(40), 2).unwrap();
+        array.stop(&mut rw, 3).unwrap();
+        let mut again = Array::assemble(&mut rw, None).unwrap();
+        again.start(&mut rw, 4).unwrap();
+        for disk in &rw.disks.0 {
+            let head = &disk[16 * SECTOR..][..4096];
+            assert_eq!(u32::from_le_bytes(head[528..532].try_into().unwrap()), 0);
+            assert_eq!(u64::from_le_bytes(head[520..528].try_into().unwrap()), 0);
+        }
+        // a log that overlaps the data is not trusted
+        let mut bad = striped(LEVEL_RAID5, 2, 4);
+        add_ppl(&mut bad, 4000);
+        let mut array = Array::assemble(&mut bad, None).unwrap();
+        assert!(!array.has_ppl());
+        assert_eq!(array.start(&mut bad, 1), Err(Error::Unsupported));
     }
 }

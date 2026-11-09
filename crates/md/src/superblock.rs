@@ -22,6 +22,10 @@ pub const FEATURE_BITMAP: u32 = 1;
 pub const FEATURE_RECOVERY_OFFSET: u32 = 2;
 pub const FEATURE_RESHAPE_ACTIVE: u32 = 4;
 pub const FEATURE_BAD_BLOCKS: u32 = 8;
+/// RAID 5 partial parity log; its `offset` (i16, sectors from the superblock) and `size` (u16, sectors) share the
+/// bytes of `bitmap_offset`. MULTIPLE says the log area holds a ring of headers (Linux uses it when the area is big).
+pub const FEATURE_PPL: u32 = 0x400;
+pub const FEATURE_MULTIPLE_PPLS: u32 = 0x800;
 /// Set by mdadm on every RAID 0 since Linux 5.4: `layout` says how members of unequal size are zoned. With equal
 /// members (one zone) it changes nothing.
 pub const FEATURE_RAID0_LAYOUT: u32 = 0x1000;

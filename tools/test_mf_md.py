@@ -40,7 +40,7 @@ def check(ok, text, detail=""):
         failures.append(f"{text}: {detail}")
 
 
-def superblock(dev, events, resync=CLEAN, level=1, layout=0, chunk=0, disks=2, size=DATA_SECTORS):
+def superblock(dev, events, resync=CLEAN, level=1, layout=0, chunk=0, disks=2, size=DATA_SECTORS, ppl=False):
     max_dev = 128
     b = bytearray(256 + max_dev * 2)
     struct.pack_into("<LLL", b, 0, 0xA92B4EFC, 1, 0)
@@ -55,6 +55,9 @@ def superblock(dev, events, resync=CLEAN, level=1, layout=0, chunk=0, disks=2, s
         struct.pack_into("<H", b, 256 + 2 * i, i)
     for i in range(disks, max_dev):
         struct.pack_into("<H", b, 256 + 2 * i, 0xFFFF)
+    if ppl:  # a partial parity log of 128 sectors, 8 sectors past the superblock
+        struct.pack_into("<L", b, 96, 8 | 128 << 16)
+        struct.pack_into("<L", b, 8, 0x400)
     total = sum(struct.unpack_from("<%dL" % (len(b) // 4), b)) & 0xFFFFFFFFFFFFFFFF
     total = (total & 0xFFFFFFFF) + (total >> 32)
     total = (total & 0xFFFFFFFF) + (total >> 32)
@@ -312,7 +315,7 @@ def layout5(layout, disks, row, i):
     return order[i], parity
 
 
-def raid5_members(paths, layout, image=None, absent=None):
+def raid5_members(paths, layout, image=None, absent=None, **sb):
     """RAID 5 members in role order. With `image`: lays it out and writes the superblocks. Without: reads the array back
     (the member at role `absent`, if any, is reconstructed from the rest) and returns (image, parity_ok)."""
     disks = len(paths)
@@ -323,7 +326,7 @@ def raid5_members(paths, layout, image=None, absent=None):
             f = open(path, "wb")
             f.truncate(SECTORS * 512)
             f.seek(8 * 512)
-            f.write(superblock(role, 10, level=5, layout=layout, chunk=CHUNK, disks=disks, size=DATA_SECTORS))
+            f.write(superblock(role, 10, level=5, layout=layout, chunk=CHUNK, disks=disks, size=DATA_SECTORS, **sb))
             files.append(f)
         for row in range(rows):
             parity = 0
@@ -548,6 +551,61 @@ def raid6_boots(tmp, mkfs, e2fsck, digest, layout=2, disks=5):
     host_check([paths[0], blank, paths[2], paths[3], paths[4]], "after the rebuild", absent=(3,))
 
 
+def crc32c(data, crc=0):
+    crc ^= 0xFFFFFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ (0x82F63B78 if crc & 1 else 0)
+    return crc ^ 0xFFFFFFFF
+
+
+def ppl_header(generation, entries):
+    """A partial parity log header: entries are (data sector, partial parity bytes, parity role)."""
+    h = bytearray(4096)
+    h[:512] = b"\xff" * 512
+    struct.pack_into("<LLQL", h, 512, crc32c(UUID), 0, generation, len(entries))
+    for i, (sector, pp, role) in enumerate(entries):
+        struct.pack_into("<QLLLL", h, 536 + 24 * i, sector, len(pp), len(pp), role, crc32c(pp))
+    struct.pack_into("<L", h, 532, crc32c(bytes(h)))
+    return bytes(h)
+
+
+def ppl_boot(tmp, mkfs, e2fsck, digest, disks=3):
+    """RAID 5 with a partial parity log, left dirty with the parity of one piece wrong: the kernel replays the log."""
+    layout = 2
+    array_sectors = (disks - 1) * (DATA_SECTORS // CHUNK * CHUNK)
+    fs = tmp / "ppl.img"
+    fs.write_bytes(bytes(array_sectors * 512))
+    subprocess.run([mkfs, "-q", "-F", "-L", "mdvol", "-d", str(tmp / "src"), str(fs)], check=True, capture_output=True)
+    paths = [tmp / f"ppm{i}.img" for i in range(disks)]
+    raid5_members(paths, layout, image=fs.read_bytes(), ppl=True, resync=0)
+    piece = 16 * 512
+    parity = layout5(layout, disks, 0, 0)[1]
+    other = layout5(layout, disks, 0, 1)[0]
+    with open(paths[other], "rb") as f:
+        f.seek(DATA_OFFSET * 512)
+        partial = f.read(piece)  # the part of the stripe the write did not touch: the data of the next chunk
+    for role, path in enumerate(paths):
+        with open(path, "r+b") as f:
+            f.seek(16 * 512)
+            f.write(ppl_header(1, [(0, partial, parity)] if role == parity else []))
+            if role == parity:
+                f.write(partial)
+                f.seek(DATA_OFFSET * 512)  # the parity write that never happened
+                f.write(bytes([0xA5]) * piece)
+    g = Guest(paths, build_image(tmp, "md auto\nmd wait 20\n"))
+    try:
+        check(g.wait_for("md: partial parity log: 1 entries replayed, 0 not usable", 150), "ppl: the log is replayed at assembly", g.log[-600:].decode("utf8", "replace"))
+        check(g.wait_for("fos> ", 60), "ppl: the shell prompt came up")
+        ok, text = g.command("sha256 @mdvol/hello.bin", digest, 120)
+        check(ok, "ppl: a file read through the array has the host's SHA-256", text[-300:])
+    finally:
+        g.kill()
+    image, parity_ok = raid5_members(paths, layout)
+    check(parity_ok, "ppl: every stripe XORs to zero after the replay")
+
+
 def raid5_boots(tmp, mkfs, e2fsck, digest, layout=2, disks=4):
     """RAID 5: read and write with every member, then one missing (degraded read and write), then a blank disk added."""
     array_sectors = (disks - 1) * (DATA_SECTORS // CHUNK * CHUNK)
@@ -700,6 +758,7 @@ def main():
         repair_boots(tmp, mkfs, e2fsck, digest)
         raid5_boots(tmp, mkfs, e2fsck, digest)
         raid6_boots(tmp, mkfs, e2fsck, digest)
+        ppl_boot(tmp, mkfs, e2fsck, digest)
     for failure in failures:
         print("FAIL:", failure)
     return 1 if failures else 0
