@@ -144,6 +144,68 @@ fn pin_raw(reference: &str) -> Vec<u8> {
     }
 }
 
+// A FAT/exFAT destination takes one contiguous run reserved up front (`fs_stream_open2`), written in 1 MiB pieces
+// (a multiple of 512, as the stream calls need); the last piece is padded and the true length set at close.
+fn stream_to_fat(from: &[u8], to: &str) -> Result<u64, FsError> {
+    use kernel_core::{tape_fs, tape_vfs};
+    let mut chunk: Vec<u8> = Vec::new();
+    if chunk.try_reserve_exact(STREAM_CHUNK).is_err() {
+        return Err(FsError::Failed);
+    }
+    chunk.resize(STREAM_CHUNK, 0);
+    let total = {
+        let _disk = tapefs::lock();
+        let mut info = fosfor_abi::tape::VfsStat::default();
+        match tape_vfs::stat(from, &mut info) {
+            0 => info.size,
+            _ => match tape_fs::length(from) {
+                length if length >= 0 => length as u64,
+                code => return Err(error(code)),
+            },
+        }
+    };
+    let (handle, capacity) = {
+        let _disk = tapefs::lock();
+        let mut capacity = 0u64;
+        let handle = tape_fs::api_fs_stream_open2(to.as_ptr(), to.len(), total, &mut capacity);
+        if handle < 0 {
+            return Err(error(handle));
+        }
+        (handle, capacity)
+    };
+    if capacity < total {
+        let _disk = tapefs::lock();
+        tape_fs::api_fs_stream_close2(handle, 0);
+        let _ = tape_fs::remove(to.as_bytes());
+        return Err(FsError::Failed);
+    }
+    let mut offset = 0u64;
+    let result = loop {
+        crate::debug::pet();
+        let _disk = tapefs::lock();
+        let count = match tape_vfs::read(from, offset, &mut chunk) {
+            count if count < 0 => break Err(error(count)),
+            0 => break Ok(offset),
+            count => count as usize,
+        };
+        let padded = count.div_ceil(512) * 512;
+        chunk[count..padded].fill(0);
+        match tape_fs::api_fs_stream_write2(handle, offset, chunk.as_ptr(), padded, offset + count as u64) {
+            code if code < 0 => break Err(error(code)),
+            _ => offset += count as u64,
+        }
+    };
+    let _disk = tapefs::lock();
+    let closed = tape_fs::api_fs_stream_close2(handle, *result.as_ref().unwrap_or(&0));
+    if result.is_err() || closed < 0 {
+        let _ = tape_fs::remove(to.as_bytes());
+    }
+    match (result, closed) {
+        (Ok(_), code) if code < 0 => Err(error(code)),
+        (result, _) => result,
+    }
+}
+
 impl Host for MfHost {
     fn print(&mut self, arguments: fmt::Arguments) {
         print!("{}", arguments);
@@ -272,10 +334,10 @@ impl Host for MfHost {
         use fosfor_abi::tape::{VFS_FILE, VfsMake, VfsStat};
         use kernel_core::tape_vfs;
         let to = &here(to);
-        if !tape_vfs::is_ext_reference(to.as_bytes()) {
-            return None;
-        }
         let from = pin(from);
+        if !tape_vfs::is_ext_reference(to.as_bytes()) {
+            return Some(stream_to_fat(&from, to));
+        }
         let mut chunk: Vec<u8> = Vec::new();
         if chunk.try_reserve_exact(STREAM_CHUNK).is_err() {
             return Some(Err(FsError::Failed));
@@ -296,6 +358,7 @@ impl Host for MfHost {
         }
         let mut offset = 0u64;
         loop {
+            crate::debug::pet();
             let _disk = tapefs::lock();
             let count = match tape_vfs::read(&from, offset, &mut chunk) {
                 count if count < 0 => return Some(Err(error(count))),
@@ -330,6 +393,7 @@ impl Host for MfHost {
         right.resize(STREAM_CHUNK, 0);
         let mut offset = 0u64;
         loop {
+            crate::debug::pet();
             let _disk = tapefs::lock();
             let (x, y) = (tape_vfs::read(&a, offset, &mut left), tape_vfs::read(&b, offset, &mut right));
             if x < 0 || y < 0 {
