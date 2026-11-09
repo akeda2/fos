@@ -12,7 +12,7 @@
 //! the event count two higher, and `mdadm --assemble --scan` must still work. Use test disks, or an array whose last
 //! sectors are free (ext4 puts nothing user-visible there, but never run it on a mounted array).
 
-use md::{Error, Members, SECTOR, raid1::Array};
+use md::{Error, Members, SECTOR, array::Array};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -110,5 +110,5 @@ fn main() {
 }
 
 fn array_offset(disks: &mut Disks, member: usize) -> Option<u64> {
-    md::raid1::find_superblock(disks, member).map(|(sb, _)| sb.data_offset)
+    md::array::find_superblock(disks, member).map(|(sb, _)| sb.data_offset)
 }

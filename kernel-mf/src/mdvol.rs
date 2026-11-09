@@ -15,13 +15,29 @@
 use crate::{block, sched};
 use alloc::boxed::Box;
 use core::fmt::Write;
-use md::{Error, Members, raid1::Array};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use md::{
+    Error, Members,
+    array::{Array, Job, Step},
+};
 
 /// GPT type "Linux RAID" (A19D880F-05FC-4D3B-A006-743F0F84911E), in on-disk mixed-endian order.
 const RAID_GUID: [u8; 16] = [0x0f, 0x88, 0x9d, 0xa1, 0xfc, 0x05, 0x3b, 0x4d, 0xa0, 0x06, 0x74, 0x3f, 0x0f, 0x84, 0x91, 0x1e];
 
 /// Seconds without a write after which the array is closed clean.
 const IDLE_SECONDS: u64 = 3;
+
+/// Array sectors a resync or rebuild covers per hold of the lock; reads and writes get in between.
+const JOB_BUDGET: u64 = 2048;
+
+static JOB_THREAD: AtomicBool = AtomicBool::new(false);
+/// The disk index `md add` announced and waits to have confirmed (usize::MAX: none).
+static PENDING_ADD: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Forgets an unconfirmed `md add`: a confirmation must be the very next command.
+pub fn cancel() {
+    PENDING_ADD.store(usize::MAX, Ordering::Relaxed);
+}
 
 #[derive(Clone, Copy)]
 struct Member {
@@ -31,7 +47,7 @@ struct Member {
 }
 
 struct Candidates {
-    list: [Member; md::raid1::MAX_MEMBERS],
+    list: [Member; md::array::MAX_MEMBERS],
     count: usize,
 }
 
@@ -95,7 +111,7 @@ impl StatusText {
 
 static STATE: sched::SleepMutex<State> = sched::SleepMutex::new(State {
     array: None,
-    members: Candidates { list: [Member { disk: 0, base: 0, sectors: 0 }; md::raid1::MAX_MEMBERS], count: 0 },
+    members: Candidates { list: [Member { disk: 0, base: 0, sectors: 0 }; md::array::MAX_MEMBERS], count: 0 },
     disk: None,
     force_rw: false,
     last_write: 0,
@@ -112,7 +128,7 @@ fn seconds() -> u64 {
 
 /// Finds every disk and Linux RAID partition that carries an md superblock. The array's own disk is skipped.
 fn scan(own: Option<usize>) -> Candidates {
-    let mut found = Candidates { list: [Member { disk: 0, base: 0, sectors: 0 }; md::raid1::MAX_MEMBERS], count: 0 };
+    let mut found = Candidates { list: [Member { disk: 0, base: 0, sectors: 0 }; md::array::MAX_MEMBERS], count: 0 };
     for disk in 0..block::count() {
         if Some(disk) == own || matches!(block::get(disk), Some(block::Disk { backend: block::Backend::Md, .. }) | None) {
             continue;
@@ -133,7 +149,7 @@ fn scan(own: Option<usize>) -> Candidates {
             }
             let index = found.count;
             found.list[index] = *member;
-            if md::raid1::find_superblock(&mut found, index).is_some() {
+            if md::array::find_superblock(&mut found, index).is_some() {
                 found.count += 1;
             }
         }
@@ -226,10 +242,140 @@ fn idle_close() {
     let mut state = STATE.lock();
     let state = &mut *state;
     if let Some(array) = state.array.as_mut() {
-        if array.is_writing() && seconds().saturating_sub(state.last_write) >= IDLE_SECONDS {
+        if array.is_writing() && array.job().is_none() && seconds().saturating_sub(state.last_write) >= IDLE_SECONDS {
             let _ = array.stop(&mut state.members, now());
         }
     }
+}
+
+fn start_job_thread() {
+    if !JOB_THREAD.swap(true, Ordering::AcqRel) && sched::spawn("md-job", job_thread, 0).is_none() {
+        JOB_THREAD.store(false, Ordering::Release);
+        crate::println!("md: could not start the job thread.");
+    }
+}
+
+/// Runs a resync or rebuild to its end, a slice at a time, then exits.
+extern "C" fn job_thread(_: usize) {
+    let mut report = 0;
+    loop {
+        let outcome = {
+            let mut state = STATE.lock();
+            let state = &mut *state;
+            state.last_write = seconds();
+            state.array.as_mut().map(|array| {
+                let before = array.job();
+                (before, array.step(&mut state.members, JOB_BUDGET, now()), array.job(), array.sectors())
+            })
+        };
+        match outcome {
+            Some((_, Ok(Step::Running(_)), after, sectors)) => {
+                let percent = after.map_or(0, |(_, done)| done * 100 / sectors.max(1)) / 10 * 10;
+                if percent >= report + 10 {
+                    report = percent;
+                    crate::println!("md: {percent}% done.");
+                }
+            }
+            Some((_, Ok(Step::Done(job)), _, _)) => {
+                crate::println!("md: {} finished.", if job == Job::Resync { "resync" } else { "rebuild" });
+                break;
+            }
+            Some((_, Ok(Step::Idle), _, _)) | None => break,
+            Some((_, Err(error), _, _)) => {
+                crate::println!("md: the job stopped: {error:?}");
+                break;
+            }
+        }
+        sched::sleep_ticks(1);
+    }
+    JOB_THREAD.store(false, Ordering::Release);
+    sched::exit()
+}
+
+/// `md resync`: opens a dirty array and compares its copies in the background.
+fn resync_command() {
+    {
+        let mut state = STATE.lock();
+        let state = &mut *state;
+        let Some(array) = state.array.as_mut() else { return crate::println!("md: no array is up.") };
+        if !array.dirty() {
+            return crate::println!("md: the array is clean; nothing to resync.");
+        }
+        if !array.is_writing() {
+            if let Err(error) = array.start(&mut state.members, now()) {
+                return crate::println!("md: cannot open the array for writing: {error:?}");
+            }
+        }
+        match array.begin_resync() {
+            Ok(()) => crate::println!("md: resync started in the background; `md` shows how far it is."),
+            Err(error) => return crate::println!("md: cannot resync: {error:?}"),
+        }
+    }
+    start_job_thread();
+}
+
+/// `md add diskN` then `md add diskN confirm`: fills the disk in as the array's missing member.
+fn add_command(mut words: core::str::SplitWhitespace) {
+    let Some(disk) = words.next().and_then(|word| word.strip_prefix("disk")).and_then(|n| n.parse::<usize>().ok()).filter(|&n| n >= 1) else {
+        return crate::println!("usage: md add diskN  then  md add diskN confirm");
+    };
+    let index = disk - 1;
+    let confirm = words.next() == Some("confirm");
+    {
+        let mut state = STATE.lock();
+        let state = &mut *state;
+        let Some(array) = state.array.as_mut() else { return crate::println!("md: no array is up.") };
+        let Some(info) = block::get(index) else { return crate::println!("md: disk{disk} does not exist.") };
+        if index == 0 || state.disk == Some(index) || matches!(info.backend, block::Backend::Md) {
+            return crate::println!("md: disk{disk} cannot be added (the boot disk and the array itself never can).");
+        }
+        if array.present() >= array.expected() {
+            return crate::println!("md: no member is missing.");
+        }
+        if array.used_members().any(|m| state.members.list[m].disk == index) {
+            return crate::println!("md: disk{disk} is already a member.");
+        }
+        if !confirm {
+            PENDING_ADD.store(index, Ordering::Relaxed);
+            crate::println!("md: disk{disk} ({} MiB) would be erased and filled in as the missing member.", info.sectors >> 11);
+            return crate::println!("md: type `md add disk{disk} confirm` as the very next command to go on.");
+        }
+        if PENDING_ADD.swap(usize::MAX, Ordering::Relaxed) != index {
+            return crate::println!("md: nothing announced for disk{disk}; run `md add disk{disk}` first.");
+        }
+        if array.dirty() {
+            return crate::println!("md: the array is not clean; run `md resync` first.");
+        }
+        if !array.is_writing() {
+            if let Err(error) = array.start(&mut state.members, now()) {
+                return crate::println!("md: cannot open the array for writing: {error:?}");
+            }
+        }
+        let known = (0..state.members.count).find(|&m| state.members.list[m].disk == index && state.members.list[m].base == 0);
+        let pushed = known.is_none();
+        let slot = match known {
+            Some(slot) => slot,
+            None if state.members.count < state.members.list.len() => {
+                state.members.list[state.members.count] = Member { disk: index, base: 0, sectors: info.sectors };
+                state.members.count += 1;
+                state.members.count - 1
+            }
+            None => return crate::println!("md: no room for another member."),
+        };
+        let mut uuid = [0u8; 16];
+        kernel_core::random::fill(&mut uuid);
+        match array.begin_rebuild(&mut state.members, slot, uuid) {
+            Ok(()) => crate::println!("md: rebuilding onto disk{disk} in the background; `md` shows how far it is."),
+            Err(error) => {
+                if pushed {
+                    state.members.count -= 1;
+                }
+                return crate::println!("md: cannot add disk{disk}: {error:?}");
+            }
+        }
+        state.last_write = seconds();
+    }
+    start_job_thread();
 }
 
 /// A read of the array as disk sectors, for the block layer.
@@ -284,6 +430,9 @@ pub fn command(mut words: core::str::SplitWhitespace) {
                 Some(array) => {
                     println!("md: {} ({} MiB, events {}): {}", array.name(), array.sectors() >> 11, array.events(), text);
                     println!("    members in use: {} of {}{}", array.present(), array.expected(), if state.force_rw { ", force-rw" } else { "" });
+                    if let Some((job, done)) = array.job() {
+                        println!("    {}: {}% of {} MiB", if job == Job::Resync { "resync" } else { "rebuild" }, done * 100 / array.sectors().max(1), array.sectors() >> 11);
+                    }
                 }
                 None => println!("md: no array{}{}", if text.is_empty() { "" } else { ": " }, text),
             }
@@ -311,11 +460,13 @@ pub fn command(mut words: core::str::SplitWhitespace) {
                 }
             }
         }
+        Some("resync") => resync_command(),
+        Some("add") => add_command(words),
         Some("force-rw") => {
             let mut state = STATE.lock();
             state.force_rw = true;
             println!("md: writes allowed even though the array was not clean (nothing resyncs it here; run a check on Linux).");
         }
-        Some(_) => println!("usage: md [assemble | stop | force-rw]"),
+        Some(_) => println!("usage: md [assemble | stop | resync | add diskN | force-rw]"),
     }
 }
