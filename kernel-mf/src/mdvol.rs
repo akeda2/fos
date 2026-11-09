@@ -175,7 +175,7 @@ fn try_assemble(wait_over: bool) -> Outcome {
     let (present, expected, sectors, dirty) = (array.present(), array.expected(), array.sectors(), array.dirty());
     let mut model = [b' '; 40];
     let mut text = StatusText { bytes: [0; 96], length: 0 };
-    let _ = write!(text, "Linux md RAID 1 {}", array.name());
+    let _ = write!(text, "Linux md RAID {} {}", array.level(), array.name());
     let take = text.length.min(40);
     model[..take].copy_from_slice(&text.bytes[..take]);
     let disk = match state.disk {
@@ -193,7 +193,7 @@ fn try_assemble(wait_over: bool) -> Outcome {
     state.status.set(format_args!("disk{} up: {present} of {expected} members{}", disk + 1, if dirty { ", dirty: read-only" } else { "" }));
     crate::println!("md: array assembled as disk{} ({} MiB, {present} of {expected} members{}).", disk + 1, sectors >> 11, if dirty { ", not clean: read-only until `md force-rw`" } else { "" });
     if present < expected {
-        crate::println!("md: WARNING: running degraded, one copy only.");
+        crate::println!("md: WARNING: running degraded, with no spare copy of some data.");
     }
     Outcome::Assembled
 }

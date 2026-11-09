@@ -2,16 +2,21 @@
 //!
 //! The point is recovery: an array fos assembles is the same bytes a Linux live USB assembles with
 //! `mdadm --assemble --scan`, and the filesystem on it (ext4) is plain ext4. [`superblock`] reads and writes the v1.x
-//! superblock (v1.0 at the end of the member, v1.1 at its start, v1.2 4 KiB in); [`raid1`] assembles members into a
+//! superblock (v1.0 at the end of the member, v1.1 at its start, v1.2 4 KiB in); [`array`] assembles members into a
 //! mirror and reads from it. The caller supplies the members through [`Members`], so the same code serves the kernel's
 //! block layer and host tests over byte vectors.
 //!
-//! RAID 1 reads and writes are done (writes follow md's order: dirty mark, data, clean mark); RAID 0/10 and RAID 5/6
+//! RAID 0, 1 and 10 (near layout) read and write (writes follow md's order: dirty mark, data, clean mark); RAID 5/6
 //! come later; see `docs/md.md`.
 #![cfg_attr(not(test), no_std)]
 
-pub mod raid1;
+pub mod array;
 pub mod superblock;
+
+/// The mirror's old home: `Array` handles RAID 0 and 10 too now and lives in [`array`].
+pub mod raid1 {
+    pub use crate::array::*;
+}
 
 /// The sector size md addresses everything in; a member with larger physical sectors is still counted in 512 bytes.
 pub const SECTOR: usize = 512;

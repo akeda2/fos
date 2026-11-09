@@ -6,6 +6,9 @@ boots the server kernel with `md auto` in `settings`.
 Boot 1 (both members): the array must assemble in the background, show as a disk, read the host's file, take a write, and
 `md stop` must leave both superblocks clean with one more event pair and identical data that e2fsck accepts.
 Boot 2 (one member only, `md wait 2`): it must assemble degraded, say so, and still read the file.
+Boots 3 and 4: the same for a four-member RAID 10 (near 2, 64 KiB chunks, striped here by an independent routine), then
+with one member of each mirrored pair missing. Boot 5: a two-member RAID 0, which must read, take a write and refuse to
+assemble with a member missing.
 The superblock writer here is independent of crates/md (written from md_p.h), so the two check each other."""
 import os
 import select
@@ -36,20 +39,20 @@ def check(ok, text, detail=""):
         failures.append(f"{text}: {detail}")
 
 
-def superblock(dev, events, resync=CLEAN):
+def superblock(dev, events, resync=CLEAN, level=1, layout=0, chunk=0, disks=2, size=DATA_SECTORS):
     max_dev = 128
     b = bytearray(256 + max_dev * 2)
     struct.pack_into("<LLL", b, 0, 0xA92B4EFC, 1, 0)
     b[16:32] = UUID
     b[32:32 + 5] = b"fos:0"
-    struct.pack_into("<QlLQLLL", b, 64, 1700000000, 1, 0, DATA_SECTORS, 0, 2, 0)
+    struct.pack_into("<QlLQLLL", b, 64, 1700000000, level, layout, size, chunk, disks, 0)
     struct.pack_into("<QQQQL", b, 128, DATA_OFFSET, DATA_SECTORS, 8, 0, dev)
     b[168:184] = bytes([0x40 + dev]) * 16
     struct.pack_into("<QQQ", b, 192, 1700000100, events, resync)
     struct.pack_into("<L", b, 220, max_dev)
-    for i in range(2):
+    for i in range(disks):
         struct.pack_into("<H", b, 256 + 2 * i, i)
-    for i in range(2, max_dev):
+    for i in range(disks, max_dev):
         struct.pack_into("<H", b, 256 + 2 * i, 0xFFFF)
     total = sum(struct.unpack_from("<%dL" % (len(b) // 4), b)) & 0xFFFFFFFFFFFFFFFF
     total = (total & 0xFFFFFFFF) + (total >> 32)
@@ -116,6 +119,103 @@ def build_image(tmp, settings_text):
                     "--output", str(out), "--bios-stage1", os.environ["BIOS_STAGE1"], "--bios-stage2", os.environ["BIOS_STAGE2"],
                     "--file", f"settings={settings}"], check=True, capture_output=True)
     return out
+
+
+CHUNK = 128   # sectors
+
+
+def stripe(image, disks, near, tmp, prefix):
+    """Lays an array image out over `disks` members the way md's raid0/raid10 do and returns the member files."""
+    size = DATA_SECTORS
+    paths = []
+    files = []
+    for dev in range(disks):
+        path = tmp / f"{prefix}{dev}.img"
+        f = open(path, "wb")
+        f.truncate(SECTORS * 512)
+        f.seek(8 * 512)
+        f.write(superblock(dev, 10, level=10 if near > 1 else 0, layout=0x100 | near if near > 1 else 0,
+                           chunk=CHUNK, disks=disks, size=size))
+        paths.append(path)
+        files.append(f)
+    for k in range(len(image) // (CHUNK * 512)):
+        piece = image[k * CHUNK * 512:(k + 1) * CHUNK * 512]
+        for c in range(near):
+            pos = k * near + c
+            files[pos % disks].seek((DATA_OFFSET + pos // disks * CHUNK) * 512)
+            files[pos % disks].write(piece)
+    for f in files:
+        f.close()
+    return paths
+
+
+def unstripe(paths, near, length):
+    """The array image read back from the members, checking that every copy of a chunk agrees."""
+    disks = len(paths)
+    out = bytearray()
+    files = [open(p, "rb") for p in paths]
+    for k in range(length // (CHUNK * 512)):
+        copies = []
+        for c in range(near):
+            pos = k * near + c
+            files[pos % disks].seek((DATA_OFFSET + pos // disks * CHUNK) * 512)
+            copies.append(files[pos % disks].read(CHUNK * 512))
+        if any(copy != copies[0] for copy in copies):
+            return None
+        out += copies[0]
+    for f in files:
+        f.close()
+    return bytes(out)
+
+
+def striped_boot(tmp, mkfs, e2fsck, level_name, near, disks, array_sectors, blob, digest, down):
+    """Boots a striped array, reads the file, writes one, stops it, and checks the members; then boots `down`-less."""
+    src = tmp / "src"
+    fs = tmp / f"{level_name}.img"
+    fs.write_bytes(bytes(array_sectors * 512))
+    subprocess.run([mkfs, "-q", "-F", "-L", "mdvol", "-d", str(src), str(fs)], check=True, capture_output=True)
+    paths = stripe(fs.read_bytes(), disks, near, tmp, level_name)
+    g = Guest(paths, build_image(tmp, "md auto\nmd wait 20\n"))
+    try:
+        check(g.wait_for("md: array assembled", 150), f"{level_name}: array assembled", g.log[-600:].decode("utf8", "replace"))
+        check(g.wait_for("fos> ", 60), f"{level_name}: the shell prompt came up")
+        ok, text = g.command("md", f"members in use: {disks} of {disks}")
+        check(ok, f"{level_name}: md shows every member", text[-300:])
+        ok, text = g.command("sha256 @mdvol/hello.bin", digest, 120)
+        check(ok, f"{level_name}: a file read through the array has the host's SHA-256", text[-300:])
+        g.command("write @mdvol/new.txt striped42", "fos", 30)
+        ok, text = g.command("cat @mdvol/new.txt", "striped42", 30)
+        check(ok, f"{level_name}: a write through the array reads back", text[-300:])
+        time.sleep(5)
+        ok, text = g.command("md stop", "members are clean", 30)
+        check(ok, f"{level_name}: md stop closes the array", text[-300:])
+    finally:
+        g.kill()
+    image = unstripe(paths, near, array_sectors * 512)
+    check(image is not None, f"{level_name}: every copy of every chunk agrees")
+    if image is not None and Path(e2fsck).exists():
+        (tmp / "out.img").write_bytes(image)
+        r = subprocess.run([e2fsck, "-fn", str(tmp / "out.img")], capture_output=True, text=True)
+        check(r.returncode == 0, f"{level_name}: e2fsck accepts the volume after the guest wrote to it", r.stdout[-400:])
+    if down is None:
+        # a RAID 0 must refuse to assemble without a member
+        g = Guest(paths[:-1], build_image(tmp, "md auto\nmd wait 2\n"))
+        try:
+            g.wait_for("fos> ", 150)
+            time.sleep(8)
+            ok, text = g.command("md", "md: ", 20)
+            check(ok and "md: no array" in text, f"{level_name}: no array with a member missing", text[-300:])
+        finally:
+            g.kill()
+    else:
+        g = Guest([paths[i] for i in down], build_image(tmp, "md auto\nmd wait 2\n"))
+        try:
+            check(g.wait_for("running degraded", 150), f"{level_name}: half the members assemble degraded", g.log[-600:].decode("utf8", "replace"))
+            check(g.wait_for("fos> ", 60), f"{level_name}: the shell prompt came up")
+            ok, text = g.command("sha256 @mdvol/hello.bin", digest, 120)
+            check(ok, f"{level_name}: the degraded array reads the file", text[-300:])
+        finally:
+            g.kill()
 
 
 def main():
@@ -186,6 +286,8 @@ def main():
             check(ok, "the degraded array reads the file", text[-300:])
         finally:
             g.kill()
+        striped_boot(tmp, mkfs, e2fsck, "raid10", 2, 4, DATA_SECTORS * 2 // CHUNK * CHUNK, blob, digest, [0, 2])
+        striped_boot(tmp, mkfs, e2fsck, "raid0", 1, 2, DATA_SECTORS * 2 // CHUNK * CHUNK, blob, digest, None)
     for failure in failures:
         print("FAIL:", failure)
     return 1 if failures else 0

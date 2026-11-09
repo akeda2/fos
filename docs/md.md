@@ -17,7 +17,16 @@ through the `Members` trait. Stages:
    unknown fields survive. Arrays with a write-intent bitmap or a bad-block log are refused for writing
    (`mdadm --bitmap=none` when creating; mdadm adds a bitmap by default only on large arrays). Nothing here resyncs a
    dirty or degraded array or re-adds a returned member; use Linux for that.
-3. RAID 0 and RAID 10 (striping arithmetic), 4. RAID 5/6 (parity; the write hole needs the journal or a bitmap).
+3. **RAID 0 and RAID 10** (done in the library, same `Array`): chunk `k` of the array is copy `c` at position
+   `p = k * near + c`, which is member role `p % raid_disks`, row `p / raid_disks`, physical sector `row * chunk + offset`
+   (Linux `raid10.c`'s near layout; RAID 0 is `near = 1`). RAID 10 reads the layout from the superblock (`near` copies in
+   the low byte); "far" and "offset" layouts are refused (`Unsupported`), and so is a RAID 0 or 10 with more than
+   `MAX_MEMBERS` members. RAID 0 needs equal-sized members (one zone) and every one of them, writes no superblocks on
+   `start`/`stop` (it has no resync state) and fails a write instead of dropping a member. RAID 10 drops a failed member
+   as long as every chunk keeps a copy (copies sit on `near` consecutive roles starting at a multiple of
+   `gcd(near, raid_disks)`); a member whose loss would leave a chunk with no copy stays and the write fails. Assembly
+   needs the same coverage.
+4. RAID 5/6 (parity; the write hole needs the journal or a bitmap).
 5. **Kernel glue** (done in kernel-mf, `kernel-mf/src/mdvol.rs`): the assembled array is registered as one more disk
    (`block::Backend::Md`), so `disks`, `ext4 diskN`, `fstab`, `mount` and `@LABEL` work on it unchanged. Members are whole
    disks or GPT "Linux RAID" partitions. `md auto` in `settings` starts the `md-assemble` thread at boot; boot never waits
@@ -27,7 +36,9 @@ through the `Members` trait. Stages:
    only a crash during a write leaves it dirty. A dirty array is read-only until `md force-rw`. A failing member costs a
    failed transfer, never a stall (reads fall back, writes drop the member). Commands: `md`, `md assemble`, `md stop`,
    `md force-rw`. One array per machine for now. `make test-mf-md` boots QEMU with a hand-built mirror, reads and writes
-   ext4 on it, checks the superblocks and mirrors on the host and boots again with one member (degraded).
+   ext4 on it, checks the superblocks and mirrors on the host and boots again with one member (degraded); the same for a
+   four-member RAID 10 (striped by an independent routine in the test; booted again with one member of each pair) and a
+   two-member RAID 0 (which must not assemble with a member missing).
 
 `cargo run --example probe -- DISK1 DISK2 [--dump FILE]` (in `crates/md`) assembles real members read-only, prints what
 `mdadm --examine` should agree with and compares the mirrors; `--dump` writes the array so `fsck.ext4 -n` can check it. `--write-test` (members opened read-write) starts the array,
@@ -37,4 +48,6 @@ must show a clean array with events +2 and `mdadm --assemble --scan` must still 
 **Verification status.** The superblock layout and checksum come from the kernel's `md_p.h` and mdadm's description and are
 tested against an independent Python builder, not yet against a superblock written by real `mdadm`. First real check:
 `mdadm --create /dev/md0 --level=1 --raid-devices=2 --metadata=1.2 /dev/sdX /dev/sdY`, then `probe` on the members and
-compare with `mdadm --examine`.
+compare with `mdadm --examine`. The RAID 0 and 10 placement is from `raid10.c` and tested against the test's own striping,
+so check it against real members as well (`mdadm --create ... --level=10 --layout=n2 --raid-devices=4`, `--level=0`);
+RAID 0 members of unequal size (several zones) are not read, and the `sb->size` a real RAID 0 stores is unverified.

@@ -55,7 +55,7 @@ pub const TOPICS: &[Topic] = &[
     t("format", "Disks", "format diskN [NAME] [v3] [force]  |  format diskN exfat [LABEL]  then  format diskN confirm", "Erase a disk and make a FOSFS (v4, or v3) or exFAT volume. Says what it would erase and needs `confirm` as the very next command. Never the boot disk."),
     t("install", "Disks", "install diskN [LABEL] [fosfs=SIZE] [ext4[=LABEL]] [bare] [force]  then  install diskN confirm", "Make a disk bootable with this system. Announces first; needs `confirm` next. Never the boot disk."),
     t("ext4", "Disks", "ext4 diskN [ls|cat|info|recover|trim|mkfs|remkfs|mkdir|rm|mv|write] [PATH ...]", "Work on an ext2/3/4 volume; `ext4 diskN` alone shows it. mkfs and remkfs ask for confirmation."),
-    t("md", "Disks", "md [assemble | stop | force-rw]", "Linux software RAID 1 (mdadm v1.x): show the array, assemble it now, close it clean, or allow writes to an array that was not clean. `md auto` in `settings` assembles at boot."),
+    t("md", "Disks", "md [assemble | stop | force-rw]", "Linux software RAID 0, 1 and 10 (mdadm v1.x): show the array, assemble it now, close it clean, or allow writes to an array that was not clean. `md auto` in `settings` assembles at boot."),
     t("sector", "Disks", "sector diskN LBA [COUNT <= 4]", "Dump raw sectors, read-only (decimal or 0x hex)."),
     t("bootcode", "Disks", "bootcode | bootcode update  then  bootcode update confirm", "Show or replace the BIOS boot code / UEFI loader (needs stage1.bin and stage2.bin or loader.efi on the boot volume)."),
     t("kup", "Machine", "kup serial", "Receive a kernel update over the serial line (sender: tools/send_kernel_serial.py)."),
