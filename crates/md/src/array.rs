@@ -120,7 +120,8 @@ fn geometry(lead: &Superblock) -> Result<(u64, u32, u64), Error> {
     match lead.level {
         LEVEL_RAID1 => Ok((0, disks, lead.size)),
         LEVEL_RAID5 if chunk > 0 && disks >= 2 && lead.layout <= 3 => Ok((chunk, 1, lead.size / chunk * chunk * (disks as u64 - 1))),
-        LEVEL_RAID0 if chunk > 0 && disks > 0 => Ok((chunk, 1, lead.size / chunk * chunk * disks as u64)),
+        // mdadm leaves `size` 0 in a RAID 0 superblock; the kernel's raid0 uses each member's data size
+        LEVEL_RAID0 if chunk > 0 && disks > 0 => Ok((chunk, 1, lead.data_size / chunk * chunk * disks as u64)),
         LEVEL_RAID10 => {
             let (near, far, offset) = (lead.layout & 0xff, (lead.layout >> 8) & 0xff, lead.layout & 0x1_0000);
             if chunk == 0 || far != 1 || offset != 0 || near == 0 || near > disks {
@@ -198,7 +199,8 @@ impl Array {
             let Some((sb, block)) = entry else { continue };
             let active = roles.get(sb.dev_number as usize).is_some_and(|role| role < ROLE_FAULTY && (role as u32) < lead.raid_disks);
             let in_step = sb.events == best && sb.feature_map & FEATURE_RECOVERY_OFFSET == 0;
-            let fits = sb.data_offset.checked_add(sb.size).is_some_and(|end| end <= members.sectors(member));
+            let used = if lead.level == LEVEL_RAID0 { sb.data_size } else { sb.size };
+            let fits = sb.data_offset.checked_add(used).is_some_and(|end| end <= members.sectors(member));
             let one_zone = lead.level != LEVEL_RAID0 || sb.data_size == lead.data_size;
             if active && in_step && fits && sb.size == lead.size && one_zone {
                 let super_sector = superblock::super_sector(sb.minor, members.sectors(member)).unwrap_or(0);
