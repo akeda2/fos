@@ -40,11 +40,12 @@ def main():
         disk = tmp / "ext.img"
         disk.write_bytes(bytes(256 << 20))
         subprocess.run([mkfs, "-q", "-F", "-L", "linuxvol", "-d", str(tmp / "src"), str(disk)], check=True, capture_output=True)
+        (tmp / "stick.img").write_bytes(bytes(64 << 20))
         qemu = subprocess.Popen(
             ["qemu-system-x86_64", "-cpu", "max", "-machine", "q35", "-m", "1024", "-smp", "2", "-display", "none",
              "-serial", "stdio", "-monitor", "none", "-no-reboot",
              "-drive", f"if=pflash,format=raw,readonly=on,file={CODE}", "-drive", f"format=raw,file={IMAGE},snapshot=on",
-             "-drive", f"format=raw,file={disk},snapshot=on"],
+             "-drive", f"format=raw,file={disk},snapshot=on", "-drive", f"format=raw,file={tmp / 'stick.img'},snapshot=on"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         log = b""
 
@@ -110,6 +111,12 @@ def main():
             ok, text = command("cd ../..", "fos", 20)
             ok, text = command("cd nosuch", "no such folder", 20)
             check(ok, "cd to a missing folder fails", text[-300:])
+            # `mount` lists an exFAT volume mounted by label as present, like the embedded kernel does.
+            ok, text = command("format disk3 exfat STICK", "confirm", 20)
+            ok, text = command("format disk3 confirm", "fos", 60)
+            ok, text = command("mount rec @stick", "mount", 10)
+            ok, text = command("mount", "(disk3)", 10)
+            check("rec -> @stick (disk3)" in text and "not present" not in text.split("rec ->")[-1], "mount lists an exFAT volume as present", text[-300:])
         finally:
             qemu.kill()
     return finish()
