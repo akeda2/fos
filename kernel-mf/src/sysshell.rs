@@ -63,8 +63,9 @@ pub fn mount(rest: &str) {
             mounts::each(|path, label| {
                 any = true;
                 let (path, label) = (core::str::from_utf8(path).unwrap_or("?"), core::str::from_utf8(label).unwrap_or("?"));
-                match volumes::volume_labelled(label.as_bytes()) {
-                    Some((number, _)) => println!("{path} -> @{label} (disk{number})"),
+                let found = volumes::volume_labelled(label.as_bytes()).map(|(number, _)| number);
+                match found.or_else(|| kernel_core::tape_fs::fat_labelled(label.as_bytes()).map(|(number, _)| number)) {
+                    Some(number) => println!("{path} -> @{label} (disk{number})"),
                     None if kernel_core::ext4vol::disk_labelled(label.as_bytes()).is_some() => println!("{path} -> @{label} (ext volume)"),
                     None => println!("{path} -> @{label} (not present: {path}/ is the boot volume's own folder)"),
                 }
