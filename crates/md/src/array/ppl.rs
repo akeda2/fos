@@ -15,8 +15,10 @@
 //! was being updated": `data_size / pp_size` consecutive data chunks, the same `pp_size`-byte range in each, from the
 //! chunk holding `data_sector`. The log lives on the member that holds the parity of the stripe it describes.
 //!
-//! This code logs one piece (a stretch of one chunk, one data member) at a time, and always at the start of the area:
-//! one header with one entry, rewritten for every piece, with a higher generation. It reads whatever Linux wrote (the
+//! This code logs one piece (a stretch of one chunk on one data member, up to 32 KiB, 8 KiB when the area is small) at a
+//! time, and always at the start of the area: one header with one entry, rewritten for every piece, with a higher
+//! generation. Several entries cannot share a flush: pieces of one stripe update overlapping parity, so the second
+//! one's partial parity depends on the first one's write; the long piece is what saves flushes. It reads whatever Linux wrote (the
 //! MULTIPLE_PPLS feature, a ring of headers, included): the newest valid header (a CRC-32C-clean one of this array whose generation does not fall)
 //! wins. At the start of a write session the whole area is zeroed and an empty header written, so no old header can be
 //! mistaken for a newer one (Linux does the same when it starts an array).
@@ -39,7 +41,7 @@ const CHECKSUM_AT: usize = RESERVED + 20;
 const ENTRIES_AT: usize = RESERVED + 24;
 const ENTRY: usize = 24;
 const MAX_ENTRIES: usize = (HEADER - ENTRIES_AT) / ENTRY;
-const PP_BYTES: usize = PIECE as usize * SECTOR;
+const PP_BYTES: usize = PPL_RUN as usize * SECTOR;
 
 /// Where the logs are and the generation the next header gets.
 pub(super) struct Ppl {
@@ -184,6 +186,14 @@ impl Array {
 
     /// Logs partial parity `pp` for a write at array sector `v` when the array has a log and the parity member takes
     /// part (a rebuild target or a missing member has nothing to protect). False when the log write failed.
+    /// How many sectors one write step covers: `PPL_RUN` when the log area holds that much partial parity, else `PIECE`.
+    pub(super) fn ppl_run(&self) -> u64 {
+        match &self.ppl {
+            Some(ppl) if ppl.size - HEADER_SECTORS >= PPL_RUN => PPL_RUN,
+            _ => PIECE,
+        }
+    }
+
     pub(super) fn ppl_logged<M: Members>(&mut self, members: &mut M, parity: u16, v: u64, pp: &[u8]) -> bool {
         if self.ppl.is_none() || self.slot_of_role(parity).is_none() {
             return true;

@@ -195,7 +195,7 @@ fn try_assemble(wait_over: bool) -> Outcome {
             Err(error) => crate::println!("md: partial parity log not replayed: {error:?}"),
         }
     }
-    let (present, expected, sectors, dirty) = (array.present(), array.expected(), array.sectors(), array.dirty());
+    let (present, expected, sectors, dirty, pending) = (array.present(), array.expected(), array.sectors(), array.dirty(), array.rebuild_pending());
     let mut model = [b' '; 40];
     let mut text = StatusText { bytes: [0; 96], length: 0 };
     let _ = write!(text, "Linux md RAID {} {}", array.level(), array.name());
@@ -217,6 +217,9 @@ fn try_assemble(wait_over: bool) -> Outcome {
     crate::println!("md: array assembled as disk{} ({} MiB, {present} of {expected} members{}).", disk + 1, sectors >> 11, if dirty { ", not clean: read-only until `md force-rw`" } else { "" });
     if present < expected {
         crate::println!("md: WARNING: running degraded, with no spare copy of some data.");
+    }
+    if pending {
+        crate::println!("md: a rebuild was interrupted; `md resume` goes on from where it stopped.");
     }
     Outcome::Assembled
 }
@@ -321,6 +324,27 @@ fn resync_command() {
     start_job_thread();
 }
 
+/// `md resume`: goes on with a rebuild that an earlier `md stop` or power cut interrupted.
+fn resume_command() {
+    {
+        let mut state = STATE.lock();
+        let state = &mut *state;
+        let Some(array) = state.array.as_mut() else { return crate::println!("md: no array is up.") };
+        if !array.rebuild_pending() {
+            return crate::println!("md: no interrupted rebuild to go on with.");
+        }
+        if array.dirty() {
+            return crate::println!("md: the array is not clean; run `md resync` first.");
+        }
+        if let Err(error) = array.start(&mut state.members, now()) {
+            return crate::println!("md: cannot open the array for writing: {error:?}");
+        }
+        state.last_write = seconds();
+        crate::println!("md: rebuild goes on in the background; `md` shows how far it is.");
+    }
+    start_job_thread();
+}
+
 /// `md add diskN` then `md add diskN confirm`: fills the disk in as the array's missing member.
 fn add_command(mut words: core::str::SplitWhitespace) {
     let Some(disk) = words.next().and_then(|word| word.strip_prefix("disk")).and_then(|n| n.parse::<usize>().ok()).filter(|&n| n >= 1) else {
@@ -335,6 +359,9 @@ fn add_command(mut words: core::str::SplitWhitespace) {
         let Some(info) = block::get(index) else { return crate::println!("md: disk{disk} does not exist.") };
         if index == 0 || state.disk == Some(index) || matches!(info.backend, block::Backend::Md) {
             return crate::println!("md: disk{disk} cannot be added (the boot disk and the array itself never can).");
+        }
+        if array.rebuild_pending() {
+            return crate::println!("md: an interrupted rebuild is waiting; `md resume` goes on with it.");
         }
         if array.present() >= array.expected() {
             return crate::println!("md: no member is missing.");
@@ -469,11 +496,12 @@ pub fn command(mut words: core::str::SplitWhitespace) {
         }
         Some("resync") => resync_command(),
         Some("add") => add_command(words),
+        Some("resume") => resume_command(),
         Some("force-rw") => {
             let mut state = STATE.lock();
             state.force_rw = true;
             println!("md: writes allowed even though the array was not clean (nothing resyncs it here; run a check on Linux).");
         }
-        Some(_) => println!("usage: md [assemble | stop | resync | add diskN | force-rw]"),
+        Some(_) => println!("usage: md [assemble | stop | resync | resume | add diskN | force-rw]"),
     }
 }

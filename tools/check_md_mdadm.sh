@@ -11,6 +11,8 @@
 #   2. probe --write-test starts, writes and stops the array; mdadm must assemble it and fsck it clean;
 #   3. (redundant levels) a member is blanked and rebuilt by probe --rebuild; mdadm must assemble the result,
 #      its own "check" must find 0 mismatches, and the file must still be there.
+# Then (redundant levels) a rebuild is stopped part way (probe --rebuild-part, which records its offset in the new
+# member) and finished twice: by mdadm's own recovery, and by probe --rebuild-resume; "check" must find 0 mismatches.
 # With a bitmap, between 2 and 3: the write-test leaves 0 dirty bits and the bitmap's events level with the array's;
 # probe --crash-test leaves the array open, mdadm must see dirty bits, and probe --resync (and, on another crash,
 # mdadm's own resync of just those chunks) must bring them back to 0.
@@ -99,6 +101,32 @@ ppl_steps() {
     detach
 }
 
+# A rebuild we stop part way records its offset in the new member. mdadm must carry on from it, and so must we.
+resume_steps() {
+    local how part
+    for how in mdadm ours; do
+        : >"${files[1]}"; truncate -s $SIZE "${files[1]}"
+        part=$("$PROBE" --rebuild-part 1 "${files[@]}" | tail -1)
+        echo "    $part" | cut -c1-100
+        case $part in *"part way"*) ;; *) echo "    (rebuild finished in one go; nothing to resume)"; return ;; esac
+        if [ $how = ours ]; then
+            "$PROBE" --rebuild-resume "${files[@]}" | sed 's/^/    /' | tail -2
+        fi
+        attach "${files[@]}"
+        mdadm --assemble $MD "${loops[@]}" >/dev/null 2>&1 && ok "$how resume: mdadm assembles" || bad "$how resume: mdadm --assemble"
+        mdadm --wait $MD >/dev/null 2>&1
+        echo check >/sys/block/md199/md/sync_action
+        mdadm --wait $MD >/dev/null 2>&1
+        mm=$(cat /sys/block/md199/md/mismatch_cnt)
+        [ "$mm" = 0 ] && ok "$how resume: mdadm check 0 mismatches" || bad "$how resume: $mm mismatches"
+        fsck_ok $MD "$how resume"
+        mount $MD "$work/mnt" && [ "$(sha256sum <"$work/mnt/data")" = "$sum" ] && ok "$how resume: file intact" || bad "$how resume: file"
+        umount "$work/mnt"
+        mdadm --stop $MD >/dev/null
+        detach
+    done
+}
+
 run() {
     name=$1
     case $name in
@@ -175,6 +203,7 @@ run() {
     umount "$work/mnt"
     mdadm --stop $MD >/dev/null
     detach
+    resume_steps
 }
 
 configs=("$@")

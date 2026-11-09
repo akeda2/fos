@@ -711,3 +711,12 @@ Tapes see just another NIC, so `tape-ip`, DHCP, `smbd`, `httpd` and `router` nee
 - **AES-GCM** (`aes256-gcm@openssh.com`, AES-NI/PCLMUL from user mode) next to chacha20-poly1305; measure on rack first.
 - SFTP has no symlinks, no statvfs and ignores times; password logins and other key types are deliberately absent.
 - smbd still has its own copy of the file backend; moving it to `crates/vfs-export` is optional.
+
+## Software RAID (`crates/md`, `docs/md.md`)
+
+- **Not done**: RAID 10 far and offset layouts, RAID 0 with members of unequal size (several zones), RAID 4, a write journal
+  (`consistency-policy=journal`), reshape and grow, `md add` with a partition (whole disks only), several arrays per machine.
+- **Not verified**: real disks (timings, a pulled USB disk, an mdadm-made array on real hardware). The mdadm cross-check
+  (`tools/check_md_mdadm.sh`) and the QEMU test (`make test-mf-md`) are the evidence so far; the resume-a-half-rebuild
+  steps of the cross-check were added after its last run.
+- **PPL** logs one piece (up to 32 KiB) per flushed write; entries cannot share a flush (see `docs/md.md` 5d).
