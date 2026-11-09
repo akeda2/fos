@@ -22,6 +22,7 @@ struct Slot {
     member: usize,
     data_offset: u64,
     dev_number: u32,
+    minor: u8,
     /// The position in the array (what the role table says for `dev_number`); the stripe arithmetic uses it.
     role: u16,
     super_sector: u64,
@@ -49,7 +50,36 @@ pub struct Array {
     /// Chunk size in sectors (RAID 0 and 10), and copies of each chunk (1 for RAID 0, `raid_disks` for RAID 1).
     chunk: u64,
     near: u32,
+    /// A resync of a dirty array in progress: the next array sector to compare.
+    sync_cursor: Option<u64>,
+    /// The data size on each member, from the superblock.
+    member_size: u64,
+    /// A member being filled in: not read from, written to alongside the others.
+    rebuild: Option<Rebuild>,
 }
+
+struct Rebuild {
+    slot: Slot,
+    cursor: u64,
+}
+
+/// What `Array::step` worked on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Job {
+    Resync,
+    Rebuild,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// Nothing to do (no job, or the array was closed).
+    Idle,
+    Running(Job),
+    Done(Job),
+}
+
+/// Sectors compared or copied per piece (the stack buffers are this big).
+const PIECE: u64 = 16;
 
 /// Finds the superblock on `member`, trying minor versions 1.2, 1.1 and 1.0 in the order mdadm prefers.
 pub fn find_superblock<M: Members>(members: &mut M, member: usize) -> Option<(Superblock, [u8; READ_BYTES])> {
@@ -150,6 +180,9 @@ impl Array {
             level: lead.level,
             chunk,
             near,
+            sync_cursor: None,
+            member_size: lead.size,
+            rebuild: None,
         };
         for (member, entry) in found.iter().enumerate() {
             let Some((sb, block)) = entry else { continue };
@@ -159,7 +192,7 @@ impl Array {
             if active && in_step && fits && sb.size == lead.size {
                 let super_sector = superblock::super_sector(sb.minor, members.sectors(member)).unwrap_or(0);
                 let role = roles.get(sb.dev_number as usize).unwrap_or(0);
-                array.slots[array.used] = Some(Slot { member, data_offset: sb.data_offset, dev_number: sb.dev_number, role, super_sector, block: *block });
+                array.slots[array.used] = Some(Slot { member, data_offset: sb.data_offset, dev_number: sb.dev_number, minor: sb.minor, role, super_sector, block: *block });
                 array.used += 1;
             }
         }
@@ -235,6 +268,12 @@ impl Array {
     /// (role, sector from the start of that member's data).
     fn locate(&self, v: u64) -> (u64, [(u16, u64); MAX_MEMBERS], usize) {
         let mut copies = [(0u16, 0u64); MAX_MEMBERS];
+        if self.level == LEVEL_RAID1 {
+            for c in 0..self.raid_disks as usize {
+                copies[c] = (c as u16, v);
+            }
+            return (u64::MAX, copies, self.raid_disks as usize);
+        }
         let (k, offset) = (v / self.chunk, v % self.chunk);
         let n = self.raid_disks as u64;
         for c in 0..self.near as u64 {
@@ -275,6 +314,29 @@ impl Array {
         Ok(())
     }
 
+    /// Drops the members holding `failed_roles` as far as every chunk keeps a copy, and records it. Returns whether
+    /// some failed member had to stay because its loss would leave data without a copy.
+    fn drop_roles<M: Members>(&mut self, members: &mut M, failed_roles: u32, now: u64) -> Result<bool, Error> {
+        let mut failed = [false; MAX_MEMBERS];
+        let (mut mask, mut stayed) = (self.role_mask(), false);
+        for index in 0..self.used {
+            let role = self.slots[index].as_ref().unwrap().role;
+            if failed_roles & (1 << role) != 0 {
+                let without = mask & !(1 << role);
+                if self.covered(without) {
+                    failed[index] = true;
+                    mask = without;
+                } else {
+                    stayed = true;
+                }
+            }
+        }
+        if self.drop_failed(&failed) {
+            self.commit(members, now)?;
+        }
+        Ok(stayed)
+    }
+
     /// Writes a striped array. A member that fails is dropped when every chunk keeps a copy without it; otherwise it
     /// stays (a RAID 0 never drops one) and the write fails.
     fn write_striped<M: Members>(&mut self, members: &mut M, lba: u64, buffer: &[u8], now: u64) -> Result<(), Error> {
@@ -296,24 +358,16 @@ impl Array {
                 lost = true;
                 break;
             }
+            let rebuild_failed = self.rebuild.as_ref().is_some_and(|r| {
+                copies[..n].iter().filter(|c| c.0 == r.slot.role).any(|&(_, at)| members.write(r.slot.member, r.slot.data_offset + at, piece).is_err())
+            });
+            if rebuild_failed {
+                self.rebuild = None;
+            }
             done += run;
         }
-        let mut failed = [false; MAX_MEMBERS];
-        let mut mask = self.role_mask();
-        for index in 0..self.used {
-            let role = self.slots[index].as_ref().unwrap().role;
-            if failed_roles & (1 << role) != 0 {
-                let without = mask & !(1 << role);
-                if self.covered(without) {
-                    failed[index] = true;
-                    mask = without;
-                } else {
-                    lost = true;
-                }
-            }
-        }
-        if self.drop_failed(&failed) {
-            self.commit(members, now)?;
+        if self.drop_roles(members, failed_roles, now)? {
+            lost = true;
         }
         if lost { Err(Error::Device) } else { Ok(()) }
     }
@@ -388,6 +442,9 @@ impl Array {
                 Err(_) => failed[index] = true,
             }
         }
+        if self.rebuild.as_ref().is_some_and(|r| members.write(r.slot.member, r.slot.data_offset + lba, buffer).is_err()) {
+            self.rebuild = None;
+        }
         if done == 0 {
             return Err(Error::Device);
         }
@@ -399,6 +456,9 @@ impl Array {
 
     /// Makes everything written so far durable on every member in use (members that fail to flush are dropped).
     pub fn flush<M: Members>(&mut self, members: &mut M, now: u64) -> Result<(), Error> {
+        if self.rebuild.as_ref().is_some_and(|r| members.flush(r.slot.member).is_err()) {
+            self.rebuild = None;
+        }
         let mut failed = [false; MAX_MEMBERS];
         let mut done = 0;
         for (index, slot) in self.slots[..self.used].iter().flatten().enumerate() {
@@ -422,6 +482,8 @@ impl Array {
         if !self.writing {
             return Err(Error::NotWritable);
         }
+        self.sync_cursor = None;
+        self.rebuild = None;
         self.flush(members, now)?;
         self.writing = false;
         if self.level == LEVEL_RAID0 {
@@ -430,6 +492,205 @@ impl Array {
         if !self.dirty {
             self.resync = SYNCED;
         }
+        self.commit(members, now)
+    }
+
+    /// The running job and how far it is, in array sectors out of `sectors()`.
+    pub fn job(&self) -> Option<(Job, u64)> {
+        match (self.sync_cursor, &self.rebuild) {
+            (Some(cursor), _) => Some((Job::Resync, cursor)),
+            (None, Some(r)) => Some((Job::Rebuild, r.cursor)),
+            _ => None,
+        }
+    }
+
+    /// Starts making the copies of a dirty array agree: every piece is compared across the members and the first
+    /// readable copy is written over the others (what a Linux resync does without a bitmap). The array must be open
+    /// for writing. Run it with `step`; when it finishes the array counts as clean and `stop` records that.
+    pub fn begin_resync(&mut self) -> Result<(), Error> {
+        if !self.writing {
+            return Err(Error::NotWritable);
+        }
+        if self.job().is_some() || !self.dirty || self.level == LEVEL_RAID0 {
+            return Err(Error::Busy);
+        }
+        self.resync = 0;
+        self.sync_cursor = Some(0);
+        Ok(())
+    }
+
+    /// Starts filling `member` in as the array's missing copy: its superblock is written now (flagged as recovering, so
+    /// it is not used until the copy is complete), then `step` copies the data from the members in use while every
+    /// write also goes to it. `device_uuid` identifies the disk in the array. What is on `member` is overwritten.
+    /// The array must be open for writing and have a member missing.
+    pub fn begin_rebuild<M: Members>(&mut self, members: &mut M, member: usize, device_uuid: [u8; 16]) -> Result<(), Error> {
+        if !self.writing {
+            return Err(Error::NotWritable);
+        }
+        if self.job().is_some() || self.used >= self.raid_disks as usize || self.level == LEVEL_RAID0 {
+            return Err(Error::Busy);
+        }
+        if member >= members.count() || self.slots[..self.used].iter().flatten().any(|slot| slot.member == member) {
+            return Err(Error::Busy);
+        }
+        let lead = self.slots[0].as_ref().ok_or(Error::Degraded)?;
+        let (data_offset, minor, size) = (lead.data_offset, lead.minor, self.member_size);
+        let sectors = members.sectors(member);
+        let super_sector = superblock::super_sector(minor, sectors).ok_or(Error::TooSmall)?;
+        let header = (READ_BYTES / SECTOR) as u64;
+        let clear_of_data = super_sector + header <= data_offset || super_sector >= data_offset + size;
+        if data_offset + size > sectors || !clear_of_data {
+            return Err(Error::TooSmall);
+        }
+        let mask = self.role_mask();
+        let role = (0..self.raid_disks as u16).find(|r| mask & (1 << r) == 0).ok_or(Error::Busy)?;
+        // reuse the dev number the member had if the array lists it as gone, else the one the tables give to the
+        // missing role (an array assembled without that member), else the first that is free
+        let (lead_sb, roles) = Superblock::parse(&lead.block, minor)?;
+        let used_devs = |dev: u32| self.slots[..self.used].iter().flatten().any(|slot| slot.dev_number == dev);
+        let free = |dev: u32| !used_devs(dev) && roles.get(dev as usize).is_some_and(|r| r >= ROLE_FAULTY || r == role);
+        let old = find_superblock(members, member).filter(|(sb, _)| sb.set_uuid == self.uuid).map(|(sb, _)| sb.dev_number);
+        let dev = old.filter(|&dev| free(dev)).or_else(|| (0..lead_sb.max_dev).find(|&dev| !used_devs(dev) && roles.get(dev as usize) == Some(role)))
+            .or_else(|| (0..lead_sb.max_dev).find(|&dev| free(dev))).ok_or(Error::Unsupported)?;
+        let mut block = lead.block;
+        superblock::set_dev_number(&mut block, dev);
+        superblock::set_device_uuid(&mut block, &device_uuid);
+        superblock::set_super_offset(&mut block, super_sector);
+        superblock::set_feature_map(&mut block, self.features | FEATURE_RECOVERY_OFFSET);
+        superblock::set_recovery_offset(&mut block, 0);
+        superblock::set_role(&mut block, dev as usize, role);
+        let length = superblock::reseal(&mut block).div_ceil(SECTOR);
+        members.write(member, super_sector, &block[..length * SECTOR])?;
+        members.flush(member)?;
+        self.rebuild = Some(Rebuild { slot: Slot { member, data_offset, dev_number: dev, minor, role, super_sector, block }, cursor: 0 });
+        Ok(())
+    }
+
+    /// Advances the running resync or rebuild by about `budget` sectors of array space. The caller holds whatever lock
+    /// serialises it with reads and writes; a job that fails is abandoned (a rebuild target stays flagged as
+    /// recovering and is left out at the next assembly).
+    pub fn step<M: Members>(&mut self, members: &mut M, budget: u64, now: u64) -> Result<Step, Error> {
+        if !self.writing {
+            self.sync_cursor = None;
+            self.rebuild = None;
+            return Ok(Step::Idle);
+        }
+        if let Some(mut cursor) = self.sync_cursor {
+            let end = (cursor + budget).min(self.sectors);
+            while cursor < end {
+                cursor = match self.resync_piece(members, cursor, end, now) {
+                    Ok(next) => next,
+                    Err(error) => {
+                        self.sync_cursor = None;
+                        return Err(error);
+                    }
+                };
+            }
+            if cursor < self.sectors {
+                self.sync_cursor = Some(cursor);
+                return Ok(Step::Running(Job::Resync));
+            }
+            self.sync_cursor = None;
+            self.flush(members, now)?;
+            self.dirty = false;
+            return Ok(Step::Done(Job::Resync));
+        }
+        if let Some(cursor) = self.rebuild.as_ref().map(|r| r.cursor) {
+            let (mut cursor, end) = (cursor, (cursor + budget).min(self.sectors));
+            while cursor < end {
+                cursor = self.rebuild_piece(members, cursor, end, now)?;
+            }
+            if cursor < self.sectors {
+                if let Some(r) = self.rebuild.as_mut() {
+                    r.cursor = cursor;
+                }
+                return Ok(Step::Running(Job::Rebuild));
+            }
+            self.finish_rebuild(members, now)?;
+            return Ok(Step::Done(Job::Rebuild));
+        }
+        Ok(Step::Idle)
+    }
+
+    fn resync_piece<M: Members>(&mut self, members: &mut M, cursor: u64, end: u64, now: u64) -> Result<u64, Error> {
+        let (run, copies, n) = self.locate(cursor);
+        let length = run.min(end - cursor).min(PIECE);
+        let bytes = length as usize * SECTOR;
+        let (mut reference, mut other) = ([0u8; PIECE as usize * SECTOR], [0u8; PIECE as usize * SECTOR]);
+        let (mut have, mut failed_roles) = (false, 0u32);
+        for &(role, at) in &copies[..n] {
+            let Some(slot) = self.slot_of_role(role) else { continue };
+            let (member, base) = (slot.member, slot.data_offset + at);
+            if !have {
+                match members.read(member, base, &mut reference[..bytes]) {
+                    Ok(()) => have = true,
+                    Err(_) => failed_roles |= 1 << role,
+                }
+            } else if members.read(member, base, &mut other[..bytes]).is_err() {
+                failed_roles |= 1 << role;
+            } else if other[..bytes] != reference[..bytes] && members.write(member, base, &reference[..bytes]).is_err() {
+                failed_roles |= 1 << role;
+            }
+        }
+        if failed_roles != 0 {
+            self.drop_roles(members, failed_roles, now)?;
+        }
+        if !have {
+            return Err(Error::Device);
+        }
+        Ok(cursor + length)
+    }
+
+    fn rebuild_piece<M: Members>(&mut self, members: &mut M, cursor: u64, end: u64, now: u64) -> Result<u64, Error> {
+        let (run, copies, n) = self.locate(cursor);
+        let length = run.min(end - cursor).min(PIECE);
+        let bytes = length as usize * SECTOR;
+        let target_role = self.rebuild.as_ref().map(|r| r.slot.role).ok_or(Error::Busy)?;
+        let Some(&(_, target_at)) = copies[..n].iter().find(|c| c.0 == target_role) else { return Ok(cursor + length) };
+        let mut buffer = [0u8; PIECE as usize * SECTOR];
+        let (mut got, mut failed_roles) = (false, 0u32);
+        for &(role, at) in copies[..n].iter().filter(|c| c.0 != target_role) {
+            let Some(slot) = self.slot_of_role(role) else { continue };
+            if members.read(slot.member, slot.data_offset + at, &mut buffer[..bytes]).is_ok() {
+                got = true;
+                break;
+            }
+            failed_roles |= 1 << role;
+        }
+        if failed_roles != 0 {
+            self.drop_roles(members, failed_roles, now)?;
+        }
+        let target = self.rebuild.as_ref().map(|r| (r.slot.member, r.slot.data_offset + target_at));
+        match target {
+            Some((member, at)) if got && members.write(member, at, &buffer[..bytes]).is_ok() => Ok(cursor + length),
+            _ => {
+                self.rebuild = None;
+                Err(Error::Device)
+            }
+        }
+    }
+
+    /// The copy is complete: the member becomes an ordinary one, in the role tables of every member, with one more event.
+    fn finish_rebuild<M: Members>(&mut self, members: &mut M, now: u64) -> Result<(), Error> {
+        let Some(Rebuild { mut slot, .. }) = self.rebuild.take() else { return Ok(()) };
+        members.flush(slot.member)?;
+        superblock::set_feature_map(&mut slot.block, self.features);
+        superblock::set_recovery_offset(&mut slot.block, 0);
+        let (dev, role) = (slot.dev_number, slot.role);
+        for other in self.slots[..self.used].iter_mut().flatten().chain(core::iter::once(&mut slot)) {
+            superblock::set_role(&mut other.block, dev as usize, role);
+        }
+        let mut kept = 0;
+        for index in 0..self.faulty_count {
+            if self.faulty[index] != dev {
+                self.faulty[kept] = self.faulty[index];
+                kept += 1;
+            }
+        }
+        self.faulty_count = kept;
+        // last in line: a crash while the superblocks are written never shows the new member ahead of the others
+        self.slots[self.used] = Some(slot);
+        self.used += 1;
         self.commit(members, now)
     }
 
@@ -913,5 +1174,108 @@ mod tests {
             let mut rw = striped(LEVEL_RAID10, layout, 4);
             assert_eq!(Array::assemble(&mut rw, None).err(), Some(Error::Unsupported));
         }
+    }
+
+    fn data_of(rw: &Rw, member: usize, sectors: u64) -> Vec<u8> {
+        let at = DATA_OFFSET as usize * SECTOR;
+        rw.disks.0[member][at..at + sectors as usize * SECTOR].to_vec()
+    }
+
+    fn run_job(array: &mut Array, rw: &mut Rw) -> Job {
+        loop {
+            match array.step(rw, 100, 5).unwrap() {
+                Step::Running(_) => {}
+                Step::Done(job) => return job,
+                Step::Idle => panic!("no job"),
+            }
+        }
+    }
+
+    #[test]
+    fn resync_copies_the_first_member_over_a_differing_one() {
+        let mut dirty = member(2, 1, 10, &[0, 1], 9);
+        let at = superblock::super_sector(2, DISK_SECTORS as u64).unwrap() as usize * SECTOR;
+        superblock::set_resync(&mut dirty[at..], 0);
+        superblock::reseal(&mut dirty[at..]);
+        let mut first = member(2, 0, 10, &[0, 1], 1);
+        superblock::set_resync(&mut first[at..], 0);
+        superblock::reseal(&mut first[at..]);
+        let mut rw = Rw::new(vec![first, dirty]);
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        assert!(array.dirty());
+        assert_eq!(array.begin_resync(), Err(Error::NotWritable));
+        array.start(&mut rw, 1).unwrap();
+        array.begin_resync().unwrap();
+        assert_eq!(array.begin_resync(), Err(Error::Busy));
+        assert_eq!(run_job(&mut array, &mut rw), Job::Resync);
+        assert!(!array.dirty());
+        assert_eq!(data_of(&rw, 0, ARRAY_SECTORS), data_of(&rw, 1, ARRAY_SECTORS));
+        assert_eq!(data_of(&rw, 0, 1)[0], 1);
+        array.stop(&mut rw, 6).unwrap();
+        for m in 0..2 {
+            assert_eq!(super_of(&mut rw, m).resync_offset, SYNCED, "member {m}");
+        }
+        assert_eq!(Array::assemble(&mut rw, None).unwrap().dirty(), false);
+    }
+
+    #[test]
+    fn a_mirror_member_comes_back_by_rebuild_while_writes_continue() {
+        let mut rw = pair();
+        rw.disks.0.push(vec![0u8; DISK_SECTORS * SECTOR]);
+        let survivor = rw.disks.0[0].clone();
+        rw.disks.0.remove(1);
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        assert_eq!((array.present(), array.degraded()), (1, true));
+        assert_eq!(array.begin_rebuild(&mut rw, 1, [9; 16]), Err(Error::NotWritable));
+        array.start(&mut rw, 1).unwrap();
+        assert_eq!(array.begin_rebuild(&mut rw, 0, [9; 16]), Err(Error::Busy));
+        array.begin_rebuild(&mut rw, 1, [9; 16]).unwrap();
+        // flagged as recovering until done: a fresh assembly ignores it
+        let sb = super_of(&mut rw, 1);
+        assert_eq!((sb.feature_map & FEATURE_RECOVERY_OFFSET, sb.dev_number), (FEATURE_RECOVERY_OFFSET, 1));
+        assert_eq!(array.step(&mut rw, 300, 2).unwrap(), Step::Running(Job::Rebuild));
+        let fresh = Array::assemble(&mut rw, None).unwrap();
+        assert_eq!(fresh.present(), 1);
+        // writes before and after the cursor both reach the new member
+        array.write(&mut rw, 10, &[0x5a; SECTOR], 3).unwrap();
+        array.write(&mut rw, 900, &[0xa5; SECTOR], 3).unwrap();
+        assert_eq!(run_job(&mut array, &mut rw), Job::Rebuild);
+        assert_eq!((array.present(), array.degraded()), (2, false));
+        array.stop(&mut rw, 7).unwrap();
+        assert_eq!(data_of(&rw, 0, ARRAY_SECTORS), data_of(&rw, 1, ARRAY_SECTORS));
+        assert_eq!(&data_of(&rw, 1, ARRAY_SECTORS)[10 * SECTOR..11 * SECTOR], &[0x5a; SECTOR][..]);
+        assert_eq!(&data_of(&rw, 1, ARRAY_SECTORS)[20 * SECTOR..21 * SECTOR], &survivor[(DATA_OFFSET as usize + 20) * SECTOR..][..SECTOR]);
+        let (a, b) = (super_of(&mut rw, 0), super_of(&mut rw, 1));
+        assert_eq!((a.events, a.resync_offset), (b.events, b.resync_offset));
+        assert_eq!((b.feature_map, b.resync_offset), (0, SYNCED));
+        let again = Array::assemble(&mut rw, None).unwrap();
+        assert_eq!((again.present(), again.degraded()), (2, false));
+    }
+
+    #[test]
+    fn a_raid10_member_is_rebuilt_from_its_neighbour() {
+        let mut rw = striped(LEVEL_RAID10, 0x102, 4);
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        array.start(&mut rw, 1).unwrap();
+        array.write(&mut rw, 0, &pattern(200), 1).unwrap();
+        array.stop(&mut rw, 2).unwrap();
+        let lost = data_of(&rw, 2, 1024);
+        let blank = vec![0u8; DISK_SECTORS * SECTOR];
+        let mut old = core::mem::replace(&mut rw.disks.0[2], blank);
+        old.clear();
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        // the stale member is not in the array any more: assembling saw a blank disk at index 2
+        assert_eq!((array.present(), array.degraded()), (3, true));
+        array.start(&mut rw, 3).unwrap();
+        array.begin_rebuild(&mut rw, 2, [8; 16]).unwrap();
+        assert_eq!(run_job(&mut array, &mut rw), Job::Rebuild);
+        assert_eq!(array.present(), 4);
+        array.stop(&mut rw, 4).unwrap();
+        assert_eq!(data_of(&rw, 2, 1024), lost);
+        let again = Array::assemble(&mut rw, None).unwrap();
+        assert_eq!((again.present(), again.degraded()), (4, false));
+        let mut back = vec![0u8; 200 * SECTOR];
+        again.read(&mut rw, 0, &mut back).unwrap();
+        assert_eq!(back, pattern(200));
     }
 }

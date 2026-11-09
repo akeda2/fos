@@ -201,6 +201,21 @@ pub fn set_resync(block: &mut [u8], offset: u64) {
 pub fn set_role(block: &mut [u8], slot: usize, role: u16) {
     block[HEADER + slot * 2..HEADER + slot * 2 + 2].copy_from_slice(&role.to_le_bytes());
 }
+pub fn set_feature_map(block: &mut [u8], features: u32) {
+    block[8..12].copy_from_slice(&features.to_le_bytes());
+}
+pub fn set_super_offset(block: &mut [u8], sector: u64) {
+    block[144..152].copy_from_slice(&sector.to_le_bytes());
+}
+pub fn set_recovery_offset(block: &mut [u8], sectors: u64) {
+    block[152..160].copy_from_slice(&sectors.to_le_bytes());
+}
+pub fn set_dev_number(block: &mut [u8], dev: u32) {
+    block[160..164].copy_from_slice(&dev.to_le_bytes());
+}
+pub fn set_device_uuid(block: &mut [u8], uuid: &[u8; 16]) {
+    block[168..184].copy_from_slice(uuid);
+}
 /// Recomputes `sb_csum`. Returns the bytes the superblock covers (header and role table).
 pub fn reseal(block: &mut [u8]) -> usize {
     let sum = checksum(block);

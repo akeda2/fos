@@ -218,6 +218,89 @@ def striped_boot(tmp, mkfs, e2fsck, level_name, near, disks, array_sectors, blob
             g.kill()
 
 
+def mirror_member(path, dev, fs, resync=CLEAN, events=10):
+    with open(path, "wb") as f:
+        f.truncate(SECTORS * 512)
+        f.seek(8 * 512)
+        f.write(superblock(dev, events, resync))
+        f.seek(DATA_OFFSET * 512)
+        f.write(fs)
+
+
+def check_mirror(a, b, e2fsck, tmp, what):
+    sa, sb = read_super(a), read_super(b)
+    check(sa["csum_ok"] and sb["csum_ok"] and sa["events"] == sb["events"], f"{what}: both superblocks agree on the events", f"{sa} {sb}")
+    check(sa["resync"] == CLEAN and sb["resync"] == CLEAN, f"{what}: both are marked clean", f"{sa} {sb}")
+    data = []
+    for m in (a, b):
+        with open(m, "rb") as f:
+            f.seek(DATA_OFFSET * 512)
+            data.append(f.read(DATA_SECTORS * 512))
+    check(data[0] == data[1], f"{what}: the two members hold identical data")
+    if Path(e2fsck).exists():
+        (tmp / "out.img").write_bytes(data[0])
+        r = subprocess.run([e2fsck, "-fn", str(tmp / "out.img")], capture_output=True, text=True)
+        check(r.returncode == 0, f"{what}: e2fsck accepts the volume", r.stdout[-400:])
+
+
+def repair_boots(tmp, mkfs, e2fsck, digest):
+    """Resync of a dirty mirror, and a blank disk added to a mirror that lost a member."""
+    fs = tmp / "repair.img"
+    fs.write_bytes(bytes(DATA_SECTORS * 512))
+    subprocess.run([mkfs, "-q", "-F", "-L", "mdvol", "-d", str(tmp / "src"), str(fs)], check=True, capture_output=True)
+    image = bytearray(fs.read_bytes())
+    # resync: both members dirty, the second differs in a few places (one of them inside the file system's tables)
+    a, b = tmp / "ra.img", tmp / "rb.img"
+    mirror_member(a, 0, bytes(image), resync=0)
+    damaged = bytearray(image)
+    for at in (0, 1 << 20, 9 << 20, 40 << 20):
+        damaged[at:at + 4096] = bytes([0x66]) * 4096
+    mirror_member(b, 1, bytes(damaged), resync=0)
+    g = Guest([a, b], build_image(tmp, "md auto\nmd wait 20\n"))
+    try:
+        check(g.wait_for("md: array assembled", 150), "resync: dirty array assembled", g.log[-600:].decode("utf8", "replace"))
+        check(g.wait_for("fos> ", 60), "resync: the shell prompt came up")
+        ok, text = g.command("md resync", "resync started", 30)
+        check(ok, "resync: md resync starts it", text[-300:])
+        check(g.wait_for("md: resync finished", 120), "resync: it finishes", g.log[-400:].decode("utf8", "replace"))
+        ok, text = g.command("sha256 @mdvol/hello.bin", digest, 120)
+        check(ok, "resync: the file reads back", text[-300:])
+        time.sleep(5)
+        ok, text = g.command("md stop", "members are clean", 30)
+        check(ok, "resync: md stop closes the array", text[-300:])
+    finally:
+        g.kill()
+    check_mirror(a, b, e2fsck, tmp, "resync")
+
+    # re-add: the second member is gone; a blank disk takes its place
+    a, blank = tmp / "aa.img", tmp / "blank.img"
+    mirror_member(a, 0, bytes(image))
+    with open(blank, "wb") as f:
+        f.truncate(SECTORS * 512)
+    g = Guest([a, blank], build_image(tmp, "md auto\nmd wait 2\n"))
+    try:
+        check(g.wait_for("running degraded", 150), "add: one member assembles degraded", g.log[-600:].decode("utf8", "replace"))
+        check(g.wait_for("fos> ", 60), "add: the shell prompt came up")
+        ok, text = g.command("md add disk3", "confirm", 30)
+        check(ok, "add: md add asks first", text[-300:])
+        ok, text = g.command("md add disk3 confirm", "rebuilding", 30)
+        check(ok, "add: md add confirm starts the rebuild", text[-300:])
+        check(g.wait_for("md: rebuild finished", 120), "add: the rebuild finishes", g.log[-400:].decode("utf8", "replace"))
+        ok, text = g.command("md", "members in use: 2 of 2", 30)
+        check(ok, "add: both members are in use again", text[-300:])
+        g.command("write @mdvol/after.txt rebuilt42", "fos", 30)
+        ok, text = g.command("cat @mdvol/after.txt", "rebuilt42", 30)
+        check(ok, "add: a write after the rebuild reads back", text[-300:])
+        time.sleep(5)
+        ok, text = g.command("md stop", "members are clean", 30)
+        check(ok, "add: md stop closes the array", text[-300:])
+    finally:
+        g.kill()
+    s = read_super(blank)
+    check(s["csum_ok"] and s["roles"] == (0, 1), "add: the new member has a valid superblock", str(s))
+    check_mirror(a, blank, e2fsck, tmp, "add")
+
+
 def main():
     mkfs = shutil.which("mkfs.ext4") or "/usr/sbin/mkfs.ext4"
     e2fsck = shutil.which("e2fsck") or "/usr/sbin/e2fsck"
@@ -288,6 +371,7 @@ def main():
             g.kill()
         striped_boot(tmp, mkfs, e2fsck, "raid10", 2, 4, DATA_SECTORS * 2 // CHUNK * CHUNK, blob, digest, [0, 2])
         striped_boot(tmp, mkfs, e2fsck, "raid0", 1, 2, DATA_SECTORS * 2 // CHUNK * CHUNK, blob, digest, None)
+        repair_boots(tmp, mkfs, e2fsck, digest)
     for failure in failures:
         print("FAIL:", failure)
     return 1 if failures else 0

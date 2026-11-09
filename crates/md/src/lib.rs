@@ -37,6 +37,10 @@ pub enum Error {
     Range,
     /// The array is not open for writing (or is already).
     NotWritable,
+    /// A resync or rebuild is already running, or there is nothing to rebuild.
+    Busy,
+    /// The member is too small to hold the array's data and its superblock.
+    TooSmall,
 }
 
 /// The disks an array is assembled from, numbered by the caller from 0.

@@ -207,6 +207,9 @@ pub fn run_command(line: &str) {
     if !matches!(command, "format" | "shrink" | "ext4") {
         crate::formatshell::cancel(); // a format needs its confirmation as the very next command
     }
+    if command != "md" {
+        crate::mdvol::cancel();
+    }
     if command != "install" {
         crate::install::cancel();
     }
