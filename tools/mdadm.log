@@ -1,0 +1,166 @@
+== raid1
+    name "ragnar:199"  uuid a5ad5ae1cce68be5cdf45815209841fc
+    194560 sectors (95 MiB), events 19, members 2 of 2
+    in use: /tmp/mdcheck.BjMdUp/m0.img /tmp/mdcheck.BjMdUp/m1.img
+    0 sectors differ between mirrors
+  ok:   dump: e2fsck clean
+  ok:   dump holds the file
+    write test ok: events now 21, array stopped clean
+  ok:   mdadm assembles after probe write-test
+                 State : clean 
+  ok:   after write-test: e2fsck clean
+    name "ragnar:199"  uuid a5ad5ae1cce68be5cdf45815209841fc
+    194560 sectors (95 MiB), events 21, members 1 of 2, DEGRADED
+    name "ragnar:199"  uuid a5ad5ae1cce68be5cdf45815209841fc
+    194560 sectors (95 MiB), events 21, members 1 of 2, DEGRADED
+    in use: /tmp/mdcheck.BjMdUp/m0.img
+    rebuild ok: 2 of 2 members, events now 24, array stopped clean
+  ok:   mdadm assembles the rebuilt array
+                 State : clean 
+        Active Devices : 2
+       Working Devices : 2
+  ok:   mdadm check: 0 mismatches
+  ok:   after rebuild: e2fsck clean
+  ok:   file intact after rebuild
+== raid0
+    not assembled: Unsupported
+  FAIL: probe did not assemble
+== raid10
+    name "ragnar:199"  uuid b12dc478f2b2e1d61b60cb5981c40481
+    389120 sectors (190 MiB), events 19, members 4 of 4
+    in use: /tmp/mdcheck.BjMdUp/m0.img /tmp/mdcheck.BjMdUp/m1.img /tmp/mdcheck.BjMdUp/m2.img /tmp/mdcheck.BjMdUp/m3.img
+  ok:   dump: e2fsck clean
+  ok:   dump holds the file
+    write test ok: events now 21, array stopped clean
+  ok:   mdadm assembles after probe write-test
+                 State : clean 
+  ok:   after write-test: e2fsck clean
+    name "ragnar:199"  uuid b12dc478f2b2e1d61b60cb5981c40481
+    389120 sectors (190 MiB), events 21, members 3 of 4, DEGRADED
+    name "ragnar:199"  uuid b12dc478f2b2e1d61b60cb5981c40481
+    389120 sectors (190 MiB), events 21, members 3 of 4, DEGRADED
+    in use: /tmp/mdcheck.BjMdUp/m0.img /tmp/mdcheck.BjMdUp/m2.img /tmp/mdcheck.BjMdUp/m3.img
+    rebuild ok: 4 of 4 members, events now 24, array stopped clean
+  ok:   mdadm assembles the rebuilt array
+                 State : clean 
+        Active Devices : 4
+       Working Devices : 4
+  ok:   mdadm check: 0 mismatches
+  ok:   after rebuild: e2fsck clean
+  ok:   file intact after rebuild
+== raid5-ls
+    name "ragnar:199"  uuid dd4a49cc5ff76abf47d803fa3673a73d
+    583680 sectors (285 MiB), events 20, members 4 of 4
+    in use: /tmp/mdcheck.BjMdUp/m0.img /tmp/mdcheck.BjMdUp/m1.img /tmp/mdcheck.BjMdUp/m2.img /tmp/mdcheck.BjMdUp/m3.img
+  ok:   dump: e2fsck clean
+  ok:   dump holds the file
+    write test ok: events now 22, array stopped clean
+  ok:   mdadm assembles after probe write-test
+                 State : clean 
+  ok:   after write-test: e2fsck clean
+    name "ragnar:199"  uuid dd4a49cc5ff76abf47d803fa3673a73d
+    583680 sectors (285 MiB), events 22, members 3 of 4, DEGRADED
+    name "ragnar:199"  uuid dd4a49cc5ff76abf47d803fa3673a73d
+    583680 sectors (285 MiB), events 22, members 3 of 4, DEGRADED
+    in use: /tmp/mdcheck.BjMdUp/m0.img /tmp/mdcheck.BjMdUp/m2.img /tmp/mdcheck.BjMdUp/m3.img
+    rebuild ok: 4 of 4 members, events now 25, array stopped clean
+  ok:   mdadm assembles the rebuilt array
+                 State : clean 
+        Active Devices : 4
+       Working Devices : 4
+  ok:   mdadm check: 0 mismatches
+  ok:   after rebuild: e2fsck clean
+  ok:   file intact after rebuild
+== raid5-la
+    name "ragnar:199"  uuid f982818bf2198b2cd32847ce53188b76
+    583680 sectors (285 MiB), events 20, members 4 of 4
+    in use: /tmp/mdcheck.BjMdUp/m0.img /tmp/mdcheck.BjMdUp/m1.img /tmp/mdcheck.BjMdUp/m2.img /tmp/mdcheck.BjMdUp/m3.img
+  ok:   dump: e2fsck clean
+  ok:   dump holds the file
+    write test ok: events now 22, array stopped clean
+  ok:   mdadm assembles after probe write-test
+                 State : clean 
+  ok:   after write-test: e2fsck clean
+    name "ragnar:199"  uuid f982818bf2198b2cd32847ce53188b76
+    583680 sectors (285 MiB), events 22, members 3 of 4, DEGRADED
+    name "ragnar:199"  uuid f982818bf2198b2cd32847ce53188b76
+    583680 sectors (285 MiB), events 22, members 3 of 4, DEGRADED
+    in use: /tmp/mdcheck.BjMdUp/m0.img /tmp/mdcheck.BjMdUp/m2.img /tmp/mdcheck.BjMdUp/m3.img
+    rebuild ok: 4 of 4 members, events now 25, array stopped clean
+  ok:   mdadm assembles the rebuilt array
+                 State : clean 
+        Active Devices : 4
+       Working Devices : 4
+  ok:   mdadm check: 0 mismatches
+  ok:   after rebuild: e2fsck clean
+  ok:   file intact after rebuild
+== raid5-rs
+    name "ragnar:199"  uuid e71bd6cc6ad8f75066dcf73218b75e2d
+    583680 sectors (285 MiB), events 20, members 4 of 4
+    in use: /tmp/mdcheck.BjMdUp/m0.img /tmp/mdcheck.BjMdUp/m1.img /tmp/mdcheck.BjMdUp/m2.img /tmp/mdcheck.BjMdUp/m3.img
+  ok:   dump: e2fsck clean
+  ok:   dump holds the file
+    write test ok: events now 22, array stopped clean
+  ok:   mdadm assembles after probe write-test
+                 State : clean 
+  ok:   after write-test: e2fsck clean
+    name "ragnar:199"  uuid e71bd6cc6ad8f75066dcf73218b75e2d
+    583680 sectors (285 MiB), events 22, members 3 of 4, DEGRADED
+    name "ragnar:199"  uuid e71bd6cc6ad8f75066dcf73218b75e2d
+    583680 sectors (285 MiB), events 22, members 3 of 4, DEGRADED
+    in use: /tmp/mdcheck.BjMdUp/m0.img /tmp/mdcheck.BjMdUp/m2.img /tmp/mdcheck.BjMdUp/m3.img
+    rebuild ok: 4 of 4 members, events now 25, array stopped clean
+  ok:   mdadm assembles the rebuilt array
+                 State : clean 
+        Active Devices : 4
+       Working Devices : 4
+  ok:   mdadm check: 0 mismatches
+  ok:   after rebuild: e2fsck clean
+  ok:   file intact after rebuild
+== raid5-ra
+    name "ragnar:199"  uuid 03529df83c96f574cadd5bc8d92b2f56
+    583680 sectors (285 MiB), events 20, members 4 of 4
+    in use: /tmp/mdcheck.BjMdUp/m0.img /tmp/mdcheck.BjMdUp/m1.img /tmp/mdcheck.BjMdUp/m2.img /tmp/mdcheck.BjMdUp/m3.img
+  ok:   dump: e2fsck clean
+  ok:   dump holds the file
+    write test ok: events now 22, array stopped clean
+  ok:   mdadm assembles after probe write-test
+                 State : clean 
+  ok:   after write-test: e2fsck clean
+    name "ragnar:199"  uuid 03529df83c96f574cadd5bc8d92b2f56
+    583680 sectors (285 MiB), events 22, members 3 of 4, DEGRADED
+    name "ragnar:199"  uuid 03529df83c96f574cadd5bc8d92b2f56
+    583680 sectors (285 MiB), events 22, members 3 of 4, DEGRADED
+    in use: /tmp/mdcheck.BjMdUp/m0.img /tmp/mdcheck.BjMdUp/m2.img /tmp/mdcheck.BjMdUp/m3.img
+    rebuild ok: 4 of 4 members, events now 25, array stopped clean
+  ok:   mdadm assembles the rebuilt array
+                 State : clean 
+        Active Devices : 4
+       Working Devices : 4
+  ok:   mdadm check: 0 mismatches
+  ok:   after rebuild: e2fsck clean
+  ok:   file intact after rebuild
+== raid5-3
+    name "ragnar:199"  uuid b348e4f174a4991ad53df72892bf96bf
+    389120 sectors (190 MiB), events 20, members 3 of 3
+    in use: /tmp/mdcheck.BjMdUp/m0.img /tmp/mdcheck.BjMdUp/m1.img /tmp/mdcheck.BjMdUp/m2.img
+  ok:   dump: e2fsck clean
+  ok:   dump holds the file
+    write test ok: events now 22, array stopped clean
+  ok:   mdadm assembles after probe write-test
+                 State : clean 
+  ok:   after write-test: e2fsck clean
+    name "ragnar:199"  uuid b348e4f174a4991ad53df72892bf96bf
+    389120 sectors (190 MiB), events 22, members 2 of 3, DEGRADED
+    name "ragnar:199"  uuid b348e4f174a4991ad53df72892bf96bf
+    389120 sectors (190 MiB), events 22, members 2 of 3, DEGRADED
+    in use: /tmp/mdcheck.BjMdUp/m0.img /tmp/mdcheck.BjMdUp/m2.img
+    rebuild ok: 3 of 3 members, events now 25, array stopped clean
+  ok:   mdadm assembles the rebuilt array
+                 State : clean 
+        Active Devices : 3
+       Working Devices : 3
+  ok:   mdadm check: 0 mismatches
+  ok:   after rebuild: e2fsck clean
+  ok:   file intact after rebuild
+FAILURES

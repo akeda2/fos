@@ -12,7 +12,7 @@
 //! has no redundancy and no resync, so it is never marked dirty and a member that fails a write fails the write. RAID 10
 //! needs one copy of every chunk: a member that fails is dropped as long as that holds.
 
-use crate::superblock::{self, Superblock, FEATURE_BAD_BLOCKS, FEATURE_BITMAP, FEATURE_RECOVERY_OFFSET, LEVEL_RAID0, LEVEL_RAID1, LEVEL_RAID10, LEVEL_RAID5, READ_BYTES, ROLE_FAULTY, SYNCED};
+use crate::superblock::{self, Superblock, FEATURE_BAD_BLOCKS, FEATURE_BITMAP, FEATURE_RAID0_LAYOUT, FEATURE_RECOVERY_OFFSET, LEVEL_RAID0, LEVEL_RAID1, LEVEL_RAID10, LEVEL_RAID5, READ_BYTES, ROLE_FAULTY, SYNCED};
 use crate::{Error, Members, SECTOR};
 
 pub const MAX_MEMBERS: usize = 8;
@@ -160,7 +160,7 @@ impl Array {
                 if !matches!(sb.level, LEVEL_RAID0 | LEVEL_RAID1 | LEVEL_RAID5 | LEVEL_RAID10) {
                     return Err(Error::Unsupported);
                 }
-                if sb.feature_map & !(FEATURE_BITMAP | FEATURE_RECOVERY_OFFSET | FEATURE_BAD_BLOCKS) != 0 {
+                if sb.feature_map & !(FEATURE_BITMAP | FEATURE_RECOVERY_OFFSET | FEATURE_BAD_BLOCKS | FEATURE_RAID0_LAYOUT) != 0 {
                     return Err(Error::Unsupported);
                 }
                 if best_member == usize::MAX || sb.events > best {
@@ -199,7 +199,8 @@ impl Array {
             let active = roles.get(sb.dev_number as usize).is_some_and(|role| role < ROLE_FAULTY && (role as u32) < lead.raid_disks);
             let in_step = sb.events == best && sb.feature_map & FEATURE_RECOVERY_OFFSET == 0;
             let fits = sb.data_offset.checked_add(sb.size).is_some_and(|end| end <= members.sectors(member));
-            if active && in_step && fits && sb.size == lead.size {
+            let one_zone = lead.level != LEVEL_RAID0 || sb.data_size == lead.data_size;
+            if active && in_step && fits && sb.size == lead.size && one_zone {
                 let super_sector = superblock::super_sector(sb.minor, members.sectors(member)).unwrap_or(0);
                 let role = roles.get(sb.dev_number as usize).unwrap_or(0);
                 array.slots[array.used] = Some(Slot { member, data_offset: sb.data_offset, dev_number: sb.dev_number, minor: sb.minor, role, super_sector, block: *block });
