@@ -12,8 +12,10 @@
 //! has no redundancy and no resync, so it is never marked dirty and a member that fails a write fails the write. RAID 10
 //! needs one copy of every chunk: a member that fails is dropped as long as that holds.
 
-use crate::superblock::{self, Superblock, FEATURE_BAD_BLOCKS, FEATURE_BITMAP, FEATURE_RAID0_LAYOUT, FEATURE_RECOVERY_OFFSET, LEVEL_RAID0, LEVEL_RAID1, LEVEL_RAID10, LEVEL_RAID5, READ_BYTES, ROLE_FAULTY, SYNCED};
+use crate::superblock::{self, Superblock, FEATURE_BAD_BLOCKS, FEATURE_BITMAP, FEATURE_RAID0_LAYOUT, FEATURE_RECOVERY_OFFSET, LEVEL_RAID0, LEVEL_RAID1, LEVEL_RAID10, LEVEL_RAID5, LEVEL_RAID6, READ_BYTES, ROLE_FAULTY, SYNCED};
 use crate::{Error, Members, SECTOR};
+
+mod raid6;
 
 pub const MAX_MEMBERS: usize = 8;
 
@@ -119,6 +121,7 @@ fn geometry(lead: &Superblock) -> Result<(u64, u32, u64), Error> {
     }
     match lead.level {
         LEVEL_RAID1 => Ok((0, disks, lead.size)),
+        LEVEL_RAID6 if chunk > 0 && disks >= 4 && lead.layout <= 3 => Ok((chunk, 1, lead.size / chunk * chunk * (disks as u64 - 2))),
         LEVEL_RAID5 if chunk > 0 && disks >= 2 && lead.layout <= 3 => Ok((chunk, 1, lead.size / chunk * chunk * (disks as u64 - 1))),
         // mdadm leaves `size` 0 in a RAID 0 superblock; the kernel's raid0 uses each member's data size
         LEVEL_RAID0 if chunk > 0 && disks > 0 => Ok((chunk, 1, lead.data_size / chunk * chunk * disks as u64)),
@@ -158,7 +161,7 @@ impl Array {
         let (mut best, mut best_member) = (0u64, usize::MAX);
         for (member, entry) in found.iter().enumerate() {
             if let Some((sb, _)) = entry {
-                if !matches!(sb.level, LEVEL_RAID0 | LEVEL_RAID1 | LEVEL_RAID5 | LEVEL_RAID10) {
+                if !matches!(sb.level, LEVEL_RAID0 | LEVEL_RAID1 | LEVEL_RAID5 | LEVEL_RAID6 | LEVEL_RAID10) {
                     return Err(Error::Unsupported);
                 }
                 if sb.feature_map & !(FEATURE_BITMAP | FEATURE_RECOVERY_OFFSET | FEATURE_BAD_BLOCKS | FEATURE_RAID0_LAYOUT) != 0 {
@@ -213,6 +216,10 @@ impl Array {
         if array.level == LEVEL_RAID5 && array.dirty && array.degraded() {
             return Err(Error::Degraded);
         }
+        // a RAID 6 can lose one member and still trust its syndromes, two it cannot
+        if array.level == LEVEL_RAID6 && array.dirty && array.role_mask().count_ones() + 1 < array.raid_disks {
+            return Err(Error::Degraded);
+        }
         if array.used == 0 || (array.level != LEVEL_RAID1 && !array.covered(array.role_mask())) {
             return Err(Error::Degraded);
         }
@@ -222,10 +229,14 @@ impl Array {
     /// Units a job's cursor counts: array sectors, but sectors of one member for RAID 5 (a stripe row is one unit of
     /// work there). `job()` reports it scaled back to array sectors.
     fn span(&self) -> u64 {
-        if self.level == LEVEL_RAID5 { self.sectors / (self.raid_disks as u64 - 1) } else { self.sectors }
+        self.sectors / self.scale()
     }
     fn scale(&self) -> u64 {
-        if self.level == LEVEL_RAID5 { self.raid_disks as u64 - 1 } else { 1 }
+        match self.level {
+            LEVEL_RAID5 => self.raid_disks as u64 - 1,
+            LEVEL_RAID6 => self.raid_disks as u64 - 2,
+            _ => 1,
+        }
     }
     fn unit_budget(&self, budget: u64) -> u64 {
         (budget / self.scale()).max(1)
@@ -292,6 +303,9 @@ impl Array {
         }
         if self.level == LEVEL_RAID5 {
             return (mask & ((1u32 << n) - 1)).count_ones() + 1 >= n;
+        }
+        if self.level == LEVEL_RAID6 {
+            return (mask & ((1u32 << n) - 1)).count_ones() + 2 >= n;
         }
         (0..n).step_by(gcd(self.near, n) as usize).all(|start| (0..self.near).any(|c| mask & (1 << ((start + c) % n)) != 0))
     }
@@ -567,6 +581,9 @@ impl Array {
         if self.level == LEVEL_RAID5 {
             return self.read_parity(members, lba, buffer);
         }
+        if self.level == LEVEL_RAID6 {
+            return self.read_raid6(members, lba, buffer);
+        }
         if self.level != LEVEL_RAID1 {
             return self.read_striped(members, lba, buffer);
         }
@@ -619,6 +636,9 @@ impl Array {
         }
         if self.level == LEVEL_RAID5 {
             return self.write_parity(members, lba, buffer, now);
+        }
+        if self.level == LEVEL_RAID6 {
+            return self.write_raid6(members, lba, buffer, now);
         }
         if self.level != LEVEL_RAID1 {
             return self.write_striped(members, lba, buffer, now);
@@ -807,6 +827,9 @@ impl Array {
         if self.level == LEVEL_RAID5 {
             return self.resync_piece5(members, cursor, end);
         }
+        if self.level == LEVEL_RAID6 {
+            return self.resync_piece6(members, cursor, end);
+        }
         let (run, copies, n) = self.locate(cursor);
         let length = run.min(end - cursor).min(PIECE);
         let bytes = length as usize * SECTOR;
@@ -838,6 +861,9 @@ impl Array {
     fn rebuild_piece<M: Members>(&mut self, members: &mut M, cursor: u64, end: u64, now: u64) -> Result<u64, Error> {
         if self.level == LEVEL_RAID5 {
             return self.rebuild_piece5(members, cursor, end);
+        }
+        if self.level == LEVEL_RAID6 {
+            return self.rebuild_piece6(members, cursor, end);
         }
         let (run, copies, n) = self.locate(cursor);
         let length = run.min(end - cursor).min(PIECE);
@@ -1637,6 +1663,208 @@ mod tests {
             crashed.stop(&mut rw, 10).unwrap();
             check_raid5(&rw, layout, 4, crashed.sectors(), &data);
         }
+    }
+
+    /// Multiplication in GF(2^8) by shift and add, polynomial 0x11d: independent of the table-driven `gf`.
+    fn gmul(mut a: u8, mut b: u8) -> u8 {
+        let mut product = 0u8;
+        while b != 0 {
+            if b & 1 != 0 {
+                product ^= a;
+            }
+            a = (a << 1) ^ if a & 0x80 != 0 { 0x1d } else { 0 };
+            b >>= 1;
+        }
+        product
+    }
+
+    /// (P member, Q member, data members in chunk order, data members in syndrome order) of row `row`, from the
+    /// description of the layouts rather than the formulas of `locate6`.
+    fn model6(layout: u32, n: usize, row: usize) -> (usize, usize, Vec<usize>, Vec<usize>) {
+        let p = if layout & 1 == 0 { n - 1 - row % n } else { row % n };
+        let q = (p + 1) % n;
+        let syndrome: Vec<usize> = (1..=n - 2).map(|k| (q + k) % n).collect();
+        let chunks = if layout & 2 != 0 { syndrome.clone() } else { (0..n).filter(|&d| d != p && d != q).collect() };
+        (p, q, chunks, syndrome)
+    }
+
+    fn check_raid6(rw: &Rw, layout: u32, n: usize, array_sectors: u64, expect: &[u8]) {
+        for v in 0..array_sectors as usize {
+            let (k, off) = (v / 8, v % 8);
+            let row = k / (n - 2);
+            let (_, _, chunks, _) = model6(layout, n, row);
+            assert_eq!(sector_of(rw, chunks[k % (n - 2)], (row * 8 + off) as u64), &expect[v * SECTOR..(v + 1) * SECTOR], "layout {layout} sector {v}");
+        }
+        for sector in 0..1024u64 {
+            let (p, q, _, syndrome) = model6(layout, n, sector as usize / 8);
+            let (mut psum, mut qsum) = (vec![0u8; SECTOR], vec![0u8; SECTOR]);
+            let mut g = 1u8;
+            for &disk in &syndrome {
+                for (i, b) in sector_of(rw, disk, sector).iter().enumerate() {
+                    psum[i] ^= b;
+                    qsum[i] ^= gmul(g, *b);
+                }
+                g = gmul(g, 2);
+            }
+            assert_eq!(sector_of(rw, p, sector), &psum[..], "layout {layout} P at {sector}");
+            assert_eq!(sector_of(rw, q, sector), &qsum[..], "layout {layout} Q at {sector}");
+        }
+    }
+
+    fn blank(rw: &mut Rw, member: usize) {
+        rw.disks.0[member] = vec![0; DISK_SECTORS * SECTOR];
+    }
+
+    #[test]
+    fn raid6_layouts_place_data_and_syndromes_like_linux() {
+        for layout in 0..4 {
+            for n in [4u32, 5, 6] {
+                let mut rw = striped(LEVEL_RAID6, layout, n);
+                let mut array = Array::assemble(&mut rw, None).unwrap();
+                assert_eq!(array.sectors(), 1024 / 8 * 8 * (n as u64 - 2));
+                array.start(&mut rw, 1).unwrap();
+                let data = pattern(array.sectors());
+                let mut at = 0;
+                for len in [1usize, 7, 9, 30, 100].iter().cycle() {
+                    if at >= array.sectors() as usize {
+                        break;
+                    }
+                    let len = (*len).min(array.sectors() as usize - at);
+                    array.write(&mut rw, at as u64, &data[at * SECTOR..(at + len) * SECTOR], 2).unwrap();
+                    at += len;
+                }
+                array.stop(&mut rw, 3).unwrap();
+                check_raid6(&rw, layout, n as usize, array.sectors(), &data);
+                let mut back = vec![0u8; data.len()];
+                array.read(&mut rw, 0, &mut back).unwrap();
+                assert_eq!(back, data);
+            }
+        }
+    }
+
+    #[test]
+    fn raid6_reads_around_any_one_or_two_missing_members() {
+        for layout in [0, 1, 2, 3] {
+            let mut rw = striped(LEVEL_RAID6, layout, 5);
+            let mut array = Array::assemble(&mut rw, None).unwrap();
+            array.start(&mut rw, 1).unwrap();
+            let data = pattern(array.sectors());
+            array.write(&mut rw, 0, &data, 2).unwrap();
+            array.stop(&mut rw, 3).unwrap();
+            for a in 0..5 {
+                for b in a..5 {
+                    let mut absent = Rw::new(rw.disks.0.clone());
+                    blank(&mut absent, a);
+                    if b != a {
+                        blank(&mut absent, b);
+                    }
+                    let degraded = Array::assemble(&mut absent, None).unwrap();
+                    let mut back = vec![0u8; data.len()];
+                    degraded.read(&mut absent, 0, &mut back).unwrap();
+                    assert_eq!(back, data, "layout {layout} absent {a} {b}");
+                    // present but failing every read
+                    let mut failing = Rw::new(rw.disks.0.clone());
+                    let degraded = Array::assemble(&mut failing, None).unwrap();
+                    failing.disks.1[a] = true;
+                    failing.disks.1[b] = true;
+                    degraded.read(&mut failing, 0, &mut back).unwrap();
+                    assert_eq!(back, data, "layout {layout} failing {a} {b}");
+                }
+            }
+        }
+        let mut rw = striped(LEVEL_RAID6, 2, 5);
+        for m in 0..3 {
+            blank(&mut rw, m);
+        }
+        assert_eq!(Array::assemble(&mut rw, None).err(), Some(Error::Degraded));
+    }
+
+    #[test]
+    fn raid6_writes_survive_members_failing_and_keep_the_syndromes_right() {
+        for layout in [0, 3] {
+            for (first, second) in [(0usize, 1usize), (1, 4), (3, 2)] {
+                let mut rw = striped(LEVEL_RAID6, layout, 5);
+                let mut array = Array::assemble(&mut rw, None).unwrap();
+                array.start(&mut rw, 1).unwrap();
+                let mut data = pattern(array.sectors());
+                array.write(&mut rw, 0, &data, 2).unwrap();
+                rw.write_fail[first] = true;
+                let fresh: Vec<u8> = (0..60 * SECTOR).map(|i| (i * 7 + 3) as u8).collect();
+                array.write(&mut rw, 5, &fresh, 3).unwrap();
+                data[5 * SECTOR..65 * SECTOR].copy_from_slice(&fresh);
+                assert_eq!((array.present(), array.degraded()), (4, true));
+                rw.write_fail[second] = true;
+                let more: Vec<u8> = (0..40 * SECTOR).map(|i| (i * 11 + 1) as u8).collect();
+                array.write(&mut rw, 100, &more, 4).unwrap();
+                data[100 * SECTOR..140 * SECTOR].copy_from_slice(&more);
+                assert_eq!(array.present(), 3);
+                array.stop(&mut rw, 5).unwrap();
+                let mut again = Array::assemble(&mut rw, None).unwrap();
+                let mut back = vec![0u8; data.len()];
+                again.read(&mut rw, 0, &mut back).unwrap();
+                assert_eq!(back, data, "layout {layout} lost {first} {second}");
+                // a third failing is refused
+                again.start(&mut rw, 6).unwrap();
+                let third = (0..5).find(|m| *m != first && *m != second).unwrap();
+                rw.write_fail[third] = true;
+                assert_eq!(again.write(&mut rw, 0, &[1; SECTOR * 40], 7), Err(Error::Device));
+            }
+        }
+    }
+
+    #[test]
+    fn raid6_rebuilds_two_members_one_after_the_other_and_resync_repairs_syndromes() {
+        for layout in [0, 2, 3] {
+            let mut rw = striped(LEVEL_RAID6, layout, 5);
+            let mut array = Array::assemble(&mut rw, None).unwrap();
+            array.start(&mut rw, 1).unwrap();
+            let mut data = pattern(array.sectors());
+            array.write(&mut rw, 0, &data, 2).unwrap();
+            array.stop(&mut rw, 3).unwrap();
+            blank(&mut rw, 1);
+            blank(&mut rw, 3);
+            let mut array = Array::assemble(&mut rw, None).unwrap();
+            assert_eq!(array.present(), 3);
+            array.start(&mut rw, 4).unwrap();
+            for target in [1, 3] {
+                array.begin_rebuild(&mut rw, target, [9; 16]).unwrap();
+                assert_eq!(array.step(&mut rw, 1200, 5).unwrap(), Step::Running(Job::Rebuild));
+                for at in [3u64, 400, 1500] {
+                    let fresh: Vec<u8> = (0..20 * SECTOR).map(|i| (i as u64 * 13 + at) as u8).collect();
+                    array.write(&mut rw, at, &fresh, 6).unwrap();
+                    data[at as usize * SECTOR..(at as usize + 20) * SECTOR].copy_from_slice(&fresh);
+                }
+                assert_eq!(run_job(&mut array, &mut rw), Job::Rebuild);
+            }
+            assert_eq!(array.present(), 5);
+            array.stop(&mut rw, 7).unwrap();
+            check_raid6(&rw, layout, 5, array.sectors(), &data);
+
+            // a crash leaves P and Q of a row stale: resync repairs them
+            let mut array = Array::assemble(&mut rw, None).unwrap();
+            array.start(&mut rw, 8).unwrap();
+            let (p, q, _, _) = model6(layout, 5, 5);
+            let at = (DATA_OFFSET + 5 * 8 + 3) as usize * SECTOR;
+            rw.disks.0[p][at] ^= 0xff;
+            rw.disks.0[q][at + 1] ^= 0x55;
+            let mut crashed = Array::assemble(&mut rw, None).unwrap();
+            assert!(crashed.dirty());
+            crashed.start(&mut rw, 9).unwrap();
+            crashed.begin_resync().unwrap();
+            assert_eq!(run_job(&mut crashed, &mut rw), Job::Resync);
+            crashed.stop(&mut rw, 10).unwrap();
+            check_raid6(&rw, layout, 5, crashed.sectors(), &data);
+        }
+    }
+
+    #[test]
+    fn a_dirty_raid6_missing_two_members_is_not_assembled() {
+        let mut rw = striped(LEVEL_RAID6, 2, 5);
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        array.start(&mut rw, 1).unwrap();
+        blank(&mut rw, 0);
+        blank(&mut rw, 2);
+        assert_eq!(Array::assemble(&mut rw, None).err(), Some(Error::Degraded));
     }
 
     #[test]

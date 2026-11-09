@@ -4,7 +4,7 @@
 #
 #     (cd crates/md && cargo build --example probe) && sudo tools/check_md_mdadm.sh [CONFIG...]
 #
-# CONFIG is one of: raid1 raid0 raid10 raid5-ls raid5-la raid5-rs raid5-ra raid5-3. Default: all of them.
+# CONFIG is one of: raid1 raid0 raid10 raid5-ls raid5-la raid5-rs raid5-ra raid5-3 raid6-ls raid6-la raid6-rs raid6-ra raid6-5. Default: all of them.
 # For each, mdadm creates the array and an ext4 with a known file; then
 #   1. probe assembles the members read-only: the dump must fsck clean and hold the file;
 #   2. probe --write-test starts, writes and stops the array; mdadm must assemble it and fsck it clean;
@@ -53,6 +53,11 @@ run() {
         raid5-rs) level=5; n=4; extra="--chunk=64 --layout=right-symmetric" ;;
         raid5-ra) level=5; n=4; extra="--chunk=64 --layout=right-asymmetric" ;;
         raid5-3) level=5; n=3; extra="--chunk=128" ;;
+        raid6-ls) level=6; n=4; extra="--chunk=64 --layout=left-symmetric" ;;
+        raid6-la) level=6; n=4; extra="--chunk=64 --layout=left-asymmetric" ;;
+        raid6-rs) level=6; n=4; extra="--chunk=64 --layout=right-symmetric" ;;
+        raid6-ra) level=6; n=4; extra="--chunk=64 --layout=right-asymmetric" ;;
+        raid6-5) level=6; n=5; extra="--chunk=128" ;;
         *) echo "unknown config $name"; return ;;
     esac
     echo "== $name"
@@ -109,7 +114,7 @@ run() {
 }
 
 configs=("$@")
-[ ${#configs[@]} -gt 0 ] || configs=(raid1 raid0 raid10 raid5-ls raid5-la raid5-rs raid5-ra raid5-3)
+[ ${#configs[@]} -gt 0 ] || configs=(raid1 raid0 raid10 raid5-ls raid5-la raid5-rs raid5-ra raid5-3 raid6-ls raid6-la raid6-rs raid6-ra raid6-5)
 for c in "${configs[@]}"; do run "$c"; done
 [ $fail = 0 ] && echo "ALL OK" || echo "FAILURES"
 exit $fail
