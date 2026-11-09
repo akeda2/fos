@@ -35,7 +35,16 @@ through the `Members` trait. Stages:
    the new member's last. The dev number is the member's old one when the array lists it as gone, else the one the role
    table gives the missing role. A failed write to the target abandons the rebuild, never an active member. Progress is
    not saved: a rebuild interrupted by `stop` or a crash starts again from sector 0. RAID 0 has neither.
-5. RAID 5/6 (parity; the write hole needs the journal or a bitmap).
+5. **RAID 5** (done in the library, same `Array`; RAID 6 is not): the four md layouts (left/right, symmetric/asymmetric;
+   mdadm's default is left-symmetric), chunk size from the superblock, array size `(disks - 1) * (size / chunk * chunk)`.
+   Any member of a stripe row is the XOR of the others, so one rule serves reads of a missing or failing member,
+   a degraded write, the resync (parity recomputed from the data) and the rebuild. A write is read-modify-write
+   (old data, old parity) when both members are there, else the parity is the XOR of the other data. One member may
+   be missing; a second failure fails the write. During a rebuild every write also reaches the target, parity
+   included. The write hole is the same as in Linux without a journal: a crash during a write leaves the array dirty
+   and the resync recomputes parity. A dirty array that is also degraded is not assembled (Linux refuses it too:
+   the parity cannot be trusted to rebuild the missing member). No journal, no bitmap, no reshape.
+   Job cursors count sectors of one member here (`job()` reports array sectors).
 6. **Kernel glue** (done in kernel-mf, `kernel-mf/src/mdvol.rs`): the assembled array is registered as one more disk
    (`block::Backend::Md`), so `disks`, `ext4 diskN`, `fstab`, `mount` and `@LABEL` work on it unchanged. Members are whole
    disks or GPT "Linux RAID" partitions. `md auto` in `settings` starts the `md-assemble` thread at boot; boot never waits
@@ -51,6 +60,9 @@ through the `Members` trait. Stages:
    ext4 on it, checks the superblocks and mirrors on the host and boots again with one member (degraded); the same for a
    four-member RAID 10 (striped by an independent routine in the test; booted again with one member of each pair) and a
    two-member RAID 0 (which must not assemble with a member missing).
+
+`tools/check_md_mdadm.sh` (run as root, loop devices only) is the cross-check against the real driver: mdadm creates RAID 1, 0, 10 and
+5 (every layout), `probe` dumps, writes and rebuilds them, and mdadm must assemble, `check` (0 mismatches) and fsck the results.
 
 `cargo run --example probe -- DISK1 DISK2 [--dump FILE]` (in `crates/md`) assembles real members read-only, prints what
 `mdadm --examine` should agree with and compares the mirrors; `--dump` writes the array so `fsck.ext4 -n` can check it. `--write-test` (members opened read-write) starts the array,

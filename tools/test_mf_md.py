@@ -8,7 +8,8 @@ Boot 1 (both members): the array must assemble in the background, show as a disk
 Boot 2 (one member only, `md wait 2`): it must assemble degraded, say so, and still read the file.
 Boots 3 and 4: the same for a four-member RAID 10 (near 2, 64 KiB chunks, striped here by an independent routine), then
 with one member of each mirrored pair missing. Boot 5: a two-member RAID 0, which must read, take a write and refuse to
-assemble with a member missing.
+assemble with a member missing. Then resync and re-add on mirrors, and a four-member RAID 5 (left-symmetric, laid out by
+an independent routine): read and write, degraded read and write, a blank disk added.
 The superblock writer here is independent of crates/md (written from md_p.h), so the two check each other."""
 import os
 import select
@@ -301,6 +302,148 @@ def repair_boots(tmp, mkfs, e2fsck, digest):
     check_mirror(a, blank, e2fsck, tmp, "add")
 
 
+def layout5(layout, disks, row, i):
+    """(data member, parity member) of data chunk `i` in stripe row `row`, written out per layout (not md's formulas)."""
+    parity = disks - 1 - row % disks if layout & 1 == 0 else row % disks
+    if layout & 2 == 0:
+        order = [d for d in range(disks) if d != parity]
+    else:
+        order = [(parity + k) % disks for k in range(1, disks)]
+    return order[i], parity
+
+
+def raid5_members(paths, layout, image=None, absent=None):
+    """RAID 5 members in role order. With `image`: lays it out and writes the superblocks. Without: reads the array back
+    (the member at role `absent`, if any, is reconstructed from the rest) and returns (image, parity_ok)."""
+    disks = len(paths)
+    rows = DATA_SECTORS // CHUNK
+    if image is not None:
+        files = []
+        for role, path in enumerate(paths):
+            f = open(path, "wb")
+            f.truncate(SECTORS * 512)
+            f.seek(8 * 512)
+            f.write(superblock(role, 10, level=5, layout=layout, chunk=CHUNK, disks=disks, size=DATA_SECTORS))
+            files.append(f)
+        for row in range(rows):
+            parity = 0
+            for i in range(disks - 1):
+                k = row * (disks - 1) + i
+                piece = image[k * CHUNK * 512:(k + 1) * CHUNK * 512]
+                disk, parity_disk = layout5(layout, disks, row, i)
+                files[disk].seek((DATA_OFFSET + row * CHUNK) * 512)
+                files[disk].write(piece)
+                parity ^= int.from_bytes(piece, "little")
+            files[parity_disk].seek((DATA_OFFSET + row * CHUNK) * 512)
+            files[parity_disk].write(parity.to_bytes(CHUNK * 512, "little"))
+        for f in files:
+            f.close()
+        return None
+    files = [open(p, "rb") for p in paths]
+    out, parity_ok = bytearray(), True
+    for row in range(rows):
+        chunks = []
+        for f in files:
+            f.seek((DATA_OFFSET + row * CHUNK) * 512)
+            chunks.append(f.read(CHUNK * 512))
+        total = 0
+        for chunk in chunks:
+            total ^= int.from_bytes(chunk, "little")
+        if absent is None:
+            parity_ok = parity_ok and total == 0
+        else:
+            chunks[absent] = total.to_bytes(CHUNK * 512, "little")
+            total = 0
+            for i, chunk in enumerate(chunks):
+                if i != absent:
+                    total ^= int.from_bytes(chunk, "little")
+            chunks[absent] = total.to_bytes(CHUNK * 512, "little")
+        for i in range(disks - 1):
+            out += chunks[layout5(layout, disks, row, i)[0]]
+    for f in files:
+        f.close()
+    return bytes(out), parity_ok
+
+
+def raid5_boots(tmp, mkfs, e2fsck, digest, layout=2, disks=4):
+    """RAID 5: read and write with every member, then one missing (degraded read and write), then a blank disk added."""
+    array_sectors = (disks - 1) * (DATA_SECTORS // CHUNK * CHUNK)
+    fs = tmp / "raid5.img"
+    fs.write_bytes(bytes(array_sectors * 512))
+    subprocess.run([mkfs, "-q", "-F", "-L", "mdvol", "-d", str(tmp / "src"), str(fs)], check=True, capture_output=True)
+    paths = [tmp / f"r5m{i}.img" for i in range(disks)]
+    raid5_members(paths, layout, image=fs.read_bytes())
+
+    def host_check(order, what, absent=None):
+        image, parity_ok = raid5_members(order, layout, absent=absent)
+        if absent is None:
+            check(parity_ok, f"raid5 {what}: every stripe XORs to zero")
+        if Path(e2fsck).exists():
+            (tmp / "out.img").write_bytes(image)
+            r = subprocess.run([e2fsck, "-fn", str(tmp / "out.img")], capture_output=True, text=True)
+            check(r.returncode == 0, f"raid5 {what}: e2fsck accepts the volume", r.stdout[-400:])
+
+    g = Guest(paths, build_image(tmp, "md auto\nmd wait 20\n"))
+    try:
+        check(g.wait_for("md: array assembled", 150), "raid5: array assembled", g.log[-600:].decode("utf8", "replace"))
+        check(g.wait_for("fos> ", 60), "raid5: the shell prompt came up")
+        ok, text = g.command("md", f"members in use: {disks} of {disks}")
+        check(ok, "raid5: md shows every member", text[-300:])
+        ok, text = g.command("sha256 @mdvol/hello.bin", digest, 120)
+        check(ok, "raid5: a file read through the array has the host's SHA-256", text[-300:])
+        g.command("write @mdvol/new.txt parity42", "fos", 30)
+        ok, text = g.command("cat @mdvol/new.txt", "parity42", 30)
+        check(ok, "raid5: a write through the array reads back", text[-300:])
+        time.sleep(5)
+        ok, text = g.command("md stop", "members are clean", 30)
+        check(ok, "raid5: md stop closes the array", text[-300:])
+    finally:
+        g.kill()
+    host_check(paths, "after a write")
+
+    # one member (role 1) missing: reads are reconstructed, a write keeps the stripes reconstructible
+    rest = [paths[0], paths[2], paths[3]]
+    g = Guest(rest, build_image(tmp, "md auto\nmd wait 2\n"))
+    try:
+        check(g.wait_for("running degraded", 150), "raid5: three of four members assemble degraded", g.log[-600:].decode("utf8", "replace"))
+        check(g.wait_for("fos> ", 60), "raid5: degraded: the shell prompt came up")
+        ok, text = g.command("sha256 @mdvol/hello.bin", digest, 120)
+        check(ok, "raid5: the degraded array reads the file", text[-300:])
+        g.command("write @mdvol/deg.txt degraded42", "fos", 30)
+        ok, text = g.command("cat @mdvol/deg.txt", "degraded42", 30)
+        check(ok, "raid5: a degraded write reads back", text[-300:])
+        time.sleep(5)
+        ok, text = g.command("md stop", "members are clean", 30)
+        check(ok, "raid5: degraded: md stop closes the array", text[-300:])
+    finally:
+        g.kill()
+    host_check([paths[0], paths[1], paths[2], paths[3]], "after a degraded write", absent=1)
+
+    # a blank disk takes the missing role (1)
+    blank = tmp / "r5blank.img"
+    with open(blank, "wb") as f:
+        f.truncate(SECTORS * 512)
+    g = Guest(rest + [blank], build_image(tmp, "md auto\nmd wait 2\n"))
+    try:
+        check(g.wait_for("running degraded", 150), "raid5 add: assembles degraded", g.log[-600:].decode("utf8", "replace"))
+        check(g.wait_for("fos> ", 60), "raid5 add: the shell prompt came up")
+        ok, text = g.command(f"md add disk{len(rest) + 2}", "confirm", 30)
+        check(ok, "raid5 add: md add asks first", text[-300:])
+        ok, text = g.command(f"md add disk{len(rest) + 2} confirm", "rebuilding", 30)
+        check(ok, "raid5 add: md add confirm starts the rebuild", text[-300:])
+        check(g.wait_for("md: rebuild finished", 240), "raid5 add: the rebuild finishes", g.log[-400:].decode("utf8", "replace"))
+        ok, text = g.command("md", f"members in use: {disks} of {disks}", 30)
+        check(ok, "raid5 add: every member is in use again", text[-300:])
+        ok, text = g.command("cat @mdvol/deg.txt", "degraded42", 30)
+        check(ok, "raid5 add: the degraded write survived", text[-300:])
+        time.sleep(5)
+        ok, text = g.command("md stop", "members are clean", 30)
+        check(ok, "raid5 add: md stop closes the array", text[-300:])
+    finally:
+        g.kill()
+    host_check([paths[0], blank, paths[2], paths[3]], "after the rebuild")
+
+
 def main():
     mkfs = shutil.which("mkfs.ext4") or "/usr/sbin/mkfs.ext4"
     e2fsck = shutil.which("e2fsck") or "/usr/sbin/e2fsck"
@@ -372,6 +515,7 @@ def main():
         striped_boot(tmp, mkfs, e2fsck, "raid10", 2, 4, DATA_SECTORS * 2 // CHUNK * CHUNK, blob, digest, [0, 2])
         striped_boot(tmp, mkfs, e2fsck, "raid0", 1, 2, DATA_SECTORS * 2 // CHUNK * CHUNK, blob, digest, None)
         repair_boots(tmp, mkfs, e2fsck, digest)
+        raid5_boots(tmp, mkfs, e2fsck, digest)
     for failure in failures:
         print("FAIL:", failure)
     return 1 if failures else 0
