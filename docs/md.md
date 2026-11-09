@@ -54,7 +54,7 @@ through the `Members` trait. Stages:
    rewrites a P or Q that differs; a rebuild fills one target while another member may still be missing. Pieces are 8
    sectors (the row buffers live on the stack). A dirty array missing two members is not assembled.
 5c. **Write-intent bitmap** (`crates/md/src/bitmap.rs`, RAID 1, 5 and 6; `mdadm --bitmap=internal`): the 256-byte header
-   and the bits sit at `super_sector + bitmap_offset` on every member (layout checked against bytes mdadm 4.5 wrote).
+   and the bits sit at `super_sector + bitmap_offset` on every member (layout checked against bytes mdadm 4.5 wrote; `check_md_mdadm.sh raid1-bm raid5-bm raid6-bm` passes: mdadm sees our dirty bits, assembles and fscks after our writes and resync, and its own resync clears them).
    One bit covers `chunk` sectors of the resync cursor space (array sectors for RAID 1, member sectors for RAID 5/6),
    `sync_size` must equal that span. With a trusted bitmap `start` leaves the superblocks in step (no `resync_offset` 0,
    no event bump); every `write` first sets the bits of the chunks it touches and flushes them on all members;
@@ -94,5 +94,5 @@ the same checks as RAID 5; one blank member was rebuilt, the double-loss paths a
 RAID 5 (all four layouts, 3 and 4 members): our dump fscks clean, mdadm assembles and fscks the array after our write, and a blank
 member rebuilt by `probe --rebuild` makes `mdadm` check report 0 mismatches. It found two real-mdadm differences, both fixed:
 RAID 0 carries feature bit `RAID0_LAYOUT` and `size` 0 (the length is the members' `data_size`). Not verified: RAID 0 members of
-unequal size (several zones, refused), the bitmap against real mdadm until `check_md_mdadm.sh raid1-bm raid5-bm raid6-bm` has run, real disks (timings, a pulled USB disk), and
+unequal size (several zones, refused), real disks (timings, a pulled USB disk), and
 the kernel glue against an mdadm-made array on real hardware.
