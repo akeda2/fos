@@ -35,7 +35,7 @@ through the `Members` trait. Stages:
    the new member's last. The dev number is the member's old one when the array lists it as gone, else the one the role
    table gives the missing role. A failed write to the target abandons the rebuild, never an active member. Progress is
    not saved: a rebuild interrupted by `stop` or a crash starts again from sector 0. RAID 0 has neither.
-5. **RAID 5** (done in the library, same `Array`; RAID 6 is not): the four md layouts (left/right, symmetric/asymmetric;
+5. **RAID 5** (done in the library, same `Array`; RAID 6 is item 5b): the four md layouts (left/right, symmetric/asymmetric;
    mdadm's default is left-symmetric), chunk size from the superblock, array size `(disks - 1) * (size / chunk * chunk)`.
    Any member of a stripe row is the XOR of the others, so one rule serves reads of a missing or failing member,
    a degraded write, the resync (parity recomputed from the data) and the rebuild. A write is read-modify-write
@@ -45,6 +45,14 @@ through the `Members` trait. Stages:
    and the resync recomputes parity. A dirty array that is also degraded is not assembled (Linux refuses it too:
    the parity cannot be trusted to rebuild the missing member). No journal, no bitmap, no reshape.
    Job cursors count sectors of one member here (`job()` reports array sectors).
+5b. **RAID 6** (`crates/md/src/array/raid6.rs`, GF(2^8) in `gf.rs`, polynomial 0x11d, generator 2): the same four layouts,
+   array size `(disks - 2) * (size / chunk * chunk)`, at least 4 members. P sits where RAID 5 puts parity, Q on the next
+   member. Q is the sum of g^j times the data, j counting the data members round the ring from the one after Q (for the
+   asymmetric layouts that is not the chunk order). Any two members of a row can be missing: one data member comes from P
+   (or from Q when P is gone too), two from the pair of equations, P and Q are recomputed. Writes are read-modify-write
+   of data, P and Q when all three are there, else the row is read whole, rebuilt and P and Q recomputed; the resync
+   rewrites a P or Q that differs; a rebuild fills one target while another member may still be missing. Pieces are 8
+   sectors (the row buffers live on the stack). A dirty array missing two members is not assembled.
 6. **Kernel glue** (done in kernel-mf, `kernel-mf/src/mdvol.rs`): the assembled array is registered as one more disk
    (`block::Backend::Md`), so `disks`, `ext4 diskN`, `fstab`, `mount` and `@LABEL` work on it unchanged. Members are whole
    disks or GPT "Linux RAID" partitions. `md auto` in `settings` starts the `md-assemble` thread at boot; boot never waits
@@ -61,15 +69,16 @@ through the `Members` trait. Stages:
    four-member RAID 10 (striped by an independent routine in the test; booted again with one member of each pair) and a
    two-member RAID 0 (which must not assemble with a member missing).
 
-`tools/check_md_mdadm.sh` (run as root, loop devices only) is the cross-check against the real driver: mdadm creates RAID 1, 0, 10 and
-5 (every layout), `probe` dumps, writes and rebuilds them, and mdadm must assemble, `check` (0 mismatches) and fsck the results.
+`tools/check_md_mdadm.sh` (run as root, loop devices only) is the cross-check against the real driver: mdadm creates RAID 1, 0, 10, 5 and
+6 (every layout), `probe` dumps, writes and rebuilds them, and mdadm must assemble, `check` (0 mismatches) and fsck the results.
 
 `cargo run --example probe -- DISK1 DISK2 [--dump FILE]` (in `crates/md`) assembles real members read-only, prints what
 `mdadm --examine` should agree with and compares the mirrors; `--dump` writes the array so `fsck.ext4 -n` can check it. `--write-test` (members opened read-write) starts the array,
 writes and reads back a pattern in its last 8 sectors, restores them and stops it clean: afterwards `mdadm --examine`
 must show a clean array with events +2 and `mdadm --assemble --scan` must still work.
 
-**Verification status.** `tools/check_md_mdadm.sh` (mdadm 4.5, loop devices, 2026-11-09) passed for RAID 1, 0, 10 (near 2) and
+**Verification status.** RAID 6 is checked against an independent model in the host tests and the QEMU test, and not yet
+against mdadm (`tools/check_md_mdadm.sh raid6-ls raid6-la raid6-rs raid6-ra raid6-5`). `tools/check_md_mdadm.sh` (mdadm 4.5, loop devices, 2026-11-09) passed for RAID 1, 0, 10 (near 2) and
 RAID 5 (all four layouts, 3 and 4 members): our dump fscks clean, mdadm assembles and fscks the array after our write, and a blank
 member rebuilt by `probe --rebuild` makes `mdadm` check report 0 mismatches. It found two real-mdadm differences, both fixed:
 RAID 0 carries feature bit `RAID0_LAYOUT` and `size` 0 (the length is the members' `data_size`). Not verified: RAID 0 members of

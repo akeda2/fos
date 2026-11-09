@@ -30,6 +30,7 @@ pub const LEVEL_LINEAR: i32 = -1;
 pub const LEVEL_RAID0: i32 = 0;
 pub const LEVEL_RAID1: i32 = 1;
 pub const LEVEL_RAID5: i32 = 5;
+pub const LEVEL_RAID6: i32 = 6;
 pub const LEVEL_RAID10: i32 = 10;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

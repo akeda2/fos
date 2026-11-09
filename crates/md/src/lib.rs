@@ -11,6 +11,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod array;
+pub mod gf;
 pub mod superblock;
 
 /// The mirror's old home: `Array` handles RAID 0 and 10 too now and lives in [`array`].

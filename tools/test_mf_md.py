@@ -365,6 +365,189 @@ def raid5_members(paths, layout, image=None, absent=None):
     return bytes(out), parity_ok
 
 
+def gmul(a, b):
+    """GF(2^8) product, polynomial 0x11d (shift and add, independent of the kernel's tables)."""
+    r = 0
+    while b:
+        if b & 1:
+            r ^= a
+        a = ((a << 1) ^ 0x1d) & 0xff if a & 0x80 else a << 1
+        b >>= 1
+    return r
+
+
+def gpow(n):
+    r = 1
+    for _ in range(n):
+        r = gmul(r, 2)
+    return r
+
+
+def gscale(chunk, c):
+    return chunk.translate(bytes(gmul(x, c) for x in range(256)))
+
+
+def gxor(a, b):
+    return (int.from_bytes(a, "little") ^ int.from_bytes(b, "little")).to_bytes(len(a), "little")
+
+
+def layout6(layout, disks, row):
+    """(P member, Q member, data members in chunk order, data members in syndrome order) of a stripe row."""
+    p = disks - 1 - row % disks if layout & 1 == 0 else row % disks
+    q = (p + 1) % disks
+    syndrome = [(q + k) % disks for k in range(1, disks - 1)]
+    chunks = syndrome if layout & 2 else [d for d in range(disks) if d not in (p, q)]
+    return p, q, chunks, syndrome
+
+
+def raid6_members(paths, layout, image=None, absent=()):
+    """RAID 6 members in role order. With `image`: lays it out and writes the superblocks. Without: reads the array back
+    (members at the roles in `absent` are reconstructed from the rest) and returns (image, syndromes_ok)."""
+    disks = len(paths)
+    rows = DATA_SECTORS // CHUNK
+    size = CHUNK * 512
+    if image is not None:
+        files = []
+        for role, path in enumerate(paths):
+            f = open(path, "wb")
+            f.truncate(SECTORS * 512)
+            f.seek(8 * 512)
+            f.write(superblock(role, 10, level=6, layout=layout, chunk=CHUNK, disks=disks, size=DATA_SECTORS))
+            files.append(f)
+        for row in range(rows):
+            p, q, chunks, syndrome = layout6(layout, disks, row)
+            psum, qsum = bytes(size), bytes(size)
+            for i, disk in enumerate(chunks):
+                k = row * (disks - 2) + i
+                piece = image[k * size:(k + 1) * size]
+                files[disk].seek((DATA_OFFSET + row * CHUNK) * 512)
+                files[disk].write(piece)
+                psum = gxor(psum, piece)
+                qsum = gxor(qsum, gscale(piece, gpow(syndrome.index(disk))))
+            for disk, parity in ((p, psum), (q, qsum)):
+                files[disk].seek((DATA_OFFSET + row * CHUNK) * 512)
+                files[disk].write(parity)
+        for f in files:
+            f.close()
+        return None
+    files = [open(path, "rb") for path in paths]
+    out, ok = bytearray(), True
+    for row in range(rows):
+        p, q, chunks, syndrome = layout6(layout, disks, row)
+        data = {}
+        for disk, f in enumerate(files):
+            f.seek((DATA_OFFSET + row * CHUNK) * 512)
+            data[disk] = f.read(size)
+        lost = [d for d in syndrome if d in absent]
+        psum, qsum = bytes(size), bytes(size)
+        for disk in syndrome:
+            if disk not in lost:
+                psum = gxor(psum, data[disk])
+                qsum = gxor(qsum, gscale(data[disk], gpow(syndrome.index(disk))))
+        if not absent:
+            ok = ok and psum == data[p] and qsum == data[q]
+        elif len(lost) == 1:
+            x = lost[0]
+            if p not in absent:
+                data[x] = gxor(psum, data[p])
+            else:
+                data[x] = gscale(gxor(qsum, data[q]), gmul_inv(gpow(syndrome.index(x))))
+        elif len(lost) == 2:
+            x, y = lost
+            pxy, qxy = gxor(psum, data[p]), gxor(qsum, data[q])
+            gx, gy = gpow(syndrome.index(x)), gpow(syndrome.index(y))
+            data[x] = gscale(gxor(qxy, gscale(pxy, gy)), gmul_inv(gx ^ gy))
+            data[y] = gxor(pxy, data[x])
+        for disk in chunks:
+            out += data[disk]
+    for f in files:
+        f.close()
+    return bytes(out), ok
+
+
+def gmul_inv(a):
+    return next(b for b in range(1, 256) if gmul(a, b) == 1)
+
+
+def raid6_boots(tmp, mkfs, e2fsck, digest, layout=2, disks=5):
+    """RAID 6: every member, then two missing (degraded read and write), then a blank disk added for one of them."""
+    array_sectors = (disks - 2) * (DATA_SECTORS // CHUNK * CHUNK)
+    fs = tmp / "raid6.img"
+    fs.write_bytes(bytes(array_sectors * 512))
+    subprocess.run([mkfs, "-q", "-F", "-L", "mdvol", "-d", str(tmp / "src"), str(fs)], check=True, capture_output=True)
+    paths = [tmp / f"r6m{i}.img" for i in range(disks)]
+    raid6_members(paths, layout, image=fs.read_bytes())
+
+    def host_check(order, what, absent=()):
+        image, ok = raid6_members(order, layout, absent=absent)
+        if not absent:
+            check(ok, f"raid6 {what}: every P and Q matches the data")
+        if Path(e2fsck).exists():
+            (tmp / "out.img").write_bytes(image)
+            r = subprocess.run([e2fsck, "-fn", str(tmp / "out.img")], capture_output=True, text=True)
+            check(r.returncode == 0, f"raid6 {what}: e2fsck accepts the volume", r.stdout[-400:])
+
+    g = Guest(paths, build_image(tmp, "md auto\nmd wait 20\n"))
+    try:
+        check(g.wait_for("md: array assembled", 150), "raid6: array assembled", g.log[-600:].decode("utf8", "replace"))
+        check(g.wait_for("fos> ", 60), "raid6: the shell prompt came up")
+        ok, text = g.command("md", f"members in use: {disks} of {disks}")
+        check(ok, "raid6: md shows every member", text[-300:])
+        ok, text = g.command("sha256 @mdvol/hello.bin", digest, 120)
+        check(ok, "raid6: a file read through the array has the host's SHA-256", text[-300:])
+        g.command("write @mdvol/new.txt syndrome42", "fos", 30)
+        ok, text = g.command("cat @mdvol/new.txt", "syndrome42", 30)
+        check(ok, "raid6: a write through the array reads back", text[-300:])
+        time.sleep(5)
+        ok, text = g.command("md stop", "members are clean", 30)
+        check(ok, "raid6: md stop closes the array", text[-300:])
+    finally:
+        g.kill()
+    host_check(paths, "after a write")
+
+    # members 1 and 3 missing: reads are reconstructed from P and Q, a write keeps the stripes reconstructible
+    rest = [paths[0], paths[2], paths[4]]
+    g = Guest(rest, build_image(tmp, "md auto\nmd wait 2\n"))
+    try:
+        check(g.wait_for("running degraded", 150), "raid6: three of five members assemble degraded", g.log[-600:].decode("utf8", "replace"))
+        check(g.wait_for("fos> ", 60), "raid6: degraded: the shell prompt came up")
+        ok, text = g.command("sha256 @mdvol/hello.bin", digest, 120)
+        check(ok, "raid6: the array missing two members reads the file", text[-300:])
+        g.command("write @mdvol/deg.txt degraded42", "fos", 30)
+        ok, text = g.command("cat @mdvol/deg.txt", "degraded42", 30)
+        check(ok, "raid6: a write with two members missing reads back", text[-300:])
+        time.sleep(5)
+        ok, text = g.command("md stop", "members are clean", 30)
+        check(ok, "raid6: degraded: md stop closes the array", text[-300:])
+    finally:
+        g.kill()
+    host_check(paths, "after a double-degraded write", absent=(1, 3))
+
+    # a blank disk takes the first missing role (1); role 3 stays missing
+    blank = tmp / "r6blank.img"
+    with open(blank, "wb") as f:
+        f.truncate(SECTORS * 512)
+    g = Guest(rest + [blank], build_image(tmp, "md auto\nmd wait 2\n"))
+    try:
+        check(g.wait_for("running degraded", 150), "raid6 add: assembles degraded", g.log[-600:].decode("utf8", "replace"))
+        check(g.wait_for("fos> ", 60), "raid6 add: the shell prompt came up")
+        ok, text = g.command(f"md add disk{len(rest) + 2}", "confirm", 30)
+        check(ok, "raid6 add: md add asks first", text[-300:])
+        ok, text = g.command(f"md add disk{len(rest) + 2} confirm", "rebuilding", 30)
+        check(ok, "raid6 add: md add confirm starts the rebuild", text[-300:])
+        check(g.wait_for("md: rebuild finished", 300), "raid6 add: the rebuild finishes", g.log[-400:].decode("utf8", "replace"))
+        ok, text = g.command("md", f"members in use: {disks - 1} of {disks}", 30)
+        check(ok, "raid6 add: one member is still missing", text[-300:])
+        ok, text = g.command("cat @mdvol/deg.txt", "degraded42", 30)
+        check(ok, "raid6 add: the degraded write survived", text[-300:])
+        time.sleep(5)
+        ok, text = g.command("md stop", "members are clean", 30)
+        check(ok, "raid6 add: md stop closes the array", text[-300:])
+    finally:
+        g.kill()
+    host_check([paths[0], blank, paths[2], paths[3], paths[4]], "after the rebuild", absent=(3,))
+
+
 def raid5_boots(tmp, mkfs, e2fsck, digest, layout=2, disks=4):
     """RAID 5: read and write with every member, then one missing (degraded read and write), then a blank disk added."""
     array_sectors = (disks - 1) * (DATA_SECTORS // CHUNK * CHUNK)
@@ -516,6 +699,7 @@ def main():
         striped_boot(tmp, mkfs, e2fsck, "raid0", 1, 2, DATA_SECTORS * 2 // CHUNK * CHUNK, blob, digest, None)
         repair_boots(tmp, mkfs, e2fsck, digest)
         raid5_boots(tmp, mkfs, e2fsck, digest)
+        raid6_boots(tmp, mkfs, e2fsck, digest)
     for failure in failures:
         print("FAIL:", failure)
     return 1 if failures else 0
