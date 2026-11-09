@@ -1,12 +1,18 @@
-//! A RAID 1 (mirror) array assembled from md v1.x members, read-only.
+//! An md array assembled from v1.x members: RAID 1 (mirror), RAID 0 (stripe) and RAID 10 in the "near" layout.
 //!
 //! Assembly follows what the Linux kernel's md does: look for a superblock on every member, keep those of one array
 //! (same `set_uuid`), take the highest event count as the truth and use only the members that reached it and whose slot
 //! the freshest member's role table lists as active. A member with a lower count missed writes and is left out; one
 //! flagged as still recovering is left out too. Reads come from the first usable member and fall back to the next when
-//! one fails. Nothing is written, so an array in the middle of a resync (`dirty`) is read but never repaired here.
+//! one fails. An array in the middle of a resync (`dirty`) is read but not repaired by reading.
+//!
+//! RAID 0 and RAID 10 spread the array over `chunk` sectors at a time: chunk `k` of the array is copy `c` (0..`near`) at
+//! position `p = k * near + c`, which is member role `p % raid_disks`, row `p / raid_disks`, so physical sector
+//! `row * chunk + offset` on that member (the same arithmetic as Linux's `raid10.c`; RAID 0 is `near = 1`). A RAID 0
+//! has no redundancy and no resync, so it is never marked dirty and a member that fails a write fails the write. RAID 10
+//! needs one copy of every chunk: a member that fails is dropped as long as that holds.
 
-use crate::superblock::{self, Superblock, FEATURE_BAD_BLOCKS, FEATURE_BITMAP, FEATURE_RECOVERY_OFFSET, LEVEL_RAID1, READ_BYTES, ROLE_FAULTY, SYNCED};
+use crate::superblock::{self, Superblock, FEATURE_BAD_BLOCKS, FEATURE_BITMAP, FEATURE_RECOVERY_OFFSET, LEVEL_RAID0, LEVEL_RAID1, LEVEL_RAID10, READ_BYTES, ROLE_FAULTY, SYNCED};
 use crate::{Error, Members, SECTOR};
 
 pub const MAX_MEMBERS: usize = 8;
@@ -16,6 +22,8 @@ struct Slot {
     member: usize,
     data_offset: u64,
     dev_number: u32,
+    /// The position in the array (what the role table says for `dev_number`); the stripe arithmetic uses it.
+    role: u16,
     super_sector: u64,
     block: [u8; READ_BYTES],
 }
@@ -37,6 +45,10 @@ pub struct Array {
     faulty: [u32; MAX_MEMBERS],
     faulty_count: usize,
     features: u32,
+    level: i32,
+    /// Chunk size in sectors (RAID 0 and 10), and copies of each chunk (1 for RAID 0, `raid_disks` for RAID 1).
+    chunk: u64,
+    near: u32,
 }
 
 /// Finds the superblock on `member`, trying minor versions 1.2, 1.1 and 1.0 in the order mdadm prefers.
@@ -59,8 +71,34 @@ pub fn find_superblock<M: Members>(members: &mut M, member: usize) -> Option<(Su
     None
 }
 
+/// Chunk size, copies per chunk and array size in sectors for the freshest superblock; Unsupported for layouts this code
+/// does not read (RAID 10 "far" and "offset", too many members, a RAID 0 or 10 with no chunk size).
+fn geometry(lead: &Superblock) -> Result<(u64, u32, u64), Error> {
+    let chunk = lead.chunk_sectors as u64;
+    let disks = lead.raid_disks;
+    if disks as usize > MAX_MEMBERS {
+        return Err(Error::Unsupported);
+    }
+    match lead.level {
+        LEVEL_RAID1 => Ok((0, disks, lead.size)),
+        LEVEL_RAID0 if chunk > 0 && disks > 0 => Ok((chunk, 1, lead.size / chunk * chunk * disks as u64)),
+        LEVEL_RAID10 => {
+            let (near, far, offset) = (lead.layout & 0xff, (lead.layout >> 8) & 0xff, lead.layout & 0x1_0000);
+            if chunk == 0 || far != 1 || offset != 0 || near == 0 || near > disks {
+                return Err(Error::Unsupported);
+            }
+            Ok((chunk, near, lead.size / chunk * disks as u64 / near as u64 * chunk))
+        }
+        _ => Err(Error::Unsupported),
+    }
+}
+
+fn gcd(a: u32, b: u32) -> u32 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
 impl Array {
-    /// Assembles the mirror made of the offered members. With `uuid`, only that array; without, the first one found.
+    /// Assembles the array made of the offered members. With `uuid`, only that array; without, the first one found.
     pub fn assemble<M: Members>(members: &mut M, uuid: Option<[u8; 16]>) -> Result<Array, Error> {
         let mut wanted = uuid;
         let mut found: [Option<(Superblock, [u8; READ_BYTES])>; MAX_MEMBERS] = core::array::from_fn(|_| None);
@@ -80,7 +118,7 @@ impl Array {
         let (mut best, mut best_member) = (0u64, usize::MAX);
         for (member, entry) in found.iter().enumerate() {
             if let Some((sb, _)) = entry {
-                if sb.level != LEVEL_RAID1 {
+                if !matches!(sb.level, LEVEL_RAID0 | LEVEL_RAID1 | LEVEL_RAID10) {
                     return Err(Error::Unsupported);
                 }
                 if sb.feature_map & !(FEATURE_BITMAP | FEATURE_RECOVERY_OFFSET | FEATURE_BAD_BLOCKS) != 0 {
@@ -94,20 +132,24 @@ impl Array {
         }
         let (lead, lead_block) = found[best_member].as_ref().unwrap();
         let (_, roles) = Superblock::parse(lead_block, lead.minor)?;
+        let (chunk, near, sectors) = geometry(lead)?;
         let mut array = Array {
             slots: core::array::from_fn(|_| None),
             used: 0,
-            sectors: lead.size,
+            sectors,
             uuid: lead.set_uuid,
             name: lead.set_name,
             events: best,
             raid_disks: lead.raid_disks,
-            dirty: lead.resync_offset != SYNCED,
+            dirty: lead.level != LEVEL_RAID0 && lead.resync_offset != SYNCED,
             writing: false,
             resync: lead.resync_offset,
             faulty: [0; MAX_MEMBERS],
             faulty_count: 0,
             features: lead.feature_map,
+            level: lead.level,
+            chunk,
+            near,
         };
         for (member, entry) in found.iter().enumerate() {
             let Some((sb, block)) = entry else { continue };
@@ -116,11 +158,12 @@ impl Array {
             let fits = sb.data_offset.checked_add(sb.size).is_some_and(|end| end <= members.sectors(member));
             if active && in_step && fits && sb.size == lead.size {
                 let super_sector = superblock::super_sector(sb.minor, members.sectors(member)).unwrap_or(0);
-                array.slots[array.used] = Some(Slot { member, data_offset: sb.data_offset, dev_number: sb.dev_number, super_sector, block: *block });
+                let role = roles.get(sb.dev_number as usize).unwrap_or(0);
+                array.slots[array.used] = Some(Slot { member, data_offset: sb.data_offset, dev_number: sb.dev_number, role, super_sector, block: *block });
                 array.used += 1;
             }
         }
-        if array.used == 0 {
+        if array.used == 0 || (array.level != LEVEL_RAID1 && !array.covered(array.role_mask())) {
             return Err(Error::Degraded);
         }
         Ok(array)
@@ -156,14 +199,123 @@ impl Array {
     pub fn dirty(&self) -> bool {
         self.dirty
     }
-    /// The member numbers in use, in the order reads try them.
     /// Whether the array is open for writing (between `start` and `stop`).
     pub fn is_writing(&self) -> bool {
         self.writing
     }
+    /// 0, 1 or 10.
+    pub fn level(&self) -> i32 {
+        self.level
+    }
+    pub fn chunk_sectors(&self) -> u64 {
+        self.chunk
+    }
 
+    /// The member numbers in use, in the order reads try them.
     pub fn used_members(&self) -> impl Iterator<Item = usize> + '_ {
         self.slots[..self.used].iter().flatten().map(|slot| slot.member)
+    }
+
+    /// The roles of the members in use, one bit each.
+    fn role_mask(&self) -> u32 {
+        self.slots[..self.used].iter().flatten().filter(|slot| slot.role < 32).fold(0, |mask, slot| mask | 1 << slot.role)
+    }
+
+    /// Whether every chunk has a copy among the members whose roles are in `mask`. The copies of a chunk are `near`
+    /// consecutive roles starting at a multiple of `gcd(near, raid_disks)`, wrapping; a RAID 0 needs every member.
+    fn covered(&self, mask: u32) -> bool {
+        let n = self.raid_disks;
+        if self.level == LEVEL_RAID1 {
+            return mask != 0;
+        }
+        (0..n).step_by(gcd(self.near, n) as usize).all(|start| (0..self.near).any(|c| mask & (1 << ((start + c) % n)) != 0))
+    }
+
+    /// Where array sector `v` lives in a striped array: sectors left in its chunk, and each copy as
+    /// (role, sector from the start of that member's data).
+    fn locate(&self, v: u64) -> (u64, [(u16, u64); MAX_MEMBERS], usize) {
+        let mut copies = [(0u16, 0u64); MAX_MEMBERS];
+        let (k, offset) = (v / self.chunk, v % self.chunk);
+        let n = self.raid_disks as u64;
+        for c in 0..self.near as u64 {
+            let position = k * self.near as u64 + c;
+            copies[c as usize] = ((position % n) as u16, position / n * self.chunk + offset);
+        }
+        (self.chunk - offset, copies, self.near as usize)
+    }
+
+    fn slot_of_role(&self, role: u16) -> Option<&Slot> {
+        self.slots[..self.used].iter().flatten().find(|slot| slot.role == role)
+    }
+
+    fn read_striped<M: Members>(&self, members: &mut M, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
+        let count = (buffer.len() / SECTOR) as u64;
+        let mut done = 0;
+        while done < count {
+            let (run, copies, n) = self.locate(lba + done);
+            let run = run.min(count - done);
+            let piece = &mut buffer[done as usize * SECTOR..(done + run) as usize * SECTOR];
+            let mut last = Error::Device;
+            let mut got = false;
+            for &(role, at) in &copies[..n] {
+                let Some(slot) = self.slot_of_role(role) else { continue };
+                match members.read(slot.member, slot.data_offset + at, piece) {
+                    Ok(()) => {
+                        got = true;
+                        break;
+                    }
+                    Err(error) => last = error,
+                }
+            }
+            if !got {
+                return Err(last);
+            }
+            done += run;
+        }
+        Ok(())
+    }
+
+    /// Writes a striped array. A member that fails is dropped when every chunk keeps a copy without it; otherwise it
+    /// stays (a RAID 0 never drops one) and the write fails.
+    fn write_striped<M: Members>(&mut self, members: &mut M, lba: u64, buffer: &[u8], now: u64) -> Result<(), Error> {
+        let count = (buffer.len() / SECTOR) as u64;
+        let (mut done, mut failed_roles, mut lost) = (0, 0u32, false);
+        while done < count {
+            let (run, copies, n) = self.locate(lba + done);
+            let run = run.min(count - done);
+            let piece = &buffer[done as usize * SECTOR..(done + run) as usize * SECTOR];
+            let mut took = 0;
+            for &(role, at) in &copies[..n] {
+                let Some(slot) = self.slot_of_role(role) else { continue };
+                match members.write(slot.member, slot.data_offset + at, piece) {
+                    Ok(()) => took += 1,
+                    Err(_) => failed_roles |= 1 << role,
+                }
+            }
+            if took == 0 {
+                lost = true;
+                break;
+            }
+            done += run;
+        }
+        let mut failed = [false; MAX_MEMBERS];
+        let mut mask = self.role_mask();
+        for index in 0..self.used {
+            let role = self.slots[index].as_ref().unwrap().role;
+            if failed_roles & (1 << role) != 0 {
+                let without = mask & !(1 << role);
+                if self.covered(without) {
+                    failed[index] = true;
+                    mask = without;
+                } else {
+                    lost = true;
+                }
+            }
+        }
+        if self.drop_failed(&failed) {
+            self.commit(members, now)?;
+        }
+        if lost { Err(Error::Device) } else { Ok(()) }
     }
 
     /// Reads whole sectors from the array, addressed from its first sector.
@@ -174,6 +326,9 @@ impl Array {
         let count = (buffer.len() / SECTOR) as u64;
         if lba.checked_add(count).is_none_or(|end| end > self.sectors) {
             return Err(Error::Range);
+        }
+        if self.level != LEVEL_RAID1 {
+            return self.read_striped(members, lba, buffer);
         }
         let mut last = Error::Device;
         for slot in self.slots[..self.used].iter().flatten() {
@@ -197,6 +352,10 @@ impl Array {
         if self.features & (FEATURE_BITMAP | FEATURE_BAD_BLOCKS) != 0 {
             return Err(Error::Unsupported);
         }
+        if self.level == LEVEL_RAID0 {
+            self.writing = true;
+            return Ok(());
+        }
         if !self.dirty {
             self.resync = 0;
         }
@@ -217,6 +376,9 @@ impl Array {
         let count = (buffer.len() / SECTOR) as u64;
         if lba.checked_add(count).is_none_or(|end| end > self.sectors) {
             return Err(Error::Range);
+        }
+        if self.level != LEVEL_RAID1 {
+            return self.write_striped(members, lba, buffer, now);
         }
         let mut failed = [false; MAX_MEMBERS];
         let mut done = 0;
@@ -261,10 +423,13 @@ impl Array {
             return Err(Error::NotWritable);
         }
         self.flush(members, now)?;
+        self.writing = false;
+        if self.level == LEVEL_RAID0 {
+            return Ok(());
+        }
         if !self.dirty {
             self.resync = SYNCED;
         }
-        self.writing = false;
         self.commit(members, now)
     }
 
@@ -613,5 +778,140 @@ mod tests {
         }
         let mut array = Array::assemble(&mut bitmapped, None).unwrap();
         assert_eq!(array.start(&mut bitmapped, 1), Err(Error::Unsupported));
+    }
+
+    /// `disks` members of a striped array: `level`, `layout`, chunk of 8 sectors, member data 1024 sectors.
+    fn striped(level: i32, layout: u32, disks: u32) -> Rw {
+        let roles: Vec<u16> = (0..disks as u16).collect();
+        let members = (0..disks)
+            .map(|slot| {
+                let mut disk = vec![0u8; DISK_SECTORS * SECTOR];
+                let mut block = sb(2, slot, 10);
+                block.level = level;
+                block.layout = layout;
+                block.chunk_sectors = 8;
+                block.raid_disks = disks;
+                block.max_dev = disks;
+                block.super_offset = 8;
+                block.build(&roles, &mut disk[8 * SECTOR..]);
+                disk
+            })
+            .collect();
+        Rw::new(members)
+    }
+
+    fn pattern(sectors: u64) -> Vec<u8> {
+        (0..sectors as usize * SECTOR).map(|i| (i / SECTOR) as u8 ^ (i % 251) as u8).collect()
+    }
+
+    fn sector_of(rw: &Rw, member: usize, sector: u64) -> &[u8] {
+        let at = (DATA_OFFSET + sector) as usize * SECTOR;
+        &rw.disks.0[member][at..at + SECTOR]
+    }
+
+    #[test]
+    fn raid0_stripes_chunks_across_members() {
+        let mut rw = striped(LEVEL_RAID0, 0, 3);
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        assert_eq!((array.level(), array.sectors()), (LEVEL_RAID0, 3 * 1024));
+        array.start(&mut rw, 1).unwrap();
+        let data = pattern(60);
+        array.write(&mut rw, 5, &data, 1).unwrap();
+        // array sector v: chunk v/8 on member (v/8)%3, row (v/8)/3
+        for v in 5..65u64 {
+            let (k, off) = (v / 8, v % 8);
+            let want = &data[(v - 5) as usize * SECTOR..][..SECTOR];
+            assert_eq!(sector_of(&rw, (k % 3) as usize, k / 3 * 8 + off), want, "sector {v}");
+        }
+        let mut back = vec![0u8; 60 * SECTOR];
+        array.read(&mut rw, 5, &mut back).unwrap();
+        assert_eq!(back, data);
+        let before = rw.log.len();
+        array.stop(&mut rw, 2).unwrap();
+        // no superblock traffic for a RAID 0: stopping only flushes
+        assert!(rw.log[before..].iter().all(|op| op.starts_with('f')));
+        assert_eq!(super_of(&mut rw, 0).events, 10);
+    }
+
+    #[test]
+    fn raid0_needs_every_member_and_never_drops_one() {
+        let mut rw = striped(LEVEL_RAID0, 0, 3);
+        rw.disks.0.pop();
+        assert_eq!(Array::assemble(&mut rw, None).err(), Some(Error::Degraded));
+        let mut rw = striped(LEVEL_RAID0, 0, 2);
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        array.start(&mut rw, 1).unwrap();
+        rw.write_fail[1] = true;
+        assert_eq!(array.write(&mut rw, 0, &pattern(16), 1), Err(Error::Device));
+        assert_eq!(array.present(), 2);
+    }
+
+    #[test]
+    fn raid10_near2_puts_copies_on_neighbouring_members() {
+        let mut rw = striped(LEVEL_RAID10, 0x102, 4);
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        assert_eq!(array.sectors(), 2 * 1024);
+        array.start(&mut rw, 1).unwrap();
+        let data = pattern(32);
+        array.write(&mut rw, 0, &data, 1).unwrap();
+        // chunk 0 on members 0 and 1, chunk 1 on 2 and 3, chunk 2 on 0 and 1 again one row down
+        for (chunk, members, row) in [(0usize, [0, 1], 0u64), (1, [2, 3], 0), (2, [0, 1], 1), (3, [2, 3], 1)] {
+            for m in members {
+                assert_eq!(sector_of(&rw, m, row * 8), &data[chunk * 8 * SECTOR..][..SECTOR], "chunk {chunk} member {m}");
+            }
+        }
+    }
+
+    #[test]
+    fn raid10_survives_one_loss_per_pair_and_refuses_a_lost_pair() {
+        let mut rw = striped(LEVEL_RAID10, 0x102, 4);
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        array.start(&mut rw, 1).unwrap();
+        let data = pattern(64);
+        array.write(&mut rw, 0, &data, 1).unwrap();
+        // member 1 fails: still whole thanks to member 0
+        rw.write_fail[1] = true;
+        array.write(&mut rw, 0, &data, 2).unwrap();
+        assert_eq!((array.present(), array.degraded()), (3, true));
+        // member 3 (the other pair) too
+        rw.write_fail[3] = true;
+        array.write(&mut rw, 0, &data, 3).unwrap();
+        assert_eq!(array.present(), 2);
+        // losing member 0 as well would lose chunks: the write fails and the member stays
+        rw.write_fail[0] = true;
+        assert_eq!(array.write(&mut rw, 0, &data, 4), Err(Error::Device));
+        assert_eq!(array.present(), 2);
+        let mut back = vec![0u8; 64 * SECTOR];
+        array.read(&mut rw, 0, &mut back).unwrap();
+        assert_eq!(back, data);
+
+        // the survivors recorded the losses, so a fresh assemble leaves the dead members out
+        let mut again = Array::assemble(&mut rw, None).unwrap();
+        assert_eq!(again.present(), 2);
+        let mut back = vec![0u8; 64 * SECTOR];
+        again.read(&mut rw, 0, &mut back).unwrap();
+        assert_eq!(back, data);
+    }
+
+    #[test]
+    fn raid10_three_members_near2_and_unsupported_layouts() {
+        let mut rw = striped(LEVEL_RAID10, 0x102, 3);
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        assert_eq!(array.sectors(), 1024 * 3 / 2 / 8 * 8);
+        array.start(&mut rw, 1).unwrap();
+        let data = pattern(24);
+        array.write(&mut rw, 0, &data, 1).unwrap();
+        // chunk 1 is positions 2 and 3: member 2 row 0, member 0 row 1
+        assert_eq!(sector_of(&rw, 2, 0), &data[8 * SECTOR..][..SECTOR]);
+        assert_eq!(sector_of(&rw, 0, 8), &data[8 * SECTOR..][..SECTOR]);
+        rw.write_fail[0] = true;
+        array.write(&mut rw, 0, &data, 2).unwrap();
+        rw.write_fail[1] = true;
+        assert_eq!(array.write(&mut rw, 0, &data, 3), Err(Error::Device));
+
+        for layout in [0x201, 0x1_0102] {
+            let mut rw = striped(LEVEL_RAID10, layout, 4);
+            assert_eq!(Array::assemble(&mut rw, None).err(), Some(Error::Unsupported));
+        }
     }
 }
