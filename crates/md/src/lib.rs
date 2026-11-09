@@ -6,11 +6,12 @@
 //! mirror and reads from it. The caller supplies the members through [`Members`], so the same code serves the kernel's
 //! block layer and host tests over byte vectors.
 //!
-//! RAID 0, 1 and 10 (near layout) read and write (writes follow md's order: dirty mark, data, clean mark); RAID 5/6
-//! come later; see `docs/md.md`.
+//! RAID 0, 1, 5, 6 and 10 (near layout) read and write (writes follow md's order: dirty mark, data, clean mark). An
+//! internal write-intent bitmap ([`bitmap`]) is kept for RAID 1, 5 and 6; see `docs/md.md`.
 #![cfg_attr(not(test), no_std)]
 
 pub mod array;
+pub mod bitmap;
 pub mod gf;
 pub mod superblock;
 

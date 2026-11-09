@@ -17,6 +17,8 @@ use crate::{Error, Members, SECTOR};
 
 mod raid6;
 
+use crate::bitmap::Bitmap;
+
 pub const MAX_MEMBERS: usize = 8;
 
 fn xor(into: &mut [u8], from: &[u8]) {
@@ -66,6 +68,13 @@ pub struct Array {
     member_size: u64,
     /// A member being filled in: not read from, written to alongside the others.
     rebuild: Option<Rebuild>,
+    /// The write-intent bitmap (RAID 1, 5, 6) and where it sits relative to each superblock; `bitmap_bad` is a bitmap
+    /// this code cannot vouch for (the array reads but is not opened for writing).
+    bitmap: Option<Bitmap>,
+    bitmap_offset: i32,
+    bitmap_bad: bool,
+    /// The running resync compares only the chunks the bitmap marks.
+    partial: bool,
 }
 
 struct Rebuild {
@@ -197,6 +206,10 @@ impl Array {
             sync_cursor: None,
             member_size: lead.size,
             rebuild: None,
+            bitmap: None,
+            bitmap_offset: lead.bitmap_offset,
+            bitmap_bad: false,
+            partial: false,
         };
         for (member, entry) in found.iter().enumerate() {
             let Some((sb, block)) = entry else { continue };
@@ -212,6 +225,9 @@ impl Array {
                 array.used += 1;
             }
         }
+        if lead.feature_map & FEATURE_BITMAP != 0 {
+            array.attach_bitmap(members, lead.resync_offset);
+        }
         // parity of a dirty array cannot be trusted to rebuild a missing member (Linux refuses this too)
         if array.level == LEVEL_RAID5 && array.dirty && array.degraded() {
             return Err(Error::Degraded);
@@ -224,6 +240,63 @@ impl Array {
             return Err(Error::Degraded);
         }
         Ok(array)
+    }
+
+    /// Where the bitmap starts on a member.
+    fn bitmap_at(&self, slot: &Slot) -> u64 {
+        (slot.super_sector as i64 + self.bitmap_offset as i64) as u64
+    }
+
+    /// Whether a bitmap of `sectors` starting at sector `start` (may be negative: 1.0 puts it before the superblock)
+    /// stays clear of the data and the superblock on a member of `disk` sectors.
+    fn bitmap_fits(&self, start: i64, sectors: u64, data_offset: u64, super_sector: u64, disk: u64) -> bool {
+        if start < 0 {
+            return false;
+        }
+        let (start, end) = (start as u64, start as u64 + sectors);
+        let header = (READ_BYTES / SECTOR) as u64;
+        (end <= data_offset || start >= data_offset + self.member_size) && (end <= super_sector || start >= super_sector + header) && end <= disk
+    }
+
+    /// Reads the bitmap of every member in use and keeps the union of their bits. Anything unexpected (RAID 10, a stale
+    /// or foreign header, copies of different shape, a bitmap that overlaps the data or a superblock, one too big for
+    /// `bitmap::CAP`) leaves the array read-only (`bitmap_bad`). With the superblocks saying "in step" the set bits are
+    /// what a crash left unverified, so the array counts as dirty and the resync covers just those chunks.
+    fn attach_bitmap<M: Members>(&mut self, members: &mut M, resync: u64) {
+        let supported = matches!(self.level, LEVEL_RAID1 | LEVEL_RAID5 | LEVEL_RAID6);
+        let sync_size = self.span();
+        let mut merged: Option<Bitmap> = None;
+        let mut ok = supported;
+        for slot in self.slots[..self.used].iter().flatten() {
+            if !ok {
+                break;
+            }
+            let start = slot.super_sector as i64 + self.bitmap_offset as i64;
+            let loaded = (start >= 0)
+                .then(|| Bitmap::load(members, slot.member, start as u64, &self.uuid, self.events, sync_size))
+                .and_then(Result::ok);
+            let Some(copy) = loaded else {
+                ok = false;
+                break;
+            };
+            if !self.bitmap_fits(start, copy.sectors as u64, slot.data_offset, slot.super_sector, members.sectors(slot.member)) {
+                ok = false;
+                break;
+            }
+            match merged.as_mut() {
+                None => merged = Some(copy),
+                Some(have) => ok = have.merge(&copy).is_ok(),
+            }
+        }
+        match merged {
+            Some(bitmap) if ok => {
+                if resync == SYNCED && bitmap.any() {
+                    self.dirty = true;
+                }
+                self.bitmap = Some(bitmap);
+            }
+            _ => self.bitmap_bad = true,
+        }
     }
 
     /// Units a job's cursor counts: array sectors, but sectors of one member for RAID 5 (a stripe row is one unit of
@@ -597,19 +670,26 @@ impl Array {
         Err(last)
     }
 
-    /// Opens the array for writing: every member's superblock is rewritten with the event count one higher and
-    /// `resync_offset` 0 ("not known to be in step"), and flushed, before any data write may follow. A crash after
-    /// this makes Linux resync the whole array (there is no write-intent bitmap to narrow it); a clean `stop` marks it
-    /// in step again. `now` is the time in seconds since 1970 (0 if unknown). Refused for arrays with a bitmap or a
-    /// bad-block log, which this code would leave stale (create with `mdadm --bitmap=none`).
+    /// Opens the array for writing. Without a bitmap every member's superblock is rewritten with the event count one
+    /// higher and `resync_offset` 0 ("not known to be in step"), and flushed, before any data write may follow; a
+    /// crash after this makes Linux resync the whole array, and a clean `stop` marks it in step again. With an internal
+    /// bitmap (RAID 1, 5, 6) the superblocks stay in step and each write marks its chunks first (`bitmap_mark`), so a
+    /// crash leaves only those to compare. `now` is the time in seconds since 1970 (0 if unknown). Refused for an
+    /// array with a bad-block log, or a bitmap this code does not trust (stale, other level), which it would leave
+    /// stale (create with `mdadm --bitmap=none`).
     pub fn start<M: Members>(&mut self, members: &mut M, now: u64) -> Result<(), Error> {
         if self.writing {
             return Err(Error::NotWritable);
         }
-        if self.features & (FEATURE_BITMAP | FEATURE_BAD_BLOCKS) != 0 {
+        if self.bitmap_bad || self.features & FEATURE_BAD_BLOCKS != 0 || (self.features & FEATURE_BITMAP != 0 && self.bitmap.is_none()) {
             return Err(Error::Unsupported);
         }
         if self.level == LEVEL_RAID0 {
+            self.writing = true;
+            return Ok(());
+        }
+        // with a bitmap the superblocks stay "in step": the bits say which chunks a crash leaves unverified
+        if self.bitmap.is_some() {
             self.writing = true;
             return Ok(());
         }
@@ -634,6 +714,7 @@ impl Array {
         if lba.checked_add(count).is_none_or(|end| end > self.sectors) {
             return Err(Error::Range);
         }
+        self.bitmap_mark(members, lba, count, now)?;
         if self.level == LEVEL_RAID5 {
             return self.write_parity(members, lba, buffer, now);
         }
@@ -661,6 +742,75 @@ impl Array {
             self.commit(members, now)?;
         }
         Ok(())
+    }
+
+    /// Sets the bits of the chunks a write of `count` sectors at `lba` touches and makes them durable on every member
+    /// before the data goes out. RAID 5 and 6 count member sectors, so the write is widened to whole stripe rows.
+    fn bitmap_mark<M: Members>(&mut self, members: &mut M, lba: u64, count: u64, now: u64) -> Result<(), Error> {
+        if self.bitmap.is_none() || count == 0 {
+            return Ok(());
+        }
+        let (from, to) = match self.level {
+            LEVEL_RAID5 | LEVEL_RAID6 => {
+                let row = self.chunk * self.scale();
+                ((lba / row) * self.chunk, ((lba + count - 1) / row + 1) * self.chunk)
+            }
+            _ => (lba, lba + count),
+        };
+        let to = to.min(self.span());
+        let Some(bitmap) = self.bitmap.as_mut() else { return Ok(()) };
+        let (mut lo, mut hi) = (usize::MAX, 0);
+        for bit in from / bitmap.chunk..=(to - 1) / bitmap.chunk {
+            if bitmap.set(bit) {
+                let sector = bitmap.sector_of(bit);
+                lo = lo.min(sector);
+                hi = hi.max(sector);
+            }
+        }
+        if lo == usize::MAX {
+            return Ok(());
+        }
+        self.bitmap_store(members, lo, hi, now)
+    }
+
+    /// Writes bitmap sectors `lo..=hi` to every member in use (and a member being rebuilt) and flushes them.
+    fn bitmap_store<M: Members>(&mut self, members: &mut M, lo: usize, hi: usize, now: u64) -> Result<(), Error> {
+        let Some(bitmap) = self.bitmap.as_ref() else { return Ok(()) };
+        let bytes = &bitmap.data[lo * SECTOR..(hi + 1) * SECTOR];
+        let mut failed = [false; MAX_MEMBERS];
+        let mut done = 0;
+        for (index, slot) in self.slots[..self.used].iter().flatten().enumerate() {
+            let at = self.bitmap_at(slot) + lo as u64;
+            if members.write(slot.member, at, bytes).is_ok() && members.flush(slot.member).is_ok() {
+                done += 1;
+            } else {
+                failed[index] = true;
+            }
+        }
+        if let Some(r) = &self.rebuild {
+            let at = (r.slot.super_sector as i64 + self.bitmap_offset as i64) as u64 + lo as u64;
+            if members.write(r.slot.member, at, bytes).is_err() || members.flush(r.slot.member).is_err() {
+                self.rebuild = None;
+            }
+        }
+        if done == 0 {
+            return Err(Error::Device);
+        }
+        if self.drop_failed(&failed) {
+            self.commit(members, now)?;
+        }
+        Ok(())
+    }
+
+    /// Clears every bit (the data must be durable already: nothing is in flight between calls).
+    fn bitmap_clear<M: Members>(&mut self, members: &mut M, now: u64) -> Result<(), Error> {
+        let Some(bitmap) = self.bitmap.as_mut() else { return Ok(()) };
+        if !bitmap.any() {
+            return Ok(());
+        }
+        bitmap.clear();
+        let last = bitmap.sectors - 1;
+        self.bitmap_store(members, 0, last, now)
     }
 
     /// Makes everything written so far durable on every member in use (members that fail to flush are dropped).
@@ -699,6 +849,7 @@ impl Array {
             return Ok(());
         }
         if !self.dirty {
+            self.bitmap_clear(members, now)?;
             self.resync = SYNCED;
         }
         self.commit(members, now)
@@ -723,7 +874,11 @@ impl Array {
         if self.job().is_some() || !self.dirty || self.level == LEVEL_RAID0 {
             return Err(Error::Busy);
         }
-        self.resync = 0;
+        // with the superblocks saying "in step", only the chunks the bitmap marks are compared
+        self.partial = self.bitmap.is_some() && self.resync == SYNCED;
+        if !self.partial {
+            self.resync = 0;
+        }
         self.sync_cursor = Some(0);
         Ok(())
     }
@@ -770,6 +925,13 @@ impl Array {
         superblock::set_role(&mut block, dev as usize, role);
         let length = superblock::reseal(&mut block).div_ceil(SECTOR);
         members.write(member, super_sector, &block[..length * SECTOR])?;
+        if let Some(bitmap) = &self.bitmap {
+            let start = super_sector as i64 + self.bitmap_offset as i64;
+            if !self.bitmap_fits(start, bitmap.sectors as u64, data_offset, super_sector, sectors) {
+                return Err(Error::TooSmall);
+            }
+            members.write(member, start as u64, &bitmap.data[..bitmap.sectors * SECTOR])?;
+        }
         members.flush(member)?;
         self.rebuild = Some(Rebuild { slot: Slot { member, data_offset, dev_number: dev, minor, role, super_sector, block }, cursor: 0 });
         Ok(())
@@ -788,6 +950,13 @@ impl Array {
             let (total, budget) = (self.span(), self.unit_budget(budget));
             let end = (cursor + budget).min(total);
             while cursor < end {
+                if let Some(bitmap) = self.bitmap.as_ref().filter(|_| self.partial) {
+                    let bit = cursor / bitmap.chunk;
+                    if !bitmap.get(bit) {
+                        cursor = bitmap.next_set(bit + 1).map_or(total, |b| b * bitmap.chunk).min(end);
+                        continue;
+                    }
+                }
                 cursor = match self.resync_piece(members, cursor, end, now) {
                     Ok(next) => next,
                     Err(error) => {
@@ -803,6 +972,8 @@ impl Array {
             self.sync_cursor = None;
             self.flush(members, now)?;
             self.dirty = false;
+            self.partial = false;
+            self.bitmap_clear(members, now)?;
             return Ok(Step::Done(Job::Resync));
         }
         if let Some(cursor) = self.rebuild.as_ref().map(|r| r.cursor) {
@@ -943,6 +1114,14 @@ impl Array {
             }
             self.events += 1;
             let (events, resync, faulty, faulty_count) = (self.events, self.resync, self.faulty, self.faulty_count);
+            // md keeps the bitmap's event count level with the array's: an older one is distrusted at assembly
+            let head = self.bitmap.as_mut().map(|bitmap| {
+                bitmap.set_events(events);
+                let mut head = [0u8; SECTOR];
+                head.copy_from_slice(&bitmap.data[..SECTOR]);
+                head
+            });
+            let bitmap_offset = self.bitmap_offset;
             let mut failed = [false; MAX_MEMBERS];
             for (index, slot) in self.slots[..self.used].iter_mut().flatten().enumerate() {
                 let block = &mut slot.block;
@@ -956,8 +1135,12 @@ impl Array {
                     }
                 }
                 let sectors = superblock::reseal(block).div_ceil(SECTOR);
+                let bitmap_ok = head.as_ref().is_none_or(|head| {
+                    let at = (slot.super_sector as i64 + bitmap_offset as i64) as u64;
+                    members.write(slot.member, at, head).is_ok()
+                });
                 let written = members.write(slot.member, slot.super_sector, &block[..sectors * SECTOR]);
-                failed[index] = written.is_err() || members.flush(slot.member).is_err();
+                failed[index] = !bitmap_ok || written.is_err() || members.flush(slot.member).is_err();
             }
             if !self.drop_failed(&failed) {
                 return Ok(());
@@ -1874,5 +2057,110 @@ mod tests {
         array.start(&mut rw, 1).unwrap();
         rw.disks.0[2] = vec![0; DISK_SECTORS * SECTOR];
         assert_eq!(Array::assemble(&mut rw, None).err(), Some(Error::Degraded));
+    }
+    /// Gives every member of `rw` an internal bitmap of 64-sector chunks, all clear, at 8 sectors past its superblock.
+    fn add_bitmap(rw: &mut Rw, sync_size: u64, events: u64) {
+        for disk in rw.disks.0.iter_mut() {
+            let block = &mut disk[8 * SECTOR..8 * SECTOR + READ_BYTES];
+            block[96..100].copy_from_slice(&8u32.to_le_bytes());
+            superblock::set_feature_map(block, superblock::FEATURE_BITMAP);
+            superblock::reseal(block);
+            let head = &mut disk[16 * SECTOR..17 * SECTOR];
+            head[0..4].copy_from_slice(&crate::bitmap::MAGIC.to_le_bytes());
+            head[4..8].copy_from_slice(&4u32.to_le_bytes());
+            head[8..24].fill(7);
+            head[24..32].copy_from_slice(&events.to_le_bytes());
+            head[40..48].copy_from_slice(&sync_size.to_le_bytes());
+            head[52..56].copy_from_slice(&(64 * SECTOR as u32).to_le_bytes());
+            head[256..].fill(0);
+            // the bits past the last chunk stay set, as mdadm leaves them
+            let nbits = sync_size.div_ceil(64) as usize;
+            if nbits % 8 != 0 {
+                head[256 + nbits / 8] = !((1u8 << (nbits % 8)) - 1);
+            }
+        }
+    }
+
+    fn bits_on(rw: &Rw, member: usize) -> u16 {
+        let at = 16 * SECTOR + 256;
+        u16::from_le_bytes(rw.disks.0[member][at..at + 2].try_into().unwrap())
+    }
+
+    fn bitmap_events(rw: &Rw, member: usize) -> u64 {
+        u64::from_le_bytes(rw.disks.0[member][16 * SECTOR + 24..16 * SECTOR + 32].try_into().unwrap())
+    }
+
+    #[test]
+    fn a_bitmap_narrows_the_resync_to_the_chunks_written() {
+        let mut rw = pair();
+        add_bitmap(&mut rw, ARRAY_SECTORS, 10);
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        assert!(!array.dirty());
+        array.start(&mut rw, 1).unwrap();
+        assert_eq!(super_of(&mut rw, 0).events, 10, "start leaves the superblocks in step");
+        array.write(&mut rw, 100, &[9; SECTOR], 2).unwrap();
+        assert_eq!((bits_on(&rw, 0), bits_on(&rw, 1)), (0b10, 0b10), "chunk 1 is marked before the data goes");
+        drop(array);
+
+        // the crash left chunk 1 (marked) and chunk 5 (not) differing between the copies
+        let at = |chunk: usize| (DATA_OFFSET as usize + chunk * 64 + 3) * SECTOR;
+        rw.disks.0[1][at(1)] ^= 0xff;
+        rw.disks.0[1][at(5)] ^= 0xff;
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        assert!(array.dirty());
+        array.start(&mut rw, 3).unwrap();
+        array.begin_resync().unwrap();
+        assert_eq!(run_job(&mut array, &mut rw), Job::Resync);
+        assert_eq!(rw.disks.0[0][at(1)], rw.disks.0[1][at(1)]);
+        assert_ne!(rw.disks.0[0][at(5)], rw.disks.0[1][at(5)], "an unmarked chunk is not looked at");
+        assert_eq!((bits_on(&rw, 0), bits_on(&rw, 1)), (0, 0));
+        assert!(!array.dirty());
+    }
+
+    #[test]
+    fn the_bitmap_clears_at_stop_and_a_stale_one_is_refused() {
+        let mut rw = pair();
+        add_bitmap(&mut rw, ARRAY_SECTORS, 10);
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        array.start(&mut rw, 1).unwrap();
+        array.write(&mut rw, 0, &[1; SECTOR], 2).unwrap();
+        array.write(&mut rw, 1000, &[1; SECTOR], 2).unwrap();
+        assert_eq!(bits_on(&rw, 1), 0b1000_0000_0000_0001);
+        array.stop(&mut rw, 5).unwrap();
+        assert_eq!(bits_on(&rw, 0), 0);
+        let events = super_of(&mut rw, 0).events;
+        assert_eq!((bitmap_events(&rw, 0), bitmap_events(&rw, 1)), (events, events), "the bitmap's events follow the array's");
+        assert!(!Array::assemble(&mut rw, None).unwrap().dirty());
+
+        let mut stale = pair();
+        add_bitmap(&mut stale, ARRAY_SECTORS, 9);
+        assert_eq!(Array::assemble(&mut stale, None).unwrap().start(&mut stale, 1), Err(Error::Unsupported));
+        let mut wrong_size = pair();
+        add_bitmap(&mut wrong_size, ARRAY_SECTORS - 64, 10);
+        assert_eq!(Array::assemble(&mut wrong_size, None).unwrap().start(&mut wrong_size, 1), Err(Error::Unsupported));
+    }
+
+    #[test]
+    fn a_raid5_bitmap_counts_member_sectors() {
+        let mut rw = striped(LEVEL_RAID5, 2, 3);
+        add_bitmap(&mut rw, ARRAY_SECTORS, 10);
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        array.start(&mut rw, 1).unwrap();
+        // row 9 (16 array sectors per row) is member sectors 72..80: chunk 1
+        array.write(&mut rw, 9 * 16 + 2, &[5; SECTOR], 2).unwrap();
+        assert_eq!(bits_on(&rw, 2), 0b10);
+        drop(array);
+        // data of row 9 and of the unmarked row 40 (chunk 5) changed without their parity
+        rw.disks.0[0][(DATA_OFFSET as usize + 75) * SECTOR] ^= 1;
+        rw.disks.0[0][(DATA_OFFSET as usize + 323) * SECTOR] ^= 1;
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        assert!(array.dirty());
+        array.start(&mut rw, 3).unwrap();
+        array.begin_resync().unwrap();
+        run_job(&mut array, &mut rw);
+        let xor_at = |rw: &Rw, sector: usize| (0..3).fold(0u8, |acc, m| acc ^ rw.disks.0[m][(DATA_OFFSET as usize + sector) * SECTOR]);
+        assert_eq!(xor_at(&rw, 75), 0);
+        assert_ne!(xor_at(&rw, 323), 0);
+        assert_eq!(bits_on(&rw, 1), 0);
     }
 }
