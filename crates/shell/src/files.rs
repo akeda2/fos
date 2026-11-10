@@ -17,6 +17,7 @@ pub static COMMANDS: &[Command] = &[
     Command::new("stat", "stat NAME", "shows the owner, permission bits and size of a file or folder on an ext volume (extN/NAME or @LABEL/NAME).", stat),
     Command::new("chmod", "chmod [-R] MODE NAME", "sets the permission bits (octal, e.g. 755) of a file or folder on an ext volume; -R includes everything inside a folder.", chmod),
     Command::new("chown", "chown [-R] UID[:GID] NAME", "sets the owner (and group) of a file or folder on an ext volume; :GID alone changes only the group; -R includes everything inside a folder.", chown),
+    Command::new("kernel", "kernel [list|use embedded|mf [force]]", "lists the kernels kept on the boot volume (kernel.embedded, kernel.mf) and the one running; `use` writes the other into the inactive slot and restarts into it (the loader falls back if it does not come up).", crate::kernel::run),
 ];
 
 fn rwx(mode: u32) -> [u8; 9] {

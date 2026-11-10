@@ -462,6 +462,32 @@ def content_states(iface: str, host: Host, tape_dir: Path, names: list[str]) -> 
     return states
 
 
+def kernel_files(source: Path | None) -> dict[str, Path]:
+    """The kernels `kernel use` can switch to, as the boot volume keeps them: `kernel.embedded` and `kernel.mf`."""
+    found = {}
+    for name, arch in (("kernel.embedded", "x86_64"), ("kernel.mf", "x86_64-mf")):
+        kernel = source_files(source, arch)[0]
+        if kernel:
+            found[name] = kernel
+    return found
+
+
+def kernel_states(iface: str, host: Host, built: dict[str, Path], files: dict[str, int], content: bool) -> dict[str, str]:
+    """name -> "same" | "differs" | "missing" for the stored kernels, by SHA-256 (sizes when asked or the host cannot hash)."""
+    import tempfile
+    names = sorted(built)
+    sized = {n: ("same" if files.get(n) == built[n].stat().st_size else "differs") if n in files else "missing" for n in names}
+    if not content:
+        return sized
+    with tempfile.TemporaryDirectory() as scratch:
+        for name in names:
+            (Path(scratch) / name).symlink_to(built[name].resolve())
+        states = content_states(iface, host, Path(scratch), [n for n in names if n in files])
+    if not states or set(states.values()) == {"unsupported"}:
+        return sized
+    return {n: states.get(n, "missing") for n in names}
+
+
 def stop_running_tape(iface: str, host: Host) -> None:
     """A lone ESC through term net ends a foreground tape (ptp from a start file, say); harmless at an idle prompt."""
     if host.serial:
@@ -562,12 +588,17 @@ def plan_host(iface: str, args, host: Host, parallel: bool):
     note = abi_note(abi)
     if note and tape_list and not new_kernel:
         say(host, f"{host.name}: WARNING {note}; deploy the kernel too (tapes may not run)", parallel)
-    return host, new_kernel, tape_list, stopped, arch
+    stored: list[str] = []
+    if not args.tapes_only and not args.no_store_kernels and not host.serial and arch.startswith("x86_64"):
+        built = kernel_files(Path(args.source) if args.source else None)
+        states = kernel_states(iface, host, built, files, args.content)
+        stored = [n for n in sorted(built) if states[n] != "same"]
+    return host, new_kernel, tape_list, stopped, arch, stored
 
 
 def deploy_host(iface: str, args, plan, parallel: bool) -> int:
     """Carries out one host's plan; returns the number of failures."""
-    host, new_kernel, tape_list, stopped, arch = plan
+    host, new_kernel, tape_list, stopped, arch, stored = plan
     failed = 0
 
     def print(text: str) -> None:
@@ -648,6 +679,18 @@ def deploy_host(iface: str, args, plan, parallel: bool) -> int:
             bad = [n for n, state in states.items() if state != "same"]
             print("  verified by content (SHA-256)" if not bad else f"  not identical to the build after copy: {' '.join(bad)}")
         failed += bool(bad)
+    if stored:
+        built = kernel_files(Path(args.source) if args.source else None)
+        for name in stored:
+            ok = subprocess.run([sys.executable, str(TOOLS / "foscopy.py"), "--iface", iface, "--mac", mac,
+                                 str(built[name]), f":disk1/{name}"], capture_output=True, text=True).returncode == 0
+            print(f"  stored {name} (for `kernel use`): {'ok' if ok else 'FAILED'}")
+            failed += not ok
+        sizes = parse_ls(ask_host(iface, host, ["ls"]))
+        bad = [n for n, state in kernel_states(iface, host, built, sizes, args.content).items() if n in stored and state != "same"]
+        if bad:
+            print(f"  stored kernels not identical to the build after copy: {' '.join(bad)}")
+            failed += 1
     restart = host_setting(host, "restart")
     if stopped and restart and host.serial:
         host.serial.ask([restart])
@@ -666,10 +709,11 @@ def cmd_deploy(args, iface: str) -> int:
     parallel = not args.serial and not args.one_by_one
     plans = [p for p in run_hosts(lambda host: plan_host(iface, args, host, parallel), hosts, parallel) if p]
     print("Plan:")
-    for host, new_kernel, tape_list, _, arch in plans:
-        what = (["kernel"] if new_kernel else []) + [f"{len(tape_list)} tape(s): {' '.join(tape_list)}"] * bool(tape_list)
+    for host, new_kernel, tape_list, _, arch, stored in plans:
+        what = (["kernel"] if new_kernel else []) + [f"{len(tape_list)} tape(s): {' '.join(tape_list)}"] * bool(tape_list) \
+            + [f"store {' '.join(stored)}"] * bool(stored)
         print(f"  {host.name:<14} {arch:<8} {'; '.join(what) or 'up to date'}")
-    todo = [p for p in plans if p[1] or p[2]]
+    todo = [p for p in plans if p[1] or p[2] or p[5]]
     if not todo:
         return 0
     if args.dry_run:
@@ -776,6 +820,8 @@ def main() -> int:
                         help="which x86_64 kernel to put on the host: the one it runs now (default), or switch to the embedded or the server (mf) kernel")
     deploy.add_argument("--kernel-only", action="store_true")
     deploy.add_argument("--tapes-only", action="store_true")
+    deploy.add_argument("--no-store-kernels", action="store_true",
+                        help="do not keep kernel.embedded and kernel.mf on the host (x86_64 Ethernet hosts get both, for `kernel use`)")
     deploy.add_argument("--force-kernel", action="store_true", help="push the kernel even if the size matches")
     deploy.add_argument("--add-missing", action="store_true", help="also install tapes the host does not have")
     deploy.add_argument("--one-by-one", action="store_true", help="handle the hosts one after the other (default: all at once over Ethernet)")

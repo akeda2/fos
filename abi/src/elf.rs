@@ -92,6 +92,16 @@ pub fn section<'a>(image: &'a [u8], name: &str) -> Option<&'a [u8]> {
     None
 }
 
+/// `e_machine` of the kernels: x86-64 and AArch64.
+pub const MACHINE_X86_64: u16 = 0x3e;
+pub const MACHINE_AARCH64: u16 = 0xb7;
+
+/// Whether `image` is a kernel ELF of the given flavour (`"embedded"` or `"mf"`, the `.fos_flavour` section the kernels carry) for
+/// `machine`: what `kernel use` checks before it writes an image into a slot.
+pub fn is_kernel(image: &[u8], flavour: &str, machine: u16) -> bool {
+    headers(image).is_ok() && read_u16(image, 18) == machine && section(image, ".fos_flavour") == Some(flavour.as_bytes())
+}
+
 /// How many bytes of memory the image needs (its highest segment end, page-rounded).
 pub fn span(image: &[u8]) -> Result<usize, Error> {
     let headers = headers(image)?;
