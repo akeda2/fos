@@ -135,6 +135,25 @@ impl Host for KernelHost {
         crate::term::run_script_file(reference, name, arguments)
     }
 
+    fn kernel_flavour(&mut self) -> &'static str {
+        "embedded"
+    }
+
+    fn install_kernel(&mut self, image: &mut [u8], length: usize, flavour: &str) -> Result<u8, &'static str> {
+        #[cfg(target_arch = "x86_64")]
+        let machine = fosfor_abi::elf::MACHINE_X86_64;
+        #[cfg(target_arch = "aarch64")]
+        let machine = fosfor_abi::elf::MACHINE_AARCH64;
+        if !fosfor_abi::elf::is_kernel(&image[..length], flavour, machine) {
+            return Err("that file is not a kernel of that flavour for this machine");
+        }
+        crate::kup_serial::install(image, length)
+    }
+
+    fn restart(&mut self) {
+        crate::shellcmds::restart();
+    }
+
     fn run_tape(&mut self, line: &str) {
         #[cfg(target_arch = "x86_64")]
         crate::tape::run_named(line);

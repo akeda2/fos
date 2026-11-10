@@ -8,6 +8,7 @@ use core::fmt;
 pub mod complete;
 pub mod files;
 pub mod glob;
+pub mod kernel;
 
 /// Writes formatted text to the console.
 #[macro_export]
@@ -139,6 +140,17 @@ pub trait Host {
     }
     /// Loads and runs the tape named in `line` (`NAME ARGS [&N]`, `PATH/NAME ARGS`), as `run` does.
     fn run_tape(&mut self, line: &str);
+    /// Which kernel this is, `"embedded"` or `"mf"` (the `.fos_flavour` of its ELF); empty if it cannot switch kernels.
+    fn kernel_flavour(&mut self) -> &'static str {
+        ""
+    }
+    /// Checks that `image[..length]` is a kernel of `flavour` for this machine and writes it to the inactive A/B slot as the
+    /// pending one (the loader gives it one try and falls back). `image` is a whole number of sectors. Returns the slot.
+    fn install_kernel(&mut self, _image: &mut [u8], _length: usize, _flavour: &str) -> Result<u8, &'static str> {
+        Err("this kernel cannot switch kernels")
+    }
+    /// Restarts the machine (after `install_kernel`).
+    fn restart(&mut self) {}
     /// Extra `help` lines for commands a port implements outside the tables (printed after the table's names).
     fn help_extra(&mut self) {}
     /// Prints the usage of a command the port implements outside the tables; false if it is none.

@@ -64,6 +64,23 @@ pub fn update_metadata(change: impl FnOnce(&mut SlotMetadata)) -> Option<SlotMet
     write_metadata(&metadata).then_some(metadata)
 }
 
+/// Writes `image` (a whole number of sectors, `length` of them used) to the inactive slot and makes it the pending one, as KUP
+/// does. The caller holds the disk lock. Returns the slot.
+pub fn install(image: &[u8], length: usize) -> Result<u8, &'static str> {
+    let (Some(metadata), Some((disk, payload))) = (read_metadata(), payload()) else { return Err("the slot metadata is not available") };
+    let slot = 1 - (metadata.active_slot & 1);
+    let sectors = length.div_ceil(512);
+    block::write(disk, payload + fosfor_abi::slot_start(u64::from(slot)), &image[..sectors * 512]).map_err(|_| "writing the slot failed")?;
+    update_metadata(|m| {
+        m.pending_slot = Some(slot);
+        m.attempted = false;
+        m.confirmed = false;
+        m.slot_sectors[usize::from(slot)] = sectors as u16;
+    })
+    .ok_or("updating the slot metadata failed")?;
+    Ok(slot)
+}
+
 /// The kernel's milestone: it can be used now. Confirms a pending kernel (promoting it at once), clears the crash count and
 /// marks the boot as up.
 pub fn confirm_boot() {

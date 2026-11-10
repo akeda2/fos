@@ -300,7 +300,7 @@ fn dmesg() {
     crate::dmesg();
 }
 
-fn restart() {
+pub(crate) fn restart() {
     crate::println!("Resetting.");
     #[cfg(target_arch = "x86_64")]
     {

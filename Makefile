@@ -181,7 +181,7 @@ kernel:
 
 # The server kernel (kernel-mf/, docs/big-kernel.md): same loaders, same image layout, its own crate.
 KERNEL_MF_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel-mf
-.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-sessions test-mf-tape test-mf-usb test-mf-debug test-mf-audio test-mf-netfs test-mf-tapesync test-mf-gpio test-mf-bios-video test-mf-shell test-mf-kup-serial test-mf-smbmount test-mf-smbd test-mf-sshd test-mf-sshmount test-mf-ssh test-mf-httpd test-mf-vnic test-mf-service test-mf-cp test-mf-abibad test-mf-threads test-mf-md
+.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-sessions test-mf-tape test-mf-usb test-mf-debug test-mf-audio test-mf-netfs test-mf-tapesync test-mf-gpio test-mf-bios-video test-mf-shell test-mf-kup-serial test-mf-smbmount test-mf-smbd test-mf-sshd test-mf-sshmount test-mf-ssh test-mf-httpd test-mf-vnic test-mf-service test-mf-cp test-mf-kernel-switch test-mf-abibad test-mf-threads test-mf-md
 kernel-mf:
 	cd kernel-mf && cargo +nightly-2026-09-13 build --release
 
@@ -241,6 +241,13 @@ test-mf-cp: image-mf image
 	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_MF_ELF) --output $(BUILD)/fosfor-mf/fosfor-cp.img \
 		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin --file ebb=$(BUILD)/fosfor/tapes/ebb
 	FOSFOR_IMAGE_MF=$(BUILD)/fosfor-mf/fosfor-cp.img python3 tools/test_mf_cp.py
+
+# `kernel use` switches between the embedded and the server kernel kept on the boot volume (two reboots through the A/B slots).
+test-mf-kernel-switch: image-mf image
+	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_MF_ELF) --output $(BUILD)/fosfor-mf/fosfor-kswitch.img \
+		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin --fosfs 4 \
+		--file kernel.embedded=$(KERNEL_ELF) --file kernel.mf=$(KERNEL_MF_ELF)
+	FOSFOR_IMAGE_MF=$(BUILD)/fosfor-mf/fosfor-kswitch.img python3 tools/test_mf_kernel_switch.py
 
 test-mf-md: image-mf image
 	LOADER_EFI=$(LOADER_EFI) KERNEL_MF_ELF=$(KERNEL_MF_ELF) BIOS_STAGE1=$(BIOS_OUT)/stage1.bin BIOS_STAGE2=$(BIOS_OUT)/stage2.bin python3 tools/test_mf_md.py
@@ -347,10 +354,11 @@ stamp-tapes: tapes
 # A bootable disk image: GPT + a FAT32 EFI System Partition with \EFI\BOOT\BOOTX64.EFI
 # and a payload partition with the kernel in slot 0 (tools/build_image.py;
 # standard library only).
-image: loader kernel tapes stamp-tapes $(BIOS_STAGES)
+image: loader kernel kernel-mf tapes stamp-tapes $(BIOS_STAGES)
 	mkdir -p $(OUT)
 	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_ELF) --output $(IMAGE) \
-		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin $(TAPE_FILES)
+		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin $(TAPE_FILES) \
+		--file kernel.embedded=$(KERNEL_ELF) --file kernel.mf=$(KERNEL_MF_ELF)
 
 # aarch64 (Raspberry Pi 4, QEMU virt; docs/aarch64-plan.md): the loader and kernel for the other CPU, in their own image.
 A64_LOADER := $(CARGO_TARGET_DIR)/aarch64-unknown-uefi/release/fosfor-loader.efi

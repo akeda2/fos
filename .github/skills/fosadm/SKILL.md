@@ -23,7 +23,7 @@ python3 tools/fosadm.py --iface IFACE deploy [HOST...]      # plan, then kernel 
 ```
 `deploy` handles the hosts in parallel over Ethernet (lines are tagged `[host]`; `--one-by-one` restores the old order).
 `deploy` options: `--dry-run` (plan only), `-y` (no prompt), `--tapes-only`, `--kernel-only`,
-`--sizes` (plan by size, not SHA-256; deploy compares content by default), `--force-kernel` (size matches but push anyway), `--kernel current|embedded|mf` (x86_64 only: switch the host to the embedded or the server kernel; default keeps the one it runs), `--add-missing`, `--from DIR` (a release folder).
+`--sizes` (plan by size, not SHA-256; deploy compares content by default), `--force-kernel` (size matches but push anyway), `--kernel current|embedded|mf` (x86_64 only: switch the host to the embedded or the server kernel; default keeps the one it runs), `--no-store-kernels`, `--add-missing`, `--from DIR` (a release folder).
 Also: `run HOST cmd...`, `put HOST FILE [NAME] [--disk N]`, `shell HOST`, `bootcode HOST [--update]`.
 
 Order: `status` (or `deploy --dry-run`) first, show the plan to the user, then deploy.
@@ -58,6 +58,10 @@ python3 tools/fosadm.py --serial PORT [--fast 921600] put serial FILE [NAME]
 - A server-kernel (mf) host, recognised by `version` ("server kernel (mf)"), gets `fosfor-kernel-mf` (`make image-mf` or `make kernel-mf` first); status shows `x86_64-mf`. Tapes are the x86 ones.
 - aarch64 hosts (Pi 4) get `build/fosfor-aarch64/tapes` and their own kernel automatically.
 - After a tape ABI change redeploy every tape.
+
+- **Both kernels are stored:** an x86_64 Ethernet host also gets `kernel.embedded` and `kernel.mf` on its boot volume (compared by SHA-256,
+  listed in the plan as `store ...`), so the shell's `kernel use embedded|mf` can switch without the host tools. The kernel it runs and
+  `--kernel` work as before; `--no-store-kernels` and `--tapes-only` skip it; serial hosts never store them.
 
 ## Traps
 - A running tape blocks the shell, foscopy and delays KUP's reboot. If a host is stuck, send a lone ESC through term net:

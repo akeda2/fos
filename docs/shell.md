@@ -17,6 +17,11 @@ One shell core for every port: `crates/shell` (`fosfor_shell`, `no_std`, host-te
   (`disk2`, `@LABEL`, a mount point). The prompt shows it (`fos @rackdata/www-root> `); a new remote
   terminal session starts at the root. Tapes and scripts are still found as typed. A mount point may be an ext volume
   (`mount rackdata @rackdata`, or `fstab`).
+- **Switching kernels**: `kernel [list]` shows the kernels kept on the boot volume (`kernel.embedded`, `kernel.mf`) and the running one;
+  `kernel use embedded|mf [force]` checks the file (ELF, `.fos_flavour` section, machine type), writes it to the inactive A/B slot as the
+  pending one, as KUP does, and restarts. The loader gives it one try and falls back to the old kernel if it never reaches its milestone.
+  `make image` puts both kernels on the volume; on a machine `fosadm put HOST build/cargo-target/x86_64-fos-kernel/release/fosfor-kernel
+  kernel.embedded` (and `fosfor-kernel-mf` as `kernel.mf`) keeps them current. `make test-mf-kernel-switch`.
 - **A port** keeps only what is hardware- or port-specific, as its own table (Pi: `kernel/src/shell.rs`), plus what to do with
   a line that is no command (tape names, `PATH/NAME`).
 

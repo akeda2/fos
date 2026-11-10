@@ -387,6 +387,24 @@ impl Host for MfHost {
         }
     }
 
+    fn kernel_flavour(&mut self) -> &'static str {
+        "mf"
+    }
+
+    fn install_kernel(&mut self, image: &mut [u8], length: usize, flavour: &str) -> Result<u8, &'static str> {
+        if !fosfor_abi::elf::is_kernel(&image[..length], flavour, fosfor_abi::elf::MACHINE_X86_64) {
+            return Err("that file is not a kernel of that flavour for this machine");
+        }
+        image[length..].fill(0);
+        let _disk = tapefs::lock();
+        crate::slots::install(image, length)
+    }
+
+    fn restart(&mut self) {
+        crate::slots::mark_clean_stop();
+        crate::power::reset();
+    }
+
     fn compare_stream(&mut self, a: &str, b: &str) -> Option<Result<bool, FsError>> {
         use kernel_core::tape_vfs;
         let (a, b) = (pin(a), pin(b));
