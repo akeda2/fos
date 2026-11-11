@@ -100,6 +100,20 @@ pub fn interrupts_restore(was_enabled: bool) {
     }
 }
 
+pub fn interrupts_enabled() -> bool {
+    let flags: u64;
+    unsafe { core::arch::asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags)) };
+    flags & (1 << 9) != 0
+}
+
+/// `cycles` a CPU may wait for one lock before it is called a deadlock (several seconds on any real CPU: a lock is held for microseconds).
+pub const DEADLOCK_CYCLES: u64 = 20_000_000_000;
+
+/// The free-running counter the spin-lock deadlock detector uses.
+pub fn cycles() -> u64 {
+    rdtsc()
+}
+
 pub fn rdtsc() -> u64 {
     unsafe { core::arch::x86_64::_rdtsc() }
 }

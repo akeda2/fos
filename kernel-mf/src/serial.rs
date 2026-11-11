@@ -2,12 +2,15 @@
 
 use core::fmt::{self, Write};
 
+#[cfg(target_arch = "x86_64")]
 const COM1: u16 = 0x3f8;
 
+#[cfg(target_arch = "x86_64")]
 fn outb(port: u16, value: u8) {
     unsafe { core::arch::asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack)) };
 }
 
+#[cfg(target_arch = "x86_64")]
 fn inb(port: u16) -> u8 {
     let value: u8;
     unsafe { core::arch::asm!("in al, dx", in("dx") port, out("al") value, options(nomem, nostack)) };
@@ -16,9 +19,15 @@ fn inb(port: u16) -> u8 {
 
 /// False on a machine with no UART at COM1 (most laptops): the line status register then reads 0xff, which would look like
 /// "data received" forever, so reads return nothing and writes skip the transmit wait.
+#[cfg(target_arch = "x86_64")]
 static PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
+/// The PL011 is set up by the firmware and `kmain` finds its address; nothing to do here.
+#[cfg(target_arch = "aarch64")]
+pub fn init() {}
+
 /// 115200 baud, 8N1, FIFOs on: what the rest of this project assumes.
+#[cfg(target_arch = "x86_64")]
 pub fn init() {
     // The scratch register holds any byte on a real UART and reads back 0xff (or the bus float) on an empty port.
     outb(COM1 + 7, 0x5a);
@@ -50,7 +59,7 @@ const CAPTURE_LIMIT: usize = 1 << 20;
 
 /// Starts catching what the calling thread prints (nested captures stack; a tape runs on its own thread and is not caught).
 pub fn capture_begin(tee: bool) {
-    let owner = crate::sched::current_id();
+    let owner = current_thread();
     CAPTURES.lock().push(Capture { owner, data: alloc::vec::Vec::new(), tee });
     CAPTURING.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
@@ -62,12 +71,23 @@ pub fn capture_end() -> alloc::vec::Vec<u8> {
     captured.map(|capture| capture.data).unwrap_or_default()
 }
 
+#[cfg(target_arch = "x86_64")]
+fn current_thread() -> usize {
+    crate::sched::current_id()
+}
+
+/// There is no scheduler on aarch64 yet: one thread.
+#[cfg(target_arch = "aarch64")]
+fn current_thread() -> usize {
+    0
+}
+
 /// True when the text was taken by a capture and must not be printed.
 fn captured(text: &str) -> bool {
     if CAPTURING.load(core::sync::atomic::Ordering::Relaxed) == 0 {
         return false;
     }
-    let me = crate::sched::current_id();
+    let me = current_thread();
     let mut captures = CAPTURES.lock();
     let Some(capture) = captures.iter_mut().rev().find(|capture| capture.owner == me) else { return false };
     let room = if capture.tee { 4096 } else { CAPTURE_LIMIT }.saturating_sub(capture.data.len());
@@ -83,8 +103,11 @@ impl Write for Serial {
             return Ok(());
         }
         crate::log::push(text);
-        crate::net::relay(text);
-        crate::fb::write_str(text);
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::net::relay(text);
+            crate::fb::write_str(text);
+        }
         for byte in text.bytes() {
             if byte == b'\n' {
                 put(b'\r');
@@ -95,6 +118,7 @@ impl Write for Serial {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn put(byte: u8) {
     if !PRESENT.load(core::sync::atomic::Ordering::Relaxed) {
         return;
@@ -108,14 +132,25 @@ fn put(byte: u8) {
     outb(COM1, byte);
 }
 
+#[cfg(target_arch = "aarch64")]
+fn put(byte: u8) {
+    crate::pl011::write_raw(byte);
+}
+
 /// One byte to COM1 only (not the screen or the network terminal): the serial update protocols answer through this.
 pub fn write_byte(byte: u8) {
     put(byte);
 }
 
 /// The next received byte, if the UART has one (LSR bit 0).
+#[cfg(target_arch = "x86_64")]
 pub fn read_byte() -> Option<u8> {
     (PRESENT.load(core::sync::atomic::Ordering::Relaxed) && inb(COM1 + 5) & 1 != 0).then(|| inb(COM1))
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn read_byte() -> Option<u8> {
+    crate::pl011::read_byte()
 }
 
 /// One line at a time: CPUs print whole lines, never interleaved characters.

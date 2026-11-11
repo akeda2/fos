@@ -9,8 +9,6 @@ use core::ops::{Deref, DerefMut};
 use core::panic::Location;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
-/// TSC cycles a CPU may wait for one lock before it is called a deadlock (several seconds on any real CPU: a lock is held for microseconds).
-const DEADLOCK_CYCLES: u64 = 20_000_000_000;
 static REPORTED: AtomicBool = AtomicBool::new(false);
 
 pub struct SpinLock<T> {
@@ -27,12 +25,6 @@ pub struct Guard<'a, T> {
     interrupts_were_on: bool,
 }
 
-fn interrupts_on() -> bool {
-    let flags: u64;
-    unsafe { core::arch::asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags)) };
-    flags & (1 << 9) != 0
-}
-
 impl<T> SpinLock<T> {
     pub const fn new(value: T) -> Self {
         SpinLock { next: AtomicU32::new(0), serving: AtomicU32::new(0), holder: AtomicPtr::new(core::ptr::null_mut()), data: UnsafeCell::new(value) }
@@ -40,8 +32,8 @@ impl<T> SpinLock<T> {
 
     #[track_caller]
     pub fn lock(&self) -> Guard<'_, T> {
-        let interrupts_were_on = interrupts_on();
-        unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+        let interrupts_were_on = crate::cpu::interrupts_enabled();
+        crate::cpu::interrupts_disable();
         let ticket = self.next.fetch_add(1, Ordering::Relaxed);
         if self.serving.load(Ordering::Acquire) != ticket {
             let mut spins = 0u32;
@@ -50,10 +42,10 @@ impl<T> SpinLock<T> {
                 core::hint::spin_loop();
                 spins = spins.wrapping_add(1);
                 if spins & 0xffff == 0 {
-                    let now = crate::cpu::rdtsc();
+                    let now = crate::cpu::cycles();
                     if since == 0 {
                         since = now;
-                    } else if now.wrapping_sub(since) > DEADLOCK_CYCLES {
+                    } else if now.wrapping_sub(since) > crate::cpu::DEADLOCK_CYCLES {
                         deadlock(Location::caller(), self.holder.load(Ordering::Relaxed));
                     }
                 }
@@ -89,7 +81,7 @@ impl<T> Drop for Guard<'_, T> {
     fn drop(&mut self) {
         self.lock.serving.fetch_add(1, Ordering::Release);
         if self.interrupts_were_on {
-            unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+            crate::cpu::interrupts_enable();
         }
     }
 }

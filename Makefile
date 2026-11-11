@@ -397,6 +397,18 @@ image-pi4: image-aarch64
 test-aarch64-boot: image-aarch64
 	python3 tools/test_aarch64_boot.py
 
+# The server kernel (mf) on aarch64: same loader and image layout, its own kernel (work in progress, no tapes).
+A64_KERNEL_MF := $(CARGO_TARGET_DIR)/aarch64-unknown-none-softfloat/release/fosfor-kernel-mf
+.PHONY: kernel-mf-aarch64 image-mf-aarch64 test-mf-aarch64-boot
+test-mf-aarch64-boot: image-mf-aarch64
+	python3 tools/test_mf_aarch64_boot.py
+kernel-mf-aarch64:
+	cd kernel-mf && cargo +nightly-2026-09-13 build --release --target aarch64-unknown-none-softfloat
+
+image-mf-aarch64: loader-aarch64 kernel-mf-aarch64
+	mkdir -p $(BUILD)/fosfor-mf-aarch64
+	python3 tools/build_image.py --arch aarch64 --loader $(A64_LOADER) --kernel $(A64_KERNEL_MF) --output $(BUILD)/fosfor-mf-aarch64/fosfor.img
+
 # Serial KUP: a kernel pushed over the console UART is tried from the other slot and confirmed.
 test-aarch64-kup: image-aarch64
 	python3 tools/test_kup_serial.py aarch64
