@@ -42,14 +42,33 @@ pub mod cpu {
     }
 }
 
-/// Identity map: a physical address is the pointer to it.
-pub mod vm {
-    pub const DIRECT_BASE: u64 = 0;
-    pub fn direct(physical: u64) -> u64 {
-        physical
+pub mod context;
+pub mod mmu;
+mod percpu_arch;
+pub use context::{end_wake_interrupt, prepare_stack, send_wake_ipi, switch};
+pub use percpu_arch::{CpuArch, activate, cpu_pointer, set_kernel_stack};
+
+/// FP/SIMD state of user threads: none yet (kernel threads are soft-float and EL0 comes later).
+pub mod fpu {
+    pub struct Area;
+    impl Area {
+        pub fn new() -> Option<Area> {
+            None
+        }
+        pub fn save(&self) {}
+        pub fn restore(&self) {}
     }
-    pub fn root() -> u64 {
-        crate::paging::root()
+}
+
+/// The GIC's broadcast TLB invalidates reach every CPU, so a "shootdown" is just the invalidate.
+pub mod tlb {
+    use core::sync::atomic::AtomicU64;
+    pub static SHOOTDOWNS: AtomicU64 = AtomicU64::new(0);
+    pub fn shootdown(start: u64, pages: u64) {
+        for page in 0..pages {
+            crate::paging::invalidate_page(start + page * 4096);
+        }
+        SHOOTDOWNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -65,7 +84,10 @@ pub mod memory {
 
 /// The crash machinery (record, reset) is not ported yet: a fatal exception is reported and the CPU parks.
 pub mod crash {
-    pub fn tick() {}
+    /// The timer interrupt's hook (after its acknowledgement): the scheduler's tick.
+    pub fn tick() {
+        crate::sched::tick();
+    }
     pub fn fatal(_kind: u64, _esr: u64, _elr: u64, _far: u64, _always_reset: bool) -> ! {
         crate::println!("*** fatal exception: halting.");
         crate::halt()
@@ -177,6 +199,7 @@ pub fn init_memory(_machine: &boot::Machine, info: &BootInfo) -> &'static BootIn
 }
 
 pub fn init_interrupts() {
+    activate(0);
     gic::init();
 }
 

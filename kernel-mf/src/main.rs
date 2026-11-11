@@ -15,6 +15,9 @@ mod boot;
 mod heap;
 mod log;
 mod pmm;
+mod percpu;
+mod sched;
+mod selftest;
 mod sync;
 mod vm;
 // the shared files of the embedded kernel name the macro by path
@@ -29,7 +32,6 @@ macro_rules! until_ported {
 until_ported! {
     mod session;
     mod process;
-    mod sched;
     mod tapeapi;
     mod threads;
     mod tapeaudio;
@@ -70,9 +72,7 @@ until_ported! {
     mod bootcode;
     mod slots;
     mod block;
-    mod percpu;
     mod storage;
-    mod selftest;
     use kernel_core::{fatvol, fosfs, gpt};
     use kernel_core::pci;
 }
@@ -201,8 +201,10 @@ fn boot_services(info: &BootInfo, century: u8) -> ! {
 /// become portable (see `until_ported!`).
 #[cfg(target_arch = "aarch64")]
 fn boot_services(_info: &BootInfo, _century: u8) -> ! {
-    println!("kernel-mf: slice 8 reached the end of boot; parking (the scheduler, drivers and shell are not ported yet).");
+    selftest::run();
+    println!("kernel-mf: slice 8 reached the end of boot; parking (drivers and the shell are not ported yet).");
     loop {
+        sched::yield_now();
         arch::wait_for_interrupt();
     }
 }

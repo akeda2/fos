@@ -296,6 +296,36 @@ pub fn root() -> u64 {
     unsafe { ROOT }
 }
 
+/// Maps one 4 KiB page of RAM at a virtual `address` that is not its physical address (the server kernel's thread stacks):
+/// normal memory, read/write, never executable. The caller serialises; other CPUs see it once their walkers next miss.
+pub fn map_kernel_page(address: u64, physical: u64) {
+    let root = unsafe { ROOT };
+    let table = level3(root, address);
+    unsafe { entry(table, (address >> 12) & 0x1ff).write(physical | RAM_DATA | PAGE_DESC) };
+    unsafe { core::arch::asm!("dsb ishst", "isb", options(nostack)) };
+}
+
+/// Unmaps what `map_kernel_page` mapped and flushes the page from every CPU's TLB (the invalidate is broadcast in the
+/// inner-shareable domain, so no inter-processor interrupt is needed).
+pub fn unmap_kernel_page(address: u64) {
+    let root = unsafe { ROOT };
+    let table = level3(root, address);
+    unsafe { entry(table, (address >> 12) & 0x1ff).write(0) };
+    invalidate_page(address);
+}
+
+/// Drops the TLB entries for the page at `address` on all CPUs.
+pub fn invalidate_page(address: u64) {
+    let operand = address >> 12;
+    unsafe {
+        if current_el() == 2 {
+            core::arch::asm!("dsb ishst", "tlbi vae2is, {}", "dsb ish", "isb", in(reg) operand, options(nostack));
+        } else {
+            core::arch::asm!("dsb ishst", "tlbi vaae1is, {}", "dsb ish", "isb", in(reg) operand, options(nostack));
+        }
+    }
+}
+
 /// Maps `length` bytes of device registers at physical `address` (identity), device-nGnRnE and never executable.
 pub fn map_device(address: u64, length: u64) {
     let root = unsafe { ROOT };

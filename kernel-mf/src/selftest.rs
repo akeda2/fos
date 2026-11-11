@@ -179,5 +179,7 @@ pub fn run() {
     sched_preempt_selftest();
     sched_smp_selftest();
     sched_wake_selftest();
+    // Ring 3 / EL0 processes exist on x86 only so far.
+    #[cfg(target_arch = "x86_64")]
     crate::user_test::run();
 }

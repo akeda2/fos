@@ -98,7 +98,11 @@ pub fn dispatch() {
         IRQ_TICKS.fetch_add(1, Ordering::Relaxed);
         let reload = RELOAD.load(Ordering::Relaxed);
         unsafe { core::arch::asm!("msr cntp_tval_el0, {}", in(reg) reload, options(nomem, nostack)) };
+        // The timer is acknowledged before `crash::tick` because the server kernel's scheduler may switch threads inside it: the
+        // interrupt must not stay active until this thread runs again (IRQs are masked for the whole handler).
+        write(&GICC, 0x010, iar);
         crate::crash::tick();
+        return;
     }
     let handler = HANDLERS.get(intid as usize).map_or(0, |h| h.load(Ordering::Acquire));
     if handler != 0 {

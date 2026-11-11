@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Server kernel (mf) on aarch64, first slice: the aarch64 UEFI loader (QEMU virt + AAVMF) starts it, and it reaches
-the end of boot: physical memory, the MMU page tables, the heap self-test and GIC timer ticks.
+the end of boot: physical memory, the MMU page tables, the heap self-test, GIC timer ticks and the scheduler self-tests.
 Run `make test-mf-aarch64-boot`."""
 import os
 import re
@@ -21,6 +21,8 @@ def main() -> None:
     base.check("Heap: self-test passed" in text, "the heap works", text)
     ticks = re.search(r"(\d+) timer interrupts", text)
     base.check(ticks is not None and 8 <= int(ticks.group(1)) <= 12, "the GIC delivers timer ticks", text)
+    base.check("Scheduler: 3 kernel threads took 15 interleaved steps" in text and " 0 stack frame(s) not returned" in text, "kernel threads switch and their stacks are returned", text)
+    base.check("preemption ok" in text and "sleep ok" in text and "mutex ok" in text, "timer preemption, sleep and mutex work", text)
     base.check("reached the end of boot" in text, "boot reaches its end", text)
 
 
