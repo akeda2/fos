@@ -27,7 +27,7 @@ pub const TOPICS: &[Topic] = &[
     t("mem", "System", "mem", "Free and managed RAM."),
     t("memmap", "System", "memmap", "The firmware memory map the kernel was given."),
     t("bootinfo", "System", "bootinfo", "What the boot loader passed to the kernel."),
-    t("pci", "System", "pci", "List the PCI devices."),
+    t("pci", "System", "pci [BB:DD.F [probe|diff]]", "List the PCI devices; with an address dump its config space and BARs (probe reads them, diff shows which change)."),
     t("uptime", "System", "uptime", "Seconds since boot."),
     t("date", "System", "date | date set YYYY-MM-DD HH:MM[:SS]", "Show or set the clock (local time, kept in the RTC)."),
     t("dmesg", "System", "dmesg", "The kernel's boot and event log."),

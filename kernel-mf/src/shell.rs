@@ -4,6 +4,7 @@
 
 use crate::{apic, block, clock, net, percpu, pmm, power, sched, slots};
 use kernel_core::netdump::Mac;
+use alloc::vec::Vec;
 use kernel_core::{nic, pci};
 
 const PROMPT: &str = "fos> ";
@@ -251,6 +252,7 @@ pub fn run_command(line: &str) {
             let stats = pmm::stats();
             println!("{} MiB free of {} MiB managed.", stats.free * pmm::FRAME >> 20, stats.managed * pmm::FRAME >> 20);
         }
+        "pci" if words.clone().next().is_some() => pci_inspect(words),
         "pci" => {
             for device in pci::devices() {
                 println!("{:02x}:{:02x}.{} {:04x}:{:04x} {}", device.bus, device.device, device.function, device.vendor, device.id, pci::class_name(device.class, device.subclass));
@@ -573,5 +575,89 @@ pub fn run_tape(name: &str, args: &str) {
             }
         },
         Err(error) => println!("tape: `{name}` cannot start: {error:?}."),
+    }
+}
+
+/// `pci BB:DD.F [probe|diff]`: the config space and BARs of one device; `probe` also switches on memory decoding and reads
+/// the first 256 bytes of every memory BAR (reads only, nothing is written to the device), for finding out what an
+/// undocumented card is.
+fn pci_inspect<'a>(mut words: impl Iterator<Item = &'a str>) {
+    let address = words.next().unwrap_or("");
+    let parse = || -> Option<(u8, u8, u8)> {
+        let (bus, rest) = address.split_once(':')?;
+        let (device, function) = rest.split_once('.')?;
+        Some((u8::from_str_radix(bus, 16).ok()?, u8::from_str_radix(device, 16).ok()?, function.parse().ok()?))
+    };
+    let Some((bus, slot, function)) = parse() else { return println!("usage: pci [BB:DD.F [probe]]") };
+    let Some(device) = pci::devices().find(|d| (d.bus, d.device, d.function) == (bus, slot, function)) else {
+        return println!("no such device");
+    };
+    println!("{:04x}:{:04x} class {:02x}{:02x}{:02x} rev {:02x}", device.vendor, device.id, device.class, device.subclass, device.interface, device.revision);
+    println!("subsystem {:04x}:{:04x}, command/status {:08x}, interrupt line {}", pci::read32(bus, slot, function, 0x2e) & 0xffff, pci::read32(bus, slot, function, 0x2c) >> 16, device.read32(4), device.interrupt_line());
+    for row in 0..8u8 {
+        let mut line = alloc::format!("{:02x}:", row * 16);
+        for column in 0..4 {
+            line += &alloc::format!(" {:08x}", device.read32(row * 16 + column * 4));
+        }
+        println!("{}", line);
+    }
+    let mode = words.next();
+    let probe = mode == Some("probe");
+    if mode == Some("diff") {
+        return pci_diff(&device);
+    }
+    if probe {
+        device.write32(4, device.read32(4) & 0xffff | 2);
+    }
+    for index in 0..6u8 {
+        if let Some(port) = device.io_bar(index) {
+            println!("BAR{} I/O port {:#x}", index, port);
+        } else if let Some((base, size)) = device.memory_bar(index) {
+            println!("BAR{} memory {:#x}, {} bytes", index, base, size);
+            if probe {
+                crate::vm::map_device(base, size.min(0x100));
+                let registers = crate::vm::direct(base) as *const u32;
+                for row in 0..16 {
+                    let mut line = alloc::format!("  {:03x}:", row * 16);
+                    for column in 0..4 {
+                        line += &alloc::format!(" {:08x}", unsafe { registers.add(row * 4 + column).read_volatile() });
+                    }
+                    println!("{}", line);
+                }
+            }
+        }
+    }
+}
+
+/// Reads the first 4 KiB of every memory BAR of `device` eight times, a short busy-wait apart, and prints the dwords
+/// that changed (first value, last value, number of distinct values): live counters and status bits show up, constants
+/// and RAM do not. Reads only; memory decoding is switched on for it.
+fn pci_diff(device: &pci::Device) {
+    device.write32(4, device.read32(4) & 0xffff | 2);
+    for index in 0..6u8 {
+        let Some((base, size)) = device.memory_bar(index) else { continue };
+        let length = size.min(4096) as usize;
+        crate::vm::map_device(base, length as u64);
+        let registers = crate::vm::direct(base) as *const u32;
+        let mut samples: Vec<Vec<u32>> = Vec::new();
+        for _ in 0..8 {
+            samples.push((0..length / 4).map(|i| unsafe { registers.add(i).read_volatile() }).collect());
+            for _ in 0..2_000_000 {
+                core::hint::spin_loop();
+            }
+        }
+        let mut changed = 0;
+        for i in 0..length / 4 {
+            let mut distinct: Vec<u32> = samples.iter().map(|sample| sample[i]).collect();
+            distinct.sort_unstable();
+            distinct.dedup();
+            if distinct.len() > 1 {
+                changed += 1;
+                if changed <= 24 {
+                    println!("BAR{} {:03x}: {:08x} -> {:08x}, {} values", index, i * 4, samples[0][i], samples[7][i], distinct.len());
+                }
+            }
+        }
+        println!("BAR{}: {} of {} dwords changed", index, changed, length / 4);
     }
 }
