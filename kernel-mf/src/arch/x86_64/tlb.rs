@@ -54,7 +54,7 @@ pub fn shootdown(start: u64, pages: u64) {
         let target = percpu::get(cpu);
         if target.online.load(Ordering::Acquire) {
             PENDING[cpu].store(true, Ordering::Release);
-            apic::send_ipi(target.apic_id, 0x4000 | u32::from(TLB_VECTOR));
+            apic::send_ipi(target.arch.apic_id, 0x4000 | u32::from(TLB_VECTOR));
         }
     }
     for cpu in (0..count).filter(|&c| c != me) {

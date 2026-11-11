@@ -136,14 +136,7 @@ pub fn user_access<R>(f: impl FnOnce() -> R) -> R {
     result
 }
 
-/// How a process ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum How {
-    Exited(i64),
-    /// Killed by a CPU exception: vector and, for a page fault, the address.
-    Fault(u64, u64),
-    Killed,
-}
+pub use crate::sched::How;
 
 #[derive(Clone, Copy)]
 pub struct Outcome {

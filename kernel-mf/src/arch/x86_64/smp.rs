@@ -107,14 +107,14 @@ fn write_word(offset: u64, value: u64) {
 
 extern "sysv64" fn ap_main(index: u64) -> ! {
     let cpu = percpu::get(index as usize);
-    percpu::activate(index as usize, cpu.ist_top);
+    crate::arch::activate(index as usize, cpu.arch.ist_top);
     idt::load();
     crate::process::init_cpu();
     crate::fpu::init_cpu();
     cpu::pat_init();
     apic::enable_this_cpu();
     apic::start_local_timer();
-    cpu.apic_id = apic::id();
+    cpu.arch.apic_id = apic::id();
     cpu.online.store(true, Ordering::Release);
     cpu::interrupts_enable();
     crate::sched::idle_loop()
@@ -133,7 +133,7 @@ pub fn start_all(machine: &Machine, madt: &acpi::Madt, srat: Option<&acpi::Srat>
     let node_of = |apic_id: u32| srat.map_or(0, |s| s.node_of_cpu(apic_id));
 
     let boot = percpu::get(0);
-    boot.apic_id = boot_id;
+    boot.arch.apic_id = boot_id;
     boot.node = node_of(boot_id);
     boot.online.store(true, Ordering::Release);
 
@@ -165,9 +165,9 @@ pub fn start_all(machine: &Machine, madt: &acpi::Madt, srat: Option<&acpi::Srat>
             continue;
         };
         let cpu = percpu::get(index);
-        cpu.apic_id = apic_id;
+        cpu.arch.apic_id = apic_id;
         cpu.node = node;
-        cpu.ist_top = vm::direct(ist) + IST_FRAMES * 4096;
+        cpu.arch.ist_top = vm::direct(ist) + IST_FRAMES * 4096;
         write_word(data, vm::root());
         write_word(data + 8, vm::direct(stack) + STACK_FRAMES * 4096);
         write_word(data + 16, index as u64);

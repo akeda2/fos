@@ -22,7 +22,8 @@ struct Gdtr {
 
 /// 0: null. 1 (0x08): 64-bit kernel code. 2 (0x10): kernel data. 3 (0x18): user data (DPL 3). 4 (0x20): user 64-bit code (DPL 3).
 /// 5-6 (0x28): the TSS descriptor, 16 bytes, filled in at run time because it holds the TSS's address.
-#[repr(C, align(16))]
+// Alignment 8 on purpose: `CpuArch` (which holds this) must sit at `gs:8` in `Cpu`, see `percpu.rs`.
+#[repr(C)]
 pub struct CpuGdt {
     gdt: [u64; 7],
     tss: Tss,

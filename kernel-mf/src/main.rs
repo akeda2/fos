@@ -16,6 +16,7 @@ mod heap;
 mod log;
 mod pmm;
 mod sync;
+mod vm;
 // the shared files of the embedded kernel name the macro by path
 pub(crate) use serial::println;
 
@@ -71,7 +72,6 @@ until_ported! {
     mod block;
     mod percpu;
     mod storage;
-    mod vm;
     mod selftest;
     use kernel_core::{fatvol, fosfs, gpt};
     use kernel_core::pci;

@@ -5,10 +5,13 @@
 
 pub mod acpi;
 pub mod apic;
+pub mod context;
 pub mod cpu;
 pub mod fpu;
 pub mod gdt;
 pub mod idt;
+pub mod mmu;
+mod percpu_arch;
 pub mod pci_config;
 pub mod platform;
 pub mod smp;
@@ -16,6 +19,8 @@ pub mod tlb;
 pub mod trap;
 
 pub use apic::ioapic;
+pub use context::{WAKE_VECTOR, end_wake_interrupt, prepare_stack, send_wake_ipi, switch};
+pub use percpu_arch::{CpuArch, activate, cpu_pointer, interrupt_target, set_kernel_stack};
 
 use crate::{boot, percpu, pmm, power, process, vm};
 use fosfor_abi::BootInfo;
@@ -143,7 +148,7 @@ pub fn init_memory(machine: &boot::Machine, _info: &BootInfo) -> &'static BootIn
 
 /// Per-CPU state, the IDT, and a breakpoint that must come back through it.
 pub fn init_interrupts() {
-    percpu::activate(0, &raw const __ist_top as u64);
+    activate(0, &raw const __ist_top as u64);
     idt::build();
     idt::load();
     process::init_cpu();
@@ -197,7 +202,7 @@ pub fn init_machine(machine: &boot::Machine) -> u8 {
     println!("SMP: {} CPU(s) online ({} application processor(s) started, {} failed).", 1 + smp.started, smp.started, smp.failed);
     for index in 0..percpu::count() {
         let cpu = percpu::get(index);
-        println!("CPU {index}: APIC id {}, NUMA node {}, {}.", cpu.apic_id, cpu.node, if index == 0 { "boot processor" } else { "application processor" });
+        println!("CPU {index}: APIC id {}, NUMA node {}, {}.", cpu.arch.apic_id, cpu.node, if index == 0 { "boot processor" } else { "application processor" });
     }
     cpu::interrupts_enable();
     let start = apic::ticks();

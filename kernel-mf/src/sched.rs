@@ -19,9 +19,17 @@ use crate::percpu::MAX_CPUS;
 use crate::sync::SpinLock;
 use crate::{cpu, pmm, vm};
 
+/// How a process ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum How {
+    Exited(i64),
+    /// Killed by a CPU exception: vector and, for a page fault, the address.
+    Fault(u64, u64),
+    Killed,
+}
+
 /// Pages per kernel thread stack (512 KiB: a tape's audio call and the ext4 volume code run on it, and both keep large buffers on the stack).
 const STACK_PAGES: u64 = 128;
-pub const WAKE_VECTOR: u8 = 0x42;
 
 const NO_THREAD: usize = usize::MAX;
 
@@ -90,7 +98,7 @@ struct Proc {
     live: usize,
     heap_next: u64,
     written: u64,
-    outcome: Option<crate::process::How>,
+    outcome: Option<How>,
 }
 
 /// Threads one process may have at a time (each holds a kernel stack of 256 KiB).
@@ -101,43 +109,6 @@ const JOIN_KEY: usize = 1 << 63;
 static NEXT_TID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 static SCHED: SpinLock<Option<Sched>> = SpinLock::new(None);
-
-core::arch::global_asm!(
-    r#"
-    .text
-    .global switch_context
-switch_context:
-    push rbp
-    push rbx
-    push r12
-    push r13
-    push r14
-    push r15
-    mov [rdi], rsp
-    mov rsp, rsi
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-    pop rbp
-    ret
-
-    .global thread_trampoline
-thread_trampoline:
-    call sched_finish_switch
-    sti
-    mov rdi, r13
-    call r12
-    call sched_exit
-    ud2
-"#
-);
-
-unsafe extern "C" {
-    fn switch_context(old_rsp: *mut u64, new_rsp: u64);
-    fn thread_trampoline();
-}
 
 fn this_cpu() -> usize {
     crate::percpu::this().index as usize
@@ -224,13 +195,7 @@ fn spawn_on(name: &str, entry: extern "C" fn(usize), argument: usize, pinned: Op
         return None;
     };
     let top = vm::map_stack(slot, STACK_PAGES, frames);
-    // The first switch pops r15, r14, r13, r12, rbx, rbp and returns into the trampoline, which calls `entry(argument)`.
-    // 72 bytes below the (16-aligned) top leaves rsp 16-aligned at the trampoline's `call`.
-    let start = top - 72;
-    let words: [u64; 7] = [0, 0, argument as u64, entry as usize as u64, 0, 0, thread_trampoline as usize as u64];
-    for (index, word) in words.iter().enumerate() {
-        unsafe { ((start + index as u64 * 8) as *mut u64).write(*word) };
-    }
+    let start = crate::arch::prepare_stack(top, entry, argument);
     let mut bytes = [0u8; 16];
     let take = name.len().min(15);
     bytes[..take].copy_from_slice(&name.as_bytes()[..take]);
@@ -264,13 +229,13 @@ fn idle_cpu_for(sched: &Sched, pinned: Option<usize>, taken: u128) -> u128 {
 /// after the scheduler lock is released.
 fn kick(mask: u128) {
     for cpu in (0..crate::percpu::count()).filter(|&c| mask & (1 << c) != 0) {
-        crate::apic::send_ipi(crate::percpu::get(cpu).apic_id, 0x4000 | u32::from(WAKE_VECTOR));
+        crate::arch::send_wake_ipi(cpu);
     }
 }
 
 /// The wake IPI's handler: the CPU leaves `hlt` and looks at the run queue.
 pub fn wake_interrupt() {
-    crate::apic::end_of_interrupt();
+    crate::arch::end_wake_interrupt();
     switch_away(true);
 }
 
@@ -340,7 +305,7 @@ fn switch_away(requeue: bool) {
         sched.switches += 1;
         (old_pointer, new_rsp)
     };
-    unsafe { switch_context(old, new) };
+    unsafe { crate::arch::switch(old, new) };
     finish_switch();
 }
 
@@ -387,7 +352,7 @@ fn load_context(cpu_index: usize) {
         }
     };
     if top != 0 {
-        crate::percpu::set_kernel_stack(top);
+        crate::arch::set_kernel_stack(top);
     }
     let guard = SCHED.lock();
     if let Some(area) = guard.as_ref().and_then(|s| s.threads.get(s.current[cpu_index])).and_then(|t| t.as_ref()).and_then(|t| t.fpu.as_ref()) {
@@ -395,8 +360,8 @@ fn load_context(cpu_index: usize) {
     }
     drop(guard);
     let wanted = if root == 0 { vm::root() } else { root };
-    if cpu::read_cr3() != wanted {
-        cpu::write_cr3(wanted);
+    if vm::current_root() != wanted {
+        vm::load_root(wanted);
     }
 }
 
@@ -419,7 +384,7 @@ fn with_current<R>(f: impl FnOnce(&mut Thread) -> R) -> Option<R> {
 pub fn detach_root() -> u64 {
     let flags = cpu::interrupts_save_and_disable();
     let root = with_current(|t| core::mem::replace(&mut t.root, 0)).unwrap_or(0);
-    cpu::write_cr3(vm::root());
+    vm::load_root(vm::root());
     cpu::interrupts_restore(flags);
     root
 }
@@ -431,7 +396,7 @@ pub fn kill(pid: u64) {
 
 /// The process as a whole is ending: records `how` (first caller wins, so a sibling flagged below cannot report "killed" first)
 /// and flags the other threads of the calling thread's process.
-pub fn end_process(how: crate::process::How) {
+pub fn end_process(how: How) {
     let me = current_id();
     let pid = current_pid();
     if let Some(process) = SCHED.lock().as_mut().and_then(|s| s.procs.iter_mut().find(|p| p.pid == pid)) {
@@ -465,7 +430,7 @@ fn kill_where(matches: impl Fn(&Thread) -> bool) {
 
 /// One thread of the calling process is done. Records `how` (when given) if the process has no outcome yet; the last thread out gets
 /// `Some((outcome, console bytes written))` and the process is forgotten.
-pub fn leave_process(how: Option<crate::process::How>) -> Option<(crate::process::How, u64)> {
+pub fn leave_process(how: Option<How>) -> Option<(How, u64)> {
     let pid = current_pid();
     let mut guard = SCHED.lock();
     let sched = guard.as_mut()?;
@@ -476,7 +441,7 @@ pub fn leave_process(how: Option<crate::process::How>) -> Option<(crate::process
     }
     process.live -= 1;
     if process.live == 0 {
-        let outcome = process.outcome.unwrap_or(crate::process::How::Exited(0));
+        let outcome = process.outcome.unwrap_or(How::Exited(0));
         let written = process.written;
         sched.procs.swap_remove(index);
         Some((outcome, written))
@@ -605,7 +570,7 @@ extern "C" fn sched_exit() -> ! {
 
 /// Called from the timer interrupt (after the end-of-interrupt): wakes sleepers that are due and ends the running thread's slice.
 pub fn tick() {
-    let now = crate::apic::ticks();
+    let now = crate::arch::ticks();
     let mut mask = 0;
     {
         let mut guard = SCHED.lock();
@@ -639,7 +604,7 @@ pub fn tick() {
 pub fn idle_loop() -> ! {
     loop {
         if !ready() {
-            unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)) };
+            crate::arch::wait_for_interrupt();
             continue;
         }
         let flags = cpu::interrupts_save_and_disable();
@@ -649,7 +614,7 @@ pub fn idle_loop() -> ! {
     }
     loop {
         yield_now();
-        unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)) };
+        crate::arch::wait_for_interrupt();
     }
 }
 
@@ -684,7 +649,7 @@ pub fn sleep_ticks(ticks: u64) {
         let current = sched.current[this_cpu()];
         let thread = sched.threads[current].as_mut().unwrap();
         thread.state = State::Sleeping;
-        thread.wake_at = crate::apic::ticks() + ticks;
+        thread.wake_at = crate::arch::ticks() + ticks;
     }
     switch_away(false);
     cpu::interrupts_restore(flags);

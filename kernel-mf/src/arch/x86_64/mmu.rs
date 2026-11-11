@@ -1,0 +1,536 @@
+//! The server kernel's page tables.
+//!
+//! The firmware leaves the CPU on an identity map of its own. This replaces it with:
+//!
+//! * a **direct map** of every RAM-like region at `DIRECT_BASE + physical` (read/write, no-execute, 2 MiB pages where a whole
+//!   aligned chunk is RAM, 4 KiB at the edges). All physical memory the kernel touches after the switch goes through
+//!   `direct()`: the frame bitmap, page tables, the heap, DMA buffers;
+//! * the **kernel image**, still at its load address (it is a position-independent image the loader placed, so it keeps its
+//!   identity mapping for now), in 4 KiB pages with W^X per section: text R-X, read-only data R--, data/bss/stack RW-. Page 0
+//!   and the guard pages under the stacks are unmapped, so a null pointer or a stack overflow faults at once;
+//! * the framebuffer (or the BIOS text screen), uncached and no-execute, through the direct map.
+//!
+//! Everything else in the lower half stays empty: it is for per-process address spaces (slice 8). Not mapped on purpose: UEFI
+//! runtime services (this kernel does not call the firmware yet), loader data (copied out by `boot::Machine`), device
+//! registers (mapped on demand by their drivers, later).
+
+use crate::boot::Machine;
+use crate::pmm;
+use fosfor_abi::RAM_LIKE_TYPES;
+
+pub const PAGE: u64 = 4096;
+const HUGE: u64 = 2 * 1024 * 1024;
+
+/// Start of the direct map: the first address of the upper half of the 48-bit space.
+pub const DIRECT_BASE: u64 = 0xffff_8000_0000_0000;
+
+const PRESENT: u64 = 1 << 0;
+const WRITABLE: u64 = 1 << 1;
+const WRITE_THROUGH: u64 = 1 << 3;
+const CACHE_DISABLE: u64 = 1 << 4;
+const USER: u64 = 1 << 2;
+const LARGE: u64 = 1 << 7;
+/// In a 4 KiB entry bit 7 is the PAT bit (PAT index 4 with PCD and PWT clear).
+const PAT_4K: u64 = 1 << 7;
+const NO_EXECUTE: u64 = 1 << 63;
+const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
+
+const VGA_TEXT_BASE: u64 = 0xb8000;
+
+unsafe extern "C" {
+    static __kernel_start: u8;
+    static __kernel_end: u8;
+    static __text_start: u8;
+    static __text_end: u8;
+    static __rodata_start: u8;
+    static __rodata_end: u8;
+    static __stack_guard: u8;
+    static __stack_bottom: u8;
+    static __ist_guard: u8;
+}
+
+/// What `direct()` adds: 0 until the tables are loaded (the firmware's identity map), `DIRECT_BASE` afterwards.
+static mut OFFSET: u64 = 0;
+static mut ROOT: u64 = 0;
+
+/// The virtual address through which physical memory `physical` is reached right now.
+pub fn direct(physical: u64) -> u64 {
+    physical + unsafe { OFFSET }
+}
+
+pub fn root() -> u64 {
+    unsafe { ROOT }
+}
+
+struct Layout {
+    image: (u64, u64),
+    text: (u64, u64),
+    rodata: (u64, u64),
+    stack_guard: u64,
+    stack_bottom: u64,
+    ist_guard: u64,
+}
+
+fn layout() -> Layout {
+    Layout {
+        image: (&raw const __kernel_start as u64, &raw const __kernel_end as u64),
+        text: (&raw const __text_start as u64, &raw const __text_end as u64),
+        rodata: (&raw const __rodata_start as u64, &raw const __rodata_end as u64),
+        stack_guard: &raw const __stack_guard as u64,
+        stack_bottom: &raw const __stack_bottom as u64,
+        ist_guard: &raw const __ist_guard as u64,
+    }
+}
+
+fn new_table() -> *mut u64 {
+    match pmm::allocate(1, None) {
+        Some(address) => direct(address) as *mut u64,
+        None => {
+            println!("vm: out of frames for page tables: stopping.");
+            crate::halt();
+        }
+    }
+}
+
+/// The table an entry points to, creating it if empty. Intermediate entries are permissive; the leaf decides.
+unsafe fn next_level(entry: *mut u64) -> *mut u64 {
+    unsafe {
+        if *entry & PRESENT == 0 {
+            let table = new_table() as u64 - direct(0);
+            *entry = table | PRESENT | WRITABLE;
+        }
+        direct(*entry & ADDRESS_MASK) as *mut u64
+    }
+}
+
+unsafe fn directory_entry(root: u64, address: u64) -> *mut u64 {
+    unsafe {
+        let pml4 = direct(root) as *mut u64;
+        let pdpt = next_level(pml4.add(((address >> 39) & 511) as usize));
+        let directory = next_level(pdpt.add(((address >> 30) & 511) as usize));
+        directory.add(((address >> 21) & 511) as usize)
+    }
+}
+
+fn map_huge(root: u64, virtual_address: u64, physical: u64, flags: u64) {
+    unsafe { *directory_entry(root, virtual_address) = physical | flags | PRESENT | LARGE };
+}
+
+fn map_page(root: u64, virtual_address: u64, physical: u64, flags: u64) {
+    unsafe {
+        let entry = directory_entry(root, virtual_address);
+        assert!(*entry & LARGE == 0, "a 4 KiB mapping inside a 2 MiB page");
+        let table = next_level(entry);
+        *table.add(((virtual_address >> 12) & 511) as usize) = physical | flags | PRESENT;
+    }
+}
+
+/// Maps physical `[start, end)` at `DIRECT_BASE + physical`.
+fn map_direct(root: u64, start: u64, end: u64, flags: u64) {
+    let mut address = start & !(PAGE - 1);
+    while address < end {
+        if address % HUGE == 0 && address + HUGE <= end {
+            map_huge(root, DIRECT_BASE + address, address, flags);
+            address += HUGE;
+        } else {
+            map_page(root, DIRECT_BASE + address, address, flags);
+            address += PAGE;
+        }
+    }
+}
+
+/// Maps the kernel image page by page with W^X permissions; unmapped pages are the guards.
+fn map_image(root: u64, layout: &Layout) {
+    let mut address = layout.image.0.max(PAGE) & !(PAGE - 1);
+    while address < layout.image.1 {
+        let guard = (layout.stack_guard..layout.stack_bottom).contains(&address) || (layout.ist_guard..layout.ist_guard + PAGE).contains(&address);
+        if !guard {
+            let flags = if (layout.text.0..layout.text.1).contains(&address) {
+                0 // read + execute
+            } else if (layout.rodata.0..layout.rodata.1).contains(&address) {
+                NO_EXECUTE
+            } else {
+                WRITABLE | NO_EXECUTE
+            };
+            map_page(root, address, address, flags);
+        }
+        address += PAGE;
+    }
+}
+
+/// A mapped user page: its frame and whether user mode may use it, and write it.
+#[derive(Clone, Copy)]
+pub struct UserPage {
+    pub physical: u64,
+    pub user: bool,
+    pub writable: bool,
+}
+
+/// What a lookup found: the physical address and the page's permissions.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Mapping {
+    pub physical: u64,
+    pub writable: bool,
+    pub executable: bool,
+}
+
+/// The direct-map address of physical `address` when that page is mapped writable (RAM the firmware map listed), else None.
+pub fn writable_physical(address: u64) -> Option<u64> {
+    let virtual_address = direct(address);
+    translate(virtual_address).filter(|mapping| mapping.writable).map(|_| virtual_address)
+}
+
+/// Walks the kernel's tables for `address`.
+pub fn translate(address: u64) -> Option<Mapping> {
+    let root = root();
+    if root == 0 {
+        return None;
+    }
+    unsafe {
+        let read = |table: u64, index: u64| (direct(table & ADDRESS_MASK) as *const u64).add(index as usize).read();
+        let pml4 = read(root, (address >> 39) & 511);
+        if pml4 & PRESENT == 0 {
+            return None;
+        }
+        let pdpt = read(pml4, (address >> 30) & 511);
+        if pdpt & PRESENT == 0 {
+            return None;
+        }
+        let directory = read(pdpt, (address >> 21) & 511);
+        if directory & PRESENT == 0 {
+            return None;
+        }
+        let (leaf, offset) = if directory & LARGE != 0 {
+            (directory, address & (HUGE - 1))
+        } else {
+            let entry = read(directory, (address >> 12) & 511);
+            if entry & PRESENT == 0 {
+                return None;
+            }
+            (entry, address & (PAGE - 1))
+        };
+        let physical = if directory & LARGE != 0 { (leaf & ADDRESS_MASK & !(HUGE - 1)) + offset } else { (leaf & ADDRESS_MASK) + offset };
+        Some(Mapping { physical, writable: leaf & WRITABLE != 0, executable: leaf & NO_EXECUTE == 0 })
+    }
+}
+
+/// The permissions of the kernel's own image, for the boot self-check: (text, rodata, data, stack guard, null page).
+pub fn check_image() -> bool {
+    let l = layout();
+    let text = translate(l.text.0);
+    let rodata = translate(l.rodata.0);
+    let data = translate(l.rodata.1);
+    let ok = matches!(text, Some(m) if !m.writable && m.executable)
+        && matches!(rodata, Some(m) if !m.writable && !m.executable)
+        && matches!(data, Some(m) if m.writable && !m.executable)
+        && translate(l.stack_guard).is_none()
+        && translate(l.ist_guard).is_none()
+        && translate(0).is_none();
+    ok
+}
+
+/// Makes sure `[physical, physical + length)` is reachable through the direct map, mapping any missing 4 KiB page uncached
+/// and no-execute: for firmware tables the memory map does not describe, and for device registers (the APICs, later PCI BARs).
+/// A page that is already mapped (RAM) is left as it is.
+pub fn map_device(physical: u64, length: u64) {
+    let root = root();
+    let mut page = physical & !(PAGE - 1);
+    while page < physical + length.max(1) {
+        if translate(direct(page)).is_none() {
+            map_page(root, DIRECT_BASE + page, page, WRITABLE | NO_EXECUTE | CACHE_DISABLE | WRITE_THROUGH);
+            unsafe { core::arch::asm!("invlpg [{}]", in(reg) DIRECT_BASE + page, options(nostack, preserves_flags)) };
+        }
+        page += PAGE;
+    }
+}
+
+/// Like `map_device` for a framebuffer: write-combining (PAT entry 4, set by `cpu::pat_init`) so pixel writes are merged
+/// into bursts instead of one uncached store each. An existing 4 KiB mapping of the range is replaced; a range inside a 2 MiB
+/// mapping first splits it into 4 KiB pages with the same flags. False (and plain uncached) without a PAT.
+/// Turns the 2 MiB mapping containing `address` (if it is one) into 512 4 KiB pages with the same flags, so one page can differ.
+/// Only for use before other CPUs run: there is no shootdown.
+unsafe fn split_huge(root: u64, address: u64) {
+    unsafe {
+        let entry = directory_entry(root, address);
+        if *entry & (PRESENT | LARGE) != PRESENT | LARGE {
+            return;
+        }
+        let base = *entry & ADDRESS_MASK & !(HUGE - 1);
+        let flags = *entry & !ADDRESS_MASK & !LARGE;
+        let table = new_table() as *mut u64;
+        for index in 0..512u64 {
+            *table.add(index as usize) = (base + index * PAGE) | flags;
+        }
+        *entry = (table as u64 - direct(0)) | PRESENT | WRITABLE;
+        let first = address & !(HUGE - 1);
+        for index in 0..512u64 {
+            core::arch::asm!("invlpg [{}]", in(reg) first + index * PAGE, options(nostack, preserves_flags));
+        }
+    }
+}
+
+pub fn map_write_combining(physical: u64, length: u64) -> bool {
+    if !crate::cpu::pat_init() {
+        map_device(physical, length);
+        return false;
+    }
+    let root = root();
+    let mut page = physical & !(PAGE - 1);
+    while page < physical + length.max(1) {
+        let address = DIRECT_BASE + page;
+        unsafe { split_huge(root, address) };
+        map_page(root, address, page, WRITABLE | NO_EXECUTE | PAT_4K);
+        unsafe { core::arch::asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags)) };
+        page += PAGE;
+    }
+    true
+}
+
+/// Maps the 4 KiB page at `address` onto itself, executable and writable, in the kernel's tables: the AP trampoline runs
+/// here with paging switched on before it can jump to kernel code. Boot CPU only, while the APs are being started.
+pub fn identity_map_page(address: u64) {
+    map_page(root(), address, address, WRITABLE);
+    unsafe { core::arch::asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags)) };
+}
+
+/// Removes that mapping again. Another CPU may keep a stale TLB entry for it; nothing executes there any more.
+pub fn identity_unmap_page(address: u64) {
+    unsafe {
+        let entry = directory_entry(root(), address);
+        if *entry & PRESENT != 0 && *entry & LARGE == 0 {
+            let table = direct(*entry & ADDRESS_MASK) as *mut u64;
+            *table.add(((address >> 12) & 511) as usize) = 0;
+        }
+        core::arch::asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
+    }
+}
+
+/// Where kernel thread stacks live: far above the direct map, 4 KiB pages (`vm::map_stack` lays out the slots).
+pub const STACK_REGION: u64 = 0xffff_c000_0000_0000;
+
+/// Maps one kernel page (a thread stack page): read/write, no-execute.
+pub fn map_kernel_page(address: u64, physical: u64) {
+    map_page(root(), address, physical, WRITABLE | NO_EXECUTE);
+}
+
+/// Unmaps one kernel page. Other CPUs may keep stale TLB entries: the caller runs `tlb::shootdown` before the frame is reused.
+pub fn unmap_kernel_page(address: u64) {
+    identity_unmap_page(address);
+}
+
+/// Loads a page-table root on this CPU (CR3).
+pub fn load_root(root: u64) {
+    crate::cpu::write_cr3(root);
+}
+
+pub fn current_root() -> u64 {
+    crate::cpu::read_cr3()
+}
+
+/// What a faulting address is, for the exception report.
+pub fn describe(address: u64) -> &'static str {
+    let l = layout();
+    if address < PAGE {
+        "the null page (a null pointer was used)"
+    } else if (l.stack_guard..l.stack_bottom).contains(&address) {
+        "the kernel stack guard page (stack overflow)"
+    } else if (l.ist_guard..l.ist_guard + PAGE).contains(&address) {
+        "the double-fault stack guard page"
+    } else if (l.text.0..l.text.1).contains(&address) {
+        "kernel code (read-only)"
+    } else if (l.rodata.0..l.rodata.1).contains(&address) {
+        "kernel read-only data"
+    } else if (l.image.0..l.image.1).contains(&address) {
+        "kernel data"
+    } else if address >= STACK_REGION {
+        "a kernel thread stack region (an unmapped page there is a guard page: stack overflow)"
+    } else if address >= DIRECT_BASE {
+        "the direct map (physical memory)"
+    } else {
+        "unmapped memory"
+    }
+}
+
+/// Builds the tables and switches to them. After this, only what the module comment lists is reachable.
+pub fn init(machine: &Machine) -> u64 {
+    let layout = layout();
+    let root = pmm::allocate(1, Some(1 << 32)).expect("a page-table root below 4 GiB") as u64; // APs load a 32-bit CR3
+    let data = WRITABLE | NO_EXECUTE;
+
+    let mut highest = 0;
+    for d in machine.descriptors() {
+        if RAM_LIKE_TYPES.contains(&d.kind) {
+            let end = d.physical_start + d.pages * PAGE;
+            map_direct(root, d.physical_start, end, data);
+            highest = highest.max(end);
+        }
+    }
+    map_image(root, &layout);
+    // Every upper-half PML4 slot gets its (empty) PDPT now, so the copies in each process's root keep pointing at the same
+    // kernel tables when the kernel maps something new later (a thread stack, a device).
+    for slot in 256..512 {
+        unsafe { next_level((direct(root) as *mut u64).add(slot)) };
+    }
+    let fb = &machine.framebuffer;
+    if fb.base != 0 {
+        map_direct(root, fb.base, fb.base + fb.size, data | CACHE_DISABLE | WRITE_THROUGH);
+    } else if machine.runtime_services == 0 {
+        // A BIOS boot without a linear framebuffer: the screen is the VGA text window, which is not RAM in the memory map.
+        map_direct(root, VGA_TEXT_BASE, VGA_TEXT_BASE + 0x8000, data | CACHE_DISABLE | WRITE_THROUGH);
+    }
+
+    // NXE makes the NX bit in entries mean something; WP makes ring 0 respect read-only pages.
+    let efer: u64 = {
+        let (low, high): (u32, u32);
+        unsafe { core::arch::asm!("rdmsr", in("ecx") 0xc000_0080u32, out("eax") low, out("edx") high, options(nomem, nostack)) };
+        (high as u64) << 32 | low as u64
+    };
+    let efer = efer | 1 << 11;
+    unsafe {
+        core::arch::asm!("wrmsr", in("ecx") 0xc000_0080u32, in("eax") efer as u32, in("edx") (efer >> 32) as u32, options(nomem, nostack));
+        let cr0: u64;
+        core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack));
+        core::arch::asm!("mov cr0, {}", in(reg) cr0 | 1 << 16, options(nomem, nostack));
+        ROOT = root;
+        core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack));
+        OFFSET = DIRECT_BASE;
+    }
+    highest
+}
+
+/// User space: PML4 slots 1..255 (from 512 GiB up), so it never meets slot 0, where the kernel image keeps its identity
+/// mapping (supervisor pages, W^X). Each process has its own root; slot 0 and the upper half are shared with the kernel.
+pub const USER_BASE: u64 = 1 << 39;
+pub const USER_END: u64 = 1 << 47;
+
+/// A new root for a process: the kernel's mappings, an empty user half. `None` when out of frames.
+pub fn create_user_space() -> Option<u64> {
+    let root = pmm::allocate(1, None)?;
+    unsafe {
+        let new = direct(root) as *mut u64;
+        let kernel = direct(self::root()) as *const u64;
+        for slot in (0..1).chain(256..512) {
+            *new.add(slot) = *kernel.add(slot);
+        }
+    }
+    Some(root)
+}
+
+/// Maps the 4 KiB frame `physical` at user address `address` in `root`. The user half only; false outside it.
+pub fn map_user_page(root: u64, address: u64, physical: u64, writable: bool, executable: bool) -> bool {
+    if address < USER_BASE || address >= USER_END {
+        return false;
+    }
+    unsafe {
+        let pml4 = (direct(root) as *mut u64).add(((address >> 39) & 511) as usize);
+        let pdpt = next_level_user(pml4);
+        let directory = next_level_user(pdpt.add(((address >> 30) & 511) as usize));
+        let table = next_level_user(directory.add(((address >> 21) & 511) as usize));
+        let flags = USER | PRESENT | if writable { WRITABLE } else { 0 } | if executable { 0 } else { NO_EXECUTE };
+        *table.add(((address >> 12) & 511) as usize) = physical | flags;
+    }
+    true
+}
+
+unsafe fn next_level_user(entry: *mut u64) -> *mut u64 {
+    unsafe {
+        if *entry & PRESENT == 0 {
+            let table = new_table() as u64 - direct(0);
+            *entry = table | PRESENT | WRITABLE | USER;
+        }
+        direct(*entry & ADDRESS_MASK) as *mut u64
+    }
+}
+
+/// The leaf entry for user `address` in `root`, if the whole walk is present.
+fn user_entry(root: u64, address: u64) -> Option<u64> {
+    if address < USER_BASE || address >= USER_END {
+        return None;
+    }
+    unsafe {
+        let read = |table: u64, index: u64| (direct(table & ADDRESS_MASK) as *const u64).add(index as usize).read();
+        let pml4 = read(root, (address >> 39) & 511);
+        if pml4 & PRESENT == 0 {
+            return None;
+        }
+        let pdpt = read(pml4, (address >> 30) & 511);
+        if pdpt & PRESENT == 0 {
+            return None;
+        }
+        let directory = read(pdpt, (address >> 21) & 511);
+        if directory & PRESENT == 0 || directory & LARGE != 0 {
+            return None;
+        }
+        let leaf = read(directory, (address >> 12) & 511);
+        (leaf & PRESENT != 0).then_some(leaf)
+    }
+}
+
+/// Removes the user page at `address` and returns its frame (the caller frees it); None if nothing was mapped. The process's
+/// root must be the one loaded on this CPU (the single thread of a process runs only here), so `invlpg` is enough.
+pub fn unmap_user_page(root: u64, address: u64) -> Option<u64> {
+    user_entry(root, address)?;
+    unsafe {
+        let read = |table: u64, index: u64| (direct(table & ADDRESS_MASK) as *const u64).add(index as usize).read();
+        let pml4 = read(root, (address >> 39) & 511);
+        let pdpt = read(pml4, (address >> 30) & 511);
+        let directory = read(pdpt, (address >> 21) & 511);
+        let leaves = direct(directory & ADDRESS_MASK) as *mut u64;
+        let slot = leaves.add(((address >> 12) & 511) as usize);
+        let frame = *slot & ADDRESS_MASK;
+        *slot = 0;
+        core::arch::asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
+        Some(frame)
+    }
+}
+
+/// What the user page containing `address` in `root` is, if one is mapped.
+pub fn user_leaf(root: u64, address: u64) -> Option<UserPage> {
+    let leaf = user_entry(root, address & !(PAGE - 1))?;
+    Some(UserPage { physical: leaf & ADDRESS_MASK, user: leaf & USER != 0, writable: leaf & WRITABLE != 0 })
+}
+
+/// Frees a process's user half: every mapped frame and every table below slots 1..255, then the root. Returns the frames freed.
+/// The root must not be loaded on any CPU.
+pub fn destroy_user_space(root: u64) -> u64 {
+    let mut freed = 0;
+    unsafe {
+        let top = direct(root) as *mut u64;
+        for slot in 1..256 {
+            let pml4 = *top.add(slot);
+            if pml4 & PRESENT == 0 {
+                continue;
+            }
+            let pdpt = direct(pml4 & ADDRESS_MASK) as *mut u64;
+            for i in 0..512 {
+                let entry = *pdpt.add(i);
+                if entry & PRESENT == 0 {
+                    continue;
+                }
+                let directory = direct(entry & ADDRESS_MASK) as *mut u64;
+                for j in 0..512 {
+                    let entry = *directory.add(j);
+                    if entry & PRESENT == 0 {
+                        continue;
+                    }
+                    let leaves = direct(entry & ADDRESS_MASK) as *mut u64;
+                    for k in 0..512 {
+                        let leaf = *leaves.add(k);
+                        if leaf & PRESENT != 0 {
+                            pmm::free(leaf & ADDRESS_MASK, 1);
+                            freed += 1;
+                        }
+                    }
+                    pmm::free(entry & ADDRESS_MASK, 1);
+                    freed += 1;
+                }
+                pmm::free(entry & ADDRESS_MASK, 1);
+                freed += 1;
+            }
+            pmm::free(pml4 & ADDRESS_MASK, 1);
+            freed += 1;
+        }
+    }
+    pmm::free(root, 1);
+    freed + 1
+}
