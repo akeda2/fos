@@ -22,6 +22,7 @@ pub mod smp;
 pub mod tlb;
 pub mod trap;
 pub mod usermode;
+pub mod user_blobs;
 
 pub use apic::ioapic;
 pub use context::{WAKE_VECTOR, end_wake_interrupt, prepare_stack, send_wake_ipi, switch};

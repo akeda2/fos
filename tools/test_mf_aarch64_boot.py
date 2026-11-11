@@ -13,6 +13,10 @@ import test_aarch64_boot as base  # noqa: E402
 IMAGE = Path(os.environ.get("FOSFOR_IMAGE", base.ROOT / "build/fosfor-mf-aarch64/fosfor.img"))
 
 
+EL0_LINE = re.compile(r"EL0: hello ok, bad pointer ok, page fault ok, stack guard ok, undefined instruction ok, preempted spinner ok, "
+                      r"ELF ok, big image ok, NEON state ok, 0 frames not returned\.")
+
+
 def main() -> None:
     text = base.boot(IMAGE, commands=("version", "cpuinfo", "uptime", "nic", "run hello", "io r8 0x60", "usb", "disks"), usb=True,
                      usb_keys=("c", "p", "u", "i", "n", "f", "o", "ret"))
@@ -24,6 +28,7 @@ def main() -> None:
     base.check(ticks is not None and 8 <= int(ticks.group(1)) <= 12, "the GIC delivers timer ticks", text)
     base.check("Scheduler: 3 kernel threads took 15 interleaved steps" in text and " 0 stack frame(s) not returned" in text, "kernel threads switch and their stacks are returned", text)
     base.check("preemption ok" in text and "sleep ok" in text and "mutex ok" in text, "timer preemption, sleep and mutex work", text)
+    base.check(EL0_LINE.search(text) is not None, "EL0 processes: system calls, faults contained, preemption, an ELF, NEON state across switches", text)
     base.check("reached the end of boot" in text, "boot reaches its end", text)
     base.check("PCI: config space at" in text and "MSI: GICv2m frame" in text, "PCI (ECAM) and MSI are up", text)
     base.check("00:02.0 1af4:1001" in text, "PCI lists the virtio disk", text)
@@ -45,6 +50,7 @@ def main() -> None:
     el2 = base.boot(IMAGE, commands=("cpuinfo", "uptime"), el2=True)
     base.check("from the UEFI loader at EL2" in el2 and "running at EL1" in el2, "entered at EL2, the kernel drops to EL1 and carries on", el2)
     base.check("preemption ok" in el2 and "timer interrupts (INTID 30)" in el2, "the timer and the scheduler work after the drop", el2)
+    base.check(EL0_LINE.search(el2) is not None, "EL0 processes run after the drop from EL2", el2)
     sd = base.boot(IMAGE, steps=(("disks\r", "fos> "),), sd=True)
     base.check(re.search(r"disk2: \d+ MiB, SD card", sd) is not None, "the SDHCI controller and its card are registered as a disk", sd)
 

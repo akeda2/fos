@@ -2,9 +2,10 @@
 //!
 //! A tape's entry is `extern "C" fn(&TapeApi)`, a table of function pointers. Here every process gets, mapped at fixed user
 //! addresses, a *shim page* (read, execute: an entry wrapper and one 16-byte stub per table slot), a *table page* (read only: the
-//! `TapeApi` the tape is handed, each function pointer aimed at its stub) and an *args page*. A stub is
-//! `mov r10, rcx; mov eax, 0x100 + slot; syscall; ret`: the System V arguments stay where they are (`syscall` clobbers rcx, so the
-//! fourth goes through r10) and `process::syscall` hands the number to `call` below. The slot is the table offset divided by
+//! `TapeApi` the tape is handed, each function pointer aimed at its stub) and an *args page*. A stub (the CPU's own code, in
+//! `arch/*/usermode.rs`) loads `0x100 + slot` into the syscall number register and traps, leaving the C-ABI arguments where they
+//! are (x86: `mov r10, rcx; mov eax, ..; syscall`; aarch64: `mov x8, ..; svc #0`), and `process::syscall` hands the number to
+//! `call` below. The slot is the table offset divided by
 //! eight, so the table's layout stays the single source of truth: every field after the 8-byte version/size header is one word.
 //!
 //! What a call is worth today: console (`putc`, `puts`), time (`ticks`, `micros`), memory (`alloc`/`free` map zeroed pages into
@@ -34,40 +35,6 @@ pub const CALL_BASE: u64 = 0x100;
 const STUBS: usize = 128;
 const SLOTS: usize = size_of::<TapeApi>() / 8;
 const _: () = assert!(size_of::<TapeApi>() % 8 == 0 && SLOTS <= STUBS);
-
-core::arch::global_asm!(
-    r#"
-    .text
-    .balign 16
-    .global tape_shim_start, tape_shim_stubs, tape_shim_end, tape_thread_start
-tape_shim_start:                     # entered with rdi = the table, rsi = the tape's entry point
-    call rsi
-    mov eax, 1                       # the tape returned: exit(0)
-    xor edi, edi
-    syscall
-    ud2
-    .balign 16
-tape_thread_start:                   # another thread: rdi = its entry point, rsi = its argument (the stack is 16-aligned)
-    mov rax, rdi
-    mov rdi, rsi
-    call rax
-    mov eax, 5                       # the entry returned: end this thread only
-    syscall
-    ud2
-    .balign 16
-tape_shim_stubs:
-    .set slot, 0
-    .rept 128
-    mov r10, rcx
-    mov eax, 0x100 + slot
-    syscall
-    ret
-    .balign 16
-    .set slot, slot + 1
-    .endr
-tape_shim_end:
-"#
-);
 
 unsafe extern "C" {
     static tape_shim_start: u8;
@@ -229,6 +196,7 @@ pub fn map_support(root: u64, args: &[u8]) -> Option<()> {
     let shim = unsafe { core::slice::from_raw_parts(&tape_shim_start as *const u8, &tape_shim_end as *const u8 as usize - &tape_shim_start as *const u8 as usize) }; // kernel-memory
     let code = pmm::allocate(1, None)?;
     unsafe { core::ptr::copy_nonoverlapping(shim.as_ptr(), vm::direct(code) as *mut u8, shim.len()) }; // kernel-memory
+    crate::usermode::sync_code(vm::direct(code), shim.len() as u64);
     vm::map_user_page(root, SHIM_BASE, code, false, true).then_some(())?;
 
     let table = pmm::allocate(1, None)?;

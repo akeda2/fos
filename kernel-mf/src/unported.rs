@@ -10,70 +10,56 @@ fn missing(what: &str) {
     println!("{what}: not available on aarch64 yet.");
 }
 
-pub mod process {
-    use alloc::vec::Vec;
-    pub use crate::sched::How;
-
-    #[derive(Clone, Copy)]
-    pub struct Outcome {
-        pub pid: u64,
-        pub how: How,
-        pub written: u64,
-    }
-    pub fn outcomes() -> Vec<Outcome> {
-        Vec::new()
-    }
-    pub static START_NICS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-    #[derive(Debug)]
-    pub enum SpawnError {
-        /// No EL0 yet: a tape has nowhere to run.
-        Unsupported,
-    }
-    pub fn spawn_elf(_name: &str, _image: &[u8], _args: &[u8]) -> Result<u64, SpawnError> {
-        Err(SpawnError::Unsupported)
-    }
-    pub fn screen_owner() -> u64 {
-        0
-    }
-    pub fn user_bytes(_address: u64, _length: u64) -> Option<Vec<u8>> {
-        None
-    }
-    pub fn user_bytes_up_to(_address: u64, _length: u64, _limit: u64) -> Option<Vec<u8>> {
-        None
-    }
-    pub fn copy_to_user(_address: u64, _data: &[u8]) -> bool {
-        false
-    }
-}
-
-pub mod tapenet {
-    pub fn address(_index: usize) -> Option<[u8; 4]> {
-        None
-    }
-    pub fn exists(_index: usize) -> bool {
-        false
-    }
-    pub fn owner(_index: usize) -> u64 {
-        0
-    }
-    pub fn address_of_owner(_pid: u64) -> Option<[u8; 4]> {
-        None
-    }
-}
-
-pub mod tapeaudio {
-    pub fn owner() -> u64 {
-        0
-    }
-}
-
 pub mod audioshell {
     pub fn command(_words: words!()) {
         super::missing("audio");
     }
 }
 
+/// COM2-COM4 and USB serial adapters (`kernel_core::serialports`) exist on x86 only: a tape sees no ports.
+pub mod tapeserial {
+    pub fn count() -> u64 {
+        0
+    }
+    pub fn info(_number: u64, _out: u64) -> u64 {
+        0
+    }
+    pub fn open(_number: u64, _baud: u64, _format: u64) -> i64 {
+        0
+    }
+    pub fn close(_number: u64) {}
+    pub fn read(_number: u64, _out: u64, _capacity: u64) -> u64 {
+        0
+    }
+    pub fn write(_number: u64, _data: u64, _length: u64) -> u64 {
+        0
+    }
+    pub fn lines(_number: u64) -> u64 {
+        0
+    }
+    pub fn set_lines(_number: u64, _lines: u64) {}
+    pub fn set_break(_number: u64, _on: u64) {}
+    pub fn process_ended(_pid: u64) {}
+}
+
 pub mod fb {
+    /// No framebuffer console in mf on aarch64 yet: tapes see no pixel screen.
+    pub fn console_size() -> Option<(usize, usize)> {
+        None
+    }
+    pub fn gfx_info() -> Option<(u32, u32)> {
+        None
+    }
+    pub fn gfx_open() -> bool {
+        false
+    }
+    pub fn gfx_close() {}
+    pub fn gfx_fill(_x: u32, _y: u32, _width: u32, _height: u32, _rgb: u32) -> bool {
+        false
+    }
+    pub unsafe fn gfx_blit(_x: u32, _y: u32, _width: u32, _height: u32, _source: *const u32, _stride: u32) -> bool {
+        false
+    }
     pub fn set_colours(_foreground: Option<&str>, _background: Option<&str>) -> bool {
         false
     }

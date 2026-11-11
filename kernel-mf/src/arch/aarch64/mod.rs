@@ -86,17 +86,7 @@ mod percpu_arch;
 pub use context::{end_wake_interrupt, prepare_stack, send_wake_ipi, switch};
 pub use percpu_arch::{CpuArch, activate, cpu_pointer, set_kernel_stack};
 
-/// FP/SIMD state of user threads: none yet (kernel threads are soft-float and EL0 comes later).
-pub mod fpu {
-    pub struct Area;
-    impl Area {
-        pub fn new() -> Option<Area> {
-            None
-        }
-        pub fn save(&self) {}
-        pub fn restore(&self) {}
-    }
-}
+pub mod fpu;
 
 /// The GIC's broadcast TLB invalidates reach every CPU, so a "shootdown" is just the invalidate.
 pub mod tlb {
@@ -211,17 +201,9 @@ pub mod slots {
     pub fn mark_clean_stop() {}
 }
 
-pub mod trap {
-    /// What a fatal path reports; the aarch64 vectors fill it from ESR/ELR/FAR when the crash record is ported.
-    pub struct Frame {
-        pub vector: u64,
-        pub rip: u64,
-    }
-    pub fn fatal_reset(_frame: &Frame) -> ! {
-        crate::println!("*** fatal: halting.");
-        crate::halt()
-    }
-}
+pub mod trap;
+pub mod usermode;
+pub mod user_blobs;
 
 pub mod debug {
     pub const PANIC_VECTOR: u64 = 0xff00;
@@ -328,6 +310,7 @@ pub fn init_memory(_machine: &boot::Machine, info: &BootInfo) -> &'static BootIn
 pub fn init_interrupts() {
     activate(0);
     gic::init();
+    usermode::init_cpu();
 }
 
 /// Interrupts on, and the timer ticking; the century register is an x86 RTC detail.

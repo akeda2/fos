@@ -30,15 +30,16 @@ macro_rules! until_ported {
     ($($item:item)*) => { $( #[cfg(target_arch = "x86_64")] $item )* };
 }
 
+mod process;
+mod tapenet;
+mod tapeaudio;
+mod tapeapi;
+mod threads;
+mod tapesys;
+mod user_test;
+
 until_ported! {
-    mod process;
-    mod tapenet;
-    mod tapeaudio;
-    mod tapeapi;
-    mod threads;
-    mod tapesys;
     mod tapeserial;
-    mod user_test;
     mod audioshell;
     mod ps2;
     mod fb;

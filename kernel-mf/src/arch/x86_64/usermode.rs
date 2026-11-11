@@ -116,3 +116,60 @@ pub fn user_access<R>(f: impl FnOnce() -> R) -> R {
     result
 }
 
+
+/// Nothing to do: x86 keeps instruction fetch coherent with stores.
+pub fn sync_code(_address: u64, _length: u64) {}
+
+/// The tape shim, mapped into every tape's address space by `tapeapi::map_support` (entry wrapper, thread start, one stub per
+/// table slot). The stub numbering and layout are the contract with `tapeapi`; the instructions are this CPU's.
+core::arch::global_asm!(
+    r#"
+    .text
+    .balign 16
+    .global tape_shim_start, tape_shim_stubs, tape_shim_end, tape_thread_start
+tape_shim_start:                     # entered with rdi = the table, rsi = the tape's entry point
+    call rsi
+    mov eax, 1                       # the tape returned: exit(0)
+    xor edi, edi
+    syscall
+    ud2
+    .balign 16
+tape_thread_start:                   # another thread: rdi = its entry point, rsi = its argument (the stack is 16-aligned)
+    mov rax, rdi
+    mov rdi, rsi
+    call rax
+    mov eax, 5                       # the entry returned: end this thread only
+    syscall
+    ud2
+    .balign 16
+tape_shim_stubs:
+    .set slot, 0
+    .rept 128
+    mov r10, rcx
+    mov eax, 0x100 + slot
+    syscall
+    ret
+    .balign 16
+    .set slot, slot + 1
+    .endr
+tape_shim_end:
+"#
+);
+
+
+/// ELF `e_machine` and the RELATIVE relocation type of tapes for this CPU (the self-test builds an image by hand).
+pub const ELF_MACHINE: u16 = 62;
+pub const RELATIVE_RELOCATION: u64 = 8;
+/// The exception classes `How::Fault` carries: a page fault, and what an undefined or privileged instruction raises (#GP).
+pub const PAGE_FAULT: u64 = 14;
+pub const ILLEGAL_INSTRUCTION: u64 = 13;
+
+/// How the self-test names things on this CPU.
+pub const PRIVILEGE: &str = "Ring 3";
+pub const ILLEGAL_NAME: &str = "#GP";
+pub const FP_NAME: &str = "SSE";
+
+/// Lets one timer tick arrive: enable interrupts and halt until one does.
+pub fn halt_a_tick() {
+    unsafe { core::arch::asm!("sti", "hlt", options(nomem, nostack)) };
+}

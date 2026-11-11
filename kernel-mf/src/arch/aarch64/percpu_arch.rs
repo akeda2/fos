@@ -6,11 +6,13 @@ use crate::percpu::{Cpu, get};
 pub struct CpuArch {
     /// MPIDR_EL1's affinity bits, what PSCI `CPU_ON` names a core by.
     pub mpidr: u64,
+    /// The running thread's kernel stack top: where `enter_user_mode` points SP_EL1, and so where every exception from EL0 lands.
+    pub kernel_stack: core::sync::atomic::AtomicU64,
 }
 
 impl CpuArch {
     pub const fn new() -> CpuArch {
-        CpuArch { mpidr: 0 }
+        CpuArch { mpidr: 0, kernel_stack: core::sync::atomic::AtomicU64::new(0) }
     }
 }
 
@@ -32,5 +34,7 @@ pub fn activate(index: usize) {
     cpu.online.store(true, core::sync::atomic::Ordering::Release);
 }
 
-/// A thread's kernel stack top matters once threads enter EL0 (exceptions from EL0 land on SP_EL1); kernel threads do not need it.
-pub fn set_kernel_stack(_top: u64) {}
+/// Records the kernel stack top of the thread now running on this CPU: user threads enter EL0 with SP_EL1 set to it.
+pub fn set_kernel_stack(top: u64) {
+    crate::percpu::this().arch.kernel_stack.store(top, core::sync::atomic::Ordering::Relaxed);
+}

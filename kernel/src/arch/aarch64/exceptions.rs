@@ -29,8 +29,11 @@ global_asm!(
     b irq_entry                        // 5: IRQ from the current EL on SP_ELx, the only IRQ we expect
     vector 6
     vector 7
-    vector 8
-    vector 9
+    .balign 0x80
+    b lower_sync_entry                 // 8: synchronous from EL0 (the server kernel's system calls and faults;
+                                       // the embedded kernel defines them in arch/aarch64/mod.rs)
+    .balign 0x80
+    b lower_irq_entry                  // 9: IRQ from EL0
     vector 10
     vector 11
     vector 12

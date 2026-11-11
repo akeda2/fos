@@ -73,6 +73,7 @@ pub fn spawn(name: &str, image: &[u8]) -> Option<u64> {
             let start = (page * 4096) as usize;
             let end = image.len().min(start + 4096);
             unsafe { core::ptr::copy_nonoverlapping(image[start..end].as_ptr(), vm::direct(frame) as *mut u8, end - start) };
+            crate::usermode::sync_code(vm::direct(frame), 4096);
             vm::map_user_page(root, CODE_BASE + page * 4096, frame, false, true).then_some(())?;
         }
         map_stack(root)
@@ -120,6 +121,7 @@ pub fn spawn_elf(name: &str, image: &[u8], args: &[u8]) -> Result<u64, SpawnErro
             return Err(SpawnError::Elf(error));
         }
     };
+    crate::usermode::sync_code(vm::direct(frames), pages * 4096);
     let Some(root) = vm::create_user_space() else {
         pmm::free(frames, pages);
         return Err(SpawnError::NoMemory);

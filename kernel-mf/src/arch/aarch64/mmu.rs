@@ -1,6 +1,8 @@
 //! The aarch64 page-table hardware as the shared `vm` sees it. Memory is identity-mapped in TTBR0 by the embedded kernel's
 //! `paging.rs`; kernel thread stacks live in their own region of the same tables, one guard page under each. Per-process user
-//! tables (EL0) are not here yet: `user_leaf` finds nothing.
+//! tables (EL0) are one TTBR0 root per process: the kernel's L0 slot 0 (identity map, device windows, thread stacks) is shared,
+//! the process owns slots 1..255 (from 512 GiB up, as on x86). User pages are non-global (nG), `AP[1]` = EL0 may touch them,
+//! never executable at EL1 (PXN); TTBR0 is reloaded and the TLB flushed at every switch of address space (no ASIDs yet).
 
 pub const PAGE: u64 = 4096;
 pub const DIRECT_BASE: u64 = 0;
@@ -39,13 +41,166 @@ pub fn map_device(physical: u64, length: u64) {
     crate::paging::map_device(physical, length);
 }
 
-/// The kernel runs on one TTBR0 root for now; per-process roots come with EL0 tapes.
-pub fn load_root(_root: u64) {}
+const VALID: u64 = 1;
+const TABLE: u64 = 3;
+const PAGE_DESC: u64 = 3;
+const INNER_SHAREABLE: u64 = 3 << 8;
+const ACCESS: u64 = 1 << 10;
+const NOT_GLOBAL: u64 = 1 << 11;
+const EL0_ACCESS: u64 = 1 << 6; // AP[1]
+const READ_ONLY: u64 = 1 << 7; // AP[2]
+const PXN: u64 = 1 << 53;
+const UXN: u64 = 1 << 54;
+const ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
 
-pub fn current_root() -> u64 {
-    root()
+/// User space: L0 slots 1..255, so it never meets slot 0 (the identity map, the device windows, the thread stacks).
+pub const USER_BASE: u64 = 1 << 39;
+pub const USER_END: u64 = 1 << 47;
+
+/// Makes the process's tables visible to the walker (a stable inner-shareable write-back walk, but the stores must be ordered).
+fn publish() {
+    unsafe { core::arch::asm!("dsb ishst", options(nostack)) };
 }
 
-pub fn user_leaf(_root: u64, _address: u64) -> Option<UserPage> {
-    None
+/// A new root for a process: the kernel's slot 0, an empty user half. `None` when out of frames.
+pub fn create_user_space() -> Option<u64> {
+    let root = crate::pmm::allocate(1, None)?;
+    unsafe { (root as *mut u64).write((root_kernel() as *const u64).read()) };
+    publish();
+    Some(root)
+}
+
+fn root_kernel() -> u64 {
+    crate::paging::root()
+}
+
+/// The next-level table under `*slot`, allocated (zeroed) when absent.
+unsafe fn next_level(slot: *mut u64) -> Option<*mut u64> {
+    unsafe {
+        if *slot & VALID == 0 {
+            let table = crate::pmm::allocate(1, None)?;
+            *slot = table | TABLE;
+        }
+        Some((*slot & ADDRESS_MASK) as *mut u64)
+    }
+}
+
+/// Maps the 4 KiB frame `physical` at user address `address` in `root`. The user half only; false outside it or when out of
+/// frames. Code pages are cleaned by the caller's `usermode::sync_code`.
+pub fn map_user_page(root: u64, address: u64, physical: u64, writable: bool, executable: bool) -> bool {
+    if address < USER_BASE || address >= USER_END {
+        return false;
+    }
+    let flags = physical
+        | PAGE_DESC
+        | INNER_SHAREABLE
+        | ACCESS
+        | NOT_GLOBAL
+        | EL0_ACCESS
+        | PXN
+        | if writable { 0 } else { READ_ONLY }
+        | if executable { 0 } else { UXN };
+    unsafe {
+        let Some(l1) = next_level((root as *mut u64).add(((address >> 39) & 511) as usize)) else { return false };
+        let Some(l2) = next_level(l1.add(((address >> 30) & 511) as usize)) else { return false };
+        let Some(l3) = next_level(l2.add(((address >> 21) & 511) as usize)) else { return false };
+        l3.add(((address >> 12) & 511) as usize).write(flags);
+    }
+    publish();
+    true
+}
+
+/// The leaf descriptor slot for user `address` in `root`, if the whole walk is present.
+fn user_slot(root: u64, address: u64) -> Option<*mut u64> {
+    if address < USER_BASE || address >= USER_END {
+        return None;
+    }
+    unsafe {
+        let mut table = root as *mut u64;
+        for shift in [39, 30, 21] {
+            let entry = table.add(((address >> shift) & 511) as usize).read();
+            if entry & VALID == 0 {
+                return None;
+            }
+            table = (entry & ADDRESS_MASK) as *mut u64;
+        }
+        let slot = table.add(((address >> 12) & 511) as usize);
+        (slot.read() & VALID != 0).then_some(slot)
+    }
+}
+
+/// Removes the user page at `address` and returns its frame (the caller frees it); None if nothing was mapped. The entry is
+/// dropped from every CPU's TLB (any ASID: processes share ASID 0 and are told apart by the flush at each switch).
+pub fn unmap_user_page(root: u64, address: u64) -> Option<u64> {
+    let slot = user_slot(root, address)?;
+    unsafe {
+        let frame = slot.read() & ADDRESS_MASK;
+        slot.write(0);
+        core::arch::asm!("dsb ishst", "tlbi vaae1is, {}", "dsb ish", "isb", in(reg) address >> 12, options(nostack));
+        Some(frame)
+    }
+}
+
+/// What the user page containing `address` in `root` is, if one is mapped.
+pub fn user_leaf(root: u64, address: u64) -> Option<UserPage> {
+    let leaf = unsafe { user_slot(root, address & !(PAGE - 1))?.read() };
+    Some(UserPage { physical: leaf & ADDRESS_MASK, user: leaf & EL0_ACCESS != 0, writable: leaf & READ_ONLY == 0 })
+}
+
+/// Frees a process's user half: every mapped frame and every table below slots 1..255, then the root. Returns the frames freed.
+/// The root must not be loaded on any CPU.
+pub fn destroy_user_space(root: u64) -> u64 {
+    let mut freed = 0;
+    unsafe {
+        let top = root as *mut u64;
+        for slot in 1..256 {
+            let l0 = *top.add(slot);
+            if l0 & VALID == 0 {
+                continue;
+            }
+            let l1 = (l0 & ADDRESS_MASK) as *mut u64;
+            for i in 0..512 {
+                let entry = *l1.add(i);
+                if entry & VALID == 0 {
+                    continue;
+                }
+                let l2 = (entry & ADDRESS_MASK) as *mut u64;
+                for j in 0..512 {
+                    let entry = *l2.add(j);
+                    if entry & VALID == 0 {
+                        continue;
+                    }
+                    let l3 = (entry & ADDRESS_MASK) as *mut u64;
+                    for k in 0..512 {
+                        let leaf = *l3.add(k);
+                        if leaf & VALID != 0 {
+                            crate::pmm::free(leaf & ADDRESS_MASK, 1);
+                            freed += 1;
+                        }
+                    }
+                    crate::pmm::free(entry & ADDRESS_MASK, 1);
+                    freed += 1;
+                }
+                crate::pmm::free(entry & ADDRESS_MASK, 1);
+                freed += 1;
+            }
+            crate::pmm::free(l0 & ADDRESS_MASK, 1);
+            freed += 1;
+        }
+    }
+    crate::pmm::free(root, 1);
+    freed + 1
+}
+
+/// Switches this CPU to `root`'s user half (TTBR0_EL1) and flushes the non-global entries of the old one.
+pub fn load_root(root: u64) {
+    unsafe {
+        core::arch::asm!("msr ttbr0_el1, {}", "isb", "tlbi vmalle1", "dsb nsh", "isb", in(reg) root, options(nostack));
+    }
+}
+
+pub fn current_root() -> u64 {
+    let root: u64;
+    unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) root, options(nomem, nostack, preserves_flags)) };
+    root & ADDRESS_MASK
 }

@@ -2,184 +2,8 @@
 //! pointer checks, exception containment and preemption of user code.
 
 use crate::process::{self, How};
+use crate::user_blobs::*;
 use crate::{fpu, pmm, sched, time};
-
-core::arch::global_asm!(
-    r#"
-    .text
-    .global user_hello_start, user_hello_end
-user_hello_start:
-    lea rdi, [rip + 2f]
-    mov esi, 19
-    xor eax, eax
-    syscall
-    mov eax, 2
-    syscall
-    lea rdi, [rip + 2f]
-    mov esi, 19
-    xor eax, eax
-    syscall
-    mov eax, 1
-    mov edi, 7
-    syscall
-2:  .ascii "Hello from ring 3!\n"
-user_hello_end:
-
-    .global user_badptr_start, user_badptr_end
-user_badptr_start:
-    movabs rdi, 0xffff800000000000
-    mov esi, 16
-    xor eax, eax
-    syscall
-    mov rdi, rax
-    mov eax, 1
-    syscall
-user_badptr_end:
-
-    .global user_fault_start, user_fault_end
-user_fault_start:
-    movabs rax, 0xffff800000000000
-    mov byte ptr [rax], 1
-user_fault_end:
-
-    .global user_overflow_start, user_overflow_end
-user_overflow_start:                   # pushes until the stack runs into the guard page below it
-1:  push rax
-    jmp 1b
-user_overflow_end:
-
-    .global user_gp_start, user_gp_end
-user_gp_start:
-    hlt
-user_gp_end:
-
-    .global user_elf_start, user_elf_end, user_elf_pointer, user_elf_message
-user_elf_start:                        # a tape: rdi = the TapeApi
-    sub rsp, 8
-    mov r14, rdi
-    mov rdi, [rip + user_elf_pointer]  # the relocated pointer to the message
-    mov esi, 19
-    call [r14 + {PUTS}]
-    mov edi, 8192
-    call [r14 + {ALLOC}]
-    test rax, rax
-    jz 1f
-    mov byte ptr [rax + 4096], 1
-    mov rdi, rax
-    mov esi, 8192
-    call [r14 + {FREE}]
-    mov edi, 4096                       # the address space is usable again
-    call [r14 + {ALLOC}]
-    test rax, rax
-    jz 1f
-    call [r14 + {TICKS}]
-    add rsp, 8
-    ret                                 # back into the shim: exit(0)
-1:  mov eax, 1
-    mov edi, 2
-    syscall
-    .balign 8
-user_elf_pointer:
-    .quad 0
-user_elf_message:
-    .ascii "Hello from an ELF!\n\0"
-user_elf_end:
-
-    .macro fpcheck name, pattern
-    .global user_fp_\name\()_start, user_fp_\name\()_end
-user_fp_\name\()_start:
-    movabs rax, \pattern
-    movq xmm0, rax
-    punpcklqdq xmm0, xmm0
-    mov r12d, 40
-1:  mov r13d, 200000
-2:  dec r13d
-    jnz 2b
-    mov eax, 2
-    syscall                            # yield: another process loads its own pattern meanwhile
-    movq rax, xmm0
-    movhlps xmm1, xmm0
-    movq rbx, xmm1
-    movabs rdx, \pattern
-    cmp rax, rdx
-    jne 3f
-    cmp rbx, rdx
-    jne 3f
-    dec r12d
-    jnz 1b
-    mov eax, 1
-    xor edi, edi
-    syscall
-3:  mov eax, 1
-    mov edi, 1
-    syscall
-user_fp_\name\()_end:
-    .endm
-    fpcheck a, 0x1111111122222222
-    fpcheck b, 0x3333333344444444
-
-    .global user_avx_start, user_avx_end
-user_avx_start:
-    movabs rax, 0x5555555566666666
-    movq xmm0, rax
-    vpbroadcastq ymm0, xmm0
-    mov r12d, 40
-1:  mov r13d, 200000
-2:  dec r13d
-    jnz 2b
-    mov eax, 2
-    syscall
-    vextracti128 xmm1, ymm0, 1         # the upper half must survive the switches too
-    movq rax, xmm1
-    movabs rdx, 0x5555555566666666
-    cmp rax, rdx
-    jne 3f
-    dec r12d
-    jnz 1b
-    mov eax, 1
-    xor edi, edi
-    syscall
-3:  mov eax, 1
-    mov edi, 1
-    syscall
-user_avx_end:
-
-    .global user_spin_start, user_spin_end
-user_spin_start:
-    inc rax
-    jmp user_spin_start
-user_spin_end:
-"#,
-    PUTS = const core::mem::offset_of!(fosfor_abi::tape::TapeApi, puts),
-    ALLOC = const core::mem::offset_of!(fosfor_abi::tape::TapeApi, alloc),
-    FREE = const core::mem::offset_of!(fosfor_abi::tape::TapeApi, free),
-    TICKS = const core::mem::offset_of!(fosfor_abi::tape::TapeApi, ticks),
-);
-
-unsafe extern "C" {
-    static user_hello_start: u8;
-    static user_hello_end: u8;
-    static user_badptr_start: u8;
-    static user_badptr_end: u8;
-    static user_fault_start: u8;
-    static user_fault_end: u8;
-    static user_overflow_start: u8;
-    static user_overflow_end: u8;
-    static user_gp_start: u8;
-    static user_gp_end: u8;
-    static user_elf_start: u8;
-    static user_elf_end: u8;
-    static user_elf_pointer: u8;
-    static user_elf_message: u8;
-    static user_fp_a_start: u8;
-    static user_fp_a_end: u8;
-    static user_fp_b_start: u8;
-    static user_fp_b_end: u8;
-    static user_avx_start: u8;
-    static user_avx_end: u8;
-    static user_spin_start: u8;
-    static user_spin_end: u8;
-}
 
 fn blob(start: &'static u8, end: &'static u8) -> &'static [u8] {
     let start = start as *const u8;
@@ -187,7 +11,7 @@ fn blob(start: &'static u8, end: &'static u8) -> &'static [u8] {
 }
 
 fn halt_a_tick() {
-    unsafe { core::arch::asm!("sti", "hlt", options(nomem, nostack)) };
+    crate::usermode::halt_a_tick();
 }
 
 /// A minimal ET_DYN image: ELF header, two program headers (PT_LOAD read/write/execute, PT_DYNAMIC), the dynamic table, one
@@ -202,7 +26,7 @@ fn build_elf() -> alloc::vec::Vec<u8> {
     let mut out = alloc::vec::Vec::new();
     out.extend_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     out.extend_from_slice(&3u16.to_le_bytes()); // ET_DYN
-    out.extend_from_slice(&62u16.to_le_bytes()); // x86-64
+    out.extend_from_slice(&crate::usermode::ELF_MACHINE.to_le_bytes());
     out.extend_from_slice(&1u32.to_le_bytes());
     out.extend_from_slice(&blob_at.to_le_bytes()); // entry
     out.extend_from_slice(&64u64.to_le_bytes()); // program headers
@@ -223,8 +47,8 @@ fn build_elf() -> alloc::vec::Vec<u8> {
     for value in [7u64, rela, 8, 24, 0, 0] {
         out.extend_from_slice(&value.to_le_bytes()); // DT_RELA, DT_RELASZ, DT_NULL
     }
-    for value in [blob_at + pointer_at as u64, 8, blob_at + message_at as u64] {
-        out.extend_from_slice(&value.to_le_bytes()); // offset, R_X86_64_RELATIVE, addend
+    for value in [blob_at + pointer_at as u64, crate::usermode::RELATIVE_RELOCATION, blob_at + message_at as u64] {
+        out.extend_from_slice(&value.to_le_bytes()); // offset, the CPU's RELATIVE relocation type, addend
     }
     out.extend_from_slice(code);
     out
@@ -245,8 +69,11 @@ pub fn run() {
     for (name, code) in [("fp-a1", fp_a), ("fp-b1", fp_b), ("fp-a2", fp_a), ("fp-b2", fp_b)] {
         fp_ids.push(process::spawn(name, code).expect("fp process"));
     }
+    #[cfg(target_arch = "x86_64")]
     let avx = (fpu::level() == fosfor_abi::tape::FP_AVX2)
         .then(|| process::spawn("avx", blob(unsafe { &user_avx_start }, unsafe { &user_avx_end })).expect("avx process"));
+    #[cfg(not(target_arch = "x86_64"))]
+    let avx: Option<u64> = None;
     let expected = 7 + fp_ids.len() + usize::from(avx.is_some());
     let start = time::ticks();
     while time::ticks() - start < 4 {
@@ -265,12 +92,12 @@ pub fn run() {
     }
     let outcomes = process::outcomes();
     let find = |id: u64| outcomes.iter().find(|o| o.pid == id);
-    let hello_ok = matches!(find(hello), Some(o) if o.how == How::Exited(7) && o.written == 38);
+    let hello_ok = matches!(find(hello), Some(o) if o.how == How::Exited(7) && o.written == 2 * HELLO_BYTES);
     let badptr_ok = matches!(find(badptr), Some(o) if o.how == How::Exited(-1));
-    let fault_ok = matches!(find(fault), Some(o) if matches!(o.how, How::Fault(14, 0xffff_8000_0000_0000)));
+    let fault_ok = matches!(find(fault), Some(o) if matches!(o.how, How::Fault(crate::usermode::PAGE_FAULT, 0xffff_8000_0000_0000)));
     let guard = process::STACK_TOP - process::STACK_BYTES;
-    let overflow_ok = matches!(find(overflow), Some(o) if matches!(o.how, How::Fault(14, address) if (guard - 8..guard).contains(&address)));
-    let gp_ok = matches!(find(gp), Some(o) if matches!(o.how, How::Fault(13, _)));
+    let overflow_ok = matches!(find(overflow), Some(o) if matches!(o.how, How::Fault(crate::usermode::PAGE_FAULT, address) if (guard - 16..guard).contains(&address)));
+    let gp_ok = matches!(find(gp), Some(o) if matches!(o.how, How::Fault(crate::usermode::ILLEGAL_INSTRUCTION, _)));
     let elf_ok = matches!(find(elf), Some(o) if o.how == How::Exited(0) && o.written == 19);
     let fp_ok = fp_ids.iter().all(|&id| matches!(find(id), Some(o) if o.how == How::Exited(0)))
         && avx.is_none_or(|id| matches!(find(id), Some(o) if o.how == How::Exited(0)));
@@ -293,7 +120,7 @@ pub fn run() {
     big[104..112].copy_from_slice(&(process::MAX_IMAGE + 4096).to_le_bytes());
     let big_ok = matches!(process::spawn_elf("big", &big, b""), Err(process::SpawnError::TooLarge));
     println!(
-        "Ring 3: hello {}, bad pointer {}, page fault {}, stack guard {}, #GP {}, preempted spinner {}, ELF {}, big image {}, SSE{} state {}, {} frames not returned.",
-        ok(hello_ok), ok(badptr_ok), ok(fault_ok), ok(overflow_ok), ok(gp_ok), ok(spin_ok), ok(elf_ok), ok(big_ok), if avx.is_some() { "+AVX" } else { "" }, ok(fp_ok), leaked
+        "{}: hello {}, bad pointer {}, page fault {}, stack guard {}, {} {}, preempted spinner {}, ELF {}, big image {}, {}{} state {}, {} frames not returned.",
+        crate::usermode::PRIVILEGE, ok(hello_ok), ok(badptr_ok), ok(fault_ok), ok(overflow_ok), crate::usermode::ILLEGAL_NAME, ok(gp_ok), ok(spin_ok), ok(elf_ok), ok(big_ok), crate::usermode::FP_NAME, if avx.is_some() { "+AVX" } else { "" }, ok(fp_ok), leaked
     );
 }
