@@ -134,8 +134,22 @@ pub fn reserve(start: u64, length: u64) {
     }
 }
 
+/// The DMA pool (first frame, one past the last), (0, 0) for none: frames the CPU maps non-cacheable (aarch64, Pi 4). While it
+/// exists, requests with a `below` limit are served from it alone and every other request leaves it alone.
+static POOL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static POOL_END: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn set_pool(first: u64, end: u64) {
+    POOL.store(first, core::sync::atomic::Ordering::Relaxed);
+    POOL_END.store(end, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// `count` physically contiguous frames, optionally entirely below `below` (exclusive): the physical address, not cleared.
 pub fn allocate_uncleared(count: u64, below: Option<u64>) -> Option<u64> {
+    let (first, end) = (POOL.load(core::sync::atomic::Ordering::Relaxed), POOL_END.load(core::sync::atomic::Ordering::Relaxed));
+    if below.is_some() && end != 0 {
+        return allocate_between(count, first * FRAME, end * FRAME, false);
+    }
     allocate_between(count, 0, below.unwrap_or(u64::MAX), true)
 }
 
@@ -150,11 +164,13 @@ fn allocate_between(count: u64, from: u64, below: u64, use_hint: bool) -> Option
         return None;
     }
     let hint = if use_hint { s.hint.clamp(start, limit) } else { start };
+    let pool = (POOL.load(core::sync::atomic::Ordering::Relaxed), POOL_END.load(core::sync::atomic::Ordering::Relaxed));
+    let pooled = pool.1 != 0 && start >= pool.0 && limit <= pool.1;
     // Two passes over the rolling hint: from the hint to the limit, then from the start.
     for (from, to) in [(hint, limit), (start, hint)] {
         let mut run = 0;
         for frame in from..to {
-            if s.is_used(frame) {
+            if s.is_used(frame) || (!pooled && frame >= pool.0 && frame < pool.1) {
                 run = 0;
             } else {
                 run += 1;

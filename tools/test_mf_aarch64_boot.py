@@ -41,6 +41,8 @@ def main() -> None:
     base.check("nic1: virtio-net" in text, "`nic` lists it", text)
     base.check("cannot start" in text or "no file" in text, "`run` refuses cleanly (no EL0 yet)", text)
     base.check("no I/O port space" in text, "`io` explains there are no ports", text)
+    sd = base.boot(IMAGE, steps=(("disks\r", "fos> "),), sd=True)
+    base.check(re.search(r"disk2: \d+ MiB, SD card", sd) is not None, "the SDHCI controller and its card are registered as a disk", sd)
 
 
 def network() -> None:

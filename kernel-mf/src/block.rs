@@ -13,6 +13,8 @@ pub enum Backend {
     /// A virtio disk (QEMU on aarch64).
     #[cfg(target_arch = "aarch64")]
     Virtio(kernel_core::virtio_blk::Drive),
+    #[cfg(target_arch = "aarch64")]
+    Sd(crate::sdhci::Drive),
     /// An index into `usb_storage`'s device table.
     Usb(usize),
     /// The array `mdvol` assembled: the disk is virtual, its sectors come from the members.
@@ -116,6 +118,8 @@ pub fn read(disk: usize, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
         }
         #[cfg(target_arch = "aarch64")]
         Backend::Virtio(drive) => drive.read(lba, buffer).map_err(|_| Error::Device)?,
+        #[cfg(target_arch = "aarch64")]
+        Backend::Sd(drive) => drive.read(lba, buffer).map_err(|_| Error::Device)?,
         Backend::Usb(device) => crate::usb::storage_read(device, lba, buffer).map_err(|_| Error::Device)?,
         Backend::Md => crate::mdvol::read(lba, buffer)?,
     }
@@ -156,6 +160,8 @@ fn write_with(disk: usize, lba: u64, buffer: &[u8], flush: bool) -> Result<(), E
         }
         #[cfg(target_arch = "aarch64")]
         Backend::Virtio(drive) => drive.write(lba, buffer).map_err(|_| Error::Device)?,
+        #[cfg(target_arch = "aarch64")]
+        Backend::Sd(drive) => drive.write(lba, buffer).map_err(|_| Error::Device)?,
         Backend::Usb(device) => crate::usb::storage_write(device, lba, buffer).map_err(|_| Error::Device)?,
         Backend::Md => crate::mdvol::write(lba, buffer)?,
     }
@@ -175,5 +181,7 @@ pub fn discard(disk: usize, ranges: &[(u64, u64)]) -> Result<(), Error> {
         Backend::Usb(_) | Backend::Md => Err(Error::Unsupported),
         #[cfg(target_arch = "aarch64")]
         Backend::Virtio(_) => Err(Error::Unsupported),
+        #[cfg(target_arch = "aarch64")]
+        Backend::Sd(_) => Err(Error::Unsupported),
     }
 }

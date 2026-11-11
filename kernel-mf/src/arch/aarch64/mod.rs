@@ -120,9 +120,34 @@ pub mod memory {
     pub fn allocate() -> Option<u64> {
         crate::pmm::allocate(1, None)
     }
-    /// The Pi 4's PCIe bridge reaches only the first 3 GiB; reserving a pool below that is for the PCI slice.
-    pub fn dma_pool(_frames: u64) {}
+    /// Sets aside `frames` below 4 GiB as the DMA pool, mapped non-cacheable, for devices that are not cache-coherent (the
+    /// Pi 4's PCIe bridge). Afterwards every allocation with a `below` limit comes from it and nothing else does (see `pmm`).
+    /// Call once, after paging is up.
+    pub fn dma_pool(frames: u64) {
+        let Some(start) = crate::pmm::allocate_uncleared(frames, Some(1 << 32)) else { return };
+        crate::paging::map_uncached(start, frames * FRAME);
+        crate::pmm::free(start, frames);
+        crate::pmm::set_pool(start / FRAME, start / FRAME + frames);
+        crate::println!("DMA pool: {} KiB at {:#x}, mapped non-cacheable.", frames * FRAME / 1024, start);
+    }
 }
+
+/// What the shared aarch64 files ask of the embedded kernel's `hal` module.
+pub mod hal {
+    /// True on a Raspberry Pi 4, recognised by its GIC-400 distributor address.
+    pub fn is_pi4() -> bool {
+        crate::gic::bases().0 == 0xff84_1000
+    }
+
+    /// Routes interrupt `intid` to `handler` (level or edge triggered) on the boot CPU.
+    pub fn register_irq(intid: u32, level: bool, handler: fn(u32)) {
+        crate::gic::register(intid, level, handler)
+    }
+}
+
+// The Pi's SD host controller (EMMC2) or a PCI SDHCI (QEMU's `sdhci-pci`): the embedded kernel's driver, polled data port, no DMA.
+#[path = "../../../../kernel/src/sdhci.rs"]
+pub mod sdhci;
 
 /// The crash machinery (record, reset) is not ported yet: a fatal exception is reported and the CPU parks.
 pub mod crash {
