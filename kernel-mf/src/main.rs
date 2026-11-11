@@ -40,16 +40,8 @@ until_ported! {
     mod tapeserial;
     mod user_test;
     mod audioshell;
-    mod usbshell;
     mod ps2;
-    mod usb;
     mod fb;
-    mod net;
-    mod netfs;
-    mod netclient;
-    mod service;
-    mod vnic;
-    mod tapesync;
     #[path = "../../kernel/src/install.rs"]
     mod install;
     #[path = "../../kernel/src/bootcode.rs"]
@@ -60,6 +52,14 @@ until_ported! {
 mod unported;
 #[cfg(not(target_arch = "x86_64"))]
 use unported::*;
+mod usb;
+mod net;
+mod netfs;
+mod netclient;
+mod service;
+mod vnic;
+mod tapesync;
+mod usbshell;
 mod session;
 mod tapefs;
 mod config;
@@ -217,13 +217,24 @@ fn boot_services(info: &BootInfo, _century: u8) -> ! {
         println!("  {:02x}:{:02x}.{} {:04x}:{:04x} {} (class {:02x}{:02x}, interface {:02x})", device.bus, device.device, device.function, device.vendor, device.id, pci::class_name(device.class, device.subclass), device.class, device.subclass, device.interface);
     }
     storage::init(info);
+    // As on x86: a machine that boots from a USB stick needs USB up before its boot disk exists.
+    let usb_first = storage::boot_disk().is_none();
+    if usb_first {
+        usb::init();
+        storage::find_boot_disk(info);
+    }
     if let Some(disk) = storage::boot_disk() {
         slots::init(info, disk);
     }
     debug::init(info.crash_count);
     debug::report_previous_crash();
+    if !usb_first {
+        usb::init();
+    }
     config::load();
     slots::confirm_boot();
+    net::init();
+    vnic::apply();
     selftest::run();
     sched::spawn("service", service_thread, 0).expect("the service thread");
     println!("kernel-mf: slice 8 reached the end of boot; entering the service loop.");

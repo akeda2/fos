@@ -200,6 +200,11 @@ pub fn micros() -> u64 {
     timer::micros()
 }
 
+/// A free-running counter, only good for mixing into seeds and timing short spans (the generic counter).
+pub fn cycle_counter() -> u64 {
+    timer::counter()
+}
+
 pub fn busy_wait_ms(ms: u64) {
     let start = micros();
     while micros() - start < ms * 1000 {

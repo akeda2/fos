@@ -47,6 +47,9 @@ pub mod process {
 }
 
 pub mod tapenet {
+    pub fn address(_index: usize) -> Option<[u8; 4]> {
+        None
+    }
     pub fn exists(_index: usize) -> bool {
         false
     }
@@ -64,81 +67,9 @@ pub mod tapeaudio {
     }
 }
 
-pub mod net {
-    pub fn exit_session(_session: usize) -> bool {
-        false
-    }
-    pub fn print_list() {
-        println!("No network interfaces (no NIC driver on aarch64 yet).");
-    }
-    pub fn print_registers(_number: usize) {
-        super::missing("nic regs");
-    }
-    pub fn poll() {}
-    pub fn housekeeping() {}
-}
-
-pub mod netclient {
-    pub fn print_peers() {
-        super::missing("nic peers");
-    }
-    pub fn nic_discover() {
-        super::missing("nic discover");
-    }
-    pub fn tapesync(_words: words!()) {
-        super::missing("tapesync");
-    }
-    pub fn gpio(_rest: &str) {
-        super::missing("gpio");
-    }
-}
-
-pub mod vnic {
-    pub struct Fresh;
-    impl Fresh {
-        pub fn keep(self) {}
-        pub fn index(&self) -> usize {
-            0
-        }
-    }
-    pub fn lookup(_name: &str) -> Option<usize> {
-        None
-    }
-    pub fn add_ephemeral(_tape: &str, _parent: usize) -> Result<Fresh, &'static str> {
-        Err("no network interfaces on aarch64 yet")
-    }
-    pub fn queue(_line: &str) {}
-    pub fn command<'a>(_words: impl Iterator<Item = &'a str> + Clone) {
-        super::missing("vnic");
-    }
-}
-
-pub mod service {
-    pub fn poll() {}
-    pub fn command<'a>(_words: impl Iterator<Item = &'a str> + Clone) {
-        super::missing("service");
-    }
-}
-
 pub mod audioshell {
     pub fn command(_words: words!()) {
         super::missing("audio");
-    }
-}
-
-pub mod usbshell {
-    pub fn command(_words: words!()) {
-        super::missing("usb");
-    }
-}
-
-pub mod usb {
-    pub fn poll() {}
-    pub fn storage_read(_device: usize, _lba: u64, _buffer: &mut [u8]) -> Result<(), ()> {
-        Err(())
-    }
-    pub fn storage_write(_device: usize, _lba: u64, _buffer: &[u8]) -> Result<(), ()> {
-        Err(())
     }
 }
 

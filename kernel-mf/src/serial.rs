@@ -103,11 +103,9 @@ impl Write for Serial {
             return Ok(());
         }
         crate::log::push(text);
+        crate::net::relay(text);
         #[cfg(target_arch = "x86_64")]
-        {
-            crate::net::relay(text);
-            crate::fb::write_str(text);
-        }
+        crate::fb::write_str(text);
         for byte in text.bytes() {
             if byte == b'\n' {
                 put(b'\r');

@@ -17,7 +17,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kernel_core::nic::{self, Nic};
 use kernel_core::nicctl;
-use kernel_core::{e1000, netdump::Mac, pci, rtl8139, rtl8168, threecom};
+use kernel_core::{e1000, netdump::Mac, pci, rtl8139, rtl8168, threecom, virtio_net};
 
 use crate::time::{self, TICK_HZ};
 use crate::sync::SpinLock;
@@ -171,8 +171,20 @@ pub fn init() {
             Err(error) => println!("3c905 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
         }
     }
+    for device in pci::devices().filter(|d| d.vendor == virtio_net::VENDOR_VIRTIO && virtio_net::DEVICE_IDS.contains(&d.id)) {
+        match virtio_net::VirtioNet::init(&device, interfaces) {
+            Ok(nic) => {
+                println!("virtio-net at {:02x}:{:02x}.{}: MAC {}, link {}.", device.bus, device.device, device.function, Mac(&nic.mac), if nic.link_up() { "up" } else { "down" });
+                if nic::install(Nic::Virtio(nic)).is_some() {
+                    locate(interfaces, &device);
+                    interfaces += 1;
+                }
+            }
+            Err(error) => println!("virtio-net at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
+        }
+    }
     if interfaces == 0 {
-        println!("No supported network interface found (e1000, e1000e, I350, RTL8139, RTL8168 and 3c905 are driven).");
+        println!("No supported network interface found (e1000, e1000e, I350, RTL8139, RTL8168, 3c905 and virtio-net are driven).");
     }
 }
 

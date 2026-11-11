@@ -357,7 +357,7 @@ impl Env for Mf {
     }
     fn seed(&self) -> [u8; 16] {
         let mut seed = [0u8; 16];
-        seed[0..8].copy_from_slice(&unsafe { core::arch::x86_64::_rdtsc() }.to_le_bytes());
+        seed[0..8].copy_from_slice(&crate::arch::cycle_counter().to_le_bytes());
         seed[8..16].copy_from_slice(&time::micros().to_le_bytes());
         seed
     }

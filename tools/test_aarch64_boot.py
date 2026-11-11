@@ -24,9 +24,11 @@ def check(condition, message, text=""):
     print(f"PASS: {message}")
 
 
-def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] = (), usb_keys: tuple[str, ...] = (), during: tuple | None = None, steps: tuple[tuple[str, str], ...] = (), sd: bool = False, fat: bool = False, usb: bool = False, big: bool = False) -> str:
+def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] = (), usb_keys: tuple[str, ...] = (), during: tuple | None = None, steps: tuple[tuple[str, str], ...] = (), sd: bool = False, fat: bool = False, usb: bool = False, big: bool = False, wire=None) -> str:
     """Boots `image` under QEMU virt + AAVMF + ramfb and returns the serial text. The kernel parks, so the run ends
-    when the parking message shows (or after 60 s); a PPM screenshot goes to `screendump` when given."""
+    when the parking message shows (or after 60 s); a PPM screenshot goes to `screendump` when given. `wire` is a function
+    called with the host's end of the guest's multicast network (`test_boot.Wire`) once the shell is up; the guest's NIC
+    (virtio-net) is then on that network instead of QEMU's user-mode one."""
     if not shutil.which("qemu-system-aarch64") or not Path(CODE).exists():
         raise SystemExit("qemu-system-aarch64 or the AAVMF firmware is missing (apt install qemu-system-arm qemu-efi-aarch64)")
     with tempfile.TemporaryDirectory() as scratch:
@@ -61,12 +63,16 @@ def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] 
                 stick = ["-device", "usb-storage,drive=fat,bus=xhci.0"]
             else:
                 disk += ["-device", "virtio-blk-pci,drive=fat"]
+        nic = []
+        if wire is not None:
+            from test_boot import MCAST_GROUP, MCAST_PORT
+            nic = ["-nic", "none", "-netdev", f"socket,id=net0,mcast={MCAST_GROUP}:{MCAST_PORT}", "-device", "virtio-net-pci,netdev=net0,mac=52:54:00:12:34:7b"]
         with open(log, "wb") as out:
             qemu = subprocess.Popen(
                 ["qemu-system-aarch64", "-machine", "virt", "-cpu", "cortex-a72", "-m", "1G", "-display", "none", "-device", "ramfb",
                  "-serial", "stdio", "-no-reboot", "-monitor", f"unix:{monitor},server,nowait",
                  "-drive", f"if=pflash,format=raw,readonly=on,file={CODE}", "-drive", f"if=pflash,format=raw,file={variables}",
-                 *disk, "-device", "qemu-xhci,id=xhci", "-device", "usb-kbd", *stick],
+                 *disk, "-device", "qemu-xhci,id=xhci", "-device", "usb-kbd", *stick, *nic],
                 stdin=subprocess.PIPE, stdout=out, stderr=subprocess.STDOUT)
             try:
                 def wait_for(count: int) -> None:
@@ -83,6 +89,9 @@ def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] 
                     qemu.stdin.write(command.encode() + b"\r")
                     qemu.stdin.flush()
                     wait_for(number)
+                if wire is not None:
+                    from test_boot import Wire
+                    wire(Wire())
                 for text, marker in steps:
                     # Interactive input for a running tape: typed a byte at a time (the PL011 FIFO is 16 deep), then wait for `marker`.
                     start = len(log.read_bytes())

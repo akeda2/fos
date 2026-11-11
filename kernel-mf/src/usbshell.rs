@@ -2,7 +2,11 @@
 //! (a stick that came back gets its old disk number, a new keyboard or stick is picked up). Hot-unplug itself needs no command: the
 //! drivers notice a vanished device on the next transfer or rescan.
 
-use kernel_core::{usb_hid, usb_serial, usb_hub};
+#[cfg(target_arch = "x86_64")]
+use kernel_core::usb_hid;
+#[cfg(target_arch = "aarch64")]
+use kernel_core::usb_kbd as usb_hid;
+use kernel_core::{usb_hub, usb_serial};
 
 /// Same wrapper as `audioshell::command`: the drivers wait on timer ticks (interrupts on), on CPU 0, under the USB lock.
 pub fn command(words: core::str::SplitWhitespace) {
@@ -20,6 +24,7 @@ fn run(mut words: core::str::SplitWhitespace) {
     match words.next() {
         None => {
             usb_hub::describe_xhci(&|arguments| println!("{}", arguments));
+            #[cfg(target_arch = "x86_64")]
             usb_hid::describe_other_controllers(|arguments| println!("{}", arguments));
             usb_serial::describe();
             println!("{} USB keyboard(s), {} reports so far", usb_hid::keyboard_count(), usb_hid::reports_seen());

@@ -108,6 +108,11 @@ pub fn micros() -> u64 {
     apic::micros()
 }
 
+/// A free-running counter, only good for mixing into seeds and timing short spans (the TSC).
+pub fn cycle_counter() -> u64 {
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
 pub fn busy_wait_ms(ms: u64) {
     apic::busy_wait_ms(ms)
 }
