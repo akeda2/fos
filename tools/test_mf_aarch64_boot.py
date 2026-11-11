@@ -15,7 +15,7 @@ IMAGE = Path(os.environ.get("FOSFOR_IMAGE", base.ROOT / "build/fosfor-mf-aarch64
 
 def main() -> None:
     text = base.boot(IMAGE)
-    base.check("server kernel (mf, aarch64)" in text, "the mf kernel starts on aarch64", text)
+    base.check("server kernel (mf, slice 8): running from the UEFI loader at EL" in text, "the mf kernel starts on aarch64", text)
     base.check("Physical memory:" in text, "the physical allocator is up", text)
     base.check("Page tables: loaded" in text, "the MMU is on with our page tables", text)
     base.check("Heap: self-test passed" in text, "the heap works", text)

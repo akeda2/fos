@@ -14,7 +14,7 @@ With `--swapgs` (the server kernel, which runs ring 3 code) `isr_common` swaps t
 (CS RPL != 0), so user code can never leave its own GS base in the kernel's hands; `isr_common_body` is the entry for code
 that has already done the swap itself (the `syscall` stub):
 
-    python3 tools/gen_isr_stubs.py --swapgs > kernel-mf/src/isr_stubs.S
+    python3 tools/gen_isr_stubs.py --swapgs > kernel-mf/src/arch/x86_64/isr_stubs.S
 """
 
 import sys
