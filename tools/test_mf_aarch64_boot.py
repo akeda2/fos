@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Server kernel (mf) on aarch64, first slice: the aarch64 UEFI loader (QEMU virt + AAVMF) starts it, and it reaches
-the end of boot and the serial shell: physical memory, the MMU page tables, the heap self-test, GIC timer ticks and the scheduler self-tests.
+the end of boot and the serial shell: PCI, the virtio disk and its FOSFS volume, physical memory, the MMU page tables, the heap self-test, GIC timer ticks and the scheduler self-tests.
 Run `make test-mf-aarch64-boot`."""
 import os
 import re
@@ -24,6 +24,10 @@ def main() -> None:
     base.check("Scheduler: 3 kernel threads took 15 interleaved steps" in text and " 0 stack frame(s) not returned" in text, "kernel threads switch and their stacks are returned", text)
     base.check("preemption ok" in text and "sleep ok" in text and "mutex ok" in text, "timer preemption, sleep and mutex work", text)
     base.check("reached the end of boot" in text, "boot reaches its end", text)
+    base.check("PCI: config space at" in text and "MSI: GICv2m frame" in text, "PCI (ECAM) and MSI are up", text)
+    base.check("00:02.0 1af4:1001" in text, "PCI lists the virtio disk", text)
+    base.check("disk1: " in text and "(virtio 0)" in text, "the virtio disk is found", text)
+    base.check("FOSFS: mounted on disk1" in text, "the boot disk's FOSFS volume is mounted", text)
     base.check("fos> " in text, "the shell prompt appears on the serial console", text)
     base.check("server kernel (mf)" in text.split("fos> ", 1)[-1], "`version` answers", text)
     base.check("implementer" in text and "features" in text, "`cpuinfo` reads the ID registers", text)

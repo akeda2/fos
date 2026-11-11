@@ -54,7 +54,6 @@ until_ported! {
     mod install;
     #[path = "../../kernel/src/bootcode.rs"]
     mod bootcode;
-    use kernel_core::pci;
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -79,7 +78,7 @@ mod kup_serial;
 mod slots;
 mod block;
 mod storage;
-use kernel_core::{fatvol, fosfs, gpt};
+use kernel_core::{fatvol, fosfs, gpt, pci};
 
 use alloc::{boxed::Box, collections::BTreeMap, string::String, vec::Vec};
 use core::panic::PanicInfo;
@@ -205,7 +204,26 @@ fn boot_services(info: &BootInfo, century: u8) -> ! {
 /// network, USB) follow, and with them the config files and the slot metadata that need a disk.
 #[cfg(target_arch = "aarch64")]
 fn boot_services(info: &BootInfo, _century: u8) -> ! {
+    // Device drivers: `kernel-core` reaches the machine through the platform. The config-space window comes from the ACPI MCFG
+    // table (QEMU virt) or is the Pi 4's own controller.
+    platform::install();
+    match arch::pci_config::init(info.acpi_rsdp) {
+        Some((base, kind)) => println!("PCI: config space at {base:#x}: {kind}."),
+        None => println!("PCI: no config-space window (no MCFG, not a Pi 4)."),
+    }
+    println!("PCI: {} function(s) on bus 0.", pci::scan());
+    println!("MSI: {}.", arch::msi::init());
+    for device in pci::devices() {
+        println!("  {:02x}:{:02x}.{} {:04x}:{:04x} {} (class {:02x}{:02x}, interface {:02x})", device.bus, device.device, device.function, device.vendor, device.id, pci::class_name(device.class, device.subclass), device.class, device.subclass, device.interface);
+    }
+    storage::init(info);
+    if let Some(disk) = storage::boot_disk() {
+        slots::init(info, disk);
+    }
     debug::init(info.crash_count);
+    debug::report_previous_crash();
+    config::load();
+    slots::confirm_boot();
     selftest::run();
     sched::spawn("service", service_thread, 0).expect("the service thread");
     println!("kernel-mf: slice 8 reached the end of boot; entering the service loop.");

@@ -72,6 +72,13 @@ pub mod cpu {
     }
 }
 
+// PCI configuration space (ECAM from the ACPI MCFG table, or the Pi 4's controller) and MSI delivery (GICv2m, or the Pi 4's block).
+#[path = "../../../../kernel/src/arch/aarch64/pci_config.rs"]
+pub mod pci_config;
+#[path = "../../../../kernel/src/arch/aarch64/msi.rs"]
+pub mod msi;
+pub mod platform;
+
 pub mod context;
 pub mod cpuinfo;
 pub mod mmu;

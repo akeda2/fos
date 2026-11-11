@@ -65,6 +65,11 @@ pub fn init(info: &BootInfo) {
         let origin = Origin::new("NVMe", controller, None);
         block::register(Backend::Nvme(drive), drive.sectors, drive.model, origin.as_str());
     });
+    #[cfg(target_arch = "aarch64")]
+    kernel_core::virtio_blk::init_all(|drive, index| {
+        let origin = Origin::new("virtio", index, None);
+        block::register(Backend::Virtio(drive), drive.sectors, drive.model(), origin.as_str());
+    });
     if block::count() == 0 {
         println!("Storage: no disks found ({sata} SATA, {nvme} NVMe).");
         return;
