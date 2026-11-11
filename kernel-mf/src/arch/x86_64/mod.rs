@@ -21,6 +21,7 @@ pub mod platform;
 pub mod smp;
 pub mod tlb;
 pub mod trap;
+pub mod usermode;
 
 pub use apic::ioapic;
 pub use context::{WAKE_VECTOR, end_wake_interrupt, prepare_stack, send_wake_ipi, switch};
@@ -162,7 +163,7 @@ pub fn init_interrupts() {
     activate(0, &raw const __ist_top as u64);
     idt::build();
     idt::load();
-    process::init_cpu();
+    usermode::init_cpu();
     crate::fpu::init_cpu();
     let before = trap::BREAKPOINTS.load(core::sync::atomic::Ordering::Relaxed);
     unsafe { core::arch::asm!("int3") };

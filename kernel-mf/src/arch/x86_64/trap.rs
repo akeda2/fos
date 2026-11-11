@@ -32,6 +32,33 @@ pub struct Frame {
     pub ss: u64,
 }
 
+impl Frame {
+    /// The system call number of a `syscall` frame (rax).
+    pub fn syscall_number(&self) -> u64 {
+        self.rax
+    }
+
+    /// System call argument `index` (0-5), as System V passes them; the `syscall` stubs move the fourth from rcx to r10.
+    pub fn arg(&self, index: usize) -> u64 {
+        [self.rdi, self.rsi, self.rdx, self.r10, self.r8, self.r9][index]
+    }
+
+    pub fn set_result(&mut self, value: u64) {
+        self.rax = value;
+    }
+
+    /// Where the seventh and later arguments of a call start in user memory: one word past the return address the stub's
+    /// caller pushed.
+    pub fn stack_args(&self) -> u64 {
+        self.rsp + 8
+    }
+
+    /// What killed a process from ring 3: the exception vector and the address involved (the page fault address, else the rip).
+    pub fn fault(&self) -> (u64, u64) {
+        (self.vector, if self.vector == 14 { cpu::read_cr2() } else { self.rip })
+    }
+}
+
 pub fn exception_name(vector: u64) -> &'static str {
     match vector {
         0 => "#DE divide error",
@@ -73,7 +100,7 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
         kernel_fault_on_user_address(frame);
     }
     match frame.vector {
-        crate::process::SYSCALL_VECTOR => crate::process::syscall(frame),
+        crate::usermode::SYSCALL_VECTOR => crate::process::syscall(frame),
         3 => {
             BREAKPOINTS.fetch_add(1, Ordering::Relaxed);
             println!("Breakpoint exception at {:#x}: handled, execution continues.", frame.rip);

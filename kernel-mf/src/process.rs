@@ -23,15 +23,8 @@ use alloc::vec::Vec;
 
 use crate::sync::SpinLock;
 use crate::trap::Frame;
-use crate::{cpu, gdt, pmm, sched, time, vm};
-
-const MSR_EFER: u32 = 0xc000_0080;
-const MSR_STAR: u32 = 0xc000_0081;
-const MSR_LSTAR: u32 = 0xc000_0082;
-const MSR_SFMASK: u32 = 0xc000_0084;
-
-/// A vector number no CPU delivers: what the `syscall` stub puts in `Frame::vector`.
-pub const SYSCALL_VECTOR: u64 = 0x1000;
+use crate::{cpu, pmm, sched, time, vm};
+pub use crate::usermode::user_access;
 
 /// Where a process's code is mapped, and the top of its stack. The stack sits just under the tape shim (`tapeapi::SHIM_BASE`,
 /// 32 MiB up), with one unmapped page between them, so an image can be about 32 MiB.
@@ -44,97 +37,6 @@ const STACK_PAGES: u64 = 1024;
 /// it), so running off the end is a page fault that kills only the process.
 pub const STACK_BYTES: u64 = STACK_PAGES * 4096;
 const WRITE_LIMIT: u64 = 4096;
-
-core::arch::global_asm!(
-    r#"
-    .text
-    .global syscall_entry
-syscall_entry:
-    swapgs
-    mov gs:[8], rsp                  # Cpu::scratch_rsp
-    mov rsp, gs:[16]                 # Cpu::kernel_rsp
-    push 0x1b                        # ss  (user data)
-    push qword ptr gs:[8]            # the user's rsp
-    push r11                         # rflags, as syscall saved it
-    push 0x23                        # cs  (user code)
-    push rcx                         # rip, as syscall saved it
-    push 0                           # error code
-    push 0x1000                      # SYSCALL_VECTOR
-    jmp isr_common_body              # GS is already the kernel's: skip the stub's swapgs
-
-    .global enter_user_mode
-enter_user_mode:                     # (rdi = entry, rsi = user stack top, rdx, rcx = arguments): never returns
-    cli                              # between swapgs and iretq an interrupt would find the wrong GS
-    push 0x1b
-    push rsi
-    push 0x202                       # IF on
-    push 0x23
-    push rdi
-    mov rdi, rdx                     # the entry's first two arguments
-    mov r8, rcx
-    xor eax, eax
-    xor ebx, ebx
-    xor ecx, ecx
-    xor edx, edx
-    xor esi, esi
-    xor ebp, ebp
-    xor r9d, r9d
-    xor r10d, r10d
-    xor r11d, r11d
-    xor r12d, r12d
-    xor r13d, r13d
-    xor r14d, r14d
-    xor r15d, r15d
-    mov rsi, r8
-    xor r8d, r8d
-    swapgs
-    iretq
-"#
-);
-
-unsafe extern "C" {
-    fn syscall_entry();
-    fn enter_user_mode(entry: u64, stack_top: u64, argument: u64, second: u64) -> !;
-}
-
-/// Per CPU: `syscall` on, SMEP on, and the entry point and flag mask set.
-pub fn init_cpu() {
-    cpu::write_msr(MSR_EFER, cpu::read_msr(MSR_EFER) | 1); // SCE
-    // STAR: bits 47:32 the kernel CS (SS is the next descriptor); 63:48 the base `sysret` derives the user selectors from.
-    cpu::write_msr(MSR_STAR, u64::from(0x10u16) << 48 | u64::from(gdt::KERNEL_CODE) << 32);
-    cpu::write_msr(MSR_LSTAR, syscall_entry as usize as u64);
-    cpu::write_msr(MSR_SFMASK, 0x200 | 0x100 | 0x400 | 0x4_0000); // IF, TF, DF, AC
-    let features = cpu::cpuid(7, 0).1;
-    // CR4 bit 20 SMEP (no execution of user pages), bit 21 SMAP (no access to them unless RFLAGS.AC is set: `user_access`).
-    let wanted = (features & (1 << 7) != 0) as u64 * (1 << 20) | (features & (1 << 20) != 0) as u64 * (1 << 21);
-    if wanted != 0 {
-        unsafe {
-            let cr4: u64;
-            core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
-            core::arch::asm!("mov cr4, {}", in(reg) cr4 | wanted, options(nomem, nostack, preserves_flags));
-        }
-    }
-    if features & (1 << 20) != 0 && !SMAP_ON.swap(true, core::sync::atomic::Ordering::AcqRel) {
-        println!("SMAP: the kernel reaches user memory only through stac/clac windows (copy_to_user, user_bytes, gfx_blit).");
-    }
-}
-
-/// Set once the CPUs run with CR4.SMAP (they all have the same features); `stac`/`clac` are #UD without it.
-static SMAP_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-
-/// Runs `f`, which touches user memory, with SMAP's check lifted (RFLAGS.AC set) for exactly that long. Callers check the range
-/// first (`vm::user_range_ok`). An interrupt clears AC on entry and `iretq` restores it, so a preemption inside is safe.
-pub fn user_access<R>(f: impl FnOnce() -> R) -> R {
-    let on = SMAP_ON.load(core::sync::atomic::Ordering::Relaxed);
-    if on {
-        unsafe { core::arch::asm!("stac", options(nostack)) };
-    }
-    let result = f();
-    if on {
-        unsafe { core::arch::asm!("clac", options(nostack)) };
-    }
-    result
-}
 
 pub use crate::sched::How;
 
@@ -274,7 +176,7 @@ extern "C" fn user_thread(launch: usize) {
     sched::set_pid(launch.pid);
     let (entry, argument, second, stack) = (launch.entry, launch.argument, launch.second, launch.stack);
     drop(launch);
-    unsafe { enter_user_mode(entry, stack, argument, second) }
+    crate::usermode::enter(entry, stack, argument, second)
 }
 
 /// The kernel thread of an extra user thread: its process (pid, address space) already exists.
@@ -282,7 +184,7 @@ extern "C" fn extra_thread(launch: usize) {
     let launch = unsafe { Box::from_raw(launch as *mut Launch) };
     let (entry, argument, second, stack) = (launch.entry, launch.argument, launch.second, launch.stack);
     drop(launch);
-    unsafe { enter_user_mode(entry, stack, argument, second) }
+    crate::usermode::enter(entry, stack, argument, second)
 }
 
 /// Starts another thread in the calling process: it runs `entry(argument)` on the user stack ending at `stack_top`, through
@@ -338,8 +240,8 @@ fn leave(how: Option<How>) -> ! {
 
 /// A CPU exception from ring 3: only the process dies.
 pub fn fault(frame: &Frame) -> ! {
-    let address = if frame.vector == 14 { cpu::read_cr2() } else { frame.rip };
-    terminate(How::Fault(frame.vector, address))
+    let (class, address) = frame.fault();
+    terminate(How::Fault(class, address))
 }
 
 /// Called on the way out of every interrupt or system call from ring 3.
@@ -398,31 +300,35 @@ pub fn note_screen_open() {
     SCREEN_OWNER.store(sched::current_pid(), core::sync::atomic::Ordering::Relaxed);
 }
 
-/// A system call: the number is in rax, the arguments in rdi and rsi; the result goes back in rax.
+/// A system call: the number and arguments are where the CPU's calling convention puts them (`Frame`); the result goes back
+/// the same way.
 pub fn syscall(frame: &mut Frame) {
-    if frame.rax >= crate::tapeapi::CALL_BASE {
+    let number = frame.syscall_number();
+    if number >= crate::tapeapi::CALL_BASE {
         crate::tapeapi::call(frame);
         return;
     }
-    frame.rax = match frame.rax {
-        0 => match user_bytes(frame.rdi, frame.rsi) {
+    let (a, b) = (frame.arg(0), frame.arg(1));
+    let result = match number {
+        0 => match user_bytes(a, b) {
             Some(bytes) => {
                 console_write(&bytes);
                 bytes.len() as u64
             }
             None => u64::MAX,
         },
-        1 => terminate(How::Exited(frame.rdi as i64)),
+        1 => terminate(How::Exited(a as i64)),
         2 => {
             sched::yield_now();
             0
         }
         3 => {
-            sched::sleep_ticks(frame.rdi.min(1000));
+            sched::sleep_ticks(a.min(1000));
             0
         }
         4 => time::ticks(),
         5 => thread_exit(),
         _ => u64::MAX,
     };
+    frame.set_result(result);
 }

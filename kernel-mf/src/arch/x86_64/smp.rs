@@ -109,7 +109,7 @@ extern "sysv64" fn ap_main(index: u64) -> ! {
     let cpu = percpu::get(index as usize);
     crate::arch::activate(index as usize, cpu.arch.ist_top);
     idt::load();
-    crate::process::init_cpu();
+    crate::usermode::init_cpu();
     crate::fpu::init_cpu();
     cpu::pat_init();
     apic::enable_this_cpu();

@@ -331,9 +331,9 @@ fn free_pages_at(address: u64, bytes: u64) {
 
 /// One table call from ring 3: `slot` is the stub's number minus `CALL_BASE`, the arguments are as System V passes them.
 pub fn call(frame: &mut Frame) {
-    let number = frame.rax - CALL_BASE;
-    let (a, b, c, d, e) = (frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8);
-    frame.rax = match number {
+    let number = frame.syscall_number() - CALL_BASE;
+    let (a, b, c, d, e) = (frame.arg(0), frame.arg(1), frame.arg(2), frame.arg(3), frame.arg(4));
+    let result = match number {
         PUTC => {
             if a < 0x80 {
                 print!("{}", a as u8 as char);
@@ -464,7 +464,7 @@ pub fn call(frame: &mut Frame) {
         RANDOM => {
             // Filled in kernel memory and then copied: a direct write into user pages faults under SMAP.
             if b > 4096 {
-                return frame.rax = 0;
+                return frame.set_result(0);
             }
             let mut bytes = alloc::vec![0u8; b as usize];
             let strong = kernel_core::random::fill(&mut bytes);
@@ -532,15 +532,16 @@ pub fn call(frame: &mut Frame) {
             0
         }
         GFX_FILL => u64::from(fb::gfx_fill(a as u32, b as u32, c as u32, d as u32, e as u32)),
-        GFX_FILL_ON if a == 0 => u64::from(fb::gfx_fill(b as u32, c as u32, d as u32, e as u32, frame.r9 as u32)),
-        GFX_BLIT => blit(a as u32, b as u32, c as u32, d as u32, e, frame.r9),
+        GFX_FILL_ON if a == 0 => u64::from(fb::gfx_fill(b as u32, c as u32, d as u32, e as u32, frame.arg(5) as u32)),
+        GFX_BLIT => blit(a as u32, b as u32, c as u32, d as u32, e, frame.arg(5)),
         // The seventh argument (stride) is on the user's stack, above the return address the stub's caller pushed.
-        GFX_BLIT_ON if a == 0 => match process::user_u64(frame.rsp + 8) {
-            Some(stride) => blit(b as u32, c as u32, d as u32, e as u32, frame.r9, stride),
+        GFX_BLIT_ON if a == 0 => match process::user_u64(frame.stack_args()) {
+            Some(stride) => blit(b as u32, c as u32, d as u32, e as u32, frame.arg(5), stride),
             None => 0,
         },
         _ => 0,
     };
+    frame.set_result(result);
 }
 
 /// `gfx_blit`: `pixels` (rdi-style argument 5) and `stride` (argument 6) are checked as user memory before the copy.
