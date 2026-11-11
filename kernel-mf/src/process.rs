@@ -23,7 +23,7 @@ use alloc::vec::Vec;
 
 use crate::sync::SpinLock;
 use crate::trap::Frame;
-use crate::{apic, cpu, gdt, pmm, sched, vm};
+use crate::{cpu, gdt, pmm, sched, time, vm};
 
 const MSR_EFER: u32 = 0xc000_0080;
 const MSR_STAR: u32 = 0xc000_0081;
@@ -421,7 +421,7 @@ pub fn syscall(frame: &mut Frame) {
             sched::sleep_ticks(frame.rdi.min(1000));
             0
         }
-        4 => apic::ticks(),
+        4 => time::ticks(),
         5 => thread_exit(),
         _ => u64::MAX,
     };

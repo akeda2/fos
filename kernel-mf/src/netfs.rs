@@ -12,7 +12,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use kernel_core::{fosfs, tape_fs, volumes};
 
-use crate::apic;
+use crate::time;
 use crate::net;
 use crate::sync::SpinLock;
 use crate::tapefs;
@@ -119,7 +119,7 @@ fn name_of(bytes: &[u8]) -> &[u8] {
 }
 
 pub fn busy(source: &[u8; 6]) -> bool {
-    let other_put = put().as_ref().is_some_and(|put| put.source != *source && apic::ticks().wrapping_sub(put.last_activity) < STALE_TICKS);
+    let other_put = put().as_ref().is_some_and(|put| put.source != *source && time::ticks().wrapping_sub(put.last_activity) < STALE_TICKS);
     other_put || net::kup_busy()
 }
 
@@ -174,15 +174,15 @@ pub fn stream(index: usize, source: &[u8; 6], data: &[u8], what: &str) {
     reply(index, source, TAG_GET_START, &start);
     println!("NETFS: sending {what} ({} bytes) to {}.", data.len(), kernel_core::netdump::Mac(source));
     // The receiver reads from a finite ring: one chunk a millisecond is a pace real hardware keeps up with.
-    let mut next = apic::micros();
+    let mut next = time::micros();
     for (sequence, chunk) in data.chunks(CHUNK).enumerate() {
         let mut frame = [0u8; 4 + CHUNK];
         frame[0..4].copy_from_slice(&(sequence as u32).to_le_bytes());
         frame[4..4 + chunk.len()].copy_from_slice(chunk);
-        while apic::micros() < next {
+        while time::micros() < next {
             core::hint::spin_loop();
         }
-        next = apic::micros() + 1000;
+        next = time::micros() + 1000;
         reply(index, source, TAG_GET_DATA, &frame[..4 + chunk.len()]);
         crate::debug::pet();
     }
@@ -217,7 +217,7 @@ fn put_request(index: usize, source: [u8; 6], payload: &[u8]) {
         return fail(TOO_LARGE);
     }
     println!("NETFS: receiving {} ({expected} bytes) from {}.", core::str::from_utf8(name).unwrap_or("?"), kernel_core::netdump::Mac(&source));
-    *put() = Some(Put { source, disk: usize::from(payload[0]), name: name.to_vec(), expected, checksum, next_sequence: 0, last_activity: apic::ticks(), data });
+    *put() = Some(Put { source, disk: usize::from(payload[0]), name: name.to_vec(), expected, checksum, next_sequence: 0, last_activity: time::ticks(), data });
 }
 
 fn put_data(source: [u8; 6], payload: &[u8]) {
@@ -235,7 +235,7 @@ fn put_data(source: [u8; 6], payload: &[u8]) {
     let take = (payload.len() - 4).min(CHUNK).min(state.expected - state.data.len());
     state.data.extend_from_slice(&payload[4..4 + take]);
     state.next_sequence += 1;
-    state.last_activity = apic::ticks();
+    state.last_activity = time::ticks();
 }
 
 fn put_stop(index: usize, source: [u8; 6]) {

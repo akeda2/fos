@@ -29,6 +29,36 @@ pub mod pl011;
 pub mod timer;
 #[path = "../../../../kernel/src/arch/aarch64/cpu.rs"]
 mod cpu_arch;
+// PSCI on QEMU, the BCM2711 power-management watchdog on a Pi 4 (see the file's header).
+#[path = "../../../../kernel/src/arch/aarch64/power.rs"]
+mod power_arch;
+
+pub mod power {
+    pub use super::power_arch::{crash_reset, reset};
+    pub fn shutdown() {
+        super::power_arch::off()
+    }
+}
+
+/// The hardware watchdog: the Pi 4's PM_WDOG could serve (it is what `power` resets with) but is not wired up yet.
+pub mod hwwd {
+    pub fn start(_seconds: u32) -> Result<&'static str, &'static str> {
+        Err("not implemented on aarch64")
+    }
+    pub fn reload() {}
+    pub fn stop() {}
+    pub fn running() -> bool {
+        false
+    }
+}
+
+/// The crash record (a RAM page the next boot reads) is x86-only so far: nothing is written or reported.
+pub mod crashrec {
+    use crate::trap::Frame;
+    pub fn init() {}
+    pub fn record_crash(_frame: &Frame) {}
+    pub fn report_previous_crash() {}
+}
 
 pub mod cpu {
     pub use super::cpu_arch::*;
@@ -43,6 +73,7 @@ pub mod cpu {
 }
 
 pub mod context;
+pub mod cpuinfo;
 pub mod mmu;
 mod percpu_arch;
 pub use context::{end_wake_interrupt, prepare_stack, send_wake_ipi, switch};
@@ -71,6 +102,10 @@ pub mod tlb {
         SHOOTDOWNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
 }
+
+// The embedded kernel's wall clock: no RTC on the Pi, so it is unset until `date set` (or a time source) gives it a base.
+#[path = "../../../../kernel/src/clock.rs"]
+pub mod clock;
 
 /// What the shared aarch64 files ask of the embedded kernel's `memory` module.
 pub mod memory {
@@ -135,6 +170,11 @@ core::arch::global_asm!(
     "#
 );
 
+/// `debug crash`: a deliberate fault (an undefined instruction).
+pub fn crash_now() {
+    unsafe { core::arch::asm!("udf #0") };
+}
+
 pub fn halt() -> ! {
     cpu::halt()
 }
@@ -142,6 +182,8 @@ pub fn halt() -> ! {
 pub fn wait_for_interrupt() {
     cpu::sleep()
 }
+
+pub use timer::TICK_HZ;
 
 pub fn ticks() -> u64 {
     gic::irq_ticks()

@@ -2,7 +2,7 @@
 //! pointer checks, exception containment and preemption of user code.
 
 use crate::process::{self, How};
-use crate::{apic, fpu, pmm, sched};
+use crate::{fpu, pmm, sched, time};
 
 core::arch::global_asm!(
     r#"
@@ -248,8 +248,8 @@ pub fn run() {
     let avx = (fpu::level() == fosfor_abi::tape::FP_AVX2)
         .then(|| process::spawn("avx", blob(unsafe { &user_avx_start }, unsafe { &user_avx_end })).expect("avx process"));
     let expected = 7 + fp_ids.len() + usize::from(avx.is_some());
-    let start = apic::ticks();
-    while apic::ticks() - start < 4 {
+    let start = time::ticks();
+    while time::ticks() - start < 4 {
         halt_a_tick();
     }
     sched::kill(spin);

@@ -17,7 +17,7 @@ use core::mem::{offset_of, size_of};
 use fosfor_abi::tape::{KEY_BASE, KEY_NONE, TAPE_API_VERSION, TapeApi};
 
 use crate::trap::Frame;
-use crate::{threads, apic, fb, fpu, pmm, process, sched, tapeaudio, tapefs, tapenet, tapeserial, tapesys, vm};
+use crate::{threads, time, fb, fpu, pmm, process, sched, tapeaudio, tapefs, tapenet, tapeserial, tapesys, vm};
 
 pub const SHIM_BASE: u64 = vm::USER_BASE + 0x200_0000;
 pub const TABLE_BASE: u64 = SHIM_BASE + 0x1000;
@@ -356,8 +356,8 @@ pub fn call(frame: &mut Frame) {
             sched::sleep_ticks(1);
             0
         }
-        TICKS => apic::ticks(),
-        MICROS => apic::micros(),
+        TICKS => time::ticks(),
+        MICROS => time::micros(),
         ALLOC => alloc_pages(a),
         FREE => {
             free_pages_at(a, b);

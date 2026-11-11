@@ -19,7 +19,7 @@ use kernel_core::nic::{self, Nic};
 use kernel_core::nicctl;
 use kernel_core::{e1000, netdump::Mac, pci, rtl8139, rtl8168, threecom};
 
-use crate::apic::{self, TICK_HZ};
+use crate::time::{self, TICK_HZ};
 use crate::sync::SpinLock;
 use crate::{config, netfs, pmm, power, sched, shell, slots, vm};
 
@@ -241,7 +241,7 @@ pub fn send_frame(index: usize, destination: &[u8; 6], tag: u8, payload: &[u8]) 
 /// True while a kernel update is arriving (NETFS then refuses a transfer: both want the disk and the NIC).
 pub fn kup_busy() -> bool {
     let kup = kup();
-    kup.active && apic::ticks().wrapping_sub(kup.last_activity) < KUP_STALE_TICKS
+    kup.active && time::ticks().wrapping_sub(kup.last_activity) < KUP_STALE_TICKS
 }
 
 /// The name announced for interface `index`: `NAMEvnic` on a virtual interface, else `NAME<n>` from the `hostname` file (n is the one-based interface number), or
@@ -275,11 +275,11 @@ static mut NEXT_ANNOUNCE: u64 = 0;
 /// Broadcasts this machine's name on every interface that has a link: four times at one second, then every 10 s.
 fn announce() {
     unsafe {
-        if apic::ticks() < NEXT_ANNOUNCE {
+        if time::ticks() < NEXT_ANNOUNCE {
             return;
         }
         ANNOUNCE_COUNT = ANNOUNCE_COUNT.saturating_add(1);
-        NEXT_ANNOUNCE = apic::ticks() + if ANNOUNCE_COUNT <= 4 { 1 } else { 10 } * TICK_HZ;
+        NEXT_ANNOUNCE = time::ticks() + if ANNOUNCE_COUNT <= 4 { 1 } else { 10 } * TICK_HZ;
     }
     for index in 0..nic::count() {
         // virtual interfaces do not announce: their host is already known through its physical NIC
@@ -418,7 +418,7 @@ fn end_foreground_tape(slot: usize) {
 
 /// Service loop: closes the sessions of clients that pinged and then went silent.
 fn expire_silent_clients() {
-    let now = apic::ticks();
+    let now = time::ticks();
     for slot in 0..TERMINAL_SLOTS {
         let gone = {
             let terminals = TERMINALS.lock();
@@ -442,7 +442,7 @@ fn claim_terminal(index: usize, source: [u8; 6]) -> Option<usize> {
     if let Some(slot) = find_terminal(index, source) {
         return Some(slot);
     }
-    let now = apic::ticks();
+    let now = time::ticks();
     let mut terminals = TERMINALS.lock();
     let slot = terminals.iter().position(|terminal| !terminal.open()).or_else(|| {
         let (slot, oldest) = terminals.iter().enumerate().filter(|(_, terminal)| terminal.owner == 0).min_by_key(|(_, terminal)| terminal.activity)?;
@@ -476,7 +476,7 @@ fn handle_terminal(index: usize, source: [u8; 6], tag: u8, payload: &[u8]) -> bo
             let Some(slot) = find_terminal(index, source) else { return false };
             // The frame has no length field and Ethernet pads a short frame with zeros: drop the trailing zero bytes.
             let end = payload.iter().rposition(|&byte| byte != 0).map_or(0, |last| last + 1);
-            TERMINALS.lock()[slot].activity = apic::ticks();
+            TERMINALS.lock()[slot].activity = time::ticks();
             for &byte in &payload[..end] {
                 shell::feed_session(slot + 1, byte);
             }
@@ -484,7 +484,7 @@ fn handle_terminal(index: usize, source: [u8; 6], tag: u8, payload: &[u8]) -> bo
         TAG_PING => {
             let Some(slot) = find_terminal(index, source) else { return false };
             let mut terminals = TERMINALS.lock();
-            terminals[slot].activity = apic::ticks();
+            terminals[slot].activity = time::ticks();
             terminals[slot].pings = true;
         }
         TAG_BYE => {
@@ -503,7 +503,7 @@ pub fn tape_session_open(pid: u64) -> isize {
     let slot = {
         let mut terminals = TERMINALS.lock();
         let Some(slot) = terminals.iter().position(|terminal| !terminal.open()) else { return -2 };
-        terminals[slot] = Terminal { peer: None, nic: 0, activity: apic::ticks(), owner: pid, exited: false, pings: false };
+        terminals[slot] = Terminal { peer: None, nic: 0, activity: time::ticks(), owner: pid, exited: false, pings: false };
         OPEN.fetch_add(1, Ordering::Relaxed);
         slot
     };
@@ -591,7 +591,7 @@ fn feed_tape_sessions() {
         }
         let session = slot + 1;
         if fresh {
-            TERMINALS.lock()[slot].activity = apic::ticks().max(1);
+            TERMINALS.lock()[slot].activity = time::ticks().max(1);
             crate::shellhost::reset_folder(session);
             shell::reset(session);
             crate::session::with(session, || {
@@ -658,7 +658,7 @@ fn kup_reply(index: usize, destination: &[u8; 6], tag: u8, payload: &[u8]) {
 
 fn kup_request(index: usize, source: [u8; 6], payload: &[u8]) {
     let kup = kup();
-    if kup.active && kup.source != source && apic::ticks().wrapping_sub(kup.last_activity) < KUP_STALE_TICKS {
+    if kup.active && kup.source != source && time::ticks().wrapping_sub(kup.last_activity) < KUP_STALE_TICKS {
         return kup_reply(index, &source, TAG_KUP_ERROR, &[KUP_BUSY]);
     }
     if payload.len() < 6 {
@@ -674,7 +674,7 @@ fn kup_request(index: usize, source: [u8; 6], payload: &[u8]) {
         kup.active = false;
         return kup_reply(index, &source, TAG_KUP_ERROR, &[KUP_TOO_LARGE]);
     };
-    *kup = Kup { active: true, source, expected, checksum, received: 0, next_sequence: 0, last_activity: apic::ticks(), stage: Some((stage, frames)) };
+    *kup = Kup { active: true, source, expected, checksum, received: 0, next_sequence: 0, last_activity: time::ticks(), stage: Some((stage, frames)) };
     println!("KUP: receiving a kernel image of {expected} bytes from {}.", Mac(&source));
 }
 
@@ -696,7 +696,7 @@ fn kup_data(source: [u8; 6], payload: &[u8]) {
     staging[kup.received..kup.received + take].copy_from_slice(&payload[4..4 + take]);
     kup.received += take;
     kup.next_sequence += 1;
-    kup.last_activity = apic::ticks();
+    kup.last_activity = time::ticks();
 }
 
 fn kup_stop(index: usize, source: [u8; 6]) {
@@ -713,7 +713,7 @@ fn kup_stop(index: usize, source: [u8; 6]) {
             println!("KUP: image verified and written to slot {slot} (pending); restarting in about a second to try it.");
             kup_reply(index, &source, TAG_KUP_ACK, &[]);
             flush();
-            unsafe { RESET_AT = apic::ticks() + TICK_HZ };
+            unsafe { RESET_AT = time::ticks() + TICK_HZ };
         }
         Err(code) => kup_reply(index, &source, TAG_KUP_ERROR, &[code]),
     }
@@ -804,7 +804,7 @@ pub fn poll() {
 /// Service-loop work: restart after an accepted kernel update.
 pub fn housekeeping() {
     unsafe {
-        if RESET_AT != 0 && apic::ticks() >= RESET_AT {
+        if RESET_AT != 0 && time::ticks() >= RESET_AT {
             RESET_AT = 0;
             slots::mark_clean_stop();
             power::reset();

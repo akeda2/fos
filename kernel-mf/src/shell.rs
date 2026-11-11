@@ -2,7 +2,7 @@
 //! inspection commands. Output goes through `println!`, which reaches every console (serial and, while a session is open,
 //! the network). Runs on the boot CPU from the service loop.
 
-use crate::{apic, block, clock, net, percpu, pmm, power, sched, slots};
+use crate::{time, block, clock, net, percpu, pmm, power, sched, slots};
 use kernel_core::netdump::Mac;
 use alloc::vec::Vec;
 use kernel_core::{nic, pci};
@@ -106,7 +106,7 @@ fn feed_foreground(id: usize, byte: u8) -> bool {
         return true;
     }
     if byte == ESCAPE {
-        keys.escape_tick = apic::ticks().max(1);
+        keys.escape_tick = time::ticks().max(1);
         return true;
     }
     push_key(&mut keys, byte);
@@ -117,7 +117,7 @@ fn feed_foreground(id: usize, byte: u8) -> bool {
 pub fn poll_escape() {
     for id in 0..crate::session::MAX {
         let mut keys = KEYS[id].lock();
-        if keys.escape_tick != 0 && apic::ticks().saturating_sub(keys.escape_tick) >= ESCAPE_WAIT_TICKS {
+        if keys.escape_tick != 0 && time::ticks().saturating_sub(keys.escape_tick) >= ESCAPE_WAIT_TICKS {
             keys.escape_tick = 0;
             let pid = keys.pid;
             drop(keys);
@@ -328,7 +328,7 @@ pub fn run_command(line: &str) {
             }
             Some(_) => println!("Usage: date | date set YYYY-MM-DD HH:MM[:SS]"),
         },
-        "uptime" => println!("{} s", apic::ticks() / apic::TICK_HZ),
+        "uptime" => println!("{} s", time::ticks() / time::TICK_HZ),
         "slots" => slots::report(),
         "audio" => crate::audioshell::command(words),
         "usb" => crate::usbshell::command(words),
@@ -374,7 +374,7 @@ pub fn run_command(line: &str) {
                     _ => println!("debug revert: the slot metadata could not be written."),
                 }
             }
-            Some("crash") => unsafe { core::arch::asm!("ud2") },
+            Some("crash") => crate::arch::crash_now(),
             Some("hang") => {
                 // The shell runs on the service thread: spinning here with interrupts on stops its petting while other threads run.
                 loop {
@@ -403,10 +403,10 @@ pub fn run_command(line: &str) {
         "dmesg" => crate::sysshell::dmesg(),
         "clear" => crate::sysshell::clear(),
         "sleep" => crate::sysshell::sleep(&line.trim_start()[command.len()..]),
-        "io" => crate::sysshell::io(&line.trim_start()[command.len()..]),
+        "io" => crate::arch::cpuinfo::io(&line.trim_start()[command.len()..]),
         "memmap" => crate::sysshell::memmap(),
         "bootinfo" => crate::sysshell::bootinfo(),
-        "cpuinfo" => crate::sysshell::cpuinfo(),
+        "cpuinfo" => crate::arch::cpuinfo::cpuinfo(),
         "shrink" => crate::formatshell::shrink(&line.trim_start()[command.len()..]),
         "ext4" => crate::sysshell::ext4(&line.trim_start()[command.len()..]),
         "sector" => crate::sysshell::sector(&line.trim_start()[command.len()..]),

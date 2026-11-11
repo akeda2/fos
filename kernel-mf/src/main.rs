@@ -19,6 +19,7 @@ mod percpu;
 mod sched;
 mod selftest;
 mod sync;
+mod time;
 mod vm;
 // the shared files of the embedded kernel name the macro by path
 pub(crate) use serial::println;
@@ -30,52 +31,55 @@ macro_rules! until_ported {
 }
 
 until_ported! {
-    mod session;
     mod process;
+    mod tapenet;
+    mod tapeaudio;
     mod tapeapi;
     mod threads;
-    mod tapeaudio;
-    mod tapefs;
-    mod tapenet;
-    mod tapeserial;
     mod tapesys;
+    mod tapeserial;
+    mod user_test;
     mod audioshell;
     mod usbshell;
     mod ps2;
     mod usb;
-    mod user_test;
     mod fb;
-    mod config;
-    mod debug;
-    mod hwwd;
     mod net;
     mod netfs;
     mod netclient;
     mod service;
     mod vnic;
     mod tapesync;
-    mod power;
-    mod shell;
-    mod shellhost;
-    mod script;
-    mod sysshell;
-    mod mdvol;
-    mod top;
-    #[path = "../../kernel/src/formatshell.rs"]
-    mod formatshell;
-    mod helptext;
-    #[path = "../../kernel/src/kup_serial.rs"]
-    mod kup_serial;
     #[path = "../../kernel/src/install.rs"]
     mod install;
     #[path = "../../kernel/src/bootcode.rs"]
     mod bootcode;
-    mod slots;
-    mod block;
-    mod storage;
-    use kernel_core::{fatvol, fosfs, gpt};
     use kernel_core::pci;
 }
+
+#[cfg(not(target_arch = "x86_64"))]
+mod unported;
+#[cfg(not(target_arch = "x86_64"))]
+use unported::*;
+mod session;
+mod tapefs;
+mod config;
+mod debug;
+mod shell;
+mod shellhost;
+mod script;
+mod sysshell;
+mod mdvol;
+mod top;
+#[path = "../../kernel/src/formatshell.rs"]
+mod formatshell;
+mod helptext;
+#[path = "../../kernel/src/kup_serial.rs"]
+mod kup_serial;
+mod slots;
+mod block;
+mod storage;
+use kernel_core::{fatvol, fosfs, gpt};
 
 use alloc::{boxed::Box, collections::BTreeMap, string::String, vec::Vec};
 use core::panic::PanicInfo;
@@ -197,12 +201,14 @@ fn boot_services(info: &BootInfo, century: u8) -> ! {
     }
 }
 
-/// The aarch64 port has the CPU, memory, heap and timer so far; the rest of `boot_services` follows as the modules it uses
-/// become portable (see `until_ported!`).
+/// The aarch64 port has the CPU, memory, heap, timer and the shell on the serial console; PCI and the drivers (storage,
+/// network, USB) follow, and with them the config files and the slot metadata that need a disk.
 #[cfg(target_arch = "aarch64")]
-fn boot_services(_info: &BootInfo, _century: u8) -> ! {
+fn boot_services(info: &BootInfo, _century: u8) -> ! {
+    debug::init(info.crash_count);
     selftest::run();
-    println!("kernel-mf: slice 8 reached the end of boot; parking (drivers and the shell are not ported yet).");
+    sched::spawn("service", service_thread, 0).expect("the service thread");
+    println!("kernel-mf: slice 8 reached the end of boot; entering the service loop.");
     loop {
         sched::yield_now();
         arch::wait_for_interrupt();
@@ -259,7 +265,6 @@ fn panic(info: &PanicInfo) -> ! {
     trap::fatal_reset(&frame)
 }
 
-#[cfg(target_arch = "x86_64")]
 /// The server's housekeeping: NICs, serial input, the reset timer and the slot streak. Polls once per pass and gives way.
 extern "C" fn service_thread(_: usize) {
     // The `start` file runs here, as at the end of the embedded kernel's boot; the prompt follows it.

@@ -98,7 +98,7 @@ pub fn start(seconds: u32) -> Result<&'static str, &'static str> {
 pub fn reload() {
     let base = BASE.load(Ordering::Acquire);
     if base != 0 {
-        let now = crate::apic::ticks();
+        let now = crate::time::ticks();
         if LAST_RELOAD.swap(now, Ordering::Relaxed) != now {
             cpu::outw(base + TCO_RLD, 1);
         }

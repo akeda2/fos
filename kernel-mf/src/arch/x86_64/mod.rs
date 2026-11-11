@@ -7,6 +7,10 @@ pub mod acpi;
 pub mod apic;
 pub mod context;
 pub mod cpu;
+pub mod cpuinfo;
+pub mod crashrec;
+pub mod hwwd;
+pub mod power;
 pub mod fpu;
 pub mod gdt;
 pub mod idt;
@@ -22,7 +26,7 @@ pub use apic::ioapic;
 pub use context::{WAKE_VECTOR, end_wake_interrupt, prepare_stack, send_wake_ipi, switch};
 pub use percpu_arch::{CpuArch, activate, cpu_pointer, interrupt_target, set_kernel_stack};
 
-use crate::{boot, percpu, pmm, power, process, vm};
+use crate::{boot, percpu, pmm, process, vm};
 use fosfor_abi::BootInfo;
 
 // The embedded kernel's interrupt-routing file, included as it is so the two kernels cannot drift. It names `crate::apic`,
@@ -92,6 +96,8 @@ pub fn halt() -> ! {
 pub fn wait_for_interrupt() {
     unsafe { core::arch::asm!("sti", "hlt", options(nomem, nostack)) };
 }
+
+pub use apic::TICK_HZ;
 
 /// Scheduler ticks since the timer started.
 pub fn ticks() -> u64 {

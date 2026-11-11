@@ -34,6 +34,11 @@ pub fn unmap_kernel_page(address: u64) {
     crate::paging::unmap_kernel_page(address);
 }
 
+/// Maps device registers (Device-nGnRE, no-execute) at their physical address.
+pub fn map_device(physical: u64, length: u64) {
+    crate::paging::map_device(physical, length);
+}
+
 /// The kernel runs on one TTBR0 root for now; per-process roots come with EL0 tapes.
 pub fn load_root(_root: u64) {}
 

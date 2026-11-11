@@ -311,7 +311,7 @@ fn load_fstab() {
     }
     println!("fstab: waiting for a mounted volume (up to 10 s; the root's folders are used if it never appears).");
     for _ in 0..20 {
-        crate::apic::busy_wait_ms(500);
+        crate::time::busy_wait_ms(500);
         crate::usb::poll();
         if absent() == 0 {
             return;
