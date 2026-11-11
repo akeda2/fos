@@ -440,3 +440,11 @@ flavour marker reaches `fosadm status`, and whether the batch queue needs the sc
 
 
 **mf on aarch64 (2026-11, branch `mf-arm`).** One kernel, two arches: the CPU-specific code is behind the hooks in `kernel-mf/src/arch/{x86_64,aarch64}/mod.rs` (`pub use arch::*`), everything else is shared. Modules still x86-only sit in `until_ported!` in `main.rs`; `kernel-mf/src/unported.rs` gives non-x86 builds same-signature stand-ins for them (they shrink as modules move). Running under QEMU virt (`make test-mf-aarch64-boot`): the scheduler, serial shell, PCI (ECAM) and MSI (GICv2m), virtio-blk with the FOSFS mount, xHCI (`usb`, keyboard, USB disks; `kernel_core::usb_kbd` is the enumerator instead of `usb_hid`), virtio-net (`kernel_core::virtio_net` on the shared `virtio` transport, which `virtio_blk` also uses) and with it the whole `net` module: discovery and a `term net` session. virtio-net is polled; the `term net` console is tested over a multicast socket network. Not yet: EL0 tapes (so `tapenet`, `tapeapi`, `process`, `threads` are stubs), SMP, the Pi 4's SD, GENET, the non-coherent DMA pool, a crash record and the hardware watchdog. Only QEMU has run any of it.
+
+### Pi 4 hardware paths (mf-arm)
+
+The VL805 xHCI, the Genet and the EMMC2 SD card use the embedded kernel's code: the same `pci_config.rs` (Broadcom
+controller, outbound window), `kernel-core`'s xHCI/`usb_kbd`/hub, `genet.rs` (through `kernel_core::nic::PlatformNic`) and
+`sdhci.rs`. `memory::dma_pool` carves 4 MiB below 4 GiB, maps it non-cacheable, and `pmm` serves every `below`-limited
+request from it and nothing else. QEMU check: forcing the pool on virt (temporary line, removed) kept xHCI, virtio and SD
+working from it. Only a real Pi 4 shows the VL805 behind the PCIe bridge, the Genet and the EMMC2 controller.
