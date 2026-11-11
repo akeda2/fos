@@ -120,6 +120,10 @@ pub mod memory {
     pub fn allocate() -> Option<u64> {
         crate::pmm::allocate(1, None)
     }
+    pub fn allocate_contiguous(count: u64, below: Option<u64>) -> Option<u64> {
+        crate::pmm::allocate(count, below)
+    }
+
     /// Sets aside `frames` below 4 GiB as the DMA pool, mapped non-cacheable, for devices that are not cache-coherent (the
     /// Pi 4's PCIe bridge). Afterwards every allocation with a `below` limit comes from it and nothing else does (see `pmm`).
     /// Call once, after paging is up.
@@ -139,9 +143,51 @@ pub mod hal {
         crate::gic::bases().0 == 0xff84_1000
     }
 
+    /// Interrupts taken so far, for drivers that wait for one.
+    pub fn irq_ticks() -> u64 {
+        crate::gic::irq_ticks()
+    }
+
     /// Routes interrupt `intid` to `handler` (level or edge triggered) on the boot CPU.
     pub fn register_irq(intid: u32, level: bool, handler: fn(u32)) {
         crate::gic::register(intid, level, handler)
+    }
+}
+
+// The Pi 4's on-board Ethernet (Broadcom GENET v5): the embedded kernel's driver, a singleton over the DMA pool.
+#[path = "../../../../kernel/src/genet.rs"]
+pub mod genet;
+
+/// The Genet as a `kernel_core::nic::PlatformNic`.
+pub struct GenetNic;
+
+impl kernel_core::nic::PlatformNic for GenetNic {
+    fn family(&self) -> &'static str {
+        "genet"
+    }
+    fn mac(&self) -> [u8; 6] {
+        genet::mac().unwrap_or([0; 6])
+    }
+    fn link_up(&self) -> bool {
+        genet::info().is_some_and(|i| i.link_up)
+    }
+    fn link_speed(&self) -> Option<(u16, bool)> {
+        genet::info().filter(|i| i.link_up).map(|i| (i.speed as u16, i.full_duplex))
+    }
+    fn receive(&self, out: &mut [u8]) -> Option<usize> {
+        Some(genet::receive(out)).filter(|&n| n != 0)
+    }
+    fn send(&self, frame: &[u8]) -> bool {
+        genet::send(frame)
+    }
+    fn set_promiscuous(&self, on: bool) {
+        genet::set_promiscuous(on);
+    }
+    fn counters(&self) -> (u64, u64, u64) {
+        genet::info().map_or((0, 0, 0), |i| (i.received.into(), i.sent.into(), i.dropped.into()))
+    }
+    fn describe(&self) {
+        genet::details();
     }
 }
 

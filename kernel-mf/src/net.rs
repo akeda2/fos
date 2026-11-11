@@ -183,6 +183,12 @@ pub fn init() {
             Err(error) => println!("virtio-net at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    if crate::arch::genet::init() {
+        if nic::install(Nic::Platform(&crate::arch::GenetNic)).is_some() {
+            interfaces += 1;
+        }
+    }
     if interfaces == 0 {
         println!("No supported network interface found (e1000, e1000e, I350, RTL8139, RTL8168, 3c905 and virtio-net are driven).");
     }
