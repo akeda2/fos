@@ -1,7 +1,7 @@
 //! The aarch64 page-table hardware as the shared `vm` sees it. Memory is identity-mapped in TTBR0 by the embedded kernel's
 //! `paging.rs`; kernel thread stacks live in their own region of the same tables, one guard page under each. Per-process user
-//! tables (EL0) are one TTBR0 root per process: the kernel's L0 slot 0 (identity map, device windows, thread stacks) is shared,
-//! the process owns slots 1..255 (from 512 GiB up, as on x86). User pages are non-global (nG), `AP[1]` = EL0 may touch them,
+//! tables (EL0) are one TTBR0 root per process: the kernel's low L0 slots (identity map, device windows, thread stacks) is shared,
+//! the process owns the slots from KERNEL_SLOTS up. User pages are non-global (nG), `AP[1]` = EL0 may touch them,
 //! never executable at EL1 (PXN); TTBR0 is reloaded and the TLB flushed at every switch of address space (no ASIDs yet).
 
 pub const PAGE: u64 = 4096;
@@ -53,8 +53,10 @@ const PXN: u64 = 1 << 53;
 const UXN: u64 = 1 << 54;
 const ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
 
-/// User space: L0 slots 1..255, so it never meets slot 0 (the identity map, the device windows, the thread stacks).
-pub const USER_BASE: u64 = 1 << 39;
+/// L0 slots 0..KERNEL_SLOTS belong to the kernel and are shared by every root: the identity map, the device windows (QEMU's
+/// PCIe high window sits at 512 GiB, in slot 1) and the thread stacks. User space starts above them.
+const KERNEL_SLOTS: usize = 64;
+pub const USER_BASE: u64 = (KERNEL_SLOTS as u64) << 39;
 pub const USER_END: u64 = 1 << 47;
 
 /// Makes the process's tables visible to the walker (a stable inner-shareable write-back walk, but the stores must be ordered).
@@ -65,9 +67,19 @@ fn publish() {
 /// A new root for a process: the kernel's slot 0, an empty user half. `None` when out of frames.
 pub fn create_user_space() -> Option<u64> {
     let root = crate::pmm::allocate(1, None)?;
-    unsafe { (root as *mut u64).write((root_kernel() as *const u64).read()) };
+    unsafe { core::ptr::copy_nonoverlapping(root_kernel() as *const u64, root as *mut u64, KERNEL_SLOTS) };
     publish();
     Some(root)
+}
+
+/// Gives the first kernel L0 slots their L1 tables now: a user root copies the slots, so a device window the kernel maps later
+/// has to land in a table every root already shares. Call once after the kernel's tables are loaded.
+pub fn share_kernel_slots() {
+    let root = root_kernel() as *mut u64;
+    for slot in 0..8 {
+        unsafe { next_level(root.add(slot)) };
+    }
+    publish();
 }
 
 fn root_kernel() -> u64 {
@@ -147,13 +159,13 @@ pub fn user_leaf(root: u64, address: u64) -> Option<UserPage> {
     Some(UserPage { physical: leaf & ADDRESS_MASK, user: leaf & EL0_ACCESS != 0, writable: leaf & READ_ONLY == 0 })
 }
 
-/// Frees a process's user half: every mapped frame and every table below slots 1..255, then the root. Returns the frames freed.
+/// Frees a process's user half: every mapped frame and every table below slots KERNEL_SLOTS..255, then the root. Returns the frames freed.
 /// The root must not be loaded on any CPU.
 pub fn destroy_user_space(root: u64) -> u64 {
     let mut freed = 0;
     unsafe {
         let top = root as *mut u64;
-        for slot in 1..256 {
+        for slot in KERNEL_SLOTS..256 {
             let l0 = *top.add(slot);
             if l0 & VALID == 0 {
                 continue;

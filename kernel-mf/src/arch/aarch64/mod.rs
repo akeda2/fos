@@ -302,6 +302,7 @@ pub fn init_memory(_machine: &boot::Machine, info: &BootInfo) -> &'static BootIn
     // EL0 tapes need the EL1&0 regime: a firmware that enters at EL2 (a Pi 4) is left behind here.
     paging::drop_to_el1_when_loaded();
     paging::build_and_load(info, &info.framebuffer);
+    mmu::share_kernel_slots();
     paging::map_device(pl011::base(), 4096);
     println!("Page tables: loaded; RAM no-execute in 2 MiB blocks, kernel image W^X, page 0 and the stack guard unmapped.");
     unsafe { &*(info as *const BootInfo) }

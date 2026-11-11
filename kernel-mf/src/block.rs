@@ -103,6 +103,29 @@ fn checked(disk: usize, lba: u64, length: usize) -> Result<Disk, Error> {
     Ok(info)
 }
 
+/// DMA drivers that hand `address - offset` to the device need a buffer in the direct map; a thread's stack is mapped
+/// elsewhere (`vm::STACK_REGION`), so such a buffer goes through a heap copy.
+#[cfg(target_arch = "aarch64")]
+fn on_stack(buffer: &[u8]) -> bool {
+    buffer.as_ptr() as u64 >= crate::vm::STACK_REGION
+}
+
+#[cfg(target_arch = "aarch64")]
+fn with_direct_read<T>(buffer: &mut [u8], transfer: impl FnOnce(&mut [u8]) -> T) -> T {
+    if !on_stack(buffer) {
+        return transfer(buffer);
+    }
+    let mut bounce = alloc::vec![0u8; buffer.len()];
+    let result = transfer(&mut bounce);
+    buffer.copy_from_slice(&bounce);
+    result
+}
+
+#[cfg(target_arch = "aarch64")]
+fn with_direct_write<T>(buffer: &[u8], transfer: impl FnOnce(&[u8]) -> T) -> T {
+    if on_stack(buffer) { transfer(&alloc::vec::Vec::from(buffer)) } else { transfer(buffer) }
+}
+
 /// Reads whole sectors (`buffer.len()` a multiple of 512) from `lba`.
 pub fn read(disk: usize, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
     match checked(disk, lba, buffer.len())?.backend {
@@ -117,9 +140,9 @@ pub fn read(disk: usize, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
             }
         }
         #[cfg(target_arch = "aarch64")]
-        Backend::Virtio(drive) => drive.read(lba, buffer).map_err(|_| Error::Device)?,
+        Backend::Virtio(drive) => with_direct_read(buffer, |buffer| drive.read(lba, buffer)).map_err(|_| Error::Device)?,
         #[cfg(target_arch = "aarch64")]
-        Backend::Sd(drive) => drive.read(lba, buffer).map_err(|_| Error::Device)?,
+        Backend::Sd(drive) => with_direct_read(buffer, |buffer| drive.read(lba, buffer)).map_err(|_| Error::Device)?,
         Backend::Usb(device) => crate::usb::storage_read(device, lba, buffer).map_err(|_| Error::Device)?,
         Backend::Md => crate::mdvol::read(lba, buffer)?,
     }
@@ -159,9 +182,9 @@ fn write_with(disk: usize, lba: u64, buffer: &[u8], flush: bool) -> Result<(), E
             }
         }
         #[cfg(target_arch = "aarch64")]
-        Backend::Virtio(drive) => drive.write(lba, buffer).map_err(|_| Error::Device)?,
+        Backend::Virtio(drive) => with_direct_write(buffer, |buffer| drive.write(lba, buffer)).map_err(|_| Error::Device)?,
         #[cfg(target_arch = "aarch64")]
-        Backend::Sd(drive) => drive.write(lba, buffer).map_err(|_| Error::Device)?,
+        Backend::Sd(drive) => with_direct_write(buffer, |buffer| drive.write(lba, buffer)).map_err(|_| Error::Device)?,
         Backend::Usb(device) => crate::usb::storage_write(device, lba, buffer).map_err(|_| Error::Device)?,
         Backend::Md => crate::mdvol::write(lba, buffer)?,
     }
