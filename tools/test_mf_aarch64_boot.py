@@ -41,6 +41,10 @@ def main() -> None:
     base.check("nic1: virtio-net" in text, "`nic` lists it", text)
     base.check("cannot start" in text or "no file" in text, "`run` refuses cleanly (no EL0 yet)", text)
     base.check("no I/O port space" in text, "`io` explains there are no ports", text)
+    # A firmware that enters at EL2 (a Pi 4): the kernel leaves it for EL1, where EL0 programs can run.
+    el2 = base.boot(IMAGE, commands=("cpuinfo", "uptime"), el2=True)
+    base.check("from the UEFI loader at EL2" in el2 and "running at EL1" in el2, "entered at EL2, the kernel drops to EL1 and carries on", el2)
+    base.check("preemption ok" in el2 and "timer interrupts (INTID 30)" in el2, "the timer and the scheduler work after the drop", el2)
     sd = base.boot(IMAGE, steps=(("disks\r", "fos> "),), sd=True)
     base.check(re.search(r"disk2: \d+ MiB, SD card", sd) is not None, "the SDHCI controller and its card are registered as a disk", sd)
 

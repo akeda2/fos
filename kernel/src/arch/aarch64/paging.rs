@@ -254,6 +254,42 @@ unsafe fn next_table_peek(root: u64, address: u64) -> bool {
     l2 & VALID != 0
 }
 
+static DROP_TO_EL1: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Asks `build_and_load` to leave EL2 for EL1 when the firmware entered the kernel at EL2 (a Pi 4 with edk2): EL0 programs
+/// need the EL1&0 translation regime (at EL2 without VHE there is no EL0 to speak of). The server kernel sets it; the embedded
+/// kernel, which runs no EL0 code, stays where the firmware left it.
+pub fn drop_to_el1_when_loaded() {
+    DROP_TO_EL1.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// At EL2: programs the EL1 MMU (MAIR, TCR, TTBR0, SCTLR) with our tables, lets EL1 use the counter and timer, leaves the
+/// interrupts and traps unrouted (HCR_EL2 is only RW: EL1 is AArch64) and returns from the exception into the next
+/// instruction at EL1 on the same stack, so the MMU turns on in the same step as the level changes. Everything in the kernel asks
+/// CurrentEL, so from here on it takes its EL1 paths. A virtual-memory change at EL2 itself is never made.
+unsafe fn enter_el1(root: u64, tcr: u64) {
+    // RES1 bits of SCTLR_EL1 plus M (MMU), SA, SA0 (stack alignment), C and I (caches).
+    const SCTLR: u64 = 0x30d0_0800 | 1 | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 12);
+    unsafe {
+        core::arch::asm!(
+            "msr mair_el1, {mair}", "msr tcr_el1, {tcr}", "msr ttbr0_el1, {root}", "msr sctlr_el1, {sctlr}",
+            "mov {t}, #(1 << 31)", "msr hcr_el2, {t}",
+            "mrs {t}, cnthctl_el2", "orr {t}, {t}, #3", "msr cnthctl_el2, {t}",
+            "msr cntvoff_el2, xzr",
+            "mov {t}, #0x33ff", "msr cptr_el2, {t}",
+            "msr hstr_el2, xzr",
+            "mrs {t}, midr_el1", "msr vpidr_el2, {t}", "mrs {t}, mpidr_el1", "msr vmpidr_el2, {t}",
+            "adr {t}, __vectors", "msr vbar_el1, {t}",
+            "mov {t}, sp", "msr sp_el1, {t}",
+            "mov {t}, #0x3c5", "msr spsr_el2, {t}",
+            "adr {t}, 2f", "msr elr_el2, {t}",
+            "isb", "eret",
+            "2:", "tlbi vmalle1", "dsb nsh", "isb",
+            mair = in(reg) MAIR, tcr = in(reg) tcr, root = in(reg) root, sctlr = in(reg) SCTLR, t = out(reg) _, options(nostack)
+        );
+    }
+}
+
 fn load(root: u64) {
     let mmfr0: u64;
     unsafe { core::arch::asm!("mrs {}, id_aa64mmfr0_el1", out(reg) mmfr0, options(nomem, nostack)) };
@@ -262,7 +298,9 @@ fn load(root: u64) {
     let low = 16 | (1 << 8) | (1 << 10) | (3 << 12);
     unsafe {
         core::arch::asm!("dsb ish", options(nostack));
-        if current_el() == 2 {
+        if current_el() == 2 && DROP_TO_EL1.load(core::sync::atomic::Ordering::Relaxed) {
+            enter_el1(root, low | (1 << 23) | (pa_range << 32));
+        } else if current_el() == 2 {
             // Keep the firmware's TCR (T0SZ, PS, granule, walk attributes): its geometry is known to work on this
             // chip, and a PS or T0SZ of ours that the CPU rejects hung the MMU enable on a Pi 4.
             let _ = (low, pa_range);
