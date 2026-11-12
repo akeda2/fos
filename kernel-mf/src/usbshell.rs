@@ -33,3 +33,41 @@ fn run(mut words: core::str::SplitWhitespace) {
         Some(_) => println!("Usage: usb [rescan]"),
     }
 }
+
+/// `touch` lists the touch panels; `touch monitor [SECONDS]` prints each finger event for that long (default 10, at most 120):
+/// the embedded kernel's monitor runs until Escape, which the server shell's input path does not offer a command loop yet.
+pub fn touch(words: core::str::SplitWhitespace) {
+    crate::sched::pin_current(0);
+    let _usb = crate::usb::lock();
+    let was_on = crate::cpu::interrupts_save_and_disable();
+    crate::cpu::interrupts_enable();
+    touch_run(words);
+    if !was_on {
+        crate::cpu::interrupts_disable();
+    }
+}
+
+fn touch_run(mut words: core::str::SplitWhitespace) {
+    use kernel_core::usb_pointer as pointer;
+    match words.next() {
+        None => pointer::list_command(),
+        Some("monitor") => {
+            let seconds = words.next().and_then(|word| word.parse::<u64>().ok()).unwrap_or(10).clamp(1, 120);
+            if pointer::count() == 0 {
+                return println!("touch: no touch panel (`usb rescan` looks again).");
+            }
+            println!("touch: showing finger events for {seconds} s.");
+            let end = crate::time::micros() + seconds * 1_000_000;
+            while crate::time::micros() < end {
+                crate::debug::pet();
+                kernel_core::usb_class::poll();
+                while let Some(event) = pointer::take() {
+                    let (x, y) = pointer::range(usize::from(event.panel)).unwrap_or((0, 0));
+                    println!("touch {} finger {} {} at {},{} (of {x},{y})", event.panel + 1, event.id, if event.down { "down/moved" } else { "up" }, event.x, event.y);
+                }
+                core::hint::spin_loop();
+            }
+        }
+        Some(_) => println!("Usage: touch | touch monitor [SECONDS]"),
+    }
+}

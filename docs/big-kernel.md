@@ -448,3 +448,16 @@ controller, outbound window), `kernel-core`'s xHCI/`usb_kbd`/hub, `genet.rs` (th
 `sdhci.rs`. `memory::dma_pool` carves 4 MiB below 4 GiB, maps it non-cacheable, and `pmm` serves every `below`-limited
 request from it and nothing else. QEMU check: forcing the pool on virt (temporary line, removed) kept xHCI, virtio and SD
 working from it. Only a real Pi 4 shows the VL805 behind the PCIe bridge, the Genet and the EMMC2 controller.
+
+### Pi 4 header, I2S audio and DSI touch (mf-arm)
+
+`gpio.rs`, `mailbox.rs`, `i2c.rs`, `i2s_pi.rs` and `dsitouch.rs` are the embedded kernel's files (`#[path]` in
+`arch/aarch64/mod.rs`; `crate::framebuffer` is a two-function stand-in until the pixel console is ported). `platform::install` registers
+the I2S driver with `kernel_core::i2s::set` and the DSI chip through `kernel_core::screen::set` (no logical screen yet), so `audio`,
+the `audio_*` tape calls and `touch` see them as on the embedded kernel. Settings: `i2s-audio [off]`, `gpio-sim`, `gpio-deny N..`
+(`gpio-remote` stays ignored: serving pins to other machines is not ported). Shell: `gpio`, `i2c`, `i2s probe|capture|audio`,
+`touch` and `touch monitor [SECONDS]` (a fixed time, not until Escape). Tape ABI 22/23 (`gpio_*`, `i2c_*`) is live on aarch64
+(`tapepi.rs`: I2C buffers bounce through the kernel, the call is pinned to CPU 0; pins and bus speed are restored when a tape ends).
+`config.txt` needs nothing for any of it. Tested in QEMU: `gpio` on a `gpio-sim` bank, a denied pin, `audio` listing. Only
+a Pi 4 with the HAT or the panel shows the I2S capture/playback, the I2C bus and the touch reports. The DSI panel *display* needs the pixel
+console (`fb.rs`) on aarch64, which is not ported: the DSI touch works without it, the picture does not.

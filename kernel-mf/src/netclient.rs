@@ -416,7 +416,35 @@ impl kernel_core::gpio_client::Env for Mf {
     }
 }
 
-/// `gpio [@HOST] ...`: this kernel has no pins of its own.
+/// `gpio [@HOST] ...`: this machine's pins (a Pi 4 has them), or another's with `@HOST`.
 pub fn gpio(rest: &str) {
-    kernel_core::gpio_client::command(&Mf, rest, |_| println!("gpio: this machine has no GPIO pins; `gpio @HOST ...` works on one that has."));
+    kernel_core::gpio_client::command(&Mf, rest, run_local_gpio);
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn run_local_gpio(_op: kernel_core::gpio_client::Op) {
+    println!("gpio: this machine has no GPIO pins; `gpio @HOST ...` works on one that has.");
+}
+
+#[cfg(target_arch = "aarch64")]
+fn run_local_gpio(op: kernel_core::gpio_client::Op) {
+    use crate::gpio;
+    use kernel_core::gpio_client::{self as client, Op};
+    if !gpio::available() {
+        return println!("gpio: this machine has no GPIO pins; `gpio @HOST ...` works on one that has.");
+    }
+    let outcome = match op {
+        Op::List(all) => return client::list(&Mf, &gpio::snapshot().unwrap(), all),
+        Op::Read(pin) => return client::line(&Mf, &gpio::snapshot().unwrap(), pin),
+        Op::Set(pin, high) => {
+            let refused = gpio::write(1 << pin, u64::from(high) << pin);
+            if refused == 0 { Ok(()) } else { Err("that pin is not allowed or not an output (`gpio mode N out 0|1` first)") }
+        }
+        Op::Mode(pin, function, start) => gpio::set_function(pin, function, start).map_err(gpio::Error::text),
+        Op::Pull(pin, pull) => gpio::set_pull(pin, pull).map_err(gpio::Error::text),
+    };
+    match outcome {
+        Ok(()) => println!("done"),
+        Err(reason) => println!("gpio: {reason}."),
+    }
 }

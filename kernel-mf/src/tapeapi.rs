@@ -474,12 +474,35 @@ pub fn call(frame: &mut Frame) {
         DISK_FORMAT_EXFAT => tapesys::format_exfat(a, b, c) as u64,
         WALL_CLOCK => tapesys::wall_clock(a),
         WALL_CLOCK_SET => tapesys::wall_clock_set(a),
-        // This machine has no GPIO pins or I2C header (the Raspberry Pi 4 has): the answers of the embedded x86 kernel without
-        // pins, so a tape can tell. Reads show nothing, every write is refused, mode/pull say "no GPIO", I2C says "no bus".
+        // The Raspberry Pi 4 has pins and an I2C header (`tapepi.rs`); other machines give the answers of the embedded x86 kernel
+        // without pins, so a tape can tell: reads show nothing, every write is refused, mode/pull say "no GPIO", I2C says "no bus".
+        #[cfg(target_arch = "aarch64")]
+        GPIO_PINS => crate::gpio::api_gpio_pins(),
+        #[cfg(target_arch = "aarch64")]
+        GPIO_READ => crate::gpio::api_gpio_read(),
+        #[cfg(target_arch = "aarch64")]
+        GPIO_WRITE => crate::gpio::api_gpio_write(a, b),
+        #[cfg(target_arch = "aarch64")]
+        GPIO_MODE => crate::gpio::api_gpio_mode(a as u32, b as u32, c as u32) as i64 as u64,
+        #[cfg(target_arch = "aarch64")]
+        GPIO_PULL => crate::gpio::api_gpio_pull(a as u32, b as u32) as i64 as u64,
+        #[cfg(target_arch = "aarch64")]
+        GPIO_FUNCTION => crate::gpio::api_gpio_function(a as u32) as i64 as u64,
+        #[cfg(target_arch = "aarch64")]
+        GPIO_PULL_GET => crate::gpio::api_gpio_pull_get(a as u32) as i64 as u64,
+        #[cfg(target_arch = "aarch64")]
+        I2C_SPEED => crate::tapepi::i2c_speed(a) as u64,
+        #[cfg(target_arch = "aarch64")]
+        I2C_TRANSFER => crate::tapepi::i2c_transfer(a, b, c, d, e) as u64,
+        #[cfg(not(target_arch = "aarch64"))]
         GPIO_PINS | GPIO_READ => 0,
+        #[cfg(not(target_arch = "aarch64"))]
         GPIO_WRITE => a,
+        #[cfg(not(target_arch = "aarch64"))]
         GPIO_MODE | GPIO_PULL => (-3i64) as u64,
+        #[cfg(not(target_arch = "aarch64"))]
         GPIO_FUNCTION | GPIO_PULL_GET => (-2i64) as u64,
+        #[cfg(not(target_arch = "aarch64"))]
         I2C_SPEED | I2C_TRANSFER => (-4i64) as u64,
         FP_LEVEL => u64::from(fpu::level()),
         GFX_INFO | GFX_INFO_ON if number == GFX_INFO || a == 0 => fb::gfx_info().map_or(0, |(w, h)| u64::from(w) << 32 | u64::from(h)),

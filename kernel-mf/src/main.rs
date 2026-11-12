@@ -22,7 +22,7 @@ mod sync;
 mod time;
 mod vm;
 // the shared files of the embedded kernel name the macro by path
-pub(crate) use serial::println;
+pub(crate) use serial::{print, println};
 
 /// Modules that only build for x86-64 so far. The aarch64 port makes them portable one by one (each moves out of this list
 /// when it compiles there); nothing in it is meant to stay x86-only unless it is hardware that only x86 has.
@@ -33,6 +33,9 @@ macro_rules! until_ported {
 mod process;
 mod tapenet;
 mod tapeaudio;
+#[cfg(target_arch = "aarch64")]
+mod tapepi;
+mod audioshell;
 mod tapeapi;
 mod threads;
 mod tapesys;
@@ -45,7 +48,6 @@ mod bootcode;
 
 until_ported! {
     mod tapeserial;
-    mod audioshell;
     mod ps2;
     mod fb;
 }
@@ -81,6 +83,8 @@ mod slots;
 mod block;
 mod storage;
 use kernel_core::{fatvol, fosfs, gpt, pci};
+#[cfg(target_arch = "aarch64")]
+use kernel_core::usb_pointer;
 
 use alloc::{boxed::Box, collections::BTreeMap, string::String, vec::Vec};
 use core::panic::PanicInfo;
@@ -234,6 +238,9 @@ fn boot_services(info: &BootInfo, _century: u8) -> ! {
         usb::init();
     }
     config::load();
+    if dsitouch::init() {
+        println!("DSI touch: FT5406-style controller at 0x38 on the display connector's I2C bus (`touch`).");
+    }
     slots::confirm_boot();
     net::init();
     vnic::apply();

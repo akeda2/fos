@@ -227,8 +227,18 @@ pub fn load() {
                     _ => println!("settings: `{line}` ignored (mouse-speed PERCENT, 25-1000; 100 is the default)."),
                 }
             }
+            #[cfg(target_arch = "aarch64")]
+            match line.split_whitespace().next() {
+                Some("i2s-audio") => crate::i2s_pi::apply_setting(line),
+                Some("gpio-sim" | "gpio-deny") => {
+                    crate::gpio::apply_setting(line);
+                }
+                _ => {}
+            }
             if let Some(key @ ("hwp" | "park-idle" | "rotate" | "serial-shell" | "gpio-remote" | "gpio-sim" | "gpio-deny" | "prefer-msix" | "replace-in-place")) = line.split_whitespace().next() {
-                println!("settings: {key} is not supported by the server kernel yet; ignored.");
+                if !(cfg!(target_arch = "aarch64") && matches!(key, "gpio-sim" | "gpio-deny")) {
+                    println!("settings: {key} is not supported by the server kernel yet; ignored.");
+                }
             }
             if line.split_whitespace().next() == Some("vnic") {
                 crate::vnic::queue(line);

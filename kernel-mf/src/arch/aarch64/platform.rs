@@ -139,4 +139,35 @@ pub fn install() {
     // RAM is identity-mapped: the direct map adds nothing.
     fos_hal::memory::set_phys_offset(crate::vm::DIRECT_BASE);
     fos_hal::set_platform(&MF);
+    kernel_core::i2s::set(&I2S);
+    kernel_core::screen::set(&SCREEN);
 }
+
+static I2S: kernel_core::i2s::Ops = kernel_core::i2s::Ops {
+    present: crate::i2s_pi::present,
+    label: crate::i2s_pi::label,
+    start: crate::i2s_pi::start,
+    stop: crate::i2s_pi::stop,
+    poll: crate::i2s_pi::poll,
+    read: crate::i2s_pi::read,
+    write: crate::i2s_pi::write,
+    playback_space: crate::i2s_pi::playback_space,
+    format: crate::i2s_pi::format,
+    select: crate::i2s_pi::select,
+    print_modes: crate::i2s_pi::print_modes,
+    status: crate::i2s_pi::status,
+    fill_info: crate::i2s_pi::fill_info,
+    fill_stats: crate::i2s_pi::fill_stats,
+    buffer_info: crate::i2s_pi::buffer_info,
+};
+
+static DSI: kernel_core::screen::Dsi = kernel_core::screen::Dsi {
+    width: crate::dsitouch::WIDTH,
+    height: crate::dsitouch::HEIGHT,
+    present: crate::dsitouch::present,
+    poll: crate::dsitouch::poll,
+    reports: crate::dsitouch::reports,
+};
+
+/// No pixel console yet, so no screen size and no rotation; the DSI chip's touches still reach the pointer queue.
+static SCREEN: kernel_core::screen::Screen = kernel_core::screen::Screen { gfx_info: || None, rotation: |_| None, dsi: Some(&DSI) };

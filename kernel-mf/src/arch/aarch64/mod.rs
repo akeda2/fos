@@ -171,6 +171,27 @@ impl kernel_core::nic::PlatformNic for GenetNic {
 #[path = "../../../../kernel/src/sdhci.rs"]
 pub mod sdhci;
 
+// The Pi 4's GPIO bank, VideoCore mailbox, I2C buses, I2S audio HAT and DSI touch chip: the embedded kernel's drivers, as they
+// are. They name `crate::{gpio, memory, paging, timer, cpu, hal, usb_pointer}` and, for the mailbox's display calls, `crate::framebuffer`.
+#[path = "../../../../kernel/src/gpio.rs"]
+pub mod gpio;
+#[path = "../../../../kernel/src/mailbox.rs"]
+pub mod mailbox;
+#[path = "../../../../kernel/src/i2c.rs"]
+pub mod i2c;
+#[path = "../../../../kernel/src/i2s_pi.rs"]
+pub mod i2s_pi;
+#[path = "../../../../kernel/src/dsitouch.rs"]
+pub mod dsitouch;
+
+/// There is no pixel console in mf on aarch64 yet (`unported::fb`): the mailbox's display calls see no screen and do nothing.
+pub mod framebuffer {
+    pub fn gfx_info() -> Option<(u32, u32)> {
+        None
+    }
+    pub fn add_screen(_base: u64, _width: u32, _height: u32, _stride: u32) {}
+}
+
 /// The crash machinery (record, reset) is not ported yet: a fatal exception is reported and the CPU parks.
 pub mod crash {
     /// The timer interrupt's hook (after its acknowledgement): the boot CPU checks the watchdog, every CPU runs the scheduler's tick.

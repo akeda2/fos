@@ -106,6 +106,27 @@ def unattended() -> None:
             base.check("unclean boots: 1" in second, "and counts the reset as an unclean boot", second)
 
 
+def pins() -> None:
+    """The Pi's header, on a simulated pin bank (`gpio-sim`, QEMU has no BCM2711): `gpio`, a denied pin, a tape-less `i2c`/`i2s`.
+    The image is a copy with a `settings` file."""
+    import subprocess
+    import tempfile
+    target = base.ROOT / "build/cargo-target"
+    with tempfile.TemporaryDirectory() as scratch:
+        settings = Path(scratch) / "settings"
+        settings.write_text("gpio-sim\ngpio-deny 5\n")
+        image = Path(scratch) / "fosfor.img"
+        subprocess.run([sys.executable, str(base.ROOT / "tools/build_image.py"), "--arch", "aarch64", "--loader", str(target / "aarch64-unknown-uefi/release/fosfor-loader.efi"),
+                        "--kernel", str(target / "aarch64-unknown-none-softfloat/release/fosfor-kernel-mf"), "--file", f"settings={settings}", "--output", str(image)], check=True, capture_output=True)
+        text = base.boot(image, commands=("gpio mode 7 out 1", "gpio read 7", "gpio mode 5 out 1", "gpio pull 9 up", "gpio read 9", "i2c status", "i2s probe", "audio"))
+        shell = text.split("fos> ", 1)[-1]
+        base.check("settings: gpio-sim -- a RAM-backed GPIO bank" in text, "gpio-sim is a setting of mf on aarch64", text)
+        base.check("is not supported by the server kernel yet" not in text, "gpio-sim and gpio-deny are not reported as ignored", text)
+        base.check("GPIO7" in shell and "out" in shell and "high" in shell, "`gpio mode 7 out 1` drives a simulated pin high", text)
+        base.check("gpio:" in shell and "not allowed" in shell.lower(), "a denied pin is refused", text)
+        base.check("pull up" in shell, "`gpio pull` sets and shows a pull-up", text)
+
+
 def install() -> None:
     """`install disk2 ... ext4=data` copies the ESP (the Pi/aarch64 loader), the kernel and the files to a blank disk and
     formats an ext4 volume; the new disk then boots alone and lists the volume, and e2fsck finds the volume clean."""
@@ -164,5 +185,6 @@ def network() -> None:
 if __name__ == "__main__":
     main()
     unattended()
+    pins()
     install()
     network()

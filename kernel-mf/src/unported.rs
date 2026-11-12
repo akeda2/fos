@@ -2,20 +2,6 @@
 //! Each one is replaced by the real module as its hardware (PCI, NICs, USB, the framebuffer) or EL0 support is ported; a stand-in
 //! has the same signatures as the real thing, so the shell needs no `cfg`. Nothing here is meant to stay.
 
-macro_rules! words {
-    () => { core::str::SplitWhitespace<'_> };
-}
-
-fn missing(what: &str) {
-    println!("{what}: not available on aarch64 yet.");
-}
-
-pub mod audioshell {
-    pub fn command(_words: words!()) {
-        super::missing("audio");
-    }
-}
-
 /// COM2-COM4 and USB serial adapters (`kernel_core::serialports`) exist on x86 only: a tape sees no ports.
 pub mod tapeserial {
     pub fn count() -> u64 {
