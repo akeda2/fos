@@ -18,7 +18,7 @@ EL0_LINE = re.compile(r"EL0: hello ok, bad pointer ok, page fault ok, stack guar
 
 
 def main() -> None:
-    text = base.boot(IMAGE, commands=("version", "cpuinfo", "uptime", "nic", "run hello", "run fscheck", "io r8 0x60", "usb", "disks"), usb=True,
+    text = base.boot(IMAGE, commands=("version", "cpuinfo", "uptime", "nic", "run hello", "run thrcheck", "io r8 0x60", "usb", "disks"), usb=True,
                      usb_keys=("c", "p", "u", "i", "n", "f", "o", "ret"))
     base.check("server kernel (mf, slice 8): running from the UEFI loader at EL" in text, "the mf kernel starts on aarch64", text)
     base.check("Physical memory:" in text, "the physical allocator is up", text)
@@ -45,6 +45,7 @@ def main() -> None:
     base.check("virtio-net at 00:01.0: MAC" in text, "the virtio-net card is brought up", text)
     base.check("nic1: virtio-net" in text, "`nic` lists it", text)
     shell = text.split("fos> ", 1)[-1]
+    base.check("thrcheck: PASS threads share memory" in shell, "tape threads, futexes and a kill with sleeping and spinning threads work at EL0", text)
     base.check("no file `hello`" not in shell and "first file: readme.txt" in shell, "the boot volume's tapes are found from the shell thread (DMA from a stack buffer)", text)
     base.check("hello from a v2 tape" in shell and "primes up to 100000: 9592" in shell and "Process 12 exited with code 0." in shell,
                "an aarch64 tape runs at EL0 through the tape ABI (files, alloc, clock) and exits", text)

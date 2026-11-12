@@ -372,7 +372,7 @@ kernel-aarch64:
 	cd kernel && cargo +nightly-2026-09-13 build --release --target aarch64-unknown-none-softfloat -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem
 
 # Tapes for aarch64 (M2 of the plan): the portable ones, built for the built-in hard-float aarch64-unknown-none target.
-A64_TAPES := hello fscheck gfxcheck calc ed ebb httpd smbd smb smbmount web netcheck fosplay clock gonio ptp play record recorder ltas kaffe organ strings tape-echo epiano phono fterm telnet net-chat ip-chat bridge nettest router audio-net opus-bench i2cscan gpiopanel miccal frt60 compander
+A64_TAPES := hello thrcheck fscheck gfxcheck calc ed ebb httpd smbd smb smbmount web netcheck fosplay clock gonio ptp play record recorder ltas kaffe organ strings tape-echo epiano phono fterm telnet net-chat ip-chat bridge nettest router audio-net opus-bench i2cscan gpiopanel miccal frt60 compander
 A64_TAPE_DIR := $(CARGO_TARGET_DIR)/aarch64-unknown-none/release
 A64_TAPE_STAMPED := build/fosfor-aarch64/tapes
 A64_FILES_V3 = $(foreach tape,$(A64_TAPES),--file $(tape)=$(A64_TAPE_STAMPED)/$(tape))
@@ -407,7 +407,7 @@ kernel-mf-aarch64:
 
 image-mf-aarch64: loader-aarch64 kernel-mf-aarch64 tapes-aarch64
 	mkdir -p $(BUILD)/fosfor-mf-aarch64
-	python3 tools/build_image.py --arch aarch64 --loader $(A64_LOADER) --kernel $(A64_KERNEL_MF) $(foreach tape,hello fscheck calc,--file $(tape)=$(A64_TAPE_STAMPED)/$(tape)) --output $(BUILD)/fosfor-mf-aarch64/fosfor.img
+	python3 tools/build_image.py --arch aarch64 --loader $(A64_LOADER) --kernel $(A64_KERNEL_MF) $(foreach tape,hello thrcheck fscheck calc,--file $(tape)=$(A64_TAPE_STAMPED)/$(tape)) --output $(BUILD)/fosfor-mf-aarch64/fosfor.img
 
 # Serial KUP: a kernel pushed over the console UART is tried from the other slot and confirmed.
 test-aarch64-kup: image-aarch64
