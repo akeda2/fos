@@ -18,7 +18,26 @@ EL0_LINE = re.compile(r"EL0: hello ok, bad pointer ok, page fault ok, stack guar
 
 
 def main() -> None:
-    text = base.boot(IMAGE, commands=("version", "cpuinfo", "uptime", "nic", "run hello", "run thrcheck", "run netcheck", "fscheck readme.txt 0 7", "run httpd &0", "io r8 0x60", "usb", "disks"), usb=True, cpus=4,
+    import http.server
+    import threading
+    page = b"<html><body><h1>Hello from the host</h1><a href=\"/x\">link</a></body></html>"
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(page)))
+            self.end_headers()
+            self.wfile.write(page)
+
+        def log_message(self, *_):
+            pass
+
+    # QEMU's user-mode network reaches the host as 10.0.2.2.
+    server = http.server.ThreadingHTTPServer(("0.0.0.0", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = server.server_address[1]
+    text = base.boot(IMAGE, commands=("web -d 10.0.2.2:%d/" % port, "ed t.txt", "a", "hello", "from ed", ".", "w", "q", "cat t.txt", "fterm help", "version", "cpuinfo", "uptime", "nic", "run hello", "run thrcheck", "run netcheck", "fscheck readme.txt 0 7", "run httpd &0", "io r8 0x60", "usb", "disks"), usb=True, cpus=4,
                      usb_keys=("c", "p", "u", "i", "n", "f", "o", "ret"))
     base.check("server kernel (mf, slice 8): running from the UEFI loader at EL" in text, "the mf kernel starts on aarch64", text)
     base.check("Physical memory:" in text, "the physical allocator is up", text)
@@ -46,6 +65,9 @@ def main() -> None:
     base.check("virtio-net at 00:01.0: MAC" in text, "the virtio-net card is brought up", text)
     base.check("nic1: virtio-net" in text, "`nic` lists it", text)
     shell = text.split("fos> ", 1)[-1]
+    base.check("Hello from the host" in shell and "1. http://10.0.2.2:" in shell, "the web tape fetches a page from the host over the tape network calls and lists its links", text)
+    base.check("written t.txt" in shell and "hello\nfrom ed" in shell.replace("\r", ""), "the ed tape edits and saves a file", text)
+    base.check("Telnet (port 23)" in shell, "`fterm help` is printed from the tape's .fos_help section", text)
     base.check("thrcheck: PASS threads share memory" in shell, "tape threads, futexes and a kill with sleeping and spinning threads work at EL0", text)
     base.check("netcheck: 4/4 replies." in shell, "the netcheck tape gets a DHCP lease and pings through the tape network calls", text)
     base.check("fscheck: 7 bytes [Welcome]" in shell, "fs_read_at reads a byte range from a tape", text)

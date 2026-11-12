@@ -523,7 +523,8 @@ pub fn enable_interrupts_all(no_msi: bool) {
             continue;
         }
         match controller.enable_interrupts() {
-            Ok(vector) => crate::println!("xHCI {:02x}:{:02x}.{}: {} on vector {vector:#x} (the self-test interrupt arrived); events no longer need the foreground.", controller.pci.bus, controller.pci.device, controller.pci.function, if controller.uses_msix { "MSI-X" } else { "MSI" }),
+            // On aarch64 the number is the slot in the MSI table (the GIC SPI follows from it), not an x86 interrupt vector.
+            Ok(vector) => crate::println!("xHCI {:02x}:{:02x}.{}: {} on {} {vector:#x} (the self-test interrupt arrived); events no longer need the foreground.", controller.pci.bus, controller.pci.device, controller.pci.function, if controller.uses_msix { "MSI-X" } else { "MSI" }, if cfg!(target_arch = "aarch64") { "table slot" } else { "vector" }),
             Err(reason) => crate::println!("xHCI {:02x}:{:02x}.{}: events polled ({reason}).", controller.pci.bus, controller.pci.device, controller.pci.function),
         }
     }
