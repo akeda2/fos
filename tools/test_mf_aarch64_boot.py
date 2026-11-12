@@ -84,6 +84,36 @@ def unattended() -> None:
             base.check("unclean boots: 1" in second, "and counts the reset as an unclean boot", second)
 
 
+def install() -> None:
+    """`install disk2 ... ext4=data` copies the ESP (the Pi/aarch64 loader), the kernel and the files to a blank disk and
+    formats an ext4 volume; the new disk then boots alone and lists the volume, and e2fsck finds the volume clean."""
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory(dir=base.ROOT / "build") as scratch:
+        target = Path(scratch) / "target.img"
+        with open(target, "wb") as handle:
+            handle.truncate(256 << 20)
+        first = base.boot(IMAGE, commands=("install disk2 fosfs=64M ext4=scratch", "install disk2 confirm", "disks", "bootcode"), extra=target)
+        base.check("It is blank." in first and "becomes an ext4 volume 'scratch'" in first, "`install` announces what it will do", first)
+        base.check("ext4 volume 'scratch' ready" in first, "the install formats the ext4 volume", first)
+        base.check("is now bootable" in first, "the install finishes", first)
+        base.check(re.search(r"ext\d: 'scratch'", first.rsplit("fos> disks", 1)[-1]) is not None, "`disks` lists the ext4 volume", first)
+        base.check("UEFI loader: \\EFI\\BOOT\\BOOTAA64.EFI" in first, "`bootcode` reads the AArch64 loader from the ESP", first)
+        found = subprocess.run(["sgdisk", "--print", str(target)], capture_output=True, text=True).stdout
+        base.check("EF00" in found and "8300" in found, "the target has an ESP and a Linux partition", found)
+        start = int(re.search(r"^\s+4\s+(\d+)\s+(\d+)", found, re.M).group(1))
+        end = int(re.search(r"^\s+4\s+(\d+)\s+(\d+)", found, re.M).group(2))
+        volume = Path(scratch) / "volume.img"
+        with open(target, "rb") as source, open(volume, "wb") as out:
+            source.seek(start * 512)
+            out.write(source.read((end - start + 1) * 512))
+        fsck = subprocess.run(["e2fsck", "-fn", str(volume)], capture_output=True, text=True)
+        base.check(fsck.returncode == 0, "e2fsck finds the installed ext4 volume clean", fsck.stdout + fsck.stderr)
+        second = base.boot(target, commands=("disks", "ls"), keep=True)
+        base.check("FOSFS: mounted on disk1" in second, "the installed disk boots alone and mounts its FOSFS volume", second)
+        base.check(re.search(r"ext\d: 'scratch'", second) is not None, "and lists its ext4 volume", second)
+
+
 def network() -> None:
     """The guest's virtio-net on a multicast socket network: discovery, then a `term net` session (receive and transmit)."""
     from test_boot import BROADCAST, TAG_DISCOVER_REPLY, TAG_DISCOVER_REQUEST, TAG_HELLO, TAG_DATA
@@ -112,4 +142,5 @@ def network() -> None:
 if __name__ == "__main__":
     main()
     unattended()
+    install()
     network()

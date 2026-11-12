@@ -96,6 +96,9 @@ pub mod memory {
     pub fn allocate_contiguous(count: u64, below: Option<u64>) -> Option<u64> {
         crate::pmm::allocate(count, below)
     }
+    pub fn free(address: u64, count: u64) {
+        crate::pmm::free(address, count);
+    }
 
     /// Sets aside `frames` below 4 GiB as the DMA pool, mapped non-cacheable, for devices that are not cache-coherent (the
     /// Pi 4's PCIe bridge). Afterwards every allocation with a `below` limit comes from it and nothing else does (see `pmm`).

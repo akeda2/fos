@@ -65,20 +65,6 @@ pub mod fb {
     }
 }
 
-pub mod install {
-    pub fn cancel() {}
-    pub fn command(_words: words!()) {
-        super::missing("install");
-    }
-}
-
-pub mod bootcode {
-    pub fn cancel() {}
-    pub fn command(_words: words!()) {
-        super::missing("bootcode");
-    }
-}
-
 pub mod ps2 {
     pub fn poll() {}
 }

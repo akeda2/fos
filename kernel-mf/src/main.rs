@@ -38,15 +38,16 @@ mod threads;
 mod tapesys;
 mod user_test;
 
+#[path = "../../kernel/src/install.rs"]
+mod install;
+#[path = "../../kernel/src/bootcode.rs"]
+mod bootcode;
+
 until_ported! {
     mod tapeserial;
     mod audioshell;
     mod ps2;
     mod fb;
-    #[path = "../../kernel/src/install.rs"]
-    mod install;
-    #[path = "../../kernel/src/bootcode.rs"]
-    mod bootcode;
 }
 
 #[cfg(not(target_arch = "x86_64"))]
