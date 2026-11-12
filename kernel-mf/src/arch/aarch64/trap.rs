@@ -26,7 +26,7 @@ impl Frame {
         self.x[8]
     }
 
-    /// System call argument `index` (0-5): x0-x5, as the C ABI passes them.
+    /// System call argument `index` (0-6): x0-x6, as the C ABI passes them.
     pub fn arg(&self, index: usize) -> u64 {
         self.x[index]
     }

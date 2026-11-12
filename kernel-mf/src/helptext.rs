@@ -47,6 +47,7 @@ pub const TOPICS: &[Topic] = &[
     t("i2s", "Machine", "i2s probe | i2s capture [SECONDS] | i2s audio on|off", "The Maltex I2S audio HAT (Raspberry Pi 4): clock edge counts, a level meter, or offer it as an audio device."),
     t("audio", "Machine", "audio | audio device N|auto | audio tone [HZ] [SECONDS] [RATE]", "List audio devices, choose the active one, play a test tone."),
     t("touch", "Machine", "touch | touch monitor [SECONDS]", "List the touch panels (USB, and the Pi 4's DSI display); `monitor` prints finger events for a while."),
+    t("midi", "Machine", "midi | midi monitor [SECONDS] | midi send [#N] HEX HEX [HEX]", "USB-MIDI devices: list them, watch what they send for a while, send one message (`90 3c 64` is note C4 on)."),
     t("usb", "Machine", "usb [rescan]", "List USB devices; `rescan` finds changes behind hubs and returning disks."),
     t("disks", "Disks", "disks", "List the disks and their ext volumes."),
     t("mount", "Disks", "mount [PATH @LABEL | fstab]", "Show the mount table, add a mount point for a labelled volume, or reload `fstab`."),

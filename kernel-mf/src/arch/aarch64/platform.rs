@@ -169,5 +169,5 @@ static DSI: kernel_core::screen::Dsi = kernel_core::screen::Dsi {
     reports: crate::dsitouch::reports,
 };
 
-/// No pixel console yet, so no screen size and no rotation; the DSI chip's touches still reach the pointer queue.
-static SCREEN: kernel_core::screen::Screen = kernel_core::screen::Screen { gfx_info: || None, rotation: |_| None, dsi: Some(&DSI) };
+/// The pixel console's size (touch scaling) and no rotation yet; the DSI chip's touches reach the pointer queue.
+static SCREEN: kernel_core::screen::Screen = kernel_core::screen::Screen { gfx_info: crate::fb::gfx_info, rotation: |_| None, dsi: Some(&DSI) };

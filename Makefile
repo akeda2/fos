@@ -407,14 +407,14 @@ kernel-mf-aarch64:
 
 image-mf-aarch64: loader-aarch64 kernel-mf-aarch64 tapes-aarch64
 	mkdir -p $(BUILD)/fosfor-mf-aarch64
-	python3 tools/build_image.py --arch aarch64 --loader $(A64_LOADER) --kernel $(A64_KERNEL_MF) $(foreach tape,hello thrcheck fscheck calc ed netcheck httpd web fterm,--file $(tape)=$(A64_TAPE_STAMPED)/$(tape)) --output $(BUILD)/fosfor-mf-aarch64/fosfor-qemu.img
+	python3 tools/build_image.py --arch aarch64 --loader $(A64_LOADER) --kernel $(A64_KERNEL_MF) $(foreach tape,hello thrcheck fscheck gfxcheck calc ed netcheck httpd web fterm,--file $(tape)=$(A64_TAPE_STAMPED)/$(tape)) --output $(BUILD)/fosfor-mf-aarch64/fosfor-qemu.img
 
 # The SD card image for a Raspberry Pi 4 running the server kernel: the mf image plus the edk2 firmware files in the ESP.
 # `image-mf-aarch64` alone is the QEMU image and does not boot on a Pi (no firmware). Flash it with
 # `sudo python3 tools/write_stick.py /dev/sdX --image build/fosfor-mf-aarch64/fosfor-pi4.img` (a person runs that).
 image-mf-pi4: image-mf-aarch64
 	python3 tools/fetch_rpi4_firmware.py build/rpi4-firmware
-	python3 tools/build_image.py --arch aarch64 --loader $(A64_LOADER) --kernel $(A64_KERNEL_MF) $(foreach tape,hello thrcheck fscheck calc ed netcheck httpd web fterm,--file $(tape)=$(A64_TAPE_STAMPED)/$(tape)) --esp-dir build/rpi4-firmware --output $(BUILD)/fosfor-mf-aarch64/fosfor-pi4.img
+	python3 tools/build_image.py --arch aarch64 --loader $(A64_LOADER) --kernel $(A64_KERNEL_MF) $(foreach tape,hello thrcheck fscheck gfxcheck calc ed netcheck httpd web fterm,--file $(tape)=$(A64_TAPE_STAMPED)/$(tape)) --esp-dir build/rpi4-firmware --output $(BUILD)/fosfor-mf-aarch64/fosfor-pi4.img
 
 # Serial KUP: a kernel pushed over the console UART is tried from the other slot and confirmed.
 test-aarch64-kup: image-aarch64

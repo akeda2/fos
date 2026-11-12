@@ -21,6 +21,7 @@ mod selftest;
 mod sync;
 mod time;
 mod vm;
+mod fb;
 // the shared files of the embedded kernel name the macro by path
 pub(crate) use serial::{print, println};
 
@@ -35,6 +36,8 @@ mod tapenet;
 mod tapeaudio;
 #[cfg(target_arch = "aarch64")]
 mod tapepi;
+#[cfg(target_arch = "aarch64")]
+mod gpio_remote;
 mod audioshell;
 mod tapeapi;
 mod threads;
@@ -49,7 +52,6 @@ mod bootcode;
 until_ported! {
     mod tapeserial;
     mod ps2;
-    mod fb;
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -97,6 +99,21 @@ static FLAVOUR: [u8; 2] = *b"mf";
 
 fn mib(bytes: u64) -> u64 {
     bytes >> 20
+}
+
+/// On a Pi 4 the firmware can drive the DSI panel and a second HDMI output: the panel gets its own 800x480 console (the UEFI one
+/// is 800x600), the second output becomes tape screen 1. The mailbox needs the timer, hence this late.
+#[cfg(target_arch = "aarch64")]
+fn pi_screens(info: &BootInfo) {
+    if !arch::hal::is_pi4() {
+        return;
+    }
+    if let Some(dsi) = mailbox::dsi_framebuffer(&info.framebuffer) {
+        if fb::init(&dsi).is_some() {
+            fb::write_str(log::contents());
+        }
+    }
+    mailbox::second_screen();
 }
 
 #[unsafe(no_mangle)]
@@ -238,6 +255,9 @@ fn boot_services(info: &BootInfo, _century: u8) -> ! {
         usb::init();
     }
     config::load();
+    #[cfg(target_arch = "aarch64")]
+    pi_screens(info);
+    #[cfg(target_arch = "aarch64")]
     if dsitouch::init() {
         println!("DSI touch: FT5406-style controller at 0x38 on the display connector's I2C bus (`touch`).");
     }

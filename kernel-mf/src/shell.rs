@@ -138,7 +138,7 @@ pub fn prompt() {
 
 /// Commands `run` handles itself, outside the shared tables, for Tab completion.
 const BUILTINS: &[&str] = &[
-    "version", "cpus", "mem", "pci", "disks", "nic", "vnic", "service", "settings", "tapesync", "gpio", "top", "threads", "ps", "date", "uptime", "slots", "audio", "i2s", "i2c", "touch", "usb", "tape", "run", "kill",
+    "version", "cpus", "mem", "pci", "disks", "nic", "vnic", "service", "settings", "tapesync", "gpio", "top", "threads", "ps", "date", "uptime", "slots", "audio", "i2s", "i2c", "touch", "midi", "usb", "tape", "run", "kill",
     "echo", "debug", "start", "keymap", "kup", "recv", "dmesg", "clear", "sleep", "io", "memmap", "bootinfo", "cpuinfo", "shrink", "sector", "mount", "umount",
     "format", "label", "fsck", "grow", "install", "bootcode", "reboot", "reset", "shutdown", "halt", "ext4", "md", "sha256", "cd", "pwd", "exit",
 ];
@@ -332,6 +332,7 @@ pub fn run_command(line: &str) {
         "slots" => slots::report(),
         "audio" => crate::audioshell::command(words),
         "touch" => crate::usbshell::touch(words),
+        "midi" => crate::usbshell::midi(words),
         #[cfg(target_arch = "aarch64")]
         "i2s" => crate::i2s_pi::command(line.trim_start().strip_prefix("i2s").unwrap_or("").trim()),
         #[cfg(target_arch = "aarch64")]

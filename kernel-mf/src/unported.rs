@@ -28,29 +28,6 @@ pub mod tapeserial {
     pub fn process_ended(_pid: u64) {}
 }
 
-pub mod fb {
-    /// No framebuffer console in mf on aarch64 yet: tapes see no pixel screen.
-    pub fn console_size() -> Option<(usize, usize)> {
-        None
-    }
-    pub fn gfx_info() -> Option<(u32, u32)> {
-        None
-    }
-    pub fn gfx_open() -> bool {
-        false
-    }
-    pub fn gfx_close() {}
-    pub fn gfx_fill(_x: u32, _y: u32, _width: u32, _height: u32, _rgb: u32) -> bool {
-        false
-    }
-    pub unsafe fn gfx_blit(_x: u32, _y: u32, _width: u32, _height: u32, _source: *const u32, _stride: u32) -> bool {
-        false
-    }
-    pub fn set_colours(_foreground: Option<&str>, _background: Option<&str>) -> bool {
-        false
-    }
-}
-
 pub mod ps2 {
     pub fn poll() {}
 }

@@ -106,6 +106,24 @@ def unattended() -> None:
             base.check("unclean boots: 1" in second, "and counts the reset as an unclean boot", second)
 
 
+def screen() -> None:
+    """The pixel console (ramfb here, the HDMI/DSI framebuffer on a Pi): the boot text is drawn and a tape draws through gfx_*."""
+    import tempfile
+    shot = Path(tempfile.mkdtemp()) / "screen.ppm"
+    text = base.boot(IMAGE, shot, ("version",))
+    base.check("Framebuffer console:" in text and "characters" in text, "the boot framebuffer becomes the text console", text)
+    total, lit = base.lit_pixels(shot) if shot.exists() else (0, 0)
+    base.check(total > 0 and lit > 500, "the shell's text is on the screen", f"{lit}/{total} pixels lit")
+    gfx_shot = shot.with_name("gfx.ppm")
+    gfx = base.boot(IMAGE, None, (), (), ("run gfxcheck secs=3", "gfxcheck: drawn", gfx_shot))
+    pixel, size = base.ppm_reader(gfx_shot)
+    width, height = size
+    base.check("gfxcheck: screen" in gfx and "gfxcheck: drawn" in gfx, "a tape reads the screen size and draws through gfx_* at EL0", gfx)
+    base.check((pixel(10, 10), pixel(100, 10), pixel(170, 10)) == ((255, 0, 0), (0, 255, 0), (0, 0, 255)), "gfx_fill: red, green and blue bars have the right colours", "")
+    base.check(pixel(100, 102) == (100, 0, 0) and pixel(width - 1, height - 1) == (255, 0, 255), "gfx_blit: a ramp and a clipped block", "")
+    base.check("gfxcheck: done" in gfx, "the tape ends and the shell returns", gfx)
+
+
 def pins() -> None:
     """The Pi's header, on a simulated pin bank (`gpio-sim`, QEMU has no BCM2711): `gpio`, a denied pin, a tape-less `i2c`/`i2s`.
     The image is a copy with a `settings` file."""
@@ -118,13 +136,76 @@ def pins() -> None:
         image = Path(scratch) / "fosfor.img"
         subprocess.run([sys.executable, str(base.ROOT / "tools/build_image.py"), "--arch", "aarch64", "--loader", str(target / "aarch64-unknown-uefi/release/fosfor-loader.efi"),
                         "--kernel", str(target / "aarch64-unknown-none-softfloat/release/fosfor-kernel-mf"), "--file", f"settings={settings}", "--output", str(image)], check=True, capture_output=True)
-        text = base.boot(image, commands=("gpio mode 7 out 1", "gpio read 7", "gpio mode 5 out 1", "gpio pull 9 up", "gpio read 9", "i2c status", "i2s probe", "audio"))
+        text = base.boot(image, commands=("gpio mode 7 out 1", "gpio read 7", "gpio mode 5 out 1", "gpio pull 9 up", "gpio read 9", "i2c status", "i2s probe", "audio", "midi", "midi send 90 3c 64", "midi bogus"))
         shell = text.split("fos> ", 1)[-1]
         base.check("settings: gpio-sim -- a RAM-backed GPIO bank" in text, "gpio-sim is a setting of mf on aarch64", text)
         base.check("is not supported by the server kernel yet" not in text, "gpio-sim and gpio-deny are not reported as ignored", text)
         base.check("GPIO7" in shell and "out" in shell and "high" in shell, "`gpio mode 7 out 1` drives a simulated pin high", text)
         base.check("gpio:" in shell and "not allowed" in shell.lower(), "a denied pin is refused", text)
+        base.check("midi: no USB MIDI device" in shell and "midi send:" in shell and "Usage: midi" in shell, "`midi` lists, sends and explains usage (no device under QEMU)", text)
         base.check("pull up" in shell, "`gpio pull` sets and shows a pull-up", text)
+
+
+def remote_gpio() -> None:
+    """The Pi's pins served over the network (`gpio-remote` + `synckey`, a simulated bank): a host signs a challenge, writes a pin and
+    reads it back; a write to a denied pin and a wrong key are refused."""
+    import struct
+    import subprocess
+    import tempfile
+    sys.path.insert(0, str(base.ROOT / "tools"))
+    import gpio as client
+    from test_boot import BROADCAST, TAG_DISCOVER_REPLY, TAG_DISCOVER_REQUEST
+    target = base.ROOT / "build/cargo-target"
+    key = b"correct horse"
+    seen = {}
+
+    def ask(wire, guest, op, args=b"", key=key):
+        wire.send(guest, client.TAG_REQUEST, b"\0")
+        nonce = None
+        for _, tag, payload in wire.frames(3):
+            if tag == client.TAG_REPLY and payload[0] == 0:
+                nonce = payload[1:1 + client.NONCE_LEN]
+                break
+        if nonce is None:
+            return None
+        wire.send(guest, client.TAG_REQUEST, bytes([op]) + nonce + args + client.mac_of(b"fosgpio1", op, nonce, args, key))
+        for _, tag, payload in wire.frames(3):
+            if tag == client.TAG_REPLY:
+                size = client.DATA_LEN[op] if payload[0] == 0 or (op == client.OP_SET and payload[0] == 4) else 0
+                data = payload[1 + client.NONCE_LEN:1 + client.NONCE_LEN + size]
+                good = client.mac_of(b"fosgpio1r", payload[0], nonce, data, key)
+                return payload[0], data, payload[1 + client.NONCE_LEN + size:1 + client.NONCE_LEN + size + client.MAC_LEN] == good
+        return None
+
+    def talk(wire) -> None:
+        guest = None
+        for _ in range(60):
+            wire.send(BROADCAST, TAG_DISCOVER_REQUEST, b"host")
+            for source, tag, payload in wire.frames(0.25):
+                if tag == TAG_DISCOVER_REPLY:
+                    guest = source
+            if guest:
+                break
+        seen["mode"] = ask(wire, guest, client.OP_FUNCTION, bytes([7, 1, 1]))
+        seen["state"] = ask(wire, guest, client.OP_STATE)
+        seen["denied"] = ask(wire, guest, client.OP_FUNCTION, bytes([5, 1, 1]))
+        seen["wrongkey"] = ask(wire, guest, client.OP_STATE, key=b"battery staple")
+
+    with tempfile.TemporaryDirectory() as scratch:
+        files = {"settings": "gpio-sim\ngpio-remote\ngpio-deny 5\n", "synckey": key.decode() + "\n"}
+        args = []
+        for name, text in files.items():
+            (Path(scratch) / name).write_text(text)
+            args += ["--file", f"{name}={Path(scratch) / name}"]
+        image = Path(scratch) / "fosfor.img"
+        subprocess.run([sys.executable, str(base.ROOT / "tools/build_image.py"), "--arch", "aarch64", "--loader", str(target / "aarch64-unknown-uefi/release/fosfor-loader.efi"),
+                        "--kernel", str(target / "aarch64-unknown-none-softfloat/release/fosfor-kernel-mf"), *args, "--output", str(image)], check=True, capture_output=True)
+        text = base.boot(image, wire=talk)
+    base.check(seen.get("mode") and seen["mode"][0] == 0 and seen["mode"][2], "a signed remote `mode 7 out 1` is accepted and the answer is signed", str(seen))
+    state = seen.get("state")
+    base.check(bool(state) and state[0] == 0 and state[2] and client.decode_state(state[1])["levels"] >> 7 & 1, "the remote state shows pin 7 high", str(seen))
+    base.check(bool(seen.get("denied")) and seen["denied"][0] == 4, "a denied pin is refused over the network", str(seen))
+    base.check(seen.get("wrongkey") is None, "a request signed with another key is not answered", str(seen))
 
 
 def install() -> None:
@@ -185,6 +266,8 @@ def network() -> None:
 if __name__ == "__main__":
     main()
     unattended()
+    screen()
     pins()
+    remote_gpio()
     install()
     network()

@@ -506,7 +506,24 @@ pub fn call(frame: &mut Frame) {
         I2C_SPEED | I2C_TRANSFER => (-4i64) as u64,
         FP_LEVEL => u64::from(fpu::level()),
         GFX_INFO | GFX_INFO_ON if number == GFX_INFO || a == 0 => fb::gfx_info().map_or(0, |(w, h)| u64::from(w) << 32 | u64::from(h)),
-        GFX_SCREENS => u64::from(fb::gfx_info().is_some()),
+        GFX_INFO_ON if a == 1 => fb::extra_info().map_or(0, |(w, h)| u64::from(w) << 32 | u64::from(h)),
+        GFX_SCREENS => u64::from(fb::gfx_info().is_some()) + u64::from(fb::extra_info().is_some()),
+        GFX_OPEN_ON if a == 1 => {
+            let opened = fb::extra_open();
+            if opened {
+                process::note_screen_open();
+            }
+            u64::from(opened)
+        }
+        GFX_CLOSE_ON if a == 1 => {
+            fb::extra_close();
+            0
+        }
+        GFX_FILL_ON if a == 1 => u64::from(fb::extra_fill(b as u32, c as u32, d as u32, e as u32, frame.arg(5) as u32)),
+        GFX_BLIT_ON if a == 1 => match seventh(frame) {
+            Some(stride) => blit_on(1, b as u32, c as u32, d as u32, e as u32, frame.arg(5), stride),
+            None => 0,
+        },
         GFX_OPEN | GFX_OPEN_ON if number == GFX_OPEN || a == 0 => {
             let opened = fb::gfx_open();
             if opened {
@@ -524,10 +541,10 @@ pub fn call(frame: &mut Frame) {
         }
         GFX_FILL => u64::from(fb::gfx_fill(a as u32, b as u32, c as u32, d as u32, e as u32)),
         GFX_FILL_ON if a == 0 => u64::from(fb::gfx_fill(b as u32, c as u32, d as u32, e as u32, frame.arg(5) as u32)),
-        GFX_BLIT => blit(a as u32, b as u32, c as u32, d as u32, e, frame.arg(5)),
+        GFX_BLIT => blit_on(0, a as u32, b as u32, c as u32, d as u32, e, frame.arg(5)),
         // The seventh argument (stride) is on the user's stack, above the return address the stub's caller pushed.
-        GFX_BLIT_ON if a == 0 => match process::user_u64(frame.stack_args()) {
-            Some(stride) => blit(b as u32, c as u32, d as u32, e as u32, frame.arg(5), stride),
+        GFX_BLIT_ON if a == 0 => match seventh(frame) {
+            Some(stride) => blit_on(0, b as u32, c as u32, d as u32, e as u32, frame.arg(5), stride),
             None => 0,
         },
         _ => 0,
@@ -535,8 +552,16 @@ pub fn call(frame: &mut Frame) {
     frame.set_result(result);
 }
 
+/// The seventh argument of a call: x6 on aarch64 (eight come in registers), on x86 the first word of the caller's stack.
+fn seventh(frame: &Frame) -> Option<u64> {
+    #[cfg(target_arch = "aarch64")]
+    return Some(frame.arg(6));
+    #[cfg(not(target_arch = "aarch64"))]
+    process::user_u64(frame.stack_args())
+}
+
 /// `gfx_blit`: `pixels` (rdi-style argument 5) and `stride` (argument 6) are checked as user memory before the copy.
-fn blit(x: u32, y: u32, width: u32, height: u32, pixels: u64, stride: u64) -> u64 {
+fn blit_on(screen: u64, x: u32, y: u32, width: u32, height: u32, pixels: u64, stride: u64) -> u64 {
     let (stride, rows) = (stride as u32, u64::from(height));
     if pixels == 0 || stride < width || width == 0 || rows == 0 {
         return 0;
@@ -545,5 +570,11 @@ fn blit(x: u32, y: u32, width: u32, height: u32, pixels: u64, stride: u64) -> u6
     if pixels % 4 != 0 || !vm::user_range_ok(sched::current_root(), pixels, bytes, false) {
         return 0;
     }
-    u64::from(process::user_access(|| unsafe { fb::gfx_blit(x, y, width, height, pixels as *const u32, stride) })) // kernel-memory
+    u64::from(process::user_access(|| unsafe {
+        if screen == 1 {
+            fb::extra_blit(x, y, width, height, pixels as *const u32, stride)
+        } else {
+            fb::gfx_blit(x, y, width, height, pixels as *const u32, stride)
+        }
+    })) // kernel-memory
 }

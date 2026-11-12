@@ -455,9 +455,17 @@ working from it. Only a real Pi 4 shows the VL805 behind the PCIe bridge, the Ge
 `arch/aarch64/mod.rs`; `crate::framebuffer` is a two-function stand-in until the pixel console is ported). `platform::install` registers
 the I2S driver with `kernel_core::i2s::set` and the DSI chip through `kernel_core::screen::set` (no logical screen yet), so `audio`,
 the `audio_*` tape calls and `touch` see them as on the embedded kernel. Settings: `i2s-audio [off]`, `gpio-sim`, `gpio-deny N..`
-(`gpio-remote` stays ignored: serving pins to other machines is not ported). Shell: `gpio`, `i2c`, `i2s probe|capture|audio`,
-`touch` and `touch monitor [SECONDS]` (a fixed time, not until Escape). Tape ABI 22/23 (`gpio_*`, `i2c_*`) is live on aarch64
+`gpio-remote` too: `gpio_remote.rs` serves the pins to other machines through NETFS (signed with the `synckey`, `tools/gpio.py`,
+`gpio @HOST`), `make test-mf-aarch64-boot` runs it against a simulated bank. Shell: `gpio`, `i2c`, `i2s probe|capture|audio`,
+`touch [monitor [SECONDS]]` and `midi [monitor [SECONDS] | send [#N] HEX..]` (a fixed time, not until Escape: the mf shell has no break source). Tape ABI 22/23 (`gpio_*`, `i2c_*`) is live on aarch64
 (`tapepi.rs`: I2C buffers bounce through the kernel, the call is pinned to CPU 0; pins and bus speed are restored when a tape ends).
-`config.txt` needs nothing for any of it. Tested in QEMU: `gpio` on a `gpio-sim` bank, a denied pin, `audio` listing. Only
-a Pi 4 with the HAT or the panel shows the I2S capture/playback, the I2C bus and the touch reports. The DSI panel *display* needs the pixel
-console (`fb.rs`) on aarch64, which is not ported: the DSI touch works without it, the picture does not.
+`config.txt` needs nothing for any of it. Tested in QEMU: `gpio` on a `gpio-sim` bank, a denied pin, remote GPIO, `audio` listing.
+Only a Pi 4 with the HAT or the panel shows the I2S capture/playback, the I2C bus and the touch reports.
+
+The pixel console (`fb.rs`) is shared with x86: on aarch64 it draws on the loader's GOP framebuffer, which `paging::build_and_load`
+mapped non-cacheable (so `dsb st` stands in for the PAT/`sfence`), and replays the boot log once it exists. On a Pi 4 `pi_screens` (main.rs)
+then asks the firmware for the DSI panel's own 800x480 framebuffer (the UEFI one is 800x600) and restarts the console on it, and
+registers a second HDMI output as tape screen 1 (`fb::add_screen`, `gfx_*_on`). Tapes see the same `gfx_*` calls as on x86
+(`make test-mf-aarch64-boot`: `gfxcheck` on QEMU's ramfb). aarch64 passes the seventh call argument in x6, not on the stack
+(`tapeapi::seventh`). Only a Pi shows the mailbox framebuffers, the panel and the second output; the screen rotation (`rotate`) of
+the embedded kernel is not ported. Not ported: `cpufreq` (pipower).

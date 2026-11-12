@@ -184,12 +184,9 @@ pub mod i2s_pi;
 #[path = "../../../../kernel/src/dsitouch.rs"]
 pub mod dsitouch;
 
-/// There is no pixel console in mf on aarch64 yet (`unported::fb`): the mailbox's display calls see no screen and do nothing.
+/// The mailbox's display calls name the console as `crate::framebuffer`; it is `fb.rs` here.
 pub mod framebuffer {
-    pub fn gfx_info() -> Option<(u32, u32)> {
-        None
-    }
-    pub fn add_screen(_base: u64, _width: u32, _height: u32, _stride: u32) {}
+    pub use crate::fb::{add_screen, gfx_info};
 }
 
 /// The crash machinery (record, reset) is not ported yet: a fatal exception is reported and the CPU parks.
@@ -335,6 +332,13 @@ pub fn init_memory(_machine: &boot::Machine, info: &BootInfo) -> &'static BootIn
     paging::build_and_load(info, &info.framebuffer);
     mmu::share_kernel_slots();
     paging::map_device(pl011::base(), 4096);
+    // The boot framebuffer was mapped non-cacheable by `build_and_load`; what was printed so far is drawn again.
+    if let Some((columns, rows, _)) = crate::fb::init(&info.framebuffer) {
+        crate::fb::write_str(crate::log::contents());
+        println!("Framebuffer console: {}x{} pixels, {columns}x{rows} characters (also on the serial line and the network).", info.framebuffer.width, info.framebuffer.height);
+    } else {
+        println!("Framebuffer console: none (serial and network only).");
+    }
     println!("Page tables: loaded; RAM no-execute in 2 MiB blocks, kernel image W^X, page 0 and the stack guard unmapped.");
     unsafe { &*(info as *const BootInfo) }
 }

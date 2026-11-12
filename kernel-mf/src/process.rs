@@ -221,6 +221,7 @@ fn leave(how: Option<How>) -> ! {
     let Some((how, written)) = sched::leave_process(how) else { sched::exit() };
     if SCREEN_OWNER.compare_exchange(thread, 0, core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed).is_ok() {
         crate::fb::gfx_close();
+        crate::fb::extra_close();
     }
     if root != 0 {
         vm::destroy_user_space(root);

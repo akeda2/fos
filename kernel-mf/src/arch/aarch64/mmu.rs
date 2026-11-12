@@ -41,6 +41,12 @@ pub fn map_device(physical: u64, length: u64) {
     crate::paging::map_device(physical, length);
 }
 
+/// The framebuffer is already mapped non-cacheable (boot paging, or `paging::map_framebuffer` for the GPU's), so there is no
+/// write-combining to ask for; false says "uncached", as on an x86 without a PAT.
+pub fn map_write_combining(_physical: u64, _length: u64) -> bool {
+    false
+}
+
 const VALID: u64 = 1;
 const TABLE: u64 = 3;
 const PAGE_DESC: u64 = 3;

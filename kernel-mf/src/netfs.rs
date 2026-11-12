@@ -102,7 +102,10 @@ pub fn serve() {
             TAG_PUT_DATA => put_data(source, &payload),
             TAG_PUT_STOP => put_stop(index, source),
             TAG_SYNC_REQUEST => tapesync::serve(index, source, &payload),
+            #[cfg(target_arch = "aarch64")]
+            TAG_GPIO_REQUEST => crate::gpio_remote::serve(index, source, &payload),
             // No pins here: say so to the challenge request, answer nothing else.
+            #[cfg(not(target_arch = "aarch64"))]
             TAG_GPIO_REQUEST if payload.first() == Some(&0) => reply(index, &source, TAG_GPIO_REPLY, &[kernel_core::gpio_client::STATUS_NO_GPIO]),
             _ => {}
         }
