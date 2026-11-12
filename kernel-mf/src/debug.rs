@@ -78,6 +78,17 @@ pub fn watchdog_seconds() -> Option<u64> {
     }
 }
 
+/// True once (and disarms the watchdog) when the service thread has not petted for longer than the limit; for ports whose timer
+/// handler has no `Frame` (aarch64).
+pub fn watchdog_expired() -> bool {
+    let limit = LIMIT_TICKS.load(Ordering::Relaxed);
+    if limit != 0 && crate::time::ticks().saturating_sub(LAST_PET.load(Ordering::Relaxed)) > limit {
+        LIMIT_TICKS.store(0, Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
 /// The boot CPU's timer interrupt: resets a machine whose service thread has stopped petting.
 pub fn watchdog_check(frame: &mut Frame) {
     let limit = LIMIT_TICKS.load(Ordering::Relaxed);

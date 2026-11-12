@@ -48,7 +48,6 @@ impl Frame {
     }
 }
 
-pub fn fatal_reset(_frame: &Frame) -> ! {
-    crate::println!("*** fatal: halting.");
-    crate::halt()
+pub fn fatal_reset(frame: &Frame) -> ! {
+    crate::crash::fatal(frame.vector, frame.esr, frame.rip, frame.far, true)
 }

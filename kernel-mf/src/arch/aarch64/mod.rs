@@ -40,25 +40,8 @@ pub mod power {
     }
 }
 
-/// The hardware watchdog: the Pi 4's PM_WDOG could serve (it is what `power` resets with) but is not wired up yet.
-pub mod hwwd {
-    pub fn start(_seconds: u32) -> Result<&'static str, &'static str> {
-        Err("not implemented on aarch64")
-    }
-    pub fn reload() {}
-    pub fn stop() {}
-    pub fn running() -> bool {
-        false
-    }
-}
-
-/// The crash record (a RAM page the next boot reads) is x86-only so far: nothing is written or reported.
-pub mod crashrec {
-    use crate::trap::Frame;
-    pub fn init() {}
-    pub fn record_crash(_frame: &Frame) {}
-    pub fn report_previous_crash() {}
-}
+pub mod crashrec;
+pub mod hwwd;
 
 pub mod cpu {
     pub use super::cpu_arch::*;
@@ -187,12 +170,35 @@ pub mod sdhci;
 
 /// The crash machinery (record, reset) is not ported yet: a fatal exception is reported and the CPU parks.
 pub mod crash {
-    /// The timer interrupt's hook (after its acknowledgement): the scheduler's tick.
+    /// The timer interrupt's hook (after its acknowledgement): the boot CPU checks the watchdog, every CPU runs the scheduler's tick.
     pub fn tick() {
+        if crate::percpu::this().index == 0 && crate::debug::watchdog_expired() {
+            let elr: u64;
+            unsafe { core::arch::asm!("mrs {}, elr_el1", out(reg) elr, options(nomem, nostack)) };
+            fatal(super::crashrec::WATCHDOG_VECTOR, 0, elr, 0, true);
+        }
         crate::sched::tick();
     }
-    pub fn fatal(_kind: u64, _esr: u64, _elr: u64, _far: u64, _always_reset: bool) -> ! {
-        crate::println!("*** fatal exception: halting.");
+
+    /// A fatal exception in the kernel (or the watchdog): report, record, then reset after `reboot-delay` if `reboot-on-crash`
+    /// is set (always for the watchdog) unless the loader saw too many boots that never reached the milestone; else halt.
+    pub fn fatal(kind: u64, esr: u64, elr: u64, far: u64, always_reset: bool) -> ! {
+        crate::cpu::interrupts_disable();
+        crate::println!("*** fatal exception {kind}: ESR {esr:#x}, ELR {elr:#x}, FAR {far:#x}.");
+        super::crashrec::record(kind, esr, elr, far);
+        if crate::config::reboot_on_crash() || always_reset {
+            if crate::debug::crash_loop_tripped() {
+                crate::hwwd::stop();
+                crate::println!("*** crash loop: {} boots in a row never reached the milestone; not resetting again. Halting for an operator.", crate::debug::boot_crash_count());
+            } else {
+                crate::println!("*** resetting in {} s", crate::config::reboot_delay());
+                crate::hwwd::reload();
+                crate::timer::busy_wait_ms(u64::from(crate::config::reboot_delay()) * 1000);
+                crate::power::crash_reset();
+            }
+        }
+        crate::hwwd::stop();
+        crate::println!("*** the kernel stops here");
         crate::halt()
     }
 }

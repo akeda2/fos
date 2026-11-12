@@ -64,6 +64,26 @@ def main() -> None:
     base.check(re.search(r"disk2: \d+ MiB, SD card", sd) is not None, "the SDHCI controller and its card are registered as a disk", sd)
 
 
+def unattended() -> None:
+    """A fatal exception and a hung service thread each write the `crash` file, reset the machine (PSCI SYSTEM_RESET) and the
+    next boot reports the file and counts an unclean boot. The image is a copy with a `debug` file (written by the next boot)."""
+    import subprocess
+    import tempfile
+    target = base.ROOT / "build/cargo-target"
+    with tempfile.TemporaryDirectory() as scratch:
+        debug = Path(scratch) / "debug"
+        debug.write_text("reboot-on-crash\nreboot-delay 1\nwatchdog 6\n")
+        for command, expected in (("debug crash now", "exception 4: ESR 0x02000000"), ("debug hang now", "watchdog: no progress")):
+            image = Path(scratch) / "fosfor.img"
+            subprocess.run([sys.executable, str(base.ROOT / "tools/build_image.py"), "--arch", "aarch64", "--loader", str(target / "aarch64-unknown-uefi/release/fosfor-loader.efi"),
+                            "--kernel", str(target / "aarch64-unknown-none-softfloat/release/fosfor-kernel-mf"), "--file", f"debug={debug}", "--output", str(image)], check=True, capture_output=True)
+            first = base.boot(image, commands=(command,), keep=True)
+            base.check("Crash record written to the file `crash`." in first and "*** resetting in 1 s" in first, f"`{command}` records the crash and resets", first)
+            second = base.boot(image, commands=("slots",), keep=True)
+            base.check("Previous boot crashed (file `crash`, now removed):" in second and expected in second, f"the next boot reports the crash file ({expected})", second)
+            base.check("unclean boots: 1" in second, "and counts the reset as an unclean boot", second)
+
+
 def network() -> None:
     """The guest's virtio-net on a multicast socket network: discovery, then a `term net` session (receive and transmit)."""
     from test_boot import BROADCAST, TAG_DISCOVER_REPLY, TAG_DISCOVER_REQUEST, TAG_HELLO, TAG_DATA
@@ -91,4 +111,5 @@ def network() -> None:
 
 if __name__ == "__main__":
     main()
+    unattended()
     network()

@@ -24,7 +24,7 @@ def check(condition, message, text=""):
     print(f"PASS: {message}")
 
 
-def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] = (), usb_keys: tuple[str, ...] = (), during: tuple | None = None, steps: tuple[tuple[str, str], ...] = (), sd: bool = False, fat: bool = False, usb: bool = False, big: bool = False, wire=None, el2: bool = False, cpus: int = 1) -> str:
+def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] = (), usb_keys: tuple[str, ...] = (), during: tuple | None = None, steps: tuple[tuple[str, str], ...] = (), sd: bool = False, fat: bool = False, usb: bool = False, big: bool = False, wire=None, el2: bool = False, cpus: int = 1, keep: bool = False) -> str:
     """Boots `image` under QEMU virt + AAVMF + ramfb and returns the serial text. The kernel parks, so the run ends
     when the parking message shows (or after 60 s); a PPM screenshot goes to `screendump` when given. `wire` is a function
     called with the host's end of the guest's multicast network (`test_boot.Wire`) once the shell is up; the guest's NIC
@@ -47,7 +47,7 @@ def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] 
             image = Path(scratch) / "big.img"
             shutil.copyfile(IMAGE, image)
             os.truncate(image, 256 << 20)
-        disk = ["-drive", f"file={image},format=raw,if=none,id=boot,snapshot=on", "-device", "virtio-blk-pci,drive=boot"]
+        disk = ["-drive", f"file={image},format=raw,if=none,id=boot" + ("" if keep else ",snapshot=on"), "-device", "virtio-blk-pci,drive=boot"]
         if sd:
             disk += ["-drive", f"file={padded},format=raw,if=none,id=card,snapshot=on", "-device", "sdhci-pci", "-device", "sd-card,drive=card"]
         stick = []
