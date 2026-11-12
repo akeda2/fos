@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_aarch64_boot as base  # noqa: E402
 
-IMAGE = Path(os.environ.get("FOSFOR_IMAGE", base.ROOT / "build/fosfor-mf-aarch64/fosfor.img"))
+IMAGE = Path(os.environ.get("FOSFOR_IMAGE", base.ROOT / "build/fosfor-mf-aarch64/fosfor-qemu.img"))
 
 
 EL0_LINE = re.compile(r"EL0: hello ok, bad pointer ok, page fault ok, stack guard ok, undefined instruction ok, preempted spinner ok, "
