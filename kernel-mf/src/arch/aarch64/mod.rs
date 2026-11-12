@@ -177,6 +177,8 @@ pub mod sdhci;
 pub mod gpio;
 #[path = "../../../../kernel/src/mailbox.rs"]
 pub mod mailbox;
+#[path = "../../../../kernel/src/pipower.rs"]
+pub mod pipower;
 #[path = "../../../../kernel/src/i2c.rs"]
 pub mod i2c;
 #[path = "../../../../kernel/src/i2s_pi.rs"]

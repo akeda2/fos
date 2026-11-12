@@ -471,8 +471,42 @@ fn outb(port: u16, value: u8) {
 fn outb(_port: u16, _value: u8) {}
 
 /// Graphics for tapes (`TapeApi::gfx_*`): while a process has the screen open the text console stops drawing (serial and the
-/// network terminal go on); `gfx_close` clears the screen and the text starts again at the top. One screen, no rotation.
+/// network terminal go on); `gfx_close` clears the screen and the text starts again at the top. Tapes draw on an upright
+/// logical screen that `rotate` turns onto the framebuffer (the text console is not rotated).
 static GFX_OPEN: AtomicBool = AtomicBool::new(false);
+
+pub use kernel_core::screen::Rotate;
+
+/// The `rotate` setting per physical screen (0: the console, 1: the Pi's second HDMI output): how tapes' pixels are turned.
+static mut ROTATE: [Option<Rotate>; 2] = [None; 2];
+
+pub fn rotate_default(phys: usize, mode: Option<Rotate>) {
+    if phys < 2 {
+        unsafe { (*core::ptr::addr_of_mut!(ROTATE))[phys] = mode };
+    }
+}
+
+pub fn rotation(phys: usize) -> Option<Rotate> {
+    unsafe { (*core::ptr::addr_of!(ROTATE)).get(phys).copied().flatten() }
+}
+
+/// Size of a logical screen: width and height swap for a quarter turn.
+fn logical_size(phys: usize, width: usize, height: usize) -> (u32, u32) {
+    let (w, h) = rotation(phys).map_or((width, height), |turn| turn.logical(width, height));
+    (w as u32, h as u32)
+}
+
+/// Writes a clipped rectangle of the logical screen onto a physical `width` x `height` framebuffer, one pixel at a time
+/// through `turn`; `pixel(column, row)` gives the value for the rectangle's own coordinates.
+fn put_turned(turn: Rotate, base: *mut u32, stride: usize, width: usize, height: usize, (x, y, w, h): (usize, usize, usize, usize), pixel: impl Fn(usize, usize) -> u32) {
+    let (lw, lh) = turn.logical(width, height);
+    for row in 0..h.min(lh.saturating_sub(y)) {
+        for column in 0..w.min(lw.saturating_sub(x)) {
+            let (px, py) = turn.map(width, height, x + column, y + row);
+            unsafe { base.add(py * stride + px).write_volatile(pixel(column, row)) };
+        }
+    }
+}
 
 /// Columns and rows of the text console (`console_size`), or None before it exists.
 pub fn console_size() -> Option<(usize, usize)> {
@@ -482,7 +516,7 @@ pub fn console_size() -> Option<(usize, usize)> {
 /// Width and height of the pixel screen, or None without one.
 pub fn gfx_info() -> Option<(u32, u32)> {
     let console = unsafe { (*core::ptr::addr_of!(CONSOLE)).as_ref() }.filter(|console| !console.text)?;
-    Some((console.width as u32, console.height as u32))
+    Some(logical_size(0, console.width, console.height))
 }
 
 pub fn gfx_open() -> bool {
@@ -528,6 +562,11 @@ pub fn gfx_fill(x: u32, y: u32, width: u32, height: u32, rgb: u32) -> bool {
     let Some(console) = (unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }).filter(|_| GFX_OPEN.load(Ordering::Relaxed)) else { return false };
     let value = from_rgb(console, rgb);
     let (x, y) = (x as usize, y as usize);
+    if let Some(turn) = rotation(0) {
+        put_turned(turn, console.base, console.stride, console.width, console.height, (x, y, width as usize, height as usize), |_, _| value);
+        flush_writes();
+        return true;
+    }
     if x >= console.width || y >= console.height {
         return true;
     }
@@ -549,6 +588,16 @@ pub fn gfx_fill(x: u32, y: u32, width: u32, height: u32, rgb: u32) -> bool {
 pub unsafe fn gfx_blit(x: u32, y: u32, width: u32, height: u32, source: *const u32, stride: u32) -> bool {
     let Some(console) = (unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }).filter(|_| GFX_OPEN.load(Ordering::Relaxed)) else { return false };
     let (x, y, width, height, stride) = (x as usize, y as usize, width as usize, height as usize, stride as usize);
+    if let Some(turn) = rotation(0) {
+        let (lw, lh) = turn.logical(console.width, console.height);
+        if source.is_null() || stride < width || x >= lw || y >= lh {
+            return false;
+        }
+        let console = &*console;
+        put_turned(turn, console.base, console.stride, console.width, console.height, (x, y, width, height), |column, row| from_rgb(console, unsafe { source.add(row * stride + column).read_unaligned() }));
+        flush_writes();
+        return true;
+    }
     if source.is_null() || stride < width || x >= console.width || y >= console.height {
         return false;
     }
@@ -649,7 +698,7 @@ fn extra_clear(screen: &Extra) {
 }
 
 pub fn extra_info() -> Option<(u32, u32)> {
-    extra().map(|screen| (screen.width as u32, screen.height as u32))
+    extra().map(|screen| logical_size(1, screen.width, screen.height))
 }
 
 pub fn extra_open() -> bool {
@@ -672,6 +721,11 @@ pub fn extra_close() {
 pub fn extra_fill(x: u32, y: u32, width: u32, height: u32, rgb: u32) -> bool {
     let Some(screen) = extra().filter(|screen| screen.open) else { return false };
     let (x, y) = (x as usize, y as usize);
+    if let Some(turn) = rotation(1) {
+        put_turned(turn, screen.base, screen.stride, screen.width, screen.height, (x, y, width as usize, height as usize), |_, _| rgb);
+        flush_writes();
+        return true;
+    }
     if x >= screen.width || y >= screen.height {
         return true;
     }
@@ -690,6 +744,15 @@ pub fn extra_fill(x: u32, y: u32, width: u32, height: u32, rgb: u32) -> bool {
 pub unsafe fn extra_blit(x: u32, y: u32, width: u32, height: u32, source: *const u32, stride: u32) -> bool {
     let Some(screen) = extra().filter(|screen| screen.open) else { return false };
     let (x, y, width, height, stride) = (x as usize, y as usize, width as usize, height as usize, stride as usize);
+    if let Some(turn) = rotation(1) {
+        let (lw, lh) = turn.logical(screen.width, screen.height);
+        if source.is_null() || stride < width || x >= lw || y >= lh {
+            return false;
+        }
+        put_turned(turn, screen.base, screen.stride, screen.width, screen.height, (x, y, width, height), |column, row| unsafe { source.add(row * stride + column).read_unaligned() });
+        flush_writes();
+        return true;
+    }
     if source.is_null() || stride < width || x >= screen.width || y >= screen.height {
         return false;
     }

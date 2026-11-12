@@ -124,6 +124,28 @@ def screen() -> None:
     base.check("gfxcheck: done" in gfx, "the tape ends and the shell returns", gfx)
 
 
+def rotation() -> None:
+    """`rotate r` in settings: tapes draw on an upright logical screen (width and height swap) turned onto the framebuffer."""
+    import subprocess
+    import tempfile
+    target = base.ROOT / "build/cargo-target"
+    with tempfile.TemporaryDirectory() as scratch:
+        settings = Path(scratch) / "settings"
+        settings.write_text("rotate r\n")
+        image = Path(scratch) / "fosfor.img"
+        subprocess.run([sys.executable, str(base.ROOT / "tools/build_image.py"), "--arch", "aarch64", "--loader", str(target / "aarch64-unknown-uefi/release/fosfor-loader.efi"),
+                        "--kernel", str(target / "aarch64-unknown-none-softfloat/release/fosfor-kernel-mf"), "--file", f"settings={settings}",
+                        "--file", f"gfxcheck={base.ROOT / 'build/fosfor-aarch64/tapes/gfxcheck'}", "--output", str(image)], check=True, capture_output=True)
+        shot = Path(scratch) / "rot.ppm"
+        text = base.boot(image, None, (), (), ("run gfxcheck secs=3", "gfxcheck: drawn", shot))
+        pixel, (width, height) = base.ppm_reader(shot)
+        base.check("settings: rotate [0] r" in text, "`rotate r` is a setting of mf", text)
+        base.check(f"gfxcheck: screen {height}x{width}" in text, "the tape sees the swapped, upright screen size", text)
+        # logical (x, y) is physical (W-1-y, x) turned right
+        base.check((pixel(width - 11, 10), pixel(width - 11, 100), pixel(width - 11, 170)) == ((255, 0, 0), (0, 255, 0), (0, 0, 255)), "gfx_fill: the bars land turned a quarter", "")
+        base.check(pixel(width - 103, 100) == (100, 0, 0) and pixel(0, height - 1) == (255, 0, 255), "gfx_blit: the ramp and the clipped block land turned", "")
+
+
 def pins() -> None:
     """The Pi's header, on a simulated pin bank (`gpio-sim`, QEMU has no BCM2711): `gpio`, a denied pin, a tape-less `i2c`/`i2s`.
     The image is a copy with a `settings` file."""
@@ -136,13 +158,14 @@ def pins() -> None:
         image = Path(scratch) / "fosfor.img"
         subprocess.run([sys.executable, str(base.ROOT / "tools/build_image.py"), "--arch", "aarch64", "--loader", str(target / "aarch64-unknown-uefi/release/fosfor-loader.efi"),
                         "--kernel", str(target / "aarch64-unknown-none-softfloat/release/fosfor-kernel-mf"), "--file", f"settings={settings}", "--output", str(image)], check=True, capture_output=True)
-        text = base.boot(image, commands=("gpio mode 7 out 1", "gpio read 7", "gpio mode 5 out 1", "gpio pull 9 up", "gpio read 9", "i2c status", "i2s probe", "audio", "midi", "midi send 90 3c 64", "midi bogus"))
+        text = base.boot(image, commands=("gpio mode 7 out 1", "gpio read 7", "gpio mode 5 out 1", "gpio pull 9 up", "gpio read 9", "i2c status", "i2s probe", "audio", "cpufreq", "midi", "midi send 90 3c 64", "midi bogus"))
         shell = text.split("fos> ", 1)[-1]
         base.check("settings: gpio-sim -- a RAM-backed GPIO bank" in text, "gpio-sim is a setting of mf on aarch64", text)
         base.check("is not supported by the server kernel yet" not in text, "gpio-sim and gpio-deny are not reported as ignored", text)
         base.check("GPIO7" in shell and "out" in shell and "high" in shell, "`gpio mode 7 out 1` drives a simulated pin high", text)
         base.check("gpio:" in shell and "not allowed" in shell.lower(), "a denied pin is refused", text)
         base.check("midi: no USB MIDI device" in shell and "midi send:" in shell and "Usage: midi" in shell, "`midi` lists, sends and explains usage (no device under QEMU)", text)
+        base.check("cpufreq: needs the Raspberry Pi 4" in shell, "`cpufreq` declines off a Pi 4 (QEMU has no VideoCore mailbox)", text)
         base.check("pull up" in shell, "`gpio pull` sets and shows a pull-up", text)
 
 
@@ -267,6 +290,7 @@ if __name__ == "__main__":
     main()
     unattended()
     screen()
+    rotation()
     pins()
     remote_gpio()
     install()

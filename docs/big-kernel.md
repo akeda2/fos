@@ -467,5 +467,10 @@ mapped non-cacheable (so `dsb st` stands in for the PAT/`sfence`), and replays t
 then asks the firmware for the DSI panel's own 800x480 framebuffer (the UEFI one is 800x600) and restarts the console on it, and
 registers a second HDMI output as tape screen 1 (`fb::add_screen`, `gfx_*_on`). Tapes see the same `gfx_*` calls as on x86
 (`make test-mf-aarch64-boot`: `gfxcheck` on QEMU's ramfb). aarch64 passes the seventh call argument in x6, not on the stack
-(`tapeapi::seventh`). Only a Pi shows the mailbox framebuffers, the panel and the second output; the screen rotation (`rotate`) of
-the embedded kernel is not ported. Not ported: `cpufreq` (pipower).
+(`tapeapi::seventh`). Only a Pi shows the mailbox framebuffers, the panel and the second output; `rotate [all|0|1] r|l|flip|off` (and
+`rotate1`) in `settings` turns what tapes draw, as on the embedded kernel: they see an upright logical screen (`gfx_info` swaps width
+and height for a quarter turn), `fb.rs` maps it onto the framebuffer, the DSI touch follows it, the text console stays upright
+(`make test-mf-aarch64-boot`: `rotation`). The per-run `rotate=` option is not ported.
+
+`cpufreq [MHZ|min|max]` (alias `temp`) and the `pi-clock` setting are the embedded kernel's `pipower.rs`: ARM clock, SoC temperature
+and throttle flags through the VideoCore mailbox. Only on a Pi 4 (QEMU has no mailbox: it declines); only a Pi shows the values.

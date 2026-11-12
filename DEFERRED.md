@@ -642,7 +642,7 @@ use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limi
   httpd, web, fterm), the pixel console and `gfx_*`, GPIO (simulated bank, also served over the network), the `midi` shell command, PCI/MSI, virtio and xHCI storage, virtio-net, crash record and watchdog, `install` and `bootcode`.
   Open, hardware only: a Pi 4 run of any of it, I2S, I2C, DSI touch and the DSI/second-HDMI framebuffers (PSCI `CPU_ON`, PM_WDOG, GENET, VL805, SD, a Pi booting an installed disk,
   `bootcode update` on the Pi's ESP); `fterm` on a real serial port or telnet peer. Open, not hardware: the `tapir` branch
-  is not merged (waiting for a test against a real source); the boot CPU's `cpus` line shows 0 timer ticks on aarch64. Not ported to mf: screen `rotate`, `cpufreq` (pipower).
+  is not merged (waiting for a test against a real source); the boot CPU's `cpus` line shows 0 timer ticks on aarch64. Not ported to mf aarch64: the per-run `rotate=` option; `cpufreq` and `rotate` are untested on a real Pi.
 - **mf on `rack`: USB audio interface times out during boot** (xHCI). Reproduce on the machine, read `dmesg`, fix in
   `usb_audio`/xHCI or the mf USB init.
 
