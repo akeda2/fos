@@ -637,8 +637,12 @@ use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limi
 - **httpd on rack: measure.** The threaded httpd (keep-alive, Range, ETag, read-ahead workers, ext4 root, DHCP renewal) passes
   `make test-httpd test-mf-httpd`. Measured on `rack` 2026-11-06 (mf, RTL8168 through a vNIC, 698 MB from ext4): 100-103 MB/s,
   near gigabit line rate. Still to do: check Pi-hole shows the name.
-- **FOS-mf on aarch64** (Raspberry Pi 4 only): SMP, VM and ring-3 tapes for the server kernel, on the shared `kernel-core`
-  (`docs/big-kernel.md`, `docs/aarch64-plan.md`).
+- **FOS-mf on aarch64** (Raspberry Pi 4 only; branch `mf-arm`, `docs/big-kernel.md` "mf on aarch64", `docs/aarch64-plan.md`).
+  Built and tested in QEMU: scheduler, SMP (PSCI), EL0 processes and tapes (hello, thrcheck, fscheck, calc, ed, netcheck,
+  httpd, web, fterm), PCI/MSI, virtio and xHCI storage, virtio-net, crash record and watchdog, `install` and `bootcode`.
+  Open, hardware only: a Pi 4 run of any of it (PSCI `CPU_ON`, PM_WDOG, GENET, VL805, SD, a Pi booting an installed disk,
+  `bootcode update` on the Pi's ESP); `fterm` on a real serial port or telnet peer. Open, not hardware: the `tapir` branch
+  is not merged (waiting for a test against a real source); the boot CPU's `cpus` line shows 0 timer ticks on aarch64.
 - **mf on `rack`: USB audio interface times out during boot** (xHCI). Reproduce on the machine, read `dmesg`, fix in
   `usb_audio`/xHCI or the mf USB init.
 
