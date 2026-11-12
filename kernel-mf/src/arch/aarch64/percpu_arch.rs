@@ -8,11 +8,13 @@ pub struct CpuArch {
     pub mpidr: u64,
     /// The running thread's kernel stack top: where `enter_user_mode` points SP_EL1, and so where every exception from EL0 lands.
     pub kernel_stack: core::sync::atomic::AtomicU64,
+    /// This CPU's bit in the GIC's target lists (what a software-generated interrupt names it by).
+    pub gic_target: core::sync::atomic::AtomicU8,
 }
 
 impl CpuArch {
     pub const fn new() -> CpuArch {
-        CpuArch { mpidr: 0, kernel_stack: core::sync::atomic::AtomicU64::new(0) }
+        CpuArch { mpidr: 0, kernel_stack: core::sync::atomic::AtomicU64::new(0), gic_target: core::sync::atomic::AtomicU8::new(1) }
     }
 }
 

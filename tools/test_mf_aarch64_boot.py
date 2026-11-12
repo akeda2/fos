@@ -18,7 +18,7 @@ EL0_LINE = re.compile(r"EL0: hello ok, bad pointer ok, page fault ok, stack guar
 
 
 def main() -> None:
-    text = base.boot(IMAGE, commands=("version", "cpuinfo", "uptime", "nic", "run hello", "run thrcheck", "io r8 0x60", "usb", "disks"), usb=True,
+    text = base.boot(IMAGE, commands=("version", "cpuinfo", "uptime", "nic", "run hello", "run thrcheck", "run netcheck", "fscheck readme.txt 0 7", "run httpd &0", "io r8 0x60", "usb", "disks"), usb=True, cpus=4,
                      usb_keys=("c", "p", "u", "i", "n", "f", "o", "ret"))
     base.check("server kernel (mf, slice 8): running from the UEFI loader at EL" in text, "the mf kernel starts on aarch64", text)
     base.check("Physical memory:" in text, "the physical allocator is up", text)
@@ -28,6 +28,7 @@ def main() -> None:
     base.check(ticks is not None and 8 <= int(ticks.group(1)) <= 12, "the GIC delivers timer ticks", text)
     base.check("Scheduler: 3 kernel threads took 15 interleaved steps" in text and " 0 stack frame(s) not returned" in text, "kernel threads switch and their stacks are returned", text)
     base.check("preemption ok" in text and "sleep ok" in text and "mutex ok" in text, "timer preemption, sleep and mutex work", text)
+    base.check("SMP: 4 CPU(s) online (3 other started, 0 failed)." in text and "wake IPI ok" in text, "PSCI starts three more CPUs at EL1; threads run on all of them and the wake IPI works", text)
     base.check(EL0_LINE.search(text) is not None, "EL0 processes: system calls, faults contained, preemption, an ELF, NEON state across switches", text)
     base.check("reached the end of boot" in text, "boot reaches its end", text)
     base.check("PCI: config space at" in text and "MSI: GICv2m frame" in text, "PCI (ECAM) and MSI are up", text)
@@ -46,14 +47,18 @@ def main() -> None:
     base.check("nic1: virtio-net" in text, "`nic` lists it", text)
     shell = text.split("fos> ", 1)[-1]
     base.check("thrcheck: PASS threads share memory" in shell, "tape threads, futexes and a kill with sleeping and spinning threads work at EL0", text)
+    base.check("netcheck: 4/4 replies." in shell, "the netcheck tape gets a DHCP lease and pings through the tape network calls", text)
+    base.check("fscheck: 7 bytes [Welcome]" in shell, "fs_read_at reads a byte range from a tape", text)
+    base.check("httpd: NIC 1 at 10.0.2.15:80" in shell, "httpd starts as a service with its worker threads", text)
     base.check("no file `hello`" not in shell and "first file: readme.txt" in shell, "the boot volume's tapes are found from the shell thread (DMA from a stack buffer)", text)
     base.check("hello from a v2 tape" in shell and "primes up to 100000: 9592" in shell and "Process 12 exited with code 0." in shell,
                "an aarch64 tape runs at EL0 through the tape ABI (files, alloc, clock) and exits", text)
     base.check("no I/O port space" in text, "`io` explains there are no ports", text)
     # A firmware that enters at EL2 (a Pi 4): the kernel leaves it for EL1, where EL0 programs can run.
-    el2 = base.boot(IMAGE, commands=("cpuinfo", "uptime"), el2=True)
+    el2 = base.boot(IMAGE, commands=("cpuinfo", "uptime"), el2=True, cpus=4)
     base.check("from the UEFI loader at EL2" in el2 and "running at EL1" in el2, "entered at EL2, the kernel drops to EL1 and carries on", el2)
     base.check("preemption ok" in el2 and "timer interrupts (INTID 30)" in el2, "the timer and the scheduler work after the drop", el2)
+    base.check("SMP: 4 CPU(s) online (3 other started, 0 failed)." in el2 and "Scheduler: SMP ok (8 unpinned threads ran on 4 of 4" in el2, "PSCI starts three more CPUs after the drop from EL2 and they run threads", el2)
     base.check(EL0_LINE.search(el2) is not None, "EL0 processes run after the drop from EL2", el2)
     sd = base.boot(IMAGE, steps=(("disks\r", "fos> "),), sd=True)
     base.check(re.search(r"disk2: \d+ MiB, SD card", sd) is not None, "the SDHCI controller and its card are registered as a disk", sd)

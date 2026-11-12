@@ -65,7 +65,13 @@ pub fn prepare_stack(top: u64, entry: extern "C" fn(usize), argument: usize) -> 
     start
 }
 
-/// Waking an idle CPU needs a GIC software-generated interrupt; with one CPU running there is nobody to wake yet.
-pub fn send_wake_ipi(_cpu: usize) {}
+/// The software-generated interrupt that makes an idle CPU leave `wfi` and look at the run queue.
+pub const WAKE_SGI: u32 = 0;
+
+/// Wakes CPU `cpu` with a GIC software-generated interrupt.
+pub fn send_wake_ipi(cpu: usize) {
+    let target = crate::percpu::get(cpu).arch.gic_target.load(core::sync::atomic::Ordering::Relaxed);
+    crate::gic::send_sgi(target, WAKE_SGI);
+}
 
 pub fn end_wake_interrupt() {}

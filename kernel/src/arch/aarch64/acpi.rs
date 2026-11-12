@@ -61,7 +61,43 @@ pub fn madt_gic(rsdp: u64) -> Option<(u64, u64)> {
     Some((distributor?, cpu_interface?))
 }
 
+/// The MPIDR affinity values (Aff3..Aff0) of the enabled processors in MADT's GICC entries, in table order; returns how many
+/// went into `out`. GICC (type 0xB): flags at +12 (bit 0 enabled), MPIDR at +68.
+pub fn madt_cpus(rsdp: u64, out: &mut [u64]) -> usize {
+    let Some(table) = find_table(rsdp, b"APIC") else { return 0 };
+    let end = table_length(table);
+    let (mut offset, mut count) = (44, 0);
+    while offset + 2 <= end && count < out.len() {
+        let (kind, length): (u8, u8) = (read(table, offset), read(table, offset + 1));
+        if length == 0 {
+            break;
+        }
+        if kind == 0x0b && length >= 76 && read::<u32>(table, offset + 12) & 1 != 0 {
+            out[count] = read::<u64>(table, offset + 68) & 0xff_00ff_ffff;
+            count += 1;
+        }
+        offset += u64::from(length);
+    }
+    count
+}
+
+/// How the firmware wants PSCI called, from the FADT's ARM boot architecture flags: `Some(true)` for HVC, `Some(false)` for
+/// SMC, `None` when the FADT does not claim PSCI.
+pub fn psci_uses_hvc(rsdp: u64) -> Option<bool> {
+    let table = find_table(rsdp, b"FACP")?;
+    if table_length(table) < 131 {
+        return None;
+    }
+    let flags: u16 = read(table, 129);
+    (flags & 1 != 0).then_some(flags & 2 != 0)
+}
+
 static mut RSDP: u64 = 0;
+
+/// The RSDP given to `remember` (0 before).
+pub fn rsdp() -> u64 {
+    unsafe { RSDP }
+}
 
 /// Remembers the RSDP for the shell's `acpi` command.
 pub fn remember(rsdp: u64) {

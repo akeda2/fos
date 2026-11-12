@@ -447,7 +447,7 @@ pub fn run_command(line: &str) {
 /// `Err` when the `&` word is not a list of NIC numbers.
 fn split_background(args: &str) -> (&str, Option<Result<u64, ()>>) {
     let args = args.trim();
-    let Some((before, last)) = args.rsplit_once(char::is_whitespace).filter(|(_, last)| last.starts_with('&')) else {
+    let Some((before, last)) = Some(args.rsplit_once(char::is_whitespace).unwrap_or(("", args))).filter(|(_, last)| last.starts_with('&')) else {
         return (args, None);
     };
     let mut mask = 0u64;

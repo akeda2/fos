@@ -407,7 +407,7 @@ kernel-mf-aarch64:
 
 image-mf-aarch64: loader-aarch64 kernel-mf-aarch64 tapes-aarch64
 	mkdir -p $(BUILD)/fosfor-mf-aarch64
-	python3 tools/build_image.py --arch aarch64 --loader $(A64_LOADER) --kernel $(A64_KERNEL_MF) $(foreach tape,hello thrcheck fscheck calc,--file $(tape)=$(A64_TAPE_STAMPED)/$(tape)) --output $(BUILD)/fosfor-mf-aarch64/fosfor.img
+	python3 tools/build_image.py --arch aarch64 --loader $(A64_LOADER) --kernel $(A64_KERNEL_MF) $(foreach tape,hello thrcheck fscheck calc ed netcheck httpd web fterm,--file $(tape)=$(A64_TAPE_STAMPED)/$(tape)) --output $(BUILD)/fosfor-mf-aarch64/fosfor.img
 
 # Serial KUP: a kernel pushed over the console UART is tried from the other slot and confirmed.
 test-aarch64-kup: image-aarch64

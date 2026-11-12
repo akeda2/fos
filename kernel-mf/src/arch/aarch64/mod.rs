@@ -202,6 +202,7 @@ pub mod slots {
 }
 
 pub mod trap;
+pub mod smp;
 pub mod usermode;
 pub mod user_blobs;
 
@@ -321,6 +322,8 @@ pub fn init_machine(_machine: &boot::Machine) -> u8 {
     while timer::micros() - start < 100_000 {
         cpu::sleep();
     }
+    let smp = smp::start_all(acpi::rsdp());
+    println!("SMP: {} CPU(s) online ({} other started, {} failed).", crate::percpu::count(), smp.started, smp.failed);
     println!("GIC at {:#x}/{:#x}: {} timer interrupts (INTID 30) in 100 ms, expected about 10; counter {} Hz.", gic::bases().0, gic::bases().1, gic::irq_ticks(), timer::frequency());
     0
 }

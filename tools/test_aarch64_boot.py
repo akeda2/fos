@@ -24,7 +24,7 @@ def check(condition, message, text=""):
     print(f"PASS: {message}")
 
 
-def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] = (), usb_keys: tuple[str, ...] = (), during: tuple | None = None, steps: tuple[tuple[str, str], ...] = (), sd: bool = False, fat: bool = False, usb: bool = False, big: bool = False, wire=None, el2: bool = False) -> str:
+def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] = (), usb_keys: tuple[str, ...] = (), during: tuple | None = None, steps: tuple[tuple[str, str], ...] = (), sd: bool = False, fat: bool = False, usb: bool = False, big: bool = False, wire=None, el2: bool = False, cpus: int = 1) -> str:
     """Boots `image` under QEMU virt + AAVMF + ramfb and returns the serial text. The kernel parks, so the run ends
     when the parking message shows (or after 60 s); a PPM screenshot goes to `screendump` when given. `wire` is a function
     called with the host's end of the guest's multicast network (`test_boot.Wire`) once the shell is up; the guest's NIC
@@ -69,7 +69,7 @@ def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] 
             nic = ["-nic", "none", "-netdev", f"socket,id=net0,mcast={MCAST_GROUP}:{MCAST_PORT}", "-device", "virtio-net-pci,netdev=net0,mac=52:54:00:12:34:7b"]
         with open(log, "wb") as out:
             qemu = subprocess.Popen(
-                ["qemu-system-aarch64", "-machine", "virt,virtualization=on" if el2 else "virt", "-cpu", "cortex-a72", "-m", "1G", "-display", "none", "-device", "ramfb",
+                ["qemu-system-aarch64", "-machine", "virt,virtualization=on" if el2 else "virt", "-cpu", "cortex-a72", "-smp", str(cpus), "-m", "1G", "-display", "none", "-device", "ramfb",
                  "-serial", "stdio", "-no-reboot", "-monitor", f"unix:{monitor},server,nowait",
                  "-drive", f"if=pflash,format=raw,readonly=on,file={CODE}", "-drive", f"if=pflash,format=raw,file={variables}",
                  *disk, "-device", "qemu-xhci,id=xhci", "-device", "usb-kbd", *stick, *nic],
