@@ -124,23 +124,26 @@ def screen() -> None:
     base.check("gfxcheck: done" in gfx, "the tape ends and the shell returns", gfx)
 
 
-def rotation() -> None:
-    """`rotate r` in settings: tapes draw on an upright logical screen (width and height swap) turned onto the framebuffer."""
+def rotation(per_run: bool = False) -> None:
+    """`rotate r` in settings, or `rotate=r` on the `run` line (`per_run`): tapes draw on an upright logical screen (width and
+    height swap) turned onto the framebuffer."""
     import subprocess
     import tempfile
     target = base.ROOT / "build/cargo-target"
     with tempfile.TemporaryDirectory() as scratch:
         settings = Path(scratch) / "settings"
-        settings.write_text("rotate r\n")
+        settings.write_text("\n" if per_run else "rotate r\n")
         image = Path(scratch) / "fosfor.img"
         subprocess.run([sys.executable, str(base.ROOT / "tools/build_image.py"), "--arch", "aarch64", "--loader", str(target / "aarch64-unknown-uefi/release/fosfor-loader.efi"),
                         "--kernel", str(target / "aarch64-unknown-none-softfloat/release/fosfor-kernel-mf"), "--file", f"settings={settings}",
                         "--file", f"gfxcheck={base.ROOT / 'build/fosfor-aarch64/tapes/gfxcheck'}", "--output", str(image)], check=True, capture_output=True)
         shot = Path(scratch) / "rot.ppm"
-        text = base.boot(image, None, (), (), ("run gfxcheck secs=3", "gfxcheck: drawn", shot))
+        text = base.boot(image, None, (), (), (f"run gfxcheck {'rotate=r ' if per_run else ''}secs=3", "gfxcheck: drawn", shot))
         pixel, (width, height) = base.ppm_reader(shot)
-        base.check("settings: rotate [0] r" in text, "`rotate r` is a setting of mf", text)
-        base.check(f"gfxcheck: screen {height}x{width}" in text, "the tape sees the swapped, upright screen size", text)
+        if not per_run:
+            base.check("settings: rotate [0] r" in text, "`rotate r` is a setting of mf", text)
+        label = "`rotate=r` on the run line" if per_run else "the setting"
+        base.check(f"gfxcheck: screen {height}x{width}" in text, f"the tape sees the swapped, upright screen size ({label})", text)
         # logical (x, y) is physical (W-1-y, x) turned right
         base.check((pixel(width - 11, 10), pixel(width - 11, 100), pixel(width - 11, 170)) == ((255, 0, 0), (0, 255, 0), (0, 0, 255)), "gfx_fill: the bars land turned a quarter", "")
         base.check(pixel(width - 103, 100) == (100, 0, 0) and pixel(0, height - 1) == (255, 0, 255), "gfx_blit: the ramp and the clipped block land turned", "")
@@ -291,6 +294,7 @@ if __name__ == "__main__":
     unattended()
     screen()
     rotation()
+    rotation(per_run=True)
     pins()
     remote_gpio()
     install()

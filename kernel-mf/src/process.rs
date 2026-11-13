@@ -154,6 +154,9 @@ fn map_stack(root: u64) -> Option<()> {
 /// NICs (0-based mask) the next process started owns from its first instruction: a background tape (`run NAME &N`).
 pub static START_NICS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// The `rotate=` of the next process started (`Some(None)`: `off`); `start` hands it to the pixel console under the new pid.
+pub static START_ROTATE: SpinLock<Option<Option<crate::fb::Rotate>>> = SpinLock::new(None);
+
 static NEXT_PID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 fn start(name: &str, root: u64, entry: Option<(u64, u64, u64)>) -> Option<u64> {
@@ -162,6 +165,9 @@ fn start(name: &str, root: u64, entry: Option<(u64, u64, u64)>) -> Option<u64> {
         return None;
     };
     let pid = NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if let Some(turn) = START_ROTATE.lock().take() {
+        crate::fb::rotate_run(pid, turn);
+    }
     crate::tapenet::reserve(pid, START_NICS.swap(0, core::sync::atomic::Ordering::AcqRel));
     let launch = Box::into_raw(Box::new(Launch { pid, entry, argument, second, stack: STACK_TOP })) as usize;
     let id = sched::spawn_user(name, user_thread, launch, root);
@@ -226,6 +232,7 @@ fn leave(how: Option<How>) -> ! {
     if root != 0 {
         vm::destroy_user_space(root);
     }
+    crate::fb::rotate_forget(thread);
     OUTCOMES.lock().push(Outcome { pid: thread, how, written });
     match how {
         How::Exited(code) => println!("Process {thread} exited with code {code}."),

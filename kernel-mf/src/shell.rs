@@ -514,9 +514,34 @@ pub fn run_tape(name: &str, args: &str) {
         return;
     }
     LAST_STARTED.store(0, core::sync::atomic::Ordering::Release);
+    // `rotate=r|l|flip|off` turns what this tape draws, as the `rotate` setting does; the word is not passed on to the tape.
+    let mut text = [0u8; 256];
+    let mut args = args;
+    let mut turn = None;
+    if args.split_whitespace().any(|word| word.starts_with("rotate=")) {
+        let mut length = 0;
+        for word in args.split_whitespace() {
+            if let Some(mode) = word.strip_prefix("rotate=") {
+                match crate::fb::parse_run_turn(mode) {
+                    Some(parsed) => turn = Some(parsed),
+                    None => return println!("run: `{word}` is not rotate=r|l|flip|off."),
+                }
+                continue;
+            }
+            if length + word.len() + 1 > text.len() {
+                return println!("run: the arguments of a tape take at most {} bytes.", text.len() - 1);
+            }
+            if length != 0 {
+                text[length] = b' ';
+                length += 1;
+            }
+            text[length..length + word.len()].copy_from_slice(word.as_bytes());
+            length += word.len();
+        }
+        args = core::str::from_utf8(&text[..length]).unwrap_or("");
+    }
     // `&+N`: a virtual interface on physical NIC N made for this tape alone and removed when it ends.
     let mut fresh = None;
-    let mut args = args;
     let mut background = None;
     if let Some((before, last)) = Some(args.trim()).map(|text| text.rsplit_once(char::is_whitespace).unwrap_or(("", text))).filter(|(_, last)| last.starts_with("&+")) {
         match last[2..].parse::<usize>().map_err(|_| "`&+N` takes the physical NIC number, from 1").and_then(|parent| crate::vnic::add_ephemeral(name, parent)) {
@@ -568,8 +593,10 @@ pub fn run_tape(name: &str, args: &str) {
     }
     drop(disk);
     crate::process::START_NICS.store(nics.unwrap_or(0), core::sync::atomic::Ordering::Release);
+    *crate::process::START_ROTATE.lock() = turn;
     let started = crate::process::spawn_elf(name, &image, args.as_bytes());
     crate::process::START_NICS.store(0, core::sync::atomic::Ordering::Release);
+    *crate::process::START_ROTATE.lock() = None;
     if let (Some(interface), Ok(_)) = (fresh.take(), &started) {
         interface.keep();
     }

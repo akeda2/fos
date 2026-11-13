@@ -67,7 +67,7 @@ pub const TOPICS: &[Topic] = &[
     t("kup", "Machine", "kup serial", "Receive a kernel update over the serial line (sender: tools/send_kernel_serial.py)."),
     t("recv", "Machine", "recv NAME", "Receive a file over the serial line (sender: tools/send_file_serial.py PORT FILE NAME)."),
     t("tape", "Tapes and services", "tape [run] NAME [ARGS] [&N]", "Older spelling of `run`."),
-    t("run", "Tapes and services", "run NAME [ARGS] [&N|&NAME|&+N]", "Run a tape. In the foreground Escape stops it; with `&N` it is a service owning NIC N (`&NAME` a vNIC, `&+N` a temporary vNIC on N). `NAME help` shows the tape's usage; `NAME @FILE` takes its settings from settings/FILE."),
+    t("run", "Tapes and services", "run NAME [ARGS] [&N|&NAME|&+N]", "Run a tape. In the foreground Escape stops it; with `&N` it is a service owning NIC N (`&NAME` a vNIC, `&+N` a temporary vNIC on N). `rotate=r|l|flip|off` turns what this tape draws. `NAME help` shows the tape's usage; `NAME @FILE` takes its settings from settings/FILE."),
     t("kill", "Tapes and services", "kill PID", "Stop a process (the number `run` printed, or `ps` shows)."),
     t("service", "Tapes and services", "service | service start|stop|restart NAME|all | service reload", "Named background tapes from `settings/services` (lines `NAME [restart] TAPE ARGS... &NIC`). `restart` ones come back after a crash."),
     t("start", "Tapes and services", "start", "Run the boot script `settings/start` again."),

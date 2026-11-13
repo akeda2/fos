@@ -470,7 +470,7 @@ registers a second HDMI output as tape screen 1 (`fb::add_screen`, `gfx_*_on`). 
 (`tapeapi::seventh`). Only a Pi shows the mailbox framebuffers, the panel and the second output; `rotate [all|0|1] r|l|flip|off` (and
 `rotate1`) in `settings` turns what tapes draw, as on the embedded kernel: they see an upright logical screen (`gfx_info` swaps width
 and height for a quarter turn), `fb.rs` maps it onto the framebuffer, the DSI touch follows it, the text console stays upright
-(`make test-mf-aarch64-boot`: `rotation`). The per-run `rotate=` option is not ported.
+(`make test-mf-aarch64-boot`: `rotation`). `run NAME rotate=r|l|flip|off` turns one tape (`fb::rotate_run`, keyed by pid, dropped when the process ends; `off` forces upright against the setting; the word is not passed to the tape); `make test-mf-aarch64-boot`: `rotation(per_run=True)`. Not ported: `run A | B` pairs and `screen=` (mf has no such options).
 
 `cpufreq [MHZ|min|max]` (alias `temp`) and the `pi-clock` setting are the embedded kernel's `pipower.rs`: ARM clock, SoC temperature
 and throttle flags through the VideoCore mailbox. Only on a Pi 4 (QEMU has no mailbox: it declines); only a Pi shows the values.
