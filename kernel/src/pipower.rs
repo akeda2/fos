@@ -19,6 +19,12 @@ pub fn mhz() -> Option<(u32, u32, u32)> {
     Some((clock(0x30002)? / 1_000_000, clock(0x30007)? / 1_000_000, clock(0x30004)? / 1_000_000))
 }
 
+/// The ARM clock the firmware measures (GET_CLOCK_MEASURED 0x30047), in MHz. `mhz` only echoes the last request; this is
+/// the clock after the firmware's own clamping and throttling.
+pub fn measured_mhz() -> Option<u32> {
+    clock(0x30047).map(|hz| hz / 1_000_000)
+}
+
 /// SoC temperature in millidegrees C.
 pub fn millicelsius() -> Option<u32> {
     let mut reply = [0u32; 2];
@@ -34,10 +40,11 @@ pub fn throttled() -> Option<u32> {
     Some(reply[0])
 }
 
-/// Asks for `mhz` (clamped by the firmware to its range); returns the rate it set.
+/// Asks for `mhz` (clamped by the firmware to its range); returns the rate it set. "Skip turbo" must be 1: with 0 the firmware
+/// applies its turbo setting and keeps the ARM at maximum whatever was asked (measured on a Pi 4: 600 request, 1500 back).
 pub fn set_mhz(mhz: u32) -> Option<u32> {
     let mut reply = [0u32; 2];
-    tag(0x38002, &[ARM, mhz.checked_mul(1_000_000)?, 0], &mut reply)?;
+    tag(0x38002, &[ARM, mhz.checked_mul(1_000_000)?, 1], &mut reply)?;
     Some(reply[1] / 1_000_000)
 }
 
@@ -75,13 +82,15 @@ pub fn command(rest: &str) {
         };
         let Some(target) = target else { return crate::println!("Usage: cpufreq [MHZ|min|max]  ({min}..{max} MHz)") };
         match set_mhz(target) {
-            Some(now) => crate::println!("ARM clock set to {now} MHz."),
+            Some(now) => crate::println!("ARM clock set to {now} MHz, measured {} MHz.", measured_mhz().unwrap_or(0)),
             None => crate::println!("cpufreq: the firmware refused."),
         }
         return;
     }
     match mhz() {
-        Some((now, min, max)) => crate::println!("ARM clock {now} MHz (range {min}..{max})."),
+        Some((now, min, max)) => {
+            crate::println!("ARM clock {now} MHz, measured {} MHz (range {min}..{max}).", measured_mhz().unwrap_or(0))
+        }
         None => crate::println!("cpufreq: the firmware does not answer."),
     }
     match millicelsius() {
