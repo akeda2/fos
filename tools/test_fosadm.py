@@ -26,6 +26,8 @@ class Fosadm(unittest.TestCase):
     def test_arch(self):
         self.assertEqual(fosadm.arch_of("Fosfor OS (aarch64 port): shell"), "aarch64")
         self.assertEqual(fosadm.arch_of("Fosfor OS (fos) is a small"), "x86_64")
+        self.assertEqual(fosadm.arch_of("Fosfor OS server kernel (mf), slice 8, aarch64."), "aarch64-mf")
+        self.assertEqual(fosadm.arch_of("Fosfor OS server kernel (mf), slice 8."), "x86_64-mf")
 
     def test_release_layout(self):
         with tempfile.TemporaryDirectory() as tmp:

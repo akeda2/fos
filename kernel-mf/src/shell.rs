@@ -246,7 +246,7 @@ pub fn run_command(line: &str) {
             let folder = crate::shellhost::working_folder();
             println!("{}", if folder.is_empty() { "/ (the boot volume)" } else { &folder });
         }
-        "version" => println!("Fosfor OS server kernel (mf), slice 8."),
+        "version" => println!("Fosfor OS server kernel (mf), slice 8{}.", if cfg!(target_arch = "aarch64") { ", aarch64" } else { "" }),
         "cpus" => println!("{} CPU(s); boot CPU has taken {} timer ticks.", percpu::count(), percpu::ticks_of(0)),
         "mem" => {
             let stats = pmm::stats();
