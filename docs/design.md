@@ -277,7 +277,7 @@ firmware, so a pending slot is tried on the next boot.
   (capture) a packet slot through a 1 MiB PCM ring; the events come in through the normal xHCI event draining
   (a 1024-entry event ring: a high-speed endpoint completes 8,000 transfers/s). Shell commands: `audio`
   (status), `audio start|stop`, `audio capture SECONDS [RATE]` (per-second frame counts and per-channel
-  peaks), `audio tone [HZ] [SECONDS] [RATE]`. `make test-usb-audio` plays a tone through QEMU's class 1.0
+  peaks), `audio tone [HZ[/HZ]] [SECONDS|0] [RATE]` (LEFT/RIGHT gives each channel its own tone; 0 seconds plays until Escape). `make test-usb-audio` plays a tone through QEMU's class 1.0
   `usb-audio` and checks the WAV it records (439 Hz for 440). Confirmed on a Zoom H6 in multichannel mode on
   the Skylake (class 2.0, high speed, rates 44.1/48/88.2/96 kHz): capture of 6 channels 24-bit at 48 kHz gave
   47,984-48,016 frames/s with no errors, playback of 2 channels 24-bit streamed 8,000 packets/s with no errors.
