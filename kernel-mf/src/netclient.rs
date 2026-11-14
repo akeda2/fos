@@ -3,7 +3,7 @@
 //!
 //! The receive side runs on whatever CPU typed the command, usually inside the NIC drain of a `term net` session, with the NIC
 //! lock held and interrupts possibly off. So it polls: it drains the NICs itself and times out on the TSC clock
-//! (`apic::micros`), never on timer ticks. `net::handle_frame` offers every frame to `capture` first; while a transfer is
+//! (`time::micros`), never on timer ticks. `net::handle_frame` offers every frame to `capture` first; while a transfer is
 //! running, the GET answers of the target machine end up here instead of in the NETFS request queue, and terminal frames are
 //! dropped (a keystroke arriving mid-transfer must not reach the shell; ESC aborts).
 
@@ -14,7 +14,7 @@ use kernel_core::tapesync_client::{self as client, Env};
 use kernel_core::volumes;
 
 use crate::netfs::{self, TAG_GPIO_REPLY, TAG_GPIO_REQUEST, TAG_GET_DATA, TAG_GET_ERROR, TAG_GET_REQUEST, TAG_GET_START, TAG_GET_STOP};
-use crate::{apic, net, tapefs};
+use crate::{net, tapefs, time};
 
 const TAG_DISCOVER_REQUEST: u8 = 0x02;
 const TAG_DISCOVER_REPLY: u8 = 0x03;
@@ -195,7 +195,7 @@ fn exchange(mac: [u8; 6], nic_index: usize, request: &[u8], out: &mut [u8]) -> R
         *single = Single { active: true, mac, out: out.as_mut_ptr(), capacity: out.len(), length: None };
     }
     net::send_frame(nic_index, &mac, TAG_GPIO_REQUEST, request);
-    let deadline = apic::micros() + 2_000_000;
+    let deadline = time::micros() + 2_000_000;
     let result = loop {
         {
             let _nics = net::lock_nics();
@@ -203,7 +203,7 @@ fn exchange(mac: [u8; 6], nic_index: usize, request: &[u8], out: &mut [u8]) -> R
             if let Some(length) = single.length {
                 break Ok(length);
             }
-            if apic::micros() > deadline {
+            if time::micros() > deadline {
                 break Err("no answer");
             }
         }
@@ -229,7 +229,7 @@ fn receive_frame(rx: &mut Rx, tag: u8, payload: &[u8]) {
                 rx.total = Some(length);
                 rx.checksum = u16::from_le_bytes(payload[4..6].try_into().unwrap());
             }
-            rx.deadline = apic::micros() + SILENCE_US;
+            rx.deadline = time::micros() + SILENCE_US;
         }
         TAG_GET_DATA if payload.len() >= 4 => {
             if let Some(length) = rx.total {
@@ -240,7 +240,7 @@ fn receive_frame(rx: &mut Rx, tag: u8, payload: &[u8]) {
                     unsafe { core::ptr::copy_nonoverlapping(payload[4..].as_ptr(), rx.out.add(rx.received), take) };
                     rx.received += take;
                     rx.sequence += 1;
-                    rx.deadline = apic::micros() + SILENCE_US;
+                    rx.deadline = time::micros() + SILENCE_US;
                 }
             }
         }
@@ -263,7 +263,7 @@ fn receive(mac: [u8; 6], nic_index: usize, tag: u8, request: &[u8], out: &mut [u
     {
         let _nics = net::lock_nics();
         let rx = rx();
-        *rx = Rx { active: true, mac, out: out.as_mut_ptr(), capacity: out.len(), total: None, checksum: 0, received: 0, sequence: 0, outcome: None, aborted: false, deadline: apic::micros() + SILENCE_US };
+        *rx = Rx { active: true, mac, out: out.as_mut_ptr(), capacity: out.len(), total: None, checksum: 0, received: 0, sequence: 0, outcome: None, aborted: false, deadline: time::micros() + SILENCE_US };
     }
     net::send_frame(nic_index, &mac, tag, request);
     let result = loop {
@@ -277,7 +277,7 @@ fn receive(mac: [u8; 6], nic_index: usize, tag: u8, request: &[u8], out: &mut [u
             if rx.aborted {
                 break Err("interrupted");
             }
-            if apic::micros() > rx.deadline {
+            if time::micros() > rx.deadline {
                 break Err("no answer (is the machine at its prompt or in term net, and is the name right?)");
             }
         }
@@ -296,10 +296,10 @@ fn discover() {
     }
     println!("Looking for other fos machines (3 s)...");
     unsafe { PEER_COUNT = 0 };
-    let started = apic::micros();
+    let started = time::micros();
     let mut next_probe = started;
-    while apic::micros() < started + 3_000_000 {
-        if apic::micros() >= next_probe {
+    while time::micros() < started + 3_000_000 {
+        if time::micros() >= next_probe {
             next_probe += 1_000_000;
             for index in 0..nic::count() {
                 if net::link_up(index) && !nic::is_virtual(index) {
@@ -357,8 +357,8 @@ impl Env for Mf {
     }
     fn seed(&self) -> [u8; 16] {
         let mut seed = [0u8; 16];
-        seed[0..8].copy_from_slice(&unsafe { core::arch::x86_64::_rdtsc() }.to_le_bytes());
-        seed[8..16].copy_from_slice(&apic::micros().to_le_bytes());
+        seed[0..8].copy_from_slice(&crate::arch::cycle_counter().to_le_bytes());
+        seed[8..16].copy_from_slice(&time::micros().to_le_bytes());
         seed
     }
     fn peer(&self, host: &str) -> Option<([u8; 6], usize)> {
@@ -416,7 +416,35 @@ impl kernel_core::gpio_client::Env for Mf {
     }
 }
 
-/// `gpio [@HOST] ...`: this kernel has no pins of its own.
+/// `gpio [@HOST] ...`: this machine's pins (a Pi 4 has them), or another's with `@HOST`.
 pub fn gpio(rest: &str) {
-    kernel_core::gpio_client::command(&Mf, rest, |_| println!("gpio: this machine has no GPIO pins; `gpio @HOST ...` works on one that has."));
+    kernel_core::gpio_client::command(&Mf, rest, run_local_gpio);
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn run_local_gpio(_op: kernel_core::gpio_client::Op) {
+    println!("gpio: this machine has no GPIO pins; `gpio @HOST ...` works on one that has.");
+}
+
+#[cfg(target_arch = "aarch64")]
+fn run_local_gpio(op: kernel_core::gpio_client::Op) {
+    use crate::gpio;
+    use kernel_core::gpio_client::{self as client, Op};
+    if !gpio::available() {
+        return println!("gpio: this machine has no GPIO pins; `gpio @HOST ...` works on one that has.");
+    }
+    let outcome = match op {
+        Op::List(all) => return client::list(&Mf, &gpio::snapshot().unwrap(), all),
+        Op::Read(pin) => return client::line(&Mf, &gpio::snapshot().unwrap(), pin),
+        Op::Set(pin, high) => {
+            let refused = gpio::write(1 << pin, u64::from(high) << pin);
+            if refused == 0 { Ok(()) } else { Err("that pin is not allowed or not an output (`gpio mode N out 0|1` first)") }
+        }
+        Op::Mode(pin, function, start) => gpio::set_function(pin, function, start).map_err(gpio::Error::text),
+        Op::Pull(pin, pull) => gpio::set_pull(pin, pull).map_err(gpio::Error::text),
+    };
+    match outcome {
+        Ok(()) => println!("done"),
+        Err(reason) => println!("gpio: {reason}."),
+    }
 }

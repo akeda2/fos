@@ -6,12 +6,29 @@ use crate::e1000::{Delivery, E1000};
 use crate::rtl8139::Rtl8139;
 use crate::rtl8168::Rtl8168;
 use crate::threecom::ThreeCom;
+use crate::virtio_net::VirtioNet;
+
+/// A NIC the platform provides rather than a PCI driver (the Pi 4's Genet): a singleton behind this trait, polled.
+pub trait PlatformNic: Sync {
+    fn family(&self) -> &'static str;
+    fn mac(&self) -> [u8; 6];
+    fn link_up(&self) -> bool;
+    fn link_speed(&self) -> Option<(u16, bool)>;
+    fn receive(&self, out: &mut [u8]) -> Option<usize>;
+    fn send(&self, frame: &[u8]) -> bool;
+    fn set_promiscuous(&self, on: bool);
+    /// Frames received, sent, dropped.
+    fn counters(&self) -> (u64, u64, u64);
+    fn describe(&self);
+}
 
 pub enum Nic {
+    Platform(&'static dyn PlatformNic),
     E1000(E1000),
     Rtl8139(Rtl8139),
     Rtl8168(Rtl8168),
     ThreeCom(ThreeCom),
+    Virtio(VirtioNet),
     Virtual(Virtual),
 }
 
@@ -33,6 +50,8 @@ impl Nic {
             Nic::Rtl8139(nic) => nic.mac,
             Nic::Rtl8168(nic) => nic.mac,
             Nic::ThreeCom(nic) => nic.mac,
+            Nic::Virtio(nic) => nic.mac,
+            Nic::Platform(nic) => nic.mac(),
             Nic::Virtual(nic) => nic.mac,
         }
     }
@@ -48,6 +67,8 @@ impl Nic {
             Nic::Rtl8139(_) => "rtl8139",
             Nic::Rtl8168(_) => "rtl8168",
             Nic::ThreeCom(_) => "3c905",
+            Nic::Virtio(_) => "virtio-net",
+            Nic::Platform(nic) => nic.family(),
             Nic::Virtual(_) => "vnic",
         }
     }
@@ -58,6 +79,8 @@ impl Nic {
             Nic::Rtl8139(nic) => nic.link_up(),
             Nic::Rtl8168(nic) => nic.link_up(),
             Nic::ThreeCom(nic) => nic.link_up(),
+            Nic::Virtio(nic) => nic.link_up(),
+            Nic::Platform(nic) => nic.link_up(),
             Nic::Virtual(nic) => nic.live && parent_of(nic).is_some_and(|parent| parent.link_up()),
         }
     }
@@ -67,6 +90,7 @@ impl Nic {
         match self {
             Nic::E1000(nic) => nic.link_speed(),
             Nic::Rtl8168(nic) => nic.link_speed(),
+            Nic::Platform(nic) => nic.link_speed(),
             Nic::Virtual(nic) => parent_of(nic).and_then(|parent| parent.link_speed()),
             _ => None,
         }
@@ -95,7 +119,7 @@ impl Nic {
             Nic::E1000(nic) => nic.phy_control(),
             Nic::Rtl8139(nic) => nic.phy_control(),
             Nic::Rtl8168(nic) => nic.phy_control(),
-            Nic::ThreeCom(_) | Nic::Virtual(_) => None,
+            Nic::ThreeCom(_) | Nic::Virtio(_) | Nic::Platform(_) | Nic::Virtual(_) => None,
         }
     }
 
@@ -104,7 +128,7 @@ impl Nic {
             Nic::E1000(nic) => nic.set_phy_control(value),
             Nic::Rtl8139(nic) => nic.set_phy_control(value),
             Nic::Rtl8168(nic) => nic.set_phy_control(value),
-            Nic::ThreeCom(_) | Nic::Virtual(_) => false,
+            Nic::ThreeCom(_) | Nic::Virtio(_) | Nic::Platform(_) | Nic::Virtual(_) => false,
         }
     }
 
@@ -115,6 +139,8 @@ impl Nic {
             Nic::Rtl8139(nic) => nic.receive(out),
             Nic::Rtl8168(nic) => nic.receive(out),
             Nic::ThreeCom(nic) => nic.receive(out),
+            Nic::Virtio(nic) => nic.receive(out),
+            Nic::Platform(nic) => nic.receive(out),
             Nic::Virtual(_) => None,
         }
     }
@@ -133,6 +159,8 @@ impl Nic {
             Nic::Rtl8139(nic) => nic.send(frame),
             Nic::Rtl8168(nic) => nic.send(frame),
             Nic::ThreeCom(nic) => nic.send(frame),
+            Nic::Virtio(nic) => nic.send(frame),
+            Nic::Platform(nic) => nic.send(frame),
             Nic::Virtual(nic) => {
                 let sent = nic.live && parent_of(nic).is_some_and(|parent| parent.send(frame));
                 nic.frames_sent += u64::from(sent);
@@ -155,6 +183,8 @@ impl Nic {
             Nic::Rtl8139(nic) => nic.set_promiscuous(on),
             Nic::Rtl8168(nic) => nic.set_promiscuous(on),
             Nic::ThreeCom(nic) => nic.set_promiscuous(on),
+            Nic::Virtio(nic) => nic.set_promiscuous(on),
+            Nic::Platform(nic) => nic.set_promiscuous(on),
             Nic::Virtual(_) => {} // the parent is promiscuous for as long as virtual interfaces use it
         }
     }
@@ -204,6 +234,8 @@ impl Nic {
             Nic::Rtl8139(nic) => nic.set_multicast(on),
             Nic::Rtl8168(_) => {} // already accepts every multicast frame (its hash filter is all ones)
             Nic::ThreeCom(nic) => nic.set_multicast(on),
+            Nic::Virtio(_) => {} // the device's default filter stays
+            Nic::Platform(_) => {}
             Nic::Virtual(_) => {} // the promiscuous parent delivers every multicast frame
         }
     }
@@ -214,6 +246,8 @@ impl Nic {
             Nic::Rtl8139(nic) => nic.delivery,
             Nic::Rtl8168(nic) => nic.delivery,
             Nic::ThreeCom(nic) => nic.delivery,
+            Nic::Virtio(nic) => nic.delivery,
+            Nic::Platform(_) => Delivery::Polled,
             Nic::Virtual(nic) => parent_of(nic).map_or(Delivery::Polled, |parent| parent.delivery()),
         }
     }
@@ -225,6 +259,8 @@ impl Nic {
             Nic::Rtl8139(nic) => (nic.frames_received, nic.frames_sent, nic.frames_dropped_no_link),
             Nic::Rtl8168(nic) => (nic.frames_received, nic.frames_sent, nic.frames_dropped_no_link),
             Nic::ThreeCom(nic) => (nic.frames_received, nic.frames_sent, nic.frames_dropped_no_link),
+            Nic::Virtio(nic) => (nic.frames_received, nic.frames_sent, nic.frames_dropped_no_link),
+            Nic::Platform(nic) => nic.counters(),
             Nic::Virtual(nic) => (nic.frames_received, nic.frames_sent, 0),
         }
     }
@@ -235,6 +271,8 @@ impl Nic {
             Nic::Rtl8139(nic) => nic.describe(),
             Nic::Rtl8168(nic) => nic.describe(),
             Nic::ThreeCom(nic) => nic.describe(),
+            Nic::Virtio(nic) => nic.describe(),
+            Nic::Platform(nic) => nic.describe(),
             Nic::E1000(nic) => nic.describe(),
             Nic::Virtual(nic) if nic.live => crate::println!("   virtual interface on nic{}", nic.parent + 1),
             Nic::Virtual(_) => crate::println!("   virtual interface, removed"),
@@ -247,6 +285,7 @@ impl Nic {
             Nic::Rtl8139(nic) => nic.dump_registers(),
             Nic::Rtl8168(nic) => nic.dump_registers(),
             Nic::ThreeCom(nic) => nic.dump_registers(),
+            Nic::Virtio(_) | Nic::Platform(_) => {}
             Nic::E1000(nic) => nic.dump_registers(),
             Nic::Virtual(_) => {}
         }

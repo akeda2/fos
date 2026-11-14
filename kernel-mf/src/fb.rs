@@ -154,10 +154,10 @@ pub fn init_text() -> (usize, usize) {
     };
     console.clear_all();
     // CRTC register 0x0A bit 5 turns the cursor off: clear it, and give it scan lines 13-15 (an underline-to-block shape).
-    crate::cpu::outb(0x3d4, 0x0a);
-    crate::cpu::outb(0x3d5, 13);
-    crate::cpu::outb(0x3d4, 0x0b);
-    crate::cpu::outb(0x3d5, 15);
+    outb(0x3d4, 0x0a);
+    outb(0x3d5, 13);
+    outb(0x3d4, 0x0b);
+    outb(0x3d5, 15);
     console.place_cursor();
     unsafe { *core::ptr::addr_of_mut!(CONSOLE) = Some(console) };
     (TEXT_COLUMNS, TEXT_ROWS)
@@ -216,13 +216,13 @@ impl Console {
     /// Puts the hardware cursor (CRTC registers 0x0E and 0x0F) on the next character position.
     fn place_cursor(&self) {
         // CRTC register 0x0A bit 5 switches the hardware cursor off (`ESC [ ? 25 l`).
-        crate::cpu::outb(0x3d4, 0x0a);
-        crate::cpu::outb(0x3d5, if self.caret_hidden { 0x20 } else { 13 });
+        outb(0x3d4, 0x0a);
+        outb(0x3d5, if self.caret_hidden { 0x20 } else { 13 });
         let at = (self.row * self.columns + self.column.min(self.columns - 1)) as u16;
-        crate::cpu::outb(0x3d4, 0x0e);
-        crate::cpu::outb(0x3d5, (at >> 8) as u8);
-        crate::cpu::outb(0x3d4, 0x0f);
-        crate::cpu::outb(0x3d5, at as u8);
+        outb(0x3d4, 0x0e);
+        outb(0x3d5, (at >> 8) as u8);
+        outb(0x3d4, 0x0f);
+        outb(0x3d5, at as u8);
     }
 
     /// The pixel console's caret: an underline in the cell the next character goes to. A cell that was redrawn has lost it and
@@ -451,12 +451,121 @@ pub fn write_str(text: &str) {
 
 /// Makes the write-combining buffers drain, so what was just drawn is on the screen.
 fn flush_writes() {
-    unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)) };
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("sfence", options(nostack, preserves_flags))
+    };
+    // The framebuffer is mapped non-cacheable (`paging::build_and_load`, `map_framebuffer`); the barrier orders the stores.
+    #[cfg(not(target_arch = "x86_64"))]
+    unsafe {
+        core::arch::asm!("dsb st", options(nostack, preserves_flags))
+    };
 }
 
+/// The VGA CRTC is x86 port I/O; there is no text screen on aarch64 (`init_text` is never called there).
+#[cfg(target_arch = "x86_64")]
+fn outb(port: u16, value: u8) {
+    crate::cpu::outb(port, value)
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn outb(_port: u16, _value: u8) {}
+
 /// Graphics for tapes (`TapeApi::gfx_*`): while a process has the screen open the text console stops drawing (serial and the
-/// network terminal go on); `gfx_close` clears the screen and the text starts again at the top. One screen, no rotation.
+/// network terminal go on); `gfx_close` clears the screen and the text starts again at the top. Tapes draw on an upright
+/// logical screen that `rotate` turns onto the framebuffer (the text console is not rotated).
 static GFX_OPEN: AtomicBool = AtomicBool::new(false);
+
+pub use kernel_core::screen::Rotate;
+
+/// The `rotate` setting per physical screen (0: the console, 1: the Pi's second HDMI output): how tapes' pixels are turned.
+static mut ROTATE: [Option<Rotate>; 2] = [None; 2];
+
+pub fn rotate_default(phys: usize, mode: Option<Rotate>) {
+    if phys < 2 {
+        unsafe { (*core::ptr::addr_of_mut!(ROTATE))[phys] = mode };
+    }
+}
+
+/// `rotate=` of a `run` line: up to four running tapes, each with its own pid and turn (0: none, 1-3: `Rotate`, 4: `off`, upright
+/// whatever the setting says). It applies to the screens that tape draws on; the pid is the calling tape's.
+const RUN_SLOTS: usize = 4;
+static RUN_PID: [core::sync::atomic::AtomicU64; RUN_SLOTS] = [const { core::sync::atomic::AtomicU64::new(0) }; RUN_SLOTS];
+static RUN_TURN: [core::sync::atomic::AtomicU8; RUN_SLOTS] = [const { core::sync::atomic::AtomicU8::new(0) }; RUN_SLOTS];
+
+/// `Some(None)` is `rotate=off`; `None` is a word that is not a turn.
+pub fn parse_run_turn(word: &str) -> Option<Option<Rotate>> {
+    if word == "off" {
+        return Some(None);
+    }
+    Rotate::parse(word).map(Some)
+}
+
+fn encode(turn: Option<Rotate>) -> u8 {
+    match turn {
+        None => 4,
+        Some(Rotate::Right) => 1,
+        Some(Rotate::Left) => 2,
+        Some(Rotate::Flip) => 3,
+    }
+}
+
+/// Gives process `pid` its own turn for the rest of its life (`rotate_forget` ends it). A full table leaves the setting in force.
+pub fn rotate_run(pid: u64, turn: Option<Rotate>) {
+    for slot in 0..RUN_SLOTS {
+        if RUN_PID[slot].compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            RUN_TURN[slot].store(encode(turn), Ordering::Release);
+            return;
+        }
+    }
+}
+
+pub fn rotate_forget(pid: u64) {
+    for slot in 0..RUN_SLOTS {
+        if RUN_PID[slot].load(Ordering::Acquire) == pid {
+            RUN_TURN[slot].store(0, Ordering::Release);
+            RUN_PID[slot].store(0, Ordering::Release);
+        }
+    }
+}
+
+pub fn rotation(phys: usize) -> Option<Rotate> {
+    // A tape's own calls (`gfx_info` comes before `gfx_open`) run as that process; the touch poll runs as no tape, so it asks
+    // the process that has the screen open.
+    let caller = crate::sched::current_pid();
+    let pid = if caller != 0 { caller } else { crate::process::screen_owner() };
+    if pid != 0 {
+        for slot in 0..RUN_SLOTS {
+            if RUN_PID[slot].load(Ordering::Acquire) == pid {
+                match RUN_TURN[slot].load(Ordering::Acquire) {
+                    1 => return Some(Rotate::Right),
+                    2 => return Some(Rotate::Left),
+                    3 => return Some(Rotate::Flip),
+                    4 => return None,
+                    _ => {}
+                }
+            }
+        }
+    }
+    unsafe { (*core::ptr::addr_of!(ROTATE)).get(phys).copied().flatten() }
+}
+
+/// Size of a logical screen: width and height swap for a quarter turn.
+fn logical_size(phys: usize, width: usize, height: usize) -> (u32, u32) {
+    let (w, h) = rotation(phys).map_or((width, height), |turn| turn.logical(width, height));
+    (w as u32, h as u32)
+}
+
+/// Writes a clipped rectangle of the logical screen onto a physical `width` x `height` framebuffer, one pixel at a time
+/// through `turn`; `pixel(column, row)` gives the value for the rectangle's own coordinates.
+fn put_turned(turn: Rotate, base: *mut u32, stride: usize, width: usize, height: usize, (x, y, w, h): (usize, usize, usize, usize), pixel: impl Fn(usize, usize) -> u32) {
+    let (lw, lh) = turn.logical(width, height);
+    for row in 0..h.min(lh.saturating_sub(y)) {
+        for column in 0..w.min(lw.saturating_sub(x)) {
+            let (px, py) = turn.map(width, height, x + column, y + row);
+            unsafe { base.add(py * stride + px).write_volatile(pixel(column, row)) };
+        }
+    }
+}
 
 /// Columns and rows of the text console (`console_size`), or None before it exists.
 pub fn console_size() -> Option<(usize, usize)> {
@@ -466,7 +575,7 @@ pub fn console_size() -> Option<(usize, usize)> {
 /// Width and height of the pixel screen, or None without one.
 pub fn gfx_info() -> Option<(u32, u32)> {
     let console = unsafe { (*core::ptr::addr_of!(CONSOLE)).as_ref() }.filter(|console| !console.text)?;
-    Some((console.width as u32, console.height as u32))
+    Some(logical_size(0, console.width, console.height))
 }
 
 pub fn gfx_open() -> bool {
@@ -512,6 +621,11 @@ pub fn gfx_fill(x: u32, y: u32, width: u32, height: u32, rgb: u32) -> bool {
     let Some(console) = (unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }).filter(|_| GFX_OPEN.load(Ordering::Relaxed)) else { return false };
     let value = from_rgb(console, rgb);
     let (x, y) = (x as usize, y as usize);
+    if let Some(turn) = rotation(0) {
+        put_turned(turn, console.base, console.stride, console.width, console.height, (x, y, width as usize, height as usize), |_, _| value);
+        flush_writes();
+        return true;
+    }
     if x >= console.width || y >= console.height {
         return true;
     }
@@ -533,6 +647,16 @@ pub fn gfx_fill(x: u32, y: u32, width: u32, height: u32, rgb: u32) -> bool {
 pub unsafe fn gfx_blit(x: u32, y: u32, width: u32, height: u32, source: *const u32, stride: u32) -> bool {
     let Some(console) = (unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }).filter(|_| GFX_OPEN.load(Ordering::Relaxed)) else { return false };
     let (x, y, width, height, stride) = (x as usize, y as usize, width as usize, height as usize, stride as usize);
+    if let Some(turn) = rotation(0) {
+        let (lw, lh) = turn.logical(console.width, console.height);
+        if source.is_null() || stride < width || x >= lw || y >= lh {
+            return false;
+        }
+        let console = &*console;
+        put_turned(turn, console.base, console.stride, console.width, console.height, (x, y, width, height), |column, row| from_rgb(console, unsafe { source.add(row * stride + column).read_unaligned() }));
+        flush_writes();
+        return true;
+    }
     if source.is_null() || stride < width || x >= console.width || y >= console.height {
         return false;
     }
@@ -600,6 +724,104 @@ pub fn set_colours(foreground: Option<&str>, background: Option<&str>) -> bool {
     console.caret_at = usize::MAX;
     console.redraw();
     console.draw_caret();
+    flush_writes();
+    true
+}
+
+/// A screen beyond the console's (the Pi 4's second HDMI output, `mailbox::second_screen`): only tapes draw on it, tape screen 1.
+/// 0x00RRGGBB pixels, blue first in memory (the GPU is asked for BGR), mapped non-cacheable by the caller.
+struct Extra {
+    base: *mut u32,
+    stride: usize,
+    width: usize,
+    height: usize,
+    open: bool,
+}
+
+static mut EXTRA: Option<Extra> = None;
+
+/// Registers the second screen: `stride` is in pixels.
+pub fn add_screen(base: u64, width: u32, height: u32, stride: u32) {
+    let extra = Extra { base: base as *mut u32, stride: stride as usize, width: width as usize, height: height as usize, open: false };
+    unsafe { *core::ptr::addr_of_mut!(EXTRA) = Some(extra) };
+}
+
+fn extra() -> Option<&'static mut Extra> {
+    unsafe { (*core::ptr::addr_of_mut!(EXTRA)).as_mut() }
+}
+
+fn extra_clear(screen: &Extra) {
+    for y in 0..screen.height {
+        unsafe { core::ptr::write_bytes(screen.base.add(y * screen.stride), 0, screen.width) };
+    }
+}
+
+pub fn extra_info() -> Option<(u32, u32)> {
+    extra().map(|screen| logical_size(1, screen.width, screen.height))
+}
+
+pub fn extra_open() -> bool {
+    let Some(screen) = extra() else { return false };
+    extra_clear(screen);
+    screen.open = true;
+    flush_writes();
+    true
+}
+
+/// Ends a tape's use of the second screen: black again (there is no text to redraw).
+pub fn extra_close() {
+    if let Some(screen) = extra().filter(|screen| screen.open) {
+        screen.open = false;
+        extra_clear(screen);
+        flush_writes();
+    }
+}
+
+pub fn extra_fill(x: u32, y: u32, width: u32, height: u32, rgb: u32) -> bool {
+    let Some(screen) = extra().filter(|screen| screen.open) else { return false };
+    let (x, y) = (x as usize, y as usize);
+    if let Some(turn) = rotation(1) {
+        put_turned(turn, screen.base, screen.stride, screen.width, screen.height, (x, y, width as usize, height as usize), |_, _| rgb);
+        flush_writes();
+        return true;
+    }
+    if x >= screen.width || y >= screen.height {
+        return true;
+    }
+    let columns = (width as usize).min(screen.width - x);
+    for row in 0..(height as usize).min(screen.height - y) {
+        for column in 0..columns {
+            unsafe { screen.base.add((y + row) * screen.stride + x + column).write_volatile(rgb) };
+        }
+    }
+    flush_writes();
+    true
+}
+
+/// # Safety
+/// `source` must be readable for `(height - 1) * stride + width` pixels.
+pub unsafe fn extra_blit(x: u32, y: u32, width: u32, height: u32, source: *const u32, stride: u32) -> bool {
+    let Some(screen) = extra().filter(|screen| screen.open) else { return false };
+    let (x, y, width, height, stride) = (x as usize, y as usize, width as usize, height as usize, stride as usize);
+    if let Some(turn) = rotation(1) {
+        let (lw, lh) = turn.logical(screen.width, screen.height);
+        if source.is_null() || stride < width || x >= lw || y >= lh {
+            return false;
+        }
+        put_turned(turn, screen.base, screen.stride, screen.width, screen.height, (x, y, width, height), |column, row| unsafe { source.add(row * stride + column).read_unaligned() });
+        flush_writes();
+        return true;
+    }
+    if source.is_null() || stride < width || x >= screen.width || y >= screen.height {
+        return false;
+    }
+    let columns = width.min(screen.width - x);
+    for row in 0..height.min(screen.height - y) {
+        for column in 0..columns {
+            let rgb = unsafe { source.add(row * stride + column).read_unaligned() };
+            unsafe { screen.base.add((y + row) * screen.stride + x + column).write_volatile(rgb) };
+        }
+    }
     flush_writes();
     true
 }

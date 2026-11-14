@@ -2,9 +2,10 @@
 //!
 //! A tape's entry is `extern "C" fn(&TapeApi)`, a table of function pointers. Here every process gets, mapped at fixed user
 //! addresses, a *shim page* (read, execute: an entry wrapper and one 16-byte stub per table slot), a *table page* (read only: the
-//! `TapeApi` the tape is handed, each function pointer aimed at its stub) and an *args page*. A stub is
-//! `mov r10, rcx; mov eax, 0x100 + slot; syscall; ret`: the System V arguments stay where they are (`syscall` clobbers rcx, so the
-//! fourth goes through r10) and `process::syscall` hands the number to `call` below. The slot is the table offset divided by
+//! `TapeApi` the tape is handed, each function pointer aimed at its stub) and an *args page*. A stub (the CPU's own code, in
+//! `arch/*/usermode.rs`) loads `0x100 + slot` into the syscall number register and traps, leaving the C-ABI arguments where they
+//! are (x86: `mov r10, rcx; mov eax, ..; syscall`; aarch64: `mov x8, ..; svc #0`), and `process::syscall` hands the number to
+//! `call` below. The slot is the table offset divided by
 //! eight, so the table's layout stays the single source of truth: every field after the 8-byte version/size header is one word.
 //!
 //! What a call is worth today: console (`putc`, `puts`), time (`ticks`, `micros`), memory (`alloc`/`free` map zeroed pages into
@@ -17,7 +18,7 @@ use core::mem::{offset_of, size_of};
 use fosfor_abi::tape::{KEY_BASE, KEY_NONE, TAPE_API_VERSION, TapeApi};
 
 use crate::trap::Frame;
-use crate::{threads, apic, fb, fpu, pmm, process, sched, tapeaudio, tapefs, tapenet, tapeserial, tapesys, vm};
+use crate::{threads, time, fb, fpu, pmm, process, sched, tapeaudio, tapefs, tapenet, tapeserial, tapesys, vm};
 
 pub const SHIM_BASE: u64 = vm::USER_BASE + 0x200_0000;
 pub const TABLE_BASE: u64 = SHIM_BASE + 0x1000;
@@ -34,40 +35,6 @@ pub const CALL_BASE: u64 = 0x100;
 const STUBS: usize = 128;
 const SLOTS: usize = size_of::<TapeApi>() / 8;
 const _: () = assert!(size_of::<TapeApi>() % 8 == 0 && SLOTS <= STUBS);
-
-core::arch::global_asm!(
-    r#"
-    .text
-    .balign 16
-    .global tape_shim_start, tape_shim_stubs, tape_shim_end, tape_thread_start
-tape_shim_start:                     # entered with rdi = the table, rsi = the tape's entry point
-    call rsi
-    mov eax, 1                       # the tape returned: exit(0)
-    xor edi, edi
-    syscall
-    ud2
-    .balign 16
-tape_thread_start:                   # another thread: rdi = its entry point, rsi = its argument (the stack is 16-aligned)
-    mov rax, rdi
-    mov rdi, rsi
-    call rax
-    mov eax, 5                       # the entry returned: end this thread only
-    syscall
-    ud2
-    .balign 16
-tape_shim_stubs:
-    .set slot, 0
-    .rept 128
-    mov r10, rcx
-    mov eax, 0x100 + slot
-    syscall
-    ret
-    .balign 16
-    .set slot, slot + 1
-    .endr
-tape_shim_end:
-"#
-);
 
 unsafe extern "C" {
     static tape_shim_start: u8;
@@ -229,6 +196,7 @@ pub fn map_support(root: u64, args: &[u8]) -> Option<()> {
     let shim = unsafe { core::slice::from_raw_parts(&tape_shim_start as *const u8, &tape_shim_end as *const u8 as usize - &tape_shim_start as *const u8 as usize) }; // kernel-memory
     let code = pmm::allocate(1, None)?;
     unsafe { core::ptr::copy_nonoverlapping(shim.as_ptr(), vm::direct(code) as *mut u8, shim.len()) }; // kernel-memory
+    crate::usermode::sync_code(vm::direct(code), shim.len() as u64);
     vm::map_user_page(root, SHIM_BASE, code, false, true).then_some(())?;
 
     let table = pmm::allocate(1, None)?;
@@ -331,9 +299,9 @@ fn free_pages_at(address: u64, bytes: u64) {
 
 /// One table call from ring 3: `slot` is the stub's number minus `CALL_BASE`, the arguments are as System V passes them.
 pub fn call(frame: &mut Frame) {
-    let number = frame.rax - CALL_BASE;
-    let (a, b, c, d, e) = (frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8);
-    frame.rax = match number {
+    let number = frame.syscall_number() - CALL_BASE;
+    let (a, b, c, d, e) = (frame.arg(0), frame.arg(1), frame.arg(2), frame.arg(3), frame.arg(4));
+    let result = match number {
         PUTC => {
             if a < 0x80 {
                 print!("{}", a as u8 as char);
@@ -356,8 +324,8 @@ pub fn call(frame: &mut Frame) {
             sched::sleep_ticks(1);
             0
         }
-        TICKS => apic::ticks(),
-        MICROS => apic::micros(),
+        TICKS => time::ticks(),
+        MICROS => time::micros(),
         ALLOC => alloc_pages(a),
         FREE => {
             free_pages_at(a, b);
@@ -464,7 +432,7 @@ pub fn call(frame: &mut Frame) {
         RANDOM => {
             // Filled in kernel memory and then copied: a direct write into user pages faults under SMAP.
             if b > 4096 {
-                return frame.rax = 0;
+                return frame.set_result(0);
             }
             let mut bytes = alloc::vec![0u8; b as usize];
             let strong = kernel_core::random::fill(&mut bytes);
@@ -506,16 +474,56 @@ pub fn call(frame: &mut Frame) {
         DISK_FORMAT_EXFAT => tapesys::format_exfat(a, b, c) as u64,
         WALL_CLOCK => tapesys::wall_clock(a),
         WALL_CLOCK_SET => tapesys::wall_clock_set(a),
-        // This machine has no GPIO pins or I2C header (the Raspberry Pi 4 has): the answers of the embedded x86 kernel without
-        // pins, so a tape can tell. Reads show nothing, every write is refused, mode/pull say "no GPIO", I2C says "no bus".
+        // The Raspberry Pi 4 has pins and an I2C header (`tapepi.rs`); other machines give the answers of the embedded x86 kernel
+        // without pins, so a tape can tell: reads show nothing, every write is refused, mode/pull say "no GPIO", I2C says "no bus".
+        #[cfg(target_arch = "aarch64")]
+        GPIO_PINS => crate::gpio::api_gpio_pins(),
+        #[cfg(target_arch = "aarch64")]
+        GPIO_READ => crate::gpio::api_gpio_read(),
+        #[cfg(target_arch = "aarch64")]
+        GPIO_WRITE => crate::gpio::api_gpio_write(a, b),
+        #[cfg(target_arch = "aarch64")]
+        GPIO_MODE => crate::gpio::api_gpio_mode(a as u32, b as u32, c as u32) as i64 as u64,
+        #[cfg(target_arch = "aarch64")]
+        GPIO_PULL => crate::gpio::api_gpio_pull(a as u32, b as u32) as i64 as u64,
+        #[cfg(target_arch = "aarch64")]
+        GPIO_FUNCTION => crate::gpio::api_gpio_function(a as u32) as i64 as u64,
+        #[cfg(target_arch = "aarch64")]
+        GPIO_PULL_GET => crate::gpio::api_gpio_pull_get(a as u32) as i64 as u64,
+        #[cfg(target_arch = "aarch64")]
+        I2C_SPEED => crate::tapepi::i2c_speed(a) as u64,
+        #[cfg(target_arch = "aarch64")]
+        I2C_TRANSFER => crate::tapepi::i2c_transfer(a, b, c, d, e) as u64,
+        #[cfg(not(target_arch = "aarch64"))]
         GPIO_PINS | GPIO_READ => 0,
+        #[cfg(not(target_arch = "aarch64"))]
         GPIO_WRITE => a,
+        #[cfg(not(target_arch = "aarch64"))]
         GPIO_MODE | GPIO_PULL => (-3i64) as u64,
+        #[cfg(not(target_arch = "aarch64"))]
         GPIO_FUNCTION | GPIO_PULL_GET => (-2i64) as u64,
+        #[cfg(not(target_arch = "aarch64"))]
         I2C_SPEED | I2C_TRANSFER => (-4i64) as u64,
         FP_LEVEL => u64::from(fpu::level()),
         GFX_INFO | GFX_INFO_ON if number == GFX_INFO || a == 0 => fb::gfx_info().map_or(0, |(w, h)| u64::from(w) << 32 | u64::from(h)),
-        GFX_SCREENS => u64::from(fb::gfx_info().is_some()),
+        GFX_INFO_ON if a == 1 => fb::extra_info().map_or(0, |(w, h)| u64::from(w) << 32 | u64::from(h)),
+        GFX_SCREENS => u64::from(fb::gfx_info().is_some()) + u64::from(fb::extra_info().is_some()),
+        GFX_OPEN_ON if a == 1 => {
+            let opened = fb::extra_open();
+            if opened {
+                process::note_screen_open();
+            }
+            u64::from(opened)
+        }
+        GFX_CLOSE_ON if a == 1 => {
+            fb::extra_close();
+            0
+        }
+        GFX_FILL_ON if a == 1 => u64::from(fb::extra_fill(b as u32, c as u32, d as u32, e as u32, frame.arg(5) as u32)),
+        GFX_BLIT_ON if a == 1 => match seventh(frame) {
+            Some(stride) => blit_on(1, b as u32, c as u32, d as u32, e as u32, frame.arg(5), stride),
+            None => 0,
+        },
         GFX_OPEN | GFX_OPEN_ON if number == GFX_OPEN || a == 0 => {
             let opened = fb::gfx_open();
             if opened {
@@ -532,19 +540,28 @@ pub fn call(frame: &mut Frame) {
             0
         }
         GFX_FILL => u64::from(fb::gfx_fill(a as u32, b as u32, c as u32, d as u32, e as u32)),
-        GFX_FILL_ON if a == 0 => u64::from(fb::gfx_fill(b as u32, c as u32, d as u32, e as u32, frame.r9 as u32)),
-        GFX_BLIT => blit(a as u32, b as u32, c as u32, d as u32, e, frame.r9),
+        GFX_FILL_ON if a == 0 => u64::from(fb::gfx_fill(b as u32, c as u32, d as u32, e as u32, frame.arg(5) as u32)),
+        GFX_BLIT => blit_on(0, a as u32, b as u32, c as u32, d as u32, e, frame.arg(5)),
         // The seventh argument (stride) is on the user's stack, above the return address the stub's caller pushed.
-        GFX_BLIT_ON if a == 0 => match process::user_u64(frame.rsp + 8) {
-            Some(stride) => blit(b as u32, c as u32, d as u32, e as u32, frame.r9, stride),
+        GFX_BLIT_ON if a == 0 => match seventh(frame) {
+            Some(stride) => blit_on(0, b as u32, c as u32, d as u32, e as u32, frame.arg(5), stride),
             None => 0,
         },
         _ => 0,
     };
+    frame.set_result(result);
+}
+
+/// The seventh argument of a call: x6 on aarch64 (eight come in registers), on x86 the first word of the caller's stack.
+fn seventh(frame: &Frame) -> Option<u64> {
+    #[cfg(target_arch = "aarch64")]
+    return Some(frame.arg(6));
+    #[cfg(not(target_arch = "aarch64"))]
+    process::user_u64(frame.stack_args())
 }
 
 /// `gfx_blit`: `pixels` (rdi-style argument 5) and `stride` (argument 6) are checked as user memory before the copy.
-fn blit(x: u32, y: u32, width: u32, height: u32, pixels: u64, stride: u64) -> u64 {
+fn blit_on(screen: u64, x: u32, y: u32, width: u32, height: u32, pixels: u64, stride: u64) -> u64 {
     let (stride, rows) = (stride as u32, u64::from(height));
     if pixels == 0 || stride < width || width == 0 || rows == 0 {
         return 0;
@@ -553,5 +570,11 @@ fn blit(x: u32, y: u32, width: u32, height: u32, pixels: u64, stride: u64) -> u6
     if pixels % 4 != 0 || !vm::user_range_ok(sched::current_root(), pixels, bytes, false) {
         return 0;
     }
-    u64::from(process::user_access(|| unsafe { fb::gfx_blit(x, y, width, height, pixels as *const u32, stride) })) // kernel-memory
+    u64::from(process::user_access(|| unsafe {
+        if screen == 1 {
+            fb::extra_blit(x, y, width, height, pixels as *const u32, stride)
+        } else {
+            fb::gfx_blit(x, y, width, height, pixels as *const u32, stride)
+        }
+    })) // kernel-memory
 }

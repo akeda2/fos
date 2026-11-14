@@ -363,7 +363,7 @@ image: loader kernel kernel-mf tapes stamp-tapes $(BIOS_STAGES)
 # aarch64 (Raspberry Pi 4, QEMU virt; docs/aarch64-plan.md): the loader and kernel for the other CPU, in their own image.
 A64_LOADER := $(CARGO_TARGET_DIR)/aarch64-unknown-uefi/release/fosfor-loader.efi
 A64_KERNEL := $(CARGO_TARGET_DIR)/aarch64-unknown-none-softfloat/release/fosfor-kernel
-A64_IMAGE := $(BUILD)/fosfor-aarch64/fosfor.img
+A64_IMAGE := $(BUILD)/fosfor-aarch64/fosfor-qemu.img
 
 loader-aarch64:
 	cd boot/uefi && cargo +nightly-2026-09-13 build --release --target aarch64-unknown-uefi -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem
@@ -372,7 +372,7 @@ kernel-aarch64:
 	cd kernel && cargo +nightly-2026-09-13 build --release --target aarch64-unknown-none-softfloat -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem
 
 # Tapes for aarch64 (M2 of the plan): the portable ones, built for the built-in hard-float aarch64-unknown-none target.
-A64_TAPES := hello fscheck gfxcheck calc ed ebb httpd smbd smb smbmount web netcheck fosplay clock gonio ptp play record recorder ltas kaffe organ strings tape-echo epiano phono fterm telnet net-chat ip-chat bridge nettest router audio-net opus-bench i2cscan gpiopanel miccal frt60 compander
+A64_TAPES := hello thrcheck fscheck gfxcheck calc ed ebb httpd smbd smb smbmount web netcheck fosplay clock gonio ptp play record recorder ltas kaffe organ strings tape-echo epiano phono fterm telnet net-chat ip-chat bridge nettest router audio-net opus-bench i2cscan gpiopanel miccal frt60 compander
 A64_TAPE_DIR := $(CARGO_TARGET_DIR)/aarch64-unknown-none/release
 A64_TAPE_STAMPED := build/fosfor-aarch64/tapes
 A64_FILES_V3 = $(foreach tape,$(A64_TAPES),--file $(tape)=$(A64_TAPE_STAMPED)/$(tape))
@@ -396,6 +396,28 @@ image-pi4: image-aarch64
 
 test-aarch64-boot: image-aarch64
 	python3 tools/test_aarch64_boot.py
+
+# The server kernel (mf) on aarch64: same loader and image layout, its own kernel (work in progress, no tapes).
+A64_KERNEL_MF := $(CARGO_TARGET_DIR)/aarch64-unknown-none-softfloat/release/fosfor-kernel-mf
+.PHONY: kernel-mf-aarch64 image-mf-aarch64 image-mf-pi4 test-mf-aarch64-boot
+test-mf-aarch64-boot: image-mf-aarch64
+	python3 tools/test_mf_aarch64_boot.py
+kernel-mf-aarch64:
+	cd kernel-mf && cargo +nightly-2026-09-13 build --release --target aarch64-unknown-none-softfloat
+
+# FOSFS v4 like the other images: tapes in bin/, configuration in settings/ (docs/fosfs-v4.md).
+MF_A64_FILES = $(foreach tape,hello thrcheck fscheck gfxcheck calc ed netcheck httpd web fterm,--file bin/$(tape)=$(A64_TAPE_STAMPED)/$(tape)) --fosfs 4
+
+image-mf-aarch64: loader-aarch64 kernel-mf-aarch64 tapes-aarch64
+	mkdir -p $(BUILD)/fosfor-mf-aarch64
+	python3 tools/build_image.py --arch aarch64 --loader $(A64_LOADER) --kernel $(A64_KERNEL_MF) $(MF_A64_FILES) --output $(BUILD)/fosfor-mf-aarch64/fosfor-qemu.img
+
+# The SD card image for a Raspberry Pi 4 running the server kernel: the mf image plus the edk2 firmware files in the ESP.
+# `image-mf-aarch64` alone is the QEMU image and does not boot on a Pi (no firmware). Flash it with
+# `sudo python3 tools/write_stick.py /dev/sdX --image build/fosfor-mf-aarch64/fosfor-pi4.img` (a person runs that).
+image-mf-pi4: image-mf-aarch64
+	python3 tools/fetch_rpi4_firmware.py build/rpi4-firmware
+	python3 tools/build_image.py --arch aarch64 --loader $(A64_LOADER) --kernel $(A64_KERNEL_MF) $(MF_A64_FILES) --esp-dir build/rpi4-firmware --output $(BUILD)/fosfor-mf-aarch64/fosfor-pi4.img
 
 # Serial KUP: a kernel pushed over the console UART is tried from the other slot and confirmed.
 test-aarch64-kup: image-aarch64

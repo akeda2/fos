@@ -1,6 +1,6 @@
-//! kernel-mf's answer to `fos_hal::Platform`: what the shared drivers in `kernel-core` need from the machine. Same contract
-//! as the embedded kernel's `platform.rs`. Differences: device memory is mapped through the direct map (`vm`) and the drivers reach it with `memory::phys_to_virt`, all device
-//! interrupts go to the boot CPU, and there are no tasks yet (the defaults stand in until the scheduler, slice 8).
+//! kernel-mf's answer to `fos_hal::Platform` on aarch64: what the shared drivers in `kernel-core` need from the machine. The same
+//! contract as `arch/x86_64/platform.rs`; the differences are PCI config access (ECAM, or the Pi 4's own scheme), MSI delivery
+//! (GICv2m or the Pi 4's MSI block), no port I/O and no legacy INTx routing.
 
 use fos_hal::{BlockError, BlockInfo, Platform};
 
@@ -51,21 +51,21 @@ impl Platform for Mf {
         crate::clock::unix_seconds()
     }
     fn timer_micros(&self) -> u64 {
-        crate::apic::micros()
+        crate::time::micros()
     }
     fn timer_counter(&self) -> u64 {
-        crate::cpu::rdtsc()
+        crate::timer::counter()
     }
     fn timer_ticks(&self) -> u64 {
-        crate::apic::ticks()
+        crate::time::ticks()
     }
     fn busy_wait_ms(&self, milliseconds: u64) {
-        crate::apic::busy_wait_ms(milliseconds);
+        crate::time::busy_wait_ms(milliseconds);
     }
     fn wait_ticks(&self, count: u64) {
-        let until = crate::apic::ticks() + count;
-        while crate::apic::ticks() < until {
-            core::hint::spin_loop();
+        let until = crate::time::ticks() + count;
+        while crate::time::ticks() < until {
+            crate::cpu::sleep();
         }
     }
 
@@ -93,6 +93,9 @@ impl Platform for Mf {
     fn pci_write32(&self, bus: u8, device: u8, function: u8, offset: u8, value: u32) {
         crate::pci_config::write32(bus, device, function, offset, value);
     }
+    fn pci_cpu_address(&self, pci: u64) -> u64 {
+        crate::pci_config::cpu_address(pci)
+    }
 
     fn msi_allocate(&self, handler: fn(usize), context: usize) -> Option<u8> {
         crate::msi::allocate(handler, context)
@@ -104,45 +107,24 @@ impl Platform for Mf {
         crate::msi::count(vector)
     }
     fn msi_message(&self, vector: u8) -> (u64, u32) {
-        (0xfee0_0000 | u64::from(self.interrupt_target()) << 12, u32::from(vector))
+        crate::msi::message(vector)
     }
-    fn msi_claim(&self) {
-        crate::msi::claim();
+    // No legacy INTx routing and no I/O APIC: devices use MSI.
+    fn msi_claim(&self) {}
+    fn msi_intx_candidates(&self, _interrupt_line: u8) -> [u32; 9] {
+        [u32::MAX; 9]
     }
-    fn msi_intx_candidates(&self, interrupt_line: u8) -> [u32; 9] {
-        crate::msi::intx_candidates(interrupt_line)
+    fn msi_attach_intx(&self, _gsi: u32, _handler: fn(usize), _context: usize) -> Option<u8> {
+        None
     }
-    fn msi_attach_intx(&self, gsi: u32, handler: fn(usize), context: usize) -> Option<u8> {
-        crate::msi::attach_intx(gsi, handler, context)
-    }
-    fn msi_detach_intx(&self, vector: u8, context: usize) {
-        crate::msi::detach_intx(vector, context);
-    }
+    fn msi_detach_intx(&self, _vector: u8, _context: usize) {}
     fn interrupt_target(&self) -> u32 {
-        crate::percpu::interrupt_target()
+        0
     }
     fn gsi_range(&self) -> (u32, u32) {
-        crate::apic::ioapic::gsi_range()
+        (0, 0)
     }
 
-    fn port_in8(&self, port: u16) -> u8 {
-        crate::cpu::inb(port)
-    }
-    fn port_in16(&self, port: u16) -> u16 {
-        crate::cpu::inw(port)
-    }
-    fn port_in32(&self, port: u16) -> u32 {
-        crate::cpu::inl(port)
-    }
-    fn port_out8(&self, port: u16, value: u8) {
-        crate::cpu::outb(port, value);
-    }
-    fn port_out16(&self, port: u16, value: u16) {
-        crate::cpu::outw(port, value);
-    }
-    fn port_out32(&self, port: u16, value: u32) {
-        crate::cpu::outl(port, value);
-    }
     fn interrupts_save_and_disable(&self) -> bool {
         crate::cpu::interrupts_save_and_disable()
     }
@@ -154,6 +136,38 @@ impl Platform for Mf {
 static MF: Mf = Mf;
 
 pub fn install() {
+    // RAM is identity-mapped: the direct map adds nothing.
     fos_hal::memory::set_phys_offset(crate::vm::DIRECT_BASE);
     fos_hal::set_platform(&MF);
+    kernel_core::i2s::set(&I2S);
+    kernel_core::screen::set(&SCREEN);
 }
+
+static I2S: kernel_core::i2s::Ops = kernel_core::i2s::Ops {
+    present: crate::i2s_pi::present,
+    label: crate::i2s_pi::label,
+    start: crate::i2s_pi::start,
+    stop: crate::i2s_pi::stop,
+    poll: crate::i2s_pi::poll,
+    read: crate::i2s_pi::read,
+    write: crate::i2s_pi::write,
+    playback_space: crate::i2s_pi::playback_space,
+    format: crate::i2s_pi::format,
+    select: crate::i2s_pi::select,
+    print_modes: crate::i2s_pi::print_modes,
+    status: crate::i2s_pi::status,
+    fill_info: crate::i2s_pi::fill_info,
+    fill_stats: crate::i2s_pi::fill_stats,
+    buffer_info: crate::i2s_pi::buffer_info,
+};
+
+static DSI: kernel_core::screen::Dsi = kernel_core::screen::Dsi {
+    width: crate::dsitouch::WIDTH,
+    height: crate::dsitouch::HEIGHT,
+    present: crate::dsitouch::present,
+    poll: crate::dsitouch::poll,
+    reports: crate::dsitouch::reports,
+};
+
+/// The pixel console's logical size and rotation (touch scaling); the DSI chip's touches reach the pointer queue.
+static SCREEN: kernel_core::screen::Screen = kernel_core::screen::Screen { gfx_info: crate::fb::gfx_info, rotation: crate::fb::rotation, dsi: Some(&DSI) };

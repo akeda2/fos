@@ -29,8 +29,11 @@ global_asm!(
     b irq_entry                        // 5: IRQ from the current EL on SP_ELx, the only IRQ we expect
     vector 6
     vector 7
-    vector 8
-    vector 9
+    .balign 0x80
+    b lower_sync_entry                 // 8: synchronous from EL0 (the server kernel's system calls and faults;
+                                       // the embedded kernel defines them in arch/aarch64/mod.rs)
+    .balign 0x80
+    b lower_irq_entry                  // 9: IRQ from EL0
     vector 10
     vector 11
     vector 12
@@ -49,7 +52,26 @@ global_asm!(
         stp x14, x15, [sp, #112]
         stp x16, x17, [sp, #128]
         stp x18, x30, [sp, #144]
+        mrs x0, CurrentEL
+        cmp x0, #8
+        b.eq 2f
+        mrs x1, elr_el1
+        mrs x2, spsr_el1
+        b 3f
+    2:  mrs x1, elr_el2
+        mrs x2, spsr_el2
+    3:  stp x1, x2, [sp, #160]         // kept on the stack: a handler may switch threads, and ELR/SPSR are per CPU
         bl irq_dispatch
+        ldp x1, x2, [sp, #160]
+        mrs x0, CurrentEL
+        cmp x0, #8
+        b.eq 4f
+        msr elr_el1, x1
+        msr spsr_el1, x2
+        b 5f
+    4:  msr elr_el2, x1
+        msr spsr_el2, x2
+    5:
         ldp x18, x30, [sp, #144]
         ldp x16, x17, [sp, #128]
         ldp x14, x15, [sp, #112]

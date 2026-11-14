@@ -3,7 +3,7 @@
 //! parabola per half cycle (integer only), written only as fast as the ring has room, so any gap in the sound is an underrun
 //! the driver counts (`audio` prints the totals afterwards).
 
-use crate::apic;
+use crate::time;
 use kernel_core::audio as ua;
 
 /// The USB drivers wait on timer ticks, which only advance with interrupts on, and the shell runs with them off: turn them on
@@ -53,12 +53,12 @@ fn tone(words: &mut core::str::SplitWhitespace) {
     let (channels, slot) = (usize::from(channels), usize::from(slot));
     let step = (u64::from(frequency) << 16) / u64::from(rate);
     let mut phase = 0u64;
-    let end = apic::micros() + seconds * 1_000_000;
+    let end = time::micros() + seconds * 1_000_000;
     let frame_bytes = channels * slot;
     let float = ua::playback_float() && slot == 4;
     let mut chunk = [0u8; 2048];
     // No print from `start` to the end of the loop: a console line costs milliseconds, and the ring would run dry meanwhile.
-    while apic::micros() < end {
+    while time::micros() < end {
         crate::debug::pet();
         crate::usb::poll();
         ua::poll();

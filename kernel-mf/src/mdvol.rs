@@ -123,7 +123,7 @@ fn now() -> u64 {
 }
 
 fn seconds() -> u64 {
-    crate::apic::ticks() / 100
+    crate::time::ticks() / 100
 }
 
 /// Finds every disk and Linux RAID partition that carries an md superblock. The array's own disk is skipped.

@@ -15,7 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CODE = os.environ.get("AAVMF_CODE", "/usr/share/AAVMF/AAVMF_CODE.no-secboot.fd")
 VARS = os.environ.get("AAVMF_VARS", "/usr/share/AAVMF/AAVMF_VARS.fd")
-IMAGE = Path(os.environ.get("FOSFOR_AARCH64_IMAGE", ROOT / "build/fosfor-aarch64/fosfor.img"))
+IMAGE = Path(os.environ.get("FOSFOR_AARCH64_IMAGE", ROOT / "build/fosfor-aarch64/fosfor-qemu.img"))
 
 
 def check(condition, message, text=""):
@@ -24,9 +24,11 @@ def check(condition, message, text=""):
     print(f"PASS: {message}")
 
 
-def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] = (), usb_keys: tuple[str, ...] = (), during: tuple | None = None, steps: tuple[tuple[str, str], ...] = (), sd: bool = False, fat: bool = False, usb: bool = False, big: bool = False) -> str:
+def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] = (), usb_keys: tuple[str, ...] = (), during: tuple | None = None, steps: tuple[tuple[str, str], ...] = (), sd: bool = False, fat: bool = False, usb: bool = False, big: bool = False, wire=None, el2: bool = False, cpus: int = 1, keep: bool = False, extra: Path | None = None) -> str:
     """Boots `image` under QEMU virt + AAVMF + ramfb and returns the serial text. The kernel parks, so the run ends
-    when the parking message shows (or after 60 s); a PPM screenshot goes to `screendump` when given."""
+    when the parking message shows (or after 60 s); a PPM screenshot goes to `screendump` when given. `wire` is a function
+    called with the host's end of the guest's multicast network (`test_boot.Wire`) once the shell is up; the guest's NIC
+    (virtio-net) is then on that network instead of QEMU's user-mode one."""
     if not shutil.which("qemu-system-aarch64") or not Path(CODE).exists():
         raise SystemExit("qemu-system-aarch64 or the AAVMF firmware is missing (apt install qemu-system-arm qemu-efi-aarch64)")
     with tempfile.TemporaryDirectory() as scratch:
@@ -45,9 +47,12 @@ def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] 
             image = Path(scratch) / "big.img"
             shutil.copyfile(IMAGE, image)
             os.truncate(image, 256 << 20)
-        disk = ["-drive", f"file={image},format=raw,if=none,id=boot,snapshot=on", "-device", "virtio-blk-pci,drive=boot"]
+        disk = ["-drive", f"file={image},format=raw,if=none,id=boot" + ("" if keep else ",snapshot=on"), "-device", "virtio-blk-pci,drive=boot"]
         if sd:
             disk += ["-drive", f"file={padded},format=raw,if=none,id=card,snapshot=on", "-device", "sdhci-pci", "-device", "sd-card,drive=card"]
+        if extra is not None:
+            # A second virtio disk that persists (an `install` target; boot it alone on the next run).
+            disk += ["-drive", f"file={extra},format=raw,if=none,id=extra", "-device", "virtio-blk-pci,drive=extra"]
         stick = []
         if fat or usb:
             # A PC-formatted FAT32 volume with no partition table (a "superfloppy"), as a third disk.
@@ -61,12 +66,16 @@ def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] 
                 stick = ["-device", "usb-storage,drive=fat,bus=xhci.0"]
             else:
                 disk += ["-device", "virtio-blk-pci,drive=fat"]
+        nic = []
+        if wire is not None:
+            from test_boot import MCAST_GROUP, MCAST_PORT
+            nic = ["-nic", "none", "-netdev", f"socket,id=net0,mcast={MCAST_GROUP}:{MCAST_PORT}", "-device", "virtio-net-pci,netdev=net0,mac=52:54:00:12:34:7b"]
         with open(log, "wb") as out:
             qemu = subprocess.Popen(
-                ["qemu-system-aarch64", "-machine", "virt", "-cpu", "cortex-a72", "-m", "1G", "-display", "none", "-device", "ramfb",
+                ["qemu-system-aarch64", "-machine", "virt,virtualization=on" if el2 else "virt", "-cpu", "cortex-a72", "-smp", str(cpus), "-m", "1G", "-display", "none", "-device", "ramfb",
                  "-serial", "stdio", "-no-reboot", "-monitor", f"unix:{monitor},server,nowait",
                  "-drive", f"if=pflash,format=raw,readonly=on,file={CODE}", "-drive", f"if=pflash,format=raw,file={variables}",
-                 *disk, "-device", "qemu-xhci,id=xhci", "-device", "usb-kbd", *stick],
+                 *disk, "-device", "qemu-xhci,id=xhci", "-device", "usb-kbd", *stick, *nic],
                 stdin=subprocess.PIPE, stdout=out, stderr=subprocess.STDOUT)
             try:
                 def wait_for(count: int) -> None:
@@ -83,6 +92,9 @@ def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] 
                     qemu.stdin.write(command.encode() + b"\r")
                     qemu.stdin.flush()
                     wait_for(number)
+                if wire is not None:
+                    from test_boot import Wire
+                    wire(Wire())
                 for text, marker in steps:
                     # Interactive input for a running tape: typed a byte at a time (the PL011 FIFO is 16 deep), then wait for `marker`.
                     start = len(log.read_bytes())
@@ -237,7 +249,7 @@ def main():
     check("run: nothere: no such file." in text, "a missing tape is refused politely", text)
     check(re.search(r"^\+$", text, re.M) is not None, "keys typed on the USB keyboard reach the shell, and `keymap sv` makes the US minus key type '+'", text)
     check("PANIC" not in text and "FATAL" not in text and "EXCEPTION" not in text, "no panic, no loader fatal, no exception", text)
-    check("MSI: GICv2m frame." in text and re.search(r"xHCI \S+: MSI(-X)? on vector \S+ \(the self-test interrupt arrived\)", text) is not None, "the xHCI controller delivers its events by MSI through the GICv2m frame and the GIC", text)
+    check("MSI: GICv2m frame." in text and re.search(r"xHCI \S+: MSI(-X)? on table slot \S+ \(the self-test interrupt arrived\)", text) is not None, "the xHCI controller delivers its events by MSI through the GICv2m frame and the GIC", text)
     check("USB: 1 xHCI controller(s)." in text and re.search(r"USB keyboard 0627:0001 on port \d+ .*: ready\.", text) is not None, "the xHCI controller comes up and enumerates the USB keyboard", text)
     print("aarch64 boot: all checks passed")
 

@@ -10,6 +10,11 @@ pub const MAX_DISKS: usize = 16;
 pub enum Backend {
     Ahci(ahci::Drive),
     Nvme(nvme::Drive),
+    /// A virtio disk (QEMU on aarch64).
+    #[cfg(target_arch = "aarch64")]
+    Virtio(kernel_core::virtio_blk::Drive),
+    #[cfg(target_arch = "aarch64")]
+    Sd(crate::sdhci::Drive),
     /// An index into `usb_storage`'s device table.
     Usb(usize),
     /// The array `mdvol` assembled: the disk is virtual, its sectors come from the members.
@@ -98,6 +103,29 @@ fn checked(disk: usize, lba: u64, length: usize) -> Result<Disk, Error> {
     Ok(info)
 }
 
+/// DMA drivers that hand `address - offset` to the device need a buffer in the direct map; a thread's stack is mapped
+/// elsewhere (`vm::STACK_REGION`), so such a buffer goes through a heap copy.
+#[cfg(target_arch = "aarch64")]
+fn on_stack(buffer: &[u8]) -> bool {
+    buffer.as_ptr() as u64 >= crate::vm::STACK_REGION
+}
+
+#[cfg(target_arch = "aarch64")]
+fn with_direct_read<T>(buffer: &mut [u8], transfer: impl FnOnce(&mut [u8]) -> T) -> T {
+    if !on_stack(buffer) {
+        return transfer(buffer);
+    }
+    let mut bounce = alloc::vec![0u8; buffer.len()];
+    let result = transfer(&mut bounce);
+    buffer.copy_from_slice(&bounce);
+    result
+}
+
+#[cfg(target_arch = "aarch64")]
+fn with_direct_write<T>(buffer: &[u8], transfer: impl FnOnce(&[u8]) -> T) -> T {
+    if on_stack(buffer) { transfer(&alloc::vec::Vec::from(buffer)) } else { transfer(buffer) }
+}
+
 /// Reads whole sectors (`buffer.len()` a multiple of 512) from `lba`.
 pub fn read(disk: usize, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
     match checked(disk, lba, buffer.len())?.backend {
@@ -111,6 +139,10 @@ pub fn read(disk: usize, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
                 drive.read(lba + (index * nvme::MAX_SECTORS) as u64, chunk).map_err(|_| Error::Device)?;
             }
         }
+        #[cfg(target_arch = "aarch64")]
+        Backend::Virtio(drive) => with_direct_read(buffer, |buffer| drive.read(lba, buffer)).map_err(|_| Error::Device)?,
+        #[cfg(target_arch = "aarch64")]
+        Backend::Sd(drive) => with_direct_read(buffer, |buffer| drive.read(lba, buffer)).map_err(|_| Error::Device)?,
         Backend::Usb(device) => crate::usb::storage_read(device, lba, buffer).map_err(|_| Error::Device)?,
         Backend::Md => crate::mdvol::read(lba, buffer)?,
     }
@@ -149,6 +181,10 @@ fn write_with(disk: usize, lba: u64, buffer: &[u8], flush: bool) -> Result<(), E
                 drive.write(lba + (index * nvme::MAX_SECTORS) as u64, chunk).map_err(|_| Error::Device)?;
             }
         }
+        #[cfg(target_arch = "aarch64")]
+        Backend::Virtio(drive) => with_direct_write(buffer, |buffer| drive.write(lba, buffer)).map_err(|_| Error::Device)?,
+        #[cfg(target_arch = "aarch64")]
+        Backend::Sd(drive) => with_direct_write(buffer, |buffer| drive.write(lba, buffer)).map_err(|_| Error::Device)?,
         Backend::Usb(device) => crate::usb::storage_write(device, lba, buffer).map_err(|_| Error::Device)?,
         Backend::Md => crate::mdvol::write(lba, buffer)?,
     }
@@ -166,5 +202,9 @@ pub fn discard(disk: usize, ranges: &[(u64, u64)]) -> Result<(), Error> {
         Backend::Ahci(drive) => drive.discard(ranges).map_err(|error| if error == ahci::Error::Unsupported { Error::Unsupported } else { Error::Device }),
         Backend::Nvme(drive) => drive.discard(ranges).map_err(|error| if error == nvme::Error::Unsupported { Error::Unsupported } else { Error::Device }),
         Backend::Usb(_) | Backend::Md => Err(Error::Unsupported),
+        #[cfg(target_arch = "aarch64")]
+        Backend::Virtio(_) => Err(Error::Unsupported),
+        #[cfg(target_arch = "aarch64")]
+        Backend::Sd(_) => Err(Error::Unsupported),
     }
 }

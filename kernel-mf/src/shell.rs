@@ -2,7 +2,7 @@
 //! inspection commands. Output goes through `println!`, which reaches every console (serial and, while a session is open,
 //! the network). Runs on the boot CPU from the service loop.
 
-use crate::{apic, block, clock, net, percpu, pmm, power, sched, slots};
+use crate::{time, block, clock, net, percpu, pmm, power, sched, slots};
 use kernel_core::netdump::Mac;
 use alloc::vec::Vec;
 use kernel_core::{nic, pci};
@@ -106,7 +106,7 @@ fn feed_foreground(id: usize, byte: u8) -> bool {
         return true;
     }
     if byte == ESCAPE {
-        keys.escape_tick = apic::ticks().max(1);
+        keys.escape_tick = time::ticks().max(1);
         return true;
     }
     push_key(&mut keys, byte);
@@ -117,7 +117,7 @@ fn feed_foreground(id: usize, byte: u8) -> bool {
 pub fn poll_escape() {
     for id in 0..crate::session::MAX {
         let mut keys = KEYS[id].lock();
-        if keys.escape_tick != 0 && apic::ticks().saturating_sub(keys.escape_tick) >= ESCAPE_WAIT_TICKS {
+        if keys.escape_tick != 0 && time::ticks().saturating_sub(keys.escape_tick) >= ESCAPE_WAIT_TICKS {
             keys.escape_tick = 0;
             let pid = keys.pid;
             drop(keys);
@@ -138,7 +138,7 @@ pub fn prompt() {
 
 /// Commands `run` handles itself, outside the shared tables, for Tab completion.
 const BUILTINS: &[&str] = &[
-    "version", "cpus", "mem", "pci", "disks", "nic", "vnic", "service", "settings", "tapesync", "gpio", "top", "threads", "ps", "date", "uptime", "slots", "audio", "usb", "tape", "run", "kill",
+    "version", "cpus", "mem", "pci", "disks", "nic", "vnic", "service", "settings", "tapesync", "gpio", "top", "threads", "ps", "date", "uptime", "slots", "audio", "i2s", "i2c", "touch", "midi", #[cfg(target_arch = "aarch64")] "cpufreq", #[cfg(target_arch = "aarch64")] "temp", "usb", "tape", "run", "kill",
     "echo", "debug", "start", "keymap", "kup", "recv", "dmesg", "clear", "sleep", "io", "memmap", "bootinfo", "cpuinfo", "shrink", "sector", "mount", "umount",
     "format", "label", "fsck", "grow", "install", "bootcode", "reboot", "reset", "shutdown", "halt", "ext4", "md", "sha256", "cd", "pwd", "exit",
 ];
@@ -246,7 +246,7 @@ pub fn run_command(line: &str) {
             let folder = crate::shellhost::working_folder();
             println!("{}", if folder.is_empty() { "/ (the boot volume)" } else { &folder });
         }
-        "version" => println!("Fosfor OS server kernel (mf), slice 8."),
+        "version" => println!("Fosfor OS server kernel (mf), slice 8{}.", if cfg!(target_arch = "aarch64") { ", aarch64" } else { "" }),
         "cpus" => println!("{} CPU(s); boot CPU has taken {} timer ticks.", percpu::count(), percpu::ticks_of(0)),
         "mem" => {
             let stats = pmm::stats();
@@ -328,9 +328,21 @@ pub fn run_command(line: &str) {
             }
             Some(_) => println!("Usage: date | date set YYYY-MM-DD HH:MM[:SS]"),
         },
-        "uptime" => println!("{} s", apic::ticks() / apic::TICK_HZ),
+        "uptime" => println!("{} s", time::ticks() / time::TICK_HZ),
         "slots" => slots::report(),
         "audio" => crate::audioshell::command(words),
+        "touch" => crate::usbshell::touch(words),
+        "midi" => crate::usbshell::midi(words),
+        #[cfg(target_arch = "aarch64")]
+        "cpufreq" | "temp" if !crate::hal::is_pi4() => println!("cpufreq: needs the Raspberry Pi 4's firmware mailbox."),
+        #[cfg(target_arch = "aarch64")]
+        "cpufreq" | "temp" => crate::pipower::command(line.trim_start().split_once(char::is_whitespace).map_or("", |(_, rest)| rest)),
+        #[cfg(target_arch = "aarch64")]
+        "i2s" => crate::i2s_pi::command(line.trim_start().strip_prefix("i2s").unwrap_or("").trim()),
+        #[cfg(target_arch = "aarch64")]
+        "i2c" => crate::i2c::command(line.trim_start().strip_prefix("i2c").unwrap_or("").trim()),
+        #[cfg(not(target_arch = "aarch64"))]
+        "i2s" | "i2c" => println!("{command}: only on a Raspberry Pi 4."),
         "usb" => crate::usbshell::command(words),
         "tape" | "run" => {
             // `run` is the verb; `tape NAME` and `tape run NAME` (the embedded kernels' older spelling) stay accepted.
@@ -374,7 +386,7 @@ pub fn run_command(line: &str) {
                     _ => println!("debug revert: the slot metadata could not be written."),
                 }
             }
-            Some("crash") => unsafe { core::arch::asm!("ud2") },
+            Some("crash") => crate::arch::crash_now(),
             Some("hang") => {
                 // The shell runs on the service thread: spinning here with interrupts on stops its petting while other threads run.
                 loop {
@@ -403,10 +415,10 @@ pub fn run_command(line: &str) {
         "dmesg" => crate::sysshell::dmesg(),
         "clear" => crate::sysshell::clear(),
         "sleep" => crate::sysshell::sleep(&line.trim_start()[command.len()..]),
-        "io" => crate::sysshell::io(&line.trim_start()[command.len()..]),
+        "io" => crate::arch::cpuinfo::io(&line.trim_start()[command.len()..]),
         "memmap" => crate::sysshell::memmap(),
         "bootinfo" => crate::sysshell::bootinfo(),
-        "cpuinfo" => crate::sysshell::cpuinfo(),
+        "cpuinfo" => crate::arch::cpuinfo::cpuinfo(),
         "shrink" => crate::formatshell::shrink(&line.trim_start()[command.len()..]),
         "ext4" => crate::sysshell::ext4(&line.trim_start()[command.len()..]),
         "sector" => crate::sysshell::sector(&line.trim_start()[command.len()..]),
@@ -447,7 +459,7 @@ pub fn run_command(line: &str) {
 /// `Err` when the `&` word is not a list of NIC numbers.
 fn split_background(args: &str) -> (&str, Option<Result<u64, ()>>) {
     let args = args.trim();
-    let Some((before, last)) = args.rsplit_once(char::is_whitespace).filter(|(_, last)| last.starts_with('&')) else {
+    let Some((before, last)) = Some(args.rsplit_once(char::is_whitespace).unwrap_or(("", args))).filter(|(_, last)| last.starts_with('&')) else {
         return (args, None);
     };
     let mut mask = 0u64;
@@ -502,9 +514,34 @@ pub fn run_tape(name: &str, args: &str) {
         return;
     }
     LAST_STARTED.store(0, core::sync::atomic::Ordering::Release);
+    // `rotate=r|l|flip|off` turns what this tape draws, as the `rotate` setting does; the word is not passed on to the tape.
+    let mut text = [0u8; 256];
+    let mut args = args;
+    let mut turn = None;
+    if args.split_whitespace().any(|word| word.starts_with("rotate=")) {
+        let mut length = 0;
+        for word in args.split_whitespace() {
+            if let Some(mode) = word.strip_prefix("rotate=") {
+                match crate::fb::parse_run_turn(mode) {
+                    Some(parsed) => turn = Some(parsed),
+                    None => return println!("run: `{word}` is not rotate=r|l|flip|off."),
+                }
+                continue;
+            }
+            if length + word.len() + 1 > text.len() {
+                return println!("run: the arguments of a tape take at most {} bytes.", text.len() - 1);
+            }
+            if length != 0 {
+                text[length] = b' ';
+                length += 1;
+            }
+            text[length..length + word.len()].copy_from_slice(word.as_bytes());
+            length += word.len();
+        }
+        args = core::str::from_utf8(&text[..length]).unwrap_or("");
+    }
     // `&+N`: a virtual interface on physical NIC N made for this tape alone and removed when it ends.
     let mut fresh = None;
-    let mut args = args;
     let mut background = None;
     if let Some((before, last)) = Some(args.trim()).map(|text| text.rsplit_once(char::is_whitespace).unwrap_or(("", text))).filter(|(_, last)| last.starts_with("&+")) {
         match last[2..].parse::<usize>().map_err(|_| "`&+N` takes the physical NIC number, from 1").and_then(|parent| crate::vnic::add_ephemeral(name, parent)) {
@@ -556,8 +593,10 @@ pub fn run_tape(name: &str, args: &str) {
     }
     drop(disk);
     crate::process::START_NICS.store(nics.unwrap_or(0), core::sync::atomic::Ordering::Release);
+    *crate::process::START_ROTATE.lock() = turn;
     let started = crate::process::spawn_elf(name, &image, args.as_bytes());
     crate::process::START_NICS.store(0, core::sync::atomic::Ordering::Release);
+    *crate::process::START_ROTATE.lock() = None;
     if let (Some(interface), Ok(_)) = (fresh.take(), &started) {
         interface.keep();
     }

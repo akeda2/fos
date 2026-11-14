@@ -112,7 +112,7 @@ pub fn mark_clean_stop() {
 /// Service-loop work: clears the unclean-boot streak once the boot has run long enough to be called good.
 pub fn housekeeping() {
     unsafe {
-        if CLEAR_STREAK_PENDING && !STREAK_CLEARED && crate::apic::ticks() > GOOD_UPTIME_TICKS {
+        if CLEAR_STREAK_PENDING && !STREAK_CLEARED && crate::time::ticks() > GOOD_UPTIME_TICKS {
             STREAK_CLEARED = true;
             let _disk = crate::tapefs::lock();
             let _ = update_metadata(|metadata| metadata.unclean_boots = 0);

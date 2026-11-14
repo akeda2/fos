@@ -31,3 +31,18 @@ core::arch::global_asm!(
         b 1b
     "#
 );
+
+// The embedded kernel has no EL0: an exception from a lower level is reported and parks like any other. The server kernel
+// (kernel-mf) defines these two entries for its system calls and faults instead.
+core::arch::global_asm!(
+    r#"
+    .text
+    .global lower_sync_entry, lower_irq_entry
+lower_sync_entry:
+    mov x0, #8
+    b exception_common
+lower_irq_entry:
+    mov x0, #9
+    b exception_common
+"#
+);

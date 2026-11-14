@@ -1879,13 +1879,13 @@ pub fn format_raw<D: Device>(device: &mut D, sectors: u64, options: &FormatOptio
     for group in 0..groups {
         let (start, block_map, inode_map, table, _, _) = geometry.group(group);
         block_bitmap(group, &mut block);
-        device.write(lba(block_map), &block)?;
+        device.write_data(lba(block_map), &block)?;
         inode_bitmap(group, &mut block);
-        device.write(lba(inode_map), &block)?;
+        device.write_data(lba(inode_map), &block)?;
         let mut done = 0;
         while done < geometry.itable_blocks {
             let take = (geometry.itable_blocks - done).min(4);
-            device.write(lba(table + done), &zero[..take as usize * FORMAT_BLOCK])?;
+            device.write_data(lba(table + done), &zero[..take as usize * FORMAT_BLOCK])?;
             done += take;
         }
         let _ = start;
@@ -1914,12 +1914,12 @@ pub fn format_raw<D: Device>(device: &mut D, sectors: u64, options: &FormatOptio
         block[dir_end + 7] = 0xde;
         put32(&mut block, dir_end + 8, sum);
     }
-    device.write(lba(root_block), &block)?;
+    device.write_data(lba(root_block), &block)?;
     if jblocks > 0 {
         let mut done = 0;
         while done < jblocks {
             let take = (jblocks - done).min(4);
-            device.write(lba(root_block + 1 + done), &zero[..take as usize * FORMAT_BLOCK])?;
+            device.write_data(lba(root_block + 1 + done), &zero[..take as usize * FORMAT_BLOCK])?;
             done += take;
         }
         block.fill(0);
@@ -1932,7 +1932,7 @@ pub fn format_raw<D: Device>(device: &mut D, sectors: u64, options: &FormatOptio
         put32_be(&mut block, 40, 0);
         put32_be(&mut block, 64, 1);
         block[48..64].copy_from_slice(&options.uuid);
-        device.write(lba(root_block + 1), &block)?;
+        device.write_data(lba(root_block + 1), &block)?;
     }
     block.fill(0);
     {
@@ -1981,7 +1981,11 @@ pub fn format_raw<D: Device>(device: &mut D, sectors: u64, options: &FormatOptio
             put16(raw, 0x82, (sum >> 16) as u16);
         }
     }
-    device.write(lba(table0), &block)?;
+    device.write_data(lba(table0), &block)?;
+
+    // Everything above went out without a drive-cache flush each (a spinning disk takes ~10 ms per flush, minutes for the inode
+    // tables); one flush now, so the superblock below only appears once what it describes is on the platter.
+    device.sync()?;
 
     // The descriptor blocks, primary and backups, computed group by group.
     let superblock = |group: u64| {

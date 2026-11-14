@@ -11,7 +11,7 @@ use kernel_core::fosfs::Volume;
 use kernel_core::volumes;
 use tape_sync::{Entry, MANIFEST_MAX, MAX_TAPES, NAME_LEN, NONCE_LEN, Stamp};
 
-use crate::apic::{self, TICK_HZ};
+use crate::time::{self, TICK_HZ};
 use crate::netfs::{self, TAG_GET_ERROR};
 use crate::tapefs;
 
@@ -86,19 +86,19 @@ pub fn serve(index: usize, source: [u8; 6], payload: &[u8]) {
     if unsafe { kernel_core::tapesync_client::CLIENT_ACTIVE } {
         return refuse(NO_SYNC);
     }
-    let recently = unsafe { LAST_SERVED } != 0 && apic::ticks().wrapping_sub(unsafe { LAST_SERVED }) < 2 * TICK_HZ;
+    let recently = unsafe { LAST_SERVED } != 0 && time::ticks().wrapping_sub(unsafe { LAST_SERVED }) < 2 * TICK_HZ;
     if recently {
         return refuse(NO_SYNC);
     }
     if netfs::busy(&source) {
         return refuse(BUSY);
     }
-    unsafe { LAST_SERVED = apic::ticks() };
+    unsafe { LAST_SERVED = time::ticks() };
     let Some(volume) = volumes::boot_volume() else { return refuse(NO_SYNC) };
     let Ok(entries) = scan(&volume) else { return refuse(DISK_ERROR) };
     let mut wire = alloc::vec![0u8; MANIFEST_MAX];
     let wire: &mut [u8; MANIFEST_MAX] = wire.as_mut_slice().try_into().unwrap();
     let length = tape_sync::encode(&entries, &key[..key_length], &nonce, wire);
     netfs::stream(index, &source, &wire[..length], "the tape manifest");
-    unsafe { LAST_SERVED = apic::ticks() };
+    unsafe { LAST_SERVED = time::ticks() };
 }

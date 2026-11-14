@@ -1,6 +1,7 @@
 //! The server kernel ("FOS-mf"). It is entered by the same UEFI and BIOS loaders as the embedded kernel, with the same
-//! `BootInfo`; it narrates over COM1. Slice 2 adds memory: the frame allocator, the kernel's own page tables (direct map,
-//! W^X image) and the heap. SMP and the consoles follow in the slices of docs/big-kernel.md ("Stage 2 design").
+//! `BootInfo`; it narrates over the serial console. One kernel for every CPU: what differs (entry, interrupts, timers, page-table
+//! hardware, SMP start, the platform) lives in `arch/{x86_64,aarch64}` behind a small set of hooks; the rest is shared
+//! (docs/big-kernel.md, "mf on aarch64").
 #![no_std]
 #![no_main]
 
@@ -8,145 +9,120 @@ extern crate alloc;
 
 #[macro_use]
 mod serial;
-mod session;
-mod fpu;
-mod process;
+mod arch;
+pub use arch::*;
+mod boot;
+mod heap;
+mod log;
+mod pmm;
+mod percpu;
 mod sched;
+mod selftest;
+mod sync;
+mod time;
+mod vm;
+mod fb;
+// the shared files of the embedded kernel name the macro by path
+pub(crate) use serial::{print, println};
+
+/// Modules that only build for x86-64 so far. The aarch64 port makes them portable one by one (each moves out of this list
+/// when it compiles there); nothing in it is meant to stay x86-only unless it is hardware that only x86 has.
+macro_rules! until_ported {
+    ($($item:item)*) => { $( #[cfg(target_arch = "x86_64")] $item )* };
+}
+
+mod process;
+mod tapenet;
+mod tapeaudio;
+#[cfg(target_arch = "aarch64")]
+mod tapepi;
+#[cfg(target_arch = "aarch64")]
+mod gpio_remote;
+mod audioshell;
 mod tapeapi;
 mod threads;
-mod tapeaudio;
-mod tapefs;
-mod tapenet;
-mod tapeserial;
 mod tapesys;
-mod audioshell;
-mod usbshell;
-mod ps2;
-mod usb;
 mod user_test;
-mod fb;
-mod config;
-mod debug;
-mod hwwd;
+
+#[path = "../../kernel/src/install.rs"]
+mod install;
+#[path = "../../kernel/src/bootcode.rs"]
+mod bootcode;
+
+until_ported! {
+    mod tapeserial;
+    mod ps2;
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+mod unported;
+#[cfg(not(target_arch = "x86_64"))]
+use unported::*;
+mod usb;
 mod net;
 mod netfs;
 mod netclient;
 mod service;
 mod vnic;
 mod tapesync;
-mod power;
+mod usbshell;
+mod session;
+mod tapefs;
+mod config;
+mod debug;
 mod shell;
 mod shellhost;
 mod script;
 mod sysshell;
 mod mdvol;
 mod top;
-mod log;
 #[path = "../../kernel/src/formatshell.rs"]
 mod formatshell;
 mod helptext;
-/// The embedded kernel's `install` and `bootcode` use physical memory as pointers (identity map); here a buffer's
-/// "address" is its direct-map address and `free` takes it back to the physical frame.
-mod memory {
-    pub const FRAME: u64 = crate::pmm::FRAME;
-    pub fn allocate_contiguous(count: u64, below: Option<u64>) -> Option<u64> {
-        crate::pmm::allocate(count, below).map(crate::vm::direct)
-    }
-    pub fn free(address: u64, count: u64) {
-        crate::pmm::free(address - crate::vm::direct(0), count);
-    }
-}
 #[path = "../../kernel/src/kup_serial.rs"]
 mod kup_serial;
-#[path = "../../kernel/src/install.rs"]
-mod install;
-#[path = "../../kernel/src/bootcode.rs"]
-mod bootcode;
-use kernel_core::{fatvol, fosfs, gpt};
-// formatshell (shared with the embedded kernel) names the macro by path
-pub(crate) use serial::println;
 mod slots;
-mod acpi;
-mod apic;
-mod boot;
-mod cpu;
-mod gdt;
-mod heap;
-mod idt;
 mod block;
-mod percpu;
-mod pci_config;
-mod platform;
-mod pmm;
-mod smp;
 mod storage;
-mod sync;
-mod tlb;
-mod trap;
-mod vm;
-
-// The embedded kernel's interrupt-routing file, included as it is so the two kernels cannot drift. It names `crate::apic`,
-// `crate::ioapic` and `crate::pci`, which are provided here.
-#[path = "../../kernel/src/arch/x86_64/msi.rs"]
-mod msi;
-// The embedded kernel's wall clock (CMOS RTC read once, then advanced by the microsecond count), shared so the two cannot drift.
-mod timer {
-    pub fn micros() -> u64 {
-        crate::apic::micros()
-    }
-}
-#[path = "../../kernel/src/clock.rs"]
-mod clock;
-use apic::ioapic;
-use kernel_core::pci;
+use kernel_core::{fatvol, fosfs, gpt, pci};
+#[cfg(target_arch = "aarch64")]
+use kernel_core::usb_pointer;
 
 use alloc::{boxed::Box, collections::BTreeMap, string::String, vec::Vec};
 use core::panic::PanicInfo;
 use fosfor_abi::{BootInfo, TYPE_CONVENTIONAL};
-
-core::arch::global_asm!(include_str!("isr_stubs.S"));
-
-unsafe extern "C" {
-    static __ist_top: u8;
-}
 
 /// Read by KUP, `fosadm` and the tests from the ELF section table, so the two kernels are never mixed up.
 #[used]
 #[unsafe(link_section = ".fos_flavour")]
 static FLAVOUR: [u8; 2] = *b"mf";
 
-core::arch::global_asm!(
-    r#"
-    .section .text.entry, "ax"
-    .global _start
-    _start:
-        cli                              # the firmware's interrupt state is not ours
-        cld
-        lea rsp, [rip + __stack_top]     # our own stack, at the end of .bss
-        xor ebp, ebp
-        call kmain                       # rdi still holds the BootInfo pointer
-    2:  hlt
-        jmp 2b
-    "#
-);
-
-pub fn halt() -> ! {
-    loop {
-        unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) };
-    }
-}
-
 fn mib(bytes: u64) -> u64 {
     bytes >> 20
 }
 
+/// On a Pi 4 the firmware can drive the DSI panel and a second HDMI output: the panel gets its own 800x480 console (the UEFI one
+/// is 800x600), the second output becomes tape screen 1. The mailbox needs the timer, hence this late.
+#[cfg(target_arch = "aarch64")]
+fn pi_screens(info: &BootInfo) {
+    if !arch::hal::is_pi4() {
+        return;
+    }
+    if let Some(dsi) = mailbox::dsi_framebuffer(&info.framebuffer) {
+        if fb::init(&dsi).is_some() {
+            fb::write_str(log::contents());
+        }
+    }
+    mailbox::second_screen();
+}
+
 #[unsafe(no_mangle)]
-pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
+pub extern "C" fn kmain(info: *const BootInfo) -> ! {
+    let info = unsafe { &*info };
+    arch::early(info);
     serial::init();
     println!();
-    println!("Fosfor OS server kernel (mf, slice 8): running in 64-bit long mode.");
-
-    let info = unsafe { &*info };
+    println!("Fosfor OS server kernel (mf, slice 8): {}", arch::running_on());
     if !info.is_valid() {
         println!("BootInfo is not valid (magic {:#x}, version {}): stopping.", info.magic, info.version);
         halt();
@@ -174,42 +150,11 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     }
     println!("Memory map: {regions} regions, {} MiB of RAM-like memory, {} MiB conventional.", mib(ram_pages * 4096), mib(free_pages * 4096));
 
-    pmm::init(&machine, &[(machine.kernel_base, machine.kernel_size), (machine.info_page, 4096), machine.map]);
+    pmm::init(&machine, &[(machine.kernel_base, machine.kernel_size), (machine.info_page, 4096), machine.map, arch::reserved_extra(info)]);
     let frames = pmm::stats();
     println!("Physical memory: {} MiB managed in {} frames, {} MiB free.", mib(frames.managed * 4096), frames.managed, mib(frames.free * 4096));
 
-    let mapped = vm::init(&machine);
-    // The loader's page is no longer reachable at its own address: use it through the direct map from here on.
-    let info = unsafe { &*(vm::direct(machine.info_page) as *const BootInfo) };
-    println!("Page tables: root {:#x}; direct map of {} MiB at {:#x}, no-execute; the kernel image keeps its own mapping.", vm::root(), mib(mapped), vm::DIRECT_BASE);
-    if !vm::check_image() {
-        println!("Page tables: the kernel image does not have the W^X layout: stopping.");
-        halt();
-    }
-    println!("Page tables: W^X holds (text R-X, rodata R--, data RW-, stack guards and page 0 unmapped).");
-
-    // A frame written and read back through the direct map, and the tables agree where it is.
-    let frame = pmm::allocate(1, None).expect("a frame");
-    let through_direct = vm::direct(frame) as *mut u64;
-    unsafe { through_direct.write_volatile(0xf05f_05f0_f05f_05f0) };
-    assert_eq!(unsafe { through_direct.read_volatile() }, 0xf05f_05f0_f05f_05f0);
-    assert_eq!(vm::translate(vm::direct(frame)).map(|m| m.physical), Some(frame));
-    // No identity alias any more: the frame's own address (outside the kernel image) is not mapped in the lower half.
-    let alias_gone = vm::translate(frame).is_none();
-    pmm::free(frame, 1);
-    match fb::init(&info.framebuffer) {
-        Some((columns, rows, combining)) => {
-            println!("Framebuffer console: {}x{} pixels, {columns}x{rows} characters (also on COM1 and the network).", info.framebuffer.width, info.framebuffer.height);
-            println!("Framebuffer: {}.", if combining { "write-combining (PAT)" } else { "uncached (no PAT, or a mapping that cannot change)" });
-        }
-        None if info.runtime_services == 0 => {
-            let (columns, rows) = fb::init_text();
-            println!("Framebuffer console: none; using the BIOS's {columns}x{rows} VGA text screen (also on COM1 and the network).");
-        }
-        None => println!("Framebuffer console: no pixel screen (serial and network only)."),
-    }
-    println!("Direct map: frame {frame:#x} written and read back at {:#x}.", vm::direct(frame));
-    println!("Lower half: {} (drivers reach RAM and device registers through the direct map).", if alias_gone { "empty apart from the kernel image, no identity alias" } else { "STILL ALIASED" });
+    let info = arch::init_memory(&machine, info);
 
     if !heap::init() {
         println!("The kernel heap could not be created: stopping.");
@@ -219,71 +164,15 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     let heap = heap::stats();
     println!("Heap: self-test passed, {} KiB in the heap, {} KiB free.", heap.total / 1024, heap.free / 1024);
 
-    // ---- interrupts ----
-    percpu::activate(0, &raw const __ist_top as u64);
-    idt::build();
-    idt::load();
-    process::init_cpu();
-    fpu::init_cpu();
-    let before = trap::BREAKPOINTS.load(core::sync::atomic::Ordering::Relaxed);
-    unsafe { core::arch::asm!("int3") };
-    assert_eq!(trap::BREAKPOINTS.load(core::sync::atomic::Ordering::Relaxed), before + 1);
-    println!("Interrupts: per-CPU GDT and TSS (double-fault stack), the IDT and the GS base are set; a breakpoint came back through the IDT.");
+    arch::init_interrupts();
+    let century = arch::init_machine(&machine);
+    boot_services(info, century)
+}
 
-    // ---- ACPI, APICs, timer ----
-    let Some(tables) = acpi::open(machine.acpi_rsdp) else {
-        println!("ACPI: no valid RSDP: stopping.");
-        halt();
-    };
-    let (Some(fadt), Some(madt)) = (acpi::fadt(&tables), acpi::madt(&tables)) else {
-        println!("ACPI: FADT or MADT missing: stopping.");
-        halt();
-    };
-    println!("ACPI: revision {}, local APIC at {:#x}, {} CPU(s), {} I/O APIC(s), PM timer port {:#x}.", tables.revision, madt.local_apic_address, madt.cpu_count, madt.io_apics, fadt.pm_timer_port);
-    power::set_acpi_reset(fadt.reset);
-    power::set_acpi_s5(fadt.pm1a_control, fadt.pm1b_control, fadt.s5);
-    let srat = acpi::srat(&tables);
-    match &srat {
-        Some(srat) => {
-            println!("SRAT: {} NUMA node(s), {} memory range(s), {} CPU affinity entries.", srat.nodes, srat.memory_count, srat.cpu_affinities);
-            for node in 0..srat.nodes as u32 {
-                let (mut total, mut free) = (0, 0);
-                for &(start, length, owner) in &srat.memory[..srat.memory_count] {
-                    if owner == node {
-                        total += length;
-                        free += pmm::free_in(start, length) * pmm::FRAME;
-                    }
-                }
-                println!("NUMA node {node}: {} MiB of memory, {} MiB free.", mib(total), mib(free));
-            }
-        }
-        None => println!("SRAT: none (one NUMA node)."),
-    }
-    let Some(timer) = apic::start_timer(&fadt, madt.local_apic_address) else {
-        println!("APIC: no local APIC or PM timer: stopping.");
-        halt();
-    };
-    println!("Local APIC: id {}, {} at {:#x}, timer {} kHz.", apic::id(), if timer.x2apic { "x2APIC" } else { "xAPIC" }, timer.base, timer.timer_hz / 1000);
-    match apic::ioapic::init(&madt) {
-        Some(pins) => println!("I/O APIC: {pins} pins, all masked."),
-        None => println!("I/O APIC: none."),
-    }
-    let smp = smp::start_all(&machine, &madt, srat.as_ref());
-    println!("SMP: {} CPU(s) online ({} application processor(s) started, {} failed).", 1 + smp.started, smp.started, smp.failed);
-    for index in 0..percpu::count() {
-        let cpu = percpu::get(index);
-        println!("CPU {index}: APIC id {}, NUMA node {}, {}.", cpu.apic_id, cpu.node, if index == 0 { "boot processor" } else { "application processor" });
-    }
-    cpu::interrupts_enable();
-    let start = apic::ticks();
-    apic::busy_wait_ms(200);
-    let ticks = apic::ticks() - start;
-    println!("APIC timer: {} Hz tick, {ticks} ticks in 200 ms of PM-timer time.", apic::TICK_HZ);
-    for index in 1..percpu::count() {
-        println!("CPU {index}: {} timer ticks since it came up.", percpu::ticks_of(index));
-    }
-    println!("Clock: {} (microseconds {}).", apic::micros_source(), apic::micros());
-    clock::init(fadt.century);
+/// What follows the CPU bring-up: the clock, PCI and the drivers, the config files, the scheduler and the service loop.
+#[cfg(target_arch = "x86_64")]
+fn boot_services(info: &BootInfo, century: u8) -> ! {
+    clock::init(century);
 
     // Device drivers: `kernel-core` reaches the machine through the platform below. Interrupts stay on, as the drivers wait on ticks.
     platform::install();
@@ -314,13 +203,13 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     kernel_core::hda::init_all(config::no_msi());
     if config::crash_on_boot() {
         println!("debug: crash-on-boot is set; faulting now.");
-        unsafe { core::arch::asm!("ud2") };
+        arch::crash_now();
     }
     slots::confirm_boot();
     net::init();
     vnic::apply();
     ps2::init();
-    sched_selftest();
+    selftest::run();
     if config::md_auto() {
         sched::spawn("md-assemble", mdvol::assemble_thread, 0);
     }
@@ -330,7 +219,57 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     loop {
         sched::yield_now();
         // Interrupts are on: the next tick (or NIC interrupt) wakes the CPU.
-        unsafe { core::arch::asm!("sti", "hlt", options(nomem, nostack)) };
+        arch::wait_for_interrupt();
+    }
+}
+
+/// The aarch64 port has the CPU, memory, heap, timer and the shell on the serial console; PCI and the drivers (storage,
+/// network, USB) follow, and with them the config files and the slot metadata that need a disk.
+#[cfg(target_arch = "aarch64")]
+fn boot_services(info: &BootInfo, _century: u8) -> ! {
+    // Device drivers: `kernel-core` reaches the machine through the platform. The config-space window comes from the ACPI MCFG
+    // table (QEMU virt) or is the Pi 4's own controller.
+    platform::install();
+    match arch::pci_config::init(info.acpi_rsdp) {
+        Some((base, kind)) => println!("PCI: config space at {base:#x}: {kind}."),
+        None => println!("PCI: no config-space window (no MCFG, not a Pi 4)."),
+    }
+    println!("PCI: {} function(s) on bus 0.", pci::scan());
+    println!("MSI: {}.", arch::msi::init());
+    for device in pci::devices() {
+        println!("  {:02x}:{:02x}.{} {:04x}:{:04x} {} (class {:02x}{:02x}, interface {:02x})", device.bus, device.device, device.function, device.vendor, device.id, pci::class_name(device.class, device.subclass), device.class, device.subclass, device.interface);
+    }
+    storage::init(info);
+    // As on x86: a machine that boots from a USB stick needs USB up before its boot disk exists.
+    let usb_first = storage::boot_disk().is_none();
+    if usb_first {
+        usb::init();
+        storage::find_boot_disk(info);
+    }
+    if let Some(disk) = storage::boot_disk() {
+        slots::init(info, disk);
+    }
+    debug::init(info.crash_count);
+    debug::report_previous_crash();
+    if !usb_first {
+        usb::init();
+    }
+    config::load();
+    #[cfg(target_arch = "aarch64")]
+    pi_screens(info);
+    #[cfg(target_arch = "aarch64")]
+    if dsitouch::init() {
+        println!("DSI touch: FT5406-style controller at 0x38 on the display connector's I2C bus (`touch`).");
+    }
+    slots::confirm_boot();
+    net::init();
+    vnic::apply();
+    selftest::run();
+    sched::spawn("service", service_thread, 0).expect("the service thread");
+    println!("kernel-mf: slice 8 reached the end of boot; entering the service loop.");
+    loop {
+        sched::yield_now();
+        arch::wait_for_interrupt();
     }
 }
 
@@ -405,183 +344,4 @@ extern "C" fn service_thread(_: usize) {
         debug::pet();
         sched::yield_now();
     }
-}
-
-static SELFTEST_STEPS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-extern "C" fn selftest_worker(steps: usize) {
-    for _ in 0..steps {
-        SELFTEST_STEPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        sched::yield_now();
-    }
-}
-
-/// Starts three threads that each take five steps, interleaved by yielding, and checks that they all finish and that their
-/// stacks (frames and mappings) come back.
-static SPIN_STOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-static SPIN_COUNT: [core::sync::atomic::AtomicU64; 2] = [core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)];
-static SHARED: sched::SleepMutex<u64> = sched::SleepMutex::new(0);
-static SLEPT_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static FINISHED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-/// Never yields: only the timer tick can take the CPU from it.
-extern "C" fn spinner(index: usize) {
-    use core::sync::atomic::Ordering::Relaxed;
-    while !SPIN_STOP.load(Relaxed) {
-        SPIN_COUNT[index].fetch_add(1, Relaxed);
-    }
-    FINISHED.fetch_add(1, Relaxed);
-}
-
-/// Read-modify-write under the sleeping mutex with a yield in the middle, so the other thread contends and has to block.
-extern "C" fn incrementer(rounds: usize) {
-    for _ in 0..rounds {
-        let mut guard = SHARED.lock();
-        let value = *guard;
-        sched::yield_now();
-        *guard = value + 1;
-    }
-    FINISHED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-}
-
-extern "C" fn sleeper(ticks: usize) {
-    let start = apic::ticks();
-    sched::sleep_ticks(ticks as u64);
-    SLEPT_TICKS.store(apic::ticks() - start, core::sync::atomic::Ordering::Relaxed);
-    FINISHED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-}
-
-/// Preemption, sleeping and the sleeping mutex: two threads that never yield both make progress, a sleeper wakes on time and
-/// two contending incrementers lose no update.
-fn sched_preempt_selftest() {
-    use core::sync::atomic::Ordering::Relaxed;
-    for index in 0..2 {
-        sched::spawn("spinner", spinner, index).expect("a spinner");
-    }
-    for _ in 0..2 {
-        sched::spawn("incrementer", incrementer, 25).expect("an incrementer");
-    }
-    sched::spawn("sleeper", sleeper, 20).expect("a sleeper");
-    let start = apic::ticks();
-    // The boot thread is the idle thread and may not block: it sleeps in `hlt` until the tick brings it back.
-    while apic::ticks() - start < 60 {
-        unsafe { core::arch::asm!("sti", "hlt", options(nomem, nostack)) };
-    }
-    SPIN_STOP.store(true, Relaxed);
-    let mut waited = 0;
-    while FINISHED.load(Relaxed) < 5 && waited < 300 {
-        unsafe { core::arch::asm!("sti", "hlt", options(nomem, nostack)) };
-        waited += 1;
-    }
-    for _ in 0..4 {
-        sched::yield_now();
-    }
-    let (a, b) = (SPIN_COUNT[0].load(Relaxed), SPIN_COUNT[1].load(Relaxed));
-    let total = *SHARED.lock();
-    let slept = SLEPT_TICKS.load(Relaxed);
-    println!("Scheduler: preemption {} ({} and {} spins by two threads that never yield), sleep {} ({slept} ticks for 20), mutex {} ({total} of 50 increments).",
-        if a > 0 && b > 0 { "ok" } else { "FAILED" }, a, b, if (20..=23).contains(&slept) { "ok" } else { "FAILED" }, if total == 50 { "ok" } else { "FAILED" });
-}
-
-static SMP_SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static SMP_DONE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-extern "C" fn smp_worker(_: usize) {
-    use core::sync::atomic::Ordering::Relaxed;
-    let until = apic::ticks() + 5;
-    while apic::ticks() < until {
-        SMP_SEEN.fetch_or(1 << percpu::this().index, Relaxed);
-        core::hint::spin_loop();
-    }
-    SMP_DONE.fetch_add(1, Relaxed);
-}
-
-/// Unpinned threads that spin for a while are picked up by every online CPU (an idle application processor looks at each tick).
-fn sched_smp_selftest() {
-    use core::sync::atomic::Ordering::Relaxed;
-    let cpus = percpu::count();
-    let workers = 2 * cpus;
-    for _ in 0..workers {
-        sched::spawn_any("smp-worker", smp_worker, 0).expect("an smp worker");
-    }
-    let start = apic::ticks();
-    while SMP_DONE.load(Relaxed) < workers && apic::ticks() - start < 300 {
-        unsafe { core::arch::asm!("sti", "hlt", options(nomem, nostack)) };
-        sched::yield_now();
-    }
-    for _ in 0..4 {
-        sched::yield_now();
-    }
-    let seen = SMP_SEEN.load(Relaxed).count_ones() as usize;
-    println!("Scheduler: SMP {} ({} unpinned threads ran on {seen} of {cpus} CPU(s)).", if seen == cpus && SMP_DONE.load(Relaxed) == workers { "ok" } else { "FAILED" }, workers);
-}
-
-static WAKE_STAMP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-extern "C" fn wake_worker(_: usize) {
-    WAKE_STAMP.store(apic::micros(), core::sync::atomic::Ordering::Release);
-}
-
-/// A thread spawned while the other CPUs idle starts within the IPI's latency, not at their next 10 ms tick (which would
-/// average 5 ms).
-fn sched_wake_selftest() {
-    use core::sync::atomic::Ordering::{Acquire, Relaxed};
-    let cpus = percpu::count();
-    if cpus < 2 {
-        return;
-    }
-    for _ in 0..4 {
-        sched::yield_now();
-    }
-    let mut total = 0;
-    const TRIALS: u64 = 10;
-    for _ in 0..TRIALS {
-        WAKE_STAMP.store(0, Relaxed);
-        apic::busy_wait_ms(3);
-        let begin = apic::micros();
-        sched::spawn_any("wake-worker", wake_worker, 0).expect("a wake worker");
-        let mut spins = 0u64;
-        while WAKE_STAMP.load(Acquire) == 0 && spins < 100_000_000 {
-            core::hint::spin_loop();
-            spins += 1;
-        }
-        total += WAKE_STAMP.load(Acquire).saturating_sub(begin);
-    }
-    let average = total / TRIALS;
-    println!("Scheduler: wake IPI {} (a thread spawned on {cpus} idle CPU(s) started after {average} us on average).", if average < 2000 { "ok" } else { "FAILED" });
-}
-
-fn sched_selftest() {
-    sched::init();
-    // The first stack creates the page-table pages of the stack region, which stay: do that before counting frames.
-    sched::spawn("warmup", selftest_worker, 0).expect("a warm-up thread");
-    for _ in 0..4 {
-        sched::yield_now();
-    }
-    let free_before = pmm::stats().free;
-    for name in ["worker-a", "worker-b", "worker-c"] {
-        sched::spawn(name, selftest_worker, 5).expect("a worker thread");
-    }
-    let mut passes = 0;
-    while SELFTEST_STEPS.load(core::sync::atomic::Ordering::Relaxed) < 15 && passes < 1000 {
-        sched::yield_now();
-        passes += 1;
-    }
-    // One more pass each lets the last switch release the final dead thread.
-    for _ in 0..4 {
-        sched::yield_now();
-    }
-    let mut left = 0;
-    sched::for_each(|id, name, _| left += (id == 0 || !name.starts_with("idle")) as usize);
-    let steps = SELFTEST_STEPS.load(core::sync::atomic::Ordering::Relaxed);
-    let leaked = free_before - pmm::stats().free;
-    println!("Scheduler: 3 kernel threads took {steps} interleaved steps in {} context switches; {left} thread(s) left, {leaked} stack frame(s) not returned.", sched::switches());
-    println!("TLB: {} shootdown(s) so far (every exited thread's stack is flushed on all {} CPU(s) before its slot is reused).", tlb::SHOOTDOWNS.load(core::sync::atomic::Ordering::Relaxed), percpu::count());
-    if steps != 15 || left != 1 || leaked != 0 {
-        println!("Scheduler self-test FAILED.");
-    }
-    sched_preempt_selftest();
-    sched_smp_selftest();
-    sched_wake_selftest();
-    user_test::run();
 }

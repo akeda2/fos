@@ -74,8 +74,10 @@ pub mod gpu;
 pub mod serialports;
 #[cfg(target_arch = "x86_64")]
 pub mod uart;
+pub mod virtio;
 #[cfg(target_arch = "aarch64")]
 pub mod virtio_blk;
+pub mod virtio_net;
 #[cfg(target_arch = "x86_64")]
 pub mod ohci;
 #[cfg(target_arch = "x86_64")]

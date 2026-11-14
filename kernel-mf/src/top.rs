@@ -10,7 +10,7 @@
 //! and costs nothing in the scheduler's hot path. A CPU's load leaves out its idle thread and the `service` thread, which polls
 //! by design and would always read 100 %.
 
-use crate::{apic, percpu, pmm, process, sched, tapeaudio, tapefs, tapenet};
+use crate::{time, percpu, pmm, process, sched, tapeaudio, tapefs, tapenet};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -63,8 +63,8 @@ pub fn start(rest: &str) {
             _ => return println!("Usage: top [SECONDS (1-60)] [once]   (q or Escape ends it)"),
         }
     }
-    let now = apic::ticks();
-    *TOP[crate::session::current_or_console()].lock() = Some(Top { interval: interval * apic::TICK_HZ, next: now + interval * apic::TICK_HZ, once, drawn: false, wall: now, switches: sched::switches(), threads: threads_now(), busy: busy_now() });
+    let now = time::ticks();
+    *TOP[crate::session::current_or_console()].lock() = Some(Top { interval: interval * time::TICK_HZ, next: now + interval * time::TICK_HZ, once, drawn: false, wall: now, switches: sched::switches(), threads: threads_now(), busy: busy_now() });
     if !once {
         print!("\x1b[?25l\x1b[2J\x1b[H(collecting for {interval} s...)");
     }
@@ -87,7 +87,7 @@ pub fn poll() {
 fn poll_session(id: usize) {
     let mut guard = TOP[id].lock();
     let Some(top) = guard.as_mut() else { return };
-    let now = apic::ticks();
+    let now = time::ticks();
     if now < top.next {
         return;
     }
@@ -144,7 +144,7 @@ fn render(out: &mut String, top: &Top, wall: u64, screen: bool) {
     });
     rows.sort_by(|a, b| b.percent.cmp(&a.percent).then(a.id.cmp(&b.id)));
 
-    let uptime = apic::ticks() / apic::TICK_HZ;
+    let uptime = time::ticks() / time::TICK_HZ;
     let memory = pmm::stats();
     let (free, total) = (memory.free * pmm::FRAME >> 20, memory.managed * pmm::FRAME >> 20);
     let switches = sched::switches();
@@ -152,7 +152,7 @@ fn render(out: &mut String, top: &Top, wall: u64, screen: bool) {
     if screen {
         out.push_str("\x1b[H");
     }
-    let _ = write!(out, "top - up {}:{:02}:{:02}, {} CPU(s), {free} of {total} MiB free, {} context switches/s{line_end}", uptime / 3600, uptime / 60 % 60, uptime % 60, percpu::count(), (switches - top.switches) * apic::TICK_HZ / wall);
+    let _ = write!(out, "top - up {}:{:02}:{:02}, {} CPU(s), {free} of {total} MiB free, {} context switches/s{line_end}", uptime / 3600, uptime / 60 % 60, uptime % 60, percpu::count(), (switches - top.switches) * time::TICK_HZ / wall);
     let now_busy = busy_now();
     for cpu in 0..percpu::count() {
         let load = (now_busy[cpu].saturating_sub(top.busy.get(cpu).copied().unwrap_or(0)) * 100 / wall).min(100);
@@ -171,7 +171,7 @@ fn render(out: &mut String, top: &Top, wall: u64, screen: bool) {
             held(row.pid, &mut hardware);
         }
         let state = alloc::format!("{:?}", row.state);
-        let _ = write!(out, "{:4} {:3} {:<14.14} {state:<9} {cpu:>3} {pin:>3} {:>4}% {:>5}.{}s  {hardware}{line_end}", row.pid, row.id, row.name, row.percent, row.ticks / apic::TICK_HZ, row.ticks % apic::TICK_HZ / 10);
+        let _ = write!(out, "{:4} {:3} {:<14.14} {state:<9} {cpu:>3} {pin:>3} {:>4}% {:>5}.{}s  {hardware}{line_end}", row.pid, row.id, row.name, row.percent, row.ticks / time::TICK_HZ, row.ticks % time::TICK_HZ / 10);
     }
     let owner_name = |pid: u64| rows.iter().find(|row| row.pid == pid).map_or(alloc::format!("pid {pid}"), |row| alloc::format!("{} ({pid})", row.name));
     let _ = write!(out, "{line_end}Hardware:{line_end}");

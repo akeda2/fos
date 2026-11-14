@@ -227,8 +227,41 @@ pub fn load() {
                     _ => println!("settings: `{line}` ignored (mouse-speed PERCENT, 25-1000; 100 is the default)."),
                 }
             }
-            if let Some(key @ ("hwp" | "park-idle" | "rotate" | "serial-shell" | "gpio-remote" | "gpio-sim" | "gpio-deny" | "prefer-msix" | "replace-in-place")) = line.split_whitespace().next() {
-                println!("settings: {key} is not supported by the server kernel yet; ignored.");
+            #[cfg(target_arch = "aarch64")]
+            match line.split_whitespace().next() {
+                Some("i2s-audio") => crate::i2s_pi::apply_setting(line),
+                Some("pi-clock") if !crate::hal::is_pi4() => println!("settings: pi-clock needs the Raspberry Pi 4's firmware mailbox; ignored."),
+                Some("pi-clock") => {
+                    crate::pipower::apply_setting(line);
+                }
+                Some("gpio-remote" | "gpio-sim" | "gpio-deny") => {
+                    crate::gpio::apply_setting(line);
+                }
+                _ => {}
+            }
+            if let Some(key @ ("rotate" | "rotate1")) = line.split_whitespace().next() {
+                let mut words = line.split_whitespace().skip(1);
+                let mut word = words.next().unwrap_or("");
+                // `rotate [all|0|1] MODE`; `rotate1` is `rotate 1`.
+                let mut screens: &[usize] = if key == "rotate1" { &[1] } else { &[0] };
+                if key == "rotate" && matches!(word, "all" | "0" | "1") {
+                    screens = match word { "all" => &[0, 1], "1" => &[1], _ => &[0] };
+                    word = words.next().unwrap_or("");
+                }
+                let mode = crate::fb::Rotate::parse(word);
+                if mode.is_some() || matches!(word, "off" | "none") {
+                    for &screen in screens {
+                        crate::fb::rotate_default(screen, mode);
+                    }
+                    println!("settings: {key} {screens:?} {word} (tapes' pixel screens; the text console stays upright).");
+                } else {
+                    println!("settings: `{}` ignored ({key} [all|0|1] r|l|flip|off).", line.trim());
+                }
+            }
+            if let Some(key @ ("hwp" | "park-idle" | "serial-shell" | "gpio-remote" | "gpio-sim" | "gpio-deny" | "prefer-msix" | "replace-in-place")) = line.split_whitespace().next() {
+                if !(cfg!(target_arch = "aarch64") && matches!(key, "gpio-remote" | "gpio-sim" | "gpio-deny")) {
+                    println!("settings: {key} is not supported by the server kernel yet; ignored.");
+                }
             }
             if line.split_whitespace().next() == Some("vnic") {
                 crate::vnic::queue(line);
@@ -311,7 +344,7 @@ fn load_fstab() {
     }
     println!("fstab: waiting for a mounted volume (up to 10 s; the root's folders are used if it never appears).");
     for _ in 0..20 {
-        crate::apic::busy_wait_ms(500);
+        crate::time::busy_wait_ms(500);
         crate::usb::poll();
         if absent() == 0 {
             return;

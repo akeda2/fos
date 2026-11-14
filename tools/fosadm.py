@@ -48,6 +48,7 @@ BUILD_KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fosfor-kerne
 BUILD_KERNEL_MF = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fosfor-kernel-mf"
 BUILD_TAPES = ROOT / "build/fosfor/tapes"
 BUILD_KERNEL_A64 = ROOT / "build/cargo-target/aarch64-unknown-none-softfloat/release/fosfor-kernel"
+BUILD_KERNEL_MF_A64 = ROOT / "build/cargo-target/aarch64-unknown-none-softfloat/release/fosfor-kernel-mf"
 BUILD_TAPES_A64 = ROOT / "build/fosfor-aarch64/tapes"
 NETRAW = Path.home() / ".local/bin/python3-netraw"
 
@@ -297,11 +298,12 @@ def parse_ls(text: str) -> dict[str, int]:
 def source_files(source: Path | None, arch: str = "x86_64") -> tuple[Path | None, Path, dict[str, int]]:
     """Kernel, tape folder and tape sizes for one CPU. A release folder holds one sub-folder per CPU
     (`x86_64/`, `aarch64/`, each with `kernel` and `tapes/`); a flat folder is taken as x86_64."""
-    mf = arch == "x86_64-mf"
-    arch = "x86_64" if mf else arch
+    mf = arch.endswith("-mf")
+    arch = arch.removesuffix("-mf")
     if source is None:
         kernel, tapes = (BUILD_KERNEL_A64, BUILD_TAPES_A64) if arch == "aarch64" else (BUILD_KERNEL, BUILD_TAPES)
-        kernel = BUILD_KERNEL_MF if mf else kernel
+        if mf:
+            kernel = BUILD_KERNEL_MF_A64 if arch == "aarch64" else BUILD_KERNEL_MF
     else:
         base = source / arch if (source / arch).is_dir() else (source if arch == "x86_64" else source / "-none-")
         kernel, tapes = base / ("kernel-mf" if mf else "kernel"), base / "tapes"
@@ -342,10 +344,10 @@ def abi_note(have: int | None) -> str | None:
 
 
 def arch_of(text: str) -> str:
-    """`aarch64`, `x86_64`, or `x86_64-mf` for the server kernel (its `version` says "server kernel (mf)"):
-    it has its own kernel image, so the embedded one must never be pushed to it."""
+    """`aarch64`, `x86_64`, or `x86_64-mf` / `aarch64-mf` for the server kernel (its `version` says "server kernel (mf)",
+    and "aarch64" on the Pi): it has its own kernel image, so the embedded one must never be pushed to it."""
     if "server kernel (mf)" in text:
-        return "x86_64-mf"
+        return "aarch64-mf" if "aarch64" in text else "x86_64-mf"
     return "aarch64" if "aarch64" in text else "x86_64"
 
 
@@ -583,7 +585,7 @@ def plan_host(iface: str, args, host: Host, parallel: bool):
         changed = sorted(n for n, state in states.items() if state != "same")
     else:
         changed = sorted(n for n, s in tapes.items() if do_tapes and n in files and files[n] != s)
-    server = arch == "x86_64-mf"
+    server = arch.endswith("-mf")
     tape_list = changed + (sorted(n for n in tapes if do_tapes and n not in files and (server or n not in SERVER_ONLY_TAPES)) if args.add_missing else [])
     note = abi_note(abi)
     if note and tape_list and not new_kernel:

@@ -13,13 +13,13 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::{apic, sched};
+use crate::{sched, time};
 use crate::sync::SpinLock;
 
 const NAME_MAX: usize = 15;
 /// How long `stop` waits for the process to end.
 const STOP_WAIT_MS: u64 = 5000;
-const CHECK_TICKS: u64 = apic::TICK_HZ / 2;
+const CHECK_TICKS: u64 = time::TICK_HZ / 2;
 const MAX_DELAY_S: u64 = 60;
 const STABLE_S: u64 = 60;
 
@@ -123,12 +123,12 @@ fn start_one(index: usize) -> bool {
     let mut table = SERVICES.lock();
     let Some(service) = table.iter_mut().find(|service| service.name == name) else { return pid != 0 };
     service.pid = pid;
-    service.started_at = apic::ticks();
+    service.started_at = time::ticks();
     pid != 0
 }
 
 fn delay_ticks(failures: u32) -> u64 {
-    (1u64 << failures.min(6)).min(MAX_DELAY_S) * apic::TICK_HZ
+    (1u64 << failures.min(6)).min(MAX_DELAY_S) * time::TICK_HZ
 }
 
 /// Kills the process and waits for it to go (the NIC is free when it has).
@@ -140,7 +140,7 @@ fn stop_process(pid: u64) -> bool {
             return false;
         }
         sched::yield_now();
-        apic::busy_wait_ms(10);
+        time::busy_wait_ms(10);
         waited += 10;
     }
     true
@@ -181,8 +181,8 @@ fn begin(index: usize) {
         let service = &mut table[index];
         if service.restart {
             service.failures += 1;
-            service.retry_at = apic::ticks() + delay_ticks(service.failures);
-            println!("service {}: did not start; trying again in {} s.", service.name, delay_ticks(service.failures) / apic::TICK_HZ);
+            service.retry_at = time::ticks() + delay_ticks(service.failures);
+            println!("service {}: did not start; trying again in {} s.", service.name, delay_ticks(service.failures) / time::TICK_HZ);
         } else {
             service.wanted = false;
         }
@@ -191,7 +191,7 @@ fn begin(index: usize) {
 
 /// Restarts services whose process ended (called from the service loop, twice a second at most).
 pub fn poll() {
-    let now = apic::ticks();
+    let now = time::ticks();
     if now.saturating_sub(LAST_CHECK.load(Ordering::Relaxed)) < CHECK_TICKS || !LOADED.load(Ordering::Acquire) {
         return;
     }
@@ -201,13 +201,13 @@ pub fn poll() {
         let mut table = SERVICES.lock();
         for (index, service) in table.iter_mut().enumerate() {
             if service.pid != 0 && !alive(service.pid) {
-                let ran = now.saturating_sub(service.started_at) / apic::TICK_HZ;
+                let ran = now.saturating_sub(service.started_at) / time::TICK_HZ;
                 println!("service {}: process {} ended after {ran} s.", service.name, service.pid);
                 service.pid = 0;
                 if service.wanted && service.restart {
                     service.failures = if ran >= STABLE_S { 1 } else { service.failures + 1 };
                     service.retry_at = now + delay_ticks(service.failures);
-                    println!("service {}: starting again in {} s.", service.name, delay_ticks(service.failures) / apic::TICK_HZ);
+                    println!("service {}: starting again in {} s.", service.name, delay_ticks(service.failures) / time::TICK_HZ);
                 } else {
                     service.wanted = false;
                 }
@@ -223,7 +223,7 @@ pub fn poll() {
             let service = &mut table[index];
             service.failures += 1;
             service.retry_at = now + delay_ticks(service.failures);
-            println!("service {}: did not start; trying again in {} s.", service.name, delay_ticks(service.failures) / apic::TICK_HZ);
+            println!("service {}: did not start; trying again in {} s.", service.name, delay_ticks(service.failures) / time::TICK_HZ);
         } else {
             SERVICES.lock()[index].retry_at = 0;
         }
@@ -231,7 +231,7 @@ pub fn poll() {
 }
 
 fn list() {
-    let now = apic::ticks();
+    let now = time::ticks();
     let table = SERVICES.lock();
     if table.is_empty() {
         return println!("No services. A line `NAME [restart] TAPE ARGS... &NIC` in `services` defines one (docs/config.md).");
@@ -241,7 +241,7 @@ fn list() {
         let state = if service.pid != 0 {
             String::from("running")
         } else if service.wanted && service.retry_at != 0 {
-            alloc::format!("restart in {} s", service.retry_at.saturating_sub(now) / apic::TICK_HZ)
+            alloc::format!("restart in {} s", service.retry_at.saturating_sub(now) / time::TICK_HZ)
         } else {
             String::from("stopped")
         };

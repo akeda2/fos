@@ -7,7 +7,14 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 use fosfor_abi::keymap::Layout;
 use kernel_core::usb_class::{self, Class, Host, NONE};
-use kernel_core::{ehci, ohci, usb_audio, usb_hid, usb_midi, usb_pointer, usb_serial, usb_storage, xhci};
+#[cfg(target_arch = "x86_64")]
+use kernel_core::usb_hid;
+// The Pi's enumerator: xHCI boot keyboards, the same calls as `usb_hid` (which carries hubs, EHCI and OHCI besides).
+#[cfg(target_arch = "aarch64")]
+use kernel_core::usb_kbd as usb_hid;
+#[cfg(target_arch = "x86_64")]
+use kernel_core::ehci;
+use kernel_core::{usb_audio, usb_midi, usb_pointer, usb_serial, usb_storage, xhci};
 
 use crate::sync::SpinLock;
 
@@ -97,8 +104,14 @@ pub fn init() {
     }
     let _usb = lock();
     let x = xhci::init_all();
+    #[cfg(target_arch = "x86_64")]
     let e = ehci::init_all();
-    let o = ohci::init_all();
+    #[cfg(not(target_arch = "x86_64"))]
+    let e = 0;
+    #[cfg(target_arch = "x86_64")]
+    let o = kernel_core::ohci::init_all();
+    #[cfg(not(target_arch = "x86_64"))]
+    let o = 0;
     if x + e + o == 0 {
         println!("USB: no xHCI, EHCI or OHCI controller.");
         return;

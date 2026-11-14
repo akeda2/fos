@@ -45,8 +45,38 @@ pub fn init() {
     write(&GICD, 0x000, 1);
     write(&GICC, 0x004, 0xff);
     write(&GICC, 0x000, 1);
+    BOOT_MPIDR.store(mpidr(), Ordering::Relaxed);
+    enable(0xffff);
     enable(TIMER_INTID);
     start_timer();
+}
+
+/// A secondary CPU's share of `init`: its own banked CPU interface, the timer and the software-generated interrupts.
+/// The distributor is already running.
+pub fn init_secondary() {
+    write(&GICC, 0x004, 0xff);
+    write(&GICC, 0x000, 1);
+    enable(0xffff);
+    enable(TIMER_INTID);
+    start_timer();
+}
+
+/// This CPU's bit in the distributor's target registers (the first 32 are banked, and each CPU reads its own mask).
+pub fn cpu_target() -> u8 {
+    (0..8u64).map(|offset| unsafe { ((GICD.load(Ordering::Relaxed) + 0x800 + offset) as *const u8).read_volatile() }).find(|&mask| mask != 0).unwrap_or(1)
+}
+
+/// Raises software-generated interrupt `intid` (0..=15) on the CPUs in `targets` (a bit per GIC CPU interface).
+pub fn send_sgi(targets: u8, intid: u32) {
+    write(&GICD, 0xf00, u32::from(targets) << 16 | intid);
+}
+
+/// Calls `handler(intid)` for software-generated interrupt `intid` (0..=15), after its end-of-interrupt; every CPU enables it
+/// in `init`/`init_secondary`.
+pub fn register_sgi(intid: u32, handler: fn(u32)) {
+    if intid < 16 {
+        HANDLERS[intid as usize].store(handler as usize, Ordering::Release);
+    }
 }
 
 /// Routes shared peripheral interrupt `intid` (32 and up) to CPU 0 and calls `handler(intid)` when it fires. `level` is
@@ -71,6 +101,10 @@ fn write_byte(offset: u64, value: u8) {
 }
 
 fn enable(intid: u32) {
+    // 0xffff stands for "all sixteen SGIs" (bits 0..=15 of the banked ISENABLER0).
+    if intid == 0xffff {
+        return write(&GICD, 0x100, 0xffff);
+    }
     write(&GICD, 0x100 + 4 * (intid as u64 / 32), 1 << (intid % 32));
 }
 
@@ -82,7 +116,15 @@ fn start_timer() {
     }
 }
 
-/// Timer interrupts counted since `init`.
+static BOOT_MPIDR: AtomicU64 = AtomicU64::new(0);
+
+fn mpidr() -> u64 {
+    let value: u64;
+    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) value, options(nomem, nostack)) };
+    value & 0xff_00ff_ffff
+}
+
+/// Timer interrupts the boot CPU has taken since `init`.
 pub fn irq_ticks() -> u64 {
     IRQ_TICKS.load(Ordering::Relaxed)
 }
@@ -95,10 +137,27 @@ pub fn dispatch() {
         return;
     }
     if intid == TIMER_INTID {
-        IRQ_TICKS.fetch_add(1, Ordering::Relaxed);
+        // The clock is the boot CPU's timer alone; the others' ticks would run it several times too fast.
+        if mpidr() == BOOT_MPIDR.load(Ordering::Relaxed) {
+            IRQ_TICKS.fetch_add(1, Ordering::Relaxed);
+        }
         let reload = RELOAD.load(Ordering::Relaxed);
         unsafe { core::arch::asm!("msr cntp_tval_el0, {}", in(reg) reload, options(nomem, nostack)) };
+        // The timer is acknowledged before `crash::tick` because the server kernel's scheduler may switch threads inside it: the
+        // interrupt must not stay active until this thread runs again (IRQs are masked for the whole handler).
+        write(&GICC, 0x010, iar);
         crate::crash::tick();
+        return;
+    }
+    if intid < 16 {
+        // Software-generated: acknowledged before the handler, which may switch threads (as the timer's does).
+        write(&GICC, 0x010, iar);
+        let handler = HANDLERS[intid as usize].load(Ordering::Acquire);
+        if handler != 0 {
+            let handler: fn(u32) = unsafe { core::mem::transmute(handler) };
+            handler(intid);
+        }
+        return;
     }
     let handler = HANDLERS.get(intid as usize).map_or(0, |h| h.load(Ordering::Acquire));
     if handler != 0 {
