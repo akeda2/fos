@@ -474,3 +474,6 @@ and height for a quarter turn), `fb.rs` maps it onto the framebuffer, the DSI to
 
 `cpufreq [MHZ|min|max]` (alias `temp`) and the `pi-clock` setting are the embedded kernel's `pipower.rs`: ARM clock, SoC temperature
 and throttle flags through the VideoCore mailbox. Only on a Pi 4 (QEMU has no mailbox: it declines); only a Pi shows the values.
+Verified on a Pi 4: `cpufreq 600` gives a measured 600 MHz and `max` 1500 MHz; the set call needs the firmware's "skip turbo" argument at 1 (with 0 it answers 1500 to every request). `cpufreq` prints the clock the firmware measures next to the last request.
+
+`fosadm` knows the Pi's server kernel: its `version` says "server kernel (mf), slice 8, aarch64", status shows `aarch64-mf`, and a deploy pushes `fosfor-kernel-mf` from the aarch64 target dir (over serial: `fosadm.py --serial /dev/ttyUSB0 deploy`). The Pi image is FOSFS v4: tapes in `bin/`, boot config in `settings/` (`mkdir settings` first; `send_file_serial.py PORT FILE settings/NAME`); the root names also work. A v3 card needs a reflash to become v4.
