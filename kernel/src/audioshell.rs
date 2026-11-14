@@ -157,8 +157,21 @@ pub fn command(rest: &str) {
             ua::stop_mine();
         }
         Some("tone") => {
-            let frequency = words.next().and_then(|word| word.parse::<u32>().ok()).unwrap_or(440).clamp(20, 20_000);
-            let seconds = words.next().and_then(|word| word.parse::<u64>().ok()).unwrap_or(3).clamp(1, 60);
+            // HZ or LEFT/RIGHT: two tones, one per channel (even channels left, odd right).
+            let mut tones = words.next().unwrap_or("440").split('/');
+            let parse_hz = |word: Option<&str>| word.and_then(|word| word.parse::<u32>().ok()).map(|hz| hz.clamp(20, 20_000));
+            let Some(left) = parse_hz(tones.next()) else {
+                return crate::println!("Usage: audio tone [HZ[/HZ]] [SECONDS|0] [RATE]");
+            };
+            let right = match tones.next() {
+                Some(word) => match parse_hz(Some(word)) {
+                    Some(hz) => hz,
+                    None => return crate::println!("Usage: audio tone [HZ[/HZ]] [SECONDS|0] [RATE]"),
+                },
+                None => left,
+            };
+            // 0 seconds: play until Escape.
+            let seconds = words.next().and_then(|word| word.parse::<u64>().ok()).unwrap_or(3).min(3600);
             let rate = words.next().and_then(|word| word.parse::<u32>().ok()).unwrap_or(48_000);
             if let Err(reason) = ua::start(rate, false, true) {
                 return crate::println!("audio: {reason}.");
@@ -167,13 +180,17 @@ pub fn command(rest: &str) {
             let (channels, slot) = (usize::from(channels), usize::from(slot));
             // A phase accumulator in 1/65536 of a cycle; a parabola per half cycle stands in for a sine
             // (integer-only, and plenty to hear or to measure the fundamental).
-            let step = (u64::from(frequency) << 16) / u64::from(rate);
-            let mut phase = 0u64;
+            let steps = [(u64::from(left) << 16) / u64::from(rate), (u64::from(right) << 16) / u64::from(rate)];
+            let mut phases = [0u64; 2];
+            let forever = seconds == 0;
             let end = crate::timer::ticks() + seconds * crate::timer::TICK_HZ;
+            if forever {
+                crate::netfs::blocking(true);
+            }
             let frame_bytes = channels * slot;
             let float = ua::playback_float() && slot == 4;
             let mut chunk = [0u8; 2048];
-            while crate::timer::ticks() < end {
+            while forever && !crate::netfs::break_requested() || !forever && crate::timer::ticks() < end {
                 pump();
                 // Only as many frames as the ring has room for, so the tone never has a gap.
                 let frames = (chunk.len() / frame_bytes).min(ua::playback_space() / frame_bytes);
@@ -181,16 +198,21 @@ pub fn command(rest: &str) {
                     continue;
                 }
                 for frame in chunk[..frames * frame_bytes].chunks_mut(frame_bytes) {
-                    let half = (phase & 0x7fff) as i64;
-                    let magnitude = (half * (0x8000 - half)) >> 13; // 0..32768
-                    let sample = (if phase & 0x8000 != 0 { -magnitude } else { magnitude }) / 4; // a quarter of full scale
-                    phase = (phase + step) & 0xffff;
-                    let value = if float {
-                        i64::from(float_bits(sample as i32))
-                    } else {
-                        sample << (8 * slot as u32 - 16) // scale 16-bit to the slot's width
-                    };
-                    for sample_slot in frame.chunks_mut(slot) {
+                    let mut samples = [0i64; 2];
+                    for side in 0..2 {
+                        let phase = phases[side];
+                        let half = (phase & 0x7fff) as i64;
+                        let magnitude = (half * (0x8000 - half)) >> 13; // 0..32768
+                        let sample = (if phase & 0x8000 != 0 { -magnitude } else { magnitude }) / 4; // a quarter of full scale
+                        phases[side] = (phase + steps[side]) & 0xffff;
+                        samples[side] = if float {
+                            i64::from(float_bits(sample as i32))
+                        } else {
+                            sample << (8 * slot as u32 - 16) // scale 16-bit to the slot's width
+                        };
+                    }
+                    for (channel, sample_slot) in frame.chunks_mut(slot).enumerate() {
+                        let value = samples[channel & 1];
                         for (index, byte) in sample_slot.iter_mut().enumerate() {
                             *byte = (value >> (8 * index)) as u8;
                         }
@@ -198,10 +220,13 @@ pub fn command(rest: &str) {
                 }
                 ua::write(&chunk[..frames * frame_bytes]);
             }
+            if forever {
+                crate::netfs::blocking(false);
+            }
             ua::status();
             ua::stop_mine();
         }
-        Some(_) => crate::println!("Usage: audio | audio device N|loopN|auto | audio modes | audio use capture|playback N|auto | audio start RATE [capture|playback|both] | audio stop | audio capture SECONDS [RATE] | audio tone [HZ] [SECONDS] [RATE] | audio duplex [SECONDS] [RATE]"),
+        Some(_) => crate::println!("Usage: audio | audio device N|loopN|auto | audio modes | audio use capture|playback N|auto | audio start RATE [capture|playback|both] | audio stop | audio capture SECONDS [RATE] | audio tone [HZ[/HZ]] [SECONDS|0] [RATE] | audio duplex [SECONDS] [RATE]"),
     }
 }
 

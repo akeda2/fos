@@ -168,7 +168,7 @@ pub fn feed_session(id: usize, byte: u8) {
 }
 
 fn feed_in(id: usize, byte: u8) {
-    if crate::top::key(byte) {
+    if crate::top::key(byte) || crate::audioshell::key(byte) {
         return;
     }
     if feed_foreground(id, byte) {
