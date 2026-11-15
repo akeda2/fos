@@ -987,8 +987,8 @@ impl<S: Source> Decode for Decoder<S> {
 mod tests {
     use super::*;
 
-    /// 8192 samples of the first frame of a real 3.99 "high" stereo file, cut off before the end of the frame (so its
-    /// CRC cannot match) with a one-entry seek table and an APEv2 tag; the PCM CRCs are from ffmpeg's decoder.
+    /// 8192 stereo samples of synthetic audio (tones plus noise) encoded at "high" by Monkey's Audio 13.47, with an
+    /// APEv2 tag (`tools/make_ape_fixture.py`); the PCM CRCs are from ffmpeg's decoder.
     const FIXTURE: &[u8] = include_bytes!("../testdata/fixture.ape");
 
     fn crc32(bytes: impl Iterator<Item = u8>) -> u32 {
@@ -1011,7 +1011,8 @@ mod tests {
             all.extend(block_bytes(&d, n));
         }
         assert_eq!(all.len(), 8192 * 4);
-        assert_eq!(crc32(all.iter().copied()), 0x969b_ed6c);
+        assert_eq!(crc32(all.iter().copied()), 0x7bca_5e7c);
+        assert_eq!(d.crc_errors, 0);
     }
 
     #[test]
@@ -1021,7 +1022,7 @@ mod tests {
         assert_eq!(d.seek(5000).unwrap(), 4096);
         let n = d.next_block().unwrap().unwrap();
         assert_eq!(n, 4096);
-        assert_eq!(crc32(block_bytes(&d, n).into_iter()), 0xc46f_8a6b);
+        assert_eq!(crc32(block_bytes(&d, n).into_iter()), 0x3fc0_4c17);
         assert_eq!(d.seek(u64::MAX).unwrap(), 4096);
         assert_eq!(d.position(), 4096);
     }
