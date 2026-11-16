@@ -48,6 +48,10 @@ plan and status are in `docs/shared-codebase.md`. The v2 prefix is gone from bui
 Also read on demand: `docs/config.md` (every `settings`, `debug`, `start` and `synckey` option), `NETWORKING.md`, `AUDIO.md`, `DEFERRED.md` (things put aside),
 `README.md`.
 
+**Private overlay**: some drivers and tapes live in a separate repository checked out at `private/` (gitignored), built only
+when present (`docs/private.md`). Never copy private code, names or docs into public files or commit messages;
+`tools/check_public.py` (part of `make test`) checks against `private/denylist.txt`.
+
 ## Boot, memory, disks
 
 - **Boot**: UEFI: firmware -> `\EFI\BOOT\BOOTX64.EFI`. BIOS: MBR -> stage two (see

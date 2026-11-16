@@ -113,9 +113,9 @@ impl core::fmt::Display for AudioDeviceName {
             write!(out, "Loopback {} (virtual)", device.id)
         } else if device.kind == AUDIO_KIND_I2S {
             write!(out, "I2S audio HAT")
-        } else if device.kind == AUDIO_KIND_HDA {
+        } else if device.kind == AUDIO_KIND_HDA || device.kind == AUDIO_KIND_CARD {
             let location = device.pci_location;
-            write!(out, "HD Audio {:02x}:{:02x}.{} ({:04x}:{:04x})", (location >> 16) & 0xff, (location >> 8) & 0xff, location & 7, device.vendor, device.id)
+            write!(out, "{} {:02x}:{:02x}.{} ({:04x}:{:04x})", if device.kind == AUDIO_KIND_HDA { "HD Audio" } else { "Audio card" }, (location >> 16) & 0xff, (location >> 8) & 0xff, location & 7, device.vendor, device.id)
         } else {
             write!(out, "USB audio")
         }

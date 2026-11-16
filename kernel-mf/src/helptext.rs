@@ -9,7 +9,7 @@ pub struct Topic {
     pub summary: &'static str,
 }
 
-const fn t(name: &'static str, group: &'static str, usage: &'static str, summary: &'static str) -> Topic {
+pub const fn t(name: &'static str, group: &'static str, usage: &'static str, summary: &'static str) -> Topic {
     Topic { name, group, usage, summary }
 }
 
@@ -45,7 +45,7 @@ pub const TOPICS: &[Topic] = &[
     t("gpio", "Network", "gpio @HOST ...", "Drive the GPIO pins of this machine (Raspberry Pi 4) or, with @HOST, another's."),
     t("i2c", "Machine", "i2c [status|bus header|dsi|speed KHZ|scan|read ADDR [N]|write ADDR BYTE...|get ADDR REG [N]]", "The Raspberry Pi 4's I2C buses (the header's, and the display connector's): scan, read and write devices."),
     t("i2s", "Machine", "i2s probe | i2s capture [SECONDS] | i2s audio on|off", "The Maltex I2S audio HAT (Raspberry Pi 4): clock edge counts, a level meter, or offer it as an audio device."),
-    t("audio", "Machine", "audio | audio device N|auto | audio tone [HZ] [SECONDS] [RATE]", "List audio devices, choose the active one, play a test tone."),
+    t("audio", "Machine", "audio | audio device N|auto | audio output N|same | audio modes | audio use capture|playback N|auto | audio start RATE [capture|playback|both] | audio stop | audio capture [SECONDS] [RATE] [tone=HZ[/HZ]] | audio duplex [SECONDS] [RATE] | audio tone [HZ[/HZ]] [SECONDS|0] [RATE]", "List audio devices, choose the active one (and a separate output), pick a channel/format mode, start or stop streams, show per-channel input peaks (with `tone=` while a tone plays, a cable loop check), run both directions, play a test tone."),
     t("touch", "Machine", "touch | touch monitor [SECONDS]", "List the touch panels (USB, and the Pi 4's DSI display); `monitor` prints finger events for a while."),
     t("midi", "Machine", "midi | midi monitor [SECONDS] | midi send [#N] HEX HEX [HEX]", "USB-MIDI devices: list them, watch what they send for a while, send one message (`90 3c 64` is note C4 on)."),
     #[cfg(target_arch = "aarch64")]
@@ -80,8 +80,13 @@ pub const TOPICS: &[Topic] = &[
     t("halt", "Machine", "halt", "Same as `shutdown`."),
 ];
 
+/// The built-in topics, then those of the optional private drivers (docs/private.md).
+fn all() -> impl Iterator<Item = &'static Topic> {
+    TOPICS.iter().chain(crate::private::TOPICS.iter())
+}
+
 pub fn find(name: &str) -> Option<&'static Topic> {
-    TOPICS.iter().find(|topic| topic.name == name)
+    all().find(|topic| topic.name == name)
 }
 
 /// `help NAME` for a builtin: its usage and what it does.
@@ -96,7 +101,7 @@ pub fn overview(shared: &[fosfor_shell::Command]) {
     for group in GROUPS {
         let mut line = alloc::string::String::new();
         let mut label = alloc::format!("{group:<19}");
-        for name in shared.iter().map(|command| command.name).filter(|_| *group == "Files").chain(TOPICS.iter().filter(|topic| topic.group == *group).map(|topic| topic.name)) {
+        for name in shared.iter().map(|command| command.name).filter(|_| *group == "Files").chain(all().filter(|topic| topic.group == *group).map(|topic| topic.name)) {
             if label.len() + line.len() + name.len() + 1 > 79 {
                 crate::println!("{label}{}", line.trim_end());
                 label = alloc::string::String::from("                   ");

@@ -35,3 +35,7 @@ kernel/src/generated_slots.rs
 
 # The shared tapesync key of the test machines (tools/tape_manifest.py, fosadm); never commit it.
 /synckey
+
+# The optional private drivers and tapes (docs/private.md): a separate, private repository checked out here. Never
+# commit it, and never name what is in it in a public file (`tools/check_public.py`).
+/private/

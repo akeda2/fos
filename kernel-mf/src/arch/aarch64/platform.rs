@@ -159,6 +159,7 @@ static I2S: kernel_core::i2s::Ops = kernel_core::i2s::Ops {
     fill_info: crate::i2s_pi::fill_info,
     fill_stats: crate::i2s_pi::fill_stats,
     buffer_info: crate::i2s_pi::buffer_info,
+    identity: || (fosfor_abi::tape::AUDIO_KIND_I2S, 0, 0, 0),
 };
 
 static DSI: kernel_core::screen::Dsi = kernel_core::screen::Dsi {

@@ -320,6 +320,17 @@ pub mod ioapic {
         }
     }
 
+    /// The low word of `gsi`'s redirection entry (diagnosis: bit 12 delivery pending, bit 14 remote IRR, bit 16 mask).
+    pub fn entry_low(gsi: u32) -> Option<u32> {
+        let _guard = LOCK.lock();
+        unsafe {
+            if BASE == 0 || gsi < GSI_BASE || gsi >= GSI_BASE + PINS {
+                return None;
+            }
+            Some(read(0x10 + 2 * (gsi - GSI_BASE)))
+        }
+    }
+
     /// First GSI served and one past the last (for probing candidates).
     pub fn gsi_range() -> (u32, u32) {
         unsafe { (GSI_BASE, GSI_BASE + PINS) }

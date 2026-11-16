@@ -84,6 +84,7 @@ mod kup_serial;
 mod slots;
 mod block;
 mod storage;
+mod private;
 use kernel_core::{fatvol, fosfs, gpt, pci};
 #[cfg(target_arch = "aarch64")]
 use kernel_core::usb_pointer;
@@ -201,6 +202,7 @@ fn boot_services(info: &BootInfo, century: u8) -> ! {
     }
     config::load();
     kernel_core::hda::init_all(config::no_msi());
+    private::init();
     if config::crash_on_boot() {
         println!("debug: crash-on-boot is set; faulting now.");
         arch::crash_now();
@@ -255,6 +257,7 @@ fn boot_services(info: &BootInfo, _century: u8) -> ! {
         usb::init();
     }
     config::load();
+    private::init();
     #[cfg(target_arch = "aarch64")]
     pi_screens(info);
     #[cfg(target_arch = "aarch64")]

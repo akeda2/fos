@@ -35,6 +35,7 @@ pub mod slot_report;
 pub mod tapesync_client;
 pub mod gpio_client;
 pub mod gpt;
+pub mod ext_audio;
 pub mod i2s;
 pub mod line;
 pub mod lineedit;

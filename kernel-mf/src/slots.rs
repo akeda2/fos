@@ -104,9 +104,20 @@ pub fn confirm_boot() {
 }
 
 /// Marks the stop as deliberate, so the next boot does not count it as a crash.
+///
+/// Waits at most 2 s for the disk lock: `shutdown`, `reboot` and the KUP restart must not hang behind a tape or service
+/// stuck in a disk call. Without the mark the next boot counts this stop as unclean, which is the lesser harm.
 pub fn mark_clean_stop() {
-    let _disk = crate::tapefs::lock();
-    let _ = update_metadata(|metadata| metadata.running = RUNNING_STOPPED);
+    // Counted in 10 ms busy waits (the PM timer), not ticks: a caller may have interrupts off.
+    for _ in 0..200 {
+        if let Some(_disk) = crate::tapefs::try_lock() {
+            let _ = update_metadata(|metadata| metadata.running = RUNNING_STOPPED);
+            return;
+        }
+        crate::sched::yield_now();
+        crate::time::busy_wait_ms(10);
+    }
+    println!("The disk is busy (a tape or service is in a disk call): this stop is not marked clean.");
 }
 
 /// Service-loop work: clears the unclean-boot streak once the boot has run long enough to be called good.

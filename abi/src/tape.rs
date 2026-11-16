@@ -704,16 +704,18 @@ pub const AUDIO_KIND_HDA: u32 = 2;
 pub const AUDIO_KIND_I2S: u32 = 3;
 /// A virtual loopback device (`id` is its index: `loop0` is 0). Stereo 32-bit float at 48000 Hz.
 pub const AUDIO_KIND_LOOP: u32 = 4;
+/// A PCI audio card whose driver the server kernel registers itself (`ext_audio::CARD`); the PCI fields are filled in.
+pub const AUDIO_KIND_CARD: u32 = 5;
 
 /// What `audio_devices` reports for one device. A new struct (not more fields in `AudioInfo`), per the rule at the top of this file.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct AudioDevice {
-    /// `AUDIO_KIND_USB`, `AUDIO_KIND_HDA`, `AUDIO_KIND_I2S` (the Pi's I2S audio HAT; the other fields are 0) or `AUDIO_KIND_LOOP`.
+    /// `AUDIO_KIND_USB`, `AUDIO_KIND_HDA`, `AUDIO_KIND_I2S` (the Pi's I2S audio HAT; the other fields are 0), `AUDIO_KIND_LOOP` or `AUDIO_KIND_CARD`.
     pub kind: u32,
     /// 1 if this is the device the `audio_*` calls currently use.
     pub active: u32,
-    /// PCI location as `bus << 16 | device << 8 | function` for an HD Audio controller; 0 for USB audio.
+    /// PCI location as `bus << 16 | device << 8 | function` for an HD Audio controller or a card; 0 for USB audio.
     pub pci_location: u32,
     /// PCI vendor and device ID of an HD Audio controller; 0 for USB audio.
     pub vendor: u16,

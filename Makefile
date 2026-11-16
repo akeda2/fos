@@ -10,6 +10,17 @@ BUILD := build
 export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 
 .DEFAULT_GOAL := image
+
+# The optional private drivers and tapes (docs/private.md): a separate, private repository checked out at private/.
+# Built when it is there; PRIVATE=0 leaves it out (`make release` always does). private/private.mk adds its tapes to
+# PRIVATE_TAPES, PRIVATE_FP_TAPES and PRIVATE_A64_TAPES and defines `test-private`.
+PRIVATE ?= $(if $(wildcard private/private.mk),1,0)
+ifeq ($(PRIVATE),1)
+include private/private.mk
+MF_FEATURES := --features private
+endif
+# A tape's source folder: tapes/NAME, or private/tapes/NAME for a private one (shell, for the build loops).
+TAPE_SRC = dir=tapes/$$tape; [ -d $$dir ] || dir=private/tapes/$$tape
 .PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug test-usb-pointer test-xhci-abort test-idle-cpu test-net-chat test-telnet test-tcp test-smb test-release-loops test-nettest-lab test-nettest-remote test-audio-bench test-bootcode-uefi test-console-utf8 test-keymap test-console-colors test-hostnames test-config-fat test-fterm test-fterm-net test-fterm-ui test-serial-shell test-midi test-services
 
 # `all` builds both machines' images: the x86 image and the Raspberry Pi 4 SD card image. What is missing is said up front.
@@ -137,9 +148,9 @@ LOADER_EFI := $(CARGO_TARGET_DIR)/x86_64-unknown-uefi/release/fosfor-loader.efi
 KERNEL_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel
 IMAGE := $(OUT)/fosfor.img
 # tapes: one crate each under tapes/ (shared libraries live in crates/), each built to build/cargo-target/x86_64-fos-tape/release/NAME.
-TAPES := fosplay netcheck hello abibad thrcheck fscheck calc memtest nettest bridge router ip-chat telnet net-chat ed ebb httpd sipd smbd sshd smb smbmount sshmount ssh web record recorder play audio-net ptp fterm fpcheck gfxcheck ltas gonio clock kaffe organ strings tape-echo epiano phono gpiopanel miccal frt60 compander
+TAPES := fosplay netcheck hello abibad thrcheck fscheck calc memtest nettest bridge router ip-chat telnet net-chat ed ebb httpd sipd smbd sshd smb smbmount sshmount ssh web record recorder play audio-net ptp fterm fpcheck gfxcheck ltas gonio clock kaffe organ strings tape-echo epiano phono gpiopanel miccal frt60 compander $(PRIVATE_TAPES)
 # Hard-float tapes (target x86_64-fos-tape-fp, SSE2/AVX2; the kernel enables SSE before they start) build into their own directory.
-FP_TAPES := sshd sshmount ssh fosplay fpcheck ltas gonio clock kaffe audio-net organ strings tape-echo epiano phono gpiopanel miccal frt60 compander
+FP_TAPES := sshd sshmount ssh fosplay fpcheck ltas gonio clock kaffe audio-net organ strings tape-echo epiano phono gpiopanel miccal frt60 compander $(PRIVATE_FP_TAPES)
 tape_dir = x86_64-fos-tape$(if $(filter $(1),$(FP_TAPES)),-fp)
 TAPE_BINS := $(foreach tape,$(TAPES),$(CARGO_TARGET_DIR)/$(call tape_dir,$(tape))/release/$(tape))
 # The image and deployments use the stamped copies (tools/stamp_tape.py: the `.fos_build` section `tapesync` compares).
@@ -183,7 +194,7 @@ kernel:
 KERNEL_MF_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel-mf
 .PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-sessions test-mf-tape test-mf-usb test-mf-debug test-mf-audio test-mf-netfs test-mf-tapesync test-mf-gpio test-mf-bios-video test-mf-shell test-mf-kup-serial test-mf-smbmount test-mf-smbd test-mf-sshd test-mf-sshmount test-mf-ssh test-mf-httpd test-mf-vnic test-mf-service test-mf-cp test-mf-kernel-switch test-mf-abibad test-mf-threads test-mf-md
 kernel-mf:
-	cd kernel-mf && cargo +nightly-2026-09-13 build --release
+	cd kernel-mf && cargo +nightly-2026-09-13 build --release $(MF_FEATURES)
 
 # A bootable image with the server kernel in slot 0 (no tapes yet: the server kernel has no tape loader).
 image-mf: loader kernel-mf $(BIOS_STAGES)
@@ -341,7 +352,7 @@ test-mf-kup-serial: image-mf
 # Every v2 tape (ELF64 PIE executables for the 64-bit tape ABI).
 .PHONY: tapes
 tapes: $(OPUS_LIB)
-	for tape in $(TAPES); do (cd tapes/$$tape && cargo +nightly-2026-09-13 build --release) || exit 1; done
+	for tape in $(TAPES); do $(TAPE_SRC); (cd $$dir && cargo +nightly-2026-09-13 build --release) || exit 1; done
 
 # Copies of the tapes with the build stamp added: build/fosfor/tapes/NAME is what goes into the image and onto machines.
 .PHONY: stamp-tapes
@@ -372,7 +383,7 @@ kernel-aarch64:
 	cd kernel && cargo +nightly-2026-09-13 build --release --target aarch64-unknown-none-softfloat -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem
 
 # Tapes for aarch64 (M2 of the plan): the portable ones, built for the built-in hard-float aarch64-unknown-none target.
-A64_TAPES := hello thrcheck fscheck gfxcheck calc ed ebb httpd smbd smb smbmount web netcheck fosplay clock gonio ptp play record recorder ltas kaffe organ strings tape-echo epiano phono fterm telnet net-chat ip-chat bridge nettest router audio-net opus-bench i2cscan gpiopanel miccal frt60 compander
+A64_TAPES := hello thrcheck fscheck gfxcheck calc ed ebb httpd smbd smb smbmount web netcheck fosplay clock gonio ptp play record recorder ltas kaffe organ strings tape-echo epiano phono fterm telnet net-chat ip-chat bridge nettest router audio-net opus-bench i2cscan gpiopanel miccal frt60 compander $(PRIVATE_A64_TAPES)
 A64_TAPE_DIR := $(CARGO_TARGET_DIR)/aarch64-unknown-none/release
 A64_TAPE_STAMPED := build/fosfor-aarch64/tapes
 A64_FILES_V3 = $(foreach tape,$(A64_TAPES),--file $(tape)=$(A64_TAPE_STAMPED)/$(tape))
@@ -380,7 +391,7 @@ A64_FILES_V4 = $(foreach tape,$(A64_TAPES),--file bin/$(tape)=$(A64_TAPE_STAMPED
 A64_FILES = $(A64_FILES_V$(FOSFS))
 
 tapes-aarch64: $(OPUS_A64_LIB)
-	for tape in $(A64_TAPES); do (cd tapes/$$tape && cargo +nightly-2026-09-13 build --release --target aarch64-unknown-none -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem) || exit 1; done
+	for tape in $(A64_TAPES); do $(TAPE_SRC); (cd $$dir && cargo +nightly-2026-09-13 build --release --target aarch64-unknown-none -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem) || exit 1; done
 	mkdir -p $(A64_TAPE_STAMPED)
 	for tape in $(A64_TAPES); do python3 tools/stamp_tape.py $(A64_TAPE_DIR)/$$tape $(A64_TAPE_STAMPED)/$$tape || exit 1; done
 
@@ -403,7 +414,7 @@ A64_KERNEL_MF := $(CARGO_TARGET_DIR)/aarch64-unknown-none-softfloat/release/fosf
 test-mf-aarch64-boot: image-mf-aarch64
 	python3 tools/test_mf_aarch64_boot.py
 kernel-mf-aarch64:
-	cd kernel-mf && cargo +nightly-2026-09-13 build --release --target aarch64-unknown-none-softfloat
+	cd kernel-mf && cargo +nightly-2026-09-13 build --release --target aarch64-unknown-none-softfloat $(MF_FEATURES)
 
 # FOSFS v4 like the other images: tapes in bin/, configuration in settings/ (docs/fosfs-v4.md).
 MF_A64_FILES = $(foreach tape,hello thrcheck fscheck gfxcheck calc ed netcheck httpd web fterm,--file bin/$(tape)=$(A64_TAPE_STAMPED)/$(tape)) --fosfs 4
@@ -443,6 +454,7 @@ test: image
 	python3 tools/check_hal.py
 	python3 tools/check_user_pointers.py
 	python3 tools/check_abi_support.py
+	python3 tools/check_public.py
 	cargo +nightly-2026-09-13 test --manifest-path abi/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/fat/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/ext4/Cargo.toml
@@ -485,6 +497,9 @@ test: image
 	cargo +nightly-2026-09-13 test --manifest-path crates/tape-rt/Cargo.toml
 	for tape in router nettest ed ip-chat telnet ptp fterm organ strings tape-echo epiano phono compander; do RUST_MIN_STACK=33554432 cargo +nightly-2026-09-13 test --lib --manifest-path tapes/$$tape/Cargo.toml || exit 1; done
 	python3 tools/test_boot.py
+ifeq ($(PRIVATE),1)
+	$(MAKE) test-private
+endif
 
 # Deliberate-fault kernels (one Cargo feature each): checks the exception reports,
 # including a kernel stack overflow reported through the double-fault stack.
@@ -683,7 +698,10 @@ test-peers:
 	python3 tools/test_peers.py
 
 # A folder for `fosadm --from`: both CPUs' kernels and tapes plus a manifest (tools/make_release.py).
-release: image tapes-aarch64 kernel-aarch64
+# Always without the private tree: its tapes are removed from the stamped folders first, and the kernels rebuilt without it.
+release:
+	rm -rf $(TAPE_STAMPED) $(A64_TAPE_STAMPED)
+	$(MAKE) PRIVATE=0 image tapes-aarch64 kernel-aarch64
 	python3 tools/make_release.py
 
 test-fosadm-serial: image

@@ -21,3 +21,7 @@ fosfor-kernel-core = { path = "../crates/kernel-core", features = ["vnic"] }
 fosfor-shell = { path = "../crates/shell" }
 fosfor-script = { path = "../crates/script" }
 fosfor-tape-sync = { path = "../crates/tape-sync" }
+
+[features]
+# The optional private drivers in ../private (docs/private.md); the Makefile turns this on when that tree is present.
+private = []

@@ -147,7 +147,8 @@ const BUILTINS: &[&str] = &[
 pub fn init() {
     kernel_core::lineedit::set_completer(|line, add| {
         let mut host = crate::shellhost::MfHost;
-        fosfor_shell::complete::complete(&mut host, &[fosfor_shell::files::COMMANDS], BUILTINS, line, add);
+        let names: Vec<&str> = BUILTINS.iter().copied().chain(crate::private::TOPICS.iter().map(|topic| topic.name)).collect();
+        fosfor_shell::complete::complete(&mut host, &[fosfor_shell::files::COMMANDS], &names, line, add);
     });
 }
 
@@ -445,6 +446,7 @@ pub fn run_command(line: &str) {
             slots::mark_clean_stop();
             power::reset();
         }
+        _ if crate::private::command(command, words.clone()) => {}
         _ => {
             let mut host = crate::shellhost::MfHost;
             if !fosfor_shell::execute(&mut host, &[fosfor_shell::files::COMMANDS], line) && !fosfor_shell::external(&mut host, line) {

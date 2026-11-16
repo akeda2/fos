@@ -572,9 +572,9 @@ fn blit_on(screen: u64, x: u32, y: u32, width: u32, height: u32, pixels: u64, st
     }
     u64::from(process::user_access(|| unsafe {
         if screen == 1 {
-            fb::extra_blit(x, y, width, height, pixels as *const u32, stride)
+            fb::extra_blit(x, y, width, height, pixels as *const u32, stride) // checked-user
         } else {
-            fb::gfx_blit(x, y, width, height, pixels as *const u32, stride)
+            fb::gfx_blit(x, y, width, height, pixels as *const u32, stride) // checked-user
         }
     })) // kernel-memory
 }
