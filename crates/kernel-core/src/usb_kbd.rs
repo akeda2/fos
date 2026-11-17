@@ -145,6 +145,10 @@ pub fn probe_device(controller_index: usize, controller: &mut Controller, mut de
     }
     let total = usize::from(u16::from_le_bytes([configuration[2], configuration[3]])).clamp(9, configuration.len());
     controller.get_descriptor(&device, 2, 0, &mut configuration[..total])?;
+    // A driver for this particular product (a vendor-class device) comes before the generic class drivers.
+    if crate::usb_class::claim(controller_index, controller, device, vendor, product, &configuration[..total]) {
+        return Ok(true);
+    }
     let Some((interface, endpoint, max_packet_in, interval)) = find_boot_keyboard(&configuration[..total]) else {
         // A USB stick (Mass Storage, Bulk-Only) becomes a disk.
         if let Some(endpoints) = crate::usb_storage::find_endpoints(&configuration[..total]) {

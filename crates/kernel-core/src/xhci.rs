@@ -128,6 +128,28 @@ pub fn push_isoc(ring: &mut Ring, buffer: u64, length: u32) -> u64 {
     ring.push(buffer, length, (TRB_ISOCH << 10) | TRB_IOC | TRB_ISP | (1 << 31))
 }
 
+/// (packet size, extra transactions per microframe) of an isochronous endpoint's wMaxPacketSize: bits 11-12 only mean
+/// something at high speed (USB 2.0 9.6.6); a SuperSpeed endpoint has its burst in the companion descriptor instead.
+pub fn isoc_packet(speed: u8, max_packet: u16) -> (u16, u8) {
+    let extra = if speed == 3 { ((max_packet >> 11) & 3).min(2) as u8 } else { 0 };
+    (max_packet & 0x7ff, extra)
+}
+
+/// `push_isoc` for an endpoint that may move several packets per microframe (`max_packet` as given to
+/// `configure_isoc_endpoint`). xHCI 1.x 4.11.2.3: the TRB carries Transfer Burst Count (bits 7-8: bursts in the TD,
+/// less one) and Transfer Last Burst Packet Count (bits 16-19: packets in the last burst, less one), counted in packets
+/// of the endpoint's size with Max Burst Size + 1 packets to a burst. `ioc` asks for a completion event; without it only
+/// an error produces one, so a driver can queue a run of microframes and hear only of the last.
+pub fn push_isoc_packets(ring: &mut Ring, buffer: u64, length: u32, speed: u8, max_packet: u16, ioc: bool) -> u64 {
+    let (size, extra) = isoc_packet(speed, max_packet);
+    let packets = length.div_ceil(u32::from(size.max(1))).max(1);
+    let burst = u32::from(extra) + 1;
+    let tbc = packets.div_ceil(burst) - 1;
+    let tlbpc = (packets - 1) % burst;
+    let control = (TRB_ISOCH << 10) | (tbc & 3) << 7 | (tlbpc & 0xf) << 16 | (1 << 31) | if ioc { TRB_IOC } else { 0 };
+    ring.push(buffer, length, control)
+}
+
 /// Rings a doorbell register (`Controller::doorbell_address`) for endpoint `dci`.
 pub fn ring_doorbell_at(address: usize, dci: u32) {
     write32(address, dci);
@@ -1320,6 +1342,11 @@ impl Controller {
     /// speed (the period is 2^(bInterval-1) frames at full speed, microframes at high speed). The
     /// slot's "context entries" only ever grows, so an audio interface can add its playback,
     /// feedback and capture endpoints one at a time.
+    ///
+    /// `max_packet` is the descriptor's wMaxPacketSize as it stands: bits 0-10 the packet size and, for a high-speed
+    /// endpoint, bits 11-12 the extra transactions per microframe (a "high-bandwidth" endpoint moves up to three packets
+    /// per microframe). xHCI 1.x 6.2.3: those extra transactions go in Max Burst Size, and Max ESIT Payload is everything
+    /// one service interval carries. A caller that masks the field to 11 bits gets one packet per interval, as before.
     pub fn configure_isoc_endpoint(&mut self, device: &Device, endpoint: u8, max_packet: u16, interval: u8, ring: &Ring) -> Result<u32, Error> {
         let slot = usize::from(device.slot);
         let input_endpoint = endpoint & 0x80 != 0;
@@ -1331,6 +1358,8 @@ impl Controller {
         // Interval field: an exponent of 125 us microframes. High speed: bInterval-1. Full speed:
         // frames are 1 ms = 8 microframes, so (bInterval-1) + 3.
         let exponent = if device.speed >= 3 { u32::from(interval.clamp(1, 16)) - 1 } else { u32::from(interval.clamp(1, 16)) - 1 + 3 };
+        let (size, extra) = isoc_packet(device.speed, max_packet);
+        let esit = u32::from(size) * (u32::from(extra) + 1);
         unsafe {
             core::ptr::write_bytes(memory::phys_to_virt(input) as *mut u8, 0, memory::FRAME as usize);
             (memory::phys_to_virt(input) as *mut u32).add(1).write_volatile(1 | (1 << dci));
@@ -1342,10 +1371,10 @@ impl Controller {
             let context = memory::phys_to_virt(self.context_endpoint(input, dci)) as *mut u32;
             context.write_volatile(exponent << 16);
             // CErr 0 (isochronous transfers are never retried), endpoint type 5 (isoc IN) or 1 (isoc OUT).
-            context.add(1).write_volatile(((if input_endpoint { 5 } else { 1 }) << 3) | (u32::from(max_packet) << 16));
+            context.add(1).write_volatile(((if input_endpoint { 5 } else { 1 }) << 3) | (u32::from(extra) << 8) | (u32::from(size) << 16));
             context.add(2).write_volatile(ring.base as u32 | 1);
             context.add(3).write_volatile((ring.base >> 32) as u32);
-            context.add(4).write_volatile(u32::from(max_packet) | (u32::from(max_packet) << 16)); // average TRB length, max ESIT payload
+            context.add(4).write_volatile(esit | (esit << 16)); // average TRB length, max ESIT payload
         }
         self.command(input, 0, (TRB_CONFIGURE_ENDPOINT << 10) | (u32::from(device.slot) << 24))?;
         Ok(dci)

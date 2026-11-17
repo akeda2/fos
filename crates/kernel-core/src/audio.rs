@@ -30,7 +30,7 @@ pub enum Backend {
     Usb(usize),
     Hda(usize),
     /// A device the kernel registered (`ext_audio.rs`): the Pi's I2S audio HAT (`ext::I2S`, offered only once switched on)
-    /// or a PCI card the server kernel drives (`ext::CARD`).
+    /// a PCI card the server kernel drives (`ext::CARD`) or a USB interface with a driver of its own (`ext::USB_DEVICE`).
     Ext(usize),
     /// A virtual loopback device (`loopback.rs`): what one tape plays into it another captures.
     Loop(usize),
@@ -122,6 +122,10 @@ fn automatic() -> Option<Backend> {
     let free = |backend: Backend| claimed_by_other(backend).is_none();
     if let Some(unit) = (0..usb::UNITS).find(|&unit| usb::present(unit) && free(Backend::Usb(unit))) {
         return Some(Backend::Usb(unit));
+    }
+    // A USB interface with its own driver was plugged in on purpose too, like a class-compliant one.
+    if ext::slot(ext::USB_DEVICE).present() && free(Backend::Ext(ext::USB_DEVICE)) {
+        return Some(Backend::Ext(ext::USB_DEVICE));
     }
     // A PCI audio card the kernel drives was put in on purpose: it comes before the board's HD Audio.
     let ext_free = |slot: usize| ext::slot(slot).present() && free(Backend::Ext(slot));
@@ -354,11 +358,13 @@ pub fn playback_format() -> Option<(u8, u8)> {
     }
 }
 
-/// Whether the running capture / playback stream carries 32-bit IEEE floats instead of integers (USB only; HD Audio is PCM).
+/// Whether the running capture / playback stream carries 32-bit IEEE floats instead of integers (USB and the devices a
+/// kernel registers may; HD Audio is PCM).
 pub fn capture_float() -> bool {
     match active() {
         Some(Backend::Usb(unit)) => usb::capture_float(unit),
         Some(Backend::Loop(_)) => true,
+        Some(Backend::Ext(slot)) => ext::slot(slot).float(true),
         _ => false,
     }
 }
@@ -367,6 +373,7 @@ pub fn playback_float() -> bool {
     match output() {
         Some(Backend::Usb(unit)) => usb::playback_float(unit),
         Some(Backend::Loop(_)) => true,
+        Some(Backend::Ext(slot)) => ext::slot(slot).float(false),
         _ => false,
     }
 }
@@ -376,11 +383,13 @@ pub extern "C" fn api_audio_float() -> u32 {
     let capture = match active() {
         Some(Backend::Usb(unit)) => usb::capture_float_default(unit),
         Some(Backend::Loop(_)) => true,
+        Some(Backend::Ext(slot)) => ext::slot(slot).float(true),
         _ => false,
     };
     let playback = match output() {
         Some(Backend::Usb(unit)) => usb::playback_float_default(unit),
         Some(Backend::Loop(_)) => true,
+        Some(Backend::Ext(slot)) => ext::slot(slot).float(false),
         _ => false,
     };
     u32::from(capture) | u32::from(playback) << 1

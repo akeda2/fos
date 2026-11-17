@@ -69,6 +69,10 @@ pub fn poll() {
 
 /// The hooks a class driver may implement; a driver leaves out what does not concern it.
 pub struct Class {
+    /// A newly addressed device, before the built-in drivers look at it: (controller index, controller, device, vendor,
+    /// product, configuration descriptor). True when this driver took the device (it then selects the configuration
+    /// itself); a driver for one particular product claims it here so a generic class driver does not.
+    pub claim: Option<fn(usize, &mut Controller, crate::xhci::Device, u16, u16, &[u8]) -> bool>,
     /// The device on root port `port` (behind hub route `route`, or everything on the port when `None`) is being released.
     pub release: Option<fn(&mut Controller, u8, Option<u32>)>,
     /// An xHCI event with no waiter; true when this driver consumed it.
@@ -86,6 +90,7 @@ pub struct Class {
 }
 
 pub const NONE: Class = Class {
+    claim: None,
     release: None,
     background_event: None,
     xhci_departed: None,
@@ -109,6 +114,11 @@ pub fn register(class: &'static Class) {
 
 fn classes() -> impl Iterator<Item = &'static Class> {
     unsafe { (*addr_of!(CLASSES)).iter().filter_map(|class| *class) }
+}
+
+/// Offers a new xHCI device to the drivers with a `claim` hook; true when one took it.
+pub fn claim(controller_index: usize, controller: &mut Controller, device: crate::xhci::Device, vendor: u16, product: u16, configuration: &[u8]) -> bool {
+    classes().filter_map(|class| class.claim).any(|hook| hook(controller_index, controller, device, vendor, product, configuration))
 }
 
 pub fn release_all(controller: &mut Controller, port: u8, route: Option<u32>) {

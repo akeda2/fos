@@ -27,13 +27,18 @@ private code.
 
 | Item | Used by |
 | --- | --- |
-| `pub fn init()` | `main.rs`, after the public audio drivers (x86) or after the config is read (aarch64) |
+| `pub fn init()` | `main.rs`, after the boot self-test, so the scheduler runs and a driver may start threads (`sched::spawn`) |
 | `pub fn command(name: &str, words: SplitWhitespace) -> bool` | `shell.rs`, for a command the public table does not know |
 | `pub const TOPICS: &[helptext::Topic]` | `help`, `help NAME` and tab completion |
+| `pub const USB_CLASSES: &[&usb_class::Class]` | `usb.rs`, registered before the built-in USB class drivers (and before `init()`) |
 
-Without the feature `private.rs` has empty versions of all three. A PCI audio card driver registers itself through
-the public `kernel_core::ext_audio` interface, so the `audio` shell command and the audio tapes see it like any
-other device (`AUDIO_KIND_CARD`).
+Without the feature `private.rs` has empty versions of all four. A PCI audio card driver registers itself through
+the public `kernel_core::ext_audio` interface (slot `CARD`), so the `audio` shell command and the audio tapes see it
+like any other device (`AUDIO_KIND_CARD`). A driver for one USB product takes its device through the `claim` hook of
+`usb_class::Class`, which the enumerator offers every new device before the generic class drivers look at it, and
+registers as audio in slot `USB_DEVICE`; a high-speed isochronous endpoint with several packets per microframe is
+configured by passing the descriptor's full wMaxPacketSize to `xhci::Controller::configure_isoc_endpoint` and queued
+with `xhci::push_isoc_packets`.
 
 ## Keeping names out of the public tree
 

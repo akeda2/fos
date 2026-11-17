@@ -202,7 +202,6 @@ fn boot_services(info: &BootInfo, century: u8) -> ! {
     }
     config::load();
     kernel_core::hda::init_all(config::no_msi());
-    private::init();
     if config::crash_on_boot() {
         println!("debug: crash-on-boot is set; faulting now.");
         arch::crash_now();
@@ -212,6 +211,8 @@ fn boot_services(info: &BootInfo, century: u8) -> ! {
     vnic::apply();
     ps2::init();
     selftest::run();
+    // After the self-test: that is where the scheduler starts, and private drivers may start threads.
+    private::init();
     if config::md_auto() {
         sched::spawn("md-assemble", mdvol::assemble_thread, 0);
     }
@@ -257,7 +258,6 @@ fn boot_services(info: &BootInfo, _century: u8) -> ! {
         usb::init();
     }
     config::load();
-    private::init();
     #[cfg(target_arch = "aarch64")]
     pi_screens(info);
     #[cfg(target_arch = "aarch64")]
@@ -268,6 +268,8 @@ fn boot_services(info: &BootInfo, _century: u8) -> ! {
     net::init();
     vnic::apply();
     selftest::run();
+    // After the self-test: that is where the scheduler starts, and private drivers may start threads.
+    private::init();
     sched::spawn("service", service_thread, 0).expect("the service thread");
     println!("kernel-mf: slice 8 reached the end of boot; entering the service loop.");
     loop {

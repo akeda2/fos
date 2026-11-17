@@ -99,7 +99,8 @@ static SERIAL: Class = Class {
 pub fn init() {
     kernel_core::usb_env::set(&ENV);
     usb_class::set_host(&HOST);
-    for class in [&AUDIO, &MIDI, &POINTER, &SERIAL] {
+    // The private drivers' classes (docs/private.md) first: their `claim` must see a device before the generic drivers do.
+    for class in crate::private::USB_CLASSES.iter().copied().chain([&AUDIO, &MIDI, &POINTER, &SERIAL]) {
         usb_class::register(class);
     }
     let _usb = lock();

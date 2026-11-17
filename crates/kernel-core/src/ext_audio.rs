@@ -3,7 +3,8 @@
 //!
 //! Slot `I2S` is the Pi's I2S audio HAT (`i2s_pi.rs`, through `i2s::set`): it pokes the Pi's clock manager, GPIO and PCM
 //! block. Slot `CARD` is a PCI audio card whose driver the server kernel registers itself (through `ext_audio::set`; the
-//! optional drivers of docs/private.md use it). docs/big-kernel.md, stage 1b.
+//! optional drivers of docs/private.md use it). Slot `USB_DEVICE` is a USB interface with a driver of its own instead of
+//! the class driver (`usb_audio.rs`), registered the same way. docs/big-kernel.md, stage 1b.
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 use fosfor_abi::tape::{AudioInfo, AudioStats};
@@ -27,6 +28,8 @@ pub struct Ops {
     /// For `audio_devices`: the `AUDIO_KIND_*` value and the PCI location (`bus << 16 | device << 8 | function`), vendor
     /// and device ID (all 0 for a device that is not on PCI).
     pub identity: fn() -> (u32, u32, u16, u16),
+    /// Whether capture (true) or playback carries 32-bit IEEE floats: the running stream's mode, else the chosen one.
+    pub float: fn(bool) -> bool,
 }
 
 /// One registered device, or none.
@@ -34,9 +37,10 @@ pub struct Slot(AtomicPtr<Ops>);
 
 pub const I2S: usize = 0;
 pub const CARD: usize = 1;
-pub const COUNT: usize = 2;
+pub const USB_DEVICE: usize = 2;
+pub const COUNT: usize = 3;
 
-static SLOTS: [Slot; COUNT] = [Slot(AtomicPtr::new(core::ptr::null_mut())), Slot(AtomicPtr::new(core::ptr::null_mut()))];
+static SLOTS: [Slot; COUNT] = [const { Slot(AtomicPtr::new(core::ptr::null_mut())) }; COUNT];
 
 pub fn slot(index: usize) -> &'static Slot {
     &SLOTS[index]
@@ -107,5 +111,8 @@ impl Slot {
     }
     pub fn identity(&self) -> (u32, u32, u16, u16) {
         self.ops().map_or((0, 0, 0, 0), |ops| (ops.identity)())
+    }
+    pub fn float(&self, capture: bool) -> bool {
+        self.ops().is_some_and(|ops| (ops.float)(capture))
     }
 }

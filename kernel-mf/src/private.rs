@@ -6,7 +6,9 @@
 //! - `init()`, called at boot after the built-in audio devices, to probe its hardware and register what it finds
 //!   (an audio card through `kernel_core::ext_audio::set`);
 //! - `command(name, words) -> bool`, offered every shell command the built-in table does not know, true if it took it;
-//! - `TOPICS`, its `help` entries, also used for Tab completion.
+//! - `TOPICS`, its `help` entries, also used for Tab completion;
+//! - `USB_CLASSES`, USB class drivers (`kernel_core::usb_class::Class`) registered when USB starts, before the built-in
+//!   ones, which runs before `init()`: a driver for one product takes its device through the `claim` hook.
 //!
 //! Its modules are part of this crate, so they use the kernel's own modules (`crate::pci`, `crate::pmm`, ...) like any
 //! driver here; a crate they need is a module of theirs (no change to `Cargo.toml` or `Cargo.lock`).
@@ -16,10 +18,13 @@
 mod drivers;
 
 #[cfg(feature = "private")]
-pub use drivers::{TOPICS, command, init};
+pub use drivers::{TOPICS, USB_CLASSES, command, init};
 
 #[cfg(not(feature = "private"))]
 pub const TOPICS: &[crate::helptext::Topic] = &[];
+
+#[cfg(not(feature = "private"))]
+pub const USB_CLASSES: &[&kernel_core::usb_class::Class] = &[];
 
 #[cfg(not(feature = "private"))]
 pub fn init() {}
