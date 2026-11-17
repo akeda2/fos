@@ -652,6 +652,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     let (mut sequence, mut timestamp, mut sent, mut phase) = (0u16, 0u32, 0u64, 0u32);
     let started = tape_rt::micros();
     let mut next_report = started + 1_000_000;
+    let mut watch = tape_rt::AudioWatch::new();
     let mut probe = LatencyProbe::new(options.rate, per_packet);
     if options.latency {
         println!("Latency probe: sending silence and a click every 0.5 s; the receiver's output must be cabled to input channel {} here.", selection.channels().next().unwrap_or(0) + 1);
@@ -709,6 +710,10 @@ pub fn send(api: &'static TapeApi, options: &Options) {
             }
         };
         if !have_packet {
+            // A driver that ended the capture stream delivers nothing more.
+            if tone.is_none() && watch.poll(api) {
+                break;
+            }
             tape_rt::idle();
             continue;
         }
@@ -767,6 +772,9 @@ pub fn send(api: &'static TapeApi, options: &Options) {
         (api.audio_stop)();
     }
     println!();
+    if let Some(reason) = watch.ended {
+        println!("audio-net: {reason}; stopping.");
+    }
     transport.announce_stop(api, options.nic);
     transport.stop_clock(api, options.nic);
     println!("Sent {sent} packets ({} frames).", sent * per_packet as u64);
@@ -1120,6 +1128,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     let (mut level_sum, mut level_buckets) = (0u64, [0u32; 16]);
     let (mut second_low, mut second_high) = (usize::MAX, 0usize);
     let (mut last_pass, mut second_gap) = (tape_rt::micros(), 0u64);
+    let mut watch = tape_rt::AudioWatch::new();
     loop {
         let pass = tape_rt::micros();
         second_gap = second_gap.max(pass - last_pass);
@@ -1128,6 +1137,10 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
             break;
         }
         if options.seconds != 0 && tape_rt::micros() >= started + options.seconds * 1_000_000 {
+            break;
+        }
+        // A driver that ended the playback stream takes nothing more.
+        if watch.poll(api) {
             break;
         }
         transport.igmp_service(api, options.nic, None);
@@ -1381,6 +1394,9 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     }
     let _ = level;
     println!();
+    if let Some(reason) = watch.ended {
+        println!("audio-net: {reason}; stopping.");
+    }
     if options.verbose && packets > 0 {
         println!("Processing took {} us per packet on average, {} us at worst; nic_receive up to {slow_receive} us, audio_info up to {slow_info} us.", work_total / packets, work_max);
     }

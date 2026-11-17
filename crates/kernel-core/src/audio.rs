@@ -24,6 +24,7 @@
 use crate::{ext_audio as ext, hda, loopback, usb_audio as usb};
 pub use crate::usb_audio::PcmRing;
 use fosfor_abi::tape::{AudioDevice, AudioInfo, AudioStats, AUDIO_KIND_HDA, AUDIO_KIND_LOOP, AUDIO_KIND_USB, AUDIO_BUSY, AUDIO_NO_DEVICE};
+use fosfor_abi::tape::{AUDIO_STATE_IDLE, AUDIO_STATE_LOST, AUDIO_STATE_RUNNING, AUDIO_STATE_STOPPED};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
@@ -49,10 +50,13 @@ struct Choice {
     output: Option<Backend>,
     /// What was chosen as the output before a tape did (`audio_use_output`).
     saved_output: Option<Option<Backend>>,
+    /// The devices this context's capture and playback were last started on, for `audio_state` (`None`: not started); cleared
+    /// when a tape stops its audio or ends, kept by the shell's `audio stop`.
+    started: [Option<Backend>; 2],
 }
 
 impl Choice {
-    const NONE: Choice = Choice { chosen: None, saved_chosen: None, output: None, saved_output: None };
+    const NONE: Choice = Choice { chosen: None, saved_chosen: None, output: None, saved_output: None, started: [None; 2] };
 }
 
 static mut CHOICES: [Choice; 1 + crate::tasks::MAX_SERVICES] = [Choice::NONE; 1 + crate::tasks::MAX_SERVICES];
@@ -259,6 +263,13 @@ pub fn use_device_for_tape(number: u32) -> i32 {
 
 /// The ordinary starter for the shell and tapes. The error strings are the ones `start_for_tape` maps to codes.
 pub fn start(rate: u32, capture: bool, playback: bool) -> Result<(), &'static str> {
+    let started = [active().filter(|_| capture), output().filter(|_| playback)];
+    start_both(rate, capture, playback)?;
+    mine().started = started;
+    Ok(())
+}
+
+fn start_both(rate: u32, capture: bool, playback: bool) -> Result<(), &'static str> {
     if !split() {
         return start_on(active(), rate, capture, playback);
     }
@@ -296,6 +307,8 @@ fn stop_backend(backend: Backend, capture: bool, playback: bool) {
 
 /// Stops the streams on the devices the running context uses (its input and its output), and nobody else's: a service's
 /// stream goes on when the foreground tape ends.
+/// Stops this context's streams. `started` is kept: a tape whose stream the shell stopped (on mf they share a context) then
+/// reads `AUDIO_STATE_STOPPED` from `audio_state`; `stop_for_tape` clears it.
 pub fn stop_mine() {
     let input = active();
     let out = output();
@@ -566,10 +579,39 @@ pub fn select_for_tape(capture: bool, mode: u32) -> i32 {
     code(select(capture, mode).map_err(|reason| if reason.starts_with("no such mode") { "mode" } else { reason }))
 }
 
+/// Tape ABI `audio_state`: whether the streams the running context started still run; when one does not, why (a device
+/// that is gone, else what its driver says).
+pub fn state() -> i32 {
+    let mut result = AUDIO_STATE_IDLE;
+    for backend in mine().started.into_iter().flatten() {
+        let state = if !available(backend) {
+            AUDIO_STATE_LOST
+        } else {
+            match backend {
+                Backend::Usb(unit) if !usb::connected(unit) => AUDIO_STATE_LOST,
+                Backend::Usb(unit) => if usb::running(unit) { AUDIO_STATE_RUNNING } else { AUDIO_STATE_STOPPED },
+                Backend::Hda(index) => if hda::running(index) { AUDIO_STATE_RUNNING } else { AUDIO_STATE_STOPPED },
+                Backend::Ext(slot) => ext::slot(slot).state(),
+                Backend::Loop(_) => AUDIO_STATE_RUNNING,
+            }
+        };
+        if state < 0 {
+            return state;
+        }
+        result = AUDIO_STATE_RUNNING;
+    }
+    result
+}
+
+pub extern "C" fn api_audio_state() -> i32 {
+    state()
+}
+
 /// A tape that returns (or was aborted) must not leave a stream running, or its big capture ring allocated.
 pub fn stop_for_tape() {
     usb::set_capture_ring(0);
     stop_mine();
+    mine().started = [None; 2];
     // A device the tape picked is not the operator's choice: put the operator's back.
     if let Some(before) = mine().saved_chosen.take() {
         mine().chosen = before;

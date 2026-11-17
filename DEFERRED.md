@@ -723,3 +723,18 @@ Tapes see just another NIC, so `tape-ip`, DHCP, `smbd`, `httpd` and `router` nee
   (`tools/check_md_mdadm.sh`) and the QEMU test (`make test-mf-md`) are the evidence so far; the resume-a-half-rebuild
   steps of the cross-check were added after its last run.
 - **PPL** logs one piece (up to 32 KiB) per flushed write; entries cannot share a flush (see `docs/md.md` 5d).
+
+## USB hotplug from port-change events (planned 2026-11-17)
+
+Today a USB device that goes away is noticed by asking: `usb rescan` looks at the root ports' connect-change bits and asks
+each hub, storage asks before every transfer, and since tape ABI 40 `audio_state` reads the audio device's root-port
+connect bit once a second (`usb_audio::connected`). Gaps: an audio device pulled from behind a hub that stays plugged
+reads as present until `usb rescan`, and nothing is torn down (keyboards, MIDI, serial, disks) until someone asks.
+
+The plan: handle the xHCI Port Status Change Event (and the EHCI port-change interrupt) when it arrives, plus each hub's
+status-change interrupt endpoint (not listened to today), and run the departure hooks (`usb_class::*_departed_all`)
+and re-enumeration from there. Constraints: the event arrives in interrupt context, where nothing may lock, print or
+allocate, so teardown is queued and done by the shell loop / a tape call (embedded) or a kernel thread (mf); teardown
+must not race an in-flight disk transfer or audio refill (mf has several CPUs); `test-usb-replug` and
+`test-usb-kbd-replug` pin today's behaviour and change with it. Verify on the real hubs (Realtek 0bda:0401, the AMD
+board's EHCI) before trusting it. The once-a-second audio check can go then.

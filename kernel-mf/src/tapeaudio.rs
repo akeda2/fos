@@ -137,3 +137,8 @@ pub fn float() -> u64 {
     let _usb = pin();
     u64::from(audio::api_audio_float())
 }
+
+pub fn state() -> i32 {
+    let _usb = pin();
+    audio::state()
+}

@@ -693,6 +693,67 @@ pub fn audio_float_of(table: &TapeApi) -> (bool, bool) {
     (bits & fosfor_abi::tape::AUDIO_FLOAT_CAPTURE != 0, bits & fosfor_abi::tape::AUDIO_FLOAT_PLAYBACK != 0)
 }
 
+/// Whether the audio streams this tape started still run (ABI 40, `AUDIO_STATE_*`); `AUDIO_STATE_RUNNING` on an older
+/// kernel, which cannot say.
+pub fn audio_state() -> i32 {
+    audio_state_of(api())
+}
+
+/// `audio_state` for a tape that holds its `TapeApi` table.
+pub fn audio_state_of(table: &TapeApi) -> i32 {
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, audio_state) + core::mem::size_of::<usize>();
+    if table.version < 40 || (table.size as usize) < end {
+        return fosfor_abi::tape::AUDIO_STATE_RUNNING;
+    }
+    (table.audio_state)()
+}
+
+/// Why the stream a tape started has ended, for its message (`None` while it runs or nothing was started). A tape whose
+/// `audio_read` keeps returning 0 asks this now and then (about once a second is plenty): a driver that ended the stream
+/// (clock change, unplug) delivers nothing more, and only this tells the difference from "nothing yet".
+pub fn audio_ended_of(table: &TapeApi) -> Option<&'static str> {
+    use fosfor_abi::tape::{AUDIO_STATE_CLOCK, AUDIO_STATE_LOST};
+    match audio_state_of(table) {
+        state if state >= 0 => None,
+        AUDIO_STATE_LOST => Some("the audio device went away"),
+        AUDIO_STATE_CLOCK => Some("the audio device's external clock changed rate"),
+        _ => Some("the audio stream was stopped"),
+    }
+}
+
+/// `audio_ended_of` on this tape's table.
+pub fn audio_ended() -> Option<&'static str> {
+    audio_ended_of(api())
+}
+
+/// Asks `audio_ended_of` at most once a second from a tape's audio loop: `poll` is cheap to call every pass and true once
+/// the stream has ended, with the reason in `ended` for the message after the loop (never print inside it).
+pub struct AudioWatch {
+    next: u64,
+    pub ended: Option<&'static str>,
+}
+
+impl AudioWatch {
+    pub fn new() -> Self {
+        Self { next: micros() + 1_000_000, ended: None }
+    }
+
+    pub fn poll(&mut self, table: &TapeApi) -> bool {
+        let now = micros();
+        if now >= self.next {
+            self.next = now + 1_000_000;
+            self.ended = audio_ended_of(table);
+        }
+        self.ended.is_some()
+    }
+}
+
+impl Default for AudioWatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn gpio_table() -> Option<&'static TapeApi> {
     let table = api();
     let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, gpio_function) + core::mem::size_of::<usize>();

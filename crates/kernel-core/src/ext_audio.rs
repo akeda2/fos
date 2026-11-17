@@ -30,6 +30,9 @@ pub struct Ops {
     pub identity: fn() -> (u32, u32, u16, u16),
     /// Whether capture (true) or playback carries 32-bit IEEE floats: the running stream's mode, else the chosen one.
     pub float: fn(bool) -> bool,
+    /// Tape ABI `audio_state` for a stream that was started: `AUDIO_STATE_RUNNING`, or why the driver ended it (a negative
+    /// `AUDIO_STATE_*`).
+    pub state: fn() -> i32,
 }
 
 /// One registered device, or none.
@@ -100,6 +103,9 @@ impl Slot {
     }
     pub fn fill_info(&self, info: &mut AudioInfo) -> bool {
         self.ops().is_some_and(|ops| (ops.fill_info)(info))
+    }
+    pub fn state(&self) -> i32 {
+        self.ops().map_or(fosfor_abi::tape::AUDIO_STATE_LOST, |ops| (ops.state)())
     }
     pub fn fill_stats(&self, stats: &mut AudioStats) {
         if let Some(ops) = self.ops() {

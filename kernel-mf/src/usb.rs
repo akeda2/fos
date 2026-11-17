@@ -85,7 +85,7 @@ static HOST: Host = Host {
     poll: poll_nowait,
 };
 
-static AUDIO: Class = Class { ehci_departed: Some(usb_audio::ehci_departed), irq_event: Some(usb_audio::irq_event), ehci_event: Some(usb_audio::ehci_event), ..NONE };
+static AUDIO: Class = Class { xhci_departed: Some(usb_audio::xhci_departed), ehci_departed: Some(usb_audio::ehci_departed), irq_event: Some(usb_audio::irq_event), ehci_event: Some(usb_audio::ehci_event), ..NONE };
 static MIDI: Class = Class { release: Some(usb_midi::release), background_event: Some(usb_midi::background_event), ..NONE };
 static POINTER: Class = Class { release: Some(usb_pointer::release), background_event: Some(usb_pointer::background_event), ..NONE };
 static SERIAL: Class = Class {

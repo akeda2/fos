@@ -148,6 +148,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let out_frame = out_channels * out_slot;
     let (mut frame, mut staged, mut sent) = (0usize, 0usize, 0usize);
     let mut aborted = false;
+    let mut watch = tape_rt::AudioWatch::new();
     while frame < frames || sent < staged {
         // Convert as many frames as fit into the staging buffer once the previous batch is out.
         if sent == staged && frame < frames {
@@ -192,8 +193,16 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             break;
         }
         if accepted == 0 {
+            // A driver that ended the stream takes nothing more.
+            if watch.poll(api) {
+                aborted = true;
+                break;
+            }
             tape_rt::idle();
         }
+    }
+    if let Some(reason) = watch.ended {
+        println!("play: {reason}; stopping.");
     }
     // Underruns are counted up to the moment the ring runs empty: the silence the device is fed while the last packets finish
     // is not one, and would show as about 300 ms worth of them.

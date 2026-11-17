@@ -161,6 +161,7 @@ static I2S: kernel_core::i2s::Ops = kernel_core::i2s::Ops {
     buffer_info: crate::i2s_pi::buffer_info,
     identity: || (fosfor_abi::tape::AUDIO_KIND_I2S, 0, 0, 0),
     float: |_| false,
+    state: || fosfor_abi::tape::AUDIO_STATE_RUNNING,
 };
 
 static DSI: kernel_core::screen::Dsi = kernel_core::screen::Dsi {

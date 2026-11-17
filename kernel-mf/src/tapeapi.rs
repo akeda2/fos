@@ -32,7 +32,8 @@ const MAP_DESCRIPTOR: u64 = 48;
 pub const ARGS_MAX: usize = 4096;
 /// System call numbers from here up are table slots.
 pub const CALL_BASE: u64 = 0x100;
-const STUBS: usize = 128;
+/// The stubs `arch/*/usermode.rs` assembles (`.rept`): 16 bytes each, all in the shim's one page.
+const STUBS: usize = 192;
 const SLOTS: usize = size_of::<TapeApi>() / 8;
 const _: () = assert!(size_of::<TapeApi>() % 8 == 0 && SLOTS <= STUBS);
 
@@ -124,6 +125,7 @@ const AUDIO_DEVICES: u64 = slot(offset_of!(TapeApi, audio_devices));
 const AUDIO_USE_DEVICE: u64 = slot(offset_of!(TapeApi, audio_use_device));
 const AUDIO_USE_OUTPUT: u64 = slot(offset_of!(TapeApi, audio_use_output));
 const AUDIO_FLOAT: u64 = slot(offset_of!(TapeApi, audio_float));
+const AUDIO_STATE: u64 = slot(offset_of!(TapeApi, audio_state));
 const FS_STREAM_OPEN: u64 = slot(offset_of!(TapeApi, fs_stream_open));
 const FS_STREAM_WRITE: u64 = slot(offset_of!(TapeApi, fs_stream_write));
 const FS_STREAM_CLOSE: u64 = slot(offset_of!(TapeApi, fs_stream_close));
@@ -194,6 +196,9 @@ fn stub_address(slot: u64) -> u64 {
 /// Maps the shim, the table and the args page into `root`. `Some(())` on success; the frames belong to the address space.
 pub fn map_support(root: u64, args: &[u8]) -> Option<()> {
     let shim = unsafe { core::slice::from_raw_parts(&tape_shim_start as *const u8, &tape_shim_end as *const u8 as usize - &tape_shim_start as *const u8 as usize) }; // kernel-memory
+    if shim.len() > 4096 {
+        return None; // the stubs no longer fit the shim's page
+    }
     let code = pmm::allocate(1, None)?;
     unsafe { core::ptr::copy_nonoverlapping(shim.as_ptr(), vm::direct(code) as *mut u8, shim.len()) }; // kernel-memory
     crate::usermode::sync_code(vm::direct(code), shim.len() as u64);
@@ -382,6 +387,7 @@ pub fn call(frame: &mut Frame) {
         AUDIO_USE_DEVICE => tapeaudio::use_device(a) as u64,
         AUDIO_USE_OUTPUT => tapeaudio::use_output(a) as u64,
         AUDIO_FLOAT => tapeaudio::float(),
+        AUDIO_STATE => tapeaudio::state() as i64 as u64,
         FS_READ => tapefs::read(a, b, c, d) as u64,
         VFS_STAT => tapefs::vfs_stat(a, b, c) as u64,
         VFS_READ_DIR => tapefs::vfs_read_dir(a, b, c, d) as u64,

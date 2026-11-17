@@ -523,6 +523,7 @@ pub fn serve(api: &'static TapeApi, options: &Options) {
     server.history.keep = ((u64::from(options.prebuffer_ms) * 1000).div_ceil(frame_us) as usize).min(40);
     let started = tape_rt::micros();
     crate::stats::get().rate = RATE;
+    let mut watch = tape_rt::AudioWatch::new();
     // The prints above took a while and capture has been running: audio from before now would go out as one burst.
     if options.tone.is_none() {
         while (api.audio_read)(capture.as_mut_ptr(), capture.len()) != 0 {}
@@ -551,6 +552,9 @@ pub fn serve(api: &'static TapeApi, options: &Options) {
             held >= capture_bytes
         };
         if !ready {
+            if options.tone.is_none() && watch.poll(api) {
+                break;
+            }
             if !busy {
                 tape_rt::idle();
             }
@@ -595,6 +599,9 @@ pub fn serve(api: &'static TapeApi, options: &Options) {
     }
     if capture_bytes != 0 {
         (api.free)(capture_address, capture_bytes * 2);
+    }
+    if let Some(reason) = watch.ended {
+        println!("audio-net: {reason}; stopping.");
     }
     println!("Served {} connection(s); {} audio pages were dropped because a client was behind.", server.connections, server.dropped_total());
 }

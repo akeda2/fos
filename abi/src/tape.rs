@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`. Version 20 added `gfx_screens` and the `gfx_*_on` calls (a screen number). Version 21 added `audio_float`. Version 22 added the `gpio_*` calls. Version 23 added `i2c_speed` and `i2c_transfer`. Version 24 added `touch_info` and `touch_read`. Version 25 added `midi_read` and `midi_send`. Version 26 added `midi_devices`. Version 27 added `nic_owned`. Version 28 added `gpio_pull_get`. Version 32 added the `vfs_*` calls. Version 33 added `random`. Version 34 added the `vfs_*` change calls (`vfs_create`, `vfs_write`, `vfs_truncate`, `vfs_remove`, `vfs_rename`, `vfs_set_owner`). Version 35 added the `remote_*` calls (a tape serves a volume named `//NAME`). Version 36 added `vfs_sync`. Version 37 added the thread calls (`thread_spawn`, `thread_join`, `futex_wait`, `futex_wake`). Version 38 added the shell session calls (`session_open`, `session_write`, `session_read`, `session_close`). Version 39 added `resolve_path`.
-pub const TAPE_API_VERSION: u32 = 39;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`. Version 20 added `gfx_screens` and the `gfx_*_on` calls (a screen number). Version 21 added `audio_float`. Version 22 added the `gpio_*` calls. Version 23 added `i2c_speed` and `i2c_transfer`. Version 24 added `touch_info` and `touch_read`. Version 25 added `midi_read` and `midi_send`. Version 26 added `midi_devices`. Version 27 added `nic_owned`. Version 28 added `gpio_pull_get`. Version 32 added the `vfs_*` calls. Version 33 added `random`. Version 34 added the `vfs_*` change calls (`vfs_create`, `vfs_write`, `vfs_truncate`, `vfs_remove`, `vfs_rename`, `vfs_set_owner`). Version 35 added the `remote_*` calls (a tape serves a volume named `//NAME`). Version 36 added `vfs_sync`. Version 37 added the thread calls (`thread_spawn`, `thread_join`, `futex_wait`, `futex_wake`). Version 38 added the shell session calls (`session_open`, `session_write`, `session_read`, `session_close`). Version 39 added `resolve_path`. Version 40 added `audio_state`.
+pub const TAPE_API_VERSION: u32 = 40;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -478,7 +478,22 @@ pub struct TapeApi {
     /// (the embedded kernels have no working folder: use the name as typed) or `RESOLVE_TOO_LONG`. The file calls themselves
     /// do not apply the folder, so configuration files a tape reads by fixed name stay where they are.
     pub resolve_path: extern "C" fn(*const u8, usize, *mut u8, usize) -> isize,
+    /// `audio_state()` (version 40): whether the streams this tape started still run. `audio_read` returning 0 only says
+    /// "nothing yet"; a tape that gets 0 for a while asks this to learn that the driver ended the stream (the device's
+    /// external clock changed rate, it was unplugged). `AUDIO_STATE_RUNNING`, `AUDIO_STATE_IDLE` (nothing started, or
+    /// `audio_stop`), or a negative `AUDIO_STATE_*` reason. The stream stays ended: the tape stops or starts it again.
+    pub audio_state: extern "C" fn() -> i32,
 }
+
+/// `audio_state` results (version 40): the ended states are negative.
+pub const AUDIO_STATE_RUNNING: i32 = 0;
+pub const AUDIO_STATE_IDLE: i32 = 1;
+/// The device went away (unplugged).
+pub const AUDIO_STATE_LOST: i32 = -1;
+/// The device follows an external clock that changed to another rate than the stream's.
+pub const AUDIO_STATE_CLOCK: i32 = -2;
+/// Stopped by someone else (the driver, the operator).
+pub const AUDIO_STATE_STOPPED: i32 = -3;
 
 /// `resolve_path` results (version 39), all negative.
 pub const RESOLVE_UNSUPPORTED: isize = -1;

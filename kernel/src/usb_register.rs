@@ -19,6 +19,7 @@ static HOST: Host = Host {
 };
 
 static AUDIO: Class = Class {
+    xhci_departed: Some(crate::usb_audio::xhci_departed),
     ehci_departed: Some(crate::usb_audio::ehci_departed),
     irq_event: Some(crate::usb_audio::irq_event),
     ehci_event: Some(crate::usb_audio::ehci_event),

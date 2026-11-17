@@ -144,7 +144,7 @@ tape_thread_start:                   # another thread: rdi = its entry point, rs
     .balign 16
 tape_shim_stubs:
     .set slot, 0
-    .rept 128
+    .rept 192
     mov r10, rcx
     mov eax, 0x100 + slot
     syscall

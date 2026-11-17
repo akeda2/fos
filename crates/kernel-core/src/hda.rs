@@ -1465,6 +1465,14 @@ pub fn stop(index: usize) {
     }
 }
 
+/// Whether a stream runs on the controller (`audio_state`).
+pub fn running(index: usize) -> bool {
+    index < count() && {
+        let hda = controller(index);
+        hda.capture.active.load(Ordering::Acquire) || hda.playback.active.load(Ordering::Acquire)
+    }
+}
+
 pub fn read(index: usize, out: &mut [u8]) -> usize {
     let hda = controller(index);
     if !hda.capture.active.load(Ordering::Acquire) {

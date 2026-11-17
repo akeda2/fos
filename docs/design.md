@@ -1285,6 +1285,21 @@ screen of swapped width and height (`gfx_info`, fill and blit rotate onto the fr
 is cut on that logical screen, so `rotate=r split=v` gives two squarish areas. The `rotate r|l|flip|off` setting makes it permanent (the Pi's second screen has `rotate1`, and `rotate all|0|1 MODE` picks the screens, and a `rotate=` on a `+`/`|` group turns the physical screen that group draws on);
 the text console is not rotated. `make test-split` checks all four layouts.
 
+### When the stream ends under a tape (ABI 40, `audio_state`)
+
+`audio_read` returning 0 means "nothing yet", so a tape could not tell a stream that a driver ended (an external clock
+changing rate, a device unplugged, the shell's `audio stop` on mf) from one that is only slow, and waited forever.
+`audio_state` answers for the streams the calling context started: `AUDIO_STATE_RUNNING`, `IDLE` (nothing started),
+or a negative reason: `LOST` (the device is gone), `CLOCK` (its external clock changed rate), `STOPPED`. The facade
+(`kernel-core/src/audio.rs`) remembers the backend each direction was started on; USB audio and HD Audio say whether
+the stream still exists, an external driver answers through `ext_audio::Ops.state`. `tape_rt::AudioWatch` asks at
+most once a second from an audio loop and keeps the reason for the message after the loop; `record`, `play`,
+`recorder` and `audio-net` (raw/AVTP/RTP, Opus, `serve`) end cleanly with it. An older kernel reads as RUNNING.
+An unplugged xHCI audio device reads LOST through its root port's connect bit (`usb_audio::connected`; one behind a hub
+that stays only after `usb rescan`, which now forgets it, `usb_audio::xhci_departed`); EHCI forgets it at once.
+`make test-usb-audio` pulls the device under `play`; `make test-mf-audio` stops a background `play`'s device from the
+shell. Hotplug from port-change events is planned (`DEFERRED.md`).
+
 ### Native float audio (ABI 21, crates/audio-sample, crates/audio-wire)
 
 One USB audio driver (`usb_audio.rs`) serves both kernels and now detects 32-bit IEEE float streams (alt settings with

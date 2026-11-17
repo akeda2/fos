@@ -18,6 +18,9 @@ pub fn start(_index: usize, _rate: u32, _capture: bool, _playback: bool) -> Resu
     Err("no HD Audio on this machine")
 }
 pub fn stop(_index: usize) {}
+pub fn running(_index: usize) -> bool {
+    false
+}
 pub fn read(_index: usize, _out: &mut [u8]) -> usize {
     0
 }

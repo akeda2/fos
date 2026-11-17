@@ -65,6 +65,7 @@ def main():
             check(False, "QEMU's WAV backend recorded the stream", "no wav file")
     play_tapes_test()
     two_devices_test()
+    unplug_test()
     print("usb audio: all checks passed")
 
 
@@ -154,6 +155,71 @@ def play_tapes_test():
             crossings = sum(1 for x, y in zip(part, part[1:]) if x < 0 <= y)
             frequency = crossings * rate / len(part)
             check(abs(frequency - wanted) < 20, f"{'the first' if wanted == 440 else 'the last'} second is {frequency:.0f} Hz (wanted {wanted})", "")
+
+
+def unplug_test():
+    """The device is pulled (QEMU monitor `device_del`) while `play` streams to it: `audio_state` (ABI 40) reads the root
+    port's connect bit, so the tape ends by itself within about a second; `usb rescan` then forgets the device."""
+    import os
+    import select
+    import shutil
+    import subprocess
+    import time
+    from test_boot import CODE_CANDIDATES, ROOT, VARS_CANDIDATES, clean, find, monitor_output
+    loader = ROOT / "build/cargo-target/x86_64-unknown-uefi/release/fosfor-loader.efi"
+    kernel = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fosfor-kernel"
+    code, variables = find("FOS_OVMF_CODE", CODE_CANDIDATES), find("FOS_OVMF_VARS", VARS_CANDIDATES)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        write_wav(tmp / "long.wav", 48_000, 2, 2, 440, 20)
+        image = tmp / "unplug.img"
+        subprocess.run([sys.executable, str(ROOT / "tools/build_image.py"), "--loader", str(loader), "--kernel", str(kernel), "--output", str(image),
+                        "--file", f"play={ROOT / 'build/fosfor/tapes/play'}", "--file", f"long.wav={tmp / 'long.wav'}"], check=True, capture_output=True)
+        shutil.copy(variables, tmp / "vars.fd")
+        monitor = str(tmp / "monitor")
+        process = subprocess.Popen(
+            ["qemu-system-x86_64", "-machine", "q35", "-m", "512", "-display", "none", "-serial", "stdio", "-no-reboot",
+             "-monitor", f"unix:{monitor},server,nowait",
+             "-drive", f"if=pflash,format=raw,readonly=on,file={code}", "-drive", f"if=pflash,format=raw,file={tmp / 'vars.fd'}",
+             "-drive", f"format=raw,file={image}", "-device", "qemu-xhci,id=xhci", "-audiodev", "none,id=snd",
+             "-device", "usb-audio,audiodev=snd,id=speaker"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        raw = bytearray()
+
+        def wait_for(marker, timeout=60, since=0):
+            end = time.monotonic() + timeout
+            while marker not in clean(bytes(raw))[since:]:
+                if time.monotonic() > end or process.poll() is not None:
+                    raise SystemExit(f"FAIL: never saw {marker!r}\n{clean(bytes(raw))[since:][-2500:]}")
+                if select.select([process.stdout], [], [], 0.1)[0]:
+                    raw.extend(os.read(process.stdout.fileno(), 4096))
+
+        def send(line):
+            mark = len(clean(bytes(raw)))
+            process.stdin.write(line.encode() + b"\n")
+            process.stdin.flush()
+            return mark
+
+        try:
+            wait_for("fos> ")
+            mark = send("run play long.wav")
+            wait_for("Playing long.wav", 30, mark)
+            time.sleep(2)
+            pulled = time.monotonic()
+            monitor_output(monitor, "device_del speaker")
+            wait_for("play: the audio device went away; stopping.", 10, mark)
+            took = time.monotonic() - pulled
+            wait_for("fos> ", 15, mark + len("run play long.wav"))
+            check(took < 4, f"`play` noticed the unplugged device by itself ({took:.1f} s after the pull)", "")
+            mark = send("usb rescan")
+            wait_for("fos> ", 30, mark + len("usb rescan"))
+            mark = send("audio")
+            wait_for("fos> ", 15, mark + len("audio"))
+            listing = clean(bytes(raw))[mark:]
+            check("USB audio on xHCI" not in listing, "after `usb rescan` the pulled device is no longer listed", listing[-800:])
+        finally:
+            process.kill()
+            process.wait()
 
 
 def boot_with_commands(extra, commands, image=None):

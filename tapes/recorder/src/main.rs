@@ -783,6 +783,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let started = tape_rt::micros();
     let (mut produced, mut phase, mut phase2) = (0u64, 0u32, 0u32);
     let mut next_status = started;
+    let mut watch = tape_rt::AudioWatch::new();
     let mut next_meters = started;
     let mut quit = false;
     let mut toggle = false;
@@ -1060,6 +1061,10 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             next_status = now + 250_000;
             draw_status(&app, &ring, &detector, auto, &options, now, started);
         }
+        // A driver that ended the stream (clock change, unplug) delivers nothing more: close the take and quit.
+        if options.tone.is_none() && watch.poll(api) {
+            break;
+        }
     }
 
     app.cancel_speed_test();
@@ -1078,6 +1083,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     }
     at(meters.footer_row() + 4, 1);
     draw!("\x1b[J");
+    if let Some(reason) = watch.ended {
+        println!("recorder: {reason}; the take was closed.");
+    }
     println!("recorder: {} file(s) written{}; {} transfer error(s), {} overrun(s).", app.next_number - 1, if app.errors > 0 { " (with errors)" } else { "" }, stats_errors, stats_overruns);
 }
 

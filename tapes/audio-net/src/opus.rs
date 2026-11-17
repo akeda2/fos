@@ -120,6 +120,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     let started = tape_rt::micros();
     let mut next_report = started + 1_000_000;
     let (mut bytes_total, mut encode_total, mut encode_max) = (0u64, 0u64, 0u64);
+    let mut watch = tape_rt::AudioWatch::new();
     // The prints above took a while and capture has been running: audio from before now would go out as one burst.
     if options.tone.is_none() {
         while (api.audio_read)(capture.as_mut_ptr(), capture.len()) != 0 {}
@@ -138,6 +139,9 @@ pub fn send(api: &'static TapeApi, options: &Options) {
             held >= capture_bytes
         };
         if !ready {
+            if options.tone.is_none() && watch.poll(api) {
+                break;
+            }
             tape_rt::idle();
             continue;
         }
@@ -196,6 +200,9 @@ pub fn send(api: &'static TapeApi, options: &Options) {
         (api.free)(capture_address, capture_bytes * 2);
     }
     println!();
+    if let Some(reason) = watch.ended {
+        println!("audio-net: {reason}; stopping.");
+    }
     transport.announce_stop(api, options.nic);
     println!("Sent {sent} frames x {streams} stream(s); {} bytes of Opus ({} kbit/s); encoding took {} us per frame on average, {} us at worst.", bytes_total, bytes_total * 8 * 1000 / (sent.max(1) * frame_us) , encode_total / sent.max(1), encode_max);
 }
@@ -281,9 +288,14 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     let started = tape_rt::micros();
     let mut next_report = started + 1_000_000;
     let mut level;
+    let mut watch = tape_rt::AudioWatch::new();
     let mut trimming = false;
     loop {
         if (api.should_abort)() != 0 || (options.seconds != 0 && tape_rt::micros() >= started + options.seconds * 1_000_000) {
+            break;
+        }
+        // A driver that ended the playback stream takes nothing more.
+        if watch.poll(api) {
             break;
         }
         transport.igmp_service(api, options.nic, None);
@@ -485,6 +497,9 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     (api.audio_stats)(&mut stats);
     (api.audio_stop)();
     println!();
+    if let Some(reason) = watch.ended {
+        println!("audio-net: {reason}; stopping.");
+    }
     println!("Delay sender capture to playback ring: about {} ms (one frame plus {} ms queued); the device adds its own buffer.", crate::stats::get().delay_ms(), crate::stats::get().level_frames * 1000 / RATE);
     println!("Received {packets} Opus packets: {lost} lost ({concealed} concealed), {dropped} frame(s) discarded, {bad} undecodable, clock offset learned {} ppm; playback {} packets, {} underruns, {} transfer errors.", servo.offset_ppm(), stats.playback_packets, crate::stats::get().underrun_last.saturating_sub(crate::stats::get().underrun_base), stats.playback_errors);
 }

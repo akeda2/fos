@@ -3,7 +3,9 @@
 16-bit WAV through the shared audio facade onto QEMU's intel-hda codec; QEMU's WAV backend records it and the recording must
 hold the 440 Hz tone, at -smp 1, 2 and 8 (the tape is pinned to CPU 0 by its first audio call). Then `record` runs against
 the `none` backend (silence): it must start, run and end cleanly, and a second `play` after it works (the stream was
-released). USB audio is checked on real hardware only."""
+released). Then `audio_state` (ABI 40): `play` runs a long file in the background on QEMU's usb-audio and the shell stops the
+device's stream; the tape must notice (its writes are no longer taken) and end by itself, saying why.
+USB audio capture is checked on real hardware only."""
 import os
 import select
 import subprocess
@@ -89,6 +91,53 @@ def run(smp, tmp, usb=False):
     return None
 
 
+def stopped_under_tape(tmp):
+    """`audio stop` from the shell while `play` runs in the background: the tape's `audio_state` reads STOPPED and it ends."""
+    wav_in = tmp / "long.wav"
+    write_wav(wav_in, 48_000, 2, 2, 440, 20)
+    image = tmp / "stopped.img"
+    subprocess.run([sys.executable, str(ROOT / "tools/build_image.py"), "--loader", str(LOADER), "--kernel", str(KERNEL), "--output", str(image),
+                    "--bios-stage1", str(ROOT / "build/bios/stage1.bin"), "--bios-stage2", str(ROOT / "build/bios/stage2.bin"),
+                    "--file", f"play={TAPES / 'play'}", "--file", f"long.wav={wav_in}"], check=True, capture_output=True)
+    qemu = subprocess.Popen(
+        ["qemu-system-x86_64", "-cpu", "max", "-machine", "q35", "-m", "512", "-smp", "2", "-display", "none", "-serial", "stdio",
+         "-monitor", "none", "-no-reboot", "-audiodev", "none,id=snd", "-device", "qemu-xhci", "-device", "usb-audio,audiodev=snd",
+         "-drive", f"if=pflash,format=raw,readonly=on,file={CODE}", "-drive", f"format=raw,file={image},snapshot=on"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    log = b""
+
+    def wait_for(text, timeout, start=0):
+        nonlocal log
+        end = time.time() + timeout
+        while time.time() < end:
+            if text.encode() in log[start:]:
+                return True
+            if select.select([qemu.stdout], [], [], 0.2)[0]:
+                log += os.read(qemu.stdout.fileno(), 4096)
+        return text.encode() in log[start:]
+
+    def send(line):
+        qemu.stdin.write(f"{line}\n".encode())
+        qemu.stdin.flush()
+
+    try:
+        if not wait_for("fos> ", 150):
+            return "no shell prompt:\n" + log[-800:].decode("utf8", "replace")
+        mark = len(log)
+        send("run play long.wav &0")
+        if not wait_for("Playing long.wav", 30, mark):
+            return "play did not start:\n" + log[mark:].decode("utf8", "replace")
+        time.sleep(2)
+        mark = len(log)
+        send("audio stop")
+        if not wait_for("play: the audio stream was stopped; stopping.", 15, mark) or not wait_for("Stopped:", 5, mark):
+            return "play did not notice its stream was stopped:\n" + log[mark:].decode("utf8", "replace")
+    finally:
+        qemu.kill()
+        qemu.wait()
+    return None
+
+
 failed = False
 with tempfile.TemporaryDirectory() as tmp:
     for smp, usb in ((1, False), (2, False), (8, False), (1, True), (2, True), (8, True)):
@@ -97,4 +146,9 @@ with tempfile.TemporaryDirectory() as tmp:
         if problem:
             print(problem)
             failed = True
+    problem = stopped_under_tape(Path(tmp))
+    print(f"audio_state, stream stopped under a tape: {'ok' if problem is None else 'FAIL'}")
+    if problem:
+        print(problem)
+        failed = True
 sys.exit(1 if failed else 0)

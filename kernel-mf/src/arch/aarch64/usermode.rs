@@ -145,7 +145,7 @@ tape_thread_start:                   // another thread: x0 = its entry point, x1
     .balign 16
 tape_shim_stubs:
     .set slot, 0
-    .rept 128
+    .rept 192
     mov x8, #0x100 + slot
     svc #0
     ret

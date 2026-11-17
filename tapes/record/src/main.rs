@@ -124,6 +124,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let block = unsafe { &mut *(&raw mut BLOCK_BUFFER) };
     let mut failed = 0;
     let (mut aborted, mut full) = (false, false);
+    let mut watch = tape_rt::AudioWatch::new();
     let mut next_report = tape_rt::micros() + 1_000_000;
     let mut next_checkpoint = tape_rt::micros() + 2_000_000;
     let (started, mut produced, mut phase) = (tape_rt::micros(), 0u64, 0u32);
@@ -171,6 +172,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         if now >= next_report {
             next_report += 1_000_000;
             print!(".");
+            if tone.is_none() && watch.poll(api) {
+                break;
+            }
         }
         if now >= next_checkpoint {
             next_checkpoint = now + 2_000_000;
@@ -186,6 +190,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         (api.audio_stop)();
     }
     println!();
+    if let Some(reason) = watch.ended {
+        println!("record: {reason}; stopping.");
+    }
     // The unwritten rest, the final header and the final length.
     let summary = recorder.finish();
     (api.free)(staging_address, CHUNK);
@@ -196,7 +203,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                 "Recorded {} frames ({} s){}{}; {} transfer error(s), {} overrun(s).",
                 summary.frames,
                 summary.frames / u64::from(rate),
-                if aborted { ", stopped early" } else { "" },
+                if aborted || watch.ended.is_some() { ", stopped early" } else { "" },
                 if full { ", the reserved space ran out" } else { "" },
                 stats.capture_errors,
                 stats.capture_overruns

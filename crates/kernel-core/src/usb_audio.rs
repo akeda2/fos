@@ -702,6 +702,23 @@ pub fn present(unit: usize) -> bool {
     audio(unit).is_some()
 }
 
+/// Whether a stream runs on the unit (`audio_state`): `stop` takes them away.
+pub fn running(unit: usize) -> bool {
+    audio(unit).is_some_and(|device| device.capture.is_some() || device.playback.is_some())
+}
+
+/// Whether the unit's device is still plugged in, as far as one register read can tell (`audio_state`, once a second): on
+/// xHCI its root port's Current Connect Status (PORTSC bit 0), which also drops when a hub above it is pulled. A device that
+/// went away behind a hub that stays leaves the root port connected and reads as present until `usb rescan`. EHCI devices
+/// are forgotten at once (`ehci_departed`), so a present one is connected.
+pub fn connected(unit: usize) -> bool {
+    match audio(unit).map(|device| device.bus) {
+        Some(Bus::Xhci { device, .. }) => controller(unit).is_some_and(|controller| controller.port_status(device.port) & 1 != 0),
+        Some(Bus::Ehci { .. }) => true,
+        None => false,
+    }
+}
+
 /// Where a unit is attached, for `audio` listings: "USB audio on xHCI port 3" or "USB audio on EHCI 00:1a.0".
 pub fn label(unit: usize) -> impl core::fmt::Display {
     struct Label(Option<Bus>);
@@ -1369,6 +1386,24 @@ pub fn ehci_departed(controller_index: usize, hub_address: u8, hub_port: u8) {
         }
         stop(unit);
         unsafe { (*core::ptr::addr_of_mut!(DEVICES))[unit] = None };
+    }
+}
+
+/// The device on xHCI root port `root_port` of controller `controller_index` (or a hub on it, with everything behind) went
+/// away (`usb rescan` saw the port change): stop its streams while its slot still exists, then forget the unit, so the
+/// facade reports it lost and `audio` no longer lists it.
+pub fn xhci_departed(controller_index: usize, root_port: u8) {
+    for unit in 0..UNITS {
+        let Some(device) = audio(unit) else { continue };
+        let Bus::Xhci { controller_index: index, device: xhci_device, .. } = device.bus else { continue };
+        if index != controller_index || xhci_device.port != root_port {
+            continue;
+        }
+        stop(unit);
+        unsafe {
+            (*core::ptr::addr_of_mut!(DEVICES))[unit] = None;
+            (*core::ptr::addr_of_mut!(SELECTED))[unit] = [None, None];
+        }
     }
 }
 
