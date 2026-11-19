@@ -162,6 +162,7 @@ static I2S: kernel_core::i2s::Ops = kernel_core::i2s::Ops {
     identity: || (fosfor_abi::tape::AUDIO_KIND_I2S, 0, 0, 0),
     float: |_| false,
     state: || fosfor_abi::tape::AUDIO_STATE_RUNNING,
+    mixer: None,
 };
 
 static DSI: kernel_core::screen::Dsi = kernel_core::screen::Dsi {

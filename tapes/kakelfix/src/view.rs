@@ -1,0 +1,367 @@
+//! Drawing: header, soft keys, the Mixer page's three views, the confirm dialog and the mouse cursor. Everything is drawn
+//! each frame onto the plain background layer; positions come from `kakelfix::Layout`.
+
+use crate::{METERS, Shadowed as Hardware};
+use fosfor_abi::tape::{MixerControl, MixerMeter, MIXER_CONTROL_ACTION, MIXER_CONTROL_BOOL, MIXER_CONTROL_ENUM, MIXER_FLAG_HAZARD, MIXER_FLAG_READONLY, MIXER_METER_OVER};
+use gfx::Canvas;
+use gfx::theme::theme;
+use kakelfix::layout::fader_position;
+use kakelfix::{App, Device, Layout, Page, Rect, SOFT_KEYS, SOFT_VIEWS, Text, soft_is_page, View, field, format_db, format_pan};
+use mixer_model::{Group, Strip};
+use core::fmt::Write;
+
+/// Falling meter bars (24 dB per second) with an over light held for 1.5 s.
+pub struct Meters {
+    level: [f32; METERS],
+    over: [f32; METERS],
+    count: usize,
+}
+
+impl Meters {
+    pub fn new() -> Meters {
+        Meters { level: [-144.0; METERS], over: [0.0; METERS], count: 0 }
+    }
+
+    pub fn update(&mut self, readings: &[MixerMeter], seconds: f32) {
+        self.count = readings.len().min(METERS);
+        for (i, reading) in readings.iter().take(METERS).enumerate() {
+            let peak = reading.peak_cdb as f32 / 100.0;
+            self.level[i] = peak.max(self.level[i] - 24.0 * seconds);
+            self.over[i] = if reading.flags & MIXER_METER_OVER as u16 != 0 { 1.5 } else { (self.over[i] - seconds).max(0.0) };
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<(f32, bool)> {
+        (index < self.count).then(|| (self.level[index], self.over[index] > 0.0))
+    }
+}
+
+fn text(canvas: &mut Canvas, layout: &Layout, x: i32, y: i32, s: &str, rgb: u32) -> i32 {
+    canvas.text_scaled(x, y, s, layout.scale, rgb)
+}
+
+/// At most `chars` characters of `s`.
+fn fit(s: &str, chars: i32) -> &str {
+    match s.char_indices().nth(chars.max(0) as usize) {
+        Some((end, _)) => &s[..end],
+        None => s,
+    }
+}
+
+fn centered(canvas: &mut Canvas, layout: &Layout, area: Rect, s: &str, rgb: u32) {
+    let s = fit(s, area.w / layout.col);
+    let width = s.chars().count() as i32 * layout.col;
+    text(canvas, layout, area.x + (area.w - width) / 2, area.y + (area.h - layout.row) / 2, s, rgb);
+}
+
+fn box_(canvas: &mut Canvas, area: Rect, fill: u32, border: u32) {
+    canvas.fill_rect(area.x, area.y, area.w.max(0) as u32, area.h.max(0) as u32, fill);
+    canvas.rect(area.x, area.y, area.w.max(0) as u32, area.h.max(0) as u32, border);
+}
+
+fn level_colour(db: f32) -> u32 {
+    if db > -3.0 {
+        theme().red
+    } else if db > -18.0 {
+        theme().amber
+    } else {
+        theme().green
+    }
+}
+
+pub fn draw(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware, meters: &Meters, pointer: Option<(i32, i32)>) {
+    header(canvas, layout, app, hardware);
+    soft_keys(canvas, layout, app);
+    match app.page {
+        Page::Mixer => match app.view {
+            View::Outputs => outputs(canvas, layout, app, meters),
+            View::Matrix => matrix(canvas, layout, app),
+            View::Device => device(canvas, layout, app, hardware),
+        },
+        Page::Recorder => centered(canvas, layout, layout.body, "Recorder: a later milestone", theme().dim),
+        Page::Analyzer => centered(canvas, layout, layout.body, "Analyzer: a later milestone", theme().dim),
+    }
+    footer(canvas, layout, app);
+    if let Some((index, value)) = app.confirm {
+        dialog(canvas, layout, app, hardware, index, value);
+    }
+    if let Some((x, y)) = pointer {
+        canvas.cursor(x, y, layout.scale + 1, theme().text, theme().background);
+    }
+}
+
+fn header(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware) {
+    let t = theme();
+    let mut line = Text::<96>::new();
+    let page = match (app.page, app.view) {
+        (Page::Mixer, View::Outputs) => "Mixer / Outputs",
+        (Page::Mixer, View::Matrix) => "Mixer / Matrix",
+        (Page::Mixer, View::Device) => "Mixer / Device",
+        (Page::Recorder, _) => "Recorder",
+        (Page::Analyzer, _) => "Analyzer",
+    };
+    let _ = write!(line, "KakelFix  {}  {page}", hardware.device.mixer.title());
+    text(canvas, layout, 8, 4, line.as_str(), t.text);
+    line.clear();
+    if app.page == Page::Mixer && app.view == View::Outputs {
+        let _ = write!(line, "mix sent to output {} (pick the output above)   pan law {}", app.label(&app.output()).as_str(), app.mix.pan_law.name());
+    } else if app.page == Page::Mixer && app.view == View::Matrix {
+        let _ = write!(line, "rows: sources   columns: outputs   pan law {}", app.mix.pan_law.name());
+    }
+    text(canvas, layout, 8, 4 + layout.row, line.as_str(), t.dim);
+    if !app.message.is_empty() {
+        let width = app.message.as_str().chars().count() as i32 * layout.col;
+        text(canvas, layout, layout.keys.x - width - 8, 4 + layout.row, app.message.as_str(), t.amber);
+    }
+    canvas.line(0, layout.header.h - 2, layout.width, layout.header.h - 2, t.grid_major);
+}
+
+/// Pages (Mixer, Recorder, Analyzer) in the page colour; the Mixer's views indented under it, joined to it by a line;
+/// actions (Pair, Pan law, Quit) with a dim frame.
+fn soft_keys(canvas: &mut Canvas, layout: &Layout, app: &App) {
+    let t = theme();
+    let page_colour = t.curves[1];
+    let (mixer_key, last_view) = (layout.soft(0), layout.soft(SOFT_VIEWS.end - 1));
+    let x = mixer_key.x + layout.col / 2;
+    let drop = last_view.y + last_view.h / 2 - mixer_key.y - mixer_key.h;
+    canvas.fill_rect(x, mixer_key.y + mixer_key.h, 2, drop.max(0) as u32, page_colour);
+    for index in SOFT_VIEWS {
+        let area = layout.soft(index);
+        canvas.fill_rect(x, area.y + area.h / 2, (area.x - x).max(0) as u32, 2, page_colour);
+    }
+    for (index, name) in SOFT_KEYS.iter().enumerate() {
+        let mixer = app.page == Page::Mixer;
+        let active = match index {
+            0 => mixer,
+            1 => mixer && app.view == View::Outputs,
+            2 => mixer && app.view == View::Matrix,
+            3 => mixer && app.view == View::Device,
+            4 => app.page == Page::Recorder,
+            5 => app.page == Page::Analyzer,
+            _ => false,
+        };
+        let disabled = !mixer && (6..=7).contains(&index);
+        let area = layout.soft(index);
+        let page = soft_is_page(index);
+        let (frame, label) = if page {
+            (page_colour, page_colour)
+        } else if SOFT_VIEWS.contains(&index) {
+            (if active { t.text } else { t.frame }, t.text)
+        } else {
+            (t.grid_major, t.text)
+        };
+        box_(canvas, area, if active { t.grid_major } else { t.grid }, frame);
+        centered(canvas, layout, area, name, if disabled { t.dim } else if active && page { t.text } else { label });
+    }
+}
+
+fn footer(canvas: &mut Canvas, layout: &Layout, app: &App) {
+    let hint = match (app.page, app.view) {
+        (Page::Mixer, View::Outputs) => "Up/Dn 1 dB  PgUp/PgDn 6  +- 0.1  0 unity  x off  m mute  , . pan  o output  p pair  Tab view  1 2 3 page",
+        (Page::Mixer, View::Matrix) => "arrows select  Enter or click again: open  +- 0.1 dB  0 x m  p P pair  Tab view  1 2 3 page",
+        (Page::Mixer, View::Device) => "Up/Dn select  Left/Right/Enter or click again: change  Tab view  1 2 3 page",
+        _ => "1 Mixer  2 Recorder  3 Analyzer  Esc quits",
+    };
+    text(canvas, layout, 8, layout.footer.y + 4, fit(hint, layout.footer.w / layout.col - 2), theme().dim);
+}
+
+/// Inputs blue, playback green, the output's master amber: the band and the strip labels, so the groups tell apart at a glance.
+fn group_colour(group: Group) -> u32 {
+    match group {
+        Group::Input => theme().curves[0],
+        Group::Playback => theme().curves[2],
+        Group::Output => theme().amber,
+    }
+}
+
+/// Meter numbers (inputs, playback, outputs) of a strip's channels.
+fn meter_channels(app: &App, strip: &Strip) -> core::ops::Range<usize> {
+    let base = match strip.group {
+        Group::Input => 0,
+        Group::Playback => app.mix.n[0],
+        Group::Output => app.mix.n[0] + app.mix.n[1],
+    };
+    base + strip.first..base + strip.first + if strip.stereo { 2 } else { 1 }
+}
+
+fn outputs(canvas: &mut Canvas, layout: &Layout, app: &App, meters: &Meters) {
+    let t = theme();
+    let outputs = app.outputs();
+    for (index, output) in outputs.iter().enumerate() {
+        let Some(area) = layout.tab(index, app) else { continue };
+        let selected = index == app.out_sel;
+        box_(canvas, area, if selected { t.grid_major } else { t.grid }, if selected { t.text } else { t.frame });
+        centered(canvas, layout, area, app.label(output).as_str(), t.text);
+    }
+    let sources = app.sources();
+    let output = app.output();
+    let group_of = |index: usize| sources.get(index).map_or(Group::Output, |strip| strip.group);
+    for index in 0..app.strip_count() {
+        let Some(band) = layout.band(index, app) else { continue };
+        let group = group_of(index);
+        let colour = group_colour(group);
+        let first = index == app.first_strip || group_of(index - 1) != group;
+        let last = index + 1 == app.strip_count() || group_of(index + 1) != group;
+        let width = if last { band.w - 6 } else { band.w };
+        canvas.fill_rect(band.x, band.y + band.h - 3, width as u32, 2, colour);
+        if first {
+            let name = match group {
+                Group::Input => "Inputs (hardware)",
+                Group::Playback => "Playback (from tapes)",
+                Group::Output => "Output",
+            };
+            text(canvas, layout, band.x, band.y - 2, name, colour);
+        }
+    }
+    for index in 0..app.strip_count() {
+        let Some(column) = layout.strip(index, app) else { continue };
+        let selected = index == app.src_sel;
+        box_(canvas, column, if selected { t.grid } else { t.background }, if selected { t.text } else { t.frame });
+        let (db, pan, mute, unknown, is_send) = app.strip_level(index);
+        let strip = sources.get(index).copied().unwrap_or(output);
+        let label = if is_send { app.label(&strip) } else { Text::from("Master") };
+        centered(canvas, layout, layout.label(index, app).unwrap_or(column), label.as_str(), group_colour(group_of(index)));
+        if let Some(area) = layout.pan(index, app) {
+            if is_send {
+                box_(canvas, area, t.off, t.frame);
+                let mid = area.x + area.w / 2;
+                canvas.line(mid, area.y, mid, area.y + area.h - 1, t.grid_major);
+                let at = area.x + ((pan + 1.0) / 2.0 * (area.w - 4) as f64) as i32;
+                canvas.fill_rect(at, area.y + 1, 4, (area.h - 2).max(1) as u32, t.text);
+                centered(canvas, layout, area, format_pan(pan).as_str(), t.dim);
+            }
+        }
+        let Some(fader) = layout.fader(index, app) else { continue };
+        let mid = fader.x + fader.w / 2;
+        canvas.fill_rect(mid - 1, fader.y, 3, fader.h as u32, t.frame);
+        for mark in [6.0, 0.0, -12.0, -30.0, -60.0] {
+            let y = fader.y + fader.h - (fader_position(mark) * fader.h as f64) as i32;
+            let reach = if mark == 0.0 { fader.w / 2 } else { fader.w / 4 };
+            canvas.line(mid - reach, y, mid + reach, y, t.grid_major);
+        }
+        let knob_h = layout.row / 2 + 4;
+        let y = fader.y + fader.h - (fader_position(db) * fader.h as f64) as i32;
+        let fill = if unknown { t.dim } else if mute { t.amber } else if !db.is_finite() { t.off } else { t.text };
+        box_(canvas, Rect::new(fader.x, y - knob_h / 2, fader.w, knob_h), fill, t.frame);
+        canvas.line(fader.x + 2, y, fader.x + fader.w - 3, y, t.background);
+        if let Some(area) = layout.meter(index, app) {
+            let channels = meter_channels(app, &strip);
+            let bars = channels.len() as i32;
+            let bar_w = ((area.w - (bars - 1) * 2) / bars).max(1);
+            for (n, channel) in channels.enumerate() {
+                let x = area.x + n as i32 * (bar_w + 2);
+                canvas.fill_rect(x, area.y, bar_w as u32, area.h as u32, t.off);
+                let Some((level, over)) = meters.get(channel) else { continue };
+                let height = (fader_position(level as f64) * area.h as f64) as i32;
+                canvas.fill_rect(x, area.y + area.h - height, bar_w as u32, height.max(0) as u32, level_colour(level));
+                if over {
+                    canvas.fill_rect(x, area.y, bar_w as u32, 4, t.red);
+                }
+            }
+        }
+        if let Some(area) = layout.value(index, app) {
+            centered(canvas, layout, area, format_db(db, mute, unknown).as_str(), if mute { t.amber } else if unknown { t.dim } else { t.text });
+        }
+    }
+}
+
+fn matrix(canvas: &mut Canvas, layout: &Layout, app: &App) {
+    let t = theme();
+    let outputs = app.outputs();
+    let sources = app.sources();
+    for (col, output) in outputs.iter().enumerate() {
+        if let Some(area) = layout.cell(usize::MAX, col, app) {
+            centered(canvas, layout, area, app.label(output).as_str(), if col == app.col { t.text } else { t.dim });
+        }
+    }
+    for (row, source) in sources.iter().enumerate() {
+        if let Some(area) = layout.cell(row, usize::MAX, app) {
+            let label = app.label(source);
+            text(canvas, layout, area.x, area.y + (area.h - layout.row) / 2, fit(label.as_str(), area.w / layout.col), if row == app.row { t.text } else { t.dim });
+        }
+        for (col, output) in outputs.iter().enumerate() {
+            let Some(area) = layout.cell(row, col, app) else { continue };
+            let selected = (row, col) == (app.row, app.col);
+            let send = app.mix.send(output, source);
+            box_(canvas, area, if selected { t.grid_major } else { t.grid }, if selected { t.text } else { t.frame });
+            let off = !send.db.is_finite() && !send.unknown && !send.mute;
+            let shown = if off { Text::from("-") } else { format_db(send.db, send.mute, send.unknown) };
+            let colour = if send.mute { t.amber } else if off || send.unknown { t.dim } else { t.text };
+            centered(canvas, layout, area, shown.as_str(), colour);
+        }
+    }
+}
+
+/// A control's `value` as text, for a change not yet made.
+fn describe(hardware: &Hardware, index: usize, control: &MixerControl, value: i64) -> Text<32> {
+    let mut out = Text::new();
+    match control.kind {
+        MIXER_CONTROL_BOOL => {
+            let _ = out.write_str(if value != 0 { "On" } else { "Off" });
+        }
+        MIXER_CONTROL_ACTION => {
+            let _ = out.write_str("run");
+        }
+        MIXER_CONTROL_ENUM => {
+            let mut buffer = [0u8; 32];
+            let len = hardware.control_item(index, value as usize, &mut buffer).min(32);
+            let _ = out.write_str(core::str::from_utf8(&buffer[..len]).unwrap_or(""));
+        }
+        _ => {
+            let _ = write!(out, "{value} {}", field(&control.unit));
+        }
+    }
+    out
+}
+
+fn device(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware) {
+    let t = theme();
+    if app.controls.is_empty() {
+        centered(canvas, layout, layout.body, "This device has no settings here", t.dim);
+        return;
+    }
+    for (index, control) in app.controls.iter().enumerate() {
+        let Some(area) = layout.control(index, app) else { continue };
+        let selected = index == app.ctl_sel;
+        box_(canvas, area, if selected { t.grid_major } else { t.grid }, if selected { t.text } else { t.frame });
+        let y = area.y + (area.h - layout.row) / 2;
+        let x = text(canvas, layout, area.x + layout.col, y, field(&control.name), t.text);
+        if app.asks(control) {
+            text(canvas, layout, x + layout.col, y, "(asks first)", t.amber);
+        } else if control.flags & MIXER_FLAG_HAZARD != 0 {
+            text(canvas, layout, x + layout.col, y, "(hazard)", t.amber);
+        } else if control.flags & MIXER_FLAG_READONLY != 0 {
+            text(canvas, layout, x + layout.col, y, "(read-only)", t.dim);
+        }
+        let value = app.control_value(hardware, index);
+        let width = value.as_str().chars().count() as i32 * layout.col;
+        text(canvas, layout, area.x + area.w - width - layout.col, y, value.as_str(), t.text);
+    }
+    // The app's own switch, after the device's controls.
+    let index = app.ask_row();
+    if let Some(area) = layout.control(index, app) {
+        let selected = index == app.ctl_sel;
+        box_(canvas, area, if selected { t.grid_major } else { t.grid }, if selected { t.text } else { t.frame });
+        let y = area.y + (area.h - layout.row) / 2;
+        let x = text(canvas, layout, area.x + layout.col, y, "Ask before +48V", t.text);
+        text(canvas, layout, x + layout.col, y, "(KakelFix, saved in kakelfix.cfg)", t.dim);
+        let value = if app.ask_hazard { "Yes" } else { "No" };
+        let width = value.len() as i32 * layout.col;
+        text(canvas, layout, area.x + area.w - width - layout.col, y, value, t.text);
+    }
+}
+
+fn dialog(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware, index: usize, value: i64) {
+    let t = theme();
+    let area = layout.dialog();
+    box_(canvas, area, t.grid, t.amber);
+    let Some(control) = app.controls.get(index) else { return };
+    let mut line = Text::<80>::new();
+    let _ = write!(line, "Set {} to {}?", field(&control.name), describe(hardware, index, control, value).as_str());
+    centered(canvas, layout, Rect::new(area.x, area.y + layout.row, area.w, layout.row), line.as_str(), t.text);
+    centered(canvas, layout, Rect::new(area.x, area.y + layout.row * 2 + 4, area.w, layout.row), "This setting can harm connected equipment.", t.amber);
+    box_(canvas, layout.yes(), t.grid_major, t.text);
+    centered(canvas, layout, layout.yes(), "Yes (y)", t.text);
+    box_(canvas, layout.no(), t.grid_major, t.text);
+    centered(canvas, layout, layout.no(), "No (n)", t.text);
+}

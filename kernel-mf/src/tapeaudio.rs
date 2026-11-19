@@ -142,3 +142,97 @@ pub fn state() -> i32 {
     let _usb = pin();
     audio::state()
 }
+
+// The mixer calls (ABI 41) on the active device's mixer (`audio::mixer`). A driver's mixer may make USB control transfers,
+// hence the pin and the USB lock like every audio call. Names and meters go through kernel buffers of bounded size.
+
+/// The longest name copied back: names are short labels.
+const NAME_MAX: usize = 64;
+/// The most meters one call returns (a large interface has about 30 inputs, 30 playback channels and 30 outputs).
+const METERS_MAX: usize = 256;
+
+fn mixer_signed(value: i32) -> i64 {
+    i64::from(value)
+}
+
+pub fn mixer_info(out: u64) -> i32 {
+    let _usb = pin();
+    let mut info = fosfor_abi::tape::MixerInfo::default();
+    match audio::mixer() {
+        Some(mixer) if mixer.info(&mut info) => if put(out, &info) { 0 } else { fosfor_abi::tape::MIXER_BAD },
+        _ => fosfor_abi::tape::MIXER_NONE,
+    }
+}
+
+fn copy_name(buffer: u64, capacity: u64, fill: impl FnOnce(&mut [u8]) -> Option<usize>) -> i64 {
+    let mut name = [0u8; NAME_MAX];
+    let length = (capacity as usize).min(NAME_MAX);
+    match fill(&mut name[..length]) {
+        Some(count) if process::copy_to_user(buffer, &name[..count]) => count as i64,
+        _ => mixer_signed(fosfor_abi::tape::MIXER_BAD),
+    }
+}
+
+pub fn mixer_name(group: u64, index: u64, buffer: u64, capacity: u64) -> i64 {
+    let _usb = pin();
+    let Some(mixer) = audio::mixer() else { return mixer_signed(fosfor_abi::tape::MIXER_NONE) };
+    copy_name(buffer, capacity, |out| mixer.name(group as u32, index as u32, out))
+}
+
+pub fn mixer_get(output: u64, source: u64) -> i64 {
+    let _usb = pin();
+    audio::mixer().map_or(mixer_signed(fosfor_abi::tape::MIXER_NONE), |mixer| mixer.get(output as u32, source as u32))
+}
+
+/// Runs a mixer change or meter read with interrupts on: a driver may wait on the device (control transfers wait on timer ticks), as
+/// starting a stream does.
+fn with_interrupts(change: impl FnOnce() -> i32) -> i32 {
+    let was_on = crate::cpu::interrupts_save_and_disable();
+    crate::cpu::interrupts_enable();
+    let result = change();
+    crate::cpu::interrupts_restore(was_on);
+    result
+}
+
+pub fn mixer_set(output: u64, source: u64, gain: u64) -> i32 {
+    let _usb = pin();
+    let gain = gain.min(u64::from(u32::MAX)) as u32;
+    with_interrupts(|| audio::mixer().map_or(fosfor_abi::tape::MIXER_NONE, |mixer| mixer.set(output as u32, source as u32, gain)))
+}
+
+pub fn mixer_serial() -> u64 {
+    let _usb = pin();
+    audio::mixer().map_or(0, |mixer| mixer.serial())
+}
+
+pub fn mixer_meters(out: u64, count: u64) -> u64 {
+    let _usb = pin();
+    let Some(mixer) = audio::mixer() else { return 0 };
+    let mut meters = alloc::vec![fosfor_abi::tape::MixerMeter::default(); (count as usize).min(METERS_MAX)];
+    // Meters may be bulk reads, which wait on the device like a change does.
+    let mut got = 0;
+    with_interrupts(|| {
+        got = mixer.meters(&mut meters);
+        0
+    });
+    let bytes = unsafe { core::slice::from_raw_parts(meters.as_ptr().cast::<u8>(), got * core::mem::size_of::<fosfor_abi::tape::MixerMeter>()) }; // kernel-memory
+    if process::copy_to_user(out, bytes) { got as u64 } else { 0 }
+}
+
+pub fn mixer_control(index: u64, out: u64) -> i32 {
+    let _usb = pin();
+    let Some(mixer) = audio::mixer() else { return fosfor_abi::tape::MIXER_NONE };
+    let mut control = fosfor_abi::tape::MixerControl::default();
+    if mixer.control(index as u32, &mut control) && put(out, &control) { 0 } else { fosfor_abi::tape::MIXER_BAD }
+}
+
+pub fn mixer_control_item(index: u64, item: u64, buffer: u64, capacity: u64) -> i64 {
+    let _usb = pin();
+    let Some(mixer) = audio::mixer() else { return mixer_signed(fosfor_abi::tape::MIXER_NONE) };
+    copy_name(buffer, capacity, |out| mixer.control_item(index as u32, item as u32, out))
+}
+
+pub fn mixer_control_set(index: u64, value: u64) -> i32 {
+    let _usb = pin();
+    with_interrupts(|| audio::mixer().map_or(fosfor_abi::tape::MIXER_NONE, |mixer| mixer.control_set(index as u32, value as i64)))
+}

@@ -1,0 +1,24 @@
+[package]
+name = "kakelfix-tape"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "kakelfix"
+path = "src/main.rs"
+
+[dependencies]
+audio-screen = { path = "../../crates/audio-screen" }
+tape-rt = { path = "../../crates/tape-rt" }
+fosfor-abi = { path = "../../abi" }
+gfx = { path = "../../crates/gfx" }
+instrument-rt = { path = "../../crates/instrument-rt" }
+kakelfix = { path = "../../crates/kakelfix" }
+mixer-model = { path = "../../crates/mixer-model" }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = 2
+strip = "symbols"

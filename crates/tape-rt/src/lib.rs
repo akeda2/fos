@@ -9,6 +9,7 @@
 
 pub mod abort;
 pub mod config;
+pub mod mixer;
 pub mod save;
 pub mod text;
 

@@ -630,6 +630,15 @@ pub fn build_api(info: &BootInfo, arguments: &str) -> TapeApi {
         session_close: crate::tape_common::unsupported::api_session_close,
         resolve_path: crate::tape_common::unsupported::api_resolve_path,
         audio_state: crate::audio::api_audio_state,
+        mixer_info: kernel_core::audio::api_mixer_info,
+        mixer_name: kernel_core::audio::api_mixer_name,
+        mixer_get: kernel_core::audio::api_mixer_get,
+        mixer_set: kernel_core::audio::api_mixer_set,
+        mixer_serial: kernel_core::audio::api_mixer_serial,
+        mixer_meters: kernel_core::audio::api_mixer_meters,
+        mixer_control: kernel_core::audio::api_mixer_control,
+        mixer_control_item: kernel_core::audio::api_mixer_control_item,
+        mixer_control_set: kernel_core::audio::api_mixer_control_set,
         random: kernel_core::random::api_random,
     }
 }

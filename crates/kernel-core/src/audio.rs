@@ -668,3 +668,78 @@ pub fn claims_of(context: usize) -> (usize, usize) {
     let choice = &choices()[context];
     (choice.chosen.map_or(0, number_of), choice.output.map_or(0, number_of))
 }
+
+/// The hardware mixer of the active device (tape ABI `mixer_*`, version 41), if its driver has one.
+pub fn mixer() -> Option<&'static dyn ext::Mixer> {
+    match active()? {
+        Backend::Ext(slot) => ext::slot(slot).mixer(),
+        Backend::Loop(index) => Some(loopback::mixer(index)),
+        Backend::Usb(_) | Backend::Hda(_) => None,
+    }
+}
+
+// The embedded kernels' `mixer_*` table entries: the tape shares the kernel's address space, so its pointers are used as
+// they are (mf copies through `tapeaudio.rs` instead).
+use fosfor_abi::tape::{MixerControl, MixerInfo, MixerMeter, MIXER_BAD, MIXER_NONE};
+
+/// A tape's buffer as a slice, or none for a null pointer.
+unsafe fn tape_slice<'a, T>(pointer: *mut T, count: usize) -> Option<&'a mut [T]> {
+    if pointer.is_null() { None } else { Some(unsafe { core::slice::from_raw_parts_mut(pointer, count) }) } // tape-memory
+}
+
+pub extern "C" fn api_mixer_info(out: *mut MixerInfo) -> i32 {
+    let mut info = MixerInfo::default();
+    match mixer() {
+        Some(mixer) if mixer.info(&mut info) && !out.is_null() => {
+            unsafe { *out = info }; // tape-memory
+            0
+        }
+        Some(_) if out.is_null() => MIXER_BAD,
+        _ => MIXER_NONE,
+    }
+}
+
+pub extern "C" fn api_mixer_name(group: u32, index: u32, buffer: *mut u8, capacity: usize) -> isize {
+    let Some(mixer) = mixer() else { return MIXER_NONE as isize };
+    let Some(out) = (unsafe { tape_slice(buffer, capacity) }) else { return MIXER_BAD as isize };
+    mixer.name(group, index, out).map_or(MIXER_BAD as isize, |count| count as isize)
+}
+
+pub extern "C" fn api_mixer_get(output: u32, source: u32) -> i64 {
+    mixer().map_or(i64::from(MIXER_NONE), |mixer| mixer.get(output, source))
+}
+
+pub extern "C" fn api_mixer_set(output: u32, source: u32, gain: u32) -> i32 {
+    mixer().map_or(MIXER_NONE, |mixer| mixer.set(output, source, gain))
+}
+
+pub extern "C" fn api_mixer_serial() -> u64 {
+    mixer().map_or(0, |mixer| mixer.serial())
+}
+
+pub extern "C" fn api_mixer_meters(out: *mut MixerMeter, count: usize) -> usize {
+    match (mixer(), unsafe { tape_slice(out, count) }) {
+        (Some(mixer), Some(out)) => mixer.meters(out),
+        _ => 0,
+    }
+}
+
+pub extern "C" fn api_mixer_control(index: u32, out: *mut MixerControl) -> i32 {
+    let Some(mixer) = mixer() else { return MIXER_NONE };
+    let mut control = MixerControl::default();
+    if out.is_null() || !mixer.control(index, &mut control) {
+        return MIXER_BAD;
+    }
+    unsafe { *out = control }; // tape-memory
+    0
+}
+
+pub extern "C" fn api_mixer_control_item(index: u32, item: u32, buffer: *mut u8, capacity: usize) -> isize {
+    let Some(mixer) = mixer() else { return MIXER_NONE as isize };
+    let Some(out) = (unsafe { tape_slice(buffer, capacity) }) else { return MIXER_BAD as isize };
+    mixer.control_item(index, item, out).map_or(MIXER_BAD as isize, |count| count as isize)
+}
+
+pub extern "C" fn api_mixer_control_set(index: u32, value: i64) -> i32 {
+    mixer().map_or(MIXER_NONE, |mixer| mixer.control_set(index, value))
+}

@@ -738,3 +738,13 @@ allocate, so teardown is queued and done by the shell loop / a tape call (embedd
 must not race an in-flight disk transfer or audio refill (mf has several CPUs); `test-usb-replug` and
 `test-usb-kbd-replug` pin today's behaviour and change with it. Verify on the real hubs (Realtek 0bda:0401, the AMD
 board's EHCI) before trusting it. The once-a-second audio check can go then.
+
+## KakelFix after milestone one (the Mixer page)
+
+- Recorder and Analyzer pages (placeholders now).
+- The Mixer page ran on real hardware (a USB interface's driver, on the server kernel, with a PS/2 touchpad); the same
+  driver's second model is untested there, and the PCI card's driver has no `Mixer` yet.
+- On the server kernel the shell's Escape kills a foreground tape outright: writes still queued in kakelfix's writer are lost
+  (`q` or the Quit soft key end it cleanly). A tape-visible "please end" before the kill would fix it for every tape.
+- Meters are read by the drawing thread; a device whose meter read is slow (bulk reads under the USB lock) would want them on a
+  thread too. The driver caches a set for 50 ms.

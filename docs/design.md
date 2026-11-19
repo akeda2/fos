@@ -1711,6 +1711,38 @@ a real USB mouse is the check (rack). **Real hardware, verified:** piano's built
 **Not verified:** laptop1's touchpad, rack's USB mouse beside the touchscreen, a real click in `miccal` on any of them.
 
 
+## KakelFix: mixer, recorder, analyzer (tapes/kakelfix, crates/kakelfix, crates/mixer-model, ABI 41)
+
+`kakelfix` is one graphical tape with three pages (Mixer, Recorder, Analyzer) chosen with soft keys on the right edge (or 1 2 3; the page keys in their own colour, the Mixer's views Outputs, Matrix and Device indented under Mixer with Tab cycling them, the actions Pair, Pan law and Quit last); milestone one
+is the Mixer page. It knows no device: everything comes through the tape ABI's mixer calls (ABI 41, `mixer_*`), which a driver serves
+by implementing `kernel_core::ext_audio::Mixer` (crosspoint gains of outputs from inputs and playback channels, output masters,
+meters in cdB, named controls with a HAZARD flag, a serial that moves on every change). The loopback devices carry a small software
+mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path runs in QEMU.
+
+- **Model** (`crates/mixer-model`, no heap: tapes have none): raw gains become a logical mix (send level, pan and mute per source
+  and output pair, masters); stereo pairs of sources and outputs are found from the gains and can be paired or split by hand; pan
+  laws. `render` turns the logical mix back into raw crosspoints. Capacity 32 channels per group.
+- **App** (`crates/kakelfix`, host tests): views Outputs (one output's mix as fader strips: label, pan, fader, meter, value; a master
+  strip when the device has masters; a coloured band above the strips names each run, "Inputs (hardware)" blue, "Playback (from
+  tapes)" green, "Output" amber, because a driver may name an input and a playback channel alike), Matrix (sources by outputs) and Device (controls; a HAZARD action such as a mixer reset asks yes/no first, a HAZARD switch such as +48V only when the page's last row "Ask before +48V" is on, saved as `ask-phantom=yes` in `kakelfix.cfg`). Actions
+  are shared by keys, mouse and touch; `layout.rs` places everything from the screen size (scale 2 from 1800x1000). Fader travel: the
+  top 60% covers +6..-12 dB, the rest down to -60 dB, the bottom 3% is off.
+- **Input**: keys (no F-keys: 1 2 3 pick pages, Tab the view) and `instrument_rt::Touches`, which treats the mouse (touch panel 6,
+  finger 100) and fingers alike; a press on a fader or pan holds it until release; the tape draws the cursor.
+- **Writes off the drawing thread** (`crates/kakelfix/src/queue.rs`): some devices take milliseconds per mixer write (a USB control
+  transfer each, with a pause after it), and the kernel's mixer calls wait for the USB lock while one runs. Where tape threads exist
+  (the server kernel, `tape_rt::threads_supported`) the tape starts a writer thread: every crosspoint, master and control has a slot
+  holding the newest value not yet written, so a drag that outruns the device sends only where the fader is now. The drawing thread
+  reads its own shadow of the gains, and sees the device's serial move only when the writer is idle, so a burst of its own writes
+  costs one re-read at the end. A refused write is counted, reported and the device re-read. The embedded kernels write inline.
+- **`kakelfix show`** prints every output's non-zero sends and master and the controls, for tests and headless use.
+- **Test**: `make test-kakelfix` on the loopback: `show` reads the identity mix; in the tape `x` switches the first strip off and a
+  mouse click half way up its fader sets -9 dB, a click on the Quit soft key ends it; `show` reads the result. Then on the server
+  kernel at -smp 4 the same `x` goes through the writer thread and `q` ends the tape through the writer's join (the mf shell's
+  Escape kills a foreground process outright, which loses writes still queued). The mouse is walked exactly: the kernel's pointer
+  gain moves a packet of d counts 4d + d|d|/2 pixels.
+- **Only hardware shows**: a real device's write latency under a fast drag, meters from a real driver, touch panels.
+
 ## Room acoustics: `frt60` (tapes/frt60, crates/rt60)
 
 `frt60` measures reverberation from an impulse response (IR). `crates/rt60` holds the maths (host tests); the tape is the UI.

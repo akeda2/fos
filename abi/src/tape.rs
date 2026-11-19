@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`. Version 20 added `gfx_screens` and the `gfx_*_on` calls (a screen number). Version 21 added `audio_float`. Version 22 added the `gpio_*` calls. Version 23 added `i2c_speed` and `i2c_transfer`. Version 24 added `touch_info` and `touch_read`. Version 25 added `midi_read` and `midi_send`. Version 26 added `midi_devices`. Version 27 added `nic_owned`. Version 28 added `gpio_pull_get`. Version 32 added the `vfs_*` calls. Version 33 added `random`. Version 34 added the `vfs_*` change calls (`vfs_create`, `vfs_write`, `vfs_truncate`, `vfs_remove`, `vfs_rename`, `vfs_set_owner`). Version 35 added the `remote_*` calls (a tape serves a volume named `//NAME`). Version 36 added `vfs_sync`. Version 37 added the thread calls (`thread_spawn`, `thread_join`, `futex_wait`, `futex_wake`). Version 38 added the shell session calls (`session_open`, `session_write`, `session_read`, `session_close`). Version 39 added `resolve_path`. Version 40 added `audio_state`.
-pub const TAPE_API_VERSION: u32 = 40;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`. Version 20 added `gfx_screens` and the `gfx_*_on` calls (a screen number). Version 21 added `audio_float`. Version 22 added the `gpio_*` calls. Version 23 added `i2c_speed` and `i2c_transfer`. Version 24 added `touch_info` and `touch_read`. Version 25 added `midi_read` and `midi_send`. Version 26 added `midi_devices`. Version 27 added `nic_owned`. Version 28 added `gpio_pull_get`. Version 32 added the `vfs_*` calls. Version 33 added `random`. Version 34 added the `vfs_*` change calls (`vfs_create`, `vfs_write`, `vfs_truncate`, `vfs_remove`, `vfs_rename`, `vfs_set_owner`). Version 35 added the `remote_*` calls (a tape serves a volume named `//NAME`). Version 36 added `vfs_sync`. Version 37 added the thread calls (`thread_spawn`, `thread_join`, `futex_wait`, `futex_wake`). Version 38 added the shell session calls (`session_open`, `session_write`, `session_read`, `session_close`). Version 39 added `resolve_path`. Version 40 added `audio_state`. Version 41 added the `mixer_*` calls.
+pub const TAPE_API_VERSION: u32 = 41;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -483,7 +483,134 @@ pub struct TapeApi {
     /// external clock changed rate, it was unplugged). `AUDIO_STATE_RUNNING`, `AUDIO_STATE_IDLE` (nothing started, or
     /// `audio_stop`), or a negative `AUDIO_STATE_*` reason. The stream stays ended: the tape stops or starts it again.
     pub audio_state: extern "C" fn() -> i32,
+    /// `mixer_info(out)` (version 41): the hardware mixer of the active audio device (`audio device`, `audio_use_device`), if
+    /// its driver has one. 0 and `out` filled, or `MIXER_NONE`. The mixer is a matrix: every output channel is the sum of
+    /// every source (inputs first, then playback channels) times a crosspoint gain, then times the output's master gain.
+    /// Gains are linear: `unity` is 0 dB, 0 is off.
+    pub mixer_info: extern "C" fn(*mut MixerInfo) -> i32,
+    /// `mixer_name(group, index, buffer, capacity)` (version 41): the name of a channel (`MIXER_GROUP_*`) as the device labels
+    /// it ("AN 1", "ADAT 3"), UTF-8. Returns the byte count (at most `capacity`), or `MIXER_NONE`/`MIXER_BAD`.
+    pub mixer_name: extern "C" fn(u32, u32, *mut u8, usize) -> isize,
+    /// `mixer_get(output, source)` (version 41): a crosspoint's gain, `source` < inputs for an input, else a playback channel;
+    /// `MIXER_MASTER` as `source` for the output's master. `MIXER_UNKNOWN` when the driver cannot read the device back and
+    /// nobody has set it since it started; `MIXER_NONE`/`MIXER_BAD`.
+    pub mixer_get: extern "C" fn(u32, u32) -> i64,
+    /// `mixer_set(output, source, gain)` (version 41): sets a crosspoint (or the master), clamped to `max`. 0 or
+    /// `MIXER_NONE`/`MIXER_BAD`/`MIXER_FAILED`. The device takes it at once; a tape keeps no copy it trusts over `mixer_get`.
+    pub mixer_set: extern "C" fn(u32, u32, u32) -> i32,
+    /// `mixer_serial()` (version 41): a counter that grows whenever a gain or control changes (from any tape, the shell or
+    /// the device's own front panel). A tape re-reads what it shows when it moves. 0 without a mixer.
+    pub mixer_serial: extern "C" fn() -> u64,
+    /// `mixer_meters(out, count)` (version 41): the device's level meters, inputs, then playback, then outputs, as many as
+    /// fit `count` entries. Returns the number written; 0 when the device has no meters (or none running).
+    pub mixer_meters: extern "C" fn(*mut MixerMeter, usize) -> usize,
+    /// `mixer_control(index, out)` (version 41): one of the device's other settings (`MixerInfo::controls` of them: clock
+    /// source, input levels, phantom power, a reset). 0 and `out` filled, or `MIXER_NONE`/`MIXER_BAD`.
+    pub mixer_control: extern "C" fn(u32, *mut MixerControl) -> i32,
+    /// `mixer_control_item(index, item, buffer, capacity)` (version 41): the name of a `MIXER_CONTROL_ENUM` control's value
+    /// `item` (`min..=max`). Returns the byte count or `MIXER_BAD`.
+    pub mixer_control_item: extern "C" fn(u32, u32, *mut u8, usize) -> isize,
+    /// `mixer_control_set(index, value)` (version 41): changes a control (`MIXER_CONTROL_ACTION`: any value runs it). 0 or
+    /// `MIXER_NONE`/`MIXER_BAD`/`MIXER_FAILED`. A control flagged `MIXER_FLAG_HAZARD` (phantom power, a reset) is set as
+    /// asked: the tape asks the user first.
+    pub mixer_control_set: extern "C" fn(u32, i64) -> i32,
 }
+
+/// What `mixer_info` fills in (version 41).
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct MixerInfo {
+    /// `MIXER_KIND_*`.
+    pub kind: u32,
+    /// `MIXER_HAS_*` bits.
+    pub flags: u32,
+    pub inputs: u32,
+    pub playbacks: u32,
+    pub outputs: u32,
+    /// How many `mixer_control`s there are.
+    pub controls: u32,
+    /// The gain that is 0 dB, and the largest a crosspoint and a master take.
+    pub unity: u32,
+    pub max: u32,
+    pub master_max: u32,
+    pub reserved: u32,
+    /// The device's name for a title (UTF-8, zero-padded).
+    pub name: [u8; 32],
+}
+
+/// A matrix mixer (the only kind so far).
+pub const MIXER_KIND_MATRIX: u32 = 1;
+/// The outputs have master gains.
+pub const MIXER_HAS_MASTERS: u32 = 1;
+/// `mixer_meters` works.
+pub const MIXER_HAS_METERS: u32 = 2;
+/// Crosspoints can read `MIXER_UNKNOWN` (the device cannot be read back).
+pub const MIXER_HAS_UNKNOWN: u32 = 4;
+
+pub const MIXER_GROUP_INPUT: u32 = 0;
+pub const MIXER_GROUP_PLAYBACK: u32 = 1;
+pub const MIXER_GROUP_OUTPUT: u32 = 2;
+/// `mixer_get`/`mixer_set` source: the output's master.
+pub const MIXER_MASTER: u32 = u32::MAX;
+
+/// Mixer call results (version 41), all negative.
+pub const MIXER_NONE: i32 = -1;
+pub const MIXER_BAD: i32 = -2;
+pub const MIXER_FAILED: i32 = -3;
+/// `mixer_get`: not known (see `MIXER_HAS_UNKNOWN`).
+pub const MIXER_UNKNOWN: i64 = -4;
+
+/// One level meter (version 41): peak and RMS in hundredths of a dB below full scale (0 is full scale, -14400 or less
+/// silence).
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct MixerMeter {
+    pub peak_cdb: i16,
+    pub rms_cdb: i16,
+    /// `MIXER_METER_OVER`: the channel clipped since the last read.
+    pub flags: u16,
+    pub reserved: u16,
+}
+
+pub const MIXER_METER_OVER: u16 = 1;
+/// The level `MixerMeter` gives silence.
+pub const MIXER_METER_FLOOR: i16 = -14400;
+
+/// One device setting (version 41).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MixerControl {
+    /// `MIXER_CONTROL_*`.
+    pub kind: u32,
+    /// `MIXER_FLAG_*` bits.
+    pub flags: u32,
+    pub value: i64,
+    pub min: i64,
+    pub max: i64,
+    /// A unit for an `INT` value (UTF-8, zero-padded: "dB", "Hz"), empty when none.
+    pub unit: [u8; 8],
+    /// The control's name (UTF-8, zero-padded).
+    pub name: [u8; 32],
+}
+
+impl Default for MixerControl {
+    fn default() -> Self {
+        MixerControl { kind: 0, flags: 0, value: 0, min: 0, max: 0, unit: [0; 8], name: [0; 32] }
+    }
+}
+
+/// A choice among named values (`mixer_control_item`).
+pub const MIXER_CONTROL_ENUM: u32 = 1;
+pub const MIXER_CONTROL_INT: u32 = 2;
+pub const MIXER_CONTROL_BOOL: u32 = 3;
+/// Something to do (a reset): `value` means nothing.
+pub const MIXER_CONTROL_ACTION: u32 = 4;
+/// Ask the user before changing it (phantom power, a reset).
+pub const MIXER_FLAG_HAZARD: u32 = 1;
+/// Shown, not set (the clock the device locked to).
+pub const MIXER_FLAG_READONLY: u32 = 2;
+/// The value is not known (cannot be read back, not set since start).
+pub const MIXER_FLAG_UNKNOWN: u32 = 4;
 
 /// `audio_state` results (version 40): the ended states are negative.
 pub const AUDIO_STATE_RUNNING: i32 = 0;

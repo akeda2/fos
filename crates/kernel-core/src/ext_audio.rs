@@ -7,7 +7,7 @@
 //! the class driver (`usb_audio.rs`), registered the same way. docs/big-kernel.md, stage 1b.
 
 use core::sync::atomic::{AtomicPtr, Ordering};
-use fosfor_abi::tape::{AudioInfo, AudioStats};
+use fosfor_abi::tape::{AudioInfo, AudioStats, MixerControl, MixerInfo, MixerMeter};
 
 pub struct Ops {
     pub present: fn() -> bool,
@@ -33,6 +33,59 @@ pub struct Ops {
     /// Tape ABI `audio_state` for a stream that was started: `AUDIO_STATE_RUNNING`, or why the driver ended it (a negative
     /// `AUDIO_STATE_*`).
     pub state: fn() -> i32,
+    /// The device's hardware mixer, for the tape ABI `mixer_*` calls (version 41), if the driver offers one.
+    pub mixer: Option<&'static dyn Mixer>,
+}
+
+/// A device's mixer as the tape ABI `mixer_*` calls (version 41, `abi/src/tape.rs`) see it: a matrix of linear crosspoint
+/// gains, masters, meters and named controls. Each method is one tape call with the tape's memory already copied in or out;
+/// the results are the ABI's (`MIXER_*`). Every call comes with the audio drivers' lock held (on mf: pinned to CPU 0 under
+/// the USB lock), as the other audio calls do.
+pub trait Mixer: Sync {
+    fn info(&self, out: &mut MixerInfo) -> bool;
+    /// The channel's name into `out`: the byte count, or `None` for a channel that does not exist.
+    fn name(&self, group: u32, index: u32, out: &mut [u8]) -> Option<usize>;
+    fn get(&self, output: u32, source: u32) -> i64;
+    fn set(&self, output: u32, source: u32, gain: u32) -> i32;
+    fn serial(&self) -> u64;
+    fn meters(&self, out: &mut [MixerMeter]) -> usize;
+    fn control(&self, index: u32, out: &mut MixerControl) -> bool;
+    fn control_item(&self, index: u32, item: u32, out: &mut [u8]) -> Option<usize>;
+    fn control_set(&self, index: u32, value: i64) -> i32;
+}
+
+/// Copies `text` into a zero-padded fixed field (truncated at a character boundary), for `MixerInfo::name` and friends.
+pub fn fill_text(field: &mut [u8], text: &str) {
+    field.fill(0);
+    let mut end = text.len().min(field.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    field[..end].copy_from_slice(&text.as_bytes()[..end]);
+}
+
+/// Copies `text` for a `name` call: the byte count written, truncated at a character boundary.
+pub fn copy_text(out: &mut [u8], text: &str) -> usize {
+    let mut end = text.len().min(out.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    out[..end].copy_from_slice(&text.as_bytes()[..end]);
+    end
+}
+
+/// Hundredths of a dB of a linear power ratio (`10 * log10`), without a maths library: log2 from the float's exponent and a
+/// quadratic fit to its mantissa (within 0.01 dB). `MIXER_METER_FLOOR` for 0 and below it.
+pub fn power_cdb(power: f32) -> i16 {
+    if !(power > 0.0) {
+        return fosfor_abi::tape::MIXER_METER_FLOOR;
+    }
+    let bits = power.to_bits();
+    let exponent = ((bits >> 23) & 0xff) as i32 - 127;
+    let mantissa = f32::from_bits((bits & 0x007f_ffff) | 0x3f80_0000);
+    let log2 = exponent as f32 + (mantissa - 1.0) * (1.346_607 - 0.346_607 * mantissa);
+    let cdb = log2 * 301.03;
+    if cdb < fosfor_abi::tape::MIXER_METER_FLOOR as f32 { fosfor_abi::tape::MIXER_METER_FLOOR } else if cdb > 3000.0 { 3000 } else { cdb as i16 }
 }
 
 /// One registered device, or none.
@@ -117,6 +170,9 @@ impl Slot {
     }
     pub fn identity(&self) -> (u32, u32, u16, u16) {
         self.ops().map_or((0, 0, 0, 0), |ops| (ops.identity)())
+    }
+    pub fn mixer(&self) -> Option<&'static dyn Mixer> {
+        self.ops()?.mixer
     }
     pub fn float(&self, capture: bool) -> bool {
         self.ops().is_some_and(|ops| (ops.float)(capture))

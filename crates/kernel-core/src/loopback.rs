@@ -13,10 +13,20 @@
 //! `playback_space` tells the player how much fits, and a write returns what fitted. With no capture end running the
 //! playing end discards, like a real output with nothing plugged in, so a player never stalls on a missing listener.
 //!
+//! Each device also has a small software mixer (tape ABI `mixer_*`, version 41), so a mixer tape can be tried and tested
+//! with no hardware: its two sources are the two playback channels, its two outputs what the capture end reads, every
+//! crosspoint and master a linear gain (0x8000 = 0 dB), plus meters and one control ("Dim", -20 dB on both outputs). It
+//! starts as the identity (each playback channel to its own output at 0 dB), and while it is the identity a write copies
+//! the bytes untouched, so nothing changes for a tape that never touches the mixer.
+//!
 //! Everything runs from tape calls and the shell in one cooperative context at a time (no interrupts touch it), so plain
 //! statics are enough.
 
-use fosfor_abi::tape::{AudioInfo, AudioStats};
+use crate::ext_audio::{copy_text, fill_text, power_cdb, Mixer};
+use fosfor_abi::tape::{
+    AudioInfo, AudioStats, MixerControl, MixerInfo, MixerMeter, MIXER_BAD, MIXER_CONTROL_BOOL, MIXER_GROUP_OUTPUT,
+    MIXER_GROUP_PLAYBACK, MIXER_HAS_MASTERS, MIXER_HAS_METERS, MIXER_KIND_MATRIX, MIXER_MASTER, MIXER_METER_FLOOR,
+};
 
 pub const COUNT: usize = 4;
 pub const RATE: u32 = 48_000;
@@ -36,10 +46,62 @@ struct Loop {
     /// Writes that did not fit entirely, bytes thrown away with no capture end, and the count of both.
     short_writes: u64,
     discarded: u64,
+    mix: Mix,
+}
+
+const UNITY: u32 = 0x8000;
+const MAX_GAIN: u32 = 0x10000;
+/// "Dim": -20 dB on both outputs.
+const DIM: f32 = 0.1;
+
+/// The software mixer: `gain[output][source]`, `master[output]`, the meters' peak and power since the last `mixer_meters`
+/// (index 0-1 the playback channels, 2-3 the outputs), and `serial`, bumped by every change.
+#[derive(Clone, Copy)]
+struct Mix {
+    gain: [[u32; 2]; 2],
+    master: [u32; 2],
+    dim: bool,
+    serial: u64,
+    peak: [f32; 4],
+    power: [f32; 4],
+    frames: u32,
+    /// A tape has read the meters: measure even while the mix is the identity.
+    watched: bool,
+}
+
+impl Mix {
+    const NEW: Mix = Mix { gain: [[UNITY, 0], [0, UNITY]], master: [UNITY; 2], dim: false, serial: 1, peak: [0.0; 4], power: [0.0; 4], frames: 0, watched: false };
+
+    fn identity(&self) -> bool {
+        self.gain == [[UNITY, 0], [0, UNITY]] && self.master == [UNITY; 2] && !self.dim
+    }
+
+    /// One frame through the matrix, with the meters updated.
+    fn frame(&mut self, input: [f32; 2]) -> [f32; 2] {
+        let scale = |gain: u32| gain as f32 / UNITY as f32;
+        let mut out = [0.0f32; 2];
+        for (o, sample) in out.iter_mut().enumerate() {
+            let sum = input[0] * scale(self.gain[o][0]) + input[1] * scale(self.gain[o][1]);
+            *sample = sum * scale(self.master[o]) * if self.dim { DIM } else { 1.0 };
+        }
+        self.measure(input, out);
+        out
+    }
+
+    fn measure(&mut self, input: [f32; 2], out: [f32; 2]) {
+        for (meter, value) in input.iter().chain(out.iter()).enumerate() {
+            let level = if *value < 0.0 { -*value } else { *value };
+            if level > self.peak[meter] {
+                self.peak[meter] = level;
+            }
+            self.power[meter] += value * value;
+        }
+        self.frames += 1;
+    }
 }
 
 impl Loop {
-    const NEW: Loop = Loop { ring: [0; RING_BYTES], written: 0, read: 0, capture: None, playback: None, short_writes: 0, discarded: 0 };
+    const NEW: Loop = Loop { ring: [0; RING_BYTES], written: 0, read: 0, capture: None, playback: None, short_writes: 0, discarded: 0, mix: Mix::NEW };
 
     fn used(&self) -> usize {
         (self.written - self.read) as usize
@@ -113,6 +175,13 @@ pub fn write(index: usize, data: &[u8]) -> usize {
     }
     let whole = data.len() / FRAME * FRAME;
     if l.capture.is_none() {
+        // Nothing listens, but a mixer tape may be watching the meters.
+        if l.mix.watched {
+            for frame in data[..whole].chunks_exact(FRAME) {
+                let sample = |at: usize| f32::from_le_bytes([frame[at], frame[at + 1], frame[at + 2], frame[at + 3]]);
+                l.mix.frame([sample(0), sample(4)]);
+            }
+        }
         l.discarded += whole as u64;
         return whole;
     }
@@ -120,8 +189,25 @@ pub fn write(index: usize, data: &[u8]) -> usize {
     if count < whole {
         l.short_writes += 1;
     }
-    for (offset, &byte) in data[..count].iter().enumerate() {
-        l.ring[(l.written as usize + offset) % RING_BYTES] = byte;
+    if l.mix.identity() {
+        for (offset, &byte) in data[..count].iter().enumerate() {
+            l.ring[(l.written as usize + offset) % RING_BYTES] = byte;
+        }
+        if l.mix.watched {
+            for frame in data[..count].chunks_exact(FRAME) {
+                let sample = |at: usize| f32::from_le_bytes([frame[at], frame[at + 1], frame[at + 2], frame[at + 3]]);
+                let input = [sample(0), sample(4)];
+                l.mix.measure(input, input);
+            }
+        }
+    } else {
+        for (index, frame) in data[..count].chunks_exact(FRAME).enumerate() {
+            let sample = |at: usize| f32::from_le_bytes([frame[at], frame[at + 1], frame[at + 2], frame[at + 3]]);
+            let out = l.mix.frame([sample(0), sample(4)]);
+            let at = (l.written as usize + index * FRAME) % RING_BYTES;
+            l.ring[at..at + 4].copy_from_slice(&out[0].to_le_bytes());
+            l.ring[at + 4..at + 8].copy_from_slice(&out[1].to_le_bytes());
+        }
     }
     l.written += count as u64;
     count
@@ -203,4 +289,122 @@ pub fn fill_stats(index: usize, stats: &mut AudioStats) {
 pub fn buffer_info(index: usize) -> (u64, u64) {
     let l = state(index);
     if l.capture.is_some() { (RING_BYTES as u64, l.used() as u64) } else { (0, 0) }
+}
+
+/// The mixer of loopback device `index`, for `audio.rs`.
+pub fn mixer(index: usize) -> &'static dyn Mixer {
+    &MIXERS[index]
+}
+
+struct LoopMixer(usize);
+
+static MIXERS: [LoopMixer; COUNT] = [LoopMixer(0), LoopMixer(1), LoopMixer(2), LoopMixer(3)];
+
+impl LoopMixer {
+    fn mix(&self) -> &'static mut Mix {
+        &mut state(self.0).mix
+    }
+}
+
+impl Mixer for LoopMixer {
+    fn info(&self, out: &mut MixerInfo) -> bool {
+        *out = MixerInfo {
+            kind: MIXER_KIND_MATRIX,
+            flags: MIXER_HAS_MASTERS | MIXER_HAS_METERS,
+            inputs: 0,
+            playbacks: 2,
+            outputs: 2,
+            controls: 1,
+            unity: UNITY,
+            max: MAX_GAIN,
+            master_max: MAX_GAIN,
+            ..MixerInfo::default()
+        };
+        let mut name = *b"Loopback 0";
+        name[9] = b'0' + self.0 as u8;
+        fill_text(&mut out.name, core::str::from_utf8(&name).unwrap_or("Loopback"));
+        true
+    }
+
+    fn name(&self, group: u32, index: u32, out: &mut [u8]) -> Option<usize> {
+        let text = match (group, index) {
+            (MIXER_GROUP_PLAYBACK, 0) => "Play L",
+            (MIXER_GROUP_PLAYBACK, 1) => "Play R",
+            (MIXER_GROUP_OUTPUT, 0) => "Out L",
+            (MIXER_GROUP_OUTPUT, 1) => "Out R",
+            _ => return None,
+        };
+        Some(copy_text(out, text))
+    }
+
+    fn get(&self, output: u32, source: u32) -> i64 {
+        let mix = self.mix();
+        match (output, source) {
+            (0..=1, MIXER_MASTER) => i64::from(mix.master[output as usize]),
+            (0..=1, 0..=1) => i64::from(mix.gain[output as usize][source as usize]),
+            _ => i64::from(MIXER_BAD),
+        }
+    }
+
+    fn set(&self, output: u32, source: u32, gain: u32) -> i32 {
+        let mix = self.mix();
+        let gain = gain.min(MAX_GAIN);
+        match (output, source) {
+            (0..=1, MIXER_MASTER) => mix.master[output as usize] = gain,
+            (0..=1, 0..=1) => mix.gain[output as usize][source as usize] = gain,
+            _ => return MIXER_BAD,
+        }
+        mix.serial += 1;
+        0
+    }
+
+    fn serial(&self) -> u64 {
+        self.mix().serial
+    }
+
+    fn meters(&self, out: &mut [MixerMeter]) -> usize {
+        let mix = self.mix();
+        mix.watched = true;
+        let count = out.len().min(4);
+        for (meter, slot) in out[..count].iter_mut().enumerate() {
+            *slot = if mix.frames == 0 {
+                MixerMeter { peak_cdb: MIXER_METER_FLOOR, rms_cdb: MIXER_METER_FLOOR, ..MixerMeter::default() }
+            } else {
+                let peak = mix.peak[meter];
+                MixerMeter {
+                    peak_cdb: power_cdb(peak * peak),
+                    rms_cdb: power_cdb(mix.power[meter] / mix.frames as f32),
+                    flags: if peak >= 1.0 { fosfor_abi::tape::MIXER_METER_OVER } else { 0 },
+                    reserved: 0,
+                }
+            };
+        }
+        mix.peak = [0.0; 4];
+        mix.power = [0.0; 4];
+        mix.frames = 0;
+        count
+    }
+
+    fn control(&self, index: u32, out: &mut MixerControl) -> bool {
+        if index != 0 {
+            return false;
+        }
+        *out = MixerControl { kind: MIXER_CONTROL_BOOL, value: i64::from(self.mix().dim), max: 1, ..MixerControl::default() };
+        fill_text(&mut out.name, "Dim");
+        true
+    }
+
+    fn control_item(&self, _index: u32, _item: u32, _out: &mut [u8]) -> Option<usize> {
+        None
+    }
+
+    fn control_set(&self, index: u32, value: i64) -> i32 {
+        if index != 0 {
+            return MIXER_BAD;
+        }
+        let mix = self.mix();
+        mix.dim = value != 0;
+        mix.serial += 1;
+        0
+    }
 }

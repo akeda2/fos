@@ -1,0 +1,11 @@
+[package]
+name = "mixer-model"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "mixer_model"
+path = "src/lib.rs"
+
+[dependencies]
+dsp = { path = "../dsp" }
