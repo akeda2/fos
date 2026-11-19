@@ -1,11 +1,13 @@
 //! KakelFix: a mixer, recorder and analyzer for the active audio device, driven by mouse, touch or keyboard. The Mixer
 //! page drives the device's hardware mixer (tape ABI 41, `mixer_*`); the Analyzer page captures a channel pair and shows
-//! its waveform and spectrum (`analyze.rs`); the Recorder comes later. The state, the actions and the layout are in
+//! its waveform and spectrum (`analyze.rs`); the Meters page meters every input with its gain under it (`meters.rs`); the
+//! Recorder comes later. The state, the actions and the layout are in
 //! `crates/kakelfix` (host-tested); this file is the device glue, the input loop and `kakelfix show`; `view.rs` draws.
 #![no_std]
 #![no_main]
 
 mod analyze;
+mod meters;
 mod view;
 
 use audio_screen::{Screen, poll_keys};
@@ -25,7 +27,8 @@ tape_rt::tape_help!(
 The active audio device's mixer on the pixel screen: one output's mix as
 fader strips (Outputs), every send as a table (Matrix) and the device's own
 settings (Device); the Analyzer page shows an input pair's waveform and
-spectrum. Mouse, touch or keyboard; soft keys on the right.
+spectrum; the Meters page meters every input (dBFS, Nordic PPM or LUFS)
+with its gain and switches under it. Mouse, touch or keyboard.
   device=N     use audio device N (`audio` lists them; loop0 for a try)
   screen=N     which screen (Pi 4: 1 is the second HDMI output)
   theme=NAME   dark, classic or light
@@ -35,14 +38,17 @@ spectrum. Mouse, touch or keyboard; soft keys on the right.
 kakelfix.cfg also keeps the Analyzer's settings, saved as they change:
 an-view=waveform|spectrum|both an-wave=envelope|scope an-span=1|5|30
 an-timebase=5|10|20|50 an-scale=db|linear an-pair=N
-an-resolution=third|sixth|twelfth|fft (the same words on the command line)
+an-resolution=third|sixth|twelfth|fft, and the Meters page's
+mt-scale=dbfs|nordic|lufs mt-input=N (the same words on the command line)
   show         print every output's sends and the controls, then end
-Keys: Tab next view, 1 2 3 Mixer/Recorder/Analyzer, arrows select and
+Keys: Tab next view, 1-4 Mixer/Recorder/Analyzer/Meters, arrows select and
 move (Up/Down: 1 dB), PgUp/PgDn 6 dB, + - 0.1 dB, 0 unity, x off, m mute,
 , . pan, c centre, o O next/previous output, p pair source, P pair output,
 L pan law, Enter open (Matrix) or change (Device), y n answer, Esc quits.
 Analyzer: Tab view, Left/Right or , . input pair, Up/Down span, space
 freeze, w envelope/scope, d dB/linear, f resolution, r reset.
+Meters: Left/Right input, Up/Down or + - gain, h +48V, i other switch,
+Tab or s scale, r reset (holds, clip, loudness).
 Mouse: click a strip, drag its fader or pan, click soft keys and cells.
 "#
 );
@@ -156,6 +162,10 @@ fn action(key: Key) -> Option<Action> {
         Key::Char(b'1') => Action::Page(Page::Mixer),
         Key::Char(b'2') => Action::Page(Page::Recorder),
         Key::Char(b'3') => Action::Page(Page::Analyzer),
+        Key::Char(b'4') => Action::Page(Page::Meters),
+        Key::Char(b's') => Action::MeterScale,
+        Key::Char(b'h') => Action::Phantom,
+        Key::Char(b'i') => Action::InputSwitch,
         Key::Char(b'+') | Key::Char(b'=') => Action::Step(0.1),
         Key::Char(b'-') => Action::Step(-0.1),
         Key::Char(b'0') => Action::Unity,
@@ -237,8 +247,11 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     app.analysis.channels = capture.channels().max(1);
     app.analysis.load(|key| config.value(key));
     app.analysis.pair = app.analysis.pair.min(app.analysis.pairs() - 1);
-    let mut saved = app.analysis.persisted();
-    // When the Analyzer's settings last changed; they are written a second later, so a run of key repeats is one write.
+    app.metering.channels = capture.channels().max(1);
+    app.metering.load(|key| config.value(key));
+    let persisted = |app: &App| (app.analysis.persisted(), app.metering.persisted());
+    let mut saved = persisted(&app);
+    // When the Analyzer's or the Meters page's settings last changed; they are written a second later, so a run of key repeats is one write.
     let mut changed_at = None;
     let mut failures = 0;
     let mut woken = LINK.work.load(Ordering::Acquire);
@@ -271,18 +284,19 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         if touches.poll(&mut pointing) {
             screen.mark_dirty();
         }
-        if app.analysis.persisted() != saved && changed_at.is_none() {
+        if persisted(&app) != saved && changed_at.is_none() {
             changed_at = Some(tape_rt::micros());
         }
         let settled = changed_at.is_some_and(|at| app.quit || tape_rt::micros().wrapping_sub(at) >= 1_000_000);
         if app.ask_changed || settled {
             changed_at = None;
-            saved = app.analysis.persisted();
+            saved = persisted(&app);
             let mut body = tape_rt::config::Settings::<512>::new();
             body.put("ask-phantom", format_args!("{}", if app.ask_hazard { "yes" } else { "no" }));
             app.analysis.save(|key, value| body.put(key, value));
+            app.metering.save(|key, value| body.put(key, value));
             let result = config.save(api, body.as_str());
-            // The Analyzer saves quietly; the +48 V toggle and any failure say so.
+            // The Analyzer and Meters save quietly; the +48 V toggle and any failure say so.
             if app.ask_changed || result.is_err() {
                 app.message.clear();
                 let _ = match result {

@@ -1756,10 +1756,10 @@ a real USB mouse is the check (rack). **Real hardware, verified:** piano's built
 
 ## KakelFix: mixer, recorder, analyzer (tapes/kakelfix, crates/kakelfix, crates/mixer-model, ABI 41)
 
-`kakelfix` is one graphical tape with three pages (Mixer, Recorder, Analyzer) chosen with soft keys on the right edge (or 1 2 3).
-The soft keys follow the page: the page keys first in their own colour, the current page's views indented under it (Tab cycles
+`kakelfix` is one graphical tape with four pages (Mixer, Recorder, Analyzer, Meters) chosen with soft keys on the right edge (or 1-4).
+The soft keys follow the page: the page keys first in their own colour, each with its number key (1-4) at the left, the current page's views indented under it (Tab cycles
 them), then that page's actions, Quit last. Milestone one
-is the Mixer page; the Analyzer followed. It knows no device: everything comes through the tape ABI's mixer calls (ABI 41, `mixer_*`), which a driver serves
+is the Mixer page; the Analyzer and the Meters page followed. It knows no device: everything comes through the tape ABI's mixer calls (ABI 41, `mixer_*`), which a driver serves
 by implementing `kernel_core::ext_audio::Mixer` (crosspoint gains of outputs from inputs and playback channels, output masters,
 meters in cdB, named controls with a HAZARD flag, a serial that moves on every change). The loopback devices carry a small software
 mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path runs in QEMU.
@@ -1786,17 +1786,29 @@ mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path 
   as Waveform, Spectrum or Both. The waveform is a min/max envelope scrolling in from the right over 1, 5 or 30 s (Up/Down), or
   (`w`) a scope triggered on the left channel's rising zero crossing over 5-50 ms, free-running when nothing crosses; `d` switches
   linear and dB. The spectrum is two `ltas::Analyzer`s (8192-point FFT, 1/3, 1/6, 1/12 octave or raw bins with `f`), peak hold dim
-  behind the exponential average, 20 Hz-20 kHz by 0..-100 dB, always as lines: band resolutions as a spline through the band
+  behind the exponential average (a legend above names the channels and the peak hold), 20 Hz-20 kHz by 0..-100 dB, always as lines: band resolutions as a spline through the band
   centres (`gfx::plot::spline`, as ltas draws them), raw bins as a polyline. Space freezes, `r` resets. View, wave mode, span,
   timebase, scale, resolution and pair are saved to `kakelfix.cfg` (`an-*` keys, beside `ask-phantom`) a second after the last
   change or on quit, and read back at start; the same keys work on the command line.
+- **Meters** (`crates/kakelfix/src/meters.rs` state and control matching, `tapes/kakelfix/src/meters.rs` readings and drawing):
+  a bar per captured input on one of three scales (`s` or Tab, also the soft key): sample peak in dBFS, Nordic PPM (IEC 60268-10
+  type I, TEST = -18 dBFS, with the dBFS column beside it), or EBU R128 loudness per stereo pair (bar momentary, line short-term,
+  -23 LUFS marked). The capture is the Analyzer's (it runs while either page is open); every input is fed to an
+  `audio_screen::meters::Channel` and every pair to a `dsp::loudness::Loudness`, read every 20 ms, with a minute of history (the
+  highest per 100 ms) for each. Under each bar are that input's controls: a driver names per-input controls "<label> N" (N the
+  1-based input), and a label holding gain, 48V, Level, Inst, Pad or AutoSet counts ("Loopback N" does not). Left/Right select an
+  input; Up/Down and `+`/`-` step its gain (the first number control, else the first list), `h` toggles +48V and `i` its other
+  switch (through the same HAZARD rule as the Device page), and a mouse drag on the gain cell changes it. Along the bottom the
+  selected input (pair in LUFS) is read out in large digits (M, S, I and LRA in LUFS) beside its history. Scale and input are saved
+  as `mt-scale` and `mt-input`.
 - **Test**: `make test-kakelfix` on the loopback: `show` reads the identity mix; in the tape `x` switches the first strip off and a
   mouse click half way up its fader sets -9 dB; with a `play` service playing a tone into loop0, `3` opens the Analyzer and its
-  envelope must appear; Up then a click on the Quit soft key at once must leave `an-span=30` in `kakelfix.cfg`; `show` reads the result. Then on the server
+  envelope must appear; `4` opens the Meters page and the first bar must light for the tone; `3`, Up then a click on the Quit soft key at once must leave `an-span=30` and an `mt-scale` in `kakelfix.cfg`; `show` reads the result. Then on the server
   kernel at -smp 4 the same `x` goes through the writer thread and `q` ends the tape through the writer's join (the mf shell's
   Escape kills a foreground process outright, which loses writes still queued). The mouse is walked exactly: the kernel's pointer
   gain moves a packet of d counts 4d + d|d|/2 pixels.
-- **Only hardware shows**: a real device's write latency under a fast drag, meters from a real driver, touch panels.
+- **Only hardware shows**: a real device's write latency under a fast drag, meters from a real driver, touch panels, which
+  controls the Meters page finds under each input of a real interface.
 
 ## Room acoustics: `frt60` (tapes/frt60, crates/rt60)
 

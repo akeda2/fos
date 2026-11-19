@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 audio-screen = { path = "../../crates/audio-screen" }
+dsp = { path = "../../crates/dsp" }
 tape-rt = { path = "../../crates/tape-rt" }
 fosfor-abi = { path = "../../abi" }
 gfx = { path = "../../crates/gfx" }

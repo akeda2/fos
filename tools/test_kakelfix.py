@@ -7,11 +7,12 @@ Embedded kernel (writes made inline):
  - the screen shows the mixer (header text drawn, not a blank frame)
  - `3` opens the Analyzer, which captures from loop0 while a `play` service plays a 1 kHz tone into it: the left
    channel's envelope (the first curve colour) grows in from the right edge of the upper lane; Quit there ends the tape
+ - `4` opens the Meters page on the same capture: input 1's bar (x 81..105, Nordic PPM) lights for the tone; `3` goes back
  - Up (the 30 s span) right before Quit: the Analyzer's settings are in kakelfix.cfg afterwards (saved on quit)
 Server kernel (writes go to the worker thread): `x`, then `q` (the shell's Escape kills a foreground process there, so
 `q` is what ends it through the writer's join), then `show`, at -smp 4.
-QEMU's screen is 1280x800, so kakelfix's layout is at scale 1 (crates/kakelfix/src/layout.rs): soft-key slot 9 (Quit, on
-every page) is at x 1184..1272, y 684..740 (after two half-key gaps between the groups); strip 0's fader travel is x
+QEMU's screen is 1280x800, so kakelfix's layout is at scale 1 (crates/kakelfix/src/layout.rs): soft-key slot 10 (Quit, on
+every page) is at x 1184..1272, y 726..780 (after two half-key gaps between the groups); strip 0's fader travel is x
 12..57, y 152..744. The Analyzer's Both view puts the waveform plot at x 56..1151, y 56..325, the left lane's centre at y 123."""
 
 import os
@@ -36,7 +37,9 @@ PLAY = ROOT / "build/fosfor/tapes/play"
 MF_IMAGE = Path(os.environ.get("FOSFOR_IMAGE_MF_KAKELFIX", ROOT / "build/fosfor-mf/fosfor-kakelfix.img"))
 CODE = next(p for p in ["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_CODE.fd",
                         "/usr/share/edk2/ovmf/OVMF_CODE.fd"] if Path(p).exists())
-QUIT = (1228, 712)
+QUIT = (1228, 752)
+METER_BAR = (range(84, 103, 3), range(300, 690, 2))
+LIT = {(0x3c, 0xcf, 0x6a), (0xff, 0xc8, 0x3d), (0xff, 0x4d, 0x4d)}
 ENVELOPE = (range(1000, 1150, 3), range(110, 137))
 BLUE = (0x4a, 0xa3, 0xff)
 FADER_MIDDLE = (32, 448)
@@ -146,6 +149,17 @@ def embedded():
             played = re.search(r"^ 1 play .*\n\s+calls:.* aout (\d+)", dump, re.M)
             check(played and int(played.group(1)) > 0, "SysRq lists the play service and its audio writes", dump[-1500:])
             check(re.search(r"^loop0: play c1 capture c0", dump, re.M), "SysRq shows who holds loop0's ends", dump[-1500:])
+            # The Meters page meters every input of the same capture: the tone lights the first bar.
+            deadline = time.monotonic() + 12
+            while True:
+                send(machine, b"4", 1)
+                (machine.monitor.parent / "meters.ppm").unlink(missing_ok=True)
+                width, height, pixel = screenshot(machine.monitor, "meters.ppm")
+                lit = sum(pixel(x, y) in LIT for x in METER_BAR[0] for y in METER_BAR[1])
+                if lit >= 20 or time.monotonic() > deadline:
+                    break
+            check(lit >= 20, f"the Meters page lights input 1's bar for the tone ({lit} pixels)")
+            send(machine, b"3", 1)
             # The longest span (Up clamps there, so a lost keystroke does no harm), then Quit at once: the settings wait a
             # second before they are saved, quitting writes them.
             for _ in range(3):
@@ -164,7 +178,7 @@ def embedded():
             send(machine, b"cat settings/kakelfix.cfg\n", 1)
             send(machine, b"cat kakelfix.cfg\n", 1)
             saved = machine.text()[start:]
-            check("an-span=30" in saved and "an-view=both" in saved, "the Analyzer's settings are saved in kakelfix.cfg", saved[-600:])
+            check("an-span=30" in saved and "an-view=both" in saved and "mt-scale=" in saved, "the Analyzer's settings are saved in kakelfix.cfg", saved[-600:])
         finally:
             machine.stop()
 

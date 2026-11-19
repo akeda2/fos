@@ -7,7 +7,7 @@ use gfx::Canvas;
 use gfx::theme::theme;
 use kakelfix::layout::fader_position;
 use kakelfix::analyzer::RESOLUTIONS;
-use kakelfix::{AnView, App, Device, Layout, Page, Rect, SOFT_SLOTS, SoftKind, Text, View, WaveMode, field, format_db, format_pan};
+use kakelfix::{Action, AnView, App, MeterScale, Device, Layout, Page, Rect, SOFT_SLOTS, SoftKind, Text, View, WaveMode, field, format_db, format_pan};
 use mixer_model::{Group, Strip};
 use core::fmt::Write;
 
@@ -81,6 +81,7 @@ pub fn draw(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware
         },
         Page::Recorder => centered(canvas, layout, layout.body, "Recorder: a later milestone", theme().dim),
         Page::Analyzer => crate::analyze::draw(canvas, layout, app, capture),
+        Page::Meters => crate::meters::draw(canvas, layout, app, hardware, capture.bank(), capture.problem()),
     }
     footer(canvas, layout, app);
     if let Some((index, value)) = app.confirm {
@@ -104,6 +105,7 @@ fn header(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware) 
             AnView::Spectrum => "Analyzer / Spectrum",
             AnView::Both => "Analyzer / Both",
         },
+        (Page::Meters, _) => "Meters",
     };
     let _ = write!(line, "KakelFix  {}  {page}", hardware.device.mixer.title());
     text(canvas, layout, 8, 4, line.as_str(), t.text);
@@ -121,6 +123,17 @@ fn header(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware) 
         }
         let wave = if a.wave == WaveMode::Envelope { "envelope" } else { "scope" };
         let _ = write!(line, "   {wave}   {}{}", RESOLUTIONS[a.resolution], if a.frozen { "   FROZEN" } else { "" });
+    } else if app.page == Page::Meters {
+        let m = &app.metering;
+        let _ = write!(line, "inputs {}", m.channels);
+        if app.analysis.rate != 0 {
+            let _ = write!(line, "   {} Hz", app.analysis.rate);
+        }
+        let _ = line.write_str(match m.scale {
+            MeterScale::Dbfs => "   sample peak, dBFS",
+            MeterScale::Nordic => "   Nordic PPM (IEC 60268-10 type I): TEST = -18 dBFS",
+            MeterScale::Lufs => "   EBU R128 per pair: bar M, line S, target -23 LUFS",
+        });
     }
     text(canvas, layout, 8, 4 + layout.row, line.as_str(), t.dim);
     if !app.message.is_empty() {
@@ -131,7 +144,7 @@ fn header(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware) 
 }
 
 /// Pages (Mixer, Recorder, Analyzer) in the page colour; the active page's views indented under it, joined to it by a
-/// line; actions (Pair, Freeze, Quit, ...) with a plain frame.
+/// line, each page key with its number key (1-4); actions (Pair, Freeze, Quit, ...) with a plain frame.
 fn soft_keys(canvas: &mut Canvas, layout: &Layout, app: &App) {
     let t = theme();
     let page_colour = t.curves[1];
@@ -156,17 +169,27 @@ fn soft_keys(canvas: &mut Canvas, layout: &Layout, app: &App) {
             SoftKind::Action => (if key.active { t.amber } else { t.grid_major }, if key.active { t.amber } else { t.text }),
         };
         box_(canvas, area, if key.active { t.grid_major } else { t.grid }, frame);
-        centered(canvas, layout, area, key.label, label);
+        if let (SoftKind::Page, Action::Page(page)) = (key.kind, key.action) {
+            // The page's key (1-4) at the left; the name centred in what is left.
+            let digit = [b'1' + page as u8];
+            let digit = core::str::from_utf8(&digit).unwrap_or("");
+            text(canvas, layout, area.x + layout.col / 2, area.y + (area.h - layout.row) / 2, digit, label);
+            let rest = Rect::new(area.x + layout.col * 3 / 2, area.y, area.w - layout.col * 3 / 2, area.h);
+            centered(canvas, layout, rest, key.label, label);
+        } else {
+            centered(canvas, layout, area, key.label, label);
+        }
     }
 }
 
 fn footer(canvas: &mut Canvas, layout: &Layout, app: &App) {
     let hint = match (app.page, app.view) {
-        (Page::Mixer, View::Outputs) => "Up/Dn 1 dB  PgUp/PgDn 6  +- 0.1  0 unity  x off  m mute  , . pan  o output  p pair  Tab view  1 2 3 page",
-        (Page::Mixer, View::Matrix) => "arrows select  Enter or click again: open  +- 0.1 dB  0 x m  p P pair  Tab view  1 2 3 page",
-        (Page::Mixer, View::Device) => "Up/Dn select  Left/Right/Enter or click again: change  Tab view  1 2 3 page",
-        (Page::Analyzer, _) => "Tab view  Left/Right or , . pair  Up/Dn span  space freeze  w env/scope  d dB/lin  f resolution  r reset  1 2 3 page",
-        _ => "1 Mixer  2 Recorder  3 Analyzer  Esc quits",
+        (Page::Mixer, View::Outputs) => "Up/Dn 1 dB  PgUp/PgDn 6  +- 0.1  0 unity  x off  m mute  , . pan  o output  p pair  Tab view  1-4 page",
+        (Page::Mixer, View::Matrix) => "arrows select  Enter or click again: open  +- 0.1 dB  0 x m  p P pair  Tab view  1-4 page",
+        (Page::Mixer, View::Device) => "Up/Dn select  Left/Right/Enter or click again: change  Tab view  1-4 page",
+        (Page::Analyzer, _) => "Tab view  Left/Right or , . pair  Up/Dn span  space freeze  w env/scope  d dB/lin  f resolution  r reset  1-4 page",
+        (Page::Meters, _) => "Left/Right input  Up/Dn gain  +- gain  h +48V  i switch  Tab or s scale  r reset  drag a gain  1-4 page",
+        _ => "1 Mixer  2 Recorder  3 Analyzer  4 Meters  Esc quits",
     };
     text(canvas, layout, 8, layout.footer.y + 4, fit(hint, layout.footer.w / layout.col - 2), theme().dim);
 }

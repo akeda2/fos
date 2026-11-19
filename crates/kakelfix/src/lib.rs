@@ -2,15 +2,17 @@
 //! so the host can test them. The tape reaches the active audio device's mixer (tape ABI 41, `mixer_*`) through the
 //! `Device` trait; `mixer_model` turns its mono crosspoints into stereo strips with dB faders, pan and mute.
 //!
-//! Pages (chosen by the soft keys down the right edge): Mixer, Recorder (a later milestone) and Analyzer. The soft keys
+//! Pages (chosen by the soft keys down the right edge): Mixer, Recorder (a later milestone), Analyzer and Meters. The soft keys
 //! follow the page: the active page's views sit indented under it, its actions below, Quit last. The Mixer page has three
 //! views: Outputs (one output's mix as fader strips, its master at the end), Matrix (every send of every output as a
 //! table) and Device (the device's own settings). The Analyzer shows a captured channel pair as a waveform, a spectrum,
-//! or both (`analyzer`).
+//! or both (`analyzer`). Meters shows every captured input as a bar (dBFS, Nordic PPM or LUFS per pair) with that
+//! input's gain and switches under it (`meters`).
 #![no_std]
 
 pub mod analyzer;
 pub mod layout;
+pub mod meters;
 pub mod queue;
 
 use core::fmt::Write;
@@ -19,6 +21,7 @@ use fosfor_abi::tape::{
 };
 pub use analyzer::{AnView, Analysis, Persisted, WaveMode};
 pub use layout::{Hit, Layout, Rect};
+pub use meters::{MeterScale, Metering};
 pub use queue::{Link, Queued};
 use mixer_model::{Cell, Group, List, Master, Mixer, PanLaw, Send, Strip, Strips, MAX_CHANNELS};
 pub use mixer_model::{FADER_MAX_DB, FADER_MIN_DB};
@@ -113,6 +116,7 @@ pub enum Page {
     Mixer,
     Recorder,
     Analyzer,
+    Meters,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -154,6 +158,10 @@ pub enum Action {
     Reset,
     WaveScale,
     Resolution,
+    /// Meters: the next scale, the selected input's phantom power, its instrument (or other) switch.
+    MeterScale,
+    Phantom,
+    InputSwitch,
     Enter,
     Yes,
     No,
@@ -166,12 +174,14 @@ pub enum Grab {
     /// The fader of strip n (sources, then the master).
     Fader(usize),
     Pan(usize),
+    /// A control under a meter, dragged up or down from where it was pressed (`y`) and what it was (`value`).
+    Control { index: usize, y: i32, value: i64 },
 }
 
 /// Soft-key slots down the right edge: `SOFT_NAV` for the pages with the active page's views under it, then
 /// `SOFT_ACTIONS` for that page's actions, then Quit, with half a key between the groups.
-pub const SOFT_SLOTS: usize = 10;
-pub const SOFT_NAV: usize = 6;
+pub const SOFT_SLOTS: usize = 11;
+pub const SOFT_NAV: usize = 7;
 pub const SOFT_ACTIONS: usize = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -220,6 +230,7 @@ pub struct App {
     pub first_row: usize,
     pub first_col: usize,
     pub first_ctl: usize,
+    pub first_meter: usize,
     /// A hazardous control change waiting for yes or no: (control, value).
     pub confirm: Option<(usize, i64)>,
     /// Whether switching a hazardous control on (phantom power) asks first. Off by default; the Device page's last row
@@ -229,6 +240,7 @@ pub struct App {
     pub ask_changed: bool,
     pub controls: List<MixerControl, 32>,
     pub analysis: Analysis,
+    pub metering: Metering,
     pub message: Text<72>,
     pub quit: bool,
     names: [[Text<16>; MAX_CHANNELS]; 3],
@@ -253,11 +265,13 @@ impl App {
             first_row: 0,
             first_col: 0,
             first_ctl: 0,
+            first_meter: 0,
             confirm: None,
             ask_hazard: false,
             ask_changed: false,
             controls: List::new(),
             analysis: Analysis::new(),
+            metering: Metering::new(),
             message: Text::new(),
             quit: false,
             names: [[Text::new(); MAX_CHANNELS]; 3],
@@ -475,9 +489,11 @@ impl App {
                     }
                 }
                 Page::Analyzer => self.analysis.next_view(),
+                Page::Meters => self.metering.next_scale(),
                 Page::Recorder => {}
             },
             _ if self.page == Page::Analyzer => self.act_analyzer(action),
+            _ if self.page == Page::Meters => self.act_meters(device, action),
             _ if self.page != Page::Mixer => {}
             Action::PanLaw => {
                 self.mix.pan_law = match self.mix.pan_law {
@@ -520,6 +536,103 @@ impl App {
         }
     }
 
+    fn act_meters(&mut self, device: &mut impl Device, action: Action) {
+        let m = &mut self.metering;
+        match action {
+            Action::Left => m.step(false),
+            Action::Right => m.step(true),
+            Action::Home => m.input = 0,
+            Action::End => m.input = m.channels.max(1) - 1,
+            Action::MeterScale => m.next_scale(),
+            Action::Reset => m.reset(),
+            Action::Up => self.step_gain(device, 1),
+            Action::Down => self.step_gain(device, -1),
+            Action::Step(d) => self.step_gain(device, if d.abs() >= 1.0 { d as i64 } else if d < 0.0 { -1 } else { 1 }),
+            Action::Phantom => self.input_switch(device, true),
+            Action::InputSwitch => self.input_switch(device, false),
+            _ => {}
+        }
+    }
+
+    /// The device controls of capture input `input` (0-based), in the device's order (`meters::input_of`).
+    pub fn input_controls(&self, input: usize) -> List<usize, 4> {
+        let mut list = List::new();
+        for (index, control) in self.controls.iter().enumerate() {
+            if meters::input_of(field(&control.name)) == Some(input + 1) && list.len() < 4 {
+                list.push(index);
+            }
+        }
+        list
+    }
+
+    /// Rows of control cells under the meters: the most any input has.
+    pub fn meter_rows(&self) -> usize {
+        (0..self.metering.channels.min(MAX_CHANNELS)).map(|input| self.input_controls(input).len()).max().unwrap_or(0)
+    }
+
+    /// The control Up and Down change for `input`: its first number (a gain), else its first choice (a level switch).
+    pub fn gain_control(&self, input: usize) -> Option<usize> {
+        let controls = self.input_controls(input);
+        let of_kind = |kind| controls.iter().copied().find(|&i| self.controls[i].kind == kind);
+        of_kind(fosfor_abi::tape::MIXER_CONTROL_INT).or_else(|| of_kind(MIXER_CONTROL_ENUM))
+    }
+
+    fn step_gain(&mut self, device: &mut impl Device, delta: i64) {
+        let input = self.metering.input;
+        match self.gain_control(input) {
+            Some(index) => self.change_control(device, index, delta),
+            None => self.note(format_args!("input {} has no gain here", input + 1)),
+        }
+    }
+
+    /// Flips the selected input's phantom power (`phantom`) or its first other switch (instrument, pad); a hazardous one
+    /// goes through `change_control`, which asks when `ask_hazard` is on.
+    fn input_switch(&mut self, device: &mut impl Device, phantom: bool) {
+        let input = self.metering.input;
+        let found = self.input_controls(input).iter().copied().find(|&i| {
+            let control = &self.controls[i];
+            let is_phantom = field(&control.name).contains("48V");
+            control.kind == MIXER_CONTROL_BOOL && is_phantom == phantom
+        });
+        match found {
+            Some(index) => self.change_control(device, index, 1),
+            None => self.note(format_args!("input {} has no {} switch", input + 1, if phantom { "+48V" } else { "other" })),
+        }
+    }
+
+    /// A control's value in a meter's cell, a few characters: a switch by its name (the drawing lights it when on), a
+    /// number with its unit ("40dB"), a choice by its item; "?" while the device does not know it.
+    pub fn control_short(&self, device: &impl Device, index: usize) -> Text<12> {
+        let mut text = Text::new();
+        let Some(control) = self.controls.get(index) else { return text };
+        let label = meters::short_label(field(&control.name));
+        let unknown = control.flags & MIXER_FLAG_UNKNOWN != 0;
+        match control.kind {
+            MIXER_CONTROL_BOOL => {
+                let _ = write!(text, "{label}{}", if unknown { "?" } else { "" });
+            }
+            _ if unknown => {
+                let _ = text.write_str("?");
+            }
+            MIXER_CONTROL_ENUM => {
+                let mut buffer = [0u8; 12];
+                let len = device.control_item(index, control.value as usize, &mut buffer).min(12);
+                match core::str::from_utf8(&buffer[..len]) {
+                    Ok(item) if !item.is_empty() => {
+                        let _ = text.write_str(item);
+                    }
+                    _ => {
+                        let _ = write!(text, "{}", control.value);
+                    }
+                }
+            }
+            _ => {
+                let _ = write!(text, "{}{}", control.value, field(&control.unit));
+            }
+        }
+        text
+    }
+
     /// The soft keys for the page shown (`SOFT_SLOTS` of them, some `Empty`).
     pub fn soft_keys(&self) -> [Soft; SOFT_SLOTS] {
         let mut keys = [Soft::EMPTY; SOFT_SLOTS];
@@ -542,6 +655,7 @@ impl App {
                 put(&mut slot, label, SoftKind::View, Action::AnView(view), self.analysis.view == view);
             }
         }
+        put(&mut slot, "Meters", SoftKind::Page, Action::Page(Page::Meters), self.page == Page::Meters);
         slot = SOFT_NAV;
         if mixer {
             put(&mut slot, "Pair", SoftKind::Action, Action::Pair, false);
@@ -550,6 +664,10 @@ impl App {
             put(&mut slot, "Freeze", SoftKind::Action, Action::Freeze, self.analysis.frozen);
             let wave = if self.analysis.wave == WaveMode::Envelope { "Wave: Env" } else { "Wave: Scope" };
             put(&mut slot, wave, SoftKind::Action, Action::WaveMode, false);
+            put(&mut slot, "Reset", SoftKind::Action, Action::Reset, false);
+        } else if self.page == Page::Meters {
+            let scale = ["Scale: dBFS", "Scale: PPM", "Scale: LUFS"][self.metering.scale as usize];
+            put(&mut slot, scale, SoftKind::Action, Action::MeterScale, false);
             put(&mut slot, "Reset", SoftKind::Action, Action::Reset, false);
         }
         slot = SOFT_NAV + SOFT_ACTIONS;
@@ -847,6 +965,8 @@ impl App {
         self.first_row = keep(self.row, self.first_row, layout.visible_rows(), self.sources().len());
         self.first_col = keep(self.col, self.first_col, layout.visible_cols(), self.outputs().len());
         self.first_ctl = keep(self.ctl_sel, self.first_ctl, layout.visible_controls(), self.device_rows());
+        self.metering.input = self.metering.input.min(self.metering.channels.max(1) - 1);
+        self.first_meter = keep(self.metering.bar(), self.first_meter, layout.visible_meters(self), self.metering.bars());
     }
 
     /// A mouse button or finger came down at (`x`, `y`); `Some` when it grabbed a fader or a pan control to drag.
@@ -903,17 +1023,39 @@ impl App {
                 }
                 None
             }
+            Hit::Meter(input) => {
+                self.metering.input = input;
+                None
+            }
+            Hit::InputControl(index, input) => {
+                self.metering.input = input;
+                let control = self.controls.get(index)?;
+                if control.kind == fosfor_abi::tape::MIXER_CONTROL_INT {
+                    return Some(Grab::Control { index, y, value: control.value });
+                }
+                self.change_control(device, index, 1);
+                None
+            }
             Hit::Yes | Hit::No | Hit::Nothing => None,
         }
     }
 
     /// The held button or finger moved to (`x`, `y`): the grabbed fader follows it (0.5 dB steps, the bottom is off), a
-    /// grabbed pan control follows it sideways (1% steps).
+    /// grabbed pan control follows it sideways (1% steps), a grabbed gain under a meter one step per half text row.
     pub fn drag(&mut self, device: &mut impl Device, layout: &Layout, grab: Grab, x: i32, y: i32) {
+        if let Grab::Control { index, y: from, value } = grab {
+            let Some(control) = self.controls.get(index).filter(|_| self.page == Page::Meters && self.confirm.is_none()) else { return };
+            let target = (value + ((from - y) / (layout.row / 2).max(1)) as i64).clamp(control.min, control.max);
+            if target != control.value {
+                self.change_control(device, index, target - control.value);
+            }
+            return;
+        }
         if self.view != View::Outputs || self.page != Page::Mixer {
             return;
         }
         match grab {
+            Grab::Control { .. } => {}
             Grab::Fader(strip) => {
                 let Some(fader) = layout.fader(strip, self) else { return };
                 let position = (fader.y + fader.h - y) as f64 / fader.h.max(1) as f64;

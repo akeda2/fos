@@ -61,6 +61,15 @@ impl Channel {
     /// Both readings advance (so switching scale shows a current value); returns the one asked for. `dt_s` is the time since
     /// the last call.
     pub fn read(&mut self, kind: Kind, dt_s: f32) -> Reading {
+        let [dbfs, nordic] = self.read_both(dt_s);
+        match kind {
+            Kind::Dbfs => dbfs,
+            Kind::Nordic => nordic,
+        }
+    }
+
+    /// Both readings at once: `[sample peak in dBFS, Nordic PPM on its scale]`.
+    pub fn read_both(&mut self, dt_s: f32) -> [Reading; 2] {
         let dbfs = self.peak.read(dt_s);
         let ppm_dbfs = match self.ppm.take_max() {
             0 => FLOOR_DB,
@@ -69,10 +78,8 @@ impl Channel {
         let hold_dbfs = self.hold_dbfs.update(dbfs, dt_s);
         let hold_ppm = self.hold_nordic.update(ppm_dbfs, dt_s);
         let clipped = self.peak.clipped;
-        match kind {
-            Kind::Dbfs => Reading { level: dbfs, hold: hold_dbfs, clipped },
-            Kind::Nordic => Reading { level: ppm_dbfs - Scale::NORDIC.dbfs_at_zero, hold: hold_ppm - Scale::NORDIC.dbfs_at_zero, clipped },
-        }
+        let zero = Scale::NORDIC.dbfs_at_zero;
+        [Reading { level: dbfs, hold: hold_dbfs, clipped }, Reading { level: ppm_dbfs - zero, hold: hold_ppm - zero, clipped }]
     }
 
     /// Clears the clip lamp and the holds.

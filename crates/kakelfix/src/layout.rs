@@ -37,6 +37,9 @@ pub enum Hit {
     /// Matrix (source row, output column).
     Cell(usize, usize),
     Control(usize),
+    /// Meters: an input's bar or name (the input, 0-based), a control cell under it (control index, input).
+    Meter(usize),
+    InputControl(usize, usize),
     Yes,
     No,
     Nothing,
@@ -160,6 +163,72 @@ impl Layout {
         }
     }
 
+    /// Meters: the readouts and history of the selected input along the bottom of the page.
+    pub fn meter_strip(&self) -> Rect {
+        let h = self.row * 3 + 16;
+        Rect::new(self.body.x, self.body.y + self.body.h - h, self.body.w, h)
+    }
+
+    /// Meters: the area the bars' columns share, inside the room for the scale's labels (`gfx::meter::draw_scale` writes
+    /// the 8x16 font, unscaled: the scale at the left, the scale again and the dBFS column at the right), the scale's name
+    /// and the clip lamps above.
+    pub fn meter_area(&self) -> Rect {
+        let b = self.body;
+        let (left, right, top) = (48, 160, 36);
+        let bottom = self.meter_strip().y - 8;
+        Rect::new(b.x + left, b.y + top, b.w - left - right, bottom - b.y - top)
+    }
+
+    /// A bar's column width: a wide one for a pair (LUFS), clamped between a readable name and a sensible bar.
+    pub fn meter_column_w(&self, app: &App) -> i32 {
+        let per = app.metering.per_bar() as i32;
+        let area = self.meter_area();
+        (area.w / app.metering.bars().max(1) as i32).clamp(self.col * 6 * per, self.col * 10 * per)
+    }
+
+    pub fn visible_meters(&self, app: &App) -> usize {
+        (self.meter_area().w / self.meter_column_w(app)).max(1) as usize
+    }
+
+    /// The whole column of bar `bar` (an input, or a pair in LUFS): the bar, its name, its control cells.
+    pub fn meter_column(&self, bar: usize, app: &App) -> Option<Rect> {
+        let slot = bar.checked_sub(app.first_meter).filter(|&s| s < self.visible_meters(app) && bar < app.metering.bars())?;
+        let (area, w) = (self.meter_area(), self.meter_column_w(app));
+        Some(Rect::new(area.x + slot as i32 * w, area.y, w - 6, area.h))
+    }
+
+    /// The bars' width: the visible columns (the scale's tick lines run across it).
+    pub fn meter_span(&self, app: &App) -> i32 {
+        self.visible_meters(app).min(app.metering.bars()) as i32 * self.meter_column_w(app) - 6
+    }
+
+    /// Height of one control cell under a bar.
+    pub fn meter_cell_h(&self) -> i32 {
+        self.row + 8
+    }
+
+    /// The bar of column `bar`, above its name and control cells.
+    pub fn meter_bar(&self, bar: usize, app: &App) -> Option<Rect> {
+        let c = self.meter_column(bar, app)?;
+        let under = self.row + 4 + app.meter_rows() as i32 * self.meter_cell_h();
+        Some(Rect::new(c.x, c.y, c.w, (c.h - under).max(8)))
+    }
+
+    /// The name row under bar `bar`.
+    pub fn meter_name(&self, bar: usize, app: &App) -> Option<Rect> {
+        let b = self.meter_bar(bar, app)?;
+        Some(Rect::new(b.x, b.y + b.h + 2, b.w, self.row))
+    }
+
+    /// Control cell `row` of `input` under its bar (in LUFS the pair's column is split, left input left).
+    pub fn meter_cell(&self, input: usize, row: usize, app: &App) -> Option<Rect> {
+        let per = app.metering.per_bar();
+        let name = self.meter_name(input / per, app)?;
+        let w = (name.w - (per as i32 - 1) * 4) / per as i32;
+        let x = name.x + (input % per) as i32 * (w + 4);
+        Some(Rect::new(x, name.y + self.row + 2 + row as i32 * self.meter_cell_h(), w, self.meter_cell_h() - 4))
+    }
+
     pub fn visible_tabs(&self) -> usize {
         (self.tabs.w / self.tab_w).max(1) as usize
     }
@@ -266,6 +335,26 @@ impl Layout {
         Rect::new(d.x + d.w / 2 + self.col * 2, d.y + d.h - self.row * 2 - 8, self.col * 10, self.row * 2)
     }
 
+    fn meter_hit(&self, app: &App, x: i32, y: i32) -> Hit {
+        let m = &app.metering;
+        for input in 0..m.channels.min(crate::MAX_CHANNELS) {
+            for (row, &index) in app.input_controls(input).iter().enumerate() {
+                if self.meter_cell(input, row, app).is_some_and(|r| r.contains(x, y)) {
+                    return Hit::InputControl(index, input);
+                }
+            }
+        }
+        for bar in 0..m.bars() {
+            let Some(column) = self.meter_column(bar, app) else { continue };
+            if column.contains(x, y) {
+                // In a pair's column the half clicked picks the input.
+                let half = (x - column.x) * m.per_bar() as i32 / column.w.max(1);
+                return Hit::Meter((bar * m.per_bar() + half as usize).min(m.channels.max(1) - 1));
+            }
+        }
+        Hit::Nothing
+    }
+
     pub fn hit(&self, app: &App, x: i32, y: i32) -> Hit {
         if app.confirm.is_some() {
             return if self.yes().contains(x, y) {
@@ -279,6 +368,9 @@ impl Layout {
         let keys = app.soft_keys();
         if let Some(slot) = (0..SOFT_SLOTS).find(|&k| keys[k].kind != SoftKind::Empty && self.soft(app, k).contains(x, y)) {
             return Hit::Soft(slot);
+        }
+        if app.page == Page::Meters {
+            return self.meter_hit(app, x, y);
         }
         if app.page != Page::Mixer {
             return Hit::Nothing;

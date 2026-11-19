@@ -14,11 +14,13 @@ pub(crate) struct Fake {
     pub refuse: bool,
     /// "Trim" reports `MIXER_FLAG_UNKNOWN`.
     pub unknown_trim: bool,
+    /// The three controls' names: a switch, a hazardous switch, a number.
+    pub names: [&'static str; 3],
 }
 
 impl Fake {
     pub fn new() -> Fake {
-        Fake { gain: [[None, None, Some(UNITY), Some(0)], [None, None, Some(0), Some(UNITY)]], master: [UNITY; 2], controls: [0; 3], serial: 1, writes: 0, refuse: false, unknown_trim: false }
+        Fake { gain: [[None, None, Some(UNITY), Some(0)], [None, None, Some(0), Some(UNITY)]], master: [UNITY; 2], controls: [0; 3], serial: 1, writes: 0, refuse: false, unknown_trim: false, names: ["Dim", "Phantom", "Trim"] }
     }
 }
 
@@ -61,10 +63,10 @@ impl Device for Fake {
     fn control(&self, index: usize) -> Option<MixerControl> {
         let mut control = MixerControl::default();
         let name: &str = match index {
-            0 => "Dim",
+            0 => self.names[0],
             1 => {
                 control.flags = MIXER_FLAG_HAZARD;
-                "Phantom"
+                self.names[1]
             }
             2 => {
                 control.kind = MIXER_CONTROL_INT;
@@ -73,7 +75,7 @@ impl Device for Fake {
                 if self.unknown_trim {
                     control.flags = fosfor_abi::tape::MIXER_FLAG_UNKNOWN;
                 }
-                "Trim"
+                self.names[2]
             }
             _ => return None,
         };
@@ -258,19 +260,19 @@ fn soft_keys_follow_the_page_and_tab_cycles_its_views() {
     let mut app = app(&mut device);
     let layout = Layout::new(1280, 720);
     let labels = |app: &App| app.soft_keys().map(|k| k.label);
-    assert_eq!(labels(&app), ["Mixer", "Outputs", "Matrix", "Device", "Recorder", "Analyzer", "Pair", "Pan law", "", "Quit"]);
+    assert_eq!(labels(&app), ["Mixer", "Outputs", "Matrix", "Device", "Recorder", "Analyzer", "Meters", "Pair", "Pan law", "", "Quit"]);
     let analyzer = layout.soft(&app, 5);
     app.press(&mut device, &layout, analyzer.x + 1, analyzer.y + 1);
     assert_eq!(app.page, Page::Analyzer);
-    assert_eq!(labels(&app), ["Mixer", "Recorder", "Analyzer", "Waveform", "Spectrum", "Both", "Freeze", "Wave: Env", "Reset", "Quit"]);
+    assert_eq!(labels(&app), ["Mixer", "Recorder", "Analyzer", "Waveform", "Spectrum", "Both", "Meters", "Freeze", "Wave: Env", "Reset", "Quit"]);
     assert!(layout.soft(&app, 3).x > layout.soft(&app, 2).x, "views are indented");
     app.act(&mut device, Action::NextView);
     assert_eq!((app.page, app.analysis.view), (Page::Analyzer, AnView::Waveform));
     let spectrum = layout.soft(&app, 4);
     app.press(&mut device, &layout, spectrum.x + 1, spectrum.y + 1);
     assert_eq!(app.analysis.view, AnView::Spectrum);
-    let empty = layout.soft(&app, 8);
-    let quit = layout.soft(&app, 9);
+    let empty = layout.soft(&app, 9);
+    let quit = layout.soft(&app, 10);
     assert!(quit.y > empty.y + empty.h, "a gap before Quit");
     app.act(&mut device, Action::Page(Page::Recorder));
     let gap = layout.soft(&app, 7);
@@ -299,7 +301,7 @@ fn analyzer_keys_step_pair_and_span_and_restart_the_buffers() {
     app.act(&mut device, Action::Down);
     assert_eq!((app.analysis.wave, app.analysis.timebase, app.analysis.span), (WaveMode::Scope, 0, 2));
     app.act(&mut device, Action::Freeze);
-    assert!(app.analysis.frozen && app.soft_keys()[6].active);
+    assert!(app.analysis.frozen && app.soft_keys()[7].active);
     app.act(&mut device, Action::Mute);
     assert_eq!(device.writes, 0, "mixer keys do nothing on the Analyzer page");
 }
@@ -361,4 +363,107 @@ fn analyzer_settings_are_saved_and_loaded_back() {
     let mut c = Analysis::new();
     c.load(|key| (key == "an-view").then_some("sideways"));
     assert_eq!(c.persisted(), Analysis::new().persisted(), "an unknown word changes nothing");
+}
+
+#[test]
+fn meter_controls_belong_to_the_input_their_number_names() {
+    assert_eq!(meters::input_of("Mic gain 3"), Some(3));
+    assert_eq!(meters::input_of("+48V 12"), Some(12));
+    assert_eq!(meters::input_of("Level 5"), Some(5));
+    assert_eq!(meters::input_of("Loopback 1"), None, "not an input's control");
+    assert_eq!(meters::input_of("Clock"), None);
+    assert_eq!(meters::short_label("+48V 1"), "+48V");
+    let mut device = Fake::new();
+    device.names = ["Inst 2", "+48V 1", "Mic gain 1"];
+    let mut app = app(&mut device);
+    app.metering.channels = 2;
+    assert_eq!(&app.input_controls(0)[..], &[1, 2]);
+    assert_eq!(&app.input_controls(1)[..], &[0]);
+    assert_eq!(app.meter_rows(), 2);
+    assert_eq!(app.gain_control(0), Some(2));
+    assert_eq!(app.gain_control(1), None);
+    assert_eq!(app.control_short(&device, 2).as_str(), "0");
+    assert_eq!(app.control_short(&device, 1).as_str(), "+48V");
+}
+
+#[test]
+fn meters_keys_select_inputs_change_gain_and_ask_for_phantom() {
+    let mut device = Fake::new();
+    device.names = ["Inst 2", "+48V 1", "Mic gain 1"];
+    let mut app = app(&mut device);
+    app.metering.channels = 2;
+    app.act(&mut device, Action::Page(Page::Meters));
+    assert_eq!(app.soft_keys()[3].label, "Meters");
+    assert_eq!(app.soft_keys()[7].label, "Scale: PPM");
+    app.act(&mut device, Action::Up);
+    app.act(&mut device, Action::Step(6.0));
+    assert_eq!(device.controls[2], 7, "Up and PgUp step the selected input's gain");
+    app.act(&mut device, Action::Step(30.0));
+    assert_eq!(device.controls[2], 10, "clamped at the control's maximum");
+    app.ask_hazard = true;
+    app.act(&mut device, Action::Phantom);
+    assert_eq!((device.controls[1], app.confirm), (0, Some((1, 1))), "+48V asks first");
+    app.act(&mut device, Action::Yes);
+    assert_eq!(device.controls[1], 1);
+    app.act(&mut device, Action::Right);
+    assert_eq!(app.metering.input, 1);
+    app.act(&mut device, Action::Right);
+    assert_eq!(app.metering.input, 1, "stays on the last input");
+    app.act(&mut device, Action::Up);
+    assert!(app.message.as_str().contains("no gain"), "{}", app.message.as_str());
+    app.act(&mut device, Action::InputSwitch);
+    assert_eq!(device.controls[0], 1, "i flips input 2's Inst switch");
+    app.act(&mut device, Action::NextView);
+    assert_eq!(app.metering.scale, MeterScale::Lufs);
+    assert_eq!((app.metering.bars(), app.metering.bar()), (1, 0));
+    let generation = app.metering.generation;
+    app.act(&mut device, Action::Reset);
+    assert_ne!(app.metering.generation, generation);
+}
+
+#[test]
+fn meters_mouse_selects_and_drags_the_gain() {
+    let mut device = Fake::new();
+    device.names = ["Inst 2", "+48V 1", "Mic gain 1"];
+    let mut app = app(&mut device);
+    app.metering.channels = 2;
+    app.act(&mut device, Action::Page(Page::Meters));
+    let layout = Layout::new(1280, 800);
+    app.scroll(&layout);
+    let bar = layout.meter_bar(1, &app).unwrap();
+    app.press(&mut device, &layout, bar.x + 2, bar.y + 10);
+    assert_eq!(app.metering.input, 1);
+    let gain = layout.meter_cell(0, 1, &app).unwrap();
+    let grab = app.press(&mut device, &layout, gain.x + 2, gain.y + 2);
+    assert_eq!(app.metering.input, 0);
+    let grab = grab.expect("a gain cell is dragged");
+    app.drag(&mut device, &layout, grab, gain.x + 2, gain.y + 2 - layout.row * 2);
+    assert_eq!(device.controls[2], 4, "two rows up is four steps");
+    app.drag(&mut device, &layout, grab, gain.x + 2, gain.y + 2 + layout.row * 20);
+    assert_eq!(device.controls[2], -10);
+    let inst = layout.meter_cell(1, 0, &app).unwrap();
+    assert!(app.press(&mut device, &layout, inst.x + 2, inst.y + 2).is_none());
+    assert_eq!(device.controls[0], 1, "a click flips a switch");
+    // In LUFS a column is a pair: its right half selects the right input.
+    app.act(&mut device, Action::MeterScale);
+    let pair = layout.meter_bar(0, &app).unwrap();
+    app.press(&mut device, &layout, pair.x + pair.w - 4, pair.y + 10);
+    assert_eq!(app.metering.input, 1);
+}
+
+#[test]
+fn meter_settings_load_and_save() {
+    let mut m = Metering::new();
+    m.channels = 4;
+    m.load(|key| match key {
+        "mt-scale" => Some("lufs"),
+        "mt-input" => Some("9"),
+        _ => None,
+    });
+    assert_eq!((m.scale, m.input), (MeterScale::Lufs, 3), "the input is clamped to what is captured");
+    let mut text = Text::<64>::new();
+    m.save(|key, value| {
+        let _ = write!(text, "{key}={value} ");
+    });
+    assert_eq!(text.as_str(), "mt-scale=lufs mt-input=4 ");
 }

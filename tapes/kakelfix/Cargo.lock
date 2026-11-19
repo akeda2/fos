@@ -66,6 +66,7 @@ name = "kakelfix-tape"
 version = "0.1.0"
 dependencies = [
  "audio-screen",
+ "dsp",
  "fosfor-abi",
  "gfx",
  "instrument-rt",

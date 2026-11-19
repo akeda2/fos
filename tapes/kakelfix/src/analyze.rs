@@ -1,6 +1,6 @@
 //! The Analyzer page: capture from the active device while the page is shown, the envelope, scope and two spectra
 //! (`crates/ltas`, left and right) fed from it, and their drawing. Capture starts when the page is entered and stops when
-//! it is left, so the Mixer page never holds the device's input. The buffers are taken from the heap once, at startup.
+//! it is left (the Meters page captures too, through `meters::Bank`), so the Mixer page never holds the device's input. The buffers are taken from the heap once, at startup.
 
 use crate::view::{centered, text};
 use audio_screen::Input;
@@ -42,6 +42,7 @@ pub struct Capture {
     failed: bool,
     seen: u32,
     columns: usize,
+    bank: Option<crate::meters::Bank>,
 }
 
 impl Capture {
@@ -66,7 +67,11 @@ impl Capture {
             }
             _ => rate,
         };
-        Capture { input, buffers, rate, running: false, failed: false, seen: 0, columns: 0 }
+        let bank = match &input {
+            Ok(input) => crate::meters::Bank::new(api, rate, input.channels),
+            Err(_) => None,
+        };
+        Capture { input, buffers, rate, running: false, failed: false, seen: 0, columns: 0, bank }
     }
 
     pub fn channels(&self) -> usize {
@@ -74,7 +79,11 @@ impl Capture {
     }
 
     /// Why the page cannot show anything, if it cannot.
-    fn problem(&self) -> Option<&'static str> {
+    pub fn bank(&self) -> Option<&crate::meters::Bank> {
+        self.bank.as_ref()
+    }
+
+    pub(crate) fn problem(&self) -> Option<&'static str> {
         match (&self.input, &self.buffers) {
             (Err(reason), _) => Some(reason),
             (Ok(_), None) => Some("out of memory for the analyzer"),
@@ -85,7 +94,7 @@ impl Capture {
 
     /// Starts or stops capture with the page and feeds what arrived; true when there is something new to draw.
     pub fn update(&mut self, api: &TapeApi, app: &mut App, layout: &Layout) -> bool {
-        if app.page != Page::Analyzer {
+        if app.page != Page::Analyzer && app.page != Page::Meters {
             self.stop(api, app);
             self.failed = false;
             return false;
@@ -108,6 +117,10 @@ impl Capture {
         }
         if !self.running {
             return false;
+        }
+        if app.page == Page::Meters {
+            let Some(bank) = &mut self.bank else { return false };
+            return bank.update(api, input, b.scratch, &mut b.left[..], &mut b.right[..], app.metering.generation);
         }
         let a = app.analysis;
         let columns = layout.analyzer_plots(a.view).0.map_or(self.columns.max(1), |plot| plot.w.max(1) as usize);
@@ -162,12 +175,12 @@ pub fn draw(canvas: &mut Canvas, layout: &Layout, app: &App, capture: &mut Captu
         waveform(canvas, layout, app, b, plot);
     }
     if let Some(plot) = spectrum {
-        spectra(canvas, layout, b, plot);
+        spectra(canvas, layout, app, b, plot);
     }
 }
 
 /// A capture channel's name: the mixer's name for that input when it has one, else its number.
-fn channel_name(app: &App, channel: usize) -> Text<16> {
+pub(crate) fn channel_name(app: &App, channel: usize) -> Text<16> {
     if channel < app.mix.n[Group::Input.idx()] {
         Text::from(app.name(Group::Input, channel))
     } else {
@@ -248,6 +261,22 @@ fn waveform(canvas: &mut Canvas, layout: &Layout, app: &App, b: &Buffers, plot: 
     text(canvas, layout, plot.x + plot.w - width, plot.y - layout.row, note.as_str(), t.dim);
 }
 
+/// What the spectrum's lines are, in the row above it: a swatch and name per channel (the 0.5 s average) and the dim peak
+/// hold (the resolution is in the header).
+fn legend(canvas: &mut Canvas, layout: &Layout, app: &App, plot: Rect) {
+    let t = theme();
+    let (first, second) = app.analysis.channels_shown();
+    let y = plot.y - layout.row;
+    let mut x = plot.x;
+    let names = [channel_name(app, first), channel_name(app, second)];
+    let entries = [(names[0].as_str(), t.curves[0]), (names[1].as_str(), t.curves[1]), ("peak hold", t.dim)];
+    for (name, colour) in entries {
+        canvas.fill_rect(x, y + layout.row / 2 - 1, (layout.col * 2) as u32, 2, colour);
+        x += layout.col * 3;
+        x = text(canvas, layout, x, y, name, colour) + layout.col * 2;
+    }
+}
+
 /// `hz` on the log axis from 20 Hz to 20 kHz across `plot`.
 fn x_of(plot: &Rect, hz: f32) -> i32 {
     let decades = lin_to_db((hz.max(LOW_HZ) / LOW_HZ) as f64) as f32 / 20.0;
@@ -256,8 +285,9 @@ fn x_of(plot: &Rect, hz: f32) -> i32 {
 
 /// The left and right spectra (exponential average, 0.5 s) with their peaks since the last reset behind them, dim. Band
 /// resolutions are drawn as a spline through the band centres (as ltas does), FFT as a polyline; never as stairs.
-fn spectra(canvas: &mut Canvas, layout: &Layout, b: &mut Buffers, plot: Rect) {
+fn spectra(canvas: &mut Canvas, layout: &Layout, app: &App, b: &mut Buffers, plot: Rect) {
     let t = theme();
+    legend(canvas, layout, app, plot);
     let frame = Frame { left: plot.x, top: plot.y, plot_w: plot.w as u32, plot_h: plot.h as u32 };
     let mut db = 0;
     while db >= -(SCALE.db_range as i32) {
