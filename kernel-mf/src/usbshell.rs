@@ -114,7 +114,10 @@ fn midi_run(mut words: core::str::SplitWhitespace) {
 fn touch_run(mut words: core::str::SplitWhitespace) {
     use kernel_core::usb_pointer as pointer;
     match words.next() {
-        None => pointer::list_command(),
+        None => {
+            crate::ps2::deliver_mouse();
+            pointer::list_command()
+        }
         Some("monitor") => {
             let seconds = words.next().and_then(|word| word.parse::<u64>().ok()).unwrap_or(10).clamp(1, 120);
             if pointer::count() == 0 {
@@ -125,6 +128,7 @@ fn touch_run(mut words: core::str::SplitWhitespace) {
             while crate::time::micros() < end {
                 crate::debug::pet();
                 kernel_core::usb_class::poll();
+                crate::ps2::poll(); // the shell runs on the service thread, which polls the 8042
                 while let Some(event) = pointer::take() {
                     let (x, y) = pointer::range(usize::from(event.panel)).unwrap_or((0, 0));
                     println!("touch {} finger {} {} at {},{} (of {x},{y})", event.panel + 1, event.id, if event.down { "down/moved" } else { "up" }, event.x, event.y);

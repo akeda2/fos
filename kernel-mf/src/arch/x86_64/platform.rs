@@ -156,4 +156,8 @@ static MF: Mf = Mf;
 pub fn install() {
     fos_hal::memory::set_phys_offset(crate::vm::DIRECT_BASE);
     fos_hal::set_platform(&MF);
+    // The pointer code clamps the mouse cursor to the pixel screen; without this every mouse move (PS/2 or USB) is dropped.
+    kernel_core::screen::set(&SCREEN);
 }
+
+static SCREEN: kernel_core::screen::Screen = kernel_core::screen::Screen { gfx_info: crate::fb::gfx_info, rotation: crate::fb::rotation, dsi: None };

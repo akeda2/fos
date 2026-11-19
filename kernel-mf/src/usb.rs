@@ -50,6 +50,15 @@ pub fn lock() -> UsbGuard {
     UsbGuard { taken: true }
 }
 
+/// The lock if nobody else holds it, without waiting.
+pub fn try_lock() -> Option<UsbGuard> {
+    let me = crate::sched::current_id() + 1;
+    if OWNER.load(Ordering::Acquire) == me {
+        return Some(UsbGuard { taken: false });
+    }
+    OWNER.compare_exchange(0, me, Ordering::AcqRel, Ordering::Relaxed).is_ok().then_some(UsbGuard { taken: true })
+}
+
 impl Drop for UsbGuard {
     fn drop(&mut self) {
         if self.taken {
@@ -154,7 +163,7 @@ pub fn poll() {
             *tail = (*tail + 1) % KEYS;
             byte
         };
-        crate::shell::feed(byte);
+        crate::shell::feed_key(byte);
     }
 }
 
@@ -216,6 +225,7 @@ pub fn touch_read(out: u64) -> i64 {
     let mut event = [0i32; 6];
     let got = {
         let _usb = tape_lock();
+        crate::ps2::deliver_mouse();
         usb_pointer::api_touch_read(event.as_mut_ptr())
     };
     if got > 0 {

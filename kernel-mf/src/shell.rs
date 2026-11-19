@@ -163,6 +163,23 @@ pub fn feed(byte: u8) {
     feed_session(0, byte);
 }
 
+/// A key from a local keyboard (PS/2 or USB). Its decoders give cursor keys and å ä ö private codes >= 0x80, which the line
+/// editor understands; a running tape gets what a terminal would send instead (ESC [ A for Up, UTF-8), as on the embedded
+/// kernel (`term.rs` `tape_service`). Serial and `term net` bytes already are that, so they keep using `feed`.
+pub fn feed_key(key: u8) {
+    if foreground(0) != 0 {
+        if let Some(sequence) = fosfor_abi::keymap::ansi_sequence(key) {
+            feed(0x1b);
+            feed(b'[');
+            return sequence.iter().for_each(|&byte| feed(byte));
+        }
+        if let Some(sequence) = fosfor_abi::keymap::utf8_sequence(key) {
+            return sequence.iter().for_each(|&byte| feed(byte));
+        }
+    }
+    feed(key);
+}
+
 /// One input byte for session `id`: the line editor handles it (cursor keys, history, Tab); Enter runs the line.
 pub fn feed_session(id: usize, byte: u8) {
     crate::session::with(id, || feed_in(id, byte));

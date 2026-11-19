@@ -30,4 +30,5 @@ pub mod tapeserial {
 
 pub mod ps2 {
     pub fn poll() {}
+    pub fn deliver_mouse() {}
 }

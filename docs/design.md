@@ -1688,6 +1688,13 @@ scancode, so the first version saw no ACK. `init_aux` wraps `probe_aux` in `inte
 3-byte packets (bit 3 is the sync bit; overflow packets are dropped; dy is negated). Synaptics pads stay in plain mouse mode: no
 tap, no scroll. On machines with no 8042 (status 0xFF) nothing happens.
 
+**Server kernel (`kernel-mf/src/ps2.rs`).** The same probe and packet decoding, but polled like mf's keyboard (config bit 1 stays off,
+no IRQ 12): the service thread reads aux bytes in `ps2::poll`. Packets wait in a small queue and reach `mouse_input` only under the USB
+lock, which also guards the pointer queue `touch_read` drains; the service thread never waits for that lock (`touch monitor` holds it
+for seconds) but takes it with `usb::try_lock`, and `touch_read` and `touch` deliver what is queued. mf x86 also registers its
+`kernel_core::screen` now: without it `mouse_input` had no screen size and dropped every move, USB mice included. `make test-kakelfix`
+checks it on mf.
+
 **USB (xHCI only, `usb_pointer::claim`).** A boot-protocol mouse is claimed when the interface protocol is 2, X is a relative axis
 (`crates/hid` parses it) and there is a button 1 field; reports go to `mouse_input(dx, dy, down)` from `background_event`. An
 absolute tablet (QEMU's `usb-tablet`) and a touch panel's own mouse-emulation interface are **not** claimed. No EHCI path exists, so
