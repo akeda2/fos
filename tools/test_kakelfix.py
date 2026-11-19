@@ -5,10 +5,14 @@ Embedded kernel (writes made inline):
  - in the tape, `x` switches the selected strip off; a mouse click on the first fader sets it where the click is
    (half way up the travel is about -9 dB); a click on the Quit soft key ends the tape; `show` then reads the new gains
  - the screen shows the mixer (header text drawn, not a blank frame)
+ - `3` opens the Analyzer, which captures from loop0 while a `play` service plays a 1 kHz tone into it: the left
+   channel's envelope (the first curve colour) grows in from the right edge of the upper lane; Quit there ends the tape
+ - Up (the 30 s span) right before Quit: the Analyzer's settings are in kakelfix.cfg afterwards (saved on quit)
 Server kernel (writes go to the worker thread): `x`, then `q` (the shell's Escape kills a foreground process there, so
 `q` is what ends it through the writer's join), then `show`, at -smp 4.
-QEMU's screen is 1280x800, so kakelfix's layout is at scale 1 (crates/kakelfix/src/layout.rs): soft key 8 (Quit) is at
-x 1184..1272, y 620..676 (after two half-key gaps between the groups); strip 0's fader travel is x 12..57, y 152..744."""
+QEMU's screen is 1280x800, so kakelfix's layout is at scale 1 (crates/kakelfix/src/layout.rs): soft-key slot 9 (Quit, on
+every page) is at x 1184..1272, y 684..740 (after two half-key gaps between the groups); strip 0's fader travel is x
+12..57, y 152..744. The Analyzer's Both view puts the waveform plot at x 56..1151, y 56..325, the left lane's centre at y 123."""
 
 import os
 import re
@@ -21,15 +25,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_boot import TAG_DATA, check, monitor  # noqa: E402
+from term_net import TERM_TAG_SYSRQ as TAG_SYSRQ  # noqa: E402
 from test_debug_mode import Machine  # noqa: E402
 from test_gfx import screenshot  # noqa: E402
+from test_usb_audio import write_wav  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 TAPE = ROOT / "build/fosfor/tapes/kakelfix"
+PLAY = ROOT / "build/fosfor/tapes/play"
 MF_IMAGE = Path(os.environ.get("FOSFOR_IMAGE_MF_KAKELFIX", ROOT / "build/fosfor-mf/fosfor-kakelfix.img"))
 CODE = next(p for p in ["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_CODE.fd",
                         "/usr/share/edk2/ovmf/OVMF_CODE.fd"] if Path(p).exists())
-QUIT = (1228, 648)
+QUIT = (1228, 712)
+ENVELOPE = (range(1000, 1150, 3), range(110, 137))
+BLUE = (0x4a, 0xa3, 0xff)
 FADER_MIDDLE = (32, 448)
 
 
@@ -84,7 +93,9 @@ def where(machine):
 
 def embedded():
     with tempfile.TemporaryDirectory() as tmp:
-        machine = Machine(tmp, {}, {"kakelfix": TAPE})
+        tone = Path(tmp) / "tone.wav"
+        write_wav(tone, 48000, 2, 2, 1000, 20)
+        machine = Machine(tmp, {}, {"kakelfix": TAPE, "play": PLAY, "tone.wav": tone})
         machine.monitor = Path(tmp) / "monitor"
         machine.start()
         machine.wait_for("M3 complete")
@@ -101,6 +112,8 @@ def embedded():
             at = where(machine)
             check(at == FADER_MIDDLE, f"the cursor is at the first fader's middle ({at})", machine.text()[-400:])
 
+            # A service plays a tone into loop0 (paced at 48 kHz until a listener starts) for the Analyzer to capture.
+            send(machine, b"run play device=loop0 tone.wav &0\n", 2)
             start = len(machine.text())
             send(machine, b"run kakelfix device=loop0\n", 4)
             width, height, pixel = screenshot(machine.monitor, "kakelfix.ppm")
@@ -114,6 +127,29 @@ def embedded():
             machine.pump(0.3)
             monitor(str(machine.monitor), "mouse_button 0")
             machine.pump(0.5)
+            send(machine, b"3", 1)
+            # Bounded wait for the envelope. A term net keystroke is occasionally lost, so `3` (idempotent) is sent again.
+            deadline = time.monotonic() + 12
+            while True:
+                (machine.monitor.parent / "analyzer.ppm").unlink(missing_ok=True)
+                width, height, pixel = screenshot(machine.monitor, "analyzer.ppm")
+                traced = sum(pixel(x, y) == BLUE for x in ENVELOPE[0] for y in ENVELOPE[1])
+                if traced >= 40 or time.monotonic() > deadline:
+                    break
+                send(machine, b"3", 1)
+            check(traced >= 40, f"the Analyzer captures and draws the envelope ({traced} columns)")
+            # SysRq while the tape and the play service run: the dump names both and neither stops (Quit below still works).
+            mark = len(machine.text())
+            machine.wire.send(machine.guest, TAG_SYSRQ)
+            dump = machine.wait_for("--- end sysrq ---", since=mark, timeout=10)
+            check("foreground tape: kakelfix" in dump, "SysRq names the foreground tape", dump[-1500:])
+            played = re.search(r"^ 1 play .*\n\s+calls:.* aout (\d+)", dump, re.M)
+            check(played and int(played.group(1)) > 0, "SysRq lists the play service and its audio writes", dump[-1500:])
+            check(re.search(r"^loop0: play c1 capture c0", dump, re.M), "SysRq shows who holds loop0's ends", dump[-1500:])
+            # The longest span (Up clamps there, so a lost keystroke does no harm), then Quit at once: the settings wait a
+            # second before they are saved, quitting writes them.
+            for _ in range(3):
+                send(machine, b"\x1b[A", 0.1)
             pointer_to(machine, *QUIT)
             monitor(str(machine.monitor), "mouse_button 1")
             machine.pump(0.3)
@@ -124,6 +160,11 @@ def embedded():
             left, right = sends(text, "Out L"), sends(text, "Out R")
             check(set(left) == {"Play L"} and set(right) == {"Play R"}, f"the pair stays a pair ({left}, {right})", text[-600:])
             check(float(left["Play L"]) < -5 and float(right["Play R"]) < -5, f"the fader click set about -9 dB ({left}, {right})", text[-600:])
+            start = len(machine.text())
+            send(machine, b"cat settings/kakelfix.cfg\n", 1)
+            send(machine, b"cat kakelfix.cfg\n", 1)
+            saved = machine.text()[start:]
+            check("an-span=30" in saved and "an-view=both" in saved, "the Analyzer's settings are saved in kakelfix.cfg", saved[-600:])
         finally:
             machine.stop()
 

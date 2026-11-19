@@ -117,6 +117,11 @@ pub trait Platform: Sync {
     fn task_context(&self) -> usize {
         0
     }
+    /// Who records a trace event: `(context, None)` on a single-CPU core (`task_context`), `(cpu, Some(thread))` on a core
+    /// with threads and several CPUs. Called from interrupt handlers too: it must take no lock.
+    fn trace_origin(&self) -> (u32, Option<u32>) {
+        (self.task_context() as u32, None)
+    }
     /// Lets another context run while this one waits for it (a file call queued for a provider tape). The embedded kernels
     /// switch to the next service; a preemptive core just waits a millisecond.
     fn task_yield(&self) {
@@ -364,6 +369,10 @@ pub mod tasks {
 
     pub fn context() -> usize {
         super::platform().map_or(0, |platform| platform.task_context())
+    }
+
+    pub fn trace_origin() -> (u32, Option<u32>) {
+        super::platform().map_or((0, None), |platform| platform.trace_origin())
     }
 
     pub fn yield_now() {

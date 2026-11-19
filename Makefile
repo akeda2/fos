@@ -192,7 +192,7 @@ kernel:
 
 # The server kernel (kernel-mf/, docs/big-kernel.md): same loaders, same image layout, its own crate.
 KERNEL_MF_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel-mf
-.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-sessions test-mf-tape test-mf-usb test-mf-debug test-mf-audio test-mf-netfs test-mf-tapesync test-mf-gpio test-mf-bios-video test-mf-shell test-mf-kup-serial test-mf-smbmount test-mf-smbd test-mf-sshd test-mf-sshmount test-mf-ssh test-mf-httpd test-mf-vnic test-mf-service test-mf-cp test-mf-kernel-switch test-mf-abibad test-mf-threads test-mf-md
+.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-sessions test-mf-tape test-mf-usb test-mf-debug test-mf-audio test-mf-netfs test-mf-tapesync test-mf-gpio test-mf-bios-video test-mf-shell test-mf-kup-serial test-mf-smbmount test-mf-smbd test-mf-sshd test-mf-sshmount test-mf-ssh test-mf-httpd test-mf-vnic test-mf-service test-mf-cp test-mf-kernel-switch test-mf-abibad test-mf-threads test-mf-md test-mf-sysrq
 kernel-mf:
 	cd kernel-mf && cargo +nightly-2026-09-13 build --release $(MF_FEATURES)
 
@@ -302,6 +302,10 @@ test-mf-usb: image-mf image
 	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_MF_ELF) --output $(BUILD)/fosfor-mf/usb-stick.img \
 		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin --file note.txt=tools/test_mf_note.txt
 	python3 tools/test_mf_usb.py
+
+# SysRq and `trace` at -smp 4: in a session, over the wire, and answered from the timer interrupt while the service thread hangs.
+test-mf-sysrq: image-mf
+	python3 tools/test_mf_sysrq.py
 
 # `debug crash` and `debug hang` with reboot-on-crash and a 5 s watchdog: the record survives the reset; crash-on-boot trips the guard.
 test-mf-debug: image-mf

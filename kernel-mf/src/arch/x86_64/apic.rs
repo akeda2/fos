@@ -212,6 +212,10 @@ pub fn start_timer(fadt: &acpi::Fadt, madt_address: u64) -> Option<Report> {
 /// ICR high (0x310), then the low write sends it and delivery status (bit 12) clears when the target has accepted it.
 /// x2APIC: one 64-bit MSR write (0x830), no status to wait for.
 pub fn send_ipi(apic_id: u32, low: u32) {
+    // xAPIC: two register writes, so an interrupt handler that sends an IPI in between (the SysRq rescue, a wake) would
+    // redirect this one. Interrupts are off for the pair.
+    let was = cpu::interrupts_enabled();
+    cpu::interrupts_disable();
     unsafe {
         if X2APIC {
             cpu::write_msr(0x830, u64::from(apic_id) << 32 | u64::from(low));
@@ -226,6 +230,7 @@ pub fn send_ipi(apic_id: u32, low: u32) {
             }
         }
     }
+    cpu::interrupts_restore(was);
 }
 
 /// Enables the calling CPU's own local APIC the way the boot CPU's was (same mode, same spurious vector). An AP starts with

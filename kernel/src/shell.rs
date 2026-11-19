@@ -38,6 +38,10 @@ pub fn run() -> ! {
         crate::crash::housekeeping();
         crate::usb_kbd::poll();
         crate::termsession::flush();
+        if let Some(byte) = lineedit::take_deferred() {
+            feed_byte(byte);
+            continue;
+        }
         match crate::arch::aarch64::pl011::read_byte().or_else(crate::usb_kbd::pop) {
             Some(byte) => feed_byte(byte),
             // Background tapes (`run NAME &N`) get a pass; the CPU sleeps only when they are all idle.
@@ -57,6 +61,10 @@ pub fn run() -> ! {
 
 /// One typed byte (console or network terminal) into the line editor; a finished line runs.
 pub(crate) fn feed_byte(byte: u8) {
+    if crate::tasks::in_service() {
+        // A service's `nic_receive` handed this key on: the line runs from the shell's loop, never nested in the service.
+        return lineedit::defer(byte);
+    }
     let mut line = [0u8; lineedit::LINE_MAX];
     if let Some(length) = lineedit::feed(byte, &mut line) {
         crate::netservice::set_busy(true);

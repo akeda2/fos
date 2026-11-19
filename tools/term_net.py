@@ -65,6 +65,9 @@ TERM_TAG_HELLO = 0x20
 TERM_TAG_DATA = 0x21
 TERM_TAG_BYE = 0x22
 TERM_TAG_PING = 0x23
+# No payload: the machine answers with its state dump (kernel/src/sysrq.rs) as DATA frames, opening no session.
+TERM_TAG_SYSRQ = 0x24
+SYSRQ_END = b"--- end sysrq ---"
 # An interactive session pings this often so the server can tell a client that is just waiting from one that is gone.
 PING_SECONDS = 10
 
@@ -342,6 +345,29 @@ def run_interactive(raw: socket.socket, source: bytes, peer: bytes, initial_wait
             send_control(raw, peer, source, TERM_TAG_BYE)
 
 
+def run_sysrq(raw: socket.socket, source: bytes, peer: bytes, timeout: float) -> bool:
+    """Asks `peer` for its SysRq dump and prints it; False if it did not finish within `timeout` seconds (a machine
+    answers only when its shell loop or a tape call drains the NIC)."""
+    send_control(raw, peer, source, TERM_TAG_SYSRQ)
+    deadline = time.monotonic() + timeout
+    text = b""
+    while SYSRQ_END not in text:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        chunk = recv_data_frame(raw, source, peer, remaining)
+        if chunk is None:
+            break
+        text += chunk
+        sys.stdout.write(chunk.decode("utf-8", "replace"))
+        sys.stdout.flush()
+    if SYSRQ_END not in text:
+        print(f"\nno complete SysRq dump within {timeout:g} s.", file=sys.stderr)
+        return False
+    print()
+    return True
+
+
 def main() -> None:
     parser = ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -349,6 +375,10 @@ def main() -> None:
     )
     parser.add_argument("--stdin", action="store_true", help="Read additional command lines from stdin, one per line.")
     parser.add_argument("--interactive", action="store_true", help="Raw interactive session instead of request/response.")
+    parser.add_argument(
+        "--sysrq", action="store_true",
+        help="Print the machine's state dump (tasks, input, loopback, trace) without opening a session or stopping a tape.",
+    )
     parser.add_argument("--iface", help="Network interface to send from (default: auto-detected).")
     parser.add_argument("--mac", help="Destination MAC address, or a peer number from tools/peers.py; skips discovery.")
     parser.add_argument(
@@ -378,7 +408,7 @@ def main() -> None:
     commands = list(args.commands)
     if args.stdin:
         commands.extend(line.rstrip("\n") for line in sys.stdin)
-    if not args.interactive and not commands:
+    if not args.interactive and not args.sysrq and not commands:
         raise SystemExit("no commands given; pass some on the command line, use --stdin, or pass --interactive.")
 
     iface = args.iface or send_tape.default_interface()
@@ -418,6 +448,11 @@ def main() -> None:
                     f"found {len(live_peers)} peers this probe; pass --mac with a full MAC address "
                     "or one of the numbers listed above to pick one."
                 )
+
+        if args.sysrq:
+            if not run_sysrq(raw, source, destination, min(args.command_timeout, 10.0)):
+                raise SystemExit(1)
+            return
 
         print(f"Connecting to {send_tape.format_mac(destination)} on {iface}...", file=sys.stderr)
         send_control(raw, destination, source, TERM_TAG_HELLO)

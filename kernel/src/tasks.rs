@@ -62,6 +62,82 @@ static mut MAIN_RSP: u64 = 0;
 static mut SLICE_START: u64 = 0;
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 
+/// Tape calls counted per context, for `ps` and the SysRq dump: a tape that runs in the wrong context shows at once (its
+/// key reads counted under a service, say).
+#[derive(Clone, Copy)]
+pub enum Call {
+    ReadKey,
+    ShouldAbort,
+    Wait,
+    AudioRead,
+    AudioWrite,
+    Touch,
+    Blit,
+    /// Times the context was switched to.
+    Switch,
+}
+const CALLS: usize = 8;
+const CALL_NAMES: [&str; CALLS] = ["key", "abort", "wait", "ain", "aout", "touch", "blit", "sw"];
+static mut CALL_COUNTS: [[u32; CALLS]; MAX_SERVICES + 1] = [[0; CALLS]; MAX_SERVICES + 1];
+
+fn count_call(context: usize, call: Call) {
+    unsafe {
+        let counter = &mut (*(&raw mut CALL_COUNTS))[context.min(MAX_SERVICES)][call as usize];
+        *counter = counter.wrapping_add(1);
+    }
+}
+
+/// Counts a tape call for the running context.
+pub fn note(call: Call) {
+    count_call(unsafe { CURRENT }, call);
+}
+
+/// A tape starts in `context`: its counts start from zero.
+pub fn reset_calls(context: usize) {
+    unsafe { (*(&raw mut CALL_COUNTS))[context.min(MAX_SERVICES)] = [0; CALLS] };
+}
+
+/// "   calls: key 12 abort 0 ..." for one context.
+fn print_calls(context: usize) {
+    let counts = unsafe { (*(&raw const CALL_COUNTS))[context.min(MAX_SERVICES)] };
+    crate::print(format_args!("   calls:"));
+    for (name, count) in CALL_NAMES.iter().zip(counts) {
+        crate::print(format_args!(" {name} {count}"));
+    }
+    crate::println!();
+}
+
+/// For the SysRq dump: which context runs, every service's state, stack and saved stack pointer, and the call counts. A
+/// context that runs on another's stack is the thing to look for.
+pub fn describe() {
+    let now = timer::micros();
+    let (current, slice_start, main_rsp) = unsafe { (CURRENT, SLICE_START, MAIN_RSP) };
+    crate::println!(
+        "tasks: context {current} running for {} us; {} service(s); main rsp {main_rsp:#x}",
+        now.wrapping_sub(slice_start),
+        count()
+    );
+    crate::println!(" 0 foreground (shell or tape)");
+    print_calls(0);
+    for (index, service) in services().iter().enumerate().filter(|(_, service)| service.state != State::Free) {
+        let state = match service.state {
+            State::Live if service.abort => "stopping",
+            State::Live if service.idle => "idle",
+            State::Live => "running",
+            _ => "ended",
+        };
+        crate::println!(
+            " {} {:<16} {state:<8} rsp {:#x} stack {:#x}-{:#x}",
+            index + 1,
+            service.name(),
+            service.rsp,
+            service.stack,
+            service.stack + STACK_BYTES
+        );
+        print_calls(index + 1);
+    }
+}
+
 fn services() -> &'static mut [Service; MAX_SERVICES] {
     unsafe { &mut *core::ptr::addr_of_mut!(SERVICES) }
 }
@@ -234,6 +310,8 @@ fn switch_to(next: usize) {
         let load = saved_rsp(next);
         CURRENT = next;
         SLICE_START = timer::micros();
+        count_call(next, Call::Switch);
+        crate::trace::event(crate::trace::Category::Sched, "switch", from as u64, next as u64);
         ctx::switch(save, load);
     }
     reap();
@@ -308,6 +386,7 @@ pub extern "C" fn task_exit() -> ! {
     }
     crate::audio::release_service();
     crate::println!("Service {} ended.", service.name());
+    crate::trace::event(crate::trace::Category::Tape, "svc-exit", id as u64, 0);
     service.state = State::Dead;
     LIVE.fetch_sub(1, Ordering::Relaxed);
     if count() == 0 {
@@ -451,6 +530,8 @@ pub fn start(name: &str, arguments: &str, nics: u64) {
     service.nics = nics;
     service.state = State::Live;
     LIVE.fetch_add(1, Ordering::Relaxed);
+    reset_calls(slot + 1);
+    crate::trace::event(crate::trace::Category::Tape, "svc-start", slot as u64 + 1, stack);
     for nic in (0..64).filter(|&nic| nics >> nic & 1 != 0) {
         host::nic_claim(nic);
     }
@@ -519,6 +600,7 @@ pub fn list() {
         let mut owned = [0u8; 24];
         let owned = nic_text(&mut owned, service.nics);
         crate::println!("{}  {:<16} {}  {state}{audio}", index + 1, service.name(), owned.strip_prefix(" on ").unwrap_or("no NIC"));
+        print_calls(index + 1);
     }
 }
 

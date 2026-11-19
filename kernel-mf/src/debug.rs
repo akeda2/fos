@@ -44,6 +44,11 @@ pub fn boot_crash_count() -> u32 {
 // `kup_serial.rs` (shared with the embedded kernel) reaches the slot metadata through `debug`.
 pub use crate::slots::{read_metadata, update_metadata};
 
+/// Ticks since the service thread last went round its loop (the SysRq rescue's trigger).
+pub fn since_pet_ticks() -> u64 {
+    crate::time::ticks().saturating_sub(LAST_PET.load(Ordering::Relaxed))
+}
+
 /// The service thread is making progress.
 pub fn pet() {
     LAST_PET.store(crate::time::ticks(), Ordering::Relaxed);

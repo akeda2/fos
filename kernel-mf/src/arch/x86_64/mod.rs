@@ -88,6 +88,27 @@ pub fn reserved_extra(_info: &BootInfo) -> (u64, u64) {
     (0, 0)
 }
 
+/// May the kernel read the 8 bytes at `address` (a backtrace's stack words)? Walks the kernel's tables, takes no lock.
+pub fn readable(address: u64) -> bool {
+    address & 7 == 0 && vm::translate(address).is_some()
+}
+
+/// The caller's frame pointer (rbp; kernel-mf keeps frame pointers).
+#[inline(always)]
+pub fn frame_pointer() -> u64 {
+    let fp: u64;
+    unsafe { core::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack, preserves_flags)) };
+    fp
+}
+
+/// Sends a non-maskable interrupt to every CPU in `mask` (bit per index): `debugcpu::capture_all`. An NMI also stops a CPU that
+/// spins with interrupts off.
+pub fn capture_cpus(mask: u128) {
+    for cpu in (0..percpu::count()).filter(|&cpu| mask & 1 << cpu != 0) {
+        apic::send_ipi(percpu::get(cpu).arch.apic_id, 0x4400); // delivery mode NMI (0b100), assert
+    }
+}
+
 pub fn halt() -> ! {
     loop {
         unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) };

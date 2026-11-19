@@ -28,7 +28,7 @@ macro_rules! println {
 }
 pub use hal::print;
 // Shared code (crates/kernel-core): modules that need nothing but `fos_hal`; they keep their `crate::fosfs` paths.
-pub use kernel_core::{audio, fatvol, fosfs, gpt, hda, lineedit, loopback, pci, tape_fs, usb_audio};
+pub use kernel_core::{audio, fatvol, fosfs, gpt, hda, lineedit, loopback, pci, tape_fs, trace, usb_audio};
 #[cfg(target_arch = "x86_64")]
 pub use kernel_core::{ahci, e1000, gpu, nic, nicctl, nicpark, nvme, ohci, rtl8139, rtl8168, serialports, threecom, uart, usb_hid};
 pub use kernel_core::{ehci, netdump, usb_class, usb_hub, usb_midi, usb_serial, usb_serial_pl2303, usb_serial_ti, usb_storage, xhci};
@@ -44,6 +44,7 @@ include!("main_x86_64.rs");
 include!("main_aarch64.rs");
 // The platform services every driver may use (`hal.rs`); `tools/check_hal.py` keeps drivers off the arch-private modules.
 mod hal;
+mod sysrq;
 mod tape_common;
 pub use hal::{cpu, msi, paging, pci_config, timer};
 #[cfg(target_arch = "aarch64")]

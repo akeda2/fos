@@ -179,7 +179,7 @@ fn make_api(info: &BootInfo, arguments: &str) -> TapeApi {
         i2c_speed: crate::i2c::api_i2c_speed,
         i2c_transfer: crate::i2c::api_i2c_transfer,
         touch_info: crate::usb_pointer::api_touch_info,
-        touch_read: crate::usb_pointer::api_touch_read,
+        touch_read: api_touch_read,
         midi_read: crate::usb_midi::api_midi_read,
         midi_send: crate::usb_midi::api_midi_send,
         midi_devices: crate::usb_midi::api_midi_devices,
@@ -243,6 +243,9 @@ pub unsafe fn write_api(at: u64, arguments: &'static str) {
 
 /// Calls the tape's entry on a stack of its own with the API table; returns when the tape returns.
 pub fn run(entry: u64, arguments: &str) -> Result<(), &'static str> {
+    if crate::tasks::in_service() {
+        return Err("a service cannot start a foreground tape");
+    }
     let info = unsafe { INFO.as_ref() }.ok_or("no boot info")?;
     let stack = memory::allocate_contiguous(STACK_BYTES / memory::FRAME, None).ok_or("no memory for the tape's stack")?;
     let api = make_api(info, arguments);
@@ -250,6 +253,7 @@ pub fn run(entry: u64, arguments: &str) -> Result<(), &'static str> {
     cpu::fp_enable();
     crate::crash::set_tape_running(true);
     unsafe { RUNNING = true };
+    adopt_deferred();
     unsafe {
         // x21 is callee-saved, so the tape preserves it: it keeps our stack pointer across the call.
         core::arch::asm!(
@@ -362,6 +366,23 @@ pub fn running() -> bool {
     unsafe { RUNNING }
 }
 
+/// For the SysRq dump: whether a tape runs, and its input ring.
+pub fn describe_input() {
+    unsafe {
+        crate::println!("foreground: {}", if RUNNING { "a tape" } else { "the shell" });
+        let (head, tail) = (INPUT_HEAD, INPUT_TAIL);
+        crate::println!("tape input ring: head {head} tail {tail} (keys wait while they differ)");
+    }
+}
+
+/// Keys typed behind the command that started the tape, which a service's call took in before the shell saw them
+/// (`lineedit::defer`): they are the tape's input.
+fn adopt_deferred() {
+    while let Some(key) = crate::lineedit::take_deferred() {
+        input_push(u16::from(key));
+    }
+}
+
 /// Keys from the network terminal's client: a lone Escape byte stops the tape, as at the keyboard.
 pub fn remote_keys(keys: &[u8]) {
     if keys == [0x1b] {
@@ -453,6 +474,7 @@ fn next_key() -> Option<u16> {
 }
 
 extern "C" fn api_read_key() -> u32 {
+    crate::tasks::note(crate::tasks::Call::ReadKey);
     // A tape that polls keys with `read_key` (gonio, clock) never calls `should_abort`: it still counts as progress.
     crate::crash::pet();
     if crate::tasks::in_service() {
@@ -468,6 +490,7 @@ extern "C" fn api_read_key() -> u32 {
 
 /// Escape stops a tape; any other key typed meanwhile is dropped (`should_abort` and `read_key` share one input).
 extern "C" fn api_should_abort() -> u32 {
+    crate::tasks::note(crate::tasks::Call::ShouldAbort);
     crate::crash::pet();
     if crate::tasks::in_service() {
         return u32::from(crate::tasks::service_should_abort());
@@ -484,6 +507,7 @@ extern "C" fn api_should_abort() -> u32 {
 /// A tape found nothing to do. Alone, the CPU sleeps until the next interrupt. With two tapes each gets a pass before the CPU
 /// sleeps, and the other tape runs now.
 extern "C" fn api_wait_for_event() {
+    crate::tasks::note(crate::tasks::Call::Wait);
     crate::crash::pet();
     if crate::tasks::in_service() {
         return crate::tasks::service_wait();
@@ -602,10 +626,12 @@ extern "C" fn api_audio_info(out: *mut AudioInfo) -> u32 {
 /// USB audio moves through the xHCI event ring, which `input_pump` (and so every tape's key poll) drains; the audio calls
 /// drain it themselves too, since a tape that only streams may not read keys often.
 extern "C" fn api_audio_read(buffer: *mut u8, length: usize) -> usize {
+    crate::tasks::note(crate::tasks::Call::AudioRead);
     crate::usb_kbd::poll();
     crate::audio::read(unsafe { core::slice::from_raw_parts_mut(buffer, length) })
 }
 extern "C" fn api_audio_write(data: *const u8, length: usize) -> usize {
+    crate::tasks::note(crate::tasks::Call::AudioWrite);
     crate::usb_kbd::poll();
     crate::audio::write(unsafe { core::slice::from_raw_parts(data, length) })
 }
@@ -820,6 +846,7 @@ pub fn run_many(tapes: &[(u64, &str)]) -> Result<(), &'static str> {
     state.current = 0;
     state.active = true;
     unsafe { RUNNING = true };
+    adopt_deferred();
     unsafe { fos_task_switch(&mut state.main_sp, state.sp[0]) };
     unsafe { RUNNING = false };
     state.active = false;

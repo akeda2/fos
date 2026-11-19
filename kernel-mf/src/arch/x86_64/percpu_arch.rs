@@ -7,6 +7,9 @@ use crate::gdt::CpuGdt;
 use crate::percpu::{Cpu, count, get};
 
 const MSR_GS_BASE: u32 = 0xc000_0101;
+/// The interrupt-stack area is 16 KiB on every CPU (the linker's `__ist_top` area on the boot CPU, `smp::IST_FRAMES` on the
+/// others): 8 KiB for the double fault, 8 KiB below it for the NMI.
+pub const IST_HALF: u64 = 8192;
 
 #[repr(C)]
 pub struct CpuArch {
@@ -15,7 +18,7 @@ pub struct CpuArch {
     /// `gs:16`: top of the running thread's kernel stack (what `syscall` and, through the TSS, interrupts from ring 3 switch to).
     pub kernel_rsp: u64,
     pub apic_id: u32,
-    /// Top of this CPU's double-fault stack (what `activate` puts in IST1).
+    /// Top of this CPU's interrupt-stack area: the double-fault stack (IST1) is its upper half, the NMI stack (IST2) the lower.
     pub ist_top: u64,
     pub gdt: CpuGdt,
 }
@@ -46,7 +49,9 @@ pub fn activate(index: usize, ist_top: u64) {
     cpu.index = index as u32;
     cpu.arch.ist_top = ist_top;
     crate::gdt::load(&mut cpu.arch.gdt, ist_top);
+    crate::gdt::set_nmi_stack(&mut cpu.arch.gdt, ist_top - IST_HALF);
     crate::cpu::write_msr(MSR_GS_BASE, cpu as *const Cpu as u64);
+    crate::percpu::mark_ready();
 }
 
 /// The APIC id device interrupts are sent to: the CPU of `irq-cpu N` in `settings` if it is running, else the boot CPU.

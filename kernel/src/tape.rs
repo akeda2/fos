@@ -188,6 +188,7 @@ extern "C" fn api_puts(text: *const u8, length: usize) {
     }
 }
 extern "C" fn api_should_abort() -> u32 {
+    crate::tasks::note(crate::tasks::Call::ShouldAbort);
     if crate::tasks::in_service() {
         return u32::from(crate::tasks::service_should_abort());
     }
@@ -195,6 +196,7 @@ extern "C" fn api_should_abort() -> u32 {
     u32::from(term::tape_should_abort())
 }
 extern "C" fn api_read_key() -> u32 {
+    crate::tasks::note(crate::tasks::Call::ReadKey);
     if crate::tasks::in_service() {
         return crate::tasks::service_read_key();
     }
@@ -202,6 +204,7 @@ extern "C" fn api_read_key() -> u32 {
     term::tape_key()
 }
 extern "C" fn api_wait_for_event() {
+    crate::tasks::note(crate::tasks::Call::Wait);
     use crate::cpu::{spun, Spin};
     if crate::tasks::in_service() {
         return crate::tasks::service_wait();
@@ -484,10 +487,12 @@ extern "C" fn api_nic_active() -> u32 {
 }
 
 extern "C" fn api_audio_read(buffer: *mut u8, length: usize) -> usize {
+    crate::tasks::note(crate::tasks::Call::AudioRead);
     term::tape_poll(); // drains the xHCI event ring, which is what moves USB audio
     crate::audio::read(unsafe { core::slice::from_raw_parts_mut(buffer, length) })
 }
 extern "C" fn api_audio_write(data: *const u8, length: usize) -> usize {
+    crate::tasks::note(crate::tasks::Call::AudioWrite);
     term::tape_poll();
     crate::audio::write(unsafe { core::slice::from_raw_parts(data, length) })
 }
@@ -595,7 +600,7 @@ pub fn build_api(info: &BootInfo, arguments: &str) -> TapeApi {
         i2c_speed: api_i2c_speed,
         i2c_transfer: api_i2c_transfer,
         touch_info: crate::usb_pointer::api_touch_info,
-        touch_read: crate::usb_pointer::api_touch_read,
+        touch_read: api_touch_read,
         midi_read: crate::usb_midi::api_midi_read,
         midi_send: crate::usb_midi::api_midi_send,
         midi_devices: crate::usb_midi::api_midi_devices,
@@ -643,9 +648,29 @@ pub fn build_api(info: &BootInfo, arguments: &str) -> TapeApi {
     }
 }
 
+/// The first eight bytes of the loaded tape's name as a number, for a trace event (it reads backwards in hex).
+fn name_word() -> u64 {
+    let mut bytes = [0u8; 8];
+    unsafe {
+        let length = LOADED_NAME_LENGTH.min(8);
+        let name = *(&raw const LOADED_NAME);
+        bytes[..length].copy_from_slice(&name[..length]);
+    }
+    u64::from_le_bytes(bytes)
+}
+
+/// The loaded tape's name.
+pub fn loaded_name() -> &'static str {
+    let name: &'static [u8; 16] = unsafe { &*(&raw const LOADED_NAME) };
+    core::str::from_utf8(&name[..unsafe { LOADED_NAME_LENGTH }.min(16)]).unwrap_or("?")
+}
+
 /// Runs the loaded tape with `arguments`. The tape gets a 1 MiB stack of its own, so
 /// its recursion cannot eat the kernel's.
 pub fn run(arguments: &str) -> Result<(), &'static str> {
+    if crate::tasks::in_service() {
+        return Err("a service cannot start a foreground tape");
+    }
     let entry = unsafe { ENTRY };
     if entry == 0 {
         return Err("no tape is loaded (tape load NAME)");
@@ -653,6 +678,8 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
     let info = unsafe { INFO.as_ref() }.ok_or("no boot info")?;
     let stack = memory::allocate_contiguous(STACK_BYTES / memory::FRAME, None).ok_or("no memory for the tape's stack")?;
     let api = build_api(info, arguments);
+    crate::tasks::reset_calls(0);
+    crate::trace::event(crate::trace::Category::Tape, "tape-start", name_word(), stack);
     crate::tape_fs::stream_reset();
     term::clear_frame_queue();
     term::set_tape_mode(true);
@@ -687,6 +714,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
     term::nic_vlan_clear_all();
     term::nic_tx_offload_off_all();
     term::nic_ts_all_off(); // per-frame stamps change the receive buffer format; a tape that ends leaves PTP-only stamping
+    crate::trace::event(crate::trace::Category::Tape, "tape-end", name_word(), 0);
     memory::free(stack, STACK_BYTES / memory::FRAME);
     crate::println!("Tape returned; back at the fos shell.");
     Ok(())

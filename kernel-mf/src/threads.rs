@@ -46,10 +46,13 @@ pub fn futex_wait(address: u64, expected: u64) -> isize {
     }
     let Some(physical) = vm::user_physical(sched::current_root(), address) else { return THREAD_BAD_ARGUMENT };
     let word = vm::direct(physical) as *const u32; // kernel-memory
+    kernel_core::trace::event(kernel_core::trace::Category::Tape, "futex-wait", address, expected);
     sched::wait_while(key(address), || unsafe { word.read_volatile() } == expected as u32);
     0
 }
 
 pub fn futex_wake(address: u64, count: u64) -> isize {
-    sched::wake_up_to(key(address), count.min(usize::MAX as u64) as usize) as isize
+    let woken = sched::wake_up_to(key(address), count.min(usize::MAX as u64) as usize);
+    kernel_core::trace::event(kernel_core::trace::Category::Tape, "futex-wake", address, woken as u64);
+    woken as isize
 }

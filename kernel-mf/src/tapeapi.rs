@@ -311,6 +311,58 @@ fn free_pages_at(address: u64, bytes: u64) {
     }
 }
 
+/// `(slot, name)` for each table entry, so the debug tools can say which call a thread is in (`debugcpu::write_call`). An entry
+/// added to `TapeApi` but not here prints as its number.
+macro_rules! call_names {
+    ($($field:ident),* $(,)?) => {
+        [$((slot(offset_of!(TapeApi, $field)), stringify!($field))),*]
+    };
+}
+
+static CALL_NAMES: &[(u64, &str)] = &call_names!(
+    putc, should_abort, read_key, set_input_mode, wait_for_event, ticks, micros, alloc, free, args, args_len, fs_read,
+    fs_write, nic_count, nic_mac, nic_send, nic_receive, nic_max_frame_len, memory_map, memory_map_count,
+    memory_map_descriptor_size, free_pages, fs_remove, nic_set_promiscuous, audio_info, audio_start, audio_stop,
+    audio_read, audio_write, audio_stats, nic_set_multicast, fs_stream_open, fs_stream_write, fs_stream_close, puts,
+    audio_select, hostname, disk_info, disk_format_exfat, audio_buffer, audio_set_capture_ring, wall_clock,
+    audio_devices, audio_use_device, nic_active, peer_info, wall_clock_set, serial_count, serial_info, serial_open,
+    serial_close, serial_read, serial_write, serial_lines, serial_set_lines, serial_break, console_size, nic_ts_enable,
+    nic_ts_clock, nic_ts_rx, nic_send_stamped, nic_ts_adjust, nic_ts_step, nic_ts_all, nic_multicast_join,
+    nic_vlan_filter, nic_tx_offload, nic_counters, fp_level, gfx_info, gfx_open, gfx_close, gfx_fill, gfx_blit,
+    audio_use_output, fs_list, gfx_screens, gfx_info_on, gfx_open_on, gfx_close_on, gfx_fill_on, gfx_blit_on,
+    audio_float, gpio_pins, gpio_read, gpio_write, gpio_mode, gpio_pull, gpio_function, i2c_speed, i2c_transfer,
+    touch_info, touch_read, midi_read, midi_send, midi_devices, nic_owned, gpio_pull_get, fs_read_at, fs_stream_open2,
+    fs_stream_write2, fs_stream_close2, phys_addr, vfs_stat, vfs_read_dir, vfs_read, random, vfs_create, vfs_write,
+    vfs_truncate, vfs_remove, vfs_rename, vfs_set_owner, remote_register, remote_unregister, remote_poll, remote_reply,
+    vfs_sync, thread_spawn, thread_join, futex_wait, futex_wake, session_open, session_write, session_read,
+    session_close, resolve_path, audio_state, mixer_info, mixer_name, mixer_get, mixer_set, mixer_serial, mixer_meters,
+    mixer_control, mixer_control_item, mixer_control_set
+);
+
+/// The name of system call `number` (a table slot from `CALL_BASE` up, else one of the process calls).
+pub fn call_name(number: u64) -> CallName {
+    CallName(number)
+}
+
+pub struct CallName(u64);
+
+impl core::fmt::Display for CallName {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        let fixed = ["write", "exit", "yield", "sleep", "ticks", "thread_exit"];
+        match self.0.checked_sub(CALL_BASE) {
+            None => match fixed.get(self.0 as usize) {
+                Some(name) => f.write_str(name),
+                None => write!(f, "syscall {}", self.0),
+            },
+            Some(slot) => match CALL_NAMES.iter().find(|(known, _)| *known == slot) {
+                Some((_, name)) => f.write_str(name),
+                None => write!(f, "call {slot}"),
+            },
+        }
+    }
+}
+
+
 /// One table call from ring 3: `slot` is the stub's number minus `CALL_BASE`, the arguments are as System V passes them.
 pub fn call(frame: &mut Frame) {
     let number = frame.syscall_number() - CALL_BASE;

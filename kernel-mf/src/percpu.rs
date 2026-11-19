@@ -3,7 +3,7 @@
 //! TSS, the APIC id, ...) is `Cpu::arch`.
 
 use crate::arch::CpuArch;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 pub const MAX_CPUS: usize = 128;
 
@@ -18,11 +18,14 @@ pub struct Cpu {
     pub node: u32,
     pub ticks: AtomicU64,
     pub online: AtomicBool,
+    /// The thread this CPU runs (`sched` keeps it), readable without the scheduler's lock: the debug tools and the trace
+    /// ring ask from interrupt handlers and from a machine whose scheduler lock may be stuck.
+    pub thread: AtomicUsize,
 }
 
 const _: () = assert!(core::mem::offset_of!(Cpu, arch) == 8);
 
-const EMPTY: Cpu = Cpu { self_pointer: core::ptr::null(), arch: CpuArch::new(), index: 0, node: 0, ticks: AtomicU64::new(0), online: AtomicBool::new(false) };
+const EMPTY: Cpu = Cpu { self_pointer: core::ptr::null(), arch: CpuArch::new(), index: 0, node: 0, ticks: AtomicU64::new(0), online: AtomicBool::new(false), thread: AtomicUsize::new(0) };
 
 static mut CPUS: [Cpu; MAX_CPUS] = [EMPTY; MAX_CPUS];
 static mut COUNT: usize = 1;
@@ -43,6 +46,18 @@ pub fn set_count(count: usize) {
 /// The calling CPU's data. Only valid once the CPU has been activated (`arch`).
 pub fn this() -> &'static Cpu {
     unsafe { &*crate::arch::cpu_pointer() }
+}
+
+/// Set once the boot CPU is activated; application processors activate before they take any lock.
+static READY: AtomicBool = AtomicBool::new(false);
+
+pub fn mark_ready() {
+    READY.store(true, Ordering::Release);
+}
+
+/// The calling CPU's index, or 0 before per-CPU data exists (early boot prints take locks too).
+pub fn index() -> usize {
+    if READY.load(Ordering::Relaxed) { this().index as usize } else { 0 }
 }
 
 pub fn ticks_of(index: usize) -> u64 {

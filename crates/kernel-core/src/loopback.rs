@@ -11,7 +11,11 @@
 //! its own, so the pace is the player's: it paces itself on its own source (a hardware capture or output, a timer) and
 //! the capture end reads what has arrived (0 when nothing has). The FIFO has `RING_BYTES` of room, about 85 ms:
 //! `playback_space` tells the player how much fits, and a write returns what fitted. With no capture end running the
-//! playing end discards, like a real output with nothing plugged in, so a player never stalls on a missing listener.
+//! playing end discards, like a real output with nothing plugged in: at 48000 frames a second against a ring of the same
+//! size (`Idle`), so a player never stalls on a missing listener, nor runs through its whole file at once before a
+//! listener that starts a moment later has heard any of it. That ring plays out in whole periods of `PERIOD_FRAMES`, as a
+//! card frees its buffer: freed a frame at a time (every 21 us), a player that waits only when a write takes nothing would
+//! find room on every pass and, as a service on the embedded kernel, never let the foreground tape run.
 //!
 //! Each device also has a small software mixer (tape ABI `mixer_*`, version 41), so a mixer tape can be tried and tested
 //! with no hardware: its two sources are the two playback channels, its two outputs what the capture end reads, every
@@ -34,6 +38,8 @@ pub const RATE: u32 = 48_000;
 const FRAME: usize = 8;
 /// A power of two and a multiple of `FRAME`, so a frame never straddles the wrap.
 const RING_BYTES: usize = 64 * 1024;
+/// The idle ring frees room in steps of this many frames (about 5 ms).
+const PERIOD_FRAMES: u64 = 256;
 
 struct Loop {
     ring: [u8; RING_BYTES],
@@ -46,7 +52,39 @@ struct Loop {
     /// Writes that did not fit entirely, bytes thrown away with no capture end, and the count of both.
     short_writes: u64,
     discarded: u64,
+    /// Reads and writes made by a context that does not hold that end (they return 0): a tape running in the wrong
+    /// context shows here (`debug`'s SysRq dump).
+    refused_reads: u64,
+    refused_writes: u64,
+    idle: Idle,
     mix: Mix,
+}
+
+/// The playing end with no listener: a ring of `RING_BYTES` that plays out at `RATE` on the `timer::micros` clock. `taken`
+/// bytes went in since `since`; what has not played yet is what fills it.
+#[derive(Clone, Copy)]
+struct Idle {
+    since: u64,
+    taken: u64,
+}
+
+impl Idle {
+    const NEW: Idle = Idle { since: 0, taken: 0 };
+
+    fn restart(&mut self) {
+        *self = Idle { since: crate::timer::micros(), taken: 0 };
+    }
+
+    /// Room in the ring now. Played dry (an underrun), it starts again from empty.
+    fn room(&mut self) -> usize {
+        let frames = crate::timer::micros().wrapping_sub(self.since) * RATE as u64 / 1_000_000;
+        let played = frames / PERIOD_FRAMES * PERIOD_FRAMES * FRAME as u64;
+        if played >= self.taken {
+            self.restart();
+            return RING_BYTES;
+        }
+        RING_BYTES - ((self.taken - played) as usize).min(RING_BYTES)
+    }
 }
 
 const UNITY: u32 = 0x8000;
@@ -101,7 +139,7 @@ impl Mix {
 }
 
 impl Loop {
-    const NEW: Loop = Loop { ring: [0; RING_BYTES], written: 0, read: 0, capture: None, playback: None, short_writes: 0, discarded: 0, mix: Mix::NEW };
+    const NEW: Loop = Loop { ring: [0; RING_BYTES], written: 0, read: 0, capture: None, playback: None, short_writes: 0, discarded: 0, refused_reads: 0, refused_writes: 0, idle: Idle::NEW, mix: Mix::NEW };
 
     fn used(&self) -> usize {
         (self.written - self.read) as usize
@@ -132,6 +170,7 @@ pub fn start(index: usize, rate: u32, capture: bool, playback: bool) -> Result<(
         l.read = l.written;
     }
     let me = crate::tasks::context();
+    crate::trace::event(crate::trace::Category::Audio, "lb-start", index as u64, u64::from(capture) | u64::from(playback) << 1);
     if capture {
         l.capture = Some(me);
     }
@@ -139,6 +178,7 @@ pub fn start(index: usize, rate: u32, capture: bool, playback: bool) -> Result<(
         l.playback = Some(me);
         l.short_writes = 0;
         l.discarded = 0;
+        l.idle.restart();
     }
     Ok(())
 }
@@ -147,8 +187,10 @@ pub fn start(index: usize, rate: u32, capture: bool, playback: bool) -> Result<(
 pub fn stop(index: usize, capture: bool, playback: bool) {
     let l = state(index);
     let me = Some(crate::tasks::context());
+    crate::trace::event(crate::trace::Category::Audio, "lb-stop", index as u64, u64::from(capture) | u64::from(playback) << 1);
     if capture && l.capture == me {
         l.capture = None;
+        l.idle.restart();
     }
     if playback && l.playback == me {
         l.playback = None;
@@ -158,6 +200,7 @@ pub fn stop(index: usize, capture: bool, playback: bool) {
 pub fn read(index: usize, out: &mut [u8]) -> usize {
     let l = state(index);
     if l.capture != Some(crate::tasks::context()) {
+        l.refused_reads += 1;
         return 0;
     }
     let count = l.used().min(out.len()) / FRAME * FRAME;
@@ -171,19 +214,22 @@ pub fn read(index: usize, out: &mut [u8]) -> usize {
 pub fn write(index: usize, data: &[u8]) -> usize {
     let l = state(index);
     if l.playback != Some(crate::tasks::context()) {
+        l.refused_writes += 1;
         return 0;
     }
     let whole = data.len() / FRAME * FRAME;
     if l.capture.is_none() {
         // Nothing listens, but a mixer tape may be watching the meters.
+        let count = whole.min(l.idle.room());
+        l.idle.taken += count as u64;
         if l.mix.watched {
-            for frame in data[..whole].chunks_exact(FRAME) {
+            for frame in data[..count].chunks_exact(FRAME) {
                 let sample = |at: usize| f32::from_le_bytes([frame[at], frame[at + 1], frame[at + 2], frame[at + 3]]);
                 l.mix.frame([sample(0), sample(4)]);
             }
         }
-        l.discarded += whole as u64;
-        return whole;
+        l.discarded += count as u64;
+        return count;
     }
     let count = whole.min(RING_BYTES - l.used());
     if count < whole {
@@ -217,7 +263,7 @@ pub fn playback_space(index: usize) -> usize {
     let l = state(index);
     match (l.playback, l.capture) {
         (None, _) => 0,
-        (Some(_), None) => RING_BYTES,
+        (Some(_), None) => l.idle.room(),
         (Some(_), Some(_)) => RING_BYTES - l.used(),
     }
 }
@@ -248,6 +294,32 @@ pub fn status(index: usize) {
         RING_BYTES,
         l.short_writes,
         l.discarded
+    );
+}
+
+/// One line for the SysRq dump: who holds each end, what waits, and the refused calls. Nothing for a loop never used.
+pub fn describe(index: usize) {
+    let l = state(index);
+    if l.capture.is_none() && l.playback.is_none() && l.written == 0 && l.refused_reads == 0 && l.refused_writes == 0 {
+        return;
+    }
+    struct Holder(Option<usize>);
+    impl core::fmt::Display for Holder {
+        fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+            match self.0 {
+                Some(context) => write!(f, "c{context}"),
+                None => f.write_str("none"),
+            }
+        }
+    }
+    let holder = Holder;
+    crate::println!(
+        "loop{index}: play {} capture {}, {} B waiting, refused {} reads {} writes",
+        holder(l.playback),
+        holder(l.capture),
+        l.used(),
+        l.refused_reads,
+        l.refused_writes
     );
 }
 

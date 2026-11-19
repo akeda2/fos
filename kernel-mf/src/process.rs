@@ -316,8 +316,10 @@ pub fn note_screen_open() {
 /// the same way.
 pub fn syscall(frame: &mut Frame) {
     let number = frame.syscall_number();
+    crate::debugcpu::call_enter(number);
     if number >= crate::tapeapi::CALL_BASE {
         crate::tapeapi::call(frame);
+        crate::debugcpu::call_leave();
         return;
     }
     let (a, b) = (frame.arg(0), frame.arg(1));
@@ -342,5 +344,6 @@ pub fn syscall(frame: &mut Frame) {
         5 => thread_exit(),
         _ => u64::MAX,
     };
+    crate::debugcpu::call_leave();
     frame.set_result(result);
 }

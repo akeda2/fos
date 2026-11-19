@@ -1285,6 +1285,47 @@ screen of swapped width and height (`gfx_info`, fill and blit rotate onto the fr
 is cut on that logical screen, so `rotate=r split=v` gives two squarish areas. The `rotate r|l|flip|off` setting makes it permanent (the Pi's second screen has `rotate1`, and `rotate all|0|1 MODE` picks the screens, and a `rotate=` on a `+`/`|` group turns the physical screen that group draws on);
 the text console is not rotated. `make test-split` checks all four layouts.
 
+**A service never runs a shell line.** A service's tape calls drain the NICs, so a `term net` keystroke can arrive while a
+service runs. `term::feed` (x86) and `shell::feed_byte` (Pi) then only queue the byte (`lineedit::defer`); the shell's own loop
+feeds it on, and a tape that starts takes what is queued as its input (keys typed right behind `run NAME`). `tape::run` refuses
+to start from a service. Before this, a finished line (`run kakelfix`) ran nested inside the service whose call had received it:
+the foreground tape then ran on the service's stack, its `read_key` took the service branch and never saw a key, and the
+service froze under it (the `test-kakelfix` flake, `docs/history/nested-service-shell-line.md`).
+
+### Debug tools: SysRq, `trace`, call counts (kernel/src/sysrq.rs, crates/kernel-core/src/trace.rs)
+
+For a machine whose shell or tape looks stuck. `fosadm sysrq HOST` (or `term_net.py --mac N --sysrq`) sends one frame, tag
+0x24, and prints the answer; the `sysrq` shell command prints the same at the console. The machine answers whenever its NICs
+are drained (the shell loop, or any tape or service making a tape call), sends DATA frames to the requester only and opens no
+session, so a running tape is not stopped and an open `term net` session keeps its peer. `deny-term-net` silences it. The dump:
+which context runs and for how long, each service's state, saved stack pointer and stack range (a context running on another's
+stack is the thing to look for), per-context counts of `read_key`, `should_abort`, `wait_for_event`, `audio_read`/`write`,
+`touch_read`, `gfx_blit` and switches (`ps` shows them too), the foreground tape and its input ring's head and tail, who holds
+each loopback end and how many calls were refused for being in the wrong context, and the last 16 trace events.
+
+`trace` keeps the last 1024 kernel events (time, context, category, two numbers): tape start and end, service start and exit,
+keys into and out of the tape input ring and deferred shell keys (`input`), loopback ends (`audio`), SysRq requests (`net`),
+and with `trace on sched` every context switch (off by default: it fills the ring in a fraction of a second). `trace [N|all]`
+prints, `trace on|off CATEGORY...`, `trace clear`. Checked by `make test-kakelfix` (SysRq while kakelfix and a `play` service
+run).
+
+**On the server kernel (mf)** (`kernel-mf/src/sysrq.rs`, `debugcpu.rs`, `make test-mf-sysrq`) the same request, command and
+`trace` exist, with a back end for several CPUs and threads:
+- The other CPUs are stopped for a moment with an NMI (x86, on its own 8 KiB IST stack) or SGI 1 (aarch64), which records
+  each one's program counter, whether it was in its process, whether interrupts were on, and a frame-pointer backtrace (mf is
+  built with `force-frame-pointers`). Addresses print as `k+OFFSET`: `addr2line -f -e fosfor-kernel-mf OFFSET`.
+- Every spinlock records, per CPU, which locks it holds and where it took them, and which one it waits for and since when;
+  the dump prints "WAITS N ms for a lock at X / held by cpuN, taken at Y".
+- The thread list (state, CPU, process, futex key, CPU time, the tape call it is in and for how long) and the memory figures
+  use `try_lock`: a held lock is reported with its owner instead of waited for.
+- The service thread answers normally. When it has not gone round its loop for 2 s, the timer interrupt drains the NICs
+  itself every 0.5 s, answers only a SysRq there and keeps the kernel's other frames for the service thread. CPU 0's timer
+  alone advances the tick count, so each CPU also counts its own ticks while the count stands still: a CPU 0 hung with
+  interrupts off is answered for by another CPU.
+- Trace events carry the CPU and thread: `sched switch`, `tape spawn/exit`, `futex-wait/wake`, `net sysrq`.
+- A crash record also keeps the crashed CPU's backtrace and every other CPU's thread and program counter; the next boot
+  prints them.
+
 ### When the stream ends under a tape (ABI 40, `audio_state`)
 
 `audio_read` returning 0 means "nothing yet", so a tape could not tell a stream that a driver ended (an external clock
@@ -1570,10 +1611,12 @@ capture and playback, has one holder (foreground or service) at a time; a second
 is free, so a service can own the playing end while another tape owns the capturing end. A `device=loopN` without `outdev=`
 makes the output follow the input, i.e. a self-loop; give `outdev=` to play to hardware.
 
-There is no clock: with no capture end running the playing end discards (like an unplugged output), and with one the FIFO
+There is no clock of its own: with no capture end running the playing end discards like an unplugged output, at 48000 frames a
+second against a ring of the same size (on the `micros` clock), so a player started before its listener is still playing when
+the listener starts; with one the FIFO
 (64 KiB, about 85 ms) lets a writer through only as fast as the reader drains it. A source with a clock of its own (a
 capture, a synth paced by `playback_space`) sets the pace; a file player such as `play` runs as fast as the listener
-reads. `make test-loopback` plays a WAV through `loop0` and records it with `record`.
+reads. `make test-loopback` plays a WAV through `loop0` and records it with `record`; `make test-kakelfix` starts `play` first.
 
 ## Media player: `fosplay` (tapes/fosplay, crates/smb, crates/audio-decode, crates/tape-ip)
 
@@ -1738,8 +1781,18 @@ mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path 
   reads its own shadow of the gains, and sees the device's serial move only when the writer is idle, so a burst of its own writes
   costs one re-read at the end. A refused write is counted, reported and the device re-read. The embedded kernels write inline.
 - **`kakelfix show`** prints every output's non-zero sends and master and the controls, for tests and headless use.
+- **Analyzer** (`crates/kakelfix/src/analyzer.rs` state, `tapes/kakelfix/src/analyze.rs` capture and drawing): captures from the
+  device (`rate=`, else 48000 when offered) only while the page is open and shows one channel pair (Left/Right or `,` `.` step it)
+  as Waveform, Spectrum or Both. The waveform is a min/max envelope scrolling in from the right over 1, 5 or 30 s (Up/Down), or
+  (`w`) a scope triggered on the left channel's rising zero crossing over 5-50 ms, free-running when nothing crosses; `d` switches
+  linear and dB. The spectrum is two `ltas::Analyzer`s (8192-point FFT, 1/3, 1/6, 1/12 octave or raw bins with `f`), peak hold dim
+  behind the exponential average, 20 Hz-20 kHz by 0..-100 dB, always as lines: band resolutions as a spline through the band
+  centres (`gfx::plot::spline`, as ltas draws them), raw bins as a polyline. Space freezes, `r` resets. View, wave mode, span,
+  timebase, scale, resolution and pair are saved to `kakelfix.cfg` (`an-*` keys, beside `ask-phantom`) a second after the last
+  change or on quit, and read back at start; the same keys work on the command line.
 - **Test**: `make test-kakelfix` on the loopback: `show` reads the identity mix; in the tape `x` switches the first strip off and a
-  mouse click half way up its fader sets -9 dB, a click on the Quit soft key ends it; `show` reads the result. Then on the server
+  mouse click half way up its fader sets -9 dB; with a `play` service playing a tone into loop0, `3` opens the Analyzer and its
+  envelope must appear; Up then a click on the Quit soft key at once must leave `an-span=30` in `kakelfix.cfg`; `show` reads the result. Then on the server
   kernel at -smp 4 the same `x` goes through the writer thread and `q` ends the tape through the writer's join (the mf shell's
   Escape kills a foreground process outright, which loses writes still queued). The mouse is walked exactly: the kernel's pointer
   gain moves a packet of d counts 4d + d|d|/2 pixels.
@@ -1781,15 +1834,6 @@ loop (`ehci_service`) is shared with the iTD path (`EhciPipe::split`).
   `n > 1`); no complete-split.
 - **IN**: start-split in microframe 0, complete-splits in microframes 2 to `n + 3` (`n` = packet / 188 rounded up), which is why a
   packet over 4 x 188 bytes is refused (`SITD_MAX_PACKET`). Layout follows EHCI 3.4 and Linux `ehci-sched.c` (`smask_out`, the c-mask rule of USB 2.0 11.18.4).
-- **Analyzer** (`crates/kakelfix/src/analyzer.rs` state, `tapes/kakelfix/src/analyze.rs` capture and drawing): captures from the
-  device (`rate=`, else 48000 when offered) only while the page is open and shows one channel pair (Left/Right or `,` `.` step it)
-  as Waveform, Spectrum or Both. The waveform is a min/max envelope scrolling in from the right over 1, 5 or 30 s (Up/Down), or
-  (`w`) a scope triggered on the left channel's rising zero crossing over 5-50 ms, free-running when nothing crosses; `d` switches
-  linear and dB. The spectrum is two `ltas::Analyzer`s (8192-point FFT, 1/3, 1/6, 1/12 octave or raw bins with `f`), peak hold dim
-  behind the exponential average, 20 Hz-20 kHz by 0..-100 dB, always as lines: band resolutions as a spline through the band
-  centres (`gfx::plot::spline`, as ltas draws them), raw bins as a polyline. Space freezes, `r` resets. View, wave mode, span,
-  timebase, scale, resolution and pair are saved to `kakelfix.cfg` (`an-*` keys, beside `ask-phantom`) a second after the last
-  change or on quit, and read back at start; the same keys work on the command line.
 - Only `bInterval` 1 (every frame). A full-speed device on a root port belongs to the companion controller and a low-speed one is not streamed.
 
 **Not verified:** QEMU's `usb-hub` is full speed and cannot sit on an EHCI port, and its EHCI has no transaction translator, so this path

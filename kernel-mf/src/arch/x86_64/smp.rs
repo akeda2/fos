@@ -16,7 +16,8 @@ use core::sync::atomic::Ordering;
 
 pub const TRAMPOLINE: u64 = 0x8000;
 const STACK_FRAMES: u64 = 8;
-const IST_FRAMES: u64 = 2;
+/// The double-fault and NMI stacks, 8 KiB each (`percpu_arch::IST_HALF`).
+const IST_FRAMES: u64 = 4;
 
 core::arch::global_asm!(
     r#"

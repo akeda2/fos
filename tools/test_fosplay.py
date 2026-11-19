@@ -52,6 +52,12 @@ def listed(guest, *names):
     return bool(re.search(rf"^\d+\s+({'|'.join(names)})\b", ask(guest, "ps", "fos> "), re.M))
 
 
+def player_ended(guest, mark):
+    """Waits for the player started at `mark` to end. A loopback with no listener plays out in real time, so the player outlives
+    a shorter take; `ps` can answer late while it runs, so its own end message is what counts."""
+    guest.wait_for("Service fosplay ended", 60, since=mark)
+
+
 def make_audio(path, rate, channels, options):
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"sine=frequency={TONE_HZ}:sample_rate={rate}:duration=12",
                     "-ac", str(channels), *options, str(path)], check=True)
@@ -82,14 +88,14 @@ def main():
                 take = "rec-" + name.split(".")[0]
                 guest.send(f"run record device=loop0 {take} 4 &0")
                 guest.pump(2)
-                guest.send(f"run fosplay device=loop0 gfx=off {PLAY_OPTIONS.get(name, "")}play {name} &0")
+                mark = guest.send(f"run fosplay device=loop0 gfx=off {PLAY_OPTIONS.get(name, "")}play {name} &0")
                 deadline = time.monotonic() + 90
                 while time.monotonic() < deadline:
                     if not listed(guest, "record"):
                         break
                     guest.pump(2)
                 check(not listed(guest, "record"), f"the {name} recording finishes", guest.text()[-600:])
-                guest.pump(8)
+                player_ended(guest, mark)
             # The playlist: both tracks play, the second named [2/2], and the summary counts them.
             guest.send("run record device=loop0 list 9 &0")
             guest.pump(2)
@@ -180,15 +186,8 @@ def bass_test():
                 take = "bass-" + name.split(".")[0]
                 start_service(guest, f"run record device=loop0 {take} 4 &0")
                 guest.pump(2)
-                guest.send(f"run fosplay device=loop0 gfx=off bass=9 play {name} &0")
-                deadline = time.monotonic() + 60
-                while time.monotonic() < deadline:
-                    if not listed(guest, "record", "fosplay"):   # the player outlives the 4 s take; the next one needs the device
-                        break
-            # The last player may still be running (the shell answers late meanwhile): let it end before the next one starts.
-            deadline = time.monotonic() + 60
-            while time.monotonic() < deadline and listed(guest, "fosplay", "record"):
-                guest.pump(1)
+                mark = guest.send(f"run fosplay device=loop0 gfx=off bass=9 play {name} &0")
+                player_ended(guest, mark)   # the player outlives the 4 s take; the next one needs the device
             # loop0 has two channels: the upmix must say so and play stereo, not fail.
             mark = guest.send("run fosplay device=loop0 gfx=off upmix=on play b1k.flac &0")
             guest.wait_for("upmix needs 3 playback channels; the device has 2", 60, since=mark)
@@ -231,14 +230,8 @@ def crossfeed_test():
             for take, option in (("cf-off", ""), ("cf-med", "crossfeed=medium")):
                 start_service(guest, f"run record device=loop0 {take} 4 &0")
                 guest.pump(2)
-                guest.send(f"run fosplay device=loop0 gfx=off {option} play left.flac &0")
-                deadline = time.monotonic() + 60
-                while time.monotonic() < deadline:
-                    if not listed(guest, "record", "fosplay"):
-                        break
-            deadline = time.monotonic() + 60
-            while time.monotonic() < deadline and listed(guest, "fosplay", "record"):
-                guest.pump(1)
+                mark = guest.send(f"run fosplay device=loop0 gfx=off {option} play left.flac &0")
+                player_ended(guest, mark)
         finally:
             guest.stop()
         out = fosfs_files(Path(tmp) / "cross.img")
@@ -268,9 +261,10 @@ def browse_test():
     amber = (255, 179, 71)
     with tempfile.TemporaryDirectory() as tmp:
         files = {"notes.txt": b"not audio\n"}
-        for name in ("a1.flac", "a2.flac"):
+        # The loopback plays out in real time with no listener: a1 is short so the folder reaches a2 soon, a2 long enough to watch.
+        for name, seconds in (("a1.flac", 2), ("a2.flac", 60)):
             path = Path(tmp) / name
-            subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=500:sample_rate=48000:duration=60", "-ac", "2",
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"sine=frequency=500:sample_rate=48000:duration={seconds}", "-ac", "2",
                             "-sample_fmt", "s16", str(path)], check=True)
             files[name] = path.read_bytes()
         monitor_path = Path(tmp) / "monitor"

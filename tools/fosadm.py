@@ -781,6 +781,15 @@ def cmd_shell(args, iface: str) -> int:
                            send_tape.format_mac(host.mac), "--interactive"]).returncode
 
 
+def cmd_sysrq(args, iface: str) -> int:
+    """The machine's state dump (kernel/src/sysrq.rs): works while a tape runs and leaves it running."""
+    if args.serial:
+        raise SystemExit("sysrq goes over Ethernet; on the serial console type `sysrq` at the prompt.")
+    host = one_host(iface, args)
+    return subprocess.run([sys.executable, str(TOOLS / "term_net.py"), "--iface", iface, "--mac",
+                           send_tape.format_mac(host.mac), "--sysrq"]).returncode
+
+
 def cmd_bootcode(args, iface: str) -> int:
     if args.serial:
         raise SystemExit("bootcode needs Ethernet (its update must be confirmed in the same session).")
@@ -831,7 +840,8 @@ def main() -> int:
     deploy.add_argument("-y", "--yes", action="store_true", help="do not ask before acting")
     for name, text in (("run", "run one shell command on a host"), ("put", "copy a file to a host's boot volume"),
                        ("revert", "go back to the other kernel slot (the previous kernel) and reboot"),
-                       ("shell", "open an interactive shell (term net)"), ("bootcode", "show or update the boot code")):
+                       ("shell", "open an interactive shell (term net)"), ("bootcode", "show or update the boot code"),
+                       ("sysrq", "print a host's state dump (tasks, input, trace) without stopping its tape")):
         sp = sub.add_parser(name, help=text)
         sp.add_argument("host", **({"nargs": "?", "default": ""} if name == "shell" else {}), help="host name or MAC (shell: not needed with --serial)")
         if name == "run":
@@ -850,7 +860,7 @@ def main() -> int:
     CONFIG.update(load_config())
     iface = "" if args.serial else (args.iface or CONFIG.get("iface") or send_tape.default_interface())
     return {"hosts": cmd_hosts, "status": cmd_status, "deploy": cmd_deploy, "run": cmd_run,
-            "put": cmd_put, "revert": cmd_revert, "shell": cmd_shell, "bootcode": cmd_bootcode}[args.command](args, iface)
+            "put": cmd_put, "revert": cmd_revert, "shell": cmd_shell, "bootcode": cmd_bootcode, "sysrq": cmd_sysrq}[args.command](args, iface)
 
 
 if __name__ == "__main__":

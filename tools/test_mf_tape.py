@@ -69,6 +69,8 @@ def run(cpu, smp):
                 if not done or "exited with code 0." not in new:
                     failures.append(f"`tape {command}` did not finish cleanly:\n{new}")
                     break
+                # Keys typed before the shell's prompt is back can go to the ending tape: wait for it.
+                wait_for("fos> ", 10, log.rfind(b"exited with code 0."))
         if not failures:
             # serial_*: port 1 is the second UART (COM2), a TCP socket on the host.
             mark = len(log)

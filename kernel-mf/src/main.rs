@@ -70,6 +70,8 @@ mod session;
 mod tapefs;
 mod config;
 mod debug;
+mod debugcpu;
+mod sysrq;
 mod shell;
 mod shellhost;
 mod script;

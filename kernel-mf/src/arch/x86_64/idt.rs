@@ -36,11 +36,15 @@ unsafe extern "C" {
     static isr_0: u8;
 }
 
-/// Points every vector at its stub (the double fault, vector 8, on its own IST stack). Boot CPU, once.
+/// Points every vector at its stub (the double fault, vector 8, and the NMI, vector 2, on IST stacks of their own). Boot CPU, once.
 pub fn build() {
     for vector in 0..256usize {
         let handler = &raw const isr_0 as u64 + 16 * vector as u64;
-        let ist = if vector == 8 { gdt::DOUBLE_FAULT_IST } else { 0 };
+        let ist = match vector {
+            8 => gdt::DOUBLE_FAULT_IST,
+            2 => gdt::NMI_IST,
+            _ => 0,
+        };
         unsafe {
             (*core::ptr::addr_of_mut!(IDT)).0[vector] = Gate {
                 offset_low: handler as u16,

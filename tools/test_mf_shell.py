@@ -285,7 +285,7 @@ def main():
                   "help groups the commands in lines that fit 79 columns", out[-900:])
             shell_source = (ROOT / "kernel-mf/src/shell.rs").read_text()
             builtins = re.search(r"const BUILTINS: &\[&str\] = &\[(.*?)\];", shell_source, re.S).group(1)
-            missing = [name for name in re.findall(r'"(\w+)"', builtins) if "no help screen" in machine.run("help " + name) or machine.run("help " + name).count("\n") < 2]
+            missing = [name for name in re.findall(r'"(\w+)"', re.sub(r'#\[cfg\([^]]*\)\]\s*"\w+",?', "", builtins)) if "no help screen" in machine.run("help " + name) or machine.run("help " + name).count("\n") < 2]
             check(not missing, "help NAME works for every builtin", str(missing))
             out = machine.run("help nosuchthing")
             check("no help screen" in out, "help of an unknown name says so", out[-300:])

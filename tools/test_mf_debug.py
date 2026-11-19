@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unattended operation on the server kernel (`make test-mf-debug`): `debug crash` with reboot-on-crash writes a crash record,
 resets, and the next boot prints the record; `debug hang` (the service thread spins) is caught by the watchdog the same way, a spinlock waited for several seconds (`debug deadlock`) is reported with both call sites and resets, at
--smp 1 and 4; crash-on-boot ends in the crash-loop guard (five resets, then a halt). QEMU runs without -no-reboot: the point is
+-smp 1 and 4, each record with the crashed CPU's backtrace and the other CPUs' places; crash-on-boot ends in the crash-loop guard (five resets, then a halt). QEMU runs without -no-reboot: the point is
 what happens across resets."""
 import os
 import select
@@ -64,6 +64,10 @@ def crash_or_hang(smp, command, expect):
         text = machine.since(mark)
         if "Previous boot crashed (record found in RAM)" not in text or expect.split(":")[-1].strip().split()[0] not in text.split("Previous boot crashed")[1]:
             return "the next boot did not report the crash record:\n" + text[-1500:]
+        report = text.split("Previous boot crashed")[1]
+        # debugcpu.rs: the record carries the crashed CPU's backtrace and, with several CPUs, where each of the others was.
+        if "  backtrace: k+0x" not in report or (smp > 1 and f"  cpu{smp - 1}: thread " not in report):
+            return "the crash record has no backtrace or no other CPUs:\n" + report[:1500]
         return None
     finally:
         machine.stop()

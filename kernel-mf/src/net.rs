@@ -800,8 +800,93 @@ fn frame_hook(index: usize, frame: &[u8]) -> bool {
     if frame.len() < 15 || frame[12..14] != ETHERTYPE {
         return false;
     }
+    if RESCUER.load(Ordering::Acquire) == crate::percpu::this().index + 1 {
+        // The SysRq rescue drains from an interrupt: only a SysRq is answered there, the rest waits for the service thread.
+        if frame[14] == crate::sysrq::TAG_SYSRQ {
+            let mut request = RESCUE_REQUEST.lock();
+            *request = Some((index, frame[6..12].try_into().unwrap()));
+        } else if let Some(mut deferred) = DEFERRED.try_lock() {
+            deferred.push(index, frame);
+        }
+        return true;
+    }
     handle_frame(index, frame);
     true
+}
+
+// ---- the SysRq rescue ----
+
+/// The CPU (index + 1) draining the NICs for the SysRq rescue (`sysrq::tick`), 0 for none.
+static RESCUER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static RESCUE_REQUEST: SpinLock<Option<(usize, [u8; 6])>> = SpinLock::new(None);
+
+/// The kernel's own frames the rescue took off the NICs, kept for the service thread (`poll` replays them first).
+struct Deferred {
+    frames: [[u8; 1514]; 8],
+    lengths: [usize; 8],
+    nics: [usize; 8],
+    count: usize,
+}
+
+impl Deferred {
+    fn push(&mut self, index: usize, frame: &[u8]) {
+        if self.count < self.frames.len() && frame.len() <= 1514 {
+            self.frames[self.count][..frame.len()].copy_from_slice(frame);
+            self.lengths[self.count] = frame.len();
+            self.nics[self.count] = index;
+            self.count += 1;
+        }
+    }
+}
+
+static DEFERRED: SpinLock<Deferred> = SpinLock::new(Deferred { frames: [[0; 1514]; 8], lengths: [0; 8], nics: [0; 8], count: 0 });
+
+/// For `sysrq::tick` (a timer interrupt, the service thread silent): drains every NIC as the service thread would, but only
+/// a SysRq request is acted on; `answer(nic, requester)` runs with the NIC lock held, so it may send. Waits for no lock:
+/// false when another CPU holds the NICs.
+pub fn rescue_drain(answer: impl FnOnce(usize, [u8; 6])) -> bool {
+    let Some(guard) = NICS.try_lock() else { return false };
+    let me = crate::percpu::this().index + 1;
+    NICS_OWNER.store(me, Ordering::Release);
+    RESCUER.store(me, Ordering::Release);
+    nicctl::drain_nics_to_fifo();
+    RESCUER.store(0, Ordering::Release);
+    let request = RESCUE_REQUEST.lock().take();
+    if let Some((index, source)) = request {
+        answer(index, source);
+    }
+    NICS_OWNER.store(0, Ordering::Release);
+    drop(guard);
+    true
+}
+
+/// Sends `text` to `destination` as `term net` DATA frames (the SysRq answer). The NIC lock is re-entrant, so this works
+/// inside `rescue_drain` too.
+pub fn send_text(index: usize, destination: &[u8; 6], text: &[u8]) {
+    for chunk in text.chunks(DATA_CAPACITY) {
+        send(index, destination, TAG_DATA, chunk);
+    }
+}
+
+fn replay_deferred() {
+    loop {
+        let mut frame = [0u8; 1514];
+        let (index, length) = {
+            let mut deferred = DEFERRED.lock();
+            if deferred.count == 0 {
+                return;
+            }
+            let (index, length) = (deferred.nics[0], deferred.lengths[0]);
+            frame[..length].copy_from_slice(&deferred.frames[0][..length]);
+            let count = deferred.count;
+            deferred.frames.copy_within(1..count, 0);
+            deferred.lengths.copy_within(1..count, 0);
+            deferred.nics.copy_within(1..count, 0);
+            deferred.count -= 1;
+            (index, length)
+        };
+        handle_frame(index, &frame[..length]);
+    }
 }
 
 fn handle_frame(index: usize, frame: &[u8]) {
@@ -816,6 +901,7 @@ fn handle_frame(index: usize, frame: &[u8]) {
             let length = hostname(index, &mut name);
             send(index, &source, TAG_DISCOVER_REPLY, &name[..length]);
         }
+        crate::sysrq::TAG_SYSRQ => crate::sysrq::request(index, source),
         TAG_KUP_REQUEST if config::kernel_update() => kup_request(index, source, payload),
         TAG_KUP_DATA if config::kernel_update() => kup_data(source, payload),
         TAG_KUP_STOP if config::kernel_update() => kup_stop(index, source),
@@ -828,6 +914,7 @@ fn handle_frame(index: usize, frame: &[u8]) {
 
 /// Handles whatever the NICs have received, announces the name and sends queued console output. Call from the service loop.
 pub fn poll() {
+    replay_deferred();
     {
         let _nics = lock_nics();
         nicctl::drain_nics_to_fifo();
@@ -849,5 +936,30 @@ pub fn housekeeping() {
             slots::mark_clean_stop();
             power::reset();
         }
+    }
+}
+
+/// The debug dump's session list; never waits for a lock.
+pub fn write_sessions(out: &mut dyn core::fmt::Write) {
+    let Some(terminals) = TERMINALS.try_lock() else {
+        let _ = writeln!(out, "sessions: their lock is held");
+        return;
+    };
+    let mut any = false;
+    for (slot, terminal) in terminals.iter().enumerate().filter(|(_, t)| t.open()) {
+        any = true;
+        let _ = write!(out, "  session {}", slot + 1);
+        match terminal.peer {
+            Some(peer) => {
+                let _ = write!(out, " nic{} {}", terminal.nic, Mac(&peer));
+            }
+            None => {
+                let _ = write!(out, " tape pid {}", terminal.owner);
+            }
+        }
+        let _ = writeln!(out, ", idle {} ms", time::ticks().saturating_sub(terminal.activity) * 1000 / TICK_HZ);
+    }
+    if !any {
+        let _ = writeln!(out, "  no terminal sessions");
     }
 }

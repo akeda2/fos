@@ -92,6 +92,9 @@ static LEGACY_PIC: AtomicU64 = AtomicU64::new(0);
 
 #[unsafe(no_mangle)]
 extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
+    if frame.vector == 2 {
+        return nmi(frame);
+    }
     let from_user = frame.cs & 3 == 3;
     if from_user && frame.vector < 32 {
         crate::process::fault(frame);
@@ -109,6 +112,7 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
             if crate::percpu::this().index == 0 {
                 crate::debug::watchdog_check(frame);
             }
+            crate::sysrq::tick();
             apic::tick()
         }
         v if v == u64::from(crate::tlb::TLB_VECTOR) => crate::tlb::handle(),
@@ -140,6 +144,18 @@ fn kernel_fault_on_user_address(frame: &Frame) {
     crate::process::terminate(crate::process::How::Fault(frame.vector, address))
 }
 
+/// A non-maskable interrupt: normally `debugcpu::capture_all` asking this CPU where it is. It may arrive between `syscall`
+/// and the stack switch or between the final `swapgs` and `iretq`, so GS may be the user's: the CPU is found by its APIC id,
+/// never through `percpu::this`. An NMI nobody asked for (a hardware error, a firmware watchdog) is reported as before.
+fn nmi(frame: &Frame) {
+    let id = apic::id();
+    let cpu = (0..crate::percpu::count()).find(|&cpu| crate::percpu::get(cpu).arch.apic_id == id);
+    let interrupted = |cpu| crate::debugcpu::interrupted(cpu, frame.rip, frame.rsp, frame.rbp, frame.cs & 3 == 3, frame.rflags & 1 << 9 != 0);
+    if !cpu.is_some_and(interrupted) {
+        fatal(frame);
+    }
+}
+
 fn fatal(frame: &Frame) -> ! {
     report_and_stop(frame, false)
 }
@@ -165,6 +181,7 @@ fn report_and_stop(frame: &Frame, always_reset: bool) -> ! {
     println!("r12 {:#x} r13 {:#x} r14 {:#x} r15 {:#x}", frame.r12, frame.r13, frame.r14, frame.r15);
     println!("cr3 {:#x}.", cpu::read_cr3());
     cpu::interrupts_disable();
+    crate::debugcpu::report_crash(frame.rip, frame.rbp, frame.cs & 3 == 3);
     crate::debug::record_crash(frame);
     if crate::config::reboot_on_crash() || always_reset {
         if crate::debug::crash_loop_tripped() {

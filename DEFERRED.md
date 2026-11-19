@@ -749,3 +749,13 @@ board's EHCI) before trusting it. The once-a-second audio check can go then.
   (`q` or the Quit soft key end it cleanly). A tape-visible "please end" before the kill would fix it for every tape.
 - Meters are read by the drawing thread; a device whose meter read is slow (bulk reads under the USB lock) would want them on a
   thread too. The driver caches a set for 50 ms.
+
+## Debug tools on the server kernel (2026-10)
+
+Done on mf (`docs/design.md` "Debug tools", "On the server kernel"): SysRq with NMI capture of every CPU, backtraces, lock
+owners, the rescue from the timer interrupt, `trace` with CPU and thread, crash records with backtraces. Still open:
+- The embedded kernel still answers SysRq only when its NICs are drained (one CPU, no rescue path).
+- A single-CPU mf machine hung with interrupts off cannot answer (nothing else runs); only the serial console or the
+  hardware watchdog helps there.
+- Real hardware: whether a board delivers the NMI to a CPU with interrupts off (QEMU does), and the aarch64 SGI capture
+  (not delivered to a CPU with interrupts masked: such a CPU shows "no answer to the capture"; FIQ/pseudo-NMI would fix it).

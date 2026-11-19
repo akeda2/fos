@@ -234,10 +234,16 @@ pub fn serve_frame(frame: &[u8]) -> bool {
 /// False: not a session frame.
 pub fn session_frame(frame: &[u8]) -> bool {
     use crate::termsession::Frame;
-    if frame.len() < 15 || frame[12..14] != ETHERTYPE || !(0x20..=0x22).contains(&frame[14]) {
+    if frame.len() < 15 || frame[12..14] != ETHERTYPE || !(0x20..=0x22).contains(&frame[14]) && frame[14] != crate::sysrq::TAG_SYSRQ {
         return false;
     }
     let source: [u8; 6] = frame[6..12].try_into().unwrap();
+    if frame[14] == crate::sysrq::TAG_SYSRQ {
+        if !denied() {
+            crate::sysrq::request(0, source);
+        }
+        return true;
+    }
     if denied() {
         return true;
     }

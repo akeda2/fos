@@ -66,7 +66,13 @@ pub extern "C" fn api_gfx_close() {
 pub extern "C" fn api_gfx_fill(x: u32, y: u32, width: u32, height: u32, rgb: u32) -> u32 {
     u32::from(crate::framebuffer::gfx_fill(x, y, width, height, rgb))
 }
+/// `touch_read`, counted per context (`tasks::Call`).
+pub extern "C" fn api_touch_read(out: *mut i32) -> i32 {
+    crate::tasks::note(crate::tasks::Call::Touch);
+    crate::usb_pointer::api_touch_read(out)
+}
 pub extern "C" fn api_gfx_blit(x: u32, y: u32, width: u32, height: u32, pixels: *const u32, stride: u32) -> u32 {
+    crate::tasks::note(crate::tasks::Call::Blit);
     u32::from(unsafe { crate::framebuffer::gfx_blit(x, y, width, height, pixels, stride) })
 }
 pub extern "C" fn api_console_size() -> u32 {

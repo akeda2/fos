@@ -50,6 +50,9 @@ impl Platform for Mf {
     fn unix_seconds(&self) -> u64 {
         crate::clock::unix_seconds()
     }
+    fn trace_origin(&self) -> (u32, Option<u32>) {
+        crate::debugcpu::origin()
+    }
     fn timer_micros(&self) -> u64 {
         crate::time::micros()
     }

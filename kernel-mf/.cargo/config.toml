@@ -8,9 +8,10 @@ json-target-spec = true
 
 [target.x86_64-fos-kernel]
 # The embedded kernel's image layout (a position-independent ELF the loader places and relocates), so both loaders load it
-# unchanged: its linker script is shared, not copied.
-rustflags = ["-C", "link-arg=-T../kernel/linker.ld", "-C", "relocation-model=pic", "-C", "link-arg=-pie", "-C", "link-arg=--no-dynamic-linker", "-C", "link-arg=-znorelro"]
+# unchanged: its linker script is shared, not copied. Frame pointers stay on so a crash report, the SysRq dump and an NMI
+# capture can walk the stack (`backtrace.rs`); they cost one register and two instructions per call.
+rustflags = ["-C", "force-frame-pointers=yes", "-C", "link-arg=-T../kernel/linker.ld", "-C", "relocation-model=pic", "-C", "link-arg=-pie", "-C", "link-arg=--no-dynamic-linker", "-C", "link-arg=-znorelro"]
 
 [target.aarch64-unknown-none-softfloat]
 # The embedded aarch64 kernel's image layout (a position-independent ELF the aarch64 loader places and relocates).
-rustflags = ["-C", "link-arg=-T../kernel/linker-aarch64.ld", "-C", "relocation-model=pic", "-C", "link-arg=-pie", "-C", "link-arg=--no-dynamic-linker", "-C", "link-arg=-znorelro"]
+rustflags = ["-C", "force-frame-pointers=yes", "-C", "link-arg=-T../kernel/linker-aarch64.ld", "-C", "relocation-model=pic", "-C", "link-arg=-pie", "-C", "link-arg=--no-dynamic-linker", "-C", "link-arg=-znorelro"]

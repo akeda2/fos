@@ -227,6 +227,9 @@ maintainer's memory notes, not in this repository.
 - **Mouse/touchpad** (PS/2 8042 port 2, USB boot mouse on xHCI): tapes see touch panel 6, finger id 100, screen-sized extent; the tape draws the cursor (`gfx::Canvas::cursor`); `docs/design.md` "Mouse and touchpad", `make test-mouse`.
 - **Tape sync**: `tapesync [HOST] [apply]` pulls newer tapes (from HOST or every peer) between machines that share a `synckey` file; tapes carry a `.fos_build` stamp added by `tools/stamp_tape.py`, so deploy `build/fosfor/tapes/NAME`, not the cargo output (`docs/design.md`, `make test-tapesync`).
 - **`audio-net bench`** (`benchserve` on the far machine; panel key T) finds the lowest ptime/target a link carries: `crates/audio-bench`, `tapes/audio-net/src/bench.rs`, `make test-audio-bench`; method in `docs/design.md`.
+- **Stuck machine**: `fosadm sysrq HOST` dumps contexts, stacks, per-context call counts, input ring, loopback owners and the
+  `trace` ring without stopping the tape (`docs/design.md` "Debug tools"). A service never runs a shell line (`lineedit::defer`).
+  How to debug fos (SysRq, trace, crash records, QEMU monitor/gdb, flakes): the `fos-debug` skill, `.github/skills/fos-debug/`.
 - **Open work** is in `DEFERRED.md` ("Open after the 2026-10-09 session").
 
 - **Hostnames**: every machine broadcasts its name (`hostname` file + NIC number, else `fos-` + last 3 MAC bytes) at boot and every

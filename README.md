@@ -102,7 +102,7 @@ tools/foscopy.py --iface IF --mac MAC FILE :disk1/NAME # copy a file onto its di
 tools/term_net.py --iface IF --mac MAC                 # an interactive terminal
 ```
 
-A quiet tape can run in the background as a service that owns one NIC: `run ptp master ip=dhcp &1`; `ps` lists services; `kill N`, `kill NAME` or `kill all` ends them (see `docs/design.md`, "Services").
+A quiet tape can run in the background as a service that owns one NIC: `run ptp master ip=dhcp &1`; `ps` lists services; `kill N`, `kill NAME` or `kill all` ends them (see `docs/design.md`, "Services"). `fosadm sysrq HOST`, `sysrq` and `trace` show what a stuck machine is doing ("Debug tools").
 
 Between machines, `tapesync [HOST] [apply]` pulls newer tapes from one peer, or from all discovered ones, that share the `synckey` file (see `docs/design.md`).
 

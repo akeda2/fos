@@ -160,6 +160,13 @@ pub struct Stats {
     pub free: usize,
 }
 
+/// `stats` without waiting: None while another CPU holds the heap (the debug dump).
+pub fn try_stats() -> Option<Stats> {
+    let _guard = LOCK.try_lock()?;
+    let h = heap();
+    Some(Stats { total: h.total, free: h.free })
+}
+
 pub fn stats() -> Stats {
     let _guard = LOCK.lock();
     let h = heap();

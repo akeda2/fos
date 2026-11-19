@@ -34,6 +34,7 @@ pub fn activate(index: usize) {
     cpu.arch.mpidr = mpidr & 0xff_00ff_ffff;
     unsafe { core::arch::asm!("msr tpidr_el1, {}", in(reg) cpu as *const Cpu as u64, options(nomem, nostack)) };
     cpu.online.store(true, core::sync::atomic::Ordering::Release);
+    crate::percpu::mark_ready();
 }
 
 /// Records the kernel stack top of the thread now running on this CPU: user threads enter EL0 with SP_EL1 set to it.

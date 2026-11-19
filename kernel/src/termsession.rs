@@ -86,6 +86,21 @@ pub fn handle<'a>(index: usize, source: [u8; 6], tag: u8, payload: &'a [u8]) -> 
     }
 }
 
+/// Runs `f` with console output going to `source` on interface `index` instead of the session's peer (`sysrq`). An open
+/// session gets what was queued for it first and keeps its peer; nothing is announced, so a running tape is not stopped.
+pub fn capture(index: usize, source: [u8; 6], f: fn()) {
+    flush();
+    unsafe {
+        let saved = (*core::ptr::addr_of!(PEER), SESSION_NIC);
+        *core::ptr::addr_of_mut!(PEER) = Some(source);
+        SESSION_NIC = index;
+        f();
+        flush();
+        *core::ptr::addr_of_mut!(PEER) = saved.0;
+        SESSION_NIC = saved.1;
+    }
+}
+
 /// Called by `print` for every piece of console text; queues it for the client.
 pub fn relay(text: &str) {
     if !session_open() {

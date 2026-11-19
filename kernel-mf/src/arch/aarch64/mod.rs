@@ -200,6 +200,7 @@ pub mod crash {
             unsafe { core::arch::asm!("mrs {}, elr_el1", out(reg) elr, options(nomem, nostack)) };
             fatal(super::crashrec::WATCHDOG_VECTOR, 0, elr, 0, true);
         }
+        crate::sysrq::tick();
         crate::sched::tick();
     }
 
@@ -208,6 +209,8 @@ pub mod crash {
     pub fn fatal(kind: u64, esr: u64, elr: u64, far: u64, always_reset: bool) -> ! {
         crate::cpu::interrupts_disable();
         crate::println!("*** fatal exception {kind}: ESR {esr:#x}, ELR {elr:#x}, FAR {far:#x}.");
+        // The vector code leaves x29 alone, so the walk from here reaches the faulting code's callers.
+        crate::debugcpu::report_crash(elr, super::frame_pointer(), false);
         super::crashrec::record(kind, esr, elr, far);
         if crate::config::reboot_on_crash() || always_reset {
             if crate::debug::crash_loop_tripped() {
@@ -267,6 +270,58 @@ pub fn crash_now() {
 
 pub fn halt() -> ! {
     cpu::halt()
+}
+
+/// The software-generated interrupt `debugcpu::capture_all` sends. Unlike the x86 NMI it is an ordinary interrupt: a CPU
+/// spinning with interrupts masked does not answer, and the report says so.
+pub const CAPTURE_SGI: u32 = 1;
+
+/// May the kernel read the 8 bytes at `address`? Asks the MMU (`AT S1E1R`/`S1E2R` by the level the kernel runs at) and
+/// reads the answer in PAR_EL1 (bit 0 set: the translation faults). Takes no lock.
+pub fn readable(address: u64) -> bool {
+    if address & 7 != 0 {
+        return false;
+    }
+    let par: u64;
+    unsafe {
+        if exceptions::current_el() == 2 {
+            core::arch::asm!("at s1e2r, {}", "isb", "mrs {}, par_el1", in(reg) address, out(reg) par, options(nostack));
+        } else {
+            core::arch::asm!("at s1e1r, {}", "isb", "mrs {}, par_el1", in(reg) address, out(reg) par, options(nostack));
+        }
+    }
+    par & 1 == 0
+}
+
+/// The caller's frame pointer (x29; kernel-mf keeps frame pointers).
+#[inline(always)]
+pub fn frame_pointer() -> u64 {
+    let fp: u64;
+    unsafe { core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags)) };
+    fp
+}
+
+/// Sends the capture interrupt to every CPU in `mask` (bit per index).
+pub fn capture_cpus(mask: u128) {
+    for cpu in (0..crate::percpu::count()).filter(|&cpu| mask & 1 << cpu != 0) {
+        let target = crate::percpu::get(cpu).arch.gic_target.load(core::sync::atomic::Ordering::Relaxed);
+        gic::send_sgi(target, CAPTURE_SGI);
+    }
+}
+
+/// `CAPTURE_SGI` arrived: ELR and SPSR still say where the CPU was. The vector code leaves x29 alone, so the walk from here
+/// runs through the interrupt handlers into the interrupted code's callers.
+fn capture_interrupt() {
+    let (elr, spsr): (u64, u64);
+    unsafe {
+        if exceptions::current_el() == 2 {
+            core::arch::asm!("mrs {}, elr_el2", "mrs {}, spsr_el2", out(reg) elr, out(reg) spsr, options(nomem, nostack));
+        } else {
+            core::arch::asm!("mrs {}, elr_el1", "mrs {}, spsr_el1", out(reg) elr, out(reg) spsr, options(nomem, nostack));
+        }
+    }
+    let fp = frame_pointer();
+    crate::debugcpu::interrupted(crate::percpu::this().index as usize, elr, fp, fp, spsr & 0xf == 0, spsr & 1 << 7 == 0);
 }
 
 pub fn wait_for_interrupt() {

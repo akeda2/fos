@@ -17,6 +17,8 @@ pub static COMMANDS: &[Command] = &[
     Command::new("date", "date [set YYYY-MM-DD HH:MM[:SS]]", "the clock (local time), or sets it.", |_, rest| date(rest)),
     Command::new("keymap", "keymap [us|sv]", "the local keyboard layout (sv: Swedish/Finnish).", |_, rest| keymap(rest)),
     Command::new("ps", "ps", "lists the running tapes.", |_, _| crate::tasks::list()).alias(&["tasks"]),
+    Command::new("trace", "trace [N|all|clear|on|off CATEGORY...]", "the kernel's recent events: tape and service switches, keys, audio ends.", |_, rest| crate::trace::command(rest)),
+    Command::new("sysrq", "sysrq", "the state dump a host asks for over the network (term_net.py --sysrq).", |_, _| crate::sysrq::dump()),
     Command::new("kill", "kill N|NAME|all", "stops a background tape.", |_, rest| crate::tasks::kill(rest.split_whitespace().next())),
     Command::new("memory", "memory", "physical memory, managed and free.", |_, _| memory()).alias(&["mem"]),
     Command::new("disks", "disks", "the disks the drivers found (the boot disk is disk1).", |_, _| disks()),

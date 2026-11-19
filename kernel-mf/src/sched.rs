@@ -120,6 +120,8 @@ pub fn init() {
     let mut sched = Sched { threads: Vec::new(), queue: VecDeque::new(), free_slots: Vec::new(), next_slot: 0, current: [NO_THREAD; MAX_CPUS], previous: [NO_THREAD; MAX_CPUS], idle: [NO_THREAD; MAX_CPUS], switches: 0, busy: [0; MAX_CPUS], procs: Vec::new() };
     sched.threads.push(Some(boot));
     sched.current[0] = 0;
+    crate::debugcpu::thread_started(0, b"idle0\0\0\0\0\0\0\0\0\0\0\0");
+    crate::percpu::get(0).thread.store(0, core::sync::atomic::Ordering::Relaxed);
     *SCHED.lock() = Some(sched);
 }
 
@@ -146,6 +148,8 @@ pub fn attach_cpu() {
     }
     sched.idle[cpu_index] = id;
     sched.current[cpu_index] = id;
+    crate::debugcpu::thread_started(id, &name);
+    crate::percpu::get(cpu_index).thread.store(id, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Starts a thread on CPU 0 running `entry(argument)`; it is queued, not run yet. Returns its id.
@@ -206,10 +210,12 @@ fn spawn_on(name: &str, entry: extern "C" fn(usize), argument: usize, pinned: Op
             sched.threads.len() - 1
         }
     };
+    crate::debugcpu::thread_started(id, &bytes);
     sched.threads[id] = Some(Box::new(Thread { id, name: bytes, state: State::Ready, rsp: start, slot: Some((slot, frames)), key: 0, wake_at: 0, pinned, on_cpu: false, root, kstack_top: top, killed: false, pid, tid, cpu_ticks: 0, last_cpu: 0, fpu: if root != 0 { crate::fpu::Area::new() } else { None } }));
     sched.queue.push_back(id);
     let mask = idle_cpu_for(sched, pinned, 0);
     drop(guard);
+    kernel_core::trace::event(kernel_core::trace::Category::Tape, "spawn", id as u64, pid);
     kick(mask);
     Some(id)
 }
@@ -302,6 +308,8 @@ fn switch_away(requeue: bool) {
         let new_rsp = thread.rsp;
         sched.previous[cpu_index] = current;
         sched.current[cpu_index] = next;
+        crate::percpu::get(cpu_index).thread.store(next, core::sync::atomic::Ordering::Relaxed);
+        kernel_core::trace::event(kernel_core::trace::Category::Sched, "switch", current as u64, next as u64);
         sched.switches += 1;
         (old_pointer, new_rsp)
     };
@@ -536,6 +544,7 @@ extern "C" fn sched_finish_switch() {
 
 /// Ends the calling thread. Its stack is released by the thread that runs next.
 pub fn exit() -> ! {
+    kernel_core::trace::event(kernel_core::trace::Category::Tape, "exit", crate::percpu::this().thread.load(core::sync::atomic::Ordering::Relaxed) as u64, 0);
     cpu::interrupts_disable();
     let mut mask = 0;
     {
@@ -830,4 +839,47 @@ pub fn snapshot(mut visit: impl FnMut(&Info)) {
 /// Ticks CPU `cpu` spent on real work since boot (not idle, not the polling service thread).
 pub fn busy_ticks(cpu: usize) -> u64 {
     SCHED.lock().as_ref().map_or(0, |sched| sched.busy[cpu])
+}
+
+/// The debug dump's thread list (`sysrq.rs`): one line per thread with its state, CPU, process, CPU time and tape call.
+/// Never waits for the scheduler's lock: when it is taken, says by whom instead (the dump may run while a CPU is stuck).
+pub fn write_threads(out: &mut dyn core::fmt::Write) {
+    let Some(guard) = SCHED.try_lock() else {
+        let state = SCHED.state();
+        let _ = write!(out, "threads: the scheduler lock is held");
+        if let Some(cpu) = state.cpu {
+            let _ = write!(out, " by cpu{cpu}");
+        }
+        if let Some(place) = state.taken_at {
+            let _ = write!(out, ", taken at {place}");
+        }
+        let _ = writeln!(out);
+        return;
+    };
+    let Some(sched) = guard.as_ref() else { return };
+    let _ = writeln!(out, "threads ({} switches):", sched.switches);
+    for thread in sched.threads.iter().flatten() {
+        let length = thread.name.iter().position(|&b| b == 0).unwrap_or(16);
+        let name = core::str::from_utf8(&thread.name[..length]).unwrap_or("?");
+        let state = match thread.state {
+            State::Ready => "ready",
+            State::Running => "running",
+            State::Blocked => "blocked",
+            State::Sleeping => "sleeping",
+            State::Dead => "dead",
+        };
+        let _ = write!(out, "  {:>3} {name:<16} {state:<8}", thread.id);
+        if let Some(cpu) = (0..MAX_CPUS).find(|&cpu| sched.current[cpu] == thread.id) {
+            let _ = write!(out, " cpu{cpu}");
+        }
+        if thread.pid != 0 {
+            let _ = write!(out, " pid {}", thread.pid);
+        }
+        if thread.state == State::Blocked {
+            let _ = write!(out, " key {:#x}", thread.key);
+        }
+        let _ = write!(out, " {} ticks", thread.cpu_ticks);
+        crate::debugcpu::write_call(out, thread.id);
+        let _ = writeln!(out);
+    }
 }

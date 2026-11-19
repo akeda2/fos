@@ -66,6 +66,13 @@ pub struct Stats {
     pub free: u64,
 }
 
+/// `stats` without waiting: None while another CPU holds the allocator (the debug dump).
+pub fn try_stats() -> Option<Stats> {
+    let _guard = LOCK.try_lock()?;
+    let s = state();
+    Some(Stats { managed: s.managed, free: s.free })
+}
+
 pub fn stats() -> Stats {
     let _guard = LOCK.lock();
     let s = state();

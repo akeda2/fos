@@ -106,8 +106,19 @@ fn send(nic: &mut Nic, destination: &[u8; 6], tag: u8, payload: &[u8]) -> bool {
 /// Set while a `nic` self-test waits: `poll` then queues every unhandled frame, not only the fos ethertype's.
 static mut QUEUE_ALL: bool = false;
 
+/// Feeds the shell the keys a service's tape call took in (`feed`). Only from the shell's loop.
+fn run_deferred() {
+    if crate::tasks::in_service() || unsafe { TAPE_MODE } {
+        return;
+    }
+    while let Some(byte) = crate::lineedit::take_deferred() {
+        feed(byte);
+    }
+}
+
 /// Handles whatever the NIC has received. Call this from the main loop.
 pub fn poll() {
+    run_deferred();
     let mut buffer = [0u8; 1600];
     for index in 0..nic_count() {
         loop {
@@ -135,6 +146,10 @@ fn handle_frame(index: usize, frame: &[u8]) -> bool {
     let source: [u8; 6] = frame[6..12].try_into().unwrap();
     if let Some(consumed) = crate::netfs::handle(index, source, frame[14], &frame[15..]) {
         return consumed;
+    }
+    if frame[14] == crate::sysrq::TAG_SYSRQ {
+        crate::sysrq::request(index, source);
+        return true;
     }
     match frame[14] {
         TAG_KUP_REQUEST if crate::config::debug().kernel_update => return { kup_request(index, source, &frame[15..]); true },
@@ -333,6 +348,7 @@ static mut TAPE_INPUT_HEAD: usize = 0;
 static mut TAPE_INPUT_TAIL: usize = 0;
 
 fn tape_input_push(value: u16) {
+    crate::trace::event(crate::trace::Category::Input, "key-in", u64::from(value), unsafe { TAPE_INPUT_HEAD } as u64);
     unsafe {
         let next = (TAPE_INPUT_HEAD + 1) % TAPE_INPUT_CAPACITY;
         if next != TAPE_INPUT_TAIL {
@@ -350,6 +366,12 @@ pub fn set_tape_mode(on: bool) {
         TAPE_INPUT_HEAD = 0;
         TAPE_INPUT_TAIL = 0;
     }
+    if on {
+        // Typed behind the command that started the tape, before the shell's loop got to them: they are the tape's.
+        while let Some(byte) = crate::lineedit::take_deferred() {
+            tape_input_push(u16::from(byte));
+        }
+    }
     crate::serial::defer(on);
     if !on {
         flush();
@@ -364,6 +386,19 @@ pub fn tape_poll() {
 }
 
 /// True while a foreground tape owns the keys and the screen.
+/// For the SysRq dump: the foreground tape and its input ring.
+pub fn describe_input() {
+    unsafe {
+        if TAPE_MODE {
+            crate::println!("foreground tape: {}", crate::tape::loaded_name());
+        } else {
+            crate::println!("foreground: the shell{}", if BLOCKING { " (a command runs)" } else { "" });
+        }
+        let (head, tail) = (TAPE_INPUT_HEAD, TAPE_INPUT_TAIL);
+        crate::println!("tape input ring: head {head} tail {tail} (keys wait while they differ)");
+    }
+}
+
 pub fn tape_mode() -> bool {
     unsafe { TAPE_MODE }
 }
@@ -376,7 +411,8 @@ const SERIAL_ESCAPE_US: u64 = 50_000;
 fn tape_service() {
     crate::debug::pet();
     crate::usb_hid::poll();
-    while let Some((key, serial)) = crate::keyboard::pop_with_source() {
+    // Without a foreground tape the keys are the shell's: a service's tape call must leave them in the queue.
+    while let Some((key, serial)) = if unsafe { TAPE_MODE } { crate::keyboard::pop_with_source() } else { None } {
         if serial {
             // A terminal sends an arrow key as ESC [ A: only an Escape not followed (within SERIAL_ESCAPE_US) by `[` or `O`
             // is "stop", else every cursor key would end the tape.
@@ -434,6 +470,7 @@ pub fn tape_key() -> u32 {
         }
         let value = (*core::ptr::addr_of!(TAPE_INPUT))[TAPE_INPUT_TAIL];
         TAPE_INPUT_TAIL = (TAPE_INPUT_TAIL + 1) % TAPE_INPUT_CAPACITY;
+        crate::trace::event(crate::trace::Category::Input, "key-out", u64::from(value), TAPE_INPUT_TAIL as u64);
         if value == TAPE_ABORT { 1 } else { 0x100 + u32::from(value) }
     }
 }
@@ -506,6 +543,12 @@ fn prompt() {
 
 /// One typed byte: the line editor (`lineedit.rs`) handles the keys; a finished line runs here.
 fn feed(byte: u8) {
+    if crate::tasks::in_service() {
+        // A service's tape call drained this key: the line runs from the shell's own loop (`run_deferred`), never nested
+        // inside the service.
+        crate::trace::event(crate::trace::Category::Input, "key-defer", u64::from(byte), crate::tasks::context() as u64);
+        return crate::lineedit::defer(byte);
+    }
     let mut line = [0u8; crate::lineedit::LINE_MAX];
     if let Some(length) = crate::lineedit::feed(byte, &mut line) {
         if let Ok(text) = core::str::from_utf8(&line[..length]) {

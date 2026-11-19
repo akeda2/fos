@@ -45,6 +45,14 @@ pub const USER_CODE: u16 = 0x20 | 3;
 pub const TSS_SELECTOR: u16 = 0x28;
 /// IST slot used by the double-fault gate (1-based, as the IDT entry counts it).
 pub const DOUBLE_FAULT_IST: u8 = 1;
+/// IST slot of the NMI gate. An NMI can arrive anywhere, including the instructions after `syscall` that still run on the
+/// user's stack, so it must never use the interrupted stack.
+pub const NMI_IST: u8 = 2;
+
+/// Gives the NMI gate (IST2) its stack. The TSS is read at each interrupt, so this may follow `load`.
+pub fn set_nmi_stack(this: &mut CpuGdt, top: u64) {
+    this.tss.ist[usize::from(NMI_IST) - 1] = top;
+}
 
 /// Installs `this` as the CPU's GDT and TSS: `double_fault_stack_top` becomes IST1. Reloads every segment register (CS with a
 /// far return, the only way in 64-bit mode) and loads the task register.

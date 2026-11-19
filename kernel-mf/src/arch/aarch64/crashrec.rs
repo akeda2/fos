@@ -13,17 +13,23 @@ pub fn init() {
     println!("Crash record: the file `crash` on the boot volume (the Pi's firmware clears RAM across a reset).");
 }
 
-struct Text {
-    bytes: [u8; 256],
-    length: usize,
-}
+/// The largest record (the text with the backtrace and the other CPUs).
+const RECORD_BYTES: usize = 1536;
 
-impl Write for Text {
-    fn write_str(&mut self, text: &str) -> core::fmt::Result {
-        let take = text.len().min(self.bytes.len() - self.length);
-        self.bytes[self.length..self.length + take].copy_from_slice(&text.as_bytes()[..take]);
-        self.length += take;
-        Ok(())
+/// The debug tools' lines (`debugcpu::report_crash`), written before `record` and appended by it.
+static mut EXTRA: crate::debugcpu::Buffer<1024> = crate::debugcpu::Buffer::new();
+
+/// The crashing code's backtrace and where the other CPUs were (crash path only, one CPU: the others are stopped or asked).
+pub fn record_extra(frames: &[u64], answered: u128) {
+    let extra = unsafe { &mut *core::ptr::addr_of_mut!(EXTRA) };
+    let _ = write!(extra, "backtrace:");
+    for &frame in frames {
+        let _ = write!(extra, " {}", crate::debugcpu::Code(frame));
+    }
+    let _ = writeln!(extra);
+    for cpu in (0..crate::percpu::count().min(crate::percpu::MAX_CPUS)).filter(|&cpu| answered & 1 << cpu != 0) {
+        let snapshot = &crate::debugcpu::SNAPSHOTS[cpu];
+        let _ = writeln!(extra, "cpu{cpu}: thread {} at {}", snapshot.thread.load(core::sync::atomic::Ordering::Relaxed), crate::debugcpu::Code(snapshot.pc.load(core::sync::atomic::Ordering::Relaxed)));
     }
 }
 
@@ -37,14 +43,15 @@ pub fn record(kind: u64, esr: u64, elr: u64, far: u64) {
     // resets next anyway.
     core::mem::forget(guard);
     let Some(volume) = crate::storage::boot_volume() else { return };
-    let mut text = Text { bytes: [0; 256], length: 0 };
+    let mut text = crate::debugcpu::Buffer::<RECORD_BYTES>::new();
     if kind == WATCHDOG_VECTOR {
         let _ = writeln!(text, "watchdog: no progress, the CPU was at {elr:#018x}");
     } else {
         let _ = writeln!(text, "exception {kind}: ESR {esr:#010x} ELR {elr:#018x} FAR {far:#018x}");
     }
     let _ = writeln!(text, "slot {}, {} ticks after boot", crate::slots::boot_slot(), crate::arch::ticks());
-    if volume.write(b"crash", &text.bytes[..text.length]).is_ok() {
+    let _ = text.write_str(unsafe { (*core::ptr::addr_of!(EXTRA)).as_str() });
+    if volume.write(b"crash", text.as_str().as_bytes()).is_ok() {
         println!("Crash record written to the file `crash`.");
     }
 }
@@ -56,7 +63,7 @@ pub fn record_crash(frame: &Frame) {
 /// At boot: prints the previous boot's crash file, if there is one, and removes it.
 pub fn report_previous_crash() {
     let Some(volume) = crate::storage::boot_volume() else { return };
-    let mut buffer = [0u8; 256];
+    let mut buffer = [0u8; RECORD_BYTES];
     let Ok(Some(length)) = volume.read(b"crash", &mut buffer) else { return };
     println!("Previous boot crashed (file `crash`, now removed):");
     for line in core::str::from_utf8(&buffer[..length]).unwrap_or("?").lines() {

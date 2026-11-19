@@ -119,6 +119,7 @@ pub struct Report {
 pub fn start_all(rsdp: u64) -> Report {
     percpu::get(0).arch.gic_target.store(crate::gic::cpu_target(), Ordering::Relaxed);
     crate::gic::register_sgi(crate::context::WAKE_SGI, |_| crate::sched::wake_interrupt());
+    crate::gic::register_sgi(super::CAPTURE_SGI, |_| super::capture_interrupt());
     let mut report = Report { started: 0, failed: 0 };
     let mut mpidrs = [0u64; percpu::MAX_CPUS];
     let found = crate::acpi::madt_cpus(rsdp, &mut mpidrs);

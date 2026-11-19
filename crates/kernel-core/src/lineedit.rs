@@ -102,6 +102,41 @@ pub fn set_completer(completer: Completer) {
     }
 }
 
+// ---- shell input that arrived inside a service ----
+//
+// A service's tape calls drain the NICs (and on the Pi, `nic_receive` hands session frames on), so a `term net` key can
+// arrive while a service is the running context. A finished line must not run there: `run NAME` would start the tape
+// nested inside the service (its keys and audio then belonged to the service, and the service itself stopped). Such
+// bytes wait here until the shell's own loop feeds them; a tape that starts first gets them as its input.
+
+const DEFERRED_BYTES: usize = 512;
+static mut DEFERRED: [u8; DEFERRED_BYTES] = [0; DEFERRED_BYTES];
+static mut DEFERRED_HEAD: usize = 0;
+static mut DEFERRED_TAIL: usize = 0;
+
+/// Keeps a typed byte for the shell's loop; dropped when the ring is full.
+pub fn defer(byte: u8) {
+    unsafe {
+        let next = (DEFERRED_HEAD + 1) % DEFERRED_BYTES;
+        if next != DEFERRED_TAIL {
+            (*(&raw mut DEFERRED))[DEFERRED_HEAD] = byte;
+            DEFERRED_HEAD = next;
+        }
+    }
+}
+
+/// The oldest deferred byte.
+pub fn take_deferred() -> Option<u8> {
+    unsafe {
+        if DEFERRED_TAIL == DEFERRED_HEAD {
+            return None;
+        }
+        let byte = (*(&raw const DEFERRED))[DEFERRED_TAIL];
+        DEFERRED_TAIL = (DEFERRED_TAIL + 1) % DEFERRED_BYTES;
+        Some(byte)
+    }
+}
+
 /// Whether the selected editor's line is empty (Ctrl-D on an empty line means end of input).
 pub fn is_empty() -> bool {
     editor().length == 0
