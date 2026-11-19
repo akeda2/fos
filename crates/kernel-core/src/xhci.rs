@@ -1538,3 +1538,7 @@ impl Trb {
 
 pub const COMPLETION_SUCCESS: u8 = CC_SUCCESS;
 pub const COMPLETION_SHORT: u8 = CC_SHORT_PACKET;
+/// An isochronous OUT ring had no TD when its interval came (xHCI 4.10.3.1); the event names no TD.
+pub const COMPLETION_RING_UNDERRUN: u8 = 14;
+/// The same for an isochronous IN ring.
+pub const COMPLETION_RING_OVERRUN: u8 = 15;

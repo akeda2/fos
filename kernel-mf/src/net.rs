@@ -324,16 +324,21 @@ struct Terminal {
     exited: bool,
     /// The client has sent a PING, so silence means it is gone.
     pings: bool,
+    /// A client's HELLO or BYE waiting for the service loop (`feed_sessions`): the frame handler runs under the NIC lock with
+    /// interrupts off, too long a time to print a greeting or flush the last output there (12 ms and 4.5 ms measured).
+    greet: bool,
+    bye: bool,
 }
 impl Terminal {
-    const FREE: Terminal = Terminal { peer: None, nic: 0, activity: 0, owner: 0, exited: false, pings: false };
+    const FREE: Terminal = Terminal { peer: None, nic: 0, activity: 0, owner: 0, exited: false, pings: false, greet: false, bye: false };
     fn open(&self) -> bool {
         self.peer.is_some() || self.owner != 0
     }
 }
 const TERMINAL_SLOTS: usize = crate::session::MAX - 1;
 static TERMINALS: SpinLock<[Terminal; TERMINAL_SLOTS]> = SpinLock::new([Terminal::FREE; TERMINAL_SLOTS]);
-/// Bytes a tape typed into its session, fed to the shell by the service loop (the shell runs on that thread only).
+/// Bytes typed into a session, by a tape or a network terminal, fed to the shell by the service loop (the shell runs on that
+/// thread only).
 struct Input {
     bytes: [u8; 1024],
     length: usize,
@@ -469,7 +474,8 @@ fn claim_terminal(index: usize, source: [u8; 6]) -> Option<usize> {
     if !terminals[slot].open() {
         OPEN.fetch_add(1, Ordering::Relaxed);
     }
-    terminals[slot] = Terminal { peer: Some(source), nic: index, activity: now, owner: 0, exited: false, pings: false };
+    terminals[slot] = Terminal { peer: Some(source), nic: index, activity: now, owner: 0, exited: false, pings: false, greet: false,
+        bye: false };
     drop(terminals);
     RELAYS[slot].lock().length = 0;
     end_foreground_tape(slot);
@@ -481,23 +487,23 @@ fn handle_terminal(index: usize, source: [u8; 6], tag: u8, payload: &[u8]) -> bo
         TAG_HELLO if config::deny_term_net() || !config::term_net_allowed(index) => {}
         TAG_HELLO => {
             let Some(slot) = claim_terminal(index, source) else { return true };
-            let session = slot + 1;
-            crate::session::with(session, || {
-                println!("Remote terminal connected from {} on interface {}.", Mac(&source), index + 1);
-                println!("Type `help` for the commands.");
-            });
-            crate::shellhost::reset_folder(session);
-            shell::reset(session);
-            crate::session::with(session, shell::prompt);
+            INPUTS[slot].lock().length = 0;
+            let mut terminals = TERMINALS.lock();
+            terminals[slot].greet = true;
+            terminals[slot].bye = false;
         }
         TAG_DATA => {
             let Some(slot) = find_terminal(index, source) else { return false };
             // The frame has no length field and Ethernet pads a short frame with zeros: drop the trailing zero bytes.
             let end = payload.iter().rposition(|&byte| byte != 0).map_or(0, |last| last + 1);
             TERMINALS.lock()[slot].activity = time::ticks();
-            for &byte in &payload[..end] {
-                shell::feed_session(slot + 1, byte);
-            }
+            // Queued, not fed: this runs under the NIC lock with interrupts off, and a typed command would run inside it
+            // (an `audio` listing held off the xHCI interrupt for 0.2 s). `feed_sessions` hands the bytes to the shell.
+            let mut input = INPUTS[slot].lock();
+            let take = end.min(input.bytes.len() - input.length);
+            let start = input.length;
+            input.bytes[start..start + take].copy_from_slice(&payload[..take]);
+            input.length += take;
         }
         TAG_PING => {
             let Some(slot) = find_terminal(index, source) else { return false };
@@ -507,9 +513,7 @@ fn handle_terminal(index: usize, source: [u8; 6], tag: u8, payload: &[u8]) -> bo
         }
         TAG_BYE => {
             let Some(slot) = find_terminal(index, source) else { return false };
-            flush();
-            close_terminal(slot);
-            println!("Remote terminal {} disconnected.", slot + 1);
+            TERMINALS.lock()[slot].bye = true;
         }
         _ => return false,
     }
@@ -521,7 +525,8 @@ pub fn tape_session_open(pid: u64) -> isize {
     let slot = {
         let mut terminals = TERMINALS.lock();
         let Some(slot) = terminals.iter().position(|terminal| !terminal.open()) else { return -2 };
-        terminals[slot] = Terminal { peer: None, nic: 0, activity: time::ticks(), owner: pid, exited: false, pings: false };
+        terminals[slot] = Terminal { peer: None, nic: 0, activity: time::ticks(), owner: pid, exited: false, pings: false, greet: false,
+            bye: false };
         OPEN.fetch_add(1, Ordering::Relaxed);
         slot
     };
@@ -597,18 +602,30 @@ pub fn exit_session(session: usize) -> bool {
     true
 }
 
-/// Service loop: feeds what tapes typed into their sessions to the shell, and greets a session just opened.
-fn feed_tape_sessions() {
+/// Service loop: greets a session just opened, feeds what tapes and network terminals typed into their sessions to the shell,
+/// and closes a terminal whose client said goodbye.
+fn feed_sessions() {
     for slot in 0..TERMINAL_SLOTS {
-        let (owner, fresh, exited) = {
-            let terminals = TERMINALS.lock();
-            (terminals[slot].owner, terminals[slot].activity == 0, terminals[slot].exited)
+        let (owner, peer, nic, fresh, exited, greet) = {
+            let mut terminals = TERMINALS.lock();
+            let terminal = &mut terminals[slot];
+            let greet = core::mem::take(&mut terminal.greet);
+            (terminal.owner, terminal.peer, terminal.nic, terminal.activity == 0, terminal.exited, greet)
         };
-        if owner == 0 || exited {
+        if (owner == 0 && peer.is_none()) || exited {
             continue;
         }
         let session = slot + 1;
-        if fresh {
+        if let (true, Some(source)) = (greet, peer) {
+            crate::session::with(session, || {
+                println!("Remote terminal connected from {} on interface {}.", Mac(&source), nic + 1);
+                println!("Type `help` for the commands.");
+            });
+            crate::shellhost::reset_folder(session);
+            shell::reset(session);
+            crate::session::with(session, shell::prompt);
+        }
+        if owner != 0 && fresh {
             TERMINALS.lock()[slot].activity = time::ticks().max(1);
             crate::shellhost::reset_folder(session);
             shell::reset(session);
@@ -633,6 +650,11 @@ fn feed_tape_sessions() {
             if !more || TERMINALS.lock()[slot].exited {
                 break;
             }
+        }
+        if owner == 0 && TERMINALS.lock()[slot].bye {
+            flush();
+            close_terminal(slot);
+            println!("Remote terminal {session} disconnected.");
         }
     }
 }
@@ -814,7 +836,7 @@ pub fn poll() {
     announce();
     expire_silent_clients();
     if session_open() {
-        feed_tape_sessions();
+        feed_sessions();
         flush();
     }
 }

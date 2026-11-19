@@ -105,11 +105,13 @@ impl Write for Serial {
         crate::log::push(text);
         crate::net::relay(text);
         crate::fb::write_str(text);
+        // SAFETY: only reached under LOCK (`print`), which owns the ring's write side.
+        let ring = unsafe { &mut *core::ptr::addr_of_mut!(TX) };
         for byte in text.bytes() {
             if byte == b'\n' {
-                put(b'\r');
+                ring.push(b'\r');
             }
-            put(byte);
+            ring.push(byte);
         }
         Ok(())
     }
@@ -150,17 +152,94 @@ pub fn read_byte() -> Option<u8> {
     crate::pl011::read_byte()
 }
 
-/// One line at a time: CPUs print whole lines, never interleaved characters.
+/// One line at a time: CPUs print whole lines, never interleaved characters. It keeps interrupts off while held, so it
+/// covers only the fast consoles and the copy into `TX`; the UART itself (about 87 µs a byte at 115200 baud, 7 ms for an
+/// 80-column line) is fed from `TX` afterwards, with interrupts as the caller had them. Holding interrupts off for the
+/// whole UART write stalled the xHCI interrupt long enough to run isochronous audio rings dry.
 static LOCK: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
 
-pub fn print(arguments: fmt::Arguments) {
-    let _guard = LOCK.lock();
-    let _ = Serial.write_fmt(arguments);
+/// COM1's backlog: bytes are added under LOCK and taken out by whichever CPU holds DRAINING.
+const TX_BYTES: usize = 16 * 1024;
+
+struct TxRing {
+    data: [u8; TX_BYTES],
+    head: usize,
+    tail: usize,
+    dropped: u64,
 }
 
-/// For the fault and panic paths: the CPU that was printing may be the one that crashed.
+impl TxRing {
+    /// A full ring drops the new byte: the screen, the log and the network terminal still have the text.
+    fn push(&mut self, byte: u8) {
+        let next = (self.head + 1) % TX_BYTES;
+        if next == self.tail {
+            self.dropped += 1;
+            return;
+        }
+        self.data[self.head] = byte;
+        self.head = next;
+    }
+}
+
+static mut TX: TxRing = TxRing { data: [0; TX_BYTES], head: 0, tail: 0, dropped: 0 };
+/// Set while a CPU writes `TX` to the UART. Another print only appends: it never waits for the drainer, which may be the
+/// very thread an interrupt handler interrupted.
+static DRAINING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn print(arguments: fmt::Arguments) {
+    {
+        let _guard = LOCK.lock();
+        let _ = Serial.write_fmt(arguments);
+    }
+    drain();
+}
+
+/// Writes the backlog to the UART, up to 64 bytes per turn of LOCK so the lock is never held for the UART's pace.
+fn drain() {
+    use core::sync::atomic::Ordering;
+    loop {
+        if DRAINING.swap(true, Ordering::Acquire) {
+            return;
+        }
+        loop {
+            let mut chunk = [0u8; 64];
+            let length = {
+                let _guard = LOCK.lock();
+                // SAFETY: LOCK held.
+                let ring = unsafe { &mut *core::ptr::addr_of_mut!(TX) };
+                let mut length = 0;
+                while length < chunk.len() && ring.tail != ring.head {
+                    chunk[length] = ring.data[ring.tail];
+                    ring.tail = (ring.tail + 1) % TX_BYTES;
+                    length += 1;
+                }
+                length
+            };
+            if length == 0 {
+                break;
+            }
+            for &byte in &chunk[..length] {
+                put(byte);
+            }
+        }
+        DRAINING.store(false, Ordering::Release);
+        // A print that came in after the last check but before the flag cleared found DRAINING set and left its bytes.
+        let pending = {
+            let _guard = LOCK.lock();
+            // SAFETY: LOCK held.
+            let ring = unsafe { &*core::ptr::addr_of!(TX) };
+            ring.tail != ring.head
+        };
+        if !pending {
+            return;
+        }
+    }
+}
+
+/// For the fault and panic paths: the CPU that was printing (or draining) may be the one that crashed.
 pub fn break_lock() {
     unsafe { LOCK.force_unlock() };
+    DRAINING.store(false, core::sync::atomic::Ordering::Release);
 }
 
 macro_rules! println {
