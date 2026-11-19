@@ -1713,8 +1713,10 @@ a real USB mouse is the check (rack). **Real hardware, verified:** piano's built
 
 ## KakelFix: mixer, recorder, analyzer (tapes/kakelfix, crates/kakelfix, crates/mixer-model, ABI 41)
 
-`kakelfix` is one graphical tape with three pages (Mixer, Recorder, Analyzer) chosen with soft keys on the right edge (or 1 2 3; the page keys in their own colour, the Mixer's views Outputs, Matrix and Device indented under Mixer with Tab cycling them, the actions Pair, Pan law and Quit last); milestone one
-is the Mixer page. It knows no device: everything comes through the tape ABI's mixer calls (ABI 41, `mixer_*`), which a driver serves
+`kakelfix` is one graphical tape with three pages (Mixer, Recorder, Analyzer) chosen with soft keys on the right edge (or 1 2 3).
+The soft keys follow the page: the page keys first in their own colour, the current page's views indented under it (Tab cycles
+them), then that page's actions, Quit last. Milestone one
+is the Mixer page; the Analyzer followed. It knows no device: everything comes through the tape ABI's mixer calls (ABI 41, `mixer_*`), which a driver serves
 by implementing `kernel_core::ext_audio::Mixer` (crosspoint gains of outputs from inputs and playback channels, output masters,
 meters in cdB, named controls with a HAZARD flag, a serial that moves on every change). The loopback devices carry a small software
 mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path runs in QEMU.
@@ -1779,6 +1781,15 @@ loop (`ehci_service`) is shared with the iTD path (`EhciPipe::split`).
   `n > 1`); no complete-split.
 - **IN**: start-split in microframe 0, complete-splits in microframes 2 to `n + 3` (`n` = packet / 188 rounded up), which is why a
   packet over 4 x 188 bytes is refused (`SITD_MAX_PACKET`). Layout follows EHCI 3.4 and Linux `ehci-sched.c` (`smask_out`, the c-mask rule of USB 2.0 11.18.4).
+- **Analyzer** (`crates/kakelfix/src/analyzer.rs` state, `tapes/kakelfix/src/analyze.rs` capture and drawing): captures from the
+  device (`rate=`, else 48000 when offered) only while the page is open and shows one channel pair (Left/Right or `,` `.` step it)
+  as Waveform, Spectrum or Both. The waveform is a min/max envelope scrolling in from the right over 1, 5 or 30 s (Up/Down), or
+  (`w`) a scope triggered on the left channel's rising zero crossing over 5-50 ms, free-running when nothing crosses; `d` switches
+  linear and dB. The spectrum is two `ltas::Analyzer`s (8192-point FFT, 1/3, 1/6, 1/12 octave or raw bins with `f`), peak hold dim
+  behind the exponential average, 20 Hz-20 kHz by 0..-100 dB, always as lines: band resolutions as a spline through the band
+  centres (`gfx::plot::spline`, as ltas draws them), raw bins as a polyline. Space freezes, `r` resets. View, wave mode, span,
+  timebase, scale, resolution and pair are saved to `kakelfix.cfg` (`an-*` keys, beside `ask-phantom`) a second after the last
+  change or on quit, and read back at start; the same keys work on the command line.
 - Only `bInterval` 1 (every frame). A full-speed device on a root port belongs to the companion controller and a low-speed one is not streamed.
 
 **Not verified:** QEMU's `usb-hub` is full speed and cannot sit on an EHCI port, and its EHCI has no transaction translator, so this path

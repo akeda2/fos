@@ -70,8 +70,16 @@ dependencies = [
  "gfx",
  "instrument-rt",
  "kakelfix",
+ "ltas",
  "mixer-model",
  "tape-rt",
+]
+
+[[package]]
+name = "ltas"
+version = "0.1.0"
+dependencies = [
+ "dsp",
 ]
 
 [[package]]

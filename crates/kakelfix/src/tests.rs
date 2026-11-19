@@ -211,7 +211,7 @@ fn the_mouse_drags_faders_and_pan_and_presses_soft_keys() {
     let pan = layout.pan(1, &app).unwrap();
     assert_eq!(app.press(&mut device, &layout, pan.x, pan.y + 1), Some(Grab::Pan(1)));
     assert_eq!(device.gain[1][3], Some(0), "hard left on a pair turns the right side off");
-    let matrix = layout.soft(2);
+    let matrix = layout.soft(&app, 2);
     assert_eq!(app.press(&mut device, &layout, matrix.x + 1, matrix.y + 1), None);
     assert_eq!(app.view, View::Matrix);
     app.scroll(&layout);
@@ -250,4 +250,115 @@ fn levels_and_pan_format() {
     assert_eq!(format_pan(0.0).as_str(), "C");
     assert_eq!(format_pan(-0.5).as_str(), "L50");
     assert_eq!(format_pan(0.25).as_str(), "R25");
+}
+
+#[test]
+fn soft_keys_follow_the_page_and_tab_cycles_its_views() {
+    let mut device = Fake::new();
+    let mut app = app(&mut device);
+    let layout = Layout::new(1280, 720);
+    let labels = |app: &App| app.soft_keys().map(|k| k.label);
+    assert_eq!(labels(&app), ["Mixer", "Outputs", "Matrix", "Device", "Recorder", "Analyzer", "Pair", "Pan law", "", "Quit"]);
+    let analyzer = layout.soft(&app, 5);
+    app.press(&mut device, &layout, analyzer.x + 1, analyzer.y + 1);
+    assert_eq!(app.page, Page::Analyzer);
+    assert_eq!(labels(&app), ["Mixer", "Recorder", "Analyzer", "Waveform", "Spectrum", "Both", "Freeze", "Wave: Env", "Reset", "Quit"]);
+    assert!(layout.soft(&app, 3).x > layout.soft(&app, 2).x, "views are indented");
+    app.act(&mut device, Action::NextView);
+    assert_eq!((app.page, app.analysis.view), (Page::Analyzer, AnView::Waveform));
+    let spectrum = layout.soft(&app, 4);
+    app.press(&mut device, &layout, spectrum.x + 1, spectrum.y + 1);
+    assert_eq!(app.analysis.view, AnView::Spectrum);
+    let empty = layout.soft(&app, 8);
+    let quit = layout.soft(&app, 9);
+    assert!(quit.y > empty.y + empty.h, "a gap before Quit");
+    app.act(&mut device, Action::Page(Page::Recorder));
+    let gap = layout.soft(&app, 7);
+    app.press(&mut device, &layout, gap.x + 1, gap.y + 1);
+    assert!(!app.quit, "an empty slot does nothing");
+    app.press(&mut device, &layout, quit.x + 1, quit.y + 1);
+    assert!(app.quit);
+}
+
+#[test]
+fn analyzer_keys_step_pair_and_span_and_restart_the_buffers() {
+    let mut device = Fake::new();
+    let mut app = app(&mut device);
+    app.act(&mut device, Action::Page(Page::Analyzer));
+    app.analysis.channels = 5;
+    let start = app.analysis.generation;
+    app.act(&mut device, Action::Left);
+    assert_eq!((app.analysis.pair, app.analysis.channels_shown()), (2, (4, 4)), "wraps; an odd last channel shows twice");
+    app.act(&mut device, Action::Pan(0.1));
+    assert_eq!(app.analysis.channels_shown(), (0, 1));
+    app.act(&mut device, Action::Up);
+    app.act(&mut device, Action::Up);
+    assert_eq!(app.analysis.span, 2, "stops at the longest");
+    assert_eq!(app.analysis.generation, start.wrapping_add(3));
+    app.act(&mut device, Action::WaveMode);
+    app.act(&mut device, Action::Down);
+    assert_eq!((app.analysis.wave, app.analysis.timebase, app.analysis.span), (WaveMode::Scope, 0, 2));
+    app.act(&mut device, Action::Freeze);
+    assert!(app.analysis.frozen && app.soft_keys()[6].active);
+    app.act(&mut device, Action::Mute);
+    assert_eq!(device.writes, 0, "mixer keys do nothing on the Analyzer page");
+}
+
+#[test]
+fn the_envelope_keeps_min_and_max_per_column_newest_last() {
+    let mut envelope = analyzer::Envelope::new();
+    envelope.configure(4, 1000, 0.012);
+    assert_eq!(envelope.filled(), 0);
+    let left = [0.1, -0.5, 0.2, 0.9, 0.0, 0.0, -0.1, 0.3, 0.4];
+    let right = [0.0; 9];
+    envelope.push(&left[..5], &right[..5]);
+    envelope.push(&left[5..], &right[5..]);
+    assert_eq!(envelope.filled(), 3, "three samples a column");
+    assert_eq!(envelope.back(0)[0], [-0.1, 0.4]);
+    assert_eq!(envelope.back(2)[0], [-0.5, 0.2]);
+    envelope.push(&[0.0; 6], &[1.0; 6]);
+    assert_eq!(envelope.filled(), 4, "at most the column count");
+    assert_eq!(envelope.back(0)[1], [1.0, 1.0]);
+    assert_eq!(envelope.back(3)[0], [0.0, 0.9], "the oldest kept is the second");
+}
+
+#[test]
+fn the_scope_starts_on_a_rising_zero_crossing_or_free_runs() {
+    let mut scope = analyzer::Scope::new();
+    scope.configure(1000, 4.0);
+    assert!(scope.trace(0).0.is_empty());
+    let wave: [f32; 12] = [0.5, 0.2, -0.3, -0.6, -0.1, 0.4, 0.8, 0.3, -0.2, 0.0, 0.0, 0.0];
+    scope.push(&wave, &wave);
+    let (trace, triggered) = scope.trace(0);
+    assert!(triggered);
+    assert_eq!(trace, &[0.4, 0.8, 0.3, -0.2]);
+    let mut silent = analyzer::Scope::new();
+    silent.configure(1000, 4.0);
+    silent.push(&[0.0; 20], &[0.0; 20]);
+    assert_eq!(silent.trace(1), (&[0.0f32; 4][..], false));
+}
+
+#[test]
+fn analyzer_settings_are_saved_and_loaded_back() {
+    let mut a = Analysis::new();
+    a.view = AnView::Spectrum;
+    a.wave = WaveMode::Scope;
+    a.span = 2;
+    a.timebase = 3;
+    a.db = true;
+    a.resolution = 3;
+    a.pair = 1;
+    a.frozen = true;
+    let mut text = Text::<256>::new();
+    a.save(|key, value| {
+        let _ = write!(text, "{key}={value} ");
+    });
+    let text = text.as_str();
+    let mut b = Analysis::new();
+    b.load(|key| text.split(' ').find_map(|word| word.strip_prefix(key)?.strip_prefix('=')));
+    assert_eq!(b.persisted(), a.persisted());
+    assert!(!b.frozen, "Freeze is not a setting");
+    let mut c = Analysis::new();
+    c.load(|key| (key == "an-view").then_some("sideways"));
+    assert_eq!(c.persisted(), Analysis::new().persisted(), "an unknown word changes nothing");
 }

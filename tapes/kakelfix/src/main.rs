@@ -1,10 +1,11 @@
-//! KakelFix: a mixer, recorder and analyzer for the active audio device, driven by mouse, touch or keyboard. Milestone one
-//! is the Mixer page over the device's hardware mixer (tape ABI 41, `mixer_*`); Recorder and Analyzer come later.
-//! The state, the actions and the layout are in `crates/kakelfix` (host-tested); this file is the device glue, the input
-//! loop and `kakelfix show`; `view.rs` draws.
+//! KakelFix: a mixer, recorder and analyzer for the active audio device, driven by mouse, touch or keyboard. The Mixer
+//! page drives the device's hardware mixer (tape ABI 41, `mixer_*`); the Analyzer page captures a channel pair and shows
+//! its waveform and spectrum (`analyze.rs`); the Recorder comes later. The state, the actions and the layout are in
+//! `crates/kakelfix` (host-tested); this file is the device glue, the input loop and `kakelfix show`; `view.rs` draws.
 #![no_std]
 #![no_main]
 
+mod analyze;
 mod view;
 
 use audio_screen::{Screen, poll_keys};
@@ -20,20 +21,28 @@ use tape_rt::mixer::Mixer;
 use tape_rt::{Key, KeyDecoder, TapeApi, print, println};
 
 tape_rt::tape_help!(
-    br#"kakelfix [device=N] [screen=N] [theme=NAME] [show]
+    br#"kakelfix [device=N] [screen=N] [theme=NAME] [rate=HZ] [show]
 The active audio device's mixer on the pixel screen: one output's mix as
 fader strips (Outputs), every send as a table (Matrix) and the device's own
-settings (Device). Mouse, touch or keyboard; soft keys on the right.
+settings (Device); the Analyzer page shows an input pair's waveform and
+spectrum. Mouse, touch or keyboard; soft keys on the right.
   device=N     use audio device N (`audio` lists them; loop0 for a try)
   screen=N     which screen (Pi 4: 1 is the second HDMI output)
   theme=NAME   dark, classic or light
+  rate=HZ      the Analyzer's capture rate (default 48000 if offered)
   ask-phantom=yes  ask before switching phantom power on (Device page's
                last row; kakelfix.cfg keeps it)
+kakelfix.cfg also keeps the Analyzer's settings, saved as they change:
+an-view=waveform|spectrum|both an-wave=envelope|scope an-span=1|5|30
+an-timebase=5|10|20|50 an-scale=db|linear an-pair=N
+an-resolution=third|sixth|twelfth|fft (the same words on the command line)
   show         print every output's sends and the controls, then end
 Keys: Tab next view, 1 2 3 Mixer/Recorder/Analyzer, arrows select and
 move (Up/Down: 1 dB), PgUp/PgDn 6 dB, + - 0.1 dB, 0 unity, x off, m mute,
 , . pan, c centre, o O next/previous output, p pair source, P pair output,
 L pan law, Enter open (Matrix) or change (Device), y n answer, Esc quits.
+Analyzer: Tab view, Left/Right or , . input pair, Up/Down span, space
+freeze, w envelope/scope, d dB/linear, f resolution, r reset.
 Mouse: click a strip, drag its fader or pan, click soft keys and cells.
 "#
 );
@@ -164,6 +173,11 @@ fn action(key: Key) -> Option<Action> {
         Key::Char(b'n') => Action::No,
         Key::Char(b'q') => Action::Quit,
         Key::Char(b'v') => Action::View(View::Outputs),
+        Key::Char(b' ') => Action::Freeze,
+        Key::Char(b'w') => Action::WaveMode,
+        Key::Char(b'd') => Action::WaveScale,
+        Key::Char(b'f') => Action::Resolution,
+        Key::Char(b'r') => Action::Reset,
         _ => return None,
     })
 }
@@ -218,6 +232,14 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let mut hardware: Shadowed = Queued::new(Hardware { mixer }, link, info.outputs as usize, (info.inputs + info.playbacks) as usize);
     let mut app = App::new(shape(&mixer), &mut hardware);
     app.ask_hazard = config.value("ask-phantom") == Some("yes");
+    let rate = tape_rt::arg_value(started.arguments, "rate").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mut capture = analyze::Capture::new(api, rate);
+    app.analysis.channels = capture.channels().max(1);
+    app.analysis.load(|key| config.value(key));
+    app.analysis.pair = app.analysis.pair.min(app.analysis.pairs() - 1);
+    let mut saved = app.analysis.persisted();
+    // When the Analyzer's settings last changed; they are written a second later, so a run of key repeats is one write.
+    let mut changed_at = None;
     let mut failures = 0;
     let mut woken = LINK.work.load(Ordering::Acquire);
     let mut touches = Touches::<Grab>::new(width as i32, height as i32, started.screen);
@@ -238,7 +260,8 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             }
         });
         if !keep_going {
-            break;
+            // Through the quit check below, so a pending save is written first.
+            app.quit = true;
         }
         for action in keys[..count].iter().flatten() {
             app.act(&mut hardware, *action);
@@ -248,18 +271,30 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         if touches.poll(&mut pointing) {
             screen.mark_dirty();
         }
+        if app.analysis.persisted() != saved && changed_at.is_none() {
+            changed_at = Some(tape_rt::micros());
+        }
+        let settled = changed_at.is_some_and(|at| app.quit || tape_rt::micros().wrapping_sub(at) >= 1_000_000);
+        if app.ask_changed || settled {
+            changed_at = None;
+            saved = app.analysis.persisted();
+            let mut body = tape_rt::config::Settings::<512>::new();
+            body.put("ask-phantom", format_args!("{}", if app.ask_hazard { "yes" } else { "no" }));
+            app.analysis.save(|key, value| body.put(key, value));
+            let result = config.save(api, body.as_str());
+            // The Analyzer saves quietly; the +48 V toggle and any failure say so.
+            if app.ask_changed || result.is_err() {
+                app.message.clear();
+                let _ = match result {
+                    Ok(name) => write!(app.message, "saved {name}"),
+                    Err(reason) => write!(app.message, "save: {reason}"),
+                };
+                screen.mark_dirty();
+            }
+            app.ask_changed = false;
+        }
         if app.quit {
             break;
-        }
-        if app.ask_changed {
-            app.ask_changed = false;
-            let mut body = tape_rt::config::Settings::<64>::new();
-            body.put("ask-phantom", format_args!("{}", if app.ask_hazard { "yes" } else { "no" }));
-            app.message.clear();
-            let _ = match config.save(api, body.as_str()) {
-                Ok(name) => write!(app.message, "saved {name}"),
-                Err(reason) => write!(app.message, "save: {reason}"),
-            };
         }
         let work = LINK.work.load(Ordering::Acquire);
         if work != woken {
@@ -279,7 +314,8 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                 screen.mark_dirty();
             }
         }
-        if has_meters {
+        let fresh = capture.update(api, &mut app, &layout);
+        if has_meters || fresh {
             screen.mark_dirty();
         }
         if screen.due() {
@@ -292,12 +328,13 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             }
             app.scroll(&layout);
             let mut canvas = screen.frame();
-            view::draw(&mut canvas, &layout, &app, &hardware, &meters, touches.pointer());
+            view::draw(&mut canvas, &layout, &app, &hardware, &meters, &mut capture, touches.pointer());
             screen.present();
         } else {
             tape_rt::idle();
         }
     }
+    capture.stop(api, &mut app);
     screen.close();
     if let Some(thread) = writer_thread {
         LINK.stop();

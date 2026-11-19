@@ -1,4 +1,4 @@
-//! Drawing: header, soft keys, the Mixer page's three views, the confirm dialog and the mouse cursor. Everything is drawn
+//! Drawing: header, soft keys, the Mixer page's three views (the Analyzer's are in `analyze.rs`), the confirm dialog and the mouse cursor. Everything is drawn
 //! each frame onto the plain background layer; positions come from `kakelfix::Layout`.
 
 use crate::{METERS, Shadowed as Hardware};
@@ -6,7 +6,8 @@ use fosfor_abi::tape::{MixerControl, MixerMeter, MIXER_CONTROL_ACTION, MIXER_CON
 use gfx::Canvas;
 use gfx::theme::theme;
 use kakelfix::layout::fader_position;
-use kakelfix::{App, Device, Layout, Page, Rect, SOFT_KEYS, SOFT_VIEWS, Text, soft_is_page, View, field, format_db, format_pan};
+use kakelfix::analyzer::RESOLUTIONS;
+use kakelfix::{AnView, App, Device, Layout, Page, Rect, SOFT_SLOTS, SoftKind, Text, View, WaveMode, field, format_db, format_pan};
 use mixer_model::{Group, Strip};
 use core::fmt::Write;
 
@@ -36,7 +37,7 @@ impl Meters {
     }
 }
 
-fn text(canvas: &mut Canvas, layout: &Layout, x: i32, y: i32, s: &str, rgb: u32) -> i32 {
+pub(crate) fn text(canvas: &mut Canvas, layout: &Layout, x: i32, y: i32, s: &str, rgb: u32) -> i32 {
     canvas.text_scaled(x, y, s, layout.scale, rgb)
 }
 
@@ -48,7 +49,7 @@ fn fit(s: &str, chars: i32) -> &str {
     }
 }
 
-fn centered(canvas: &mut Canvas, layout: &Layout, area: Rect, s: &str, rgb: u32) {
+pub(crate) fn centered(canvas: &mut Canvas, layout: &Layout, area: Rect, s: &str, rgb: u32) {
     let s = fit(s, area.w / layout.col);
     let width = s.chars().count() as i32 * layout.col;
     text(canvas, layout, area.x + (area.w - width) / 2, area.y + (area.h - layout.row) / 2, s, rgb);
@@ -69,7 +70,7 @@ fn level_colour(db: f32) -> u32 {
     }
 }
 
-pub fn draw(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware, meters: &Meters, pointer: Option<(i32, i32)>) {
+pub fn draw(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware, meters: &Meters, capture: &mut crate::analyze::Capture, pointer: Option<(i32, i32)>) {
     header(canvas, layout, app, hardware);
     soft_keys(canvas, layout, app);
     match app.page {
@@ -79,7 +80,7 @@ pub fn draw(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware
             View::Device => device(canvas, layout, app, hardware),
         },
         Page::Recorder => centered(canvas, layout, layout.body, "Recorder: a later milestone", theme().dim),
-        Page::Analyzer => centered(canvas, layout, layout.body, "Analyzer: a later milestone", theme().dim),
+        Page::Analyzer => crate::analyze::draw(canvas, layout, app, capture),
     }
     footer(canvas, layout, app);
     if let Some((index, value)) = app.confirm {
@@ -98,7 +99,11 @@ fn header(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware) 
         (Page::Mixer, View::Matrix) => "Mixer / Matrix",
         (Page::Mixer, View::Device) => "Mixer / Device",
         (Page::Recorder, _) => "Recorder",
-        (Page::Analyzer, _) => "Analyzer",
+        (Page::Analyzer, _) => match app.analysis.view {
+            AnView::Waveform => "Analyzer / Waveform",
+            AnView::Spectrum => "Analyzer / Spectrum",
+            AnView::Both => "Analyzer / Both",
+        },
     };
     let _ = write!(line, "KakelFix  {}  {page}", hardware.device.mixer.title());
     text(canvas, layout, 8, 4, line.as_str(), t.text);
@@ -107,6 +112,15 @@ fn header(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware) 
         let _ = write!(line, "mix sent to output {} (pick the output above)   pan law {}", app.label(&app.output()).as_str(), app.mix.pan_law.name());
     } else if app.page == Page::Mixer && app.view == View::Matrix {
         let _ = write!(line, "rows: sources   columns: outputs   pan law {}", app.mix.pan_law.name());
+    } else if app.page == Page::Analyzer {
+        let a = &app.analysis;
+        let (first, second) = a.channels_shown();
+        let _ = write!(line, "inputs {}+{} of {}", first + 1, second + 1, a.channels);
+        if a.rate != 0 {
+            let _ = write!(line, "   {} Hz", a.rate);
+        }
+        let wave = if a.wave == WaveMode::Envelope { "envelope" } else { "scope" };
+        let _ = write!(line, "   {wave}   {}{}", RESOLUTIONS[a.resolution], if a.frozen { "   FROZEN" } else { "" });
     }
     text(canvas, layout, 8, 4 + layout.row, line.as_str(), t.dim);
     if !app.message.is_empty() {
@@ -116,42 +130,33 @@ fn header(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware) 
     canvas.line(0, layout.header.h - 2, layout.width, layout.header.h - 2, t.grid_major);
 }
 
-/// Pages (Mixer, Recorder, Analyzer) in the page colour; the Mixer's views indented under it, joined to it by a line;
-/// actions (Pair, Pan law, Quit) with a dim frame.
+/// Pages (Mixer, Recorder, Analyzer) in the page colour; the active page's views indented under it, joined to it by a
+/// line; actions (Pair, Freeze, Quit, ...) with a plain frame.
 fn soft_keys(canvas: &mut Canvas, layout: &Layout, app: &App) {
     let t = theme();
     let page_colour = t.curves[1];
-    let (mixer_key, last_view) = (layout.soft(0), layout.soft(SOFT_VIEWS.end - 1));
-    let x = mixer_key.x + layout.col / 2;
-    let drop = last_view.y + last_view.h / 2 - mixer_key.y - mixer_key.h;
-    canvas.fill_rect(x, mixer_key.y + mixer_key.h, 2, drop.max(0) as u32, page_colour);
-    for index in SOFT_VIEWS {
-        let area = layout.soft(index);
-        canvas.fill_rect(x, area.y + area.h / 2, (area.x - x).max(0) as u32, 2, page_colour);
+    let keys = app.soft_keys();
+    if let Some(page) = (0..SOFT_SLOTS).find(|&k| keys[k].kind == SoftKind::Page && keys[k].active) {
+        let views = (page + 1..SOFT_SLOTS).take_while(|&k| keys[k].kind == SoftKind::View);
+        let page_key = layout.soft(app, page);
+        let x = page_key.x + layout.col / 2;
+        for slot in views {
+            let area = layout.soft(app, slot);
+            let (top, middle) = (page_key.y + page_key.h, area.y + area.h / 2);
+            canvas.fill_rect(x, top, 2, (middle - top + 2).max(0) as u32, page_colour);
+            canvas.fill_rect(x, middle, (area.x - x).max(0) as u32, 2, page_colour);
+        }
     }
-    for (index, name) in SOFT_KEYS.iter().enumerate() {
-        let mixer = app.page == Page::Mixer;
-        let active = match index {
-            0 => mixer,
-            1 => mixer && app.view == View::Outputs,
-            2 => mixer && app.view == View::Matrix,
-            3 => mixer && app.view == View::Device,
-            4 => app.page == Page::Recorder,
-            5 => app.page == Page::Analyzer,
-            _ => false,
+    for (slot, key) in keys.iter().enumerate() {
+        let area = layout.soft(app, slot);
+        let (frame, label) = match key.kind {
+            SoftKind::Empty => continue,
+            SoftKind::Page => (page_colour, if key.active { t.text } else { page_colour }),
+            SoftKind::View => (if key.active { t.text } else { t.frame }, t.text),
+            SoftKind::Action => (if key.active { t.amber } else { t.grid_major }, if key.active { t.amber } else { t.text }),
         };
-        let disabled = !mixer && (6..=7).contains(&index);
-        let area = layout.soft(index);
-        let page = soft_is_page(index);
-        let (frame, label) = if page {
-            (page_colour, page_colour)
-        } else if SOFT_VIEWS.contains(&index) {
-            (if active { t.text } else { t.frame }, t.text)
-        } else {
-            (t.grid_major, t.text)
-        };
-        box_(canvas, area, if active { t.grid_major } else { t.grid }, frame);
-        centered(canvas, layout, area, name, if disabled { t.dim } else if active && page { t.text } else { label });
+        box_(canvas, area, if key.active { t.grid_major } else { t.grid }, frame);
+        centered(canvas, layout, area, key.label, label);
     }
 }
 
@@ -160,6 +165,7 @@ fn footer(canvas: &mut Canvas, layout: &Layout, app: &App) {
         (Page::Mixer, View::Outputs) => "Up/Dn 1 dB  PgUp/PgDn 6  +- 0.1  0 unity  x off  m mute  , . pan  o output  p pair  Tab view  1 2 3 page",
         (Page::Mixer, View::Matrix) => "arrows select  Enter or click again: open  +- 0.1 dB  0 x m  p P pair  Tab view  1 2 3 page",
         (Page::Mixer, View::Device) => "Up/Dn select  Left/Right/Enter or click again: change  Tab view  1 2 3 page",
+        (Page::Analyzer, _) => "Tab view  Left/Right or , . pair  Up/Dn span  space freeze  w env/scope  d dB/lin  f resolution  r reset  1 2 3 page",
         _ => "1 Mixer  2 Recorder  3 Analyzer  Esc quits",
     };
     text(canvas, layout, 8, layout.footer.y + 4, fit(hint, layout.footer.w / layout.col - 2), theme().dim);

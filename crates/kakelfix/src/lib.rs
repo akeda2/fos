@@ -2,11 +2,14 @@
 //! so the host can test them. The tape reaches the active audio device's mixer (tape ABI 41, `mixer_*`) through the
 //! `Device` trait; `mixer_model` turns its mono crosspoints into stereo strips with dB faders, pan and mute.
 //!
-//! Pages (chosen by the soft keys down the right edge): Mixer, Recorder and Analyzer (the last two in a later milestone).
-//! The Mixer page has three views: Outputs (one output's mix as fader strips, its master at the end), Matrix (every send
-//! of every output as a table) and Device (the device's own settings).
+//! Pages (chosen by the soft keys down the right edge): Mixer, Recorder (a later milestone) and Analyzer. The soft keys
+//! follow the page: the active page's views sit indented under it, its actions below, Quit last. The Mixer page has three
+//! views: Outputs (one output's mix as fader strips, its master at the end), Matrix (every send of every output as a
+//! table) and Device (the device's own settings). The Analyzer shows a captured channel pair as a waveform, a spectrum,
+//! or both (`analyzer`).
 #![no_std]
 
+pub mod analyzer;
 pub mod layout;
 pub mod queue;
 
@@ -14,6 +17,7 @@ use core::fmt::Write;
 use fosfor_abi::tape::{
     MixerControl, MIXER_CONTROL_ACTION, MIXER_CONTROL_BOOL, MIXER_CONTROL_ENUM, MIXER_FLAG_HAZARD, MIXER_FLAG_READONLY, MIXER_FLAG_UNKNOWN,
 };
+pub use analyzer::{AnView, Analysis, Persisted, WaveMode};
 pub use layout::{Hit, Layout, Rect};
 pub use queue::{Link, Queued};
 use mixer_model::{Cell, Group, List, Master, Mixer, PanLaw, Send, Strip, Strips, MAX_CHANNELS};
@@ -143,6 +147,13 @@ pub enum Action {
     NextView,
     Page(Page),
     View(View),
+    /// Analyzer: a view, freeze, envelope or scope, reset what was gathered, dB or linear waveform, spectrum resolution.
+    AnView(AnView),
+    Freeze,
+    WaveMode,
+    Reset,
+    WaveScale,
+    Resolution,
     Enter,
     Yes,
     No,
@@ -157,15 +168,32 @@ pub enum Grab {
     Pan(usize),
 }
 
-/// The soft keys down the right edge, top to bottom.
-pub const SOFT_KEYS: [&str; 9] = ["Mixer", "Outputs", "Matrix", "Device", "Recorder", "Analyzer", "Pair", "Pan law", "Quit"];
-/// The soft keys that are the Mixer page's views, right under Mixer; then the other pages (`SOFT_PAGES`), then actions.
-pub const SOFT_VIEWS: core::ops::Range<usize> = 1..4;
-pub const SOFT_PAGES: core::ops::Range<usize> = 4..6;
+/// Soft-key slots down the right edge: `SOFT_NAV` for the pages with the active page's views under it, then
+/// `SOFT_ACTIONS` for that page's actions, then Quit, with half a key between the groups.
+pub const SOFT_SLOTS: usize = 10;
+pub const SOFT_NAV: usize = 6;
+pub const SOFT_ACTIONS: usize = 3;
 
-/// Whether soft key `index` is a page (Mixer, Recorder, Analyzer) rather than a Mixer view or an action.
-pub fn soft_is_page(index: usize) -> bool {
-    index == 0 || SOFT_PAGES.contains(&index)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SoftKind {
+    Empty,
+    Page,
+    /// One of the active page's views, drawn indented under it.
+    View,
+    Action,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Soft {
+    pub label: &'static str,
+    pub kind: SoftKind,
+    pub action: Action,
+    /// The page or view shown, or an action that is on (Freeze).
+    pub active: bool,
+}
+
+impl Soft {
+    const EMPTY: Soft = Soft { label: "", kind: SoftKind::Empty, action: Action::Quit, active: false };
 }
 
 #[derive(Clone, Copy)]
@@ -200,6 +228,7 @@ pub struct App {
     /// Set when `ask_hazard` was toggled, for the tape to save; it clears it.
     pub ask_changed: bool,
     pub controls: List<MixerControl, 32>,
+    pub analysis: Analysis,
     pub message: Text<72>,
     pub quit: bool,
     names: [[Text<16>; MAX_CHANNELS]; 3],
@@ -228,6 +257,7 @@ impl App {
             ask_hazard: false,
             ask_changed: false,
             controls: List::new(),
+            analysis: Analysis::new(),
             message: Text::new(),
             quit: false,
             names: [[Text::new(); MAX_CHANNELS]; 3],
@@ -431,14 +461,23 @@ impl App {
                 self.view = view;
                 self.message.clear();
             }
-            Action::NextView => {
-                self.page = Page::Mixer;
-                self.view = match self.view {
-                    View::Outputs => View::Matrix,
-                    View::Matrix => View::Device,
-                    View::Device => View::Outputs,
-                };
+            Action::AnView(view) => {
+                self.page = Page::Analyzer;
+                self.analysis.view = view;
+                self.message.clear();
             }
+            Action::NextView => match self.page {
+                Page::Mixer => {
+                    self.view = match self.view {
+                        View::Outputs => View::Matrix,
+                        View::Matrix => View::Device,
+                        View::Device => View::Outputs,
+                    }
+                }
+                Page::Analyzer => self.analysis.next_view(),
+                Page::Recorder => {}
+            },
+            _ if self.page == Page::Analyzer => self.act_analyzer(action),
             _ if self.page != Page::Mixer => {}
             Action::PanLaw => {
                 self.mix.pan_law = match self.mix.pan_law {
@@ -456,6 +495,66 @@ impl App {
                 View::Device => self.act_device(device, action),
             },
         }
+    }
+
+    fn act_analyzer(&mut self, action: Action) {
+        let a = &mut self.analysis;
+        match action {
+            Action::Left => a.step_pair(false),
+            Action::Right => a.step_pair(true),
+            Action::Pan(step) => a.step_pair(step > 0.0),
+            Action::Up => a.step_span(true),
+            Action::Down => a.step_span(false),
+            Action::Freeze => a.frozen = !a.frozen,
+            Action::WaveMode => {
+                a.wave = match a.wave {
+                    WaveMode::Envelope => WaveMode::Scope,
+                    WaveMode::Scope => WaveMode::Envelope,
+                };
+                a.restart();
+            }
+            Action::Reset => a.restart(),
+            Action::WaveScale => a.db = !a.db,
+            Action::Resolution => a.next_resolution(),
+            _ => {}
+        }
+    }
+
+    /// The soft keys for the page shown (`SOFT_SLOTS` of them, some `Empty`).
+    pub fn soft_keys(&self) -> [Soft; SOFT_SLOTS] {
+        let mut keys = [Soft::EMPTY; SOFT_SLOTS];
+        let mut slot = 0;
+        let mut put = |slot: &mut usize, label, kind, action, active| {
+            keys[*slot] = Soft { label, kind, action, active };
+            *slot += 1;
+        };
+        let (mixer, analyzer) = (self.page == Page::Mixer, self.page == Page::Analyzer);
+        put(&mut slot, "Mixer", SoftKind::Page, Action::Page(Page::Mixer), mixer);
+        if mixer {
+            for (label, view) in [("Outputs", View::Outputs), ("Matrix", View::Matrix), ("Device", View::Device)] {
+                put(&mut slot, label, SoftKind::View, Action::View(view), self.view == view);
+            }
+        }
+        put(&mut slot, "Recorder", SoftKind::Page, Action::Page(Page::Recorder), self.page == Page::Recorder);
+        put(&mut slot, "Analyzer", SoftKind::Page, Action::Page(Page::Analyzer), analyzer);
+        if analyzer {
+            for (label, view) in [("Waveform", AnView::Waveform), ("Spectrum", AnView::Spectrum), ("Both", AnView::Both)] {
+                put(&mut slot, label, SoftKind::View, Action::AnView(view), self.analysis.view == view);
+            }
+        }
+        slot = SOFT_NAV;
+        if mixer {
+            put(&mut slot, "Pair", SoftKind::Action, Action::Pair, false);
+            put(&mut slot, "Pan law", SoftKind::Action, Action::PanLaw, false);
+        } else if analyzer {
+            put(&mut slot, "Freeze", SoftKind::Action, Action::Freeze, self.analysis.frozen);
+            let wave = if self.analysis.wave == WaveMode::Envelope { "Wave: Env" } else { "Wave: Scope" };
+            put(&mut slot, wave, SoftKind::Action, Action::WaveMode, false);
+            put(&mut slot, "Reset", SoftKind::Action, Action::Reset, false);
+        }
+        slot = SOFT_NAV + SOFT_ACTIONS;
+        put(&mut slot, "Quit", SoftKind::Action, Action::Quit, false);
+        keys
     }
 
     /// Pairing only changes how the device's crosspoints are shown, so the device is read again and nothing is written.
@@ -762,19 +861,11 @@ impl App {
             return None;
         }
         match hit {
-            Hit::Soft(key) => {
-                let action = match key {
-                    0 => Action::Page(Page::Mixer),
-                    1 => Action::View(View::Outputs),
-                    2 => Action::View(View::Matrix),
-                    3 => Action::View(View::Device),
-                    4 => Action::Page(Page::Recorder),
-                    5 => Action::Page(Page::Analyzer),
-                    6 => Action::Pair,
-                    7 => Action::PanLaw,
-                    _ => Action::Quit,
-                };
-                self.act(device, action);
+            Hit::Soft(slot) => {
+                let key = self.soft_keys()[slot];
+                if key.kind != SoftKind::Empty {
+                    self.act(device, key.action);
+                }
                 None
             }
             Hit::Tab(output) => {

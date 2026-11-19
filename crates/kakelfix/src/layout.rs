@@ -1,7 +1,7 @@
 //! Where everything is on the screen, in pixels, and what a point hits. Text is the 8x16 console font, doubled on large
 //! screens. Soft keys run down the right edge; the page fills the rest under a two-line header, above a one-line footer.
 
-use crate::{App, Page, SOFT_KEYS, SOFT_PAGES, SOFT_VIEWS, View};
+use crate::{App, Page, SOFT_ACTIONS, SOFT_NAV, SOFT_SLOTS, SoftKind, View};
 
 const GLYPH_W: i32 = 8;
 const GLYPH_H: i32 = 16;
@@ -104,8 +104,8 @@ impl Layout {
         let header = Rect::new(0, 0, width, row * 2 + 8);
         let key_w = col * 11 + 16;
         let keys = Rect::new(width - key_w, header.h, key_w, height - header.h);
-        // One key's height is split into the two gaps between the groups (pages, the Mixer's views, actions).
-        let key_h = ((keys.h - 8) / (SOFT_KEYS.len() as i32 + 1)).min(row * 4);
+        // One key's height is split into the two gaps between the groups (pages and views, actions, Quit).
+        let key_h = ((keys.h - 8) / (SOFT_SLOTS as i32 + 1)).min(row * 4);
         let footer = Rect::new(0, height - row - 8, keys.x, row + 8);
         let body = Rect::new(8, header.h, keys.x - 16, footer.y - header.h);
         let tabs = Rect::new(body.x, body.y, body.w, row + 12);
@@ -135,13 +135,29 @@ impl Layout {
         }
     }
 
-    /// Soft key `index`: Mixer with its views indented one column under it, then the other pages, then the actions,
-    /// with half a key between the groups.
-    pub fn soft(&self, index: usize) -> Rect {
-        let gaps = (index >= SOFT_PAGES.start) as i32 + (index >= SOFT_PAGES.end) as i32;
-        let indent = if SOFT_VIEWS.contains(&index) { self.col } else { 0 };
-        let y = self.keys.y + 4 + index as i32 * self.key_h + gaps * self.key_h / 2;
+    /// Soft key `slot` (`App::soft_keys`): pages with the active page's views indented one column under it, then the
+    /// page's actions, then Quit, with half a key between the groups.
+    pub fn soft(&self, app: &App, slot: usize) -> Rect {
+        let gaps = (slot >= SOFT_NAV) as i32 + (slot >= SOFT_NAV + SOFT_ACTIONS) as i32;
+        let indent = if app.soft_keys()[slot].kind == SoftKind::View { self.col } else { 0 };
+        let y = self.keys.y + 4 + slot as i32 * self.key_h + gaps * self.key_h / 2;
         Rect::new(self.keys.x + 8 + indent, y, self.keys.w - 16 - indent, self.key_h - 8)
+    }
+
+    /// The Analyzer's plots for `view`: the waveform and the spectrum, each inside the room for its axis labels (six
+    /// columns at the left, a row under the spectrum). Both: the waveform takes the upper two fifths.
+    pub fn analyzer_plots(&self, view: crate::AnView) -> (Option<Rect>, Option<Rect>) {
+        let b = self.body;
+        let (left, top) = (self.col * 6, self.row);
+        let plot = |y: i32, h: i32, under: i32| Rect::new(b.x + left, y + top, b.w - left - self.col, h - top - under);
+        match view {
+            crate::AnView::Waveform => (Some(plot(b.y, b.h, self.row / 2)), None),
+            crate::AnView::Spectrum => (None, Some(plot(b.y, b.h, self.row + 8))),
+            crate::AnView::Both => {
+                let wave_h = b.h * 2 / 5;
+                (Some(plot(b.y, wave_h, self.row / 2)), Some(plot(b.y + wave_h, b.h - wave_h, self.row + 8)))
+            }
+        }
     }
 
     pub fn visible_tabs(&self) -> usize {
@@ -260,8 +276,9 @@ impl Layout {
                 Hit::Nothing
             };
         }
-        if let Some(key) = (0..SOFT_KEYS.len()).find(|&k| self.soft(k).contains(x, y)) {
-            return Hit::Soft(key);
+        let keys = app.soft_keys();
+        if let Some(slot) = (0..SOFT_SLOTS).find(|&k| keys[k].kind != SoftKind::Empty && self.soft(app, k).contains(x, y)) {
+            return Hit::Soft(slot);
         }
         if app.page != Page::Mixer {
             return Hit::Nothing;

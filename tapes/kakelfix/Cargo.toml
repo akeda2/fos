@@ -14,6 +14,7 @@ fosfor-abi = { path = "../../abi" }
 gfx = { path = "../../crates/gfx" }
 instrument-rt = { path = "../../crates/instrument-rt" }
 kakelfix = { path = "../../crates/kakelfix" }
+ltas = { path = "../../crates/ltas" }
 mixer-model = { path = "../../crates/mixer-model" }
 
 [profile.release]
