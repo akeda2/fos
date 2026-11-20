@@ -448,4 +448,4 @@ them). Console output (`print`) is relayed and flushed from the shell loop, the 
 (`foscopy`) and no KUP. This is wider than on x86 (terminal and NETFS only), on purpose: a Pi deployed where it must stay silent.
 Serial console and USB keyboard still work; recover by editing `settings` there. Checked: a Pi with the line is not found by
 `peers.py --discover` and still answers on serial. The x86 kernel was refactored onto the same module (`make test-hostnames`,
-`make test-telnet` pass; the other term-net tests are for `make test-all` on landsbro).
+`make test-telnet` pass; the other term-net tests are for `make test-all` on sommen).

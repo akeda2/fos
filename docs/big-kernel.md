@@ -139,7 +139,7 @@ leave the kernel crate. `tape.rs`, `tasks.rs`, `term.rs`, `shell*.rs` are core-s
 - Size and speed: kernel is `opt-level = "z"` with LTO, so indirection is checked by comparing image size before and after.
 
 **Risks.** Path moves hide from text search (split spellings); every step needs the aarch64 build and, at the end of 1b, a full
-`make test-all` on landsbro. Real-hardware checks for anything that touches IRQ routing or DMA (`skylake`, `amd1`, laptop, `piano`).
+`make test-all` on sommen. Real-hardware checks for anything that touches IRQ routing or DMA (`skylake`, `amd1`, laptop, `piano`).
 Rough size: 1a about a week of focused work, 1b about two.
 
 ## Stage 1a status (2026-11-01, branch `kernel-core`)

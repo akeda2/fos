@@ -160,7 +160,7 @@ for the recorder, ...). `test-nettapes` (bridge and ip-chat through the
 `qemu-i386` shim) passes again. `test-audio-net` and `test-nettest`
 have been seen to flake once. A test with a fixed host port wraps it in `testslot.port()`, and a test that boots the image reads
 `FOSFOR_IMAGE` (parallel workers each get their own copy; QEMU refuses two writers). `test-bootcode-uefi` and `test-nettapes` have
-failed under load and pass alone. The landsbro buildbot (`gb -of fos`, config `fos.yaml`) runs the parallel suite. ARP/DHCP frame
+failed under load and pass alone. The sommen buildbot (`gb -of fos`, config `fos.yaml`) runs the parallel suite. ARP/DHCP frame
 building is shared in `crates/tape-net/src/frames.rs`: do not copy it into a tape. Tests use bounded waits, keep the serial output on
 failure and wait for the prompt before typing. **Every new tape needs a focused test
 through its documented load/run path**; a green build is not validation. Editing a path
@@ -241,7 +241,7 @@ maintainer's memory notes, not in this repository.
 ## Conventions
 
 - Working with this maintainer: Nordic keyboards only, so key bindings are plain keys or Ctrl+letter, never AltGr or
-  ANSI-only combinations. `make test-all` runs on landsbro (`gb -of fos`), not locally. `tools/peers.py --forget` before
+  ANSI-only combinations. `make test-all` runs on sommen (`gb -of fos`), not locally. `tools/peers.py --forget` before
   `--discover`. The 79-column cap matters only for the BIOS VGA text screen. kernel-mf stays one implementation on x86_64
   and aarch64 (Pi 4 only), doing everything the embedded kernel does except the realtime guarantees. Private drivers
   (`private/`, `docs/private.md`) are never named in the public tree: `python3 tools/check_public.py` before every push.

@@ -127,7 +127,7 @@ Also `ps`, `threads`, `top [S] [once]`, `dmesg`, `debug slots|revert|crash now|h
 
 - `make test-NAME` for one; `python3 tools/run_tests.py JOBS test-A test-B ...` for several (a failure is retried
   alone; logs in `build/test-logs/NAME.failed.log`). "PASS (alone)" means load-sensitive, not necessarily fine.
-- Full suite: on landsbro with `gb -of fos`, not locally.
+- Full suite: on sommen with `gb -of fos`, not locally.
 - Before calling something a flake, measure its rate (20-30 runs) and look for a real race: the kakelfix "flake" was a
   kernel bug. Known load-sensitive: `test-mf-boot`, `test-bootcode-uefi`, `test-nettapes`, `test-audio-net`,
   `test-nettest`.

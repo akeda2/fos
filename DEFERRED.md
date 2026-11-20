@@ -467,7 +467,7 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
 - amd1 (three 3C905) was offline: it still runs the old kernel. When it is up, check `power 5`, `irqstat` and `nic` for INTx pins and storms.
 - rack1 (headless, serial on COM1, `settings` with `park-idle` and `hwp balanced`) was moved into the rack: verify kernel, settings and serial.
 - Unverified on real hardware: HWP under busy tape-net traffic, RTL8139/RTL8168 PHY parking, link detection after a park wake, ptp master
-  on clock1 after its reset. `make test-all` has not been run for these changes (run it on landsbro with `gb -of fos`).
+  on clock1 after its reset. `make test-all` has not been run for these changes (run it on sommen with `gb -of fos`).
 - Power-button stops count as unclean boots; three in a row switch the watchdog off until one boot runs five minutes.
 
 ## Open after the nettest switch-measurement session (2026-10-16)
@@ -501,7 +501,7 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
   Two USB interfaces at once are done (QEMU: two usb-audio playing in turn; real hardware untested). Not done: a standalone `noise` tape, a test of the `t` avg-off
   setting. All hosts run the refactored `ltas` (0d7ac6b). landsbro's scheduled `gb -of fos` runs at 12:13/14:13/16:14 failed (exit 2), not investigated.
 - `gonio` (goniometer) is written and tested in QEMU with its test tone only. Open: true-peak in the LUFS panel, a PNG save key (`tape_rt::save`), real-hardware checks (UFX pairs, Nordic reading against a known tone, scope on real
-  programme material, draw speed on the real framebuffer), playing the test pair to the outputs. `make test-all` (landsbro) has not
+  programme material, draw speed on the real framebuffer), playing the test pair to the outputs. `make test-all` (sommen) has not
   run since the USB-units, simd and shared-crate changes; clock1's PTP after the last reset was not looked at.
 
 ## Planned: Pi GPIO and touchscreen (2026-10-21)
@@ -630,7 +630,7 @@ use it. The `strings` saw is PolyBLEP-smoothed (error against an ideal band-limi
 - `test-mf-tape` at `-smp 8` failed once at the `remove` case (probably the load flake); landsbro also flakes on
   `test-config`, `test-debug-mode`, `test-msi`, `test-fosplay`.
 - Not yet done: the `clock` host is stale (37 old tapes); the `abibad` tape is not installed on the mf hosts; the embedded
-  `debug revert` and `services` setting; the 1024-frame e1000 ring on embedded hardware; a full `gb -of fos` run on landsbro.
+  `debug revert` and `services` setting; the 1024-frame e1000 ring on embedded hardware; a full `gb -of fos` run on sommen.
 
 ## Planned (2026-11-05)
 
