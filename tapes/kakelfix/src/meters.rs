@@ -95,6 +95,21 @@ impl Bank {
         Some(bank)
     }
 
+    /// For another rate or channel count (capture restarted with a new layout): every meter starts afresh.
+    pub fn configure(&mut self, rate: u32, channels: usize) {
+        self.inputs = channels.min(MAX_INPUTS);
+        for channel in self.channels.iter_mut().take(self.inputs) {
+            *channel = Channel::new(rate);
+        }
+        for pair in self.loudness.iter_mut().take(self.inputs.div_ceil(2)) {
+            *pair = Loudness::new(rate);
+        }
+        self.readings = [[SILENT; 2]; MAX_INPUTS];
+        self.highest = [[-144.0; 2]; MAX_INPUTS];
+        self.filled = 0;
+        self.head = 0;
+    }
+
     fn reset(&mut self) {
         for channel in self.channels.iter_mut().take(self.inputs) {
             channel.reset();

@@ -36,9 +36,10 @@ under it. Mouse, touch or keyboard.
   device=N     use audio device N (`audio` lists them; loop0 for a try)
   screen=N     which screen (Pi 4: 1 is the second HDMI output)
   theme=NAME   dark, classic or light
-  rate=HZ      the capture rate: Recorder, Analyzer, Meters (default 48000)
-  ask-phantom=yes  ask before switching phantom power on (Device page's
-               last row; kakelfix.cfg keeps it)
+  rate=HZ      the capture rate: Recorder, Analyzer, Meters (default 48000;
+               the Device page's last row; kakelfix.cfg keeps it)
+  ask-phantom=yes  ask before switching phantom power on (Device page;
+               kakelfix.cfg keeps it)
 kakelfix.cfg also keeps the Analyzer's settings, saved as they change:
 an-view=waveform|spectrum|both an-wave=envelope|scope an-span=1|5|30
 an-timebase=5|10|20|50 an-scale=db|linear an-pair=N
@@ -264,24 +265,25 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let mut hardware: Shadowed = Queued::new(Hardware { mixer }, link, info.outputs as usize, (info.inputs + info.playbacks) as usize);
     let mut app = App::new(shape(&mixer), &mut hardware);
     app.ask_hazard = config.value("ask-phantom") == Some("yes");
-    let rate = tape_rt::arg_value(started.arguments, "rate").and_then(|v| v.parse().ok()).unwrap_or(0);
+    // The sample rate is the Device page's (`rate=` in kakelfix.cfg or on the command line). The channel count is what the
+    // device says before capture starts; the first start corrects it if the rate changes it (`Capture::relayout`).
+    let rate = config.value("rate").and_then(|v| v.parse().ok()).unwrap_or(0);
     let mut capture = analyze::Capture::new(api, rate);
-    app.analysis.channels = capture.channels().max(1);
+    app.rate = capture.rate();
+    if let Some(input) = capture.input() {
+        app.rate_count = input.rate_count.min(app.rates.len());
+        app.rates[..app.rate_count].copy_from_slice(&input.rates[..app.rate_count]);
+        app.set_capture(input.channels, capture.rate(), input.slot, input.bits, input.float);
+    }
     app.analysis.load(|key| config.value(key));
     app.analysis.pair = app.analysis.pair.min(app.analysis.pairs() - 1);
-    app.metering.channels = capture.channels().max(1);
     app.metering.load(|key| config.value(key));
     let r = &mut app.recording;
-    r.channels = capture.channels().max(1);
-    r.rate = capture.rate();
-    if let Some(input) = capture.input() {
-        (r.slot, r.bits, r.float) = (input.slot, input.bits, input.float);
-    }
     r.base = kakelfix::Text::from("take");
     r.disk_count = record::find_disks(api, &mut r.disks);
     let wanted_disk = r.load(|key| config.value(key));
     r.choose_disk(wanted_disk);
-    let persisted = |app: &App| (app.analysis.persisted(), app.metering.persisted(), app.recording.persisted());
+    let persisted = |app: &App| (app.analysis.persisted(), app.metering.persisted(), app.recording.persisted(), app.rate);
     let mut saved = persisted(&app);
     // When the Analyzer's or the Meters page's settings last changed; they are written a second later, so a run of key repeats is one write.
     let mut changed_at = None;
@@ -325,6 +327,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             saved = persisted(&app);
             let mut body = tape_rt::config::Settings::<512>::new();
             body.put("ask-phantom", format_args!("{}", if app.ask_hazard { "yes" } else { "no" }));
+            body.put("rate", format_args!("{}", app.rate));
             app.analysis.save(|key, value| body.put(key, value));
             app.metering.save(|key, value| body.put(key, value));
             app.recording.save(|key, value| body.put(key, value));
@@ -360,6 +363,11 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             if app.tick(&mut hardware) {
                 screen.mark_dirty();
             }
+        }
+        if app.rate != capture.rate() {
+            let rate = app.rate;
+            capture.set_rate(api, &mut app, rate);
+            screen.mark_dirty();
         }
         let fresh = capture.update(api, &mut app, &layout);
         if has_meters || fresh || capture.taking() {

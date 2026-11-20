@@ -13,6 +13,8 @@ use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 
 pub struct Ring {
     buffer: AtomicPtr<u8>,
+    /// The memory given (`attach`), and the part of it in use: a whole number of frames.
+    length: AtomicUsize,
     capacity: AtomicUsize,
     /// Bytes ever pushed and ever taken: their difference is what waits, `% capacity` where.
     pushed: AtomicU64,
@@ -21,17 +23,32 @@ pub struct Ring {
 
 impl Ring {
     pub const fn new() -> Ring {
-        Ring { buffer: AtomicPtr::new(core::ptr::null_mut()), capacity: AtomicUsize::new(0), pushed: AtomicU64::new(0), taken: AtomicU64::new(0) }
+        Ring {
+            buffer: AtomicPtr::new(core::ptr::null_mut()),
+            length: AtomicUsize::new(0),
+            capacity: AtomicUsize::new(0),
+            pushed: AtomicU64::new(0),
+            taken: AtomicU64::new(0),
+        }
     }
 
     /// Gives the ring its memory: the largest whole number of `frame`-byte frames that fits `memory`. Call it before the
     /// worker starts (or while no take runs and the ring is empty).
     pub fn attach(&self, memory: &'static mut [u8], frame: usize) {
-        let capacity = memory.len() / frame.max(1) * frame.max(1);
         self.buffer.store(memory.as_mut_ptr(), Ordering::Relaxed);
+        self.length.store(memory.len(), Ordering::Relaxed);
+        self.reframe(frame);
+    }
+
+    /// Another frame size for the same memory (the device's channels change with its rate). Empties the ring; only while
+    /// no take runs, so nothing is pushed or taken meanwhile.
+    pub fn reframe(&self, frame: usize) {
+        let capacity = self.length.load(Ordering::Relaxed) / frame.max(1) * frame.max(1);
         self.capacity.store(capacity, Ordering::Relaxed);
-        let taken = self.taken.load(Ordering::Relaxed);
-        self.pushed.store(taken, Ordering::Release);
+        // From zero, not from where the counters were: the old count is whole frames of the old size, and taken modulo
+        // the new capacity would start the ring mid-frame.
+        self.taken.store(0, Ordering::Relaxed);
+        self.pushed.store(0, Ordering::Release);
     }
 
     pub fn capacity(&self) -> usize {
@@ -40,7 +57,8 @@ impl Ring {
 
     /// Bytes waiting for the worker.
     pub fn waiting(&self) -> usize {
-        (self.pushed.load(Ordering::Acquire) - self.taken.load(Ordering::Acquire)) as usize
+        // Saturating: a reader that overlaps `reframe` may see one counter zeroed and not the other.
+        self.pushed.load(Ordering::Acquire).saturating_sub(self.taken.load(Ordering::Acquire)) as usize
     }
 
     /// Room for a push of this size (drawing thread).
@@ -75,7 +93,7 @@ impl Ring {
             return &[];
         }
         let taken = self.taken.load(Ordering::Relaxed);
-        let waiting = (self.pushed.load(Ordering::Acquire) - taken) as usize;
+        let waiting = self.pushed.load(Ordering::Acquire).saturating_sub(taken) as usize;
         let at = (taken % capacity as u64) as usize;
         let length = waiting.min(capacity - at);
         // SAFETY: these bytes were published by the drawing thread's Release store of `pushed`, and it does not touch them
@@ -187,6 +205,15 @@ mod tests {
         assert!(r.push(&[4; 96]));
         r.clear();
         assert_eq!(r.waiting(), 0);
+        // The device's frame shrinks (fewer channels at a higher rate): 100 bytes of 8-byte frames.
+        r.push(&[5; 24]);
+        r.reframe(8);
+        assert_eq!((r.capacity(), r.waiting()), (96, 0), "reframing empties the ring");
+        r.reframe(36);
+        assert_eq!(r.capacity(), 72);
+        assert!(r.push(&[6; 72]));
+        assert_eq!(r.waiting(), 72);
+        assert_eq!(r.peek().len() % 36, 0, "pieces are whole frames of the new size");
     }
 
     #[test]

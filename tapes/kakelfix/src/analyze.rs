@@ -52,6 +52,8 @@ pub struct Capture {
     input: Result<Input, &'static str>,
     buffers: Option<Buffers>,
     rate: u32,
+    /// The rate the meter bank was set up for.
+    bank_rate: u32,
     running: bool,
     failed: bool,
     seen: u32,
@@ -61,7 +63,8 @@ pub struct Capture {
 }
 
 impl Capture {
-    /// `rate` is the `rate=` argument (0: 48 kHz when the device offers it, else its first rate).
+    /// `rate` is the Device page's choice (`rate` in kakelfix.cfg or on the command line); 0, or a rate the device does not
+    /// list, is 48 kHz when the device offers it, else its first rate.
     pub fn new(api: &'static TapeApi, rate: u32) -> Capture {
         let input = Input::query(api, 1);
         let buffers = input.as_ref().ok().and_then(|input| {
@@ -76,9 +79,15 @@ impl Capture {
             })
         });
         let rate = match &input {
-            Ok(input) if rate == 0 => {
+            Ok(input) => {
                 let rates = &input.rates[..input.rate_count];
-                if rates.contains(&48_000) || rates.is_empty() { 48_000 } else { rates[0] }
+                if rates.contains(&rate) || (rates.is_empty() && rate != 0) {
+                    rate
+                } else if rates.contains(&48_000) || rates.is_empty() {
+                    48_000
+                } else {
+                    rates[0]
+                }
             }
             _ => rate,
         };
@@ -94,12 +103,48 @@ impl Capture {
             let spare = ((api.free_pages)() * 4096).saturating_sub(MEMORY_RESERVE);
             (api.audio_set_capture_ring)(spare.min(RING_BYTES) as u64);
         }
-        Capture { input, buffers, rate, running: false, failed: false, seen: 0, columns: 0, bank, feed }
+        Capture { input, buffers, rate, bank_rate: rate, running: false, failed: false, seen: 0, columns: 0, bank, feed }
     }
 
     /// The capture rate (what a take is recorded at).
     pub fn rate(&self) -> u32 {
         self.rate
+    }
+
+    /// The Device page chose another rate: capture stops, and starts at the new rate when a page wants it again. Never
+    /// during a take (the page refuses the change then).
+    pub fn set_rate(&mut self, api: &TapeApi, app: &mut App, rate: u32) {
+        if self.taking() || rate == self.rate {
+            return;
+        }
+        self.stop(api, app);
+        self.rate = rate;
+        self.failed = false;
+        app.recording.rate = rate;
+    }
+
+    /// Right after a start: asks the device what a frame is now (its channel count can depend on the rate, and before the
+    /// start it answered for the rate it was at) and fits the meters, the recorder's ring and the pages to it.
+    fn relayout(&mut self, api: &TapeApi, app: &mut App) {
+        let Ok(old) = &self.input else { return };
+        let Ok(mut now) = Input::query(api, 1) else { return };
+        let changed = (now.channels, now.slot, now.bits, now.float) != (old.channels, old.slot, old.bits, old.float);
+        if changed {
+            now.channel = old.channel.min(now.channels - 1);
+            now.second = old.second.min(now.channels - 1);
+            self.input = Ok(now);
+        }
+        let Ok(input) = &self.input else { return };
+        if changed || self.bank_rate != self.rate {
+            if let Some(bank) = &mut self.bank {
+                bank.configure(self.rate, input.channels);
+            }
+            self.bank_rate = self.rate;
+        }
+        if let Some(feed) = &self.feed {
+            feed.reframe(input.frame_bytes());
+        }
+        app.set_capture(input.channels, self.rate, input.slot, input.bits, input.float);
     }
 
     pub fn input(&self) -> Option<&Input> {
@@ -114,10 +159,6 @@ impl Capture {
     /// Whether a take is encoded and written on a thread of its own (the server kernel) rather than inline.
     pub fn threaded(&self) -> bool {
         self.feed.as_ref().is_some_and(Feed::threaded)
-    }
-
-    pub fn channels(&self) -> usize {
-        self.input.as_ref().map_or(0, |input| input.channels)
     }
 
     /// Why the page cannot show anything, if it cannot.
@@ -145,7 +186,7 @@ impl Capture {
             self.failed = false;
             return false;
         }
-        let (Ok(input), Some(b)) = (&self.input, &mut self.buffers) else {
+        let (Ok(input), Some(_)) = (&self.input, &self.buffers) else {
             app.recording.request = None;
             return false;
         };
@@ -155,6 +196,7 @@ impl Capture {
                     self.running = true;
                     app.analysis.rate = self.rate;
                     self.seen = app.analysis.generation.wrapping_sub(1);
+                    self.relayout(api, app);
                 }
                 Err(code) => {
                     self.failed = true;
@@ -169,6 +211,7 @@ impl Capture {
             app.recording.request = None;
             return false;
         }
+        let (Ok(input), Some(b)) = (&self.input, &mut self.buffers) else { return false };
         if let Some(feed) = &mut self.feed {
             feed.request(api, app, self.rate);
         }

@@ -370,10 +370,6 @@ fn describe(hardware: &Hardware, index: usize, control: &MixerControl, value: i6
 
 fn device(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware) {
     let t = theme();
-    if app.controls.is_empty() {
-        centered(canvas, layout, layout.body, "This device has no settings here", t.dim);
-        return;
-    }
     for (index, control) in app.controls.iter().enumerate() {
         let Some(area) = layout.control(index, app) else { continue };
         let selected = index == app.ctl_sel;
@@ -391,15 +387,20 @@ fn device(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware) 
         let width = value.as_str().chars().count() as i32 * layout.col;
         text(canvas, layout, area.x + area.w - width - layout.col, y, value.as_str(), t.text);
     }
-    // The app's own switch, after the device's controls.
-    let index = app.ask_row();
-    if let Some(area) = layout.control(index, app) {
+    // The app's own settings, after the device's controls.
+    let mut rate = Text::<16>::new();
+    let _ = write!(rate, "{} Hz", app.rate);
+    let own = [
+        (app.ask_row(), "Ask before +48V", if app.ask_hazard { "Yes" } else { "No" }),
+        (app.rate_row(), "Sample rate", rate.as_str()),
+    ];
+    for (index, name, value) in own {
+        let Some(area) = layout.control(index, app) else { continue };
         let selected = index == app.ctl_sel;
         box_(canvas, area, if selected { t.grid_major } else { t.grid }, if selected { t.text } else { t.frame });
         let y = area.y + (area.h - layout.row) / 2;
-        let x = text(canvas, layout, area.x + layout.col, y, "Ask before +48V", t.text);
+        let x = text(canvas, layout, area.x + layout.col, y, name, t.text);
         text(canvas, layout, x + layout.col, y, "(KakelFix, saved in kakelfix.cfg)", t.dim);
-        let value = if app.ask_hazard { "Yes" } else { "No" };
         let width = value.len() as i32 * layout.col;
         text(canvas, layout, area.x + area.w - width - layout.col, y, value, t.text);
     }

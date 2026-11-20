@@ -160,12 +160,12 @@ fn hazardous_controls_ask_first() {
     assert_eq!((device.controls[1], app.confirm), (1, None), "Phantom switches at once while asking is off");
     app.act(&mut device, Action::Enter);
     assert_eq!(device.controls[1], 0);
-    for _ in 0..3 {
+    for _ in 0..2 {
         app.act(&mut device, Action::Down);
     }
     assert_eq!(app.ctl_sel, app.ask_row());
     app.act(&mut device, Action::Enter);
-    assert!(app.ask_hazard && app.ask_changed, "the last row switches asking on");
+    assert!(app.ask_hazard && app.ask_changed, "the row after the device's controls switches asking on");
     for _ in 0..2 {
         app.act(&mut device, Action::Up);
     }
@@ -849,6 +849,63 @@ fn recorder_takes_lock_the_arming_and_the_disk() {
     app.act(&mut device, Action::Page(Page::Analyzer));
     app.act(&mut device, Action::Record);
     assert_eq!(app.recording.request, Some(recorder::Request::Stop));
+}
+
+#[test]
+fn the_sample_rate_is_a_device_setting_and_stays_put_during_a_take() {
+    let mut device = Fake::new();
+    let mut app = recorder_app(&mut device);
+    app.rates[..4].copy_from_slice(&[44_100, 48_000, 96_000, 192_000]);
+    (app.rate_count, app.rate) = (4, 48_000);
+    // The Recorder page's keys never touch it.
+    for action in [Action::Left, Action::Right, Action::Enter, Action::Resolution, Action::NextDisk] {
+        app.act(&mut device, action);
+    }
+    assert_eq!(app.rate, 48_000);
+    app.act(&mut device, Action::View(View::Device));
+    for _ in 0..app.device_rows() {
+        app.act(&mut device, Action::Down);
+    }
+    assert_eq!(app.ctl_sel, app.rate_row(), "the last row");
+    app.act(&mut device, Action::Right);
+    assert_eq!((app.rate, app.message.as_str()), (96_000, "capture at 96000 Hz from now on"));
+    app.act(&mut device, Action::Left);
+    app.act(&mut device, Action::Left);
+    assert_eq!(app.rate, 44_100);
+    app.act(&mut device, Action::Left);
+    assert_eq!(app.rate, 192_000, "it wraps");
+    app.recording.take.running = true;
+    app.act(&mut device, Action::Enter);
+    assert_eq!((app.rate, app.message.as_str()), (192_000, "stop the take to change the sample rate"));
+    app.recording.take.running = false;
+    app.recording.request = Some(recorder::Request::Start);
+    app.act(&mut device, Action::Enter);
+    assert_eq!(app.rate, 192_000, "nor while a take is asked for");
+}
+
+#[test]
+fn fewer_channels_at_a_higher_rate_keep_the_arming_for_later() {
+    let mut device = Fake::new();
+    let mut app = recorder_app(&mut device);
+    app.set_capture(30, 48_000, 4, 24, true);
+    app.recording.armed = 0b11 << 20 | 1;
+    app.recording.input = 25;
+    app.metering.input = 29;
+    app.analysis.pair = 14;
+    // The UFX at 192 kHz: 18 channels.
+    app.set_capture(18, 192_000, 4, 24, true);
+    let r = &app.recording;
+    assert_eq!((r.channels, r.rate, r.armed_count(), r.input), (18, 192_000, 1, 17));
+    assert_eq!(r.groups(), ([1, 0, 0, 0], 1), "only input 1 is recorded");
+    assert!(app.metering.input < 18 && app.analysis.pair == 8);
+    // Only inputs past 18 armed: everything is armed rather than nothing.
+    app.recording.armed = 0b11 << 20;
+    app.set_capture(18, 192_000, 4, 24, true);
+    assert_eq!(app.recording.armed_count(), 18);
+    // Back at 48 kHz the earlier arming is there again.
+    app.recording.armed = 0b11 << 20 | 1;
+    app.set_capture(30, 48_000, 4, 24, true);
+    assert_eq!(app.recording.armed_count(), 3);
 }
 
 #[test]

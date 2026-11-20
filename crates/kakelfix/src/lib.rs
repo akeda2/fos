@@ -325,6 +325,11 @@ pub struct App {
     pub ask_hazard: bool,
     /// Set when `ask_hazard` was toggled, for the tape to save; it clears it.
     pub ask_changed: bool,
+    /// The capture rates the device offers (none known: only `rate`), and the one chosen on the Device page (`rate` in
+    /// kakelfix.cfg). The tape restarts capture when it changes; it never changes during a take.
+    pub rates: [u32; 16],
+    pub rate_count: usize,
+    pub rate: u32,
     pub controls: List<MixerControl, { queue::MAX_CONTROLS }>,
     pub analysis: Analysis,
     pub metering: Metering,
@@ -360,6 +365,9 @@ impl App {
             confirm: None,
             ask_hazard: false,
             ask_changed: false,
+            rates: [0; 16],
+            rate_count: 0,
+            rate: 48_000,
             controls: List::new(),
             analysis: Analysis::new(),
             metering: Metering::new(),
@@ -1095,14 +1103,51 @@ impl App {
         self.view = View::Outputs;
     }
 
-    /// Rows of the Device page: the device's controls, then the app's own "Ask before +48V" switch.
+    /// Rows of the Device page: the device's controls, then the app's own "Ask before +48V" switch and sample rate.
     pub fn device_rows(&self) -> usize {
-        self.controls.len() + 1
+        self.controls.len() + 2
     }
 
     /// The Device page row of the "Ask before +48V" switch.
     pub fn ask_row(&self) -> usize {
         self.controls.len()
+    }
+
+    /// The Device page row of the sample rate.
+    pub fn rate_row(&self) -> usize {
+        self.controls.len() + 1
+    }
+
+    /// What capture gives now (after every start: a device's channel count can change with its rate, the UFX's 30 at
+    /// 48 kHz are 18 at 192 kHz), for every page that reads it. Arming and the inputs shown are kept as far as they go,
+    /// so going back to the lower rate brings them back.
+    pub fn set_capture(&mut self, channels: usize, rate: u32, slot: usize, bits: usize, float: bool) {
+        let channels = channels.max(1);
+        self.analysis.channels = channels;
+        self.analysis.pair = self.analysis.pair.min(self.analysis.pairs() - 1);
+        self.metering.channels = channels;
+        self.metering.fix();
+        let r = &mut self.recording;
+        (r.channels, r.rate, r.slot, r.bits, r.float) = (channels, rate, slot, bits, float);
+        if r.armed & r.all() == 0 {
+            r.armed |= r.all();
+        }
+        r.input = r.input.min(channels - 1);
+    }
+
+    /// The next (or previous) rate the device offers; refused during a take, whose files have one rate.
+    pub fn step_rate(&mut self, delta: i64) {
+        if self.recording.take.running || self.recording.request.is_some() {
+            return self.note(format_args!("stop the take to change the sample rate"));
+        }
+        let rates = &self.rates[..self.rate_count];
+        if rates.len() < 2 {
+            return self.note(format_args!("the device offers no other rate"));
+        }
+        let at = rates.iter().position(|&r| r == self.rate).unwrap_or(0) as i64;
+        self.rate = rates[(at + delta.signum()).rem_euclid(rates.len() as i64) as usize];
+        let rate = self.rate;
+        self.note(format_args!("capture at {rate} Hz from now on"));
     }
 
     fn act_device(&mut self, device: &mut impl Device, action: Action) {
@@ -1130,6 +1175,9 @@ impl App {
             self.ask_hazard = !self.ask_hazard;
             self.ask_changed = true;
             return;
+        }
+        if index == self.rate_row() {
+            return self.step_rate(delta);
         }
         let Some(&control) = self.controls.get(index) else { return };
         let name = field(&control.name);

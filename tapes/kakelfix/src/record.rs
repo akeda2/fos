@@ -225,9 +225,11 @@ impl Worker {
         busy
     }
 
-    /// Writes what waits in the ring, at most a capture block at a time (the sample buffers hold `CHUNK` frames).
+    /// Writes what waits in the ring, at most a capture block at a time (the sample buffers hold `CHUNK` frames, `select`
+    /// a block of the frame size the buffers were made for, which a later layout may exceed).
     fn drain(&mut self, api: &TapeApi) -> bool {
-        let most = CHUNK * self.writer.input.frame_bytes().max(1);
+        let frame = self.writer.input.frame_bytes().max(1);
+        let most = (CHUNK * frame).min(self.writer.select.len() / frame * frame).max(frame);
         let mut any = false;
         loop {
             let piece = RING.peek();
@@ -283,6 +285,13 @@ impl Feed {
         unsafe { *(&raw mut WORKER) = Some(Worker { writer, report: Report::default(), seen: 0, quit: false }) };
         let thread = if tape_rt::threads_supported() { tape_rt::spawn_thread(worker_thread, api as *const TapeApi as usize, WORKER_STACK).ok() } else { None };
         Some(Feed { thread, feeding: false, started: 0, said: 0, running: false })
+    }
+
+    /// Capture's frame changed size (another rate): the ring is cut to whole frames of it. Only between takes.
+    pub fn reframe(&self, frame: usize) {
+        if !self.taking() {
+            RING.reframe(frame);
+        }
     }
 
     /// Whether encoding runs on a thread of its own (the server kernel) or inline (the embedded kernels).
@@ -482,6 +491,8 @@ impl Writer {
             return report.say(format_args!("{reason}"));
         }
         self.mask = r.armed & r.all();
+        // The frame as capture gives it now (the page has it from the last start: channels change with the rate).
+        (self.input.channels, self.input.slot, self.input.bits, self.input.float) = (r.channels, r.slot, r.bits, r.float);
         let i = &self.input;
         self.format = Format { channels: self.mask.count_ones() as u16, rate: job.rate, slot: i.slot as u16, bits: i.bits as u16, float: i.float };
         self.peak_backlog = 0;

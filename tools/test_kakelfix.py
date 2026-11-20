@@ -15,10 +15,12 @@ Embedded kernel (writes made inline):
    bits and seconds of samples; the reference `flac` (when the host has it) tests it, MD5 included, and its decode holds
    the tone. (Not the take's wall-clock length: with a listener loop0 has no clock and `play` runs as fast as the capture
    drains, crates/kernel-core/src/loopback.rs.)
+ - the Mixer's Device view, last row (the sample rate): Enter changes nothing, loop0 has 48 kHz only
  - Up (the 30 s span) right before Quit: the Analyzer's settings are in kakelfix.cfg afterwards (saved on quit), the
-   Recorder's too
- - kakelfix again with `rec-format=wav rec-ch=2 rec-disk=disk1` on the command line: a take of input 2 alone on the FOSFS
-   boot volume, disk1/take001.wav, one channel of loop0's 32-bit float at 48 kHz, holding the tone
+   Recorder's and the sample rate (rate=48000) too
+ - kakelfix again with `rec-format=wav rec-ch=2 rec-disk=disk1 rate=44100` on the command line: a take of input 2 alone
+   on the FOSFS boot volume, disk1/take001.wav, one channel of loop0's 32-bit float at 48 kHz (44.1 kHz is not a rate
+   loop0 lists, so capture falls back), holding the tone
 Server kernel (writes go to the worker thread): `x`, then at once a lone Escape, which asks the tape to stop (`read_key`
 answers KEY_ABORT, `shell::request_stop`) rather than killing it, so it ends through the writer's join with `x` written; then `show`, at -smp 4.
 Then, on an image of its own: a Recorder take (`2`, `R`) on the Recorder's worker thread, ended by Escape while it still
@@ -266,6 +268,13 @@ def embedded():
             lit = toggle_take(machine, False)
             took = time.monotonic() - began
             check(lit < 20, f"R stops the take: the lamp is out ({lit} pixels)")
+            # The Device view's last row is the sample rate; loop0 offers 48 kHz only, so Enter there changes nothing.
+            send(machine, b"1", 0.5)
+            send(machine, b"\t", 0.3)
+            send(machine, b"\t", 0.3)
+            for _ in range(12):
+                send(machine, b"\x1b[B", 0.1)
+            send(machine, b"\r", 0.5)
             send(machine, b"3", 1)
             # The longest span (Up clamps there, so a lost keystroke does no harm), then Quit at once: the settings wait a
             # second before they are saved, quitting writes them.
@@ -288,12 +297,14 @@ def embedded():
             check("an-span=30" in saved and "an-view=both" in saved and "mt-scale=" in saved, "the Analyzer's settings are saved in kakelfix.cfg", saved[-600:])
             check("rec-ch=all" in saved and "rec-disk=ext2" in saved and "rec-name=take" in saved, "the Recorder's settings are saved too (the ext volume by name)", saved[-600:])
             check("rec-format=flac" in saved and "rec-bits=24" in saved, "the format is saved: FLAC 24, the default", saved[-600:])
+            check("rate=48000" in saved, "the Device page's sample rate is saved, 48 kHz (loop0 has no other)", saved[-600:])
             # Again with WAV and input 2 alone from the command line: the other writer, and the armed channel picked out. The
             # tone is started again: with a listener loop0 plays faster than real time, so the first run used most of it
             # (if it still plays, the second `play` is refused and the first goes on).
             send(machine, b"run play device=loop0 tone.wav &0\n", 2)
             start = len(machine.text())
-            send(machine, b"run kakelfix device=loop0 rec-format=wav rec-ch=2 rec-disk=disk1\n", 4)
+            # rate=44100 is not a rate loop0 offers: capture falls back to 48 kHz (the WAV says so below).
+            send(machine, b"run kakelfix device=loop0 rec-format=wav rec-ch=2 rec-disk=disk1 rate=44100\n", 4)
             send(machine, b"2", 1)
             lit = toggle_take(machine, True)
             check(lit >= 20, f"a WAV take starts ({lit} pixels)")
@@ -322,7 +333,7 @@ def embedded():
         files = fosfs_files(machine.image)
         check("take001.wav" in files, "the WAV take is disk1/take001.wav, on the FOSFS boot volume", str(sorted(files)))
         channels, rate, align, size, sound = take_wav(files["take001.wav"])
-        check((channels, rate, align) == (1, 48000, 4), f"take001.wav is input 2 alone, 32-bit float, 48 kHz ({channels}, {rate}, {align})")
+        check((channels, rate, align) == (1, 48000, 4), f"take001.wav is input 2 alone, 32-bit float, 48 kHz though rate=44100 was asked ({channels}, {rate}, {align})")
         check(size % align == 0 and size > 48000 * 4, f"take001.wav holds whole frames ({size / 192000:.1f} s)")
         check(sound, "take001.wav holds the tone (not all zero)")
 
