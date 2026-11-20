@@ -567,6 +567,7 @@ pub fn disk_info(number: usize, out: &mut DiskInfo) -> u32 {
 
 /// Forgets every stream (done when a tape starts; a file left open keeps what was written and its reservation).
 pub fn stream_reset() {
+    crate::tape_vfs::reset_placements();
     unsafe { *core::ptr::addr_of_mut!(STREAMS) = [const { None }; FS_STREAMS + 1] };
 }
 

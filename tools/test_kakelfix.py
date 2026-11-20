@@ -8,16 +8,17 @@ Embedded kernel (writes made inline):
  - `3` opens the Analyzer, which captures from loop0 while a `play` service plays a 1 kHz tone into it: the left
    channel's envelope (the first curve colour) grows in from the right edge of the upper lane; Quit there ends the tape
  - `4` opens the Meters page on the same capture: input 1's bar (x 81..105, Nordic PPM) lights for the tone; `3` goes back
- - `2` opens the Recorder; `R` starts a take of loop0's two inputs to the boot disk (the only disk) as FLAC 24, the
-   default: disk1/take001.flac. On the Analyzer page (`3`) the header's REC lamp stays lit, the take goes on; `2` and `R`
-   stop it. The file in the image afterwards: STREAMINFO says 2 channels, 48 kHz, 24 bits and seconds of samples; the
-   reference `flac` (when the host has it) tests it, MD5 included, and its decode holds the tone. (Not the take's
-   wall-clock length: with a listener loop0 has no clock and `play` runs as fast as the capture drains,
-   crates/kernel-core/src/loopback.rs.)
+ - A second disk holds an ext4 volume made by the host's mkfs.ext4 (journal, metadata_csum), which the Recorder prefers to
+   the FOSFS boot disk. `2` opens the Recorder; `R` starts a take of loop0's two inputs as FLAC 24, the default:
+   ext2/take001.flac. On the Analyzer page (`3`) the header's REC lamp stays lit, the take goes on; `2` and `R` stop it.
+   Afterwards e2fsck -fn passes the volume, and the file (out through debugfs): STREAMINFO says 2 channels, 48 kHz, 24
+   bits and seconds of samples; the reference `flac` (when the host has it) tests it, MD5 included, and its decode holds
+   the tone. (Not the take's wall-clock length: with a listener loop0 has no clock and `play` runs as fast as the capture
+   drains, crates/kernel-core/src/loopback.rs.)
  - Up (the 30 s span) right before Quit: the Analyzer's settings are in kakelfix.cfg afterwards (saved on quit), the
    Recorder's too
- - kakelfix again with `rec-format=wav rec-ch=2` on the command line: a take of input 2 alone is disk1/take002.wav (the
-   number is not reused across formats), one channel of loop0's 32-bit float at 48 kHz, holding the tone
+ - kakelfix again with `rec-format=wav rec-ch=2 rec-disk=disk1` on the command line: a take of input 2 alone on the FOSFS
+   boot volume, disk1/take001.wav, one channel of loop0's 32-bit float at 48 kHz, holding the tone
 Server kernel (writes go to the worker thread): `x`, then at once a lone Escape, which asks the tape to stop (`read_key`
 answers KEY_ABORT, `shell::request_stop`) rather than killing it, so it ends through the writer's join with `x` written; then `show`, at -smp 4.
 QEMU's screen is 1280x800, so kakelfix's layout is at scale 1 (crates/kakelfix/src/layout.rs): soft-key slot 10 (Quit, on
@@ -142,6 +143,10 @@ def take_wav(blob):
     check(False, "the WAV has fmt and data chunks", blob[:96].hex())
 
 
+def tool(name):
+    return shutil.which(name) or f"/usr/sbin/{name}"
+
+
 def take_flac(blob, folder, name):
     """(channels, rate, bits, total samples) from a FLAC's STREAMINFO; with the reference `flac` on the host, also its
     integrity test (frame CRCs and the MD5 of the samples) and whether the decoded samples hold anything but zeros."""
@@ -170,6 +175,11 @@ def embedded():
         write_wav(tone, 48000, 2, 2, 1000, 60)
         machine = Machine(tmp, {}, {"kakelfix": TAPE, "play": PLAY, "tone.wav": tone})
         machine.monitor = Path(tmp) / "monitor"
+        # disk2: a whole-disk ext4 volume as Linux makes it (journal, metadata_csum), what rack's data volume is like.
+        ext = Path(tmp) / "ext.img"
+        ext.write_bytes(bytes(128 << 20))
+        subprocess.run([tool("mkfs.ext4"), "-q", "-F", "-L", "recs", str(ext)], check=True, capture_output=True)
+        machine.extra = ["-drive", f"format=raw,file={ext}"]
         machine.start()
         machine.wait_for("M3 complete")
         machine.connect()
@@ -262,14 +272,14 @@ def embedded():
             send(machine, b"cat kakelfix.cfg\n", 1)
             saved = machine.text()[start:]
             check("an-span=30" in saved and "an-view=both" in saved and "mt-scale=" in saved, "the Analyzer's settings are saved in kakelfix.cfg", saved[-600:])
-            check("rec-ch=all" in saved and "rec-disk=1" in saved and "rec-name=take" in saved, "the Recorder's settings are saved too", saved[-600:])
+            check("rec-ch=all" in saved and "rec-disk=ext2" in saved and "rec-name=take" in saved, "the Recorder's settings are saved too (the ext volume by name)", saved[-600:])
             check("rec-format=flac" in saved and "rec-bits=24" in saved, "the format is saved: FLAC 24, the default", saved[-600:])
             # Again with WAV and input 2 alone from the command line: the other writer, and the armed channel picked out. The
             # tone is started again: with a listener loop0 plays faster than real time, so the first run used most of it
             # (if it still plays, the second `play` is refused and the first goes on).
             send(machine, b"run play device=loop0 tone.wav &0\n", 2)
             start = len(machine.text())
-            send(machine, b"run kakelfix device=loop0 rec-format=wav rec-ch=2\n", 4)
+            send(machine, b"run kakelfix device=loop0 rec-format=wav rec-ch=2 rec-disk=disk1\n", 4)
             send(machine, b"2", 1)
             lit = toggle_take(machine, True)
             check(lit >= 20, f"a WAV take starts ({lit} pixels)")
@@ -283,16 +293,24 @@ def embedded():
             machine.wait_for("fos>", since=start + 10, timeout=10)
         finally:
             machine.stop()
-        files = fosfs_files(machine.image)
-        check("take001.flac" in files, "the first take is disk1/take001.flac", str(sorted(files)))
-        channels, rate, bits, total = take_flac(files["take001.flac"], tmp, "take001.flac")
+        fsck = subprocess.run([tool("e2fsck"), "-fn", str(ext)], capture_output=True, text=True)
+        check(fsck.returncode == 0, "e2fsck -fn passes the ext volume after the take", (fsck.stdout + fsck.stderr)[-800:])
+        listing = subprocess.run([tool("debugfs"), "-R", "ls -l /", str(ext)], capture_output=True, text=True).stdout
+        check("take001.flac" in listing, "the first take is ext2/take001.flac", listing[-600:])
+        extents = subprocess.run([tool("debugfs"), "-R", "ex /take001.flac", str(ext)], capture_output=True, text=True).stdout
+        pieces = len([line for line in extents.splitlines() if re.match(r"\s*\d+/\s*\d+", line)])
+        check(1 <= pieces <= 3, f"take001.flac is {pieces} extent(s): written in one piece", extents[-600:])
+        flac = Path(tmp) / "out-take001.flac"
+        subprocess.run([tool("debugfs"), "-R", f"dump /take001.flac {flac}", str(ext)], check=True, capture_output=True)
+        channels, rate, bits, total = take_flac(flac.read_bytes(), tmp, "take001.flac")
         check((channels, rate, bits) == (2, 48000, 24), f"take001.flac is loop0's 2 channels, 48 kHz, 24 bits ({channels}, {rate}, {bits})")
         check(total > 3 * rate, f"take001.flac holds seconds of samples ({total / rate:.1f} s in a {took:.1f} s take)")
-        check("take002.wav" in files and "take001.wav" not in files, "the WAV take is take002.wav (numbers are shared)", str(sorted(files)))
-        channels, rate, align, size, sound = take_wav(files["take002.wav"])
-        check((channels, rate, align) == (1, 48000, 4), f"take002.wav is input 2 alone, 32-bit float, 48 kHz ({channels}, {rate}, {align})")
-        check(size % align == 0 and size > 48000 * 4, f"take002.wav holds whole frames ({size / 192000:.1f} s)")
-        check(sound, "take002.wav holds the tone (not all zero)")
+        files = fosfs_files(machine.image)
+        check("take001.wav" in files, "the WAV take is disk1/take001.wav, on the FOSFS boot volume", str(sorted(files)))
+        channels, rate, align, size, sound = take_wav(files["take001.wav"])
+        check((channels, rate, align) == (1, 48000, 4), f"take001.wav is input 2 alone, 32-bit float, 48 kHz ({channels}, {rate}, {align})")
+        check(size % align == 0 and size > 48000 * 4, f"take001.wav holds whole frames ({size / 192000:.1f} s)")
+        check(sound, "take001.wav holds the tone (not all zero)")
 
 
 def server():

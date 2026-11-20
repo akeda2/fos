@@ -94,7 +94,9 @@ update the slots they overlap, so it is never stale. `kernel-core/src/ext4vol.rs
 BSS) behind `Partition`, emptied at every `locate` and `mkfs`, and between candidate partitions (slots are keyed by sector
 within the partition). Measured with `tests/perf.rs` (counts device operations; `SLOTS=n`) on a 512 MiB checksummed volume:
 `mkdir` + 2000 creates 57481 -> 153 reads, 20 lookups in a 2000-name folder 236 -> 0, 100 small appends 214 -> 3; writes are
-unchanged (the journal commits each change). Not done: multi-block write coalescing.
+unchanged (the journal commits each change). Not done: multi-block write coalescing. Appending (`append_sizes`, 64 MiB with a
+commit every 4 MiB): every call is one data write and no reads; the journal adds about 14 writes per commit whatever the
+call size (64 KiB calls: 1.22 writes a call, 128 KiB 1.44, 1 MiB 4.5), and the host CPU per call is 38, 52 and 307 us.
 
 **Hash-tree lookup** (`Fs::lookup`, `crates/ext4/src/dirhash.rs`): an indexed folder is searched through its tree (root, index
 nodes, one leaf; names whose hashes collide continue in the following leaves). Half-MD4 (what `mkfs.ext4` uses), TEA and
@@ -107,6 +109,24 @@ and a removal keeps the tree. A one-block folder that fills up becomes an index 
 only when the root or node is full, the tree is deeper than two levels, or the hash version is unknown. A multi-block linear folder stays
 linear. `format` sets dir_index (half_md4). Tests: `grown_folder_is_indexed_*`, `full_index_root_falls_back_to_linear`
 (e2fsck -fn clean). The inode bitmap's padding bits are now set when a group's bitmap is initialised.
+
+## Placement (files written side by side)
+
+`Writer::place(bytes, avoid)` and `write_placed` (`crates/ext4/src/write.rs`), tape ABI 42 `vfs_reserve` and
+`vfs_volume` (`kernel-core/src/tape_vfs.rs`). The allocator takes a file's new blocks right after its last extent, which
+keeps one growing file contiguous (extents merge up to 128 MiB). Several files growing in turn (a recorder's four FLAC
+tracks) alternate instead: each file's next run is taken by another, every write becomes an extent of its own, and a file
+reaches the four-leaf limit (1360 extents, `TooFragmented`) after about 170 MiB at 128 KiB a write. `place` picks, from the
+group descriptors' free counts only (a few reads for the whole volume), consecutive groups starting at one at least half
+free, avoiding groups other placements have, whose free blocks add up to the expected size (else the window with the most).
+`vfs_reserve(path, bytes)` keeps that goal for the file in memory (8 slots, oldest replaced, dropped when a tape starts with
+the stream handles) and `vfs_write` hands it to `write_placed`, which uses it for an allocation with none of the file's
+blocks before it; later blocks follow the file's own last extent anyway. Nothing is written or allocated ahead, so a power
+cut changes nothing. A file that outgrows its region continues into the next groups (another file's region, if there is
+one). `vfs_volume(number)` tells a tape a disk's ext volume (size, free, label, `Fs::writable`, unreplayed journal), since
+`disk_info` knows only FOSFS and FAT. Tests: `placed_files_written_in_turn_stay_contiguous` (four files, 400 writes of 128
+KiB each in turn: 400 extents each unplaced, 1 placed; e2fsck -fn), `make test-kakelfix` (a take on a mkfs.ext4 volume is
+one extent).
 
 ## TRIM / discard
 

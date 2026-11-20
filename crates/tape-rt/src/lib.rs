@@ -947,6 +947,28 @@ pub fn vfs_sync() -> Result<(), isize> {
     vfs_done((table.vfs_sync)())
 }
 
+fn volume_table() -> Option<&'static fosfor_abi::tape::TapeApi> {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, vfs_reserve) + core::mem::size_of::<usize>();
+    (table.version >= 42 && table.size as usize >= end).then_some(table)
+}
+
+/// The ext volume on disk `number` (1-based, as `disk_info` counts), if it has one (ABI 42, `vfs_volume`); its files are
+/// `extN/path`. `None` too on a kernel without the call.
+pub fn vfs_volume(number: usize) -> Option<fosfor_abi::tape::VfsVolume> {
+    let table = volume_table()?;
+    let mut out = fosfor_abi::tape::VfsVolume::default();
+    ((table.vfs_volume)(number, &mut out) == 0).then_some(out)
+}
+
+/// Places a just-created file on an ext volume that will grow to about `bytes` in a region of its own, so files written
+/// side by side stay contiguous (ABI 42, `vfs_reserve`). Only a goal: a kernel without the call gives `Ok` and the file
+/// is placed as usual.
+pub fn vfs_reserve(path: &str, bytes: u64) -> Result<(), isize> {
+    let Some(table) = volume_table() else { return Ok(()) };
+    vfs_done((table.vfs_reserve)(path.as_ptr(), path.len(), bytes))
+}
+
 fn thread_table() -> Option<&'static fosfor_abi::tape::TapeApi> {
     let table = api();
     let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, futex_wake) + core::mem::size_of::<usize>();

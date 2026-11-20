@@ -135,6 +135,8 @@ const MIXER_METERS: u64 = slot(offset_of!(TapeApi, mixer_meters));
 const MIXER_CONTROL: u64 = slot(offset_of!(TapeApi, mixer_control));
 const MIXER_CONTROL_ITEM: u64 = slot(offset_of!(TapeApi, mixer_control_item));
 const MIXER_CONTROL_SET: u64 = slot(offset_of!(TapeApi, mixer_control_set));
+const VFS_VOLUME: u64 = slot(offset_of!(TapeApi, vfs_volume));
+const VFS_RESERVE: u64 = slot(offset_of!(TapeApi, vfs_reserve));
 const FS_STREAM_OPEN: u64 = slot(offset_of!(TapeApi, fs_stream_open));
 const FS_STREAM_WRITE: u64 = slot(offset_of!(TapeApi, fs_stream_write));
 const FS_STREAM_CLOSE: u64 = slot(offset_of!(TapeApi, fs_stream_close));
@@ -336,7 +338,7 @@ static CALL_NAMES: &[(u64, &str)] = &call_names!(
     vfs_truncate, vfs_remove, vfs_rename, vfs_set_owner, remote_register, remote_unregister, remote_poll, remote_reply,
     vfs_sync, thread_spawn, thread_join, futex_wait, futex_wake, session_open, session_write, session_read,
     session_close, resolve_path, audio_state, mixer_info, mixer_name, mixer_get, mixer_set, mixer_serial, mixer_meters,
-    mixer_control, mixer_control_item, mixer_control_set
+    mixer_control, mixer_control_item, mixer_control_set, vfs_volume, vfs_reserve
 );
 
 /// The name of system call `number` (a table slot from `CALL_BASE` up, else one of the process calls).
@@ -459,6 +461,8 @@ pub fn call(frame: &mut Frame) {
         MIXER_CONTROL => tapeaudio::mixer_control(a, b) as i64 as u64,
         MIXER_CONTROL_ITEM => tapeaudio::mixer_control_item(a, b, c, d) as u64,
         MIXER_CONTROL_SET => tapeaudio::mixer_control_set(a, b) as i64 as u64,
+        VFS_VOLUME => tapefs::vfs_volume(a, b) as u64,
+        VFS_RESERVE => tapefs::vfs_reserve(a, b, c) as u64,
         FS_READ => tapefs::read(a, b, c, d) as u64,
         VFS_STAT => tapefs::vfs_stat(a, b, c) as u64,
         VFS_READ_DIR => tapefs::vfs_read_dir(a, b, c, d) as u64,

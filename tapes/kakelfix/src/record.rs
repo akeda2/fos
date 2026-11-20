@@ -16,6 +16,11 @@
 //! inputs at 48 kHz.
 //!
 //! FAT32 is not offered (its 4 GiB file limit is not worth carrying), so a file that fills is a full disk: the take ends.
+//!
+//! Volumes: FOSFS and exFAT through `fs_stream_*` (`audio_rec::stream::StreamSink`, a reserved contiguous run per file),
+//! ext4 through `vfs_*` by path (`audio_rec::vfs::VfsSink`, `ext1/take001.flac`): there a file grows as it is written, and
+//! `vfs_reserve` (ABI 42) gives each of a take's files its own region of the volume, so four files written in turn do not
+//! alternate extent by extent (which reaches the driver's extent limit after about 170 MiB each).
 
 use crate::analyze::CHUNK;
 use crate::meters::Bank;
@@ -23,7 +28,9 @@ use crate::view::{centered, text};
 use archive::FlacFile;
 use audio_rec::recorder::Recorder;
 use audio_rec::select;
+use audio_rec::recorder::Sink;
 use audio_rec::stream::StreamSink;
+use audio_rec::vfs::{Files, VfsSink};
 use audio_rec::wav::Format;
 use audio_screen::Input;
 use core::fmt::Write;
@@ -35,7 +42,7 @@ use gfx::meter::{Scale, draw_bar, draw_scale};
 use gfx::theme::theme;
 use kakelfix::recorder::{Disk, Encoding, GROUP, MAX_DISKS, MAX_GROUPS, Request, Volume, clock, describe_channels, duration, size};
 use kakelfix::{App, Layout, Rect, Text, fit_name};
-use tape_rt::{AudioBuffer, AudioStats, DISK_EXFAT, DISK_FAT32, DISK_FOSFS, DiskInfo, FS_NOT_FOUND, TapeApi, alloc_bytes, alloc_zeroed};
+use tape_rt::{AudioBuffer, AudioStats, DISK_EXFAT, DISK_FAT32, DISK_FOSFS, DiskInfo, FS_NOT_FOUND, TapeApi, VFS_FILE, VfsVolume, alloc_bytes, alloc_zeroed};
 
 /// WAV disk writes: 256 KiB blocks (a multiple of the 512-byte sector; the `recorder` tape's size, which real USB sticks
 /// and SATA disks take at full speed). FLAC files stage `archive::file::STAGE` (128 KiB) each.
@@ -45,14 +52,76 @@ const CHECKPOINT_US: u64 = 2_000_000;
 /// What a FLAC file reserves when the disk does not say how long its longest free run is.
 const FALLBACK_RESERVE: u64 = 1 << 30;
 
-/// The one stream a WAV take writes through (`fs_stream_*`). A `Recorder` borrows it for as long as the file is open, so it
-/// lives in a static, like the `recorder` tape's.
-static mut SINK: Option<StreamSink> = None;
+/// The ext volume's file calls, by path (`tape_rt::vfs_*`).
+pub struct TapeFiles;
 
-/// One FLAC file of a take: up to 8 armed inputs on their own stream handle.
+impl Files for TapeFiles {
+    fn create(&mut self, path: &str) -> Result<(), i32> {
+        tape_rt::vfs_create(path, VFS_FILE, 0o644, 0, 0).map_err(|code| code as i32)
+    }
+    fn reserve(&mut self, path: &str, bytes: u64) -> Result<(), i32> {
+        tape_rt::vfs_reserve(path, bytes).map_err(|code| code as i32)
+    }
+    fn write(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<usize, i32> {
+        tape_rt::vfs_write(path, offset, data).map_err(|code| code as i32)
+    }
+    fn truncate(&mut self, path: &str, size: u64) -> Result<(), i32> {
+        tape_rt::vfs_truncate(path, size).map_err(|code| code as i32)
+    }
+    fn sync(&mut self) -> Result<(), i32> {
+        tape_rt::vfs_sync().map_err(|code| code as i32)
+    }
+}
+
+/// Where a file of a take goes: a stream (FOSFS, exFAT) or an ext volume's file by path.
+pub enum Out {
+    Stream(StreamSink),
+    Vfs(VfsSink<TapeFiles>),
+}
+
+impl Out {
+    fn vfs() -> Out {
+        Out::Vfs(VfsSink::new(TapeFiles, tape_rt::micros, archive::file::STAGE / 2))
+    }
+
+    /// The big writes so far: bytes, time spent, the slowest one (µs).
+    fn speed(&self) -> (u64, u64, u64) {
+        match self {
+            Out::Stream(sink) => (sink.bytes, sink.write_us, sink.write_max_us),
+            Out::Vfs(sink) => (sink.bytes, sink.write_us, sink.write_max_us),
+        }
+    }
+}
+
+impl Sink for Out {
+    fn open(&mut self, name: &[u8], reserve: u64) -> Result<u64, i32> {
+        match self {
+            Out::Stream(sink) => sink.open(name, reserve),
+            Out::Vfs(sink) => sink.open(name, reserve),
+        }
+    }
+    fn write(&mut self, offset: u64, data: &[u8], length: u64) -> Result<(), i32> {
+        match self {
+            Out::Stream(sink) => sink.write(offset, data, length),
+            Out::Vfs(sink) => sink.write(offset, data, length),
+        }
+    }
+    fn close(&mut self, length: u64) -> Result<(), i32> {
+        match self {
+            Out::Stream(sink) => sink.close(length),
+            Out::Vfs(sink) => sink.close(length),
+        }
+    }
+}
+
+/// The sink a WAV take writes through. A `Recorder` borrows it for as long as the file is open, so it lives in a static,
+/// like the `recorder` tape's; it is set for the take's volume before the file opens.
+static mut SINK: Option<Out> = None;
+
+/// One FLAC file of a take: up to 8 armed inputs on their own stream handle (or ext file).
 struct Group {
     file: &'static mut FlacFile,
-    sink: StreamSink,
+    sink: Out,
     mask: u32,
     quantizers: [Quantizer; GROUP],
 }
@@ -62,7 +131,7 @@ pub struct Writer {
     staging: usize,
     /// The armed channels of one captured block, picked out of the device's frames (WAV).
     select: &'static mut [u8],
-    wav: Option<Recorder<'static, StreamSink>>,
+    wav: Option<Recorder<'static, Out>>,
     groups: [Group; MAX_GROUPS],
     /// FLAC files open (0 for a WAV take).
     open_groups: usize,
@@ -93,12 +162,11 @@ impl Writer {
         if staging == 0 {
             return None;
         }
-        unsafe { SINK = Some(StreamSink::new(api.fs_stream_open, api.fs_stream_write, api.fs_stream_close, tape_rt::micros, STAGING / 2)) };
         // Every field of a `FlacFile` is a plain number, so zeroed memory is one (`begin` sets it up).
         let group = || -> Option<Group> {
             Some(Group {
                 file: alloc_zeroed(api)?,
-                sink: StreamSink::with_handle(api.fs_stream_open2, api.fs_stream_write2, api.fs_stream_close2, tape_rt::micros, archive::file::STAGE / 2),
+                sink: Out::vfs(),
                 mask: 0,
                 quantizers: [const { Quantizer::new(24, 1) }; GROUP],
             })
@@ -186,12 +254,12 @@ impl Writer {
         say(&mut app.message, format_args!("recording {}", app.recording.take.file.as_str()));
     }
 
-    /// The next take number whose files (one per group) are all free on the target disk; the disk prefix (`disk3/`).
+    /// The next take number whose files (one per group) are all free on the target volume; its prefix (`disk3/`, `ext1/`).
     fn number(&mut self, api: &TapeApi, app: &mut App) -> Option<(u32, Text<16>)> {
         let r = &app.recording;
         let disk = r.target()?;
-        let mut prefix = Text::<16>::new();
-        let _ = write!(prefix, "disk{}/", disk.number);
+        let prefix = disk.prefix();
+        let ext = disk.volume == Volume::Ext;
         let mut numbered = Text::<40>::new();
         let _ = write!(numbered, "{}{}", prefix.as_str(), r.base.as_str());
         if numbered != self.numbered {
@@ -199,7 +267,10 @@ impl Writer {
             self.next_number = 1;
         }
         let (groups, count) = r.groups();
-        let missing = |name: &str| (api.fs_read)(name.as_ptr(), name.len(), core::ptr::null_mut(), 0) == FS_NOT_FOUND;
+        // `fs_read` knows FOSFS and FAT; an ext volume's files are asked for with `vfs_stat`.
+        let missing = |name: &str| {
+            if ext { tape_rt::vfs_stat(name).err() == Some(FS_NOT_FOUND) } else { (api.fs_read)(name.as_ptr(), name.len(), core::ptr::null_mut(), 0) == FS_NOT_FOUND }
+        };
         // Every file this take makes, and a single-file take of either format, so a number is never used twice.
         let free = |number: u32| {
             let mut plain = Text::<48>::new();
@@ -223,7 +294,9 @@ impl Writer {
         let Some((number, prefix)) = self.number(api, app) else { return false };
         let r = &app.recording;
         let name = r.file_name(prefix.as_str(), number, self.mask, 1);
-        let Some(sink) = (unsafe { (*(&raw mut SINK)).as_mut() }) else { return false };
+        let ext = r.target().is_some_and(|d| d.volume == Volume::Ext);
+        // No `Recorder` holds the static now: the last take's was finished (consumed) before this one.
+        let sink = unsafe { (*(&raw mut SINK)).insert(if ext { Out::vfs() } else { Out::Stream(StreamSink::new(api.fs_stream_open, api.fs_stream_write, api.fs_stream_close, tape_rt::micros, STAGING / 2)) }) };
         // Only one `Recorder` holds the staging block at a time: the last one was finished (consumed) before this.
         let staging = unsafe { core::slice::from_raw_parts_mut(self.staging as *mut u8, STAGING) };
         match Recorder::begin(sink, staging, self.format, name.as_str().as_bytes(), 0) {
@@ -248,6 +321,7 @@ impl Writer {
         let r = &app.recording;
         let (groups, count) = r.groups();
         let largest = r.target().map_or(u64::MAX, |d| d.largest);
+        let ext = r.target().is_some_and(|d| d.volume == Volume::Ext);
         let armed = self.mask.count_ones().max(1) as u64;
         self.bits = bits;
         let mut first = Text::<48>::new();
@@ -259,6 +333,7 @@ impl Writer {
             describe_channels(mask, 32, &mut inputs);
             let tags = [("ENCODER", "Fosfor OS kakelfix"), ("INPUTS", inputs.as_str())];
             let group = &mut self.groups[g];
+            group.sink = if ext { Out::vfs() } else { Out::Stream(StreamSink::with_handle(api.fs_stream_open2, api.fs_stream_write2, api.fs_stream_close2, tape_rt::micros, archive::file::STAGE / 2)) };
             group.mask = mask;
             group.quantizers = core::array::from_fn(|c| Quantizer::new(bits, 0x9E37_79B9u32.wrapping_mul((g * GROUP + c) as u32 + 1)));
             let info = Info { sample_rate: rate, channels, bits };
@@ -383,12 +458,13 @@ impl Writer {
         (api.audio_buffer)(&mut buffer);
         self.peak_backlog = self.peak_backlog.max(buffer.available_bytes);
         let t = &mut app.recording.take;
-        // The disk's speed over every stream of the take: bytes and time of the big writes, summed.
+        // The disk's speed over every file of the take: bytes and time of the big writes, summed.
         let (mut written, mut spent, mut worst) = (0u64, 0u64, 0u64);
-        let mut tally = |sink: &StreamSink| {
-            written += sink.bytes;
-            spent += sink.write_us;
-            worst = worst.max(sink.write_max_us);
+        let mut tally = |sink: &Out| {
+            let (bytes, us, max) = sink.speed();
+            written += bytes;
+            spent += us;
+            worst = worst.max(max);
         };
         if let Some(wav) = &self.wav {
             let frame = self.format.frame_bytes().max(1);
@@ -456,10 +532,21 @@ fn describe(number: usize, info: &DiskInfo) -> Disk {
     for c in info.label.iter().take_while(|&&b| b != 0).map(printable) {
         let _ = label.write_char(c);
     }
-    Disk { number, volume: volume(info.kind), boot: info.boot != 0, sectors: info.sectors, free: info.free_bytes, largest: info.largest_bytes, model, label }
+    Disk { number, writable: true, volume: volume(info.kind), boot: info.boot != 0, sectors: info.sectors, free: info.free_bytes, largest: info.largest_bytes, model, label }
 }
 
-/// Every disk `disk_info` lists (at most `MAX_DISKS`), in disk order; how many.
+/// Disk `disk`'s ext volume (`vfs_volume`) as a target of its own: the drive is the disk's, the size and label the volume's.
+/// An ext file grows where there is room, so its largest run is taken to be all the free space.
+fn describe_ext(disk: &Disk, volume: &VfsVolume) -> Disk {
+    let mut label = Text::<16>::new();
+    for c in volume.label.iter().take_while(|&&b| b != 0).map(|b| if (0x20..0x7f).contains(b) { *b as char } else { '?' }) {
+        let _ = label.write_char(c);
+    }
+    Disk { volume: Volume::Ext, writable: volume.writable != 0, sectors: volume.total_bytes / 512, free: volume.free_bytes, largest: volume.free_bytes, label, ..*disk }
+}
+
+/// Every volume a take could go to (at most `MAX_DISKS`), in disk order: what `disk_info` says of each disk (FOSFS, FAT,
+/// or none), then its ext volume if it has one (`vfs_volume`), which takes the place of a "no volume" entry. How many.
 pub fn find_disks(api: &TapeApi, disks: &mut [Disk; MAX_DISKS]) -> usize {
     let mut count = 0;
     for number in 1..=16 {
@@ -467,20 +554,32 @@ pub fn find_disks(api: &TapeApi, disks: &mut [Disk; MAX_DISKS]) -> usize {
         if (api.disk_info)(number, &mut info) == 0 {
             break;
         }
-        if count < MAX_DISKS {
-            disks[count] = describe(number, &info);
-            count += 1;
+        let disk = describe(number, &info);
+        let ext = tape_rt::vfs_volume(number).map(|volume| describe_ext(&disk, &volume));
+        for entry in [(disk.volume != Volume::None || ext.is_none()).then_some(disk), ext].into_iter().flatten() {
+            if count < MAX_DISKS {
+                disks[count] = entry;
+                count += 1;
+            }
         }
     }
     count
 }
 
-/// Asks the kernel again what a disk has free (after a take).
+/// Asks the kernel again what a volume has free (after a take).
 fn refresh(api: &TapeApi, disk: Option<&mut Disk>) {
     let Some(disk) = disk else { return };
     let mut info = DiskInfo::default();
-    if (api.disk_info)(disk.number, &mut info) != 0 {
-        *disk = describe(disk.number, &info);
+    if (api.disk_info)(disk.number, &mut info) == 0 {
+        return;
+    }
+    let drive = describe(disk.number, &info);
+    if disk.volume == Volume::Ext {
+        if let Some(volume) = tape_rt::vfs_volume(disk.number) {
+            *disk = describe_ext(&drive, &volume);
+        }
+    } else {
+        *disk = drive;
     }
 }
 
@@ -542,7 +641,7 @@ fn panel(canvas: &mut Canvas, layout: &Layout, app: &App) {
     line.clear();
     match r.target() {
         Some(disk) => {
-            let _ = write!(line, "disk{} {} {}", disk.number, disk.volume.name(), size(disk.sectors * 512).as_str());
+            let _ = write!(line, "{} {} {}", disk.name().as_str(), disk.volume.name(), size(disk.sectors * 512).as_str());
             if !disk.label.is_empty() {
                 let _ = write!(line, " @{}", disk.label.as_str());
             }
@@ -550,7 +649,7 @@ fn panel(canvas: &mut Canvas, layout: &Layout, app: &App) {
             if disk.boot {
                 let _ = line.write_str(" (boot)");
             }
-            row(canvas, "Disk", line.as_str(), if disk.volume == Volume::None { t.amber } else { t.text });
+            row(canvas, "Disk", line.as_str(), if r.refusal().is_some() { t.amber } else { t.text });
             line.clear();
             match r.seconds_left() {
                 Some(seconds) => {
@@ -558,7 +657,7 @@ fn panel(canvas: &mut Canvas, layout: &Layout, app: &App) {
                     let _ = write!(line, "{}, {} at this format", size(room).as_str(), duration(seconds).as_str());
                     row(canvas, "Room", line.as_str(), if seconds < 600 { t.amber } else { t.text });
                 }
-                None if disk.volume == Volume::Fat32 => row(canvas, "Room", "not known (FAT32); files split at 4 GiB", t.dim),
+                None if r.refusal().is_some() => row(canvas, "Room", r.refusal().unwrap_or(""), t.amber),
                 None => row(canvas, "Room", "-", t.dim),
             }
         }

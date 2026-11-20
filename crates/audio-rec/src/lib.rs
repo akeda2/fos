@@ -4,7 +4,8 @@
 //!   for takes over 4 GiB);
 //! - `preroll`: a ring that always holds the last few seconds, so a take can begin before the moment it was asked for;
 //! - `silence`: the trigger that starts a take on sound and ends it on silence, with configurable timing;
-//! - `peaks`: feeding the meters from the device's own sample format.
+//! - `peaks`: feeding the meters from the device's own sample format;
+//! - `stream` and `vfs`: `Sink`s over the kernel's file calls (FOSFS and FAT streams; ext volumes by path).
 #![cfg_attr(not(test), no_std)]
 
 pub mod peaks;
@@ -13,4 +14,5 @@ pub mod recorder;
 pub mod select;
 pub mod silence;
 pub mod stream;
+pub mod vfs;
 pub mod wav;

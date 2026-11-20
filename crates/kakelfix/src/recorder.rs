@@ -2,7 +2,9 @@
 //! sample format), the disk the takes go to, the file name stem (`take` gives `take001.flac`, the next free number on that
 //! disk), and the state of the take as the tape reports it. FLAC holds at most 8 channels, so a take of more armed inputs is
 //! several files, the armed inputs in groups of 8 in input order (`take001-1-8.flac`, `take001-9-16.flac`, ...): four at
-//! most, which is what the kernel can keep open at once (`FS_STREAMS`). Recordings go to exFAT or FOSFS, not FAT32. The take itself (capture, `audio_rec::Recorder`, the file calls) is the tape's: it
+//! most, which is what the kernel can keep open at once (`FS_STREAMS`). Recordings go to exFAT, ext4 or FOSFS, not FAT32. A
+//! disk can hold two volumes (rack's boot disk: FOSFS and ext4), so a target is a volume, named as the files on it are:
+//! `disk3` (FOSFS or FAT, `disk3/take001.flac`) or `ext1` (`ext1/take001.flac`). The take itself (capture, `audio_rec::Recorder`, the file calls) is the tape's: it
 //! reads `request`, acts on it and fills in `take`. A take keeps running when another page is shown.
 //!
 //! Milestone one is a plain take, started and stopped by hand. Pre-roll and the sound/silence trigger (`audio_rec`
@@ -53,6 +55,8 @@ pub enum Volume {
     Fosfs,
     Fat32,
     Exfat,
+    /// A Linux ext2/3/4 volume (`vfs_volume`), reached as `extN/`.
+    Ext,
 }
 
 impl Volume {
@@ -62,6 +66,7 @@ impl Volume {
             Volume::Fosfs => "FOSFS",
             Volume::Fat32 => "FAT32",
             Volume::Exfat => "exFAT",
+            Volume::Ext => "ext4",
         }
     }
 }
@@ -70,6 +75,8 @@ impl Volume {
 #[derive(Clone, Copy, Debug)]
 pub struct Disk {
     pub number: usize,
+    /// Whether the kernel can change the volume (an ext volume with features its writer does not keep up is read-only).
+    pub writable: bool,
     pub volume: Volume,
     pub boot: bool,
     pub sectors: u64,
@@ -81,7 +88,21 @@ pub struct Disk {
 }
 
 impl Disk {
-    pub const EMPTY: Disk = Disk { number: 0, volume: Volume::None, boot: false, sectors: 0, free: u64::MAX, largest: u64::MAX, model: Text::new(), label: Text::new() };
+    pub const EMPTY: Disk = Disk { number: 0, writable: true, volume: Volume::None, boot: false, sectors: 0, free: u64::MAX, largest: u64::MAX, model: Text::new(), label: Text::new() };
+
+    /// The volume's name, as files on it are named: `disk3` or `ext1`.
+    pub fn name(&self) -> Text<16> {
+        let mut out = Text::new();
+        let _ = write!(out, "{}{}", if self.volume == Volume::Ext { "ext" } else { "disk" }, self.number);
+        out
+    }
+
+    /// What goes before a file name on it: `disk3/` or `ext1/`.
+    pub fn prefix(&self) -> Text<16> {
+        let mut out = self.name();
+        let _ = out.write_str("/");
+        out
+    }
 }
 
 /// What the tape is asked to do with the take.
@@ -268,14 +289,19 @@ impl Recording {
         (groups, if armed == 0 { 0 } else { count + 1 })
     }
 
-    /// Picks the disk numbered `wanted` if it is listed (and not FAT32), else by priority: the first exFAT disk (kept for
-    /// recordings), a FOSFS disk that is not the boot disk, the boot disk. FAT32 is never chosen: its 4 GiB file limit
-    /// is not worth carrying for recordings.
-    pub fn choose_disk(&mut self, wanted: Option<usize>) {
+    /// Picks the volume named `wanted` (`ext1`, `disk3`; a bare number is a `disk`) if it is listed (and not FAT32), else
+    /// by priority: the first exFAT disk (kept for recordings), the first ext volume this kernel can write, a FOSFS disk that
+    /// is not the boot disk, the boot disk. FAT32 is never chosen: its 4 GiB file limit is not worth carrying.
+    pub fn choose_disk(&mut self, wanted: Option<&str>) {
+        let mut named = Text::<16>::new();
+        if let Some(wanted) = wanted {
+            let _ = if wanted.bytes().all(|b| b.is_ascii_digit()) { write!(named, "disk{wanted}") } else { named.write_str(wanted) };
+        }
         let disks = &self.disks[..self.disk_count];
         let first = |test: &dyn Fn(&Disk) -> bool| disks.iter().position(test);
-        self.disk = first(&|d| Some(d.number) == wanted && d.volume != Volume::Fat32)
+        self.disk = first(&|d| !named.is_empty() && d.name() == named && d.volume != Volume::Fat32)
             .or_else(|| first(&|d| d.volume == Volume::Exfat))
+            .or_else(|| first(&|d| d.volume == Volume::Ext && d.writable))
             .or_else(|| first(&|d| d.volume == Volume::Fosfs && !d.boot))
             .or_else(|| first(&|d| d.boot))
             .unwrap_or(0);
@@ -307,6 +333,7 @@ impl Recording {
             None => Some("no disk to record to"),
             Some(disk) if disk.volume == Volume::None => Some("that disk has no volume (format it first)"),
             Some(disk) if disk.volume == Volume::Fat32 => Some("FAT32 is not used for recordings: exFAT"),
+            Some(disk) if !disk.writable => Some("fos cannot write that ext volume (its features)"),
             _ if self.base.is_empty() => Some("no file name (rec-name=)"),
             _ => None,
         }
@@ -325,14 +352,15 @@ impl Recording {
         Ok(())
     }
 
-    /// What is saved: the armed inputs, the disk's number, the meter scale, the file name stem, the format.
-    pub fn persisted(&self) -> (u32, usize, bool, Text<12>, Encoding) {
-        (self.armed & self.all(), self.target().map_or(0, |d| d.number), self.nordic, self.base, self.encoding)
+    /// What is saved: the armed inputs, the volume's name, the meter scale, the file name stem, the format.
+    pub fn persisted(&self) -> (u32, Text<16>, bool, Text<12>, Encoding) {
+        (self.armed & self.all(), self.target().map_or(Text::new(), Disk::name), self.nordic, self.base, self.encoding)
     }
 
-    /// Takes `rec-ch=all|1-2,9`, `rec-disk=N`, `rec-scale=dbfs|nordic`, `rec-name=STEM`, `rec-format=flac|wav` and
+    /// Takes `rec-ch=all|1-2,9`, `rec-disk=ext1|disk3` (a bare number is a `disk`), `rec-scale=dbfs|nordic`,
+    /// `rec-name=STEM`, `rec-format=flac|wav` and
     /// `rec-bits=16|20|24` from `value(key)`; invalid values are ignored. `rec-disk` only picks a disk once `disks` is filled (call `choose_disk` with it).
-    pub fn load<'a>(&mut self, value: impl Fn(&str) -> Option<&'a str>) -> Option<usize> {
+    pub fn load<'a>(&mut self, value: impl Fn(&str) -> Option<&'a str>) -> Option<&'a str> {
         if let Some(mask) = value("rec-ch").and_then(|v| parse_channels(v, self.channels.min(MAX_ARMED))) {
             self.armed = mask;
         }
@@ -356,7 +384,7 @@ impl Recording {
             _ => Encoding::Flac(bits),
         };
         self.fix();
-        value("rec-disk").and_then(|v| v.parse().ok())
+        value("rec-disk")
     }
 
     pub fn save(&self, mut put: impl FnMut(&str, core::fmt::Arguments)) {
@@ -364,7 +392,7 @@ impl Recording {
         describe_channels(self.armed & self.all(), self.channels.min(MAX_ARMED), &mut channels);
         put("rec-ch", format_args!("{}", channels.as_str()));
         if let Some(disk) = self.target() {
-            put("rec-disk", format_args!("{}", disk.number));
+            put("rec-disk", format_args!("{}", disk.name().as_str()));
         }
         put("rec-scale", format_args!("{}", if self.nordic { "nordic" } else { "dbfs" }));
         put("rec-name", format_args!("{}", self.base.as_str()));

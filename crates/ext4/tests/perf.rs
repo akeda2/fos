@@ -96,3 +96,51 @@ fn operation_counts() {
     let _ = std::fs::remove_file(&image);
     let _: Option<Journaled<CountingDevice>> = None;
 }
+
+/// A recorder's stream through `vfs_write`: one file appended in `chunk`-byte calls (the Recorder's FLAC files write 128 KiB),
+/// committed every 4 MiB (about 2 s of a 30-input take: the Recorder's checkpoint), journaled, with the kernel's 512-slot read
+/// cache. Disk commands and host CPU time per call, for 64 KiB, 128 KiB and 1 MiB calls:
+/// `cargo test --release --test perf -- --nocapture append_sizes`.
+#[test]
+fn append_sizes() {
+    for chunk in [64 << 10, 128 << 10, 1 << 20] {
+        let image = std::env::temp_dir().join(format!("fos-ext4-append-{chunk}-{}.img", std::process::id()));
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&image).unwrap();
+        file.set_len(512 << 20).unwrap();
+        let counts = Rc::new(Counts::default());
+        let options = FormatOptions { label: b"perf", bytes_per_inode: 0, uuid: [1; 16], time: 1_700_000_000, journal: true, checksums: true };
+        let stage: &'static mut Stage = Box::leak(Box::new(Stage::new()));
+        let cache: &'static mut Cache = Box::leak(Box::new(Cache::new(Box::leak(vec![0u64; 512].into_boxed_slice()), Box::leak(vec![0u8; 512 * 4096].into_boxed_slice()))));
+        let device = CountingDevice { file, counts: counts.clone() };
+        let mut w = Writer::format(Cached::new(device, cache), (512 << 20) / 512, &options, stage).unwrap();
+        let root = w.root().unwrap().number;
+        let f = w.create(root, b"take.flac", 0o644).unwrap().number;
+        w.flush().unwrap();
+        counts.reads.set(0);
+        counts.writes.set(0);
+        let data = vec![0x5au8; chunk];
+        let total: u64 = 64 << 20;
+        let began = std::time::Instant::now();
+        let mut at = 0u64;
+        while at < total {
+            w.write(f, at, &data).unwrap();
+            at += chunk as u64;
+            if at % (4 << 20) == 0 {
+                w.flush().unwrap();
+            }
+        }
+        let spent = began.elapsed();
+        let calls = total / chunk as u64;
+        eprintln!(
+            "{:>5} KiB calls: {calls:5} calls, {:6} reads {:6} writes ({:.2} reads, {:.2} writes a call; data alone is 1), {:.1} us CPU a call, extents {}",
+            chunk >> 10,
+            counts.reads.get(),
+            counts.writes.get(),
+            counts.reads.get() as f64 / calls as f64,
+            counts.writes.get() as f64 / calls as f64,
+            spent.as_secs_f64() * 1e6 / calls as f64,
+            w.extent_count(f).unwrap()
+        );
+        let _ = std::fs::remove_file(&image);
+    }
+}

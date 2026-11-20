@@ -137,6 +137,16 @@ pub struct Writer<D: Device> {
     /// metadata_csum: the volume's checksum seed (zero and unused without it).
     csum: bool,
     seed: u32,
+    /// Where the next allocation of a file with no blocks before it starts (`write_placed`); 0: the inode's home group.
+    goal: u64,
+}
+
+impl<D: Device> Fs<D> {
+    /// Whether `Writer` can change this volume (its features and block size; a volume with a journal must also be opened
+    /// through `Journaled`, which the kernel always does).
+    pub fn writable(&self) -> bool {
+        self.compat & !COMPAT_OK == 0 && self.incompat & !INCOMPAT_OK == 0 && self.ro_compat & !RO_COMPAT_OK == 0 && matches!(self.block_size, 1024 | 2048 | 4096)
+    }
 }
 
 impl<D: Device> Deref for Writer<D> {
@@ -178,6 +188,7 @@ impl<D: Device> Writer<D> {
             dirty: false,
             csum,
             seed,
+            goal: 0,
         })
     }
 
@@ -213,6 +224,7 @@ impl<D: Device> Writer<D> {
             core::ptr::addr_of_mut!((*p).dirty).write(false);
             core::ptr::addr_of_mut!((*p).csum).write(csum);
             core::ptr::addr_of_mut!((*p).seed).write(seed);
+            core::ptr::addr_of_mut!((*p).goal).write(0);
             Ok(&mut *p)
         }
     }
@@ -507,6 +519,49 @@ impl<D: Device> Writer<D> {
     fn group_blocks(&self, group: u32) -> usize {
         let start = u64::from(self.fs.first_data_block) + u64::from(group) * u64::from(self.fs.blocks_per_group);
         (self.fs.blocks - start).min(u64::from(self.fs.blocks_per_group)) as usize
+    }
+
+    fn group_free(&mut self, group: u32) -> Result<u64, Error> {
+        let at = self.load_gdt(group)?;
+        Ok(u64::from(self.gdt_value(at, 12, 0x2c)))
+    }
+
+    /// Where a file that will grow to `bytes` should start, so that files written side by side (a recorder's tracks, each
+    /// growing a block at a time) each fill a region of their own instead of taking turns: interleaved, every write would
+    /// be an extent of its own and a file would reach the extent limit (`TooFragmented`) after a few hundred MiB. Looks only
+    /// at the group descriptors' free counts (a few reads for the whole volume), not the bitmaps. `avoid`: groups
+    /// (first, end) already given to other files. Picks consecutive groups, starting at one with at least half its blocks
+    /// free and avoiding `avoid`, whose free blocks add up to `bytes` (the first such window), else the window with the most
+    /// free blocks. Returns its first block (the goal for `write_placed`) and its groups (first, end). Nothing is written:
+    /// the region is only a goal, kept by the caller for as long as it matters.
+    pub fn place(&mut self, bytes: u64, avoid: &[(u32, u32)]) -> Result<(u64, (u32, u32)), Error> {
+        let blocks = bytes.div_ceil(self.fs.block_size as u64).max(1);
+        let groups = self.fs.groups;
+        let avoided = |group: u32| avoid.iter().any(|&(first, end)| group >= first && group < end);
+        let first = u64::from(self.fs.first_data_block);
+        let per_group = u64::from(self.fs.blocks_per_group);
+        let mut best: Option<(u32, u32, u64)> = None;
+        let mut start = 0;
+        while start < groups {
+            if avoided(start) || self.group_free(start)? * 2 < self.group_blocks(start) as u64 {
+                start += 1;
+                continue;
+            }
+            let (mut end, mut free) = (start, 0u64);
+            while end < groups && !avoided(end) && free < blocks {
+                free += self.group_free(end)?;
+                end += 1;
+            }
+            if free >= blocks {
+                return Ok((first + u64::from(start) * per_group, (start, end)));
+            }
+            if best.is_none_or(|(_, _, most)| free > most) {
+                best = Some((start, end, free));
+            }
+            start = end.max(start + 1);
+        }
+        let (start, end, _) = best.ok_or(Error::NoSpace)?;
+        Ok((first + u64::from(start) * per_group, (start, end)))
     }
 
     /// Takes up to `max` contiguous free blocks, the first free run at or after `goal` (wrapping round the groups);
@@ -906,7 +961,8 @@ impl<D: Device> Writer<D> {
             let next = self.exts[..self.count].iter().map(|ext| u64::from(ext.l)).find(|&l| l > at).unwrap_or(u64::MAX);
             let hole_end = (last + 1).min(next);
             while at < hole_end {
-                let goal = self.exts[..self.count].iter().rev().find(|ext| u64::from(ext.l) < at).map_or(home, |ext| ext.p + u64::from(ext.len));
+                let start = if self.goal != 0 { self.goal } else { home };
+                let goal = self.exts[..self.count].iter().rev().find(|ext| u64::from(ext.l) < at).map_or(start, |ext| ext.p + u64::from(ext.len));
                 if self.log_len == LOG {
                     return Err(Error::TooFragmented);
                 }
@@ -940,6 +996,23 @@ impl<D: Device> Writer<D> {
 
     fn checked(&mut self, number: u32) -> Result<Inode, Error> {
         self.fs.inode(number)
+    }
+
+    /// Like `write`, but a block allocated with none of the file's blocks before it is taken at or after `goal` (from
+    /// `place`) rather than in the inode's home group. Later blocks follow the file's own last extent anyway, so only a
+    /// file's first allocation needs the goal; giving it on every write costs nothing.
+    pub fn write_placed(&mut self, number: u32, offset: u64, data: &[u8], goal: u64) -> Result<usize, Error> {
+        self.goal = goal;
+        let written = self.write(number, offset, data);
+        self.goal = 0;
+        written
+    }
+
+    /// How many extents file `number` has (each a contiguous run of blocks; at most four leaf blocks of them).
+    pub fn extent_count(&mut self, number: u32) -> Result<usize, Error> {
+        let inode = self.checked(number)?;
+        self.load_extents(&inode)?;
+        Ok(self.count)
     }
 
     /// Writes `data` at `offset` of the file, allocating blocks (a gap before `offset` stays a hole) and extending its

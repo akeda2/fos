@@ -341,7 +341,8 @@ pub fn create(reference: &[u8], make: &VfsMake) -> isize {
     done.map_or_else(change_error, |()| 0)
 }
 
-/// `vfs_write`: the bytes written into the existing file at `reference`, or an `FS_*` code.
+/// `vfs_write`: the bytes written into the existing file at `reference`, or an `FS_*` code. A file `vfs_reserve` placed
+/// takes its first blocks in its own region.
 pub fn write(reference: &[u8], offset: u64, data: &[u8]) -> isize {
     if remote::is_remote(reference) {
         return remote::write(reference, offset, data);
@@ -349,9 +350,99 @@ pub fn write(reference: &[u8], offset: u64, data: &[u8]) -> isize {
     let Some((disk, partition, path)) = ext_target(reference) else { return FS_READ_ONLY };
     let done = ext4vol::with_writer_deferred(disk, partition, |writer| {
         let inode = file_number(writer, path)?;
-        writer.write(inode.number, offset, data)
+        match placement(disk, inode.number) {
+            Some(goal) => writer.write_placed(inode.number, offset, data, goal),
+            None => writer.write(inode.number, offset, data),
+        }
     });
     done.map_or_else(change_error, |count| count as isize)
+}
+
+/// A file placed by `vfs_reserve`: its disk index, inode, the block its first allocation starts from and the block groups
+/// (first, end) it was given. Kept until the next tape starts (`reset_placements`); a slot whose file has gone only costs
+/// another file a region it would not have used.
+#[derive(Clone, Copy)]
+struct Placement {
+    disk: usize,
+    inode: u32,
+    goal: u64,
+    groups: (u32, u32),
+}
+
+/// Enough for a recorder's four FLAC files (`FS_STREAMS`) twice over; the oldest is replaced when full.
+const PLACEMENTS: usize = 8;
+static mut PLACED: [Option<Placement>; PLACEMENTS] = [None; PLACEMENTS];
+static mut PLACED_NEXT: usize = 0;
+
+fn placed() -> &'static mut [Option<Placement>; PLACEMENTS] {
+    // SAFETY: the file calls are serialised by the caller (the kernel's file lock), like the rest of this module.
+    unsafe { &mut *core::ptr::addr_of_mut!(PLACED) }
+}
+
+fn placement(disk: usize, inode: u32) -> Option<u64> {
+    placed().iter().flatten().find(|p| p.disk == disk && p.inode == inode).map(|p| p.goal)
+}
+
+/// Forgets every placement (when a tape starts, with the stream handles).
+pub fn reset_placements() {
+    *placed() = [None; PLACEMENTS];
+}
+
+/// `vfs_reserve`: places the file at `reference` (an ext volume's) in groups no other placed file has, for about `bytes`.
+pub fn reserve(reference: &[u8], bytes: u64) -> isize {
+    let Some((disk, partition, path)) = ext_target(reference) else { return FS_READ_ONLY };
+    let mut avoid = [(0u32, 0u32); PLACEMENTS];
+    let done = ext4vol::with_writer_deferred(disk, partition, |writer| {
+        let inode = file_number(writer, path)?.number;
+        let mut count = 0;
+        for p in placed().iter().flatten().filter(|p| p.disk == disk && p.inode != inode) {
+            avoid[count] = p.groups;
+            count += 1;
+        }
+        let (goal, groups) = writer.place(bytes, &avoid[..count])?;
+        Ok(Placement { disk, inode, goal, groups })
+    });
+    let placement = match done {
+        Ok(placement) => placement,
+        Err(error) => return change_error(error),
+    };
+    let slots = placed();
+    let slot = slots.iter().position(|p| p.is_some_and(|p| p.disk == disk && p.inode == placement.inode)).or_else(|| slots.iter().position(Option::is_none)).unwrap_or_else(|| {
+        // SAFETY: as in `placed`.
+        unsafe {
+            let next = *core::ptr::addr_of!(PLACED_NEXT);
+            *core::ptr::addr_of_mut!(PLACED_NEXT) = (next + 1) % PLACEMENTS;
+            next
+        }
+    });
+    slots[slot] = Some(placement);
+    0
+}
+
+/// `vfs_volume`: the ext volume of disk `number` (1-based).
+pub fn volume(number: usize, out: &mut VfsVolume) -> isize {
+    let Some(disk) = number.checked_sub(1) else { return FS_NOT_FOUND };
+    let mut info = VfsVolume::default();
+    let fill = |fs: &ext4vol::Fs, info: &mut VfsVolume| {
+        (info.total_bytes, info.free_bytes) = fs.space();
+        info.writable = u32::from(fs.writable());
+        let label = fs.label();
+        let length = label.len().min(16);
+        info.label[..length].copy_from_slice(&label[..length]);
+    };
+    match ext4vol::shared(disk) {
+        Ok(shared) => fill(&shared.fs, &mut info),
+        Err(ext4::Error::NeedsRecovery) => {
+            // Listed as the shell's `disks` lists it: what it holds, and that the first change replays the journal.
+            let Ok(partition) = ext4vol::locate(disk) else { return FS_NOT_FOUND };
+            let Ok(fs) = ext4::Fs::mount_with(partition, ext4::Options { ignore_journal: true }) else { return FS_NOT_FOUND };
+            fill(&fs, &mut info);
+            info.needs_recovery = 1;
+        }
+        Err(_) => return FS_NOT_FOUND,
+    }
+    *out = info;
+    0
 }
 
 /// `vfs_truncate`.
@@ -439,6 +530,19 @@ pub extern "C" fn api_vfs_remove(path: *const u8, path_length: usize) -> isize {
 /// Tape ABI 34 `vfs_rename(from, from_len, to, to_len)`.
 pub extern "C" fn api_vfs_rename(from: *const u8, from_length: usize, to: *const u8, to_length: usize) -> isize {
     rename(bytes(from, from_length), bytes(to, to_length))
+}
+
+/// Tape ABI 42 `vfs_volume(number, out)`.
+pub extern "C" fn api_vfs_volume(number: usize, out: *mut VfsVolume) -> isize {
+    if out.is_null() {
+        return FS_ERROR;
+    }
+    volume(number, unsafe { &mut *out })
+}
+
+/// Tape ABI 42 `vfs_reserve(path, path_len, bytes)`.
+pub extern "C" fn api_vfs_reserve(path: *const u8, path_length: usize, bytes: u64) -> isize {
+    reserve(self::bytes(path, path_length), bytes)
 }
 
 /// Tape ABI 36 `vfs_sync()`: commits the file writes still held open (0 when there are none).

@@ -12,7 +12,7 @@
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
-use fosfor_abi::tape::{FS_ERROR, FS_STREAMS, FS_TOO_BIG, FileInfo, RemoteRequest, VfsEntry, VfsMake, VfsStat};
+use fosfor_abi::tape::{FS_ERROR, FS_STREAMS, FS_TOO_BIG, FileInfo, RemoteRequest, VfsEntry, VfsMake, VfsStat, VfsVolume};
 use kernel_core::{tape_fs, tape_vfs};
 
 use crate::{process, sched};
@@ -183,6 +183,23 @@ pub fn vfs_set_owner(name_at: u64, name_len: u64, uid: u64, gid: u64, mode: u64)
     let Some(reference) = name(name_at, name_len) else { return FS_ERROR };
     let _guard = lock();
     tape_vfs::set_owner(&reference, uid as u32, gid as u32, mode as u32)
+}
+
+/// `vfs_volume(number, out)` (ABI 42): the ext volume of disk `number`.
+pub fn vfs_volume(number: u64, out: u64) -> isize {
+    let mut info = VfsVolume::default();
+    let code = {
+        let _guard = lock();
+        tape_vfs::volume(number as usize, &mut info)
+    };
+    if code == 0 && !copy_struct(out, &info) { FS_ERROR } else { code }
+}
+
+/// `vfs_reserve(path, path_len, bytes)` (ABI 42): a placement for a file about to grow.
+pub fn vfs_reserve(name_at: u64, name_len: u64, bytes: u64) -> isize {
+    let Some(reference) = name(name_at, name_len) else { return FS_ERROR };
+    let _guard = lock();
+    tape_vfs::reserve(&reference, bytes)
 }
 
 /// `vfs_sync()` (ABI 36): commits the file writes held open.

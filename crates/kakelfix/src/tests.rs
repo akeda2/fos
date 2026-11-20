@@ -756,16 +756,16 @@ fn recorder_prefers_exfat_then_a_spare_disk_then_boot() {
     let r = &mut app.recording;
     r.choose_disk(None);
     assert_eq!(r.target().unwrap().number, 3);
-    r.choose_disk(Some(1));
-    assert_eq!(r.target().unwrap().number, 1, "the saved disk wins");
+    r.choose_disk(Some("1"));
+    assert_eq!(r.target().unwrap().number, 1, "the saved disk wins (an old bare number is a disk)");
     r.disks[2].volume = recorder::Volume::None;
     r.choose_disk(None);
     assert_eq!(r.target().unwrap().number, 2, "not the boot disk when another FOSFS disk is there");
-    r.choose_disk(Some(3));
+    r.choose_disk(Some("disk3"));
     assert_eq!(r.refusal(), Some("that disk has no volume (format it first)"));
     // FAT32 is listed but never chosen, not even when it was saved.
     r.disks[2].volume = recorder::Volume::Fat32;
-    r.choose_disk(Some(3));
+    r.choose_disk(Some("disk3"));
     assert_eq!(r.target().unwrap().number, 2);
     r.disk = 2;
     assert_eq!(r.refusal(), Some("FAT32 is not used for recordings: exFAT"));
@@ -876,7 +876,7 @@ fn recorder_settings_round_trip() {
         "rec-ch" => Some("1,3-4"),
         "rec-scale" => Some("nordic"),
         "rec-name" => Some("gig"),
-        "rec-disk" => Some("2"),
+        "rec-disk" => Some("disk2"),
         _ => None,
     });
     r.choose_disk(disk);
@@ -885,7 +885,7 @@ fn recorder_settings_round_trip() {
     r.save(|key, value| {
         let _ = write!(saved, "{key}={value} ");
     });
-    assert_eq!(saved.as_str(), "rec-ch=1,3-4 rec-disk=2 rec-scale=nordic rec-name=gig rec-format=flac rec-bits=24 ");
+    assert_eq!(saved.as_str(), "rec-ch=1,3-4 rec-disk=disk2 rec-scale=nordic rec-name=gig rec-format=flac rec-bits=24 ");
     r.load(|key| match key {
         "rec-format" => Some("flac"),
         "rec-bits" => Some("16"),
@@ -928,4 +928,34 @@ fn recorder_taps_arm_and_swipes_scroll_the_meters() {
     app.release(&mut device, &layout, grab);
     assert_eq!(app.first_rec, 5);
     assert!(app.recording.input >= 5);
+}
+
+/// Rack's boot disk: FOSFS (the boot volume) and ext4 over the rest, as `install ... ext4` makes it. The ext volume is a
+/// target of its own, named and reached as `ext1`.
+#[test]
+fn recorder_ext_volumes_are_targets_of_their_own() {
+    let mut device = Fake::new();
+    let mut app = recorder_app(&mut device);
+    let r = &mut app.recording;
+    r.disks[1] = recorder::Disk { volume: recorder::Volume::Ext, ..disk(1, recorder::Volume::Fosfs, true, 200 << 30) };
+    r.disks[2] = disk(3, recorder::Volume::Fosfs, false, 1 << 30);
+    r.choose_disk(None);
+    assert_eq!(r.target().unwrap().name().as_str(), "ext1", "a writable ext volume before FOSFS");
+    assert_eq!(r.target().unwrap().prefix().as_str(), "ext1/");
+    r.choose_disk(Some("disk1"));
+    assert_eq!((r.target().unwrap().name().as_str(), r.target().unwrap().volume), ("disk1", recorder::Volume::Fosfs), "the same disk's FOSFS volume, by name");
+    r.choose_disk(Some("ext1"));
+    let mut saved = Text::<96>::new();
+    r.save(|key, value| {
+        if key == "rec-disk" {
+            let _ = write!(saved, "{value}");
+        }
+    });
+    assert_eq!(saved.as_str(), "ext1");
+    // An ext volume the writer cannot keep up with is listed, never chosen, and refused when asked for.
+    r.disks[1].writable = false;
+    r.choose_disk(None);
+    assert_eq!(r.target().unwrap().name().as_str(), "disk3");
+    r.choose_disk(Some("ext1"));
+    assert_eq!(r.refusal(), Some("fos cannot write that ext volume (its features)"));
 }

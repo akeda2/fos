@@ -644,6 +644,8 @@ pub fn build_api(info: &BootInfo, arguments: &str) -> TapeApi {
         mixer_control: kernel_core::audio::api_mixer_control,
         mixer_control_item: kernel_core::audio::api_mixer_control_item,
         mixer_control_set: kernel_core::audio::api_mixer_control_set,
+        vfs_volume: kernel_core::tape_vfs::api_vfs_volume,
+        vfs_reserve: kernel_core::tape_vfs::api_vfs_reserve,
         random: kernel_core::random::api_random,
     }
 }

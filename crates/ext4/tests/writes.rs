@@ -753,3 +753,54 @@ fn full_index_root_falls_back_to_linear() {
     fsck(&image);
     let _ = fs::remove_file(&image);
 }
+
+/// Four files written in turn, 128 KiB at a time (a recorder's tracks): `rounds` writes each, placed by `place` or not.
+/// Returns the extent count of each.
+fn interleaved(name: &str, placed: bool, rounds: u64) -> [usize; 4] {
+    let (image, mut w) = make(name, 1024);
+    let root = w.root().unwrap().number;
+    let files: Vec<u32> = (0..4).map(|n| w.create(root, format!("track{n}.flac").as_bytes(), 0o644).unwrap().number).collect();
+    let mut goals = [0u64; 4];
+    let mut taken: Vec<(u32, u32)> = Vec::new();
+    if placed {
+        for goal in goals.iter_mut() {
+            let (block, groups) = w.place(rounds * 128 * 1024, &taken).unwrap();
+            *goal = block;
+            taken.push(groups);
+        }
+        let mut sorted = taken.clone();
+        sorted.sort();
+        assert!(sorted.windows(2).all(|pair| pair[0].1 <= pair[1].0), "placements overlap: {taken:?}");
+    }
+    let chunk = pattern(0, 128 * 1024);
+    for round in 0..rounds {
+        for (index, &file) in files.iter().enumerate() {
+            let at = round * chunk.len() as u64;
+            let wrote = if placed { w.write_placed(file, at, &chunk, goals[index]) } else { w.write(file, at, &chunk) };
+            assert_eq!(wrote.unwrap(), chunk.len());
+        }
+    }
+    let counts = core::array::from_fn(|index| w.extent_count(files[index]).unwrap());
+    w.flush().unwrap();
+    fsck(&image);
+    let node = w.inode(files[3]).unwrap();
+    let mut back = vec![0u8; chunk.len()];
+    assert_eq!(w.read(&node, (rounds - 1) * chunk.len() as u64, &mut back).unwrap(), chunk.len());
+    assert_eq!(back, chunk, "the last write of the last file reads back");
+    let _ = fs::remove_file(&image);
+    counts
+}
+
+/// Without placement four files growing side by side take turns block run by block run: every write is an extent, and a
+/// file reaches the extent limit after about 170 MiB. Placed, each grows in its own groups: about one extent per 128 MiB.
+#[test]
+fn placed_files_written_in_turn_stay_contiguous() {
+    if !have("e2fsck") {
+        return;
+    }
+    let unplaced = interleaved("interleaved", false, 400);
+    assert!(unplaced.iter().all(|&count| count >= 300), "taking turns fragments every file: {unplaced:?}");
+    let placed = interleaved("placed", true, 400);
+    eprintln!("extents per file, 50 MiB each written in turn: unplaced {unplaced:?}, placed {placed:?}");
+    assert!(placed.iter().all(|&count| count <= 3), "placed files stay a few extents: {placed:?}");
+}

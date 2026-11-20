@@ -29,7 +29,7 @@ The active audio device's mixer on the pixel screen: one output's mix as
 fader strips (Outputs), every send as a table (Matrix) and the device's own
 settings (Device); the Recorder page records the armed inputs as FLAC
 (16, 20 or 24 bits; 8 inputs a file) or WAV to diskN/STEMnnn.flac on an
-exFAT or FOSFS disk, with a peak meter per input; the
+exFAT, ext4 (extN/) or FOSFS volume, with a peak meter per input; the
 Analyzer page shows an input pair's waveform and spectrum; the Meters page
 meters every input (dBFS, Nordic PPM or LUFS) with its gain and switches
 under it. Mouse, touch or keyboard.
@@ -47,7 +47,8 @@ mt-scale=dbfs|nordic|lufs mt-input=N mt-show=all|1,3-8 (inputs shown)
 mt-loop=13-14:1 (inputs 13-14 cabled from outputs 1-2: named Loop 1/2;
 a device's own Loopback N switch does this by itself), and the Recorder's:
 rec-name=STEM (1-9 of a-z 0-9 . _ -; default take) rec-ch=all|1-2,9
-rec-disk=N rec-scale=dbfs|nordic rec-format=flac|wav rec-bits=16|20|24
+rec-disk=ext1|disk3 rec-scale=dbfs|nordic rec-format=flac|wav
+rec-bits=16|20|24
 (the same words on the command line)
   show         print every output's sends and the controls, then end
 Keys: Tab next view, 1-4 Mixer/Recorder/Analyzer/Meters, arrows select and

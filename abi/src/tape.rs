@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`. Version 20 added `gfx_screens` and the `gfx_*_on` calls (a screen number). Version 21 added `audio_float`. Version 22 added the `gpio_*` calls. Version 23 added `i2c_speed` and `i2c_transfer`. Version 24 added `touch_info` and `touch_read`. Version 25 added `midi_read` and `midi_send`. Version 26 added `midi_devices`. Version 27 added `nic_owned`. Version 28 added `gpio_pull_get`. Version 32 added the `vfs_*` calls. Version 33 added `random`. Version 34 added the `vfs_*` change calls (`vfs_create`, `vfs_write`, `vfs_truncate`, `vfs_remove`, `vfs_rename`, `vfs_set_owner`). Version 35 added the `remote_*` calls (a tape serves a volume named `//NAME`). Version 36 added `vfs_sync`. Version 37 added the thread calls (`thread_spawn`, `thread_join`, `futex_wait`, `futex_wake`). Version 38 added the shell session calls (`session_open`, `session_write`, `session_read`, `session_close`). Version 39 added `resolve_path`. Version 40 added `audio_state`. Version 41 added the `mixer_*` calls.
-pub const TAPE_API_VERSION: u32 = 41;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`. Version 20 added `gfx_screens` and the `gfx_*_on` calls (a screen number). Version 21 added `audio_float`. Version 22 added the `gpio_*` calls. Version 23 added `i2c_speed` and `i2c_transfer`. Version 24 added `touch_info` and `touch_read`. Version 25 added `midi_read` and `midi_send`. Version 26 added `midi_devices`. Version 27 added `nic_owned`. Version 28 added `gpio_pull_get`. Version 32 added the `vfs_*` calls. Version 33 added `random`. Version 34 added the `vfs_*` change calls (`vfs_create`, `vfs_write`, `vfs_truncate`, `vfs_remove`, `vfs_rename`, `vfs_set_owner`). Version 35 added the `remote_*` calls (a tape serves a volume named `//NAME`). Version 36 added `vfs_sync`. Version 37 added the thread calls (`thread_spawn`, `thread_join`, `futex_wait`, `futex_wake`). Version 38 added the shell session calls (`session_open`, `session_write`, `session_read`, `session_close`). Version 39 added `resolve_path`. Version 40 added `audio_state`. Version 41 added the `mixer_*` calls. Version 42 added `vfs_volume` and `vfs_reserve`.
+pub const TAPE_API_VERSION: u32 = 42;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -403,7 +403,7 @@ pub struct TapeApi {
     /// `FS_READ_ONLY` (not an ext volume this kernel can change). Every call is committed (journaled) before it returns.
     pub vfs_create: extern "C" fn(*const u8, usize, *const VfsMake) -> isize,
     /// `vfs_write(path, path_len, offset, data, len)` (version 34): writes into an existing file, growing it (a gap stays a
-    /// hole). The count written (a call may take less than `len`: the server kernel's limit is 64 KiB per call) or a code.
+    /// hole). The count written (a call may take less than `len`: the server kernel's limit is 1 MiB per call, `kernel-mf/src/tapefs.rs` `CHUNK`) or a code.
     pub vfs_write: extern "C" fn(*const u8, usize, u64, *const u8, usize) -> isize,
     /// `vfs_truncate(path, path_len, size)` (version 34): sets a file's size; larger leaves a hole, smaller frees blocks.
     pub vfs_truncate: extern "C" fn(*const u8, usize, u64) -> isize,
@@ -514,6 +514,30 @@ pub struct TapeApi {
     /// `MIXER_NONE`/`MIXER_BAD`/`MIXER_FAILED`. A control flagged `MIXER_FLAG_HAZARD` (phantom power, a reset) is set as
     /// asked: the tape asks the user first.
     pub mixer_control_set: extern "C" fn(u32, i64) -> i32,
+    /// `vfs_volume(number, out)` (version 42): the ext volume on disk `number` (1-based, as `disk_info` counts; `disk_info`
+    /// knows only FOSFS and FAT volumes). 0 and `out` filled, or `FS_NOT_FOUND` when that disk holds none. Its files are named
+    /// `extN/path`, which reaches it even on a disk that also holds FOSFS (where `diskN/` means the FOSFS volume).
+    pub vfs_volume: extern "C" fn(usize, *mut VfsVolume) -> isize,
+    /// `vfs_reserve(path, path_len, bytes)` (version 42): the file at `path` (on an ext volume, just created) will grow to
+    /// about `bytes`: its first blocks are taken in a region of the volume (whole block groups) that no other file reserved
+    /// this way has, so files written side by side (a recorder's tracks) each stay contiguous instead of alternating extent
+    /// by extent until the driver's extent limit. Nothing is written or allocated; the placement is a goal kept in memory
+    /// until the next tape starts. 0, or `FS_READ_ONLY` (not an ext volume), `FS_NOT_FOUND`, `FS_NO_SPACE`.
+    pub vfs_reserve: extern "C" fn(*const u8, usize, u64) -> isize,
+}
+
+/// What `vfs_volume` fills in (version 42).
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct VfsVolume {
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    /// 1 when this kernel can change the volume (`vfs_create`, `vfs_write`, ...): its features are ones the writer keeps up.
+    pub writable: u32,
+    /// 1 when its journal needs replaying (the first change does that).
+    pub needs_recovery: u32,
+    /// The volume label, zero padded.
+    pub label: [u8; 16],
 }
 
 /// What `mixer_info` fills in (version 41).
