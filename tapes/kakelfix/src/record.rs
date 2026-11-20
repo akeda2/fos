@@ -930,12 +930,23 @@ fn panel(canvas: &mut Canvas, layout: &Layout, app: &App, threaded: bool) {
     let big = layout.scale * 3;
     let big_row = layout.rec_big();
     let running = r.take.running;
+    // The lamp and the take clock are one big button: a tap starts or stops the take, as `R` does.
+    let button = layout.rec_button();
+    canvas.fill_rect(button.x, button.y, button.w as u32, button.h as u32, t.grid);
+    canvas.rect(button.x, button.y, button.w as u32, button.h as u32, if running { t.red } else { t.frame });
+    if running {
+        canvas.rect(button.x + 1, button.y + 1, (button.w - 2) as u32, (button.h - 2) as u32, t.red);
+    }
+    let (x0, y0) = (x0 + layout.col / 2, y0 + 2);
     let lamp = if running { t.red } else { t.off };
     canvas.fill_rect(x0, y0 + big_row / 4, (big_row / 2) as u32, (big_row / 2) as u32, lamp);
     let x = x0 + big_row * 3 / 4;
     canvas.text_scaled(x, y0, if running { "REC" } else { "STOP" }, big, if running { t.red } else { t.dim });
     let time = clock(r.take.frames, r.rate);
     canvas.text_scaled(x + 8 * big as i32 * 5, y0, time.as_str(), big, if running { t.text } else { t.dim });
+    let hint = if running { "tap to stop" } else { "tap to record" };
+    let hint_x = button.x + button.w - (hint.len() as i32 + 1) * layout.col;
+    text(canvas, layout, hint_x, button.y + button.h - layout.row - 4, hint, if running { t.red } else { t.dim });
     let row = |canvas: &mut Canvas, which: RecRow, value: &str, colour: u32, frame: Option<u32>| {
         let area = layout.rec_row(which);
         let y = area.y + (area.h - layout.row) / 2;

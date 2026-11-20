@@ -1425,6 +1425,10 @@ impl App {
                 }
                 None
             }
+            Hit::RecButton => {
+                self.act(device, Action::Record);
+                None
+            }
             Hit::RecRow(row) => {
                 let action = match row {
                     RecRow::Project => Action::Pair,

@@ -44,6 +44,8 @@ pub enum Hit {
     RecMeter(usize),
     Arm(usize),
     RecRow(RecRow),
+    /// Recorder: the big REC/STOP button at the top of the panel (starts or stops a take).
+    RecButton,
     /// Analyzer: a pair button. Meters: an item of the inputs picker (`App::pick_items`).
     AnPair(usize),
     Pick(usize),
@@ -322,11 +324,17 @@ impl Layout {
         16 * 3 * self.scale as i32
     }
 
+    /// Recorder: the REC/STOP button, the lamp and the take clock at the top of the panel.
+    pub fn rec_button(&self) -> Rect {
+        let panel = self.rec_panel();
+        Rect::new(panel.x + 4, panel.y + 4, panel.w - 8, self.rec_big() + 8)
+    }
+
     /// Recorder: a row of the panel, two text rows tall so a finger can hit the ones that can be tapped.
     pub fn rec_row(&self, row: RecRow) -> Rect {
         let panel = self.rec_panel();
         let height = self.row * 2;
-        let top = panel.y + 8 + self.rec_big() + self.row / 2;
+        let top = panel.y + 8 + self.rec_big() + self.row;
         Rect::new(panel.x + 4, top + row as i32 * height, panel.w - 8, height - 4)
     }
 
@@ -339,9 +347,15 @@ impl Layout {
         Rect::new(x, self.body.y + top, (self.body.x + self.body.w - right - x).max(self.col * 4), self.body.h - top - 8)
     }
 
-    /// One input's column: as wide as the inputs allow, at least a short name, at most a broad bar.
+    /// One input's column: as wide as the inputs allow, at least an arm button a finger can hit (6 characters: 48 pixels
+    /// at scale 1; more inputs than fit are swiped to), at most a broad bar.
     pub fn rec_column_w(&self, app: &App) -> i32 {
-        (self.rec_area().w / app.recording.channels.max(1) as i32).clamp(self.col * 4, self.col * 12)
+        (self.rec_area().w / app.recording.channels.max(1) as i32).clamp(self.col * 6, self.col * 12)
+    }
+
+    /// The height of an arm button: three text rows (44 pixels at scale 1), a fingertip.
+    fn rec_arm_h(&self) -> i32 {
+        self.row * 3 - 4
     }
 
     pub fn visible_rec(&self, app: &App) -> usize {
@@ -362,7 +376,7 @@ impl Layout {
 
     pub fn rec_bar(&self, input: usize, app: &App) -> Option<Rect> {
         let c = self.rec_column(input, app)?;
-        let under = self.row + 6 + self.meter_cell_h();
+        let under = self.row + 10 + self.rec_arm_h();
         Some(Rect::new(c.x, c.y, c.w, (c.h - under).max(8)))
     }
 
@@ -371,13 +385,16 @@ impl Layout {
         Some(Rect::new(b.x, b.y + b.h + 2, b.w, self.row))
     }
 
-    /// The arm button under an input's name: a finger's size, as the Meters page's control cells.
+    /// The arm button under an input's name: a fingertip (`rec_arm_h` by at least `rec_column_w`).
     pub fn rec_arm(&self, input: usize, app: &App) -> Option<Rect> {
         let n = self.rec_name(input, app)?;
-        Some(Rect::new(n.x, n.y + self.row + 4, n.w, self.meter_cell_h() - 4))
+        Some(Rect::new(n.x, n.y + self.row + 4, n.w, self.rec_arm_h()))
     }
 
     fn rec_hit(&self, app: &App, x: i32, y: i32) -> Hit {
+        if self.rec_button().contains(x, y) {
+            return Hit::RecButton;
+        }
         if let Some(row) = RecRow::ALL.into_iter().find(|&row| row.tappable() && self.rec_row(row).contains(x, y)) {
             return Hit::RecRow(row);
         }

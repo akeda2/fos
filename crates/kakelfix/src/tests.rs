@@ -1172,3 +1172,25 @@ fn recorder_panel_rows_are_buttons() {
     assert!(first.y > layout.rec_panel().y + layout.rec_big() && last.y + last.h <= layout.rec_panel().y + layout.rec_panel().h);
     assert!(first.h >= layout.row * 2 - 4);
 }
+
+#[test]
+fn the_rec_button_starts_and_stops_and_arm_buttons_take_a_finger() {
+    let mut device = Fake::new();
+    let mut app = recorder_app(&mut device);
+    app.recording.choose_disk(None);
+    let layout = Layout::new(1280, 800);
+    let button = layout.rec_button();
+    assert_eq!(layout.hit(&app, button.x + button.w / 2, button.y + button.h / 2), Hit::RecButton);
+    app.press(&mut device, &layout, button.x + 10, button.y + 10);
+    assert_eq!(app.recording.request, Some(recorder::Request::Start));
+    app.recording.request = None;
+    app.recording.take.running = true;
+    app.press(&mut device, &layout, button.x + 10, button.y + 10);
+    assert_eq!(app.recording.request, Some(recorder::Request::Stop));
+    assert!(layout.rec_row(RecRow::File).y >= button.y + button.h, "the rows start under it");
+    // The UC's 18 inputs: each arm button at least 48 x 44 pixels; the rest of the inputs are swiped to.
+    app.recording.channels = 18;
+    let arm = layout.rec_arm(0, &app).unwrap();
+    assert!(arm.w >= 42 && arm.h >= 44, "{} x {}", arm.w, arm.h);
+    assert!(layout.visible_rec(&app) >= 8 && layout.visible_rec(&app) < 18);
+}

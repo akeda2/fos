@@ -1871,7 +1871,9 @@ mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path 
   (Esc, Quit) finishes the files cleanly. The capture ring is asked for at up to 256 MiB (`audio_set_capture_ring`, leaving
   256 MiB free), which absorbs disk writes, encoding and frames drawn meanwhile. Next: a count of float samples off the 24-bit grid, pre-roll and the sound/silence trigger
   (`audio_rec::preroll`, `silence`).
-  **Touch and typing**: the Project, Disk, Format and Inputs rows are framed buttons (type the project, next disk, next
+  **Touch and typing**: the REC lamp and take clock at the top are one big button (tap: start or stop, as `R`; "tap to
+  record"/"tap to stop" in it, a red frame while recording). Arm buttons are a fingertip, 3 text rows by at least 6
+  characters (44 x 48 pixels at scale 1); inputs that do not fit are swiped to. The Project, Disk, Format and Inputs rows are framed buttons (type the project, next disk, next
   format, arm all); the action soft keys are Record/Stop, Project and Arm all. `p` (or the row, or the soft key) types the
   project: every key then goes to the field (`App::type_project`), so `R` and space are text, not a take; only
   A-Z a-z 0-9 - _ are taken (a space or another character is refused with a word), at most 20; Enter keeps (empty: none,
