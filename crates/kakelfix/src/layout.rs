@@ -40,15 +40,41 @@ pub enum Hit {
     /// Meters: an input's bar or name (the input, 0-based), a control cell under it (control index, input).
     Meter(usize),
     InputControl(usize, usize),
-    /// Recorder: an input's meter or name (selects it), its arm button (arms or disarms it).
+    /// Recorder: an input's meter or name (selects it), its arm button (arms or disarms it), a row of the panel.
     RecMeter(usize),
     Arm(usize),
+    RecRow(RecRow),
     /// Analyzer: a pair button. Meters: an item of the inputs picker (`App::pick_items`).
     AnPair(usize),
     Pick(usize),
     Yes,
     No,
     Nothing,
+}
+
+/// The rows of the Recorder's panel, top to bottom under the REC lamp and clock. Four can be tapped (`tappable`): Project
+/// types a project name, Disk and Format step, Inputs arms every input.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RecRow {
+    File,
+    Project,
+    Disk,
+    Room,
+    Format,
+    Inputs,
+    Clock,
+    Writer,
+    Written,
+    Warning,
+}
+
+impl RecRow {
+    pub const ALL: [RecRow; 10] =
+        [RecRow::File, RecRow::Project, RecRow::Disk, RecRow::Room, RecRow::Format, RecRow::Inputs, RecRow::Clock, RecRow::Writer, RecRow::Written, RecRow::Warning];
+
+    pub fn tappable(self) -> bool {
+        matches!(self, RecRow::Project | RecRow::Disk | RecRow::Format | RecRow::Inputs)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -291,6 +317,19 @@ impl Layout {
         Rect::new(self.body.x, self.body.y, w, self.body.h)
     }
 
+    /// Recorder: the height of the REC lamp and take clock at the top of the panel (the 8x16 font at three times the scale).
+    pub fn rec_big(&self) -> i32 {
+        16 * 3 * self.scale as i32
+    }
+
+    /// Recorder: a row of the panel, two text rows tall so a finger can hit the ones that can be tapped.
+    pub fn rec_row(&self, row: RecRow) -> Rect {
+        let panel = self.rec_panel();
+        let height = self.row * 2;
+        let top = panel.y + 8 + self.rec_big() + self.row / 2;
+        Rect::new(panel.x + 4, top + row as i32 * height, panel.w - 8, height - 4)
+    }
+
     /// Recorder: the meters' area at the right, inside the room for the scale's labels (8x16 font, unscaled, as on the
     /// Meters page: the scale left and right of the bars, the dBFS column beside the Nordic scale) and its name above.
     pub fn rec_area(&self) -> Rect {
@@ -339,6 +378,9 @@ impl Layout {
     }
 
     fn rec_hit(&self, app: &App, x: i32, y: i32) -> Hit {
+        if let Some(row) = RecRow::ALL.into_iter().find(|&row| row.tappable() && self.rec_row(row).contains(x, y)) {
+            return Hit::RecRow(row);
+        }
         for input in 0..app.recording.channels.max(1) {
             if self.rec_arm(input, app).is_some_and(|r| r.contains(x, y)) {
                 return Hit::Arm(input);

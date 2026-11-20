@@ -24,7 +24,7 @@ use fosfor_abi::tape::{
     MixerControl, MIXER_CONTROL_ACTION, MIXER_CONTROL_BOOL, MIXER_CONTROL_ENUM, MIXER_FLAG_HAZARD, MIXER_FLAG_READONLY, MIXER_FLAG_UNKNOWN,
 };
 pub use analyzer::{AnView, Analysis, Persisted, WaveMode};
-pub use layout::{Hit, Layout, Rect};
+pub use layout::{Hit, Layout, RecRow, Rect};
 pub use meters::{MeterScale, Metering};
 pub use queue::{Link, Queued};
 pub use recorder::Recording;
@@ -217,6 +217,19 @@ pub enum Action {
     Quit,
 }
 
+/// A key while the project name is typed (`App::type_project`): the tape sends every key here instead of turning it into an
+/// `Action`, so letters that are shortcuts elsewhere (`R`, space) are only text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Edit {
+    Char(u8),
+    Erase,
+    /// Enter: the name as typed becomes the project (empty: one is made up at the next take).
+    Keep,
+    /// Tab: the project stays as it was. (Escape still quits the tape: the kernel asks the tape to stop, and on the server
+    /// kernel a second Escape kills it, so it cannot mean anything else.)
+    Cancel,
+}
+
 /// What a held mouse button or finger is moving.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Grab {
@@ -335,6 +348,8 @@ pub struct App {
     pub analysis: Analysis,
     pub metering: Metering,
     pub recording: Recording,
+    /// The project name being typed on the Recorder page, while it is (`type_project`).
+    pub editing: Option<Text<{ naming::MAX_PROJECT }>>,
     pub message: Text<72>,
     pub quit: bool,
     names: [[Text<16>; MAX_CHANNELS]; 3],
@@ -373,6 +388,7 @@ impl App {
             analysis: Analysis::new(),
             metering: Metering::new(),
             recording: Recording::new(),
+            editing: None,
             message: Text::new(),
             quit: false,
             names: [[Text::new(); MAX_CHANNELS]; 3],
@@ -569,6 +585,20 @@ impl App {
     }
 
     pub fn act(&mut self, device: &mut impl Device, action: Action) {
+        if self.editing.is_some() {
+            // Only the soft keys and the pages reach here while a name is typed (the tape sends keys to `edit`).
+            match action {
+                Action::Enter => self.type_project(Edit::Keep),
+                Action::No => self.type_project(Edit::Cancel),
+                Action::Quit => self.quit = true,
+                Action::Page(_) | Action::View(_) | Action::AnView(_) => {
+                    self.type_project(Edit::Cancel);
+                    self.act(device, action);
+                }
+                _ => {}
+            }
+            return;
+        }
         if let Some((index, value)) = self.confirm {
             match action {
                 Action::Yes => {
@@ -641,7 +671,8 @@ impl App {
     }
 
     /// Recorder keys: Left/Right select an input, Enter arms or disarms it, `a` arms every input, space starts or stops a
-    /// take, `d` the next disk, `f` the next format, `s` the meter scale, `r` clears the holds and clip lamps.
+    /// take, `d` the next disk, `f` the next format, `s` the meter scale, `r` clears the holds and clip lamps, `p` types the
+    /// project (the Pair key, which the Recorder has no other use for).
     fn act_recorder(&mut self, action: Action) {
         let r = &mut self.recording;
         let result = match action {
@@ -659,6 +690,7 @@ impl App {
             }
             Action::Enter => r.toggle(r.input).map(|_| ()),
             Action::Channels => r.arm_all(),
+            Action::Pair => return self.start_editing(),
             Action::Freeze => r.toggle_take(),
             Action::NextDisk | Action::WaveScale => r.next_disk(),
             Action::Resolution => r.next_encoding(),
@@ -674,6 +706,57 @@ impl App {
         };
         if let Err(reason) = result {
             self.note(format_args!("{reason}"));
+        }
+    }
+
+    /// Starts typing the project name (refused during a take: its files are already named).
+    pub fn start_editing(&mut self) {
+        if self.recording.take.running || self.recording.request.is_some() {
+            return self.note(format_args!("stop the take to change the project"));
+        }
+        self.editing = Some(Text::from(naming::stem(self.recording.project.as_str())));
+        self.note(format_args!("project: A-Z a-z 0-9 - _, Enter keeps, Tab cancels"));
+    }
+
+    /// A key while the project name is typed. Characters a name cannot hold are refused with a word, and the name stops at
+    /// `naming::MAX_PROJECT`.
+    pub fn type_project(&mut self, key: Edit) {
+        let Some(name) = self.editing.as_mut() else { return };
+        match key {
+            Edit::Char(c) if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' => {
+                if name.as_str().len() >= naming::MAX_PROJECT {
+                    return self.note(format_args!("a project name is at most {} characters", naming::MAX_PROJECT));
+                }
+                let _ = name.write_char(c as char);
+            }
+            Edit::Char(b' ') => return self.note(format_args!("no spaces: use - or _")),
+            Edit::Char(_) => return self.note(format_args!("only A-Z a-z 0-9 - _ (names travel to other systems)")),
+            Edit::Erase => {
+                let kept = name.as_str().len().saturating_sub(1);
+                *name = Text::from(&name.as_str()[..kept]);
+            }
+            Edit::Cancel => {
+                self.editing = None;
+                self.message.clear();
+            }
+            Edit::Keep => {
+                let typed = *name;
+                if typed.is_empty() {
+                    self.recording.project.clear();
+                    self.editing = None;
+                    return self.note(format_args!("no project: one is made up at the next take"));
+                }
+                if !naming::valid_project(typed.as_str()) {
+                    return self.note(format_args!("a project name starts with a letter or a digit"));
+                }
+                // The same name as the project's stem keeps the project (a made-up one keeps its timestamp).
+                if typed.as_str() != naming::stem(self.recording.project.as_str()) {
+                    self.recording.project = naming::ProjectName::from(typed.as_str());
+                }
+                self.editing = None;
+                let project = self.recording.project;
+                self.note(format_args!("project {}", project.as_str()));
+            }
         }
     }
 
@@ -919,11 +1002,15 @@ impl App {
             put(&mut slot, scale, SoftKind::Action, Action::MeterScale, false);
             put(&mut slot, "Inputs", SoftKind::Action, Action::Channels, self.picking.is_some());
             put(&mut slot, "Reset", SoftKind::Action, Action::Reset, false);
+        } else if self.page == Page::Recorder && self.editing.is_some() {
+            put(&mut slot, "Keep", SoftKind::Action, Action::Enter, false);
+            put(&mut slot, "Cancel", SoftKind::Action, Action::No, false);
         } else if self.page == Page::Recorder {
+            // Format and disk are panel rows to tap (and `f`, `d`); the project too, but it has a key of its own here.
             let running = self.recording.take.running;
             put(&mut slot, if running { "Stop" } else { "Record" }, SoftKind::Action, Action::Record, running);
-            put(&mut slot, self.recording.encoding.label(), SoftKind::Action, Action::Resolution, false);
-            put(&mut slot, "Next disk", SoftKind::Action, Action::NextDisk, false);
+            put(&mut slot, "Project", SoftKind::Action, Action::Pair, false);
+            put(&mut slot, "Arm all", SoftKind::Action, Action::Channels, false);
         }
         slot = SOFT_NAV + SOFT_ACTIONS;
         put(&mut slot, "Quit", SoftKind::Action, Action::Quit, false);
@@ -1292,6 +1379,10 @@ impl App {
             }
             return None;
         }
+        // While a name is typed only the soft keys (Keep, Cancel, the pages, Quit) answer a press.
+        if self.editing.is_some() && !matches!(hit, Hit::Soft(_)) {
+            return None;
+        }
         match hit {
             Hit::Soft(slot) => {
                 let key = self.soft_keys()[slot];
@@ -1332,6 +1423,17 @@ impl App {
                 if let Err(reason) = self.recording.toggle(input) {
                     self.note(format_args!("{reason}"));
                 }
+                None
+            }
+            Hit::RecRow(row) => {
+                let action = match row {
+                    RecRow::Project => Action::Pair,
+                    RecRow::Disk => Action::NextDisk,
+                    RecRow::Format => Action::Resolution,
+                    RecRow::Inputs => Action::Channels,
+                    _ => return None,
+                };
+                self.act(device, action);
                 None
             }
             Hit::InputControl(index, input) => {

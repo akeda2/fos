@@ -45,7 +45,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use kakelfix::channel::{Mailbox, Ring};
 use kakelfix::naming::{self, FileName, ProjectName, Stamp};
 use kakelfix::recorder::{Disk, Encoding, GROUP, MAX_DISKS, MAX_GROUPS, Request, Take, Volume, clock, describe_channels, duration, size};
-use kakelfix::{App, Layout, Rect, Recording, Text, fit_name};
+use kakelfix::{App, Layout, RecRow, Recording, Text, fit_name};
 use tape_rt::{AudioBuffer, AudioStats, DISK_EXFAT, DISK_FAT32, DISK_FOSFS, DiskInfo, FS_EXISTS, TapeApi, VFS_DIR, VFS_FILE, VfsVolume, alloc_bytes, alloc_zeroed};
 
 /// WAV disk writes: 256 KiB blocks (a multiple of the 512-byte sector; the `recorder` tape's size, which real USB sticks
@@ -919,31 +919,55 @@ pub fn draw(canvas: &mut Canvas, layout: &Layout, app: &App, bank: Option<&Bank>
     }
 }
 
-/// The take at the left: a large REC lamp and clock, then the file, the disk, the room left, the format, the warnings.
+/// The take at the left: a large REC lamp and take clock, then a row each (`RecRow`, the geometry `Layout::rec_row`, which
+/// taps use too): the file, the project, the disk, the room left, the format, the inputs, the wall clock, the writer, what
+/// was written, the warning that matters. Rows that can be tapped are framed, with a `>` at the right.
 fn panel(canvas: &mut Canvas, layout: &Layout, app: &App, threaded: bool) {
     let t = theme();
     let r = &app.recording;
     let panel = layout.rec_panel();
-    let area = Rect::new(panel.x + 4, panel.y + 8, panel.w - 8, panel.h - 8);
+    let (x0, y0) = (panel.x + 4, panel.y + 8);
     let big = layout.scale * 3;
-    let (big_col, big_row) = (8 * big as i32, 16 * big as i32);
+    let big_row = layout.rec_big();
     let running = r.take.running;
     let lamp = if running { t.red } else { t.off };
-    canvas.fill_rect(area.x, area.y + big_row / 4, (big_row / 2) as u32, (big_row / 2) as u32, lamp);
-    let x = area.x + big_row * 3 / 4;
-    canvas.text_scaled(x, area.y, if running { "REC" } else { "STOP" }, big, if running { t.red } else { t.dim });
+    canvas.fill_rect(x0, y0 + big_row / 4, (big_row / 2) as u32, (big_row / 2) as u32, lamp);
+    let x = x0 + big_row * 3 / 4;
+    canvas.text_scaled(x, y0, if running { "REC" } else { "STOP" }, big, if running { t.red } else { t.dim });
     let time = clock(r.take.frames, r.rate);
-    canvas.text_scaled(x + big_col * 5, area.y, time.as_str(), big, if running { t.text } else { t.dim });
-    let mut y = area.y + big_row + layout.row;
-    let mut line = Text::<96>::new();
-    let mut row = |canvas: &mut Canvas, label: &str, value: &str, colour: u32| {
-        text(canvas, layout, area.x, y, label, t.dim);
-        let room = ((area.w - layout.col * 8) / layout.col).max(0) as usize;
+    canvas.text_scaled(x + 8 * big as i32 * 5, y0, time.as_str(), big, if running { t.text } else { t.dim });
+    let row = |canvas: &mut Canvas, which: RecRow, value: &str, colour: u32, frame: Option<u32>| {
+        let area = layout.rec_row(which);
+        let y = area.y + (area.h - layout.row) / 2;
+        let tappable = which.tappable();
+        if let Some(edge) = frame.or(tappable.then_some(t.frame)) {
+            canvas.fill_rect(area.x, area.y, area.w as u32, area.h as u32, t.grid);
+            canvas.rect(area.x, area.y, area.w as u32, area.h as u32, edge);
+        }
+        let label = match which {
+            RecRow::File => if running { "File" } else if r.take.files > 0 { "Last" } else { "Next" },
+            RecRow::Project => "Project",
+            RecRow::Disk => "Disk",
+            RecRow::Room => "Room",
+            RecRow::Format => "Format",
+            RecRow::Inputs => "Inputs",
+            RecRow::Clock => "Clock",
+            RecRow::Writer => "Writer",
+            RecRow::Written => "Written",
+            RecRow::Warning => "",
+        };
+        text(canvas, layout, area.x + layout.col / 2, y, label, t.dim);
+        let left = area.x + layout.col * 9;
+        let right = area.x + area.w - if tappable { layout.col * 2 } else { layout.col / 2 };
+        let room = ((right - left) / layout.col).max(0) as usize;
         let shown = value.char_indices().nth(room).map_or(value, |(end, _)| &value[..end]);
-        text(canvas, layout, area.x + layout.col * 8, y, shown, colour);
-        y += layout.row + 6;
+        text(canvas, layout, left, y, shown, colour);
+        if tappable {
+            text(canvas, layout, right, y, ">", t.dim);
+        }
     };
-    // The file: the one being written (the first of a take's files), else what the next take is called.
+    let mut line = Text::<96>::new();
+    // The file: the one being written (the first of a take's files), else what the next take's first file looks like.
     let (groups, count) = r.groups();
     if running || r.take.files > 0 {
         let _ = write!(line, "{}", r.take.file.as_str());
@@ -951,7 +975,6 @@ fn panel(canvas: &mut Canvas, layout: &Layout, app: &App, threaded: bool) {
             let _ = write!(line, " and {} more", r.take.files - 1);
         }
     } else {
-        // What the next take's first file looks like: `Konsert_takeNNN_<time>_in01-08.flac`.
         let project = if r.project.is_empty() { "<made up>" } else { naming::stem(r.project.as_str()) };
         let mask = groups[0];
         let (first, last) = (mask.trailing_zeros() + 1, 32 - mask.leading_zeros());
@@ -961,15 +984,23 @@ fn panel(canvas: &mut Canvas, layout: &Layout, app: &App, threaded: bool) {
         }
         let _ = write!(line, ".{}", r.extension());
         if count > 1 {
-            let _ = write!(line, " and {} more (8 inputs a file)", count - 1);
+            let _ = write!(line, " and {} more", count - 1);
         }
     }
-    row(canvas, if running { "File" } else if r.take.files > 0 { "Last" } else { "Next" }, line.as_str(), t.text);
+    row(canvas, RecRow::File, line.as_str(), t.text, None);
+    // The project, or the name being typed (amber, with a cursor).
     line.clear();
-    // Where: the root and the project (a made-up one is named at the first take).
-    let _ = write!(line, "{}{}/", r.target().map_or(Text::new(), Disk::prefix).as_str(), r.root());
-    let _ = if r.project.is_empty() { line.write_str("(made up at the first take)") } else { write!(line, "{}/", r.project.as_str()) };
-    row(canvas, "Project", line.as_str(), t.text);
+    match &app.editing {
+        Some(typed) => {
+            let _ = write!(line, "{}_", typed.as_str());
+            row(canvas, RecRow::Project, line.as_str(), t.amber, Some(t.amber));
+        }
+        None => {
+            let _ = write!(line, "{}{}/", r.target().map_or(Text::new(), Disk::prefix).as_str(), r.root());
+            let _ = if r.project.is_empty() { line.write_str("(made up at the first take)") } else { write!(line, "{}/", r.project.as_str()) };
+            row(canvas, RecRow::Project, line.as_str(), t.text, None);
+        }
+    }
     line.clear();
     match r.target() {
         Some(disk) => {
@@ -981,19 +1012,19 @@ fn panel(canvas: &mut Canvas, layout: &Layout, app: &App, threaded: bool) {
             if disk.boot {
                 let _ = line.write_str(" (boot)");
             }
-            row(canvas, "Disk", line.as_str(), if r.refusal().is_some() { t.amber } else { t.text });
+            row(canvas, RecRow::Disk, line.as_str(), if r.refusal().is_some() { t.amber } else { t.text }, None);
             line.clear();
             match r.seconds_left() {
                 Some(seconds) => {
                     let room = if running { disk.largest.saturating_sub(r.take.bytes) } else { disk.largest };
                     let _ = write!(line, "{}, {} at this format", size(room).as_str(), duration(seconds).as_str());
-                    row(canvas, "Room", line.as_str(), if seconds < 600 { t.amber } else { t.text });
+                    row(canvas, RecRow::Room, line.as_str(), if seconds < 600 { t.amber } else { t.text }, None);
                 }
-                None if r.refusal().is_some() => row(canvas, "Room", r.refusal().unwrap_or(""), t.amber),
-                None => row(canvas, "Room", "-", t.dim),
+                None if r.refusal().is_some() => row(canvas, RecRow::Room, r.refusal().unwrap_or(""), t.amber, None),
+                None => row(canvas, RecRow::Room, "-", t.dim, None),
             }
         }
-        None => row(canvas, "Disk", "no disk to record to", t.amber),
+        None => row(canvas, RecRow::Disk, "no disk to record to", t.amber, None),
     }
     line.clear();
     let mut source = Text::<16>::new();
@@ -1006,28 +1037,43 @@ fn panel(canvas: &mut Canvas, layout: &Layout, app: &App, threaded: bool) {
             write!(line, "FLAC {bits}-bit {} Hz{}", r.rate, if dither { ", dithered" } else { "" })
         }
     };
-    row(canvas, "Format", line.as_str(), t.text);
+    row(canvas, RecRow::Format, line.as_str(), t.text, None);
     line.clear();
     describe_channels(r.armed & r.all(), r.channels.min(32), &mut line);
     let _ = write!(line, " ({} of {})", r.armed_count(), r.channels);
-    row(canvas, "Inputs", line.as_str(), t.text);
-    row(canvas, "Writer", if threaded { "own thread (encodes and writes)" } else { "inline (no tape threads here)" }, t.dim);
+    row(canvas, RecRow::Inputs, line.as_str(), t.text, None);
+    // The wall clock names the takes: amber when it looks never set (an RTC from the factory says 2000 or so).
+    line.clear();
+    match tape_rt::wall_clock() {
+        Some(c) => {
+            let now = Stamp { year: c.year, month: c.month, day: c.day, hour: c.hour, minute: c.minute, second: c.second };
+            let _ = line.write_str(now.display().as_str());
+            if now.plausible() {
+                row(canvas, RecRow::Clock, line.as_str(), t.text, None);
+            } else {
+                let _ = line.write_str(": not set? takes are named by it (date set)");
+                row(canvas, RecRow::Clock, line.as_str(), t.amber, None);
+            }
+        }
+        None => row(canvas, RecRow::Clock, "no wall clock: takes are named 0000-00-00", t.amber, None),
+    }
+    row(canvas, RecRow::Writer, if threaded { "own thread (encodes and writes)" } else { "inline (no tape threads here)" }, t.dim, None);
     if running || r.take.files > 0 {
         line.clear();
         let _ = write!(line, "{}", size(r.take.bytes).as_str());
         if r.take.kib_per_second > 0 {
             let _ = write!(line, ", disk {} KiB/s, slowest {} ms", r.take.kib_per_second, r.take.worst_ms);
         }
-        row(canvas, "Written", line.as_str(), t.text);
+        row(canvas, RecRow::Written, line.as_str(), t.text, None);
     }
     // What matters most when audio cannot be taken twice: lost audio, then a disk falling behind.
     line.clear();
     if r.take.overruns > 0 {
         let _ = write!(line, "AUDIO LOST: {} overrun(s), the disk did not keep up", r.take.overruns);
-        row(canvas, "", line.as_str(), t.red);
+        row(canvas, RecRow::Warning, line.as_str(), t.red, None);
     } else if running && r.take.backlog_percent >= 25 {
         let _ = write!(line, "disk falling behind: {}% of the capture ring waits", r.take.backlog_percent);
-        row(canvas, "", line.as_str(), t.amber);
+        row(canvas, RecRow::Warning, line.as_str(), t.amber, None);
     }
 }
 

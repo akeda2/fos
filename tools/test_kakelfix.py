@@ -23,7 +23,8 @@ Embedded kernel (writes made inline):
  - kakelfix again with `rec-format=wav rec-ch=2 rec-disk=ext2 rec-project=PROJECT-IN-CAPITALS rate=44100`: a take of
    input 2 alone, take002 of the same project (found ignoring case, which ext4 itself does not), ..._take002_TIME_in02.wav,
    one channel of loop0's 32-bit float at 48 kHz (44.1 kHz is not a rate loop0 lists, so capture falls back), holding the
-   tone; nothing else is on the volume
+   tone; then `p` and "Rec Live" typed (R and space start no take, the space is refused), Enter: the next take is
+   recordings/RecLive/take001_TIME/RecLive_take001_TIME_in02.wav; nothing else is on the volume
 Server kernel (writes go to the worker thread): `x`, then at once a lone Escape, which asks the tape to stop (`read_key`
 answers KEY_ABORT, `shell::request_stop`) rather than killing it, so it ends through the writer's join with `x` written; then `show`, at -smp 4.
 Then, on an image of its own: a Recorder take (`2`, `R`) on the Recorder's worker thread, ended by Escape while it still
@@ -321,6 +322,21 @@ def embedded():
             machine.pump(3)
             lit = toggle_take(machine, False)
             check(lit < 20, f"the WAV take stops ({lit} pixels)")
+            # A project typed on the page: `p`, the field cleared, "Rec Live" typed. `R` and space are only text here (no
+            # take starts; the space is refused), Enter keeps "RecLive", and the next take is that project's take001.
+            send(machine, b"p", 0.5)
+            for _ in range(24):
+                send(machine, b"\x7f", 0.05)
+            for key in b"Rec Live":
+                send(machine, bytes([key]), 0.25)
+            lit = lamp(machine, "typing.ppm")
+            check(lit < 20, f"R and space typed into the project field start no take ({lit} pixels)")
+            send(machine, b"\r", 0.5)
+            lit = toggle_take(machine, True)
+            check(lit >= 20, f"a take into the typed project starts ({lit} pixels)")
+            machine.pump(2)
+            lit = toggle_take(machine, False)
+            check(lit < 20, f"and stops ({lit} pixels)")
             pointer_to(machine, *QUIT)
             monitor(str(machine.monitor), "mouse_button 1")
             machine.pump(0.3)
@@ -334,14 +350,16 @@ def embedded():
         tree.mkdir()
         subprocess.run([tool("debugfs"), "-R", f"rdump /recordings {tree}", str(ext)], check=True, capture_output=True)
         files = {str(path.relative_to(tree)): path for path in tree.rglob("*") if path.is_file()}
-        check([p.name for p in (tree / "recordings").iterdir()] == [project], f"one project folder, recordings/{project}", str(sorted(files)))
+        check(sorted(p.name for p in (tree / "recordings").iterdir()) == sorted([project, "RecLive"]), f"two project folders, {project} and RecLive", str(sorted(files)))
         stamp = r"\d{4}-\d\d-\d\d_\d{6}"
         stem = project.rsplit("_", 2)[0]
         flac_name = next((name for name in files if re.fullmatch(rf"recordings/{project}/take001_({stamp})/{stem}_take001_\1_in01-02\.flac", name)), None)
         check(flac_name, f"the FLAC take is take001_TIME/{stem}_take001_TIME_in01-02.flac, one timestamp in its name", str(sorted(files)))
         wav_name = next((name for name in files if re.fullmatch(rf"recordings/{project}/take002_({stamp})/{stem}_take002_\1_in02\.wav", name)), None)
         check(wav_name, "the WAV take is take002 of the same project, though named in capitals", str(sorted(files)))
-        check(len(files) == 2, f"nothing else was written ({len(files)} files)", str(sorted(files)))
+        typed = next((name for name in files if re.fullmatch(rf"recordings/RecLive/take001_({stamp})/RecLive_take001_\1_in02\.wav", name)), None)
+        check(typed, "the typed project RecLive (R kept, the space refused) holds its take001", str(sorted(files)))
+        check(len(files) == 3, f"nothing else was written ({len(files)} files)", str(sorted(files)))
         extents = subprocess.run([tool("debugfs"), "-R", f"ex /{flac_name}", str(ext)], capture_output=True, text=True).stdout
         pieces = len([line for line in extents.splitlines() if re.match(r"\s*\d+/\s*\d+", line)])
         check(1 <= pieces <= 3, f"the FLAC file is {pieces} extent(s): written in one piece", extents[-600:])

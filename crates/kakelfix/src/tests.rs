@@ -346,7 +346,7 @@ fn soft_keys_follow_the_page_and_tab_cycles_its_views() {
     let quit = layout.soft(&app, 10);
     assert!(quit.y > empty.y + empty.h, "a gap before Quit");
     app.act(&mut device, Action::Page(Page::Recorder));
-    assert_eq!(labels(&app), ["Mixer", "Recorder", "Analyzer", "Meters", "", "", "", "Record", "FLAC 24", "Next disk", "Quit"]);
+    assert_eq!(labels(&app), ["Mixer", "Recorder", "Analyzer", "Meters", "", "", "", "Record", "Project", "Arm all", "Quit"]);
     let gap = layout.soft(&app, 5);
     app.press(&mut device, &layout, gap.x + 1, gap.y + 1);
     assert!(!app.quit, "an empty slot does nothing");
@@ -803,7 +803,6 @@ fn recorder_flac_groups_eight_inputs_a_file() {
     assert_eq!(r.encoding, recorder::Encoding::Wav);
     assert_eq!(r.groups().1, 1);
     assert_eq!(r.extension(), "wav");
-    assert_eq!(app.soft_keys()[SOFT_NAV + 1].label, "WAV");
     app.recording.take.running = true;
     app.act(&mut device, Action::Resolution);
     assert_eq!(app.message.as_str(), "stop the take to change the format");
@@ -1076,4 +1075,100 @@ fn project_and_root_names_are_plain_ascii() {
     let unset = Stamp { year: 2000, month: 1, day: 1, ..Stamp::default() };
     assert!(!unset.plausible());
     assert!(Stamp { year: 2026, month: 11, day: 20, hour: 23, minute: 59, second: 59 }.plausible());
+}
+
+#[test]
+fn the_project_is_typed_with_every_key_going_to_the_field() {
+    let mut device = Fake::new();
+    let mut app = recorder_app(&mut device);
+    app.recording.project = naming::ProjectName::from("keen-gull_2026-11-20_2216");
+    app.act(&mut device, Action::Pair);
+    assert_eq!(app.editing, Some(Text::from("keen-gull")), "the field starts with the stem");
+    assert_eq!((app.soft_keys()[SOFT_NAV].label, app.soft_keys()[SOFT_NAV + 1].label), ("Keep", "Cancel"));
+    // Enter with the stem unchanged keeps the made-up project, timestamp and all.
+    app.act(&mut device, Action::Enter);
+    assert_eq!((app.editing.is_none(), app.recording.project.as_str()), (true, "keen-gull_2026-11-20_2216"));
+    app.act(&mut device, Action::Pair);
+    for _ in 0..9 {
+        app.type_project(Edit::Erase);
+    }
+    // Shortcut letters and space are text or refused here, never a take.
+    for c in b"Ra dio" {
+        app.type_project(Edit::Char(*c));
+    }
+    assert_eq!((app.editing.unwrap().as_str(), app.recording.request), ("Radio", None));
+    app.type_project(Edit::Char(b'.'));
+    assert_eq!(app.message.as_str(), "only A-Z a-z 0-9 - _ (names travel to other systems)");
+    for c in b"-Konsert-2026-ABCDEF" {
+        app.type_project(Edit::Char(*c));
+    }
+    assert_eq!(app.editing.unwrap().as_str().len(), naming::MAX_PROJECT, "it stops at 20");
+    app.type_project(Edit::Cancel);
+    assert_eq!(app.recording.project.as_str(), "keen-gull_2026-11-20_2216", "Tab cancels");
+    app.act(&mut device, Action::Pair);
+    for _ in 0..9 {
+        app.type_project(Edit::Erase);
+    }
+    for c in b"-x" {
+        app.type_project(Edit::Char(*c));
+    }
+    app.type_project(Edit::Keep);
+    assert_eq!(app.message.as_str(), "a project name starts with a letter or a digit");
+    assert!(app.editing.is_some(), "still typing");
+    app.type_project(Edit::Erase);
+    app.type_project(Edit::Erase);
+    for c in b"Konsert" {
+        app.type_project(Edit::Char(*c));
+    }
+    app.act(&mut device, Action::Enter);
+    assert_eq!(app.recording.project.as_str(), "Konsert");
+    assert_eq!(app.recording.persisted().3.as_str(), "Konsert", "saved with the rest");
+    // An empty name: none, made up at the next take.
+    app.act(&mut device, Action::Pair);
+    for _ in 0..7 {
+        app.type_project(Edit::Erase);
+    }
+    app.type_project(Edit::Keep);
+    assert!(app.recording.project.is_empty());
+    // A page switch ends typing; during a take the project is locked.
+    app.act(&mut device, Action::Pair);
+    app.act(&mut device, Action::Page(Page::Meters));
+    assert!(app.editing.is_none() && app.page == Page::Meters);
+    app.act(&mut device, Action::Page(Page::Recorder));
+    app.recording.take.running = true;
+    app.act(&mut device, Action::Pair);
+    assert_eq!((app.editing.is_none(), app.message.as_str()), (true, "stop the take to change the project"));
+}
+
+#[test]
+fn recorder_panel_rows_are_buttons() {
+    let mut device = Fake::new();
+    let mut app = recorder_app(&mut device);
+    let layout = Layout::new(1280, 720);
+    app.recording.choose_disk(None);
+    let tap = |app: &mut App, device: &mut Fake, row: RecRow| {
+        let area = layout.rec_row(row);
+        assert_eq!(layout.hit(app, area.x + 4, area.y + area.h / 2), if row.tappable() { Hit::RecRow(row) } else { Hit::Nothing });
+        app.press(device, &layout, area.x + 4, area.y + area.h / 2);
+    };
+    tap(&mut app, &mut device, RecRow::Format);
+    assert_eq!(app.recording.encoding, recorder::Encoding::Flac(20));
+    tap(&mut app, &mut device, RecRow::Disk);
+    assert_eq!(app.recording.target().unwrap().name().as_str(), "disk1", "the next disk (wraps)");
+    app.recording.armed = 1;
+    tap(&mut app, &mut device, RecRow::Inputs);
+    assert_eq!(app.recording.armed_count(), 4);
+    tap(&mut app, &mut device, RecRow::Room);
+    tap(&mut app, &mut device, RecRow::Project);
+    assert!(app.editing.is_some());
+    // While typing, the panel and the arm buttons do nothing; the soft keys still answer.
+    tap(&mut app, &mut device, RecRow::Format);
+    assert_eq!(app.recording.encoding, recorder::Encoding::Flac(20));
+    let cancel = layout.soft(&app, SOFT_NAV + 1);
+    app.press(&mut device, &layout, cancel.x + 2, cancel.y + 2);
+    assert!(app.editing.is_none());
+    // Rows sit under the REC lamp, inside the panel, one after another, a finger high.
+    let (first, last) = (layout.rec_row(RecRow::File), layout.rec_row(RecRow::Warning));
+    assert!(first.y > layout.rec_panel().y + layout.rec_big() && last.y + last.h <= layout.rec_panel().y + layout.rec_panel().h);
+    assert!(first.h >= layout.row * 2 - 4);
 }

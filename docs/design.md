@@ -1857,7 +1857,9 @@ mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path 
   take's four FLAC files do not alternate extent by extent, `docs/ext4.md` "Placement"); rack's boot disk offers both.
   The default: exFAT, else a writable ext volume, else the boot disk, refused with a reason
   (`d` or Next disk steps; `rec-disk=ext1|disk3`, an old bare number is a disk). At the left the take's status:
-  a REC lamp and clock, file, project, disk, the room left in the longest free run as time at this format, the format, the armed inputs,
+  a REC lamp and clock, then rows (`layout::RecRow`, two text rows tall for a finger; the same geometry draws and hit-tests)
+  of file, project, disk, the room left in the longest free run as time at this format, the format, the armed inputs,
+  the wall clock (amber when it looks never set: it names the takes),
   bytes written with the disk's speed and slowest write, and the warnings that matter for audio that cannot be taken twice
   (capture overruns since the take began, red; a capture ring more than a quarter full, amber). At the right, one large peak meter
   per input (the Meters page's `Bank`, sample peak or Nordic PPM with Tab or `s`, `gfx::meter` bars with hold and clip, as the
@@ -1868,7 +1870,15 @@ mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path 
   runs*, so a take goes on under the Mixer or Analyzer page, with "REC mm:ss" in red in every page's header. Quitting
   (Esc, Quit) finishes the files cleanly. The capture ring is asked for at up to 256 MiB (`audio_set_capture_ring`, leaving
   256 MiB free), which absorbs disk writes, encoding and frames drawn meanwhile. Next: a count of float samples off the 24-bit grid, pre-roll and the sound/silence trigger
-  (`audio_rec::preroll`, `silence`), typing the project on the page, touch buttons, the clock on the panel. WavPack (lossless float, more than 8 channels a file) is
+  (`audio_rec::preroll`, `silence`).
+  **Touch and typing**: the Project, Disk, Format and Inputs rows are framed buttons (type the project, next disk, next
+  format, arm all); the action soft keys are Record/Stop, Project and Arm all. `p` (or the row, or the soft key) types the
+  project: every key then goes to the field (`App::type_project`), so `R` and space are text, not a take; only
+  A-Z a-z 0-9 - _ are taken (a space or another character is refused with a word), at most 20; Enter keeps (empty: none,
+  made up at the next take; the stem unchanged keeps a made-up project's timestamp), Tab cancels; the soft keys are Keep
+  and Cancel, other taps do nothing, a page switch cancels. Escape still quits the tape: the kernel turns it into a stop
+  request (on the server kernel a second one kills), so it cannot mean "cancel". Refused during a take. There is no
+  on-screen keyboard: kakelfix is started from a keyboard (or serial, `term net`) anyway. WavPack (lossless float, more than 8 channels a file) is
   not in the tree; its BSD licence allows vendoring it as libopus is, if a 32-bit float interface needs it.
 - **Test**: `make test-kakelfix` on the loopback: `show` reads the identity mix; in the tape `x` switches the first strip off and a
   mouse click half way up its fader sets -9 dB; with a `play` service playing a tone into loop0, `3` opens the Analyzer and its
@@ -1879,7 +1889,8 @@ mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path 
   channels, 48 kHz, 24 bits and seconds of samples, passes the reference `flac -t` (frame CRCs, MD5) and decodes to the tone
   (its length is not the take's wall time: with a listener loop0 has no clock and `play` runs as fast as the capture
   drains); a second run with `rec-format=wav rec-ch=2 rec-project=` the same name in capitals makes the same project's
-  take002, `..._in02.wav`, input 2 alone as 32-bit float; on the server kernel a take on the worker thread
+  take002, `..._in02.wav`, input 2 alone as 32-bit float, then `p` and "Rec Live" typed (no take starts, the space is
+  refused) and Enter make the next take `recordings/RecLive/take001_TIME/`; on the server kernel a take on the worker thread
   ended by Escape mid-take is saved ("written on its own thread") on an exFAT disk from `mkfs.exfat`, in
   `fos/takes/mf-test/take001_TIME/`, as a FLAC `flac -t` passes, the volume `fsck.exfat`-clean (with no samples: that kernel
   lets one process own audio, so no `play` can feed loop0 there); `3`, Up then a click on the Quit soft key at once must leave `an-span=30` and an `mt-scale` in `kakelfix.cfg`; `show` reads the result. Then on the server

@@ -18,7 +18,7 @@ use fosfor_abi::tape::{
 use instrument_rt::{TouchTarget, Touches};
 use core::fmt::Write;
 use core::sync::atomic::Ordering;
-use kakelfix::{Action, App, Device, Grab, Layout, Link, Page, Queued, Shape, View};
+use kakelfix::{Action, App, Device, Edit, Grab, Layout, Link, Page, Queued, Shape, View};
 use mixer_model::{Group, lin_to_db};
 use tape_rt::mixer::Mixer;
 use tape_rt::{Key, KeyDecoder, TapeApi, print, println};
@@ -61,9 +61,11 @@ L pan law, Enter open (Matrix) or change (Device), y n answer, Esc quits.
 Analyzer: Tab view, Left/Right or , . input pair, Up/Down span, space
 freeze, w envelope/scope, d dB/linear, f resolution, r reset.
 Recorder: R or space record/stop (R on any page), Left/Right input, Enter
-arm it, a arm all, f format, d next disk, Tab or s dBFS/PPM, r reset; tap an
-input's REC button to arm it. A take goes on while other pages are shown;
-Esc ends it cleanly.
+arm it, a arm all, f format, d next disk, p type the project (every key is
+text then: Enter keeps, Tab cancels, empty = made up), Tab or s dBFS/PPM, r
+reset; tap an input's REC button to arm it, tap the Project, Disk, Format or
+Inputs row to change it. A take goes on while other pages are shown; Esc
+ends it cleanly.
 Meters: Left/Right input, Up/Down or + - gain, h +48V, i other switch,
 Tab or s scale, r reset (holds, clip, loudness), a pick the inputs shown
 (arrows move, Enter or space picks, a or n closes).
@@ -168,6 +170,18 @@ fn shape(mixer: &Mixer) -> Shape {
         masters: info.flags & MIXER_HAS_MASTERS != 0,
         controls: info.controls as usize,
     }
+}
+
+/// A key while the project name is typed: every character is text (Escape is not a key here: the kernel turns it into
+/// a stop request, and the tape quits cleanly as always).
+fn edit(key: Key) -> Option<Edit> {
+    Some(match key {
+        Key::Char(c) => Edit::Char(c),
+        Key::Backspace | Key::Delete => Edit::Erase,
+        Key::Enter => Edit::Keep,
+        Key::Tab => Edit::Cancel,
+        _ => return None,
+    })
 }
 
 fn action(key: Key) -> Option<Action> {
@@ -303,7 +317,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         let mut count = 0;
         let keep_going = poll_keys(api, &mut decoder, |key| {
             if count < keys.len() {
-                keys[count] = action(key);
+                keys[count] = Some(key);
                 count += 1;
             }
         });
@@ -311,8 +325,15 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             // Through the quit check below, so a pending save is written first.
             app.quit = true;
         }
-        for action in keys[..count].iter().flatten() {
-            app.act(&mut hardware, *action);
+        // Each key is mapped as it comes: one that starts or ends typing changes what the next one is.
+        for &key in keys[..count].iter().flatten() {
+            if app.editing.is_some() {
+                if let Some(edit) = edit(key) {
+                    app.type_project(edit);
+                }
+            } else if let Some(action) = action(key) {
+                app.act(&mut hardware, action);
+            }
             screen.mark_dirty();
         }
         let mut pointing = Pointing { app: &mut app, hardware: &mut hardware, layout: &layout };
@@ -362,6 +383,10 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         if now.wrapping_sub(last_tick) >= 100_000 {
             last_tick = now;
             if app.tick(&mut hardware) {
+                screen.mark_dirty();
+            }
+            // The Recorder's panel shows the wall clock.
+            if app.page == Page::Recorder {
                 screen.mark_dirty();
             }
         }
