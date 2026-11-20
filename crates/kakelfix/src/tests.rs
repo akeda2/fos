@@ -734,14 +734,13 @@ fn disk(number: usize, volume: recorder::Volume, boot: bool, largest: u64) -> re
     recorder::Disk { number, volume, boot, largest, free: largest, ..recorder::Disk::EMPTY }
 }
 
-/// A recorder app with four inputs and three disks (the boot FOSFS disk, a spare FOSFS disk, an exFAT stick).
+/// A recorder app with four inputs and three disks (the boot FOSFS disk, an ext4 disk, an exFAT stick).
 fn recorder_app(device: &mut Fake) -> App {
     let mut app = app(device);
     let r = &mut app.recording;
     r.channels = 4;
-    r.base = Text::from("take");
     r.disks[0] = disk(1, recorder::Volume::Fosfs, true, 1 << 30);
-    r.disks[1] = disk(2, recorder::Volume::Fosfs, false, 1 << 30);
+    r.disks[1] = recorder::Disk { writable: true, ..disk(2, recorder::Volume::Ext, false, 1 << 30) };
     r.disks[2] = disk(3, recorder::Volume::Exfat, false, 10 << 30);
     r.disk_count = 3;
     r.fix();
@@ -750,25 +749,33 @@ fn recorder_app(device: &mut Fake) -> App {
 }
 
 #[test]
-fn recorder_prefers_exfat_then_a_spare_disk_then_boot() {
+fn recorder_prefers_exfat_then_ext_and_never_fosfs_or_fat32() {
     let mut device = Fake::new();
     let mut app = recorder_app(&mut device);
     let r = &mut app.recording;
     r.choose_disk(None);
-    assert_eq!(r.target().unwrap().number, 3);
+    assert_eq!(r.target().unwrap().name().as_str(), "disk3");
+    r.choose_disk(Some("ext2"));
+    assert_eq!(r.target().unwrap().name().as_str(), "ext2", "the saved volume wins");
+    // FOSFS is listed but never chosen, not even when it was saved (or named by an old bare number).
     r.choose_disk(Some("1"));
-    assert_eq!(r.target().unwrap().number, 1, "the saved disk wins (an old bare number is a disk)");
+    assert_eq!(r.target().unwrap().name().as_str(), "disk3");
+    r.disk = 0;
+    assert_eq!(r.refusal(), Some("FOSFS is not used for recordings: exFAT or ext4"));
     r.disks[2].volume = recorder::Volume::None;
     r.choose_disk(None);
-    assert_eq!(r.target().unwrap().number, 2, "not the boot disk when another FOSFS disk is there");
-    r.choose_disk(Some("disk3"));
+    assert_eq!(r.target().unwrap().name().as_str(), "ext2");
+    r.disk = 2;
     assert_eq!(r.refusal(), Some("that disk has no volume (format it first)"));
-    // FAT32 is listed but never chosen, not even when it was saved.
     r.disks[2].volume = recorder::Volume::Fat32;
     r.choose_disk(Some("disk3"));
-    assert_eq!(r.target().unwrap().number, 2);
+    assert_eq!(r.target().unwrap().name().as_str(), "ext2");
     r.disk = 2;
-    assert_eq!(r.refusal(), Some("FAT32 is not used for recordings: exFAT"));
+    assert_eq!(r.refusal(), Some("FAT32 is not used for recordings: exFAT or ext4"));
+    // Neither exFAT nor ext: the boot disk is shown, and refused.
+    r.disks[1].volume = recorder::Volume::Fosfs;
+    r.choose_disk(None);
+    assert_eq!((r.target().unwrap().number, r.refusal()), (1, Some("FOSFS is not used for recordings: exFAT or ext4")));
 }
 
 #[test]
@@ -781,17 +788,13 @@ fn recorder_flac_groups_eight_inputs_a_file() {
     let (groups, count) = r.groups();
     assert_eq!(count, 4, "30 inputs are four files");
     assert_eq!(groups[..4], [0xff, 0xff00, 0xff_0000, 0x3f00_0000]);
-    assert_eq!(r.file_name("disk3/", 7, groups[1], count).as_str(), "disk3/take007-9-16.flac");
-    assert_eq!(r.file_name("disk3/", 7, groups[3], count).as_str(), "disk3/take007-25-30.flac");
     // Gaps: the 8 armed inputs, not 8 numbers, make a group.
     r.armed = 0b1010_1010_1010_1010_1010;
     let (groups, count) = r.groups();
     assert_eq!((count, groups[0], groups[1]), (2, 0b1010_1010_1010_1010, 0b1010_0000_0000_0000_0000));
-    assert_eq!(r.file_name("", 1, groups[1], count).as_str(), "take001-18-20.flac");
-    // Up to 8: one file without a suffix. WAV: always one file, the device's samples.
+    // Up to 8: one file. WAV: always one file, the device's samples.
     r.armed = 0b11;
-    let (groups, count) = r.groups();
-    assert_eq!((count, r.file_name("disk1/", 1, groups[0], count).as_str()), (1, "disk1/take001.flac"));
+    assert_eq!(r.groups().1, 1);
     r.armed = (1 << 30) - 1;
     app.act(&mut device, Action::Resolution);
     app.act(&mut device, Action::Resolution);
@@ -799,7 +802,7 @@ fn recorder_flac_groups_eight_inputs_a_file() {
     let r = &app.recording;
     assert_eq!(r.encoding, recorder::Encoding::Wav);
     assert_eq!(r.groups().1, 1);
-    assert_eq!(r.file_name("", 2, r.groups().0[0], 1).as_str(), "take002.wav");
+    assert_eq!(r.extension(), "wav");
     assert_eq!(app.soft_keys()[SOFT_NAV + 1].label, "WAV");
     app.recording.take.running = true;
     app.act(&mut device, Action::Resolution);
@@ -932,17 +935,19 @@ fn recorder_settings_round_trip() {
     let disk = r.load(|key| match key {
         "rec-ch" => Some("1,3-4"),
         "rec-scale" => Some("nordic"),
-        "rec-name" => Some("gig"),
-        "rec-disk" => Some("disk2"),
+        "rec-project" => Some("Gig-at-Ritz"),
+        "rec-disk" => Some("ext2"),
         _ => None,
     });
     r.choose_disk(disk);
-    assert_eq!((r.armed, r.nordic, r.base.as_str(), r.target().unwrap().number), (0b1101, true, "gig", 2));
-    let mut saved = Text::<96>::new();
+    assert_eq!((r.armed, r.nordic, r.project.as_str(), r.root(), r.target().unwrap().number), (0b1101, true, "Gig-at-Ritz", "recordings", 2));
+    let mut saved = Text::<160>::new();
     r.save(|key, value| {
         let _ = write!(saved, "{key}={value} ");
     });
-    assert_eq!(saved.as_str(), "rec-ch=1,3-4 rec-disk=disk2 rec-scale=nordic rec-name=gig rec-format=flac rec-bits=24 ");
+    assert_eq!(saved.as_str(), "rec-ch=1,3-4 rec-disk=ext2 rec-scale=nordic rec-project=Gig-at-Ritz rec-root=recordings rec-format=flac rec-bits=24 ");
+    r.load(|key| (key == "rec-root").then_some("fos/takes"));
+    assert_eq!(r.root(), "fos/takes");
     r.load(|key| match key {
         "rec-format" => Some("flac"),
         "rec-bits" => Some("16"),
@@ -956,11 +961,19 @@ fn recorder_settings_round_trip() {
     // Bad values leave things as they were.
     r.load(|key| match key {
         "rec-ch" => Some("5"),
-        "rec-name" => Some("Too-Long-Name"),
+        "rec-project" => Some("Gig at Ritz"),
+        "rec-root" => Some("/abs"),
         _ => None,
     });
-    assert_eq!((r.armed, r.base.as_str()), (0b1101, "gig"));
-    assert!(recorder::valid_base("take_1") && !recorder::valid_base("Take") && !recorder::valid_base(""));
+    assert_eq!((r.armed, r.project.as_str(), r.root()), (0b1101, "Gig-at-Ritz", "recordings"), "a bad root is the default");
+    // No project yet: none is saved, and the next take makes one up.
+    r.project.clear();
+    let mut saved = Text::<160>::new();
+    r.save(|key, _| {
+        let _ = write!(saved, "{key} ");
+    });
+    assert!(!saved.as_str().contains("rec-project"));
+    assert_eq!(r.refusal(), None);
 }
 
 #[test]
@@ -994,14 +1007,13 @@ fn recorder_ext_volumes_are_targets_of_their_own() {
     let mut device = Fake::new();
     let mut app = recorder_app(&mut device);
     let r = &mut app.recording;
-    r.disks[1] = recorder::Disk { volume: recorder::Volume::Ext, ..disk(1, recorder::Volume::Fosfs, true, 200 << 30) };
-    r.disks[2] = disk(3, recorder::Volume::Fosfs, false, 1 << 30);
+    r.disks[1] = recorder::Disk { volume: recorder::Volume::Ext, writable: true, ..disk(1, recorder::Volume::Fosfs, true, 200 << 30) };
+    r.disks[2] = disk(3, recorder::Volume::Fat32, false, 1 << 30);
     r.choose_disk(None);
-    assert_eq!(r.target().unwrap().name().as_str(), "ext1", "a writable ext volume before FOSFS");
+    assert_eq!(r.target().unwrap().name().as_str(), "ext1", "a writable ext volume, not the same disk's FOSFS");
     assert_eq!(r.target().unwrap().prefix().as_str(), "ext1/");
     r.choose_disk(Some("disk1"));
-    assert_eq!((r.target().unwrap().name().as_str(), r.target().unwrap().volume), ("disk1", recorder::Volume::Fosfs), "the same disk's FOSFS volume, by name");
-    r.choose_disk(Some("ext1"));
+    assert_eq!(r.target().unwrap().name().as_str(), "ext1", "the same disk's FOSFS volume is not a target");
     let mut saved = Text::<96>::new();
     r.save(|key, value| {
         if key == "rec-disk" {
@@ -1012,7 +1024,56 @@ fn recorder_ext_volumes_are_targets_of_their_own() {
     // An ext volume the writer cannot keep up with is listed, never chosen, and refused when asked for.
     r.disks[1].writable = false;
     r.choose_disk(None);
-    assert_eq!(r.target().unwrap().name().as_str(), "disk3");
+    assert_eq!(r.target().unwrap().name().as_str(), "disk1", "nothing to record to: the boot disk, refused");
     r.choose_disk(Some("ext1"));
     assert_eq!(r.refusal(), Some("fos cannot write that ext volume (its features)"));
+}
+
+#[test]
+fn takes_are_named_with_one_timestamp_a_file() {
+    use naming::*;
+    let now = Stamp { year: 2026, month: 11, day: 20, hour: 14, minute: 35, second: 12 };
+    assert_eq!(take_folder(7, &now).as_str(), "take007_2026-11-20_143512");
+    assert_eq!(file_name("Konsert", 7, &now, 0xff, "flac").as_str(), "Konsert_take007_2026-11-20_143512_in01-08.flac");
+    assert_eq!(file_name("Konsert", 7, &now, 0x3f00_0000, "flac").as_str(), "Konsert_take007_2026-11-20_143512_in25-30.flac");
+    assert_eq!(file_name("Konsert", 12, &now, 0b10, "wav").as_str(), "Konsert_take012_2026-11-20_143512_in02.wav");
+    // A made-up project: two words and the minute; its files carry the take's timestamp only.
+    let made = made_up_project(0x0102, &now);
+    assert_eq!(made.as_str(), "calm-finch_2026-11-20_1435");
+    assert!(valid_project_folder(made.as_str()));
+    assert_eq!(stem(made.as_str()), "calm-finch");
+    assert_eq!(file_name(made.as_str(), 1, &now, 0b11, "flac").as_str(), "calm-finch_take001_2026-11-20_143512_in01-02.flac");
+    assert_eq!(stem("Konsert"), "Konsert");
+    assert_eq!(stem("Live_2026-11-20_143512"), "Live", "a typed name ending in a take-length stamp too");
+    assert_eq!(stem("_2026-11-20_1435"), "_2026-11-20_1435", "nothing is left: kept");
+    // Every file name fits exFAT's 60 characters, the longest project and take number included.
+    let longest = file_name("ABCDEFGHIJKLMNOPQRST", MAX_TAKE, &now, 0xff00_0000, "flac");
+    assert!(longest.as_str().len() <= 60, "{} is {}", longest.as_str(), longest.as_str().len());
+    let path = join(&["disk99/", "abcdefghij/abcdefghij/abcdefghij/abcdefg", "ABCDEFGHIJKLMNOPQRST_2026-11-20_1435", take_folder(MAX_TAKE, &now).as_str(), longest.as_str()]);
+    assert!(path.as_str().len() < MAX_PATH && path.as_str().ends_with(".flac"), "{}", path.as_str());
+    assert_eq!(join(&["ext1/", "recordings", "Konsert"]).as_str(), "ext1/recordings/Konsert");
+}
+
+#[test]
+fn project_and_root_names_are_plain_ascii() {
+    use naming::*;
+    for good in ["Konsert", "gig-2", "A_b", "x", "ABCDEFGHIJKLMNOPQRST"] {
+        assert!(valid_project(good), "{good}");
+    }
+    for bad in ["", "-x", "_x", "with space", "räksmörgås", "a.b", "a/b", "ABCDEFGHIJKLMNOPQRSTU", ".."] {
+        assert!(!valid_project(bad), "{bad}");
+    }
+    assert!(valid_project_folder("amber-otter_2026-11-20_1435"));
+    assert!(!valid_project_folder("ABCDEFGHIJKLMNOPQRSTU_2026-11-20_1435"), "the stem is still at most 20");
+    for good in ["recordings", "fos/recordings", "A-1/b_2"] {
+        assert!(valid_root(good), "{good}");
+    }
+    for bad in ["", "/recordings", "recordings/", "a//b", "a b", "../x", "abcdefghij/abcdefghij/abcdefghij/abcdefghij/"] {
+        assert!(!valid_root(bad), "{bad}");
+    }
+    assert!(same_project("Konsert", "konsert") && !same_project("Konsert", "Konsert2"));
+    assert_eq!((take_number("take007_2026-11-20_143512"), take_number("take1234_x"), take_number("take12_x"), take_number("take12345_x"), take_number("takeout"), take_number("Konsert")), (Some(7), Some(1234), None, None, None, None));
+    let unset = Stamp { year: 2000, month: 1, day: 1, ..Stamp::default() };
+    assert!(!unset.plausible());
+    assert!(Stamp { year: 2026, month: 11, day: 20, hour: 23, minute: 59, second: 59 }.plausible());
 }

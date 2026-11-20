@@ -8,24 +8,30 @@ Embedded kernel (writes made inline):
  - `3` opens the Analyzer, which captures from loop0 while a `play` service plays a 1 kHz tone into it: the left
    channel's envelope (the first curve colour) grows in from the right edge of the upper lane; Quit there ends the tape
  - `4` opens the Meters page on the same capture: input 1's bar (x 81..105, Nordic PPM) lights for the tone; `3` goes back
- - A second disk holds an ext4 volume made by the host's mkfs.ext4 (journal, metadata_csum), which the Recorder prefers to
-   the FOSFS boot disk. `2` opens the Recorder; `R` starts a take of loop0's two inputs as FLAC 24, the default:
-   ext2/take001.flac. On the Analyzer page (`3`) the header's REC lamp stays lit, the take goes on; `2` and `R` stop it.
-   Afterwards e2fsck -fn passes the volume, and the file (out through debugfs): STREAMINFO says 2 channels, 48 kHz, 24
+ - A second disk holds an ext4 volume made by the host's mkfs.ext4 (journal, metadata_csum), the Recorder's target (FOSFS,
+   the boot disk, never is). `2` opens the Recorder; `R` starts a take of loop0's two inputs as FLAC 24, the default. No
+   project is set, so one is made up (two words, date, time), saved as rec-project: the file is
+   ext2/recordings/PROJECT/take001_TIME/STEM_take001_TIME_in01-02.flac, one timestamp in its own name. On the Analyzer
+   page (`3`) the header's REC lamp stays lit, the take goes on; `2` and `R` stop it. Afterwards e2fsck -fn passes the
+   volume, the tree comes out through debugfs rdump, and the FLAC: STREAMINFO says 2 channels, 48 kHz, 24
    bits and seconds of samples; the reference `flac` (when the host has it) tests it, MD5 included, and its decode holds
    the tone. (Not the take's wall-clock length: with a listener loop0 has no clock and `play` runs as fast as the capture
    drains, crates/kernel-core/src/loopback.rs.)
  - the Mixer's Device view, last row (the sample rate): Enter changes nothing, loop0 has 48 kHz only
  - Up (the 30 s span) right before Quit: the Analyzer's settings are in kakelfix.cfg afterwards (saved on quit), the
    Recorder's and the sample rate (rate=48000) too
- - kakelfix again with `rec-format=wav rec-ch=2 rec-disk=disk1 rate=44100` on the command line: a take of input 2 alone
-   on the FOSFS boot volume, disk1/take001.wav, one channel of loop0's 32-bit float at 48 kHz (44.1 kHz is not a rate
-   loop0 lists, so capture falls back), holding the tone
+ - kakelfix again with `rec-format=wav rec-ch=2 rec-disk=ext2 rec-project=PROJECT-IN-CAPITALS rate=44100`: a take of
+   input 2 alone, take002 of the same project (found ignoring case, which ext4 itself does not), ..._take002_TIME_in02.wav,
+   one channel of loop0's 32-bit float at 48 kHz (44.1 kHz is not a rate loop0 lists, so capture falls back), holding the
+   tone; nothing else is on the volume
 Server kernel (writes go to the worker thread): `x`, then at once a lone Escape, which asks the tape to stop (`read_key`
 answers KEY_ABORT, `shell::request_stop`) rather than killing it, so it ends through the writer's join with `x` written; then `show`, at -smp 4.
 Then, on an image of its own: a Recorder take (`2`, `R`) on the Recorder's worker thread, ended by Escape while it still
 records: the worker drains what it was given and closes the file before the join. The tape says the take was written on
-its own thread, and disk1/take001.flac in the image is a FLAC that `flac -t` passes. It holds no samples: the server
+its own thread. The take goes to an exFAT disk made by mkfs.exfat (`rec-project=mf-test rec-root=fos/takes`: the root
+two folders deep), through the stream calls into folders: fsck.exfat passes it, and
+fos/takes/mf-test/take001_TIME/mf-test_take001_TIME_in01-02.flac read out of the image is a FLAC that `flac -t`
+passes. It holds no samples: the server
 kernel lets one process own audio at a time (`kernel-mf/src/tapeaudio.rs`, AUDIO_BUSY), so no `play` can feed loop0
 while kakelfix captures; encoding real audio is the embedded run's, through the same worker code inline.
 QEMU's screen is 1280x800, so kakelfix's layout is at scale 1 (crates/kakelfix/src/layout.rs): soft-key slot 10 (Quit, on
@@ -48,7 +54,6 @@ from test_boot import TAG_DATA, check, monitor  # noqa: E402
 from term_net import TERM_TAG_SYSRQ as TAG_SYSRQ  # noqa: E402
 from test_debug_mode import Machine  # noqa: E402
 from test_gfx import screenshot  # noqa: E402
-from test_record import fosfs_files  # noqa: E402
 from test_usb_audio import write_wav  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -295,16 +300,21 @@ def embedded():
             send(machine, b"cat kakelfix.cfg\n", 1)
             saved = machine.text()[start:]
             check("an-span=30" in saved and "an-view=both" in saved and "mt-scale=" in saved, "the Analyzer's settings are saved in kakelfix.cfg", saved[-600:])
-            check("rec-ch=all" in saved and "rec-disk=ext2" in saved and "rec-name=take" in saved, "the Recorder's settings are saved too (the ext volume by name)", saved[-600:])
+            check("rec-ch=all" in saved and "rec-disk=ext2" in saved and "rec-root=recordings" in saved, "the Recorder's settings are saved too (the ext volume by name)", saved[-600:])
+            made = re.search(r"rec-project=([a-z]+-[a-z]+_\d{4}-\d\d-\d\d_\d{4})", saved)
+            check(made, "no project was set: the take made one up (two words, date, time) and it is saved", saved[-600:])
+            project = made.group(1)
             check("rec-format=flac" in saved and "rec-bits=24" in saved, "the format is saved: FLAC 24, the default", saved[-600:])
             check("rate=48000" in saved, "the Device page's sample rate is saved, 48 kHz (loop0 has no other)", saved[-600:])
             # Again with WAV and input 2 alone from the command line: the other writer, and the armed channel picked out. The
             # tone is started again: with a listener loop0 plays faster than real time, so the first run used most of it
-            # (if it still plays, the second `play` is refused and the first goes on).
+            # (if it still plays, the second `play` is refused and the first goes on). The project is named in capitals: it
+            # is the same project (ext4 itself would not say so), so the take is its take002.
             send(machine, b"run play device=loop0 tone.wav &0\n", 2)
             start = len(machine.text())
             # rate=44100 is not a rate loop0 offers: capture falls back to 48 kHz (the WAV says so below).
-            send(machine, b"run kakelfix device=loop0 rec-format=wav rec-ch=2 rec-disk=disk1 rate=44100\n", 4)
+            line = f"run kakelfix device=loop0 rec-format=wav rec-ch=2 rec-disk=ext2 rec-project={project.upper()} rate=44100\n"
+            send(machine, line.encode(), 4)
             send(machine, b"2", 1)
             lit = toggle_take(machine, True)
             check(lit >= 20, f"a WAV take starts ({lit} pixels)")
@@ -320,22 +330,73 @@ def embedded():
             machine.stop()
         fsck = subprocess.run([tool("e2fsck"), "-fn", str(ext)], capture_output=True, text=True)
         check(fsck.returncode == 0, "e2fsck -fn passes the ext volume after the take", (fsck.stdout + fsck.stderr)[-800:])
-        listing = subprocess.run([tool("debugfs"), "-R", "ls -l /", str(ext)], capture_output=True, text=True).stdout
-        check("take001.flac" in listing, "the first take is ext2/take001.flac", listing[-600:])
-        extents = subprocess.run([tool("debugfs"), "-R", "ex /take001.flac", str(ext)], capture_output=True, text=True).stdout
+        tree = Path(tmp) / "tree"
+        tree.mkdir()
+        subprocess.run([tool("debugfs"), "-R", f"rdump /recordings {tree}", str(ext)], check=True, capture_output=True)
+        files = {str(path.relative_to(tree)): path for path in tree.rglob("*") if path.is_file()}
+        check([p.name for p in (tree / "recordings").iterdir()] == [project], f"one project folder, recordings/{project}", str(sorted(files)))
+        stamp = r"\d{4}-\d\d-\d\d_\d{6}"
+        stem = project.rsplit("_", 2)[0]
+        flac_name = next((name for name in files if re.fullmatch(rf"recordings/{project}/take001_({stamp})/{stem}_take001_\1_in01-02\.flac", name)), None)
+        check(flac_name, f"the FLAC take is take001_TIME/{stem}_take001_TIME_in01-02.flac, one timestamp in its name", str(sorted(files)))
+        wav_name = next((name for name in files if re.fullmatch(rf"recordings/{project}/take002_({stamp})/{stem}_take002_\1_in02\.wav", name)), None)
+        check(wav_name, "the WAV take is take002 of the same project, though named in capitals", str(sorted(files)))
+        check(len(files) == 2, f"nothing else was written ({len(files)} files)", str(sorted(files)))
+        extents = subprocess.run([tool("debugfs"), "-R", f"ex /{flac_name}", str(ext)], capture_output=True, text=True).stdout
         pieces = len([line for line in extents.splitlines() if re.match(r"\s*\d+/\s*\d+", line)])
-        check(1 <= pieces <= 3, f"take001.flac is {pieces} extent(s): written in one piece", extents[-600:])
-        flac = Path(tmp) / "out-take001.flac"
-        subprocess.run([tool("debugfs"), "-R", f"dump /take001.flac {flac}", str(ext)], check=True, capture_output=True)
-        channels, rate, bits, total = take_flac(flac.read_bytes(), tmp, "take001.flac")
-        check((channels, rate, bits) == (2, 48000, 24), f"take001.flac is loop0's 2 channels, 48 kHz, 24 bits ({channels}, {rate}, {bits})")
-        check(total > 3 * rate, f"take001.flac holds seconds of samples ({total / rate:.1f} s in a {took:.1f} s take)")
-        files = fosfs_files(machine.image)
-        check("take001.wav" in files, "the WAV take is disk1/take001.wav, on the FOSFS boot volume", str(sorted(files)))
-        channels, rate, align, size, sound = take_wav(files["take001.wav"])
-        check((channels, rate, align) == (1, 48000, 4), f"take001.wav is input 2 alone, 32-bit float, 48 kHz though rate=44100 was asked ({channels}, {rate}, {align})")
-        check(size % align == 0 and size > 48000 * 4, f"take001.wav holds whole frames ({size / 192000:.1f} s)")
-        check(sound, "take001.wav holds the tone (not all zero)")
+        check(1 <= pieces <= 3, f"the FLAC file is {pieces} extent(s): written in one piece", extents[-600:])
+        channels, rate, bits, total = take_flac(files[flac_name].read_bytes(), tmp, "take001.flac")
+        check((channels, rate, bits) == (2, 48000, 24), f"the FLAC take is loop0's 2 channels, 48 kHz, 24 bits ({channels}, {rate}, {bits})")
+        check(total > 3 * rate, f"the FLAC take holds seconds of samples ({total / rate:.1f} s in a {took:.1f} s take)")
+        channels, rate, align, size, sound = take_wav(files[wav_name].read_bytes())
+        check((channels, rate, align) == (1, 48000, 4), f"the WAV take is input 2 alone, 32-bit float, 48 kHz though rate=44100 was asked ({channels}, {rate}, {align})")
+        check(size % align == 0 and size > 48000 * 4, f"the WAV take holds whole frames ({size / 192000:.1f} s)")
+        check(sound, "the WAV take holds the tone (not all zero)")
+
+
+def exfat_tree(path: Path):
+    """{"folder/name": bytes} of every file on an exFAT image, folders followed (contiguous or chained, through the FAT)."""
+    data = path.read_bytes()
+    fat_offset, _fat_length, heap_offset, _clusters, root = struct.unpack_from("<IIIII", data, 80)
+    sector_shift, cluster_shift = data[108], data[109]
+    cluster_bytes = 1 << (sector_shift + cluster_shift)
+
+    def cluster_at(number):
+        at = (heap_offset << sector_shift) + (number - 2) * cluster_bytes
+        return data[at:at + cluster_bytes]
+
+    def chain(first, size, contiguous):
+        if contiguous:
+            start = (heap_offset << sector_shift) + (first - 2) * cluster_bytes
+            return data[start:start + size]
+        body, number = b"", first
+        while 2 <= number < 0xfffffff8 and (size is None or len(body) < size):
+            body += cluster_at(number)
+            number = struct.unpack_from("<I", data, (fat_offset << sector_shift) + number * 4)[0]
+        return body if size is None else body[:size]
+
+    files = {}
+
+    def walk(directory, prefix):
+        index = 0
+        while index < len(directory) and directory[index] != 0:
+            entry = directory[index:index + 32]
+            if entry[0] != 0x85:
+                index += 32
+                continue
+            count, attributes = entry[1], struct.unpack_from("<H", entry, 4)[0]
+            stream = directory[index + 32:index + 64]
+            name = b"".join(directory[index + 64 + 32 * n + 2:index + 64 + 32 * n + 32] for n in range(count - 1)).decode("utf-16le")[:stream[3]]
+            flags, first, size = stream[1], struct.unpack_from("<I", stream, 20)[0], struct.unpack_from("<Q", stream, 24)[0]
+            body = chain(first, size, flags & 2) if first else b""
+            if attributes & 0x10:
+                walk(body, f"{prefix}{name}/")
+            else:
+                files[f"{prefix}{name}"] = body
+            index += 32 * (count + 1)
+
+    walk(chain(root, None, False), "")
+    return files
 
 
 def server():
@@ -411,10 +472,15 @@ def server_take(tmp):
     subprocess.run([sys.executable, str(ROOT / "tools/build_image.py"), "--loader", str(LOADER), "--kernel", str(MF_KERNEL), "--output", str(image),
                     "--bios-stage1", str(ROOT / "build/bios/stage1.bin"), "--bios-stage2", str(ROOT / "build/bios/stage2.bin"),
                     "--file", f"kakelfix={TAPE}"], check=True, capture_output=True)
+    # disk2: an exFAT volume as a PC makes it, which takes reach through the stream calls (FOSFS is not a target).
+    exfat = folder / "exfat.img"
+    exfat.write_bytes(bytes(64 << 20))
+    subprocess.run([tool("mkfs.exfat"), "-L", "takes", str(exfat)], check=True, capture_output=True)
     qemu = subprocess.Popen(
         ["qemu-system-x86_64", "-cpu", "max", "-machine", "q35", "-m", "1024", "-smp", "4", "-display", "none",
          "-nic", "user,model=e1000", "-serial", "stdio", "-monitor", "none", "-no-reboot",
-         "-drive", f"if=pflash,format=raw,readonly=on,file={CODE}", "-drive", f"format=raw,file={image}"],
+         "-drive", f"if=pflash,format=raw,readonly=on,file={CODE}", "-drive", f"format=raw,file={image}",
+         "-drive", f"format=raw,file={exfat}"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     log = b""
 
@@ -437,22 +503,26 @@ def server_take(tmp):
     try:
         check(wait_for("fos> ", 150), "mf take: shell prompt", log[-800:].decode("utf8", "replace"))
         mark = len(log)
-        type_text(b"tape kakelfix device=loop0 rec-disk=disk1\n", 4)
+        type_text(b"tape kakelfix device=loop0 rec-disk=disk2 rec-project=mf-test rec-root=fos/takes\n", 4)
         type_text(b"2", 1)
         type_text(b"R", 5)
         type_text(b"\x1b")
         done = wait_for("exited with code 0", 30, mark)
         text = log[mark:].decode("utf8", "replace")
         check(done, "mf take: Escape mid-take ends kakelfix cleanly", text[-800:])
-        check(re.search(r"kakelfix: saved disk1/take001\.flac, \S+ \(written on its own thread\)", text),
+        check(re.search(r"kakelfix: saved mf-test_take001_\d{4}-\d\d-\d\d_\d{6}_in01-02\.flac, \S+ \(written on its own thread\)", text),
               "mf take: the take was saved, written on the worker thread", text[-800:])
         check("CPU exception" not in text and "killed" not in text, "mf take: no fault, not killed", text[-800:])
     finally:
         qemu.kill()
         qemu.wait()
-    files = fosfs_files(image)
-    check("take001.flac" in files, "mf take: disk1/take001.flac is in the image", str(sorted(files)))
-    channels, rate, bits, total = take_flac(files["take001.flac"], folder, "mf-take001.flac", sound=False)
+    if Path(tool("fsck.exfat")).exists():
+        fsck = subprocess.run([tool("fsck.exfat"), "-n", str(exfat)], capture_output=True, text=True)
+        check(fsck.returncode == 0, "mf take: fsck.exfat finds the exFAT volume consistent", (fsck.stdout + fsck.stderr)[-800:])
+    files = exfat_tree(exfat)
+    name = next((name for name in files if re.fullmatch(r"fos/takes/mf-test/take001_(\d{4}-\d\d-\d\d_\d{6})/mf-test_take001_\1_in01-02\.flac", name)), None)
+    check(name, "mf take: fos/takes/mf-test/take001_TIME/mf-test_take001_TIME_in01-02.flac on the exFAT disk (root two deep)", str(sorted(files)))
+    channels, rate, bits, total = take_flac(files[name], folder, "mf-take001.flac", sound=False)
     check((channels, rate, bits) == (2, 48000, 24), f"mf take: 2 channels, 48 kHz, 24 bits ({total} samples: nothing plays into loop0)")
 
 

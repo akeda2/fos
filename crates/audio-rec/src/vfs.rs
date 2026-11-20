@@ -26,7 +26,8 @@ pub trait Files {
 /// What `open` offers as the file's largest size: no limit of its own (the volume's free space is the limit, and running
 /// out is a write error).
 pub const NO_LIMIT: u64 = u64::MAX / 2;
-const MAX_PATH: usize = 128;
+/// A path's length: KakelFix's `ROOT/PROJECT/TAKE/FILE` reaches 175 (`kakelfix::naming::MAX_PATH`); FOSFS's limit is 192 too.
+const MAX_PATH: usize = 192;
 /// A write that takes nothing at all is an error rather than a loop.
 const STALLED: i32 = -3;
 

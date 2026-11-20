@@ -15,6 +15,7 @@ pub mod analyzer;
 pub mod channel;
 pub mod layout;
 pub mod meters;
+pub mod naming;
 pub mod queue;
 pub mod recorder;
 

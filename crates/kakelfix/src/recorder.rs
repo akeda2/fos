@@ -1,24 +1,25 @@
 //! The Recorder page's state: which inputs are armed, the file format (FLAC at 16, 20 or 24 bits, or WAV in the device's own
-//! sample format), the disk the takes go to, the file name stem (`take` gives `take001.flac`, the next free number on that
-//! disk), and the state of the take as the tape reports it. FLAC holds at most 8 channels, so a take of more armed inputs is
-//! several files, the armed inputs in groups of 8 in input order (`take001-1-8.flac`, `take001-9-16.flac`, ...): four at
-//! most, which is what the kernel can keep open at once (`FS_STREAMS`). Recordings go to exFAT, ext4 or FOSFS, not FAT32. A
-//! disk can hold two volumes (rack's boot disk: FOSFS and ext4), so a target is a volume, named as the files on it are:
-//! `disk3` (FOSFS or FAT, `disk3/take001.flac`) or `ext1` (`ext1/take001.flac`). The take itself (capture, `audio_rec::Recorder`, the file calls) is the tape's: it
-//! reads `request`, acts on it and fills in `take`. A take keeps running when another page is shown.
+//! sample format), the disk the takes go to, the project and the root folder the projects are in (`naming`: a take is
+//! `ROOT/PROJECT/take007_2026-11-20_143512/`), and the state of the take as the tape reports it. FLAC holds at most 8
+//! channels, so a take of more armed inputs is several files, the armed inputs in groups of 8 in input order (`..._in01-08.flac`,
+//! `..._in09-16.flac`, ...): four at most, which is what the kernel can keep open at once (`FS_STREAMS`). Recordings go to
+//! exFAT or ext4 only: FAT32's 4 GiB file limit is not worth carrying, and FOSFS (the boot volume) is not for hours of
+//! audio, nor do its 48-character names fit. A disk can hold two volumes (rack's boot disk: FOSFS and ext4), so a target
+//! is a volume, named as the files on it are: `disk3` (exFAT, `disk3/recordings/...`) or `ext1` (`ext1/recordings/...`).
+//! The take itself (capture, `audio_rec::Recorder`, the file calls) is the tape's: it reads `request`, acts on it and
+//! fills in `take`. A take keeps running when another page is shown.
 //!
 //! Milestone one is a plain take, started and stopped by hand. Pre-roll and the sound/silence trigger (`audio_rec`
 //! `preroll`, `silence`, as the `recorder` tape uses them) are the next step.
 
 use crate::Text;
+use crate::naming::{self, FileName, ProjectName};
 use core::fmt::Write;
 
 /// Disks offered (`disk_info` numbers them from 1; the recorder tape looks at the same eight).
 pub const MAX_DISKS: usize = 8;
 /// Inputs a take can record: `audio_rec::select` keeps a 32-bit channel mask.
 pub const MAX_ARMED: usize = 32;
-/// The longest file name stem: `NAMEnnn.wav` must fit FOSFS v3's 16 characters.
-pub const MAX_BASE: usize = 9;
 /// Channels in one FLAC file (the format's limit), and so the inputs of one group.
 pub const GROUP: usize = 8;
 /// Groups a take can have: 32 armed inputs in groups of 8.
@@ -119,9 +120,9 @@ pub struct Take {
     /// Frames recorded in this take (all its files), and bytes written to disk.
     pub frames: u64,
     pub bytes: u64,
-    /// Files so far (a FAT32 take continues in a new file at 4 GiB), and the one being written (or the last one).
+    /// Files so far, and the first of them (its own name, without the folders).
     pub files: u32,
-    pub file: Text<40>,
+    pub file: FileName,
     /// Capture overruns since the take began: audio that never reached the file.
     pub overruns: u64,
     /// Audio waiting in the kernel's capture ring, as a share of it (a disk falling behind shows here first).
@@ -146,8 +147,10 @@ pub struct Recording {
     pub disk_count: usize,
     /// Index into `disks`.
     pub disk: usize,
-    /// The file name stem.
-    pub base: Text<12>,
+    /// The project folder takes go to (`naming`); empty: one is made up at the next take, and kept.
+    pub project: ProjectName,
+    /// The folder the projects are in, the same on every disk (`rec-root`; empty: `recordings`, see `root`).
+    pub root: Text<{ naming::MAX_ROOT }>,
     /// The capture's format, for the size of a second of recording: rate, bytes per sample slot. Set by the tape.
     pub rate: u32,
     pub slot: usize,
@@ -170,7 +173,8 @@ impl Recording {
             disks: [Disk::EMPTY; MAX_DISKS],
             disk_count: 0,
             disk: 0,
-            base: Text::new(),
+            project: ProjectName::new(),
+            root: Text::new(),
             rate: 48_000,
             slot: 4,
             bits: 24,
@@ -292,9 +296,9 @@ impl Recording {
         (groups, if armed == 0 { 0 } else { count + 1 })
     }
 
-    /// Picks the volume named `wanted` (`ext1`, `disk3`; a bare number is a `disk`) if it is listed (and not FAT32), else
-    /// by priority: the first exFAT disk (kept for recordings), the first ext volume this kernel can write, a FOSFS disk that
-    /// is not the boot disk, the boot disk. FAT32 is never chosen: its 4 GiB file limit is not worth carrying.
+    /// Picks the volume named `wanted` (`ext1`, `disk3`; a bare number is a `disk`) if it is listed and can take recordings,
+    /// else by priority: the first exFAT disk (kept for recordings), the first ext volume this kernel can write; with
+    /// neither, the boot disk, which `refusal` then explains.
     pub fn choose_disk(&mut self, wanted: Option<&str>) {
         let mut named = Text::<16>::new();
         if let Some(wanted) = wanted {
@@ -302,10 +306,9 @@ impl Recording {
         }
         let disks = &self.disks[..self.disk_count];
         let first = |test: &dyn Fn(&Disk) -> bool| disks.iter().position(test);
-        self.disk = first(&|d| !named.is_empty() && d.name() == named && d.volume != Volume::Fat32)
+        self.disk = first(&|d| !named.is_empty() && d.name() == named && matches!(d.volume, Volume::Exfat | Volume::Ext))
             .or_else(|| first(&|d| d.volume == Volume::Exfat))
             .or_else(|| first(&|d| d.volume == Volume::Ext && d.writable))
-            .or_else(|| first(&|d| d.volume == Volume::Fosfs && !d.boot))
             .or_else(|| first(&|d| d.boot))
             .unwrap_or(0);
     }
@@ -335,9 +338,11 @@ impl Recording {
         match self.target() {
             None => Some("no disk to record to"),
             Some(disk) if disk.volume == Volume::None => Some("that disk has no volume (format it first)"),
-            Some(disk) if disk.volume == Volume::Fat32 => Some("FAT32 is not used for recordings: exFAT"),
+            Some(disk) if disk.volume == Volume::Fat32 => Some("FAT32 is not used for recordings: exFAT or ext4"),
+            Some(disk) if disk.volume == Volume::Fosfs => Some("FOSFS is not used for recordings: exFAT or ext4"),
             Some(disk) if !disk.writable => Some("fos cannot write that ext volume (its features)"),
-            _ if self.base.is_empty() => Some("no file name (rec-name=)"),
+            _ if !naming::valid_root(self.root()) => Some("rec-root= is not a folder name (letters, digits, - _ /)"),
+            _ if !self.project.is_empty() && !naming::valid_project_folder(self.project.as_str()) => Some("the project name is not valid"),
             _ => None,
         }
     }
@@ -356,14 +361,15 @@ impl Recording {
         Ok(())
     }
 
-    /// What is saved: the armed inputs, the volume's name, the meter scale, the file name stem, the format.
-    pub fn persisted(&self) -> (u32, Text<16>, bool, Text<12>, Encoding) {
-        (self.armed & self.all(), self.target().map_or(Text::new(), Disk::name), self.nordic, self.base, self.encoding)
+    /// What is saved: the armed inputs, the volume's name, the meter scale, the project, the root folder, the format.
+    pub fn persisted(&self) -> (u32, Text<16>, bool, ProjectName, Text<{ naming::MAX_ROOT }>, Encoding) {
+        (self.armed & self.all(), self.target().map_or(Text::new(), Disk::name), self.nordic, self.project, self.root, self.encoding)
     }
 
     /// Takes `rec-ch=all|1-2,9`, `rec-disk=ext1|disk3` (a bare number is a `disk`), `rec-scale=dbfs|nordic`,
-    /// `rec-name=STEM`, `rec-format=flac|wav` and
-    /// `rec-bits=16|20|24` from `value(key)`; invalid values are ignored. `rec-disk` only picks a disk once `disks` is filled (call `choose_disk` with it).
+    /// `rec-project=NAME`, `rec-root=FOLDER`, `rec-format=flac|wav` and `rec-bits=16|20|24` from `value(key)`; invalid
+    /// values are ignored (the root falls back to `recordings`). `rec-disk` only picks a disk once `disks` is filled (call
+    /// `choose_disk` with it).
     pub fn load<'a>(&mut self, value: impl Fn(&str) -> Option<&'a str>) -> Option<&'a str> {
         if let Some(mask) = value("rec-ch").and_then(|v| parse_channels(v, self.channels.min(MAX_ARMED))) {
             self.armed = mask;
@@ -373,9 +379,11 @@ impl Recording {
             Some("dbfs") => self.nordic = false,
             _ => {}
         }
-        if let Some(name) = value("rec-name").filter(|name| valid_base(name)) {
-            self.base = Text::from(name);
+        if let Some(name) = value("rec-project").filter(|name| naming::valid_project_folder(name)) {
+            self.project = ProjectName::from(name);
         }
+        let root = value("rec-root").filter(|root| naming::valid_root(root)).unwrap_or(naming::DEFAULT_ROOT);
+        self.root = Text::from(root);
         let bits = match self.encoding {
             Encoding::Flac(bits) => bits,
             Encoding::Wav => 24,
@@ -399,7 +407,10 @@ impl Recording {
             put("rec-disk", format_args!("{}", disk.name().as_str()));
         }
         put("rec-scale", format_args!("{}", if self.nordic { "nordic" } else { "dbfs" }));
-        put("rec-name", format_args!("{}", self.base.as_str()));
+        if !self.project.is_empty() {
+            put("rec-project", format_args!("{}", self.project.as_str()));
+        }
+        put("rec-root", format_args!("{}", self.root()));
         match self.encoding {
             Encoding::Flac(bits) => {
                 put("rec-format", format_args!("flac"));
@@ -409,17 +420,14 @@ impl Recording {
         }
     }
 
-    /// A take's file for `group` (a mask from `groups`) of `groups`, numbered `number`, on `prefix` (`disk3/`):
-    /// `disk3/take007.wav`, `disk3/take007.flac`, or with several groups `disk3/take007-9-16.flac` (the group's first and
-    /// last input).
-    pub fn file_name(&self, prefix: &str, number: u32, group: u32, groups: usize) -> Text<48> {
-        let mut out = Text::new();
-        let _ = write!(out, "{prefix}{}{number:03}", self.base.as_str());
-        if groups > 1 && group != 0 {
-            let _ = write!(out, "-{}-{}", group.trailing_zeros() + 1, 32 - group.leading_zeros());
-        }
-        let _ = out.write_str(if self.encoding == Encoding::Wav { ".wav" } else { ".flac" });
-        out
+    /// The folder the projects are in on every disk: `rec-root`, else `recordings`.
+    pub fn root(&self) -> &str {
+        if self.root.is_empty() { naming::DEFAULT_ROOT } else { self.root.as_str() }
+    }
+
+    /// The extension of a take's files.
+    pub fn extension(&self) -> &'static str {
+        if self.encoding == Encoding::Wav { "wav" } else { "flac" }
     }
 }
 
@@ -427,12 +435,6 @@ impl Default for Recording {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// A stem every volume takes: 1 to 9 of lowercase letters, digits, `.`, `_`, `-` (the FOSFS v3 rule, which the others
-/// accept too).
-pub fn valid_base(name: &str) -> bool {
-    (1..=MAX_BASE).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
 }
 
 /// `all`, or 1-based inputs and ranges (`1-2,9,11-12`) within `channels`; None when it names nothing or a missing input.

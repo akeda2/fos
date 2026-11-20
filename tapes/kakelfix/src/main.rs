@@ -28,11 +28,11 @@ tape_rt::tape_help!(
 The active audio device's mixer on the pixel screen: one output's mix as
 fader strips (Outputs), every send as a table (Matrix) and the device's own
 settings (Device); the Recorder page records the armed inputs as FLAC
-(16, 20 or 24 bits; 8 inputs a file) or WAV to diskN/STEMnnn.flac on an
-exFAT, ext4 (extN/) or FOSFS volume, with a peak meter per input; the
-Analyzer page shows an input pair's waveform and spectrum; the Meters page
-meters every input (dBFS, Nordic PPM or LUFS) with its gain and switches
-under it. Mouse, touch or keyboard.
+(16, 20 or 24 bits; 8 inputs a file) or WAV to an exFAT (diskN/) or ext4
+(extN/) volume, in ROOT/PROJECT/takeNNN_DATE_TIME/, with a peak meter per
+input; the Analyzer page shows an input pair's waveform and spectrum; the
+Meters page meters every input (dBFS, Nordic PPM or LUFS) with its gain and
+switches under it. Mouse, touch or keyboard.
   device=N     use audio device N (`audio` lists them; loop0 for a try)
   screen=N     which screen (Pi 4: 1 is the second HDMI output)
   theme=NAME   dark, classic or light
@@ -47,7 +47,9 @@ an-resolution=third|sixth|twelfth|fft, and the Meters page's
 mt-scale=dbfs|nordic|lufs mt-input=N mt-show=all|1,3-8 (inputs shown)
 mt-loop=13-14:1 (inputs 13-14 cabled from outputs 1-2: named Loop 1/2;
 a device's own Loopback N switch does this by itself), and the Recorder's:
-rec-name=STEM (1-9 of a-z 0-9 . _ -; default take) rec-ch=all|1-2,9
+rec-project=NAME (up to 20 of A-Z a-z 0-9 - _; none: one is made up at
+the next take, amber-otter_DATE_TIME) rec-root=recordings (the projects'
+folder on every disk; a/b for deeper) rec-ch=all|1-2,9
 rec-disk=ext1|disk3 rec-scale=dbfs|nordic rec-format=flac|wav
 rec-bits=16|20|24
 (the same words on the command line)
@@ -279,7 +281,6 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     app.analysis.pair = app.analysis.pair.min(app.analysis.pairs() - 1);
     app.metering.load(|key| config.value(key));
     let r = &mut app.recording;
-    r.base = kakelfix::Text::from("take");
     r.disk_count = record::find_disks(api, &mut r.disks);
     let wanted_disk = r.load(|key| config.value(key));
     r.choose_disk(wanted_disk);

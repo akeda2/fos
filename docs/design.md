@@ -1820,13 +1820,20 @@ mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path 
   cable (inputs 13-14 carry outputs 1-2). The picker then has a Loop preset. A digital loop (AES, ADAT) is bit-exact; an
   analog one reads as its output level and input gain set it.
 - **Recorder** (`crates/kakelfix/src/recorder.rs` state, `tapes/kakelfix/src/record.rs` the take and drawing), milestone one, a
-  plain take by hand: Record (or `R` on any page, space on the page) writes the armed inputs to the next free number of
-  `diskN/STEM` (`rec-name=`, default `take`, 1-9 characters; a number is never reused across formats). The format (`f` or
+  plain take by hand: Record (or `R` on any page, space on the page) writes the armed inputs into a folder of their own
+  (`kakelfix::naming`): `ROOT/PROJECT/take007_2026-11-20_143512/PROJECT_take007_2026-11-20_143512_in01-08.flac`. The root
+  (`rec-root=`, default `recordings`, `a/b` for deeper) is the same on every disk; the project (`rec-project=`, up to 20 of
+  ASCII letters, digits, `-`, `_`) is found again whatever its case (exFAT ignores case, ext4 not; both must reach the same
+  project), and when none is set one is made up at the next take, two words and the minute (`amber-otter_2026-11-20_1435`),
+  and kept. Takes are numbered within the project, one past its highest take folder (at most 9999). A file's own name
+  holds one timestamp, the take's (a made-up project's is left out of it, `naming::stem`), so a file copied elsewhere still
+  says when it was recorded; names fit exFAT's 60 characters. The worker makes the folders with `vfs_create(VFS_DIR)`,
+  which makes exFAT folders too. The format (`f` or
   the soft key, `rec-format=flac|wav`, `rec-bits=16|20|24`) is FLAC 24 by default: each input unpacked to -1..1 and rounded
   by `flac_enc::depth::Quantizer` (TPDF dither below 24 bits; at 24 plain rounding, exact for 24-bit capture and for float
   samples on the 24-bit grid, which every interface here delivers: none has a 32-bit float converter), encoded by
   `archive::FlacFile` (now 8 channels, FLAC's limit). More than 8 armed inputs are several files, the armed inputs in groups
-  of 8 in input order (`take007-1-8.flac`, `take007-9-16.flac`, ...; a group of 8 or fewer has no suffix), each on its own
+  of 8 in input order (`..._in01-08.flac`, `..._in09-16.flac`, ...), each on its own
   stream handle (`fs_stream_open2`): 32 inputs are 4 files, `FS_STREAMS`. Each reserves its channels' share of the longest
   free run (FLAC never needs more than the samples uncompressed). Tags: `ENCODER`, `INPUTS` (`9-16`). WAV keeps the
   device's samples untouched (float stays float) through `audio_rec::Recorder` and `fs_stream_*`, as the `recorder` tape
@@ -1842,36 +1849,39 @@ mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path 
   and Quit are acted on after everything pushed before them, so Escape mid-take closes complete files before the thread
   is joined. The embedded kernels have no tape threads and pump the same worker inline. The capture read loop reads at most
   16 blocks a pass (680 ms at 48 kHz): a loopback, which its player refills whenever the tape yields, held the drawing
-  thread for the whole tone before. FAT32 is
-  not used for recordings (listed, never chosen, refused): its 4 GiB limit is not carried, so a file that fills means a
-  full disk and ends the take. Targets are volumes, named as their files are: `disk3` (FOSFS, exFAT: `fs_stream_*`, a
+  thread for the whole tone before. FAT32 and FOSFS
+  are not used for recordings (listed, never chosen, refused): FAT32's 4 GiB limit is not carried, so a file that fills means a
+  full disk and ends the take; FOSFS is the boot volume, and its 48-character names do not fit. Targets are volumes, named as their files are: `disk3` (exFAT: `fs_stream_*`, a
   reserved run per file) or `ext1` (ext4, `vfs_volume` lists it, `audio_rec::vfs::VfsSink` writes it by path with
   `vfs_write`, committing with `vfs_sync` whenever the length moves; each file is placed with `vfs_reserve` (ABI 42) so a
   take's four FLAC files do not alternate extent by extent, `docs/ext4.md` "Placement"); rack's boot disk offers both.
-  The default is chosen without FAT32: exFAT, a writable ext volume, a FOSFS disk that is not the boot disk, the boot
-  disk (`d` or Next disk steps; `rec-disk=ext1|disk3`, an old bare number is a disk). At the left the take's status:
-  a REC lamp and clock, file, disk, the room left in the longest free run as time at this format, the format, the armed inputs,
+  The default: exFAT, else a writable ext volume, else the boot disk, refused with a reason
+  (`d` or Next disk steps; `rec-disk=ext1|disk3`, an old bare number is a disk). At the left the take's status:
+  a REC lamp and clock, file, project, disk, the room left in the longest free run as time at this format, the format, the armed inputs,
   bytes written with the disk's speed and slowest write, and the warnings that matter for audio that cannot be taken twice
   (capture overruns since the take began, red; a capture ring more than a quarter full, amber). At the right, one large peak meter
   per input (the Meters page's `Bank`, sample peak or Nordic PPM with Tab or `s`, `gfx::meter` bars with hold and clip, as the
   Linux KakelFix's meter panel) with an arm button under each: tap it, or Enter on the selected input; `a` arms all; arming and
-  the disk are locked during a take, and the last armed input stays. Armed inputs, disk, scale and stem are saved as `rec-ch`,
-  `rec-disk`, `rec-scale`, `rec-name`. **One read loop** (`analyze::Capture::update`) now serves every user of the captured
+  the disk are locked during a take, and the last armed input stays. Armed inputs, disk, scale, project and root are saved as `rec-ch`,
+  `rec-disk`, `rec-scale`, `rec-project`, `rec-root`. **One read loop** (`analyze::Capture::update`) now serves every user of the captured
   audio: the take, the Meters and Recorder meters, the Analyzer; capture runs while one of those pages is shown *or a take
   runs*, so a take goes on under the Mixer or Analyzer page, with "REC mm:ss" in red in every page's header. Quitting
   (Esc, Quit) finishes the files cleanly. The capture ring is asked for at up to 256 MiB (`audio_set_capture_ring`, leaving
   256 MiB free), which absorbs disk writes, encoding and frames drawn meanwhile. Next: a count of float samples off the 24-bit grid, pre-roll and the sound/silence trigger
-  (`audio_rec::preroll`, `silence`), typing the stem on the page. WavPack (lossless float, more than 8 channels a file) is
+  (`audio_rec::preroll`, `silence`), typing the project on the page, touch buttons, the clock on the panel. WavPack (lossless float, more than 8 channels a file) is
   not in the tree; its BSD licence allows vendoring it as libopus is, if a 32-bit float interface needs it.
 - **Test**: `make test-kakelfix` on the loopback: `show` reads the identity mix; in the tape `x` switches the first strip off and a
   mouse click half way up its fader sets -9 dB; with a `play` service playing a tone into loop0, `3` opens the Analyzer and its
   envelope must appear; `4` opens the Meters page and the first bar must light for the tone; `2` and `R` start a take (the header lamp lights), it
-  must stay lit on the Analyzer page, `2` and `R` stop it, and `ext2/take001.flac` (a second disk, made by the host's `mkfs.ext4`, which the Recorder
-  prefers to the FOSFS boot disk) is then one extent on a volume `e2fsck -fn` passes, and has a STREAMINFO of 2
+  must stay lit on the Analyzer page, `2` and `R` stop it, and on a second disk made by the host's `mkfs.ext4` the
+  made-up project (saved as `rec-project`) holds `take001_TIME/STEM_take001_TIME_in01-02.flac`, one extent on a volume
+  `e2fsck -fn` passes, with a STREAMINFO of 2
   channels, 48 kHz, 24 bits and seconds of samples, passes the reference `flac -t` (frame CRCs, MD5) and decodes to the tone
   (its length is not the take's wall time: with a listener loop0 has no clock and `play` runs as fast as the capture
-  drains); a second run with `rec-format=wav rec-ch=2 rec-disk=disk1` makes `disk1/take001.wav` on FOSFS, input 2 alone as 32-bit float; on the server kernel a take on the worker thread
-  ended by Escape mid-take is saved ("written on its own thread") as a FLAC `flac -t` passes (with no samples: that kernel
+  drains); a second run with `rec-format=wav rec-ch=2 rec-project=` the same name in capitals makes the same project's
+  take002, `..._in02.wav`, input 2 alone as 32-bit float; on the server kernel a take on the worker thread
+  ended by Escape mid-take is saved ("written on its own thread") on an exFAT disk from `mkfs.exfat`, in
+  `fos/takes/mf-test/take001_TIME/`, as a FLAC `flac -t` passes, the volume `fsck.exfat`-clean (with no samples: that kernel
   lets one process own audio, so no `play` can feed loop0 there); `3`, Up then a click on the Quit soft key at once must leave `an-span=30` and an `mt-scale` in `kakelfix.cfg`; `show` reads the result. Then on the server
   kernel at -smp 4 the same `x` goes through the writer thread and a lone Escape typed at once ends the tape through the writer's join, so the
   queued write is not lost. The mouse is walked exactly: the kernel's pointer

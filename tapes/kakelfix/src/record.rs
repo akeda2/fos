@@ -15,10 +15,11 @@
 //! one core of an i5-6500 (`cargo test --release -p archive -- --ignored encode_speed`): a quarter of a core for 30
 //! inputs at 48 kHz.
 //!
-//! FAT32 is not offered (its 4 GiB file limit is not worth carrying), so a file that fills is a full disk: the take ends.
+//! FAT32 and FOSFS are not offered (`Recording::refusal`), so a file that fills is a full disk: the take ends.
 //!
-//! Volumes: FOSFS and exFAT through `fs_stream_*` (`audio_rec::stream::StreamSink`, a reserved contiguous run per file),
-//! ext4 through `vfs_*` by path (`audio_rec::vfs::VfsSink`, `ext1/take001.flac`): there a file grows as it is written, and
+//! Where: `ROOT/PROJECT/take007_TIME/` (`kakelfix::naming`), its folders made by the worker as the take starts (`place`).
+//! Volumes: exFAT through `fs_stream_*` (`audio_rec::stream::StreamSink`, a reserved contiguous run per file), ext4 through
+//! `vfs_*` by path (`audio_rec::vfs::VfsSink`, `ext1/recordings/...`): there a file grows as it is written, and
 //! `vfs_reserve` (ABI 42) gives each of a take's files its own region of the volume, so four files written in turn do not
 //! alternate extent by extent (which reaches the driver's extent limit after about 170 MiB each).
 
@@ -42,9 +43,10 @@ use gfx::meter::{Scale, draw_bar, draw_scale};
 use gfx::theme::theme;
 use core::sync::atomic::{AtomicU32, Ordering};
 use kakelfix::channel::{Mailbox, Ring};
+use kakelfix::naming::{self, FileName, ProjectName, Stamp};
 use kakelfix::recorder::{Disk, Encoding, GROUP, MAX_DISKS, MAX_GROUPS, Request, Take, Volume, clock, describe_channels, duration, size};
 use kakelfix::{App, Layout, Rect, Recording, Text, fit_name};
-use tape_rt::{AudioBuffer, AudioStats, DISK_EXFAT, DISK_FAT32, DISK_FOSFS, DiskInfo, FS_NOT_FOUND, TapeApi, VFS_FILE, VfsVolume, alloc_bytes, alloc_zeroed};
+use tape_rt::{AudioBuffer, AudioStats, DISK_EXFAT, DISK_FAT32, DISK_FOSFS, DiskInfo, FS_EXISTS, TapeApi, VFS_DIR, VFS_FILE, VfsVolume, alloc_bytes, alloc_zeroed};
 
 /// WAV disk writes: 256 KiB blocks (a multiple of the 512-byte sector; the `recorder` tape's size, which real USB sticks
 /// and SATA disks take at full speed). FLAC files stage `archive::file::STAGE` (128 KiB) each.
@@ -120,6 +122,38 @@ impl Sink for Out {
 /// like the `recorder` tape's; it is set for the take's volume before the file opens.
 static mut SINK: Option<Out> = None;
 
+/// Where a take goes: its folder (`ext1/recordings/Konsert/take007_2026-11-20_143512`), its project, number and moment.
+struct Place {
+    folder: Text<{ naming::MAX_PATH }>,
+    project: ProjectName,
+    number: u32,
+    now: Stamp,
+}
+
+/// The folders in `path`, the first `pick` takes.
+fn folders<T>(path: &str, mut pick: impl FnMut(&str) -> Option<T>) -> Option<T> {
+    let mut index = 0;
+    while let Ok(Some(entry)) = tape_rt::vfs_read_dir(path, index) {
+        index += 1;
+        if entry.stat.kind == VFS_DIR {
+            if let Some(found) = core::str::from_utf8(entry.name()).ok().and_then(&mut pick) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// The highest `number` gives for a folder in `path` (0 for none).
+fn folders_max(path: &str, number: impl Fn(&str) -> Option<u32>) -> u32 {
+    let mut highest = 0;
+    folders::<()>(path, |name| {
+        highest = highest.max(number(name).unwrap_or(0));
+        None
+    });
+    highest
+}
+
 /// One FLAC file of a take: up to 8 armed inputs on their own stream handle (or ext file).
 struct Group {
     file: &'static mut FlacFile,
@@ -156,6 +190,10 @@ pub struct Report {
     pub message: Text<72>,
     pub said: u32,
     pub acted: u32,
+    /// The project the last take went to, when it was not the page's (made up, or found in another case); a new
+    /// `project_serial` means the page should take it over (and save it).
+    pub project: ProjectName,
+    pub project_serial: u32,
 }
 
 impl Report {
@@ -170,7 +208,14 @@ impl Report {
 /// counter the worker sleeps on (`futex_wait`) and the drawing thread bumps when it pushes or posts.
 static RING: Ring = Ring::new();
 static COMMANDS: Mailbox<Command> = Mailbox::new(Command::None);
-static REPORTS: Mailbox<Report> = Mailbox::new(Report { take: Take { running: false, frames: 0, bytes: 0, files: 0, file: Text::new(), overruns: 0, backlog_percent: 0, worst_ms: 0, kib_per_second: 0 }, message: Text::new(), said: 0, acted: 0 });
+static REPORTS: Mailbox<Report> = Mailbox::new(Report {
+    take: Take { running: false, frames: 0, bytes: 0, files: 0, file: Text::new(), overruns: 0, backlog_percent: 0, worst_ms: 0, kib_per_second: 0 },
+    message: Text::new(),
+    said: 0,
+    acted: 0,
+    project: ProjectName::new(),
+    project_serial: 0,
+});
 static WORK: AtomicU32 = AtomicU32::new(0);
 /// The worker: created on the drawing thread at startup, then used only by the worker thread (or, where the kernel has
 /// no threads, by the drawing thread itself through `Feed::pump_inline`).
@@ -271,6 +316,7 @@ pub struct Feed {
     feeding: bool,
     started: u32,
     said: u32,
+    project_serial: u32,
     running: bool,
 }
 
@@ -284,7 +330,7 @@ impl Feed {
         // SAFETY: no thread runs yet; from here on only the worker (thread or inline pump) touches the static.
         unsafe { *(&raw mut WORKER) = Some(Worker { writer, report: Report::default(), seen: 0, quit: false }) };
         let thread = if tape_rt::threads_supported() { tape_rt::spawn_thread(worker_thread, api as *const TapeApi as usize, WORKER_STACK).ok() } else { None };
-        Some(Feed { thread, feeding: false, started: 0, said: 0, running: false })
+        Some(Feed { thread, feeding: false, started: 0, said: 0, project_serial: 0, running: false })
     }
 
     /// Capture's frame changed size (another rate): the ring is cut to whole frames of it. Only between takes.
@@ -375,6 +421,11 @@ impl Feed {
             self.said = report.said;
             app.message = report.message;
         }
+        // A made-up project (or one found in another case) becomes the page's, so the next take goes there too.
+        if report.project_serial != self.project_serial {
+            self.project_serial = report.project_serial;
+            app.recording.project = report.project;
+        }
     }
 
     /// At the end of the tape: ends a take (its files closed and complete) and the worker thread.
@@ -414,9 +465,6 @@ pub struct Writer {
     mask: u32,
     /// The device's frame: channels, slot bytes, valid bits, float.
     input: Input,
-    /// The volume prefix and stem the numbering was found for, and the number to try next.
-    numbered: Text<40>,
-    next_number: u32,
     next_checkpoint: u64,
     overruns_at_start: u64,
     ring_bytes: u64,
@@ -454,8 +502,6 @@ impl Writer {
             format: Format { channels: 0, rate: 0, slot: 0, bits: 0, float: false },
             mask: 0,
             input: Input { ..*input },
-            numbered: Text::new(),
-            next_number: 1,
             next_checkpoint: 0,
             overruns_at_start: 0,
             ring_bytes: 0,
@@ -516,46 +562,63 @@ impl Writer {
         report.say(format_args!("recording {}", { report.take.file }.as_str()));
     }
 
-    /// The next take number whose files (one per group) are all free on the target volume; its prefix (`disk3/`, `ext1/`).
-    fn number(&mut self, api: &TapeApi, job: &Job, report: &mut Report) -> Option<(u32, Text<16>)> {
+    /// Makes the take's folders (`naming`): the root's, the project's (found again whatever its case, or made up when none
+    /// is set) and the take's, numbered one past the project's highest. Folders already there are fine. None, said why,
+    /// when one cannot be made.
+    fn place(&mut self, job: &Job, report: &mut Report) -> Option<Place> {
         let r = &job.recording;
         let disk = r.target()?;
         let prefix = disk.prefix();
-        let ext = disk.volume == Volume::Ext;
-        let mut numbered = Text::<40>::new();
-        let _ = write!(numbered, "{}{}", prefix.as_str(), r.base.as_str());
-        if numbered != self.numbered {
-            self.numbered = numbered;
-            self.next_number = 1;
+        let now = tape_rt::wall_clock().map_or(Stamp::default(), |c| Stamp { year: c.year, month: c.month, day: c.day, hour: c.hour, minute: c.minute, second: c.second });
+        let mkdir = |path: &str, report: &mut Report| match tape_rt::vfs_create(path, VFS_DIR, 0o755, 0, 0) {
+            Ok(()) | Err(FS_EXISTS) => true,
+            Err(code) => {
+                report.say(format_args!("cannot make the folder {path} (code {code})"));
+                false
+            }
+        };
+        let root = r.root();
+        for (at, _) in root.match_indices('/').chain([(root.len(), "")]) {
+            if !mkdir(naming::join(&[prefix.as_str(), &root[..at]]).as_str(), report) {
+                return None;
+            }
         }
-        let (groups, count) = r.groups();
-        // `fs_read` knows FOSFS and FAT; an ext volume's files are asked for with `vfs_stat`.
-        let missing = |name: &str| {
-            if ext { tape_rt::vfs_stat(name).err() == Some(FS_NOT_FOUND) } else { (api.fs_read)(name.as_ptr(), name.len(), core::ptr::null_mut(), 0) == FS_NOT_FOUND }
+        let root_path = naming::join(&[prefix.as_str(), root]);
+        // An existing project of the same name in another case is that project (exFAT would say so itself; ext4 not).
+        let project = if r.project.is_empty() {
+            let mut random = [0u8; 4];
+            let _ = tape_rt::random(&mut random);
+            naming::made_up_project(u32::from_le_bytes(random), &now)
+        } else {
+            folders(root_path.as_str(), |name| naming::same_project(name, r.project.as_str()).then(|| ProjectName::from(name))).unwrap_or(r.project)
         };
-        // Every file this take makes, and a single-file take of either format, so a number is never used twice.
-        let free = |number: u32| {
-            let mut plain = Text::<48>::new();
-            let base = r.base.as_str();
-            groups[..count].iter().all(|&group| missing(r.file_name(prefix.as_str(), number, group, count).as_str()))
-                && [".wav", ".flac"].iter().all(|extension| {
-                    plain.clear();
-                    let _ = write!(plain, "{}{base}{number:03}{extension}", prefix.as_str());
-                    missing(plain.as_str())
-                })
-        };
-        let Some(number) = (self.next_number..self.next_number + 1000).find(|&n| free(n)) else {
-            report.say(format_args!("no free file name for {}nnn", r.base.as_str()));
+        let project_path = naming::join(&[root_path.as_str(), project.as_str()]);
+        if !mkdir(project_path.as_str(), report) {
             return None;
-        };
-        self.next_number = number + 1;
-        Some((number, prefix))
+        }
+        let highest = folders_max(project_path.as_str(), naming::take_number);
+        let number = highest + 1;
+        if number > naming::MAX_TAKE {
+            report.say(format_args!("{} has {} takes, the most a project holds: start another", project.as_str(), naming::MAX_TAKE));
+            return None;
+        }
+        let take = naming::take_folder(number, &now);
+        let take_path = naming::join(&[project_path.as_str(), take.as_str()]);
+        if !mkdir(take_path.as_str(), report) {
+            return None;
+        }
+        if project != r.project {
+            report.project = project;
+            report.project_serial = report.project_serial.wrapping_add(1);
+        }
+        Some(Place { folder: take_path, project, number, now })
     }
 
     fn open_wav(&mut self, api: &TapeApi, job: &Job, report: &mut Report) -> bool {
-        let Some((number, prefix)) = self.number(api, job, report) else { return false };
+        let Some(place) = self.place(job, report) else { return false };
         let r = &job.recording;
-        let name = r.file_name(prefix.as_str(), number, self.mask, 1);
+        let leaf = naming::file_name(place.project.as_str(), place.number, &place.now, self.mask, r.extension());
+        let name = naming::join(&[place.folder.as_str(), leaf.as_str()]);
         let ext = r.target().is_some_and(|d| d.volume == Volume::Ext);
         // No `Recorder` holds the static now: the last take's was finished (consumed) before this one.
         let sink = unsafe { (*(&raw mut SINK)).insert(if ext { Out::vfs() } else { Out::Stream(StreamSink::new(api.fs_stream_open, api.fs_stream_write, api.fs_stream_close, tape_rt::micros, STAGING / 2)) }) };
@@ -564,7 +627,7 @@ impl Writer {
         match Recorder::begin(sink, staging, self.format, name.as_str().as_bytes(), 0) {
             Ok(recorder) => {
                 self.wav = Some(recorder);
-                report.take.file = Text::from(name.as_str());
+                report.take.file = leaf;
                 report.take.files = 1;
                 true
             }
@@ -579,18 +642,19 @@ impl Writer {
     /// never needs more than the samples uncompressed), since a stream given 0 would take the whole run and leave the
     /// next none.
     fn open_flac(&mut self, api: &TapeApi, job: &Job, report: &mut Report, bits: u32) -> bool {
-        let Some((number, prefix)) = self.number(api, job, report) else { return false };
+        let Some(place) = self.place(job, report) else { return false };
         let r = &job.recording;
         let (groups, count) = r.groups();
         let largest = r.target().map_or(u64::MAX, |d| d.largest);
         let ext = r.target().is_some_and(|d| d.volume == Volume::Ext);
         let armed = self.mask.count_ones().max(1) as u64;
         self.bits = bits;
-        let mut first = Text::<48>::new();
+        let mut first = FileName::new();
         for (g, &mask) in groups[..count].iter().enumerate() {
             let channels = mask.count_ones();
             let reserve = if largest == u64::MAX { FALLBACK_RESERVE } else { (largest / armed * channels as u64) & !511 };
-            let name = r.file_name(prefix.as_str(), number, mask, count);
+            let leaf = naming::file_name(place.project.as_str(), place.number, &place.now, mask, r.extension());
+            let name = naming::join(&[place.folder.as_str(), leaf.as_str()]);
             let mut inputs = Text::<96>::new();
             describe_channels(mask, 32, &mut inputs);
             let tags = [("ENCODER", "Fosfor OS kakelfix"), ("INPUTS", inputs.as_str())];
@@ -607,11 +671,11 @@ impl Writer {
                 return false;
             }
             if g == 0 {
-                first = name;
+                first = leaf;
             }
         }
         self.open_groups = count;
-        report.take.file = Text::from(first.as_str());
+        report.take.file = first;
         report.take.files = count as u32;
         true
     }
@@ -887,15 +951,25 @@ fn panel(canvas: &mut Canvas, layout: &Layout, app: &App, threaded: bool) {
             let _ = write!(line, " and {} more", r.take.files - 1);
         }
     } else {
-        // The number goes right after the stem: `take` + `nnn` + `-1-8.flac`.
-        let next = r.file_name("", 0, groups[0], count);
-        let at = r.base.as_str().len();
-        let _ = write!(line, "{}nnn{}", &next.as_str()[..at], &next.as_str()[at + 3..]);
+        // What the next take's first file looks like: `Konsert_takeNNN_<time>_in01-08.flac`.
+        let project = if r.project.is_empty() { "<made up>" } else { naming::stem(r.project.as_str()) };
+        let mask = groups[0];
+        let (first, last) = (mask.trailing_zeros() + 1, 32 - mask.leading_zeros());
+        let _ = write!(line, "{project}_takeNNN_<time>_in{first:02}");
+        if last != first {
+            let _ = write!(line, "-{last:02}");
+        }
+        let _ = write!(line, ".{}", r.extension());
         if count > 1 {
             let _ = write!(line, " and {} more (8 inputs a file)", count - 1);
         }
     }
     row(canvas, if running { "File" } else if r.take.files > 0 { "Last" } else { "Next" }, line.as_str(), t.text);
+    line.clear();
+    // Where: the root and the project (a made-up one is named at the first take).
+    let _ = write!(line, "{}{}/", r.target().map_or(Text::new(), Disk::prefix).as_str(), r.root());
+    let _ = if r.project.is_empty() { line.write_str("(made up at the first take)") } else { write!(line, "{}/", r.project.as_str()) };
+    row(canvas, "Project", line.as_str(), t.text);
     line.clear();
     match r.target() {
         Some(disk) => {

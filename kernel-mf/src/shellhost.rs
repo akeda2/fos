@@ -7,7 +7,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use fosfor_abi::tape::{FS_BAD_NAME, FS_NO_VOLUME, FS_NOT_FOUND, FS_READ_ONLY, FS_TOO_BIG};
+use fosfor_abi::tape::{FS_BAD_NAME, FS_EXISTS, FS_NO_VOLUME, FS_NOT_FOUND, FS_READ_ONLY, FS_TOO_BIG};
 use fosfor_shell::{Entry, FsError, Host, Owner, Stamp};
 use kernel_core::{mounts, tape_fs};
 
