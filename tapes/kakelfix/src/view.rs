@@ -7,7 +7,7 @@ use gfx::Canvas;
 use gfx::theme::theme;
 use kakelfix::layout::fader_position;
 use kakelfix::analyzer::RESOLUTIONS;
-use kakelfix::{Action, AnView, App, MeterScale, Device, Layout, Page, Rect, SOFT_SLOTS, SoftKind, Text, View, WaveMode, field, format_db, format_pan};
+use kakelfix::{Action, AnView, App, MeterScale, Device, Layout, Page, Rect, SOFT_SLOTS, SoftKind, Text, View, WaveMode, field, fit_name, format_db, format_pan};
 use mixer_model::{Group, Strip};
 use core::fmt::Write;
 
@@ -49,8 +49,16 @@ fn fit(s: &str, chars: i32) -> &str {
     }
 }
 
+/// `s` centred in `area`, a name cut so that its number stays ("Mic 10" -> "Mic10", not "Mic 1").
 pub(crate) fn centered(canvas: &mut Canvas, layout: &Layout, area: Rect, s: &str, rgb: u32) {
-    let s = fit(s, area.w / layout.col);
+    let chars = (area.w / layout.col).max(0);
+    let short;
+    let s = if s.chars().count() as i32 > chars && s.len() <= 32 {
+        short = fit_name(s, chars as usize);
+        short.as_str()
+    } else {
+        fit(s, chars)
+    };
     let width = s.chars().count() as i32 * layout.col;
     text(canvas, layout, area.x + (area.w - width) / 2, area.y + (area.h - layout.row) / 2, s, rgb);
 }
@@ -187,8 +195,8 @@ fn footer(canvas: &mut Canvas, layout: &Layout, app: &App) {
         (Page::Mixer, View::Outputs) => "Up/Dn 1 dB  PgUp/PgDn 6  +- 0.1  0 unity  x off  m mute  , . pan  o output  p pair  Tab view  1-4 page",
         (Page::Mixer, View::Matrix) => "arrows select  Enter or click again: open  +- 0.1 dB  0 x m  p P pair  Tab view  1-4 page",
         (Page::Mixer, View::Device) => "Up/Dn select  Left/Right/Enter or click again: change  Tab view  1-4 page",
-        (Page::Analyzer, _) => "Tab view  Left/Right or , . pair  Up/Dn span  space freeze  w env/scope  d dB/lin  f resolution  r reset  1-4 page",
-        (Page::Meters, _) => "Left/Right input  Up/Dn gain  +- gain  h +48V  i switch  Tab or s scale  r reset  drag a gain  1-4 page",
+        (Page::Analyzer, _) => "Tab view  Left/Right , . or tap pair  Up/Dn span  space freeze  w env/scope  d dB/lin  f resolution  r reset  1-4 page",
+        (Page::Meters, _) => "Left/Right input  Up/Dn gain  +- gain  h +48V  i switch  Tab or s scale  r reset  a inputs  drag a gain  1-4 page",
         _ => "1 Mixer  2 Recorder  3 Analyzer  4 Meters  Esc quits",
     };
     text(canvas, layout, 8, layout.footer.y + 4, fit(hint, layout.footer.w / layout.col - 2), theme().dim);
@@ -260,19 +268,22 @@ fn outputs(canvas: &mut Canvas, layout: &Layout, app: &App, meters: &Meters) {
                 centered(canvas, layout, area, format_pan(pan).as_str(), t.dim);
             }
         }
+        // A flat bar: the whole column is the fader, filled from the bottom to the level, the dB written on it.
         let Some(fader) = layout.fader(index, app) else { continue };
-        let mid = fader.x + fader.w / 2;
-        canvas.fill_rect(mid - 1, fader.y, 3, fader.h as u32, t.frame);
+        box_(canvas, fader, t.off, t.frame);
+        let top = fader.y + fader.h - (fader_position(db) * fader.h as f64) as i32;
+        let fill = if unknown { t.dim } else if mute { t.amber } else { group_colour(group_of(index)) };
+        if db.is_finite() || unknown {
+            canvas.fill_rect(fader.x + 1, top, (fader.w - 2).max(0) as u32, (fader.y + fader.h - 1 - top).max(0) as u32, fill);
+            canvas.fill_rect(fader.x + 1, top, (fader.w - 2).max(0) as u32, 2, t.text);
+        }
         for mark in [6.0, 0.0, -12.0, -30.0, -60.0] {
             let y = fader.y + fader.h - (fader_position(mark) * fader.h as f64) as i32;
-            let reach = if mark == 0.0 { fader.w / 2 } else { fader.w / 4 };
-            canvas.line(mid - reach, y, mid + reach, y, t.grid_major);
+            let reach = if mark == 0.0 { fader.w } else { fader.w / 4 };
+            canvas.line(fader.x, y, fader.x + reach - 1, y, t.grid_major);
         }
-        let knob_h = layout.row / 2 + 4;
-        let y = fader.y + fader.h - (fader_position(db) * fader.h as f64) as i32;
-        let fill = if unknown { t.dim } else if mute { t.amber } else if !db.is_finite() { t.off } else { t.text };
-        box_(canvas, Rect::new(fader.x, y - knob_h / 2, fader.w, knob_h), fill, t.frame);
-        canvas.line(fader.x + 2, y, fader.x + fader.w - 3, y, t.background);
+        let value = Rect::new(fader.x, fader.y + 4, fader.w, layout.row);
+        centered(canvas, layout, value, format_db(db, mute, unknown).as_str(), if mute { t.amber } else if unknown { t.dim } else { t.text });
         if let Some(area) = layout.meter(index, app) {
             let channels = meter_channels(app, &strip);
             let bars = channels.len() as i32;
@@ -288,9 +299,12 @@ fn outputs(canvas: &mut Canvas, layout: &Layout, app: &App, meters: &Meters) {
                 }
             }
         }
-        if let Some(area) = layout.value(index, app) {
-            centered(canvas, layout, area, format_db(db, mute, unknown).as_str(), if mute { t.amber } else if unknown { t.dim } else { t.text });
-        }
+    }
+    // The swipe band: moving the strips from here never touches a fader.
+    let band = layout.swipe_band();
+    if band.h > 4 && app.strip_count() > 0 {
+        box_(canvas, band, t.grid, t.grid_major);
+        centered(canvas, layout, band, "<  swipe here to scroll the strips  >", t.dim);
     }
 }
 
@@ -306,7 +320,8 @@ fn matrix(canvas: &mut Canvas, layout: &Layout, app: &App) {
     for (row, source) in sources.iter().enumerate() {
         if let Some(area) = layout.cell(row, usize::MAX, app) {
             let label = app.label(source);
-            text(canvas, layout, area.x, area.y + (area.h - layout.row) / 2, fit(label.as_str(), area.w / layout.col), if row == app.row { t.text } else { t.dim });
+            let short = fit_name(label.as_str(), (area.w / layout.col).max(0) as usize);
+            text(canvas, layout, area.x, area.y + (area.h - layout.row) / 2, short.as_str(), if row == app.row { t.text } else { t.dim });
         }
         for (col, output) in outputs.iter().enumerate() {
             let Some(area) = layout.cell(row, col, app) else { continue };

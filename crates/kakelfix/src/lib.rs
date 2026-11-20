@@ -106,6 +106,33 @@ impl<const N: usize> Write for Text<N> {
 }
 
 /// A zero-padded UTF-8 field (`MixerControl::name`, `unit`) as text.
+/// `name` in at most `chars` characters, keeping a short last word whole ("Mic 10" -> "Mic10" -> "Mi10"; "ADAT 12" ->
+/// "AD 12"), since that is what tells channels apart; other text is cut at the end.
+pub fn fit_name(name: &str, chars: usize) -> Text<32> {
+    fn take(s: &str, n: usize) -> &str {
+        s.char_indices().nth(n).map_or(s, |(end, _)| &s[..end])
+    }
+    let mut out = Text::new();
+    if name.chars().count() <= chars {
+        let _ = out.write_str(name);
+        return out;
+    }
+    let _ = match name.rsplit_once(' ') {
+        Some((head, tail)) if !head.is_empty() && (1..=5).contains(&tail.chars().count()) && tail.chars().count() < chars => {
+            let room = chars - tail.chars().count();
+            if head.chars().count() <= room {
+                write!(out, "{head}{tail}")
+            } else if room >= 3 {
+                write!(out, "{} {tail}", take(head, room - 1))
+            } else {
+                write!(out, "{}{tail}", take(head, room))
+            }
+        }
+        _ => out.write_str(take(name, chars)),
+    };
+    out
+}
+
 pub fn field(bytes: &[u8]) -> &str {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     core::str::from_utf8(&bytes[..end]).unwrap_or("")
@@ -160,6 +187,8 @@ pub enum Action {
     Resolution,
     /// Meters: the next scale, the selected input's phantom power, its instrument (or other) switch.
     MeterScale,
+    /// Meters: open or close the picker of the inputs shown.
+    Channels,
     Phantom,
     InputSwitch,
     Enter,
@@ -176,6 +205,39 @@ pub enum Grab {
     Pan(usize),
     /// A control under a meter, dragged up or down from where it was pressed (`y`) and what it was (`value`).
     Control { index: usize, y: i32, value: i64 },
+    /// A fader pressed at (`x`, `y`) and not moved yet: up or down makes it `Fader`, sideways a swipe of the strips, and
+    /// a release without moving sets the fader where it was pressed.
+    Pressed { strip: usize, x: i32, y: i32 },
+    /// A list followed by the finger from (`x`, `y`), where `first` (and the matrix's `first_col`) were at the press.
+    /// `tap` is what a release does while the finger has not moved further than `Layout::slop`.
+    Swipe { list: Swipe, x: i32, y: i32, first: usize, first_col: usize, tap: Tap },
+    /// A finger whose press already acted (a soft key, a picker button) or found nothing: held so that its later
+    /// reports are moves, not fresh presses, until it lifts (`instrument_rt::Touches` re-offers a finger that holds
+    /// nothing, which made a toggle such as Inputs flip once per report).
+    Held,
+}
+
+/// The lists a finger or the mouse can swipe.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Swipe {
+    Strips,
+    Tabs,
+    Matrix,
+    Controls,
+    Meters,
+    /// The Analyzer's pair buttons.
+    Pairs,
+}
+
+/// What a press that never moved does on release: a matrix cell or a Device row is selected, or acted on when it
+/// already was (so a swipe starting on one never opens or flips it).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tap {
+    None,
+    Cell(usize, usize),
+    Control(usize),
+    /// An Analyzer pair button: shows that pair.
+    Pair(usize),
 }
 
 /// Soft-key slots down the right edge: `SOFT_NAV` for the pages with the active page's views under it, then
@@ -231,6 +293,9 @@ pub struct App {
     pub first_col: usize,
     pub first_ctl: usize,
     pub first_meter: usize,
+    pub first_pair: usize,
+    /// Meters: the inputs picker is open, its cursor on this item (`pick_items`).
+    pub picking: Option<usize>,
     /// A hazardous control change waiting for yes or no: (control, value).
     pub confirm: Option<(usize, i64)>,
     /// Whether switching a hazardous control on (phantom power) asks first. Off by default; the Device page's last row
@@ -238,7 +303,7 @@ pub struct App {
     pub ask_hazard: bool,
     /// Set when `ask_hazard` was toggled, for the tape to save; it clears it.
     pub ask_changed: bool,
-    pub controls: List<MixerControl, 32>,
+    pub controls: List<MixerControl, { queue::MAX_CONTROLS }>,
     pub analysis: Analysis,
     pub metering: Metering,
     pub message: Text<72>,
@@ -266,6 +331,8 @@ impl App {
             first_col: 0,
             first_ctl: 0,
             first_meter: 0,
+            first_pair: 0,
+            picking: None,
             confirm: None,
             ask_hazard: false,
             ask_changed: false,
@@ -292,7 +359,23 @@ impl App {
             }
         }
         app.rederive(device);
+        // A device that links input pairs itself ("Link 1/2" ...) decides how they start.
+        for first in (0..app.mix.n[Group::Input.idx()]).step_by(2) {
+            if let Some(on) = app.link_control(first).and_then(|i| app.controls.get(i)).filter(|c| c.flags & MIXER_FLAG_UNKNOWN == 0).map(|c| c.value != 0) {
+                if app.mix.paired[Group::Input.idx()][first] != on {
+                    app.mix.toggle_pair(Group::Input, first);
+                }
+            }
+        }
+        app.rederive(device);
         app
+    }
+
+    /// The device's own stereo link of the input pair starting at `first` (even), a switch named "Link a/b".
+    fn link_control(&self, first: usize) -> Option<usize> {
+        let mut name: Text<16> = Text::new();
+        let _ = write!(name, "Link {}/{}", first + 1, first + 2);
+        self.controls.iter().position(|c| c.kind == MIXER_CONTROL_BOOL && field(&c.name) == name.as_str())
     }
 
     pub fn outputs(&self) -> Strips {
@@ -357,7 +440,7 @@ impl App {
         let masters = self.shape.masters;
         let unity = self.shape.unity;
         self.mix.derive(|o, s| device.gain(o, s), |o| if masters { device.master(o) } else { Some(unity) });
-        self.controls = (0..self.shape.controls.min(32)).filter_map(|i| device.control(i)).collect();
+        self.controls = (0..self.shape.controls.min(queue::MAX_CONTROLS)).filter_map(|i| device.control(i)).collect();
         self.seen = device.serial();
     }
 
@@ -464,10 +547,14 @@ impl App {
             }
             return;
         }
+        if self.picking.is_some() && self.act_picker(action) {
+            return;
+        }
         match action {
             Action::Quit => self.quit = true,
             Action::Page(page) => {
                 self.page = page;
+                self.picking = None;
                 self.message.clear();
             }
             Action::View(view) => {
@@ -536,14 +623,99 @@ impl App {
         }
     }
 
+    /// Meters: the picker's presets, one per word the input names start with ("Analog", "Mic", "ADAT"), after "All";
+    /// a word that names every input is left out.
+    pub fn meter_groups(&self) -> List<(Text<16>, u64), 8> {
+        let all = self.metering.all();
+        let mut found = [(Text::from("All"), all); 8];
+        let mut count = 1;
+        for input in 0..self.metering.channels.min(64) {
+            let name = self.input_name(input);
+            let word = name.as_str().split(' ').next().unwrap_or("");
+            match found[..count].iter().position(|(w, _)| w.as_str() == word) {
+                Some(g) => found[g].1 |= 1 << input,
+                None if count < found.len() => {
+                    found[count] = (Text::from(word), 1 << input);
+                    count += 1;
+                }
+                None => {}
+            }
+        }
+        found[..count].iter().copied().enumerate().filter(|&(i, (_, mask))| i == 0 || mask != all).map(|(_, g)| g).collect()
+    }
+
+    /// A capture input's name: "Loop N" when it carries output N (cabled, `mt-loop`, or the device's own "Loopback N"
+    /// switch, which sends output N to capture channel N), else the mixer's, else "In N".
+    pub fn input_name(&self, input: usize) -> Text<16> {
+        let cabled = self.metering.loops.get(input).copied().unwrap_or(0) as usize;
+        let looped = cabled != 0 || self.loopback_on(input);
+        if looped {
+            let mut name = Text::new();
+            let _ = write!(name, "Loop {}", if cabled != 0 { cabled } else { input + 1 });
+            return name;
+        }
+        if input < self.mix.n[Group::Input.idx()] {
+            Text::from(self.name(Group::Input, input))
+        } else {
+            let mut name = Text::new();
+            let _ = write!(name, "In {}", input + 1);
+            name
+        }
+    }
+
+    /// The device's "Loopback N" switch for capture channel `input` is on.
+    fn loopback_on(&self, input: usize) -> bool {
+        let mut want = Text::<16>::new();
+        let _ = write!(want, "Loopback {}", input + 1);
+        self.controls.iter().any(|c| c.kind == MIXER_CONTROL_BOOL && c.value != 0 && field(&c.name) == want.as_str())
+    }
+
+    /// The picker's items: the presets, every input, Done.
+    pub fn pick_items(&self) -> usize {
+        self.meter_groups().len() + self.metering.channels.max(1) + 1
+    }
+
+    /// A preset shows its inputs, an input is switched on or off (the last one stays), Done closes.
+    pub fn pick(&mut self, item: usize) {
+        let groups = self.meter_groups();
+        self.picking = Some(item);
+        let m = &mut self.metering;
+        if let Some(&(_, mask)) = groups.get(item) {
+            m.show(mask);
+        } else if let Some(input) = item.checked_sub(groups.len()).filter(|&i| i < m.channels.max(1)) {
+            let toggled = (m.shown & m.all()) ^ 1 << input;
+            if toggled != 0 {
+                m.show(toggled);
+            }
+        } else {
+            self.picking = None;
+        }
+    }
+
+    /// Keys while the picker is open: Left/Right/Up/Down move, Enter or space picks, `a` or `n` closes. False for the
+    /// rest (pages, Quit), which act as usual.
+    fn act_picker(&mut self, action: Action) -> bool {
+        let Some(at) = self.picking else { return false };
+        let last = self.pick_items() - 1;
+        match action {
+            Action::Left | Action::Up => self.picking = Some(at.saturating_sub(1)),
+            Action::Right | Action::Down => self.picking = Some((at + 1).min(last)),
+            Action::Enter | Action::Freeze => self.pick(at),
+            Action::Channels | Action::No => self.picking = None,
+            _ => return false,
+        }
+        true
+    }
+
     fn act_meters(&mut self, device: &mut impl Device, action: Action) {
         let m = &mut self.metering;
         match action {
             Action::Left => m.step(false),
             Action::Right => m.step(true),
-            Action::Home => m.input = 0,
-            Action::End => m.input = m.channels.max(1) - 1,
+            Action::Home => m.home(false),
+            Action::End => m.home(true),
             Action::MeterScale => m.next_scale(),
+            Action::Channels => self.picking = Some(0),
             Action::Reset => m.reset(),
             Action::Up => self.step_gain(device, 1),
             Action::Down => self.step_gain(device, -1),
@@ -567,7 +739,7 @@ impl App {
 
     /// Rows of control cells under the meters: the most any input has.
     pub fn meter_rows(&self) -> usize {
-        (0..self.metering.channels.min(MAX_CHANNELS)).map(|input| self.input_controls(input).len()).max().unwrap_or(0)
+        (0..self.metering.channels.min(MAX_CHANNELS)).filter(|&i| self.metering.is_shown(i)).map(|input| self.input_controls(input).len()).max().unwrap_or(0)
     }
 
     /// The control Up and Down change for `input`: its first number (a gain), else its first choice (a level switch).
@@ -668,6 +840,7 @@ impl App {
         } else if self.page == Page::Meters {
             let scale = ["Scale: dBFS", "Scale: PPM", "Scale: LUFS"][self.metering.scale as usize];
             put(&mut slot, scale, SoftKind::Action, Action::MeterScale, false);
+            put(&mut slot, "Inputs", SoftKind::Action, Action::Channels, self.picking.is_some());
             put(&mut slot, "Reset", SoftKind::Action, Action::Reset, false);
         }
         slot = SOFT_NAV + SOFT_ACTIONS;
@@ -690,7 +863,21 @@ impl App {
             let mut changed = strip;
             changed.first &= !1;
             let label = self.label(&Strip { stereo: false, ..changed });
-            self.note(format_args!("{} {}", label.as_str(), if self.mix.paired[strip.group.idx()][changed.first] { "paired" } else { "split" }));
+            let paired = self.mix.paired[strip.group.idx()][changed.first];
+            self.note(format_args!("{} {}", label.as_str(), if paired { "paired" } else { "split" }));
+            // The device links the pair too, so its analog settings (+48V, gain) follow or part; linking asks first
+            // when the device marks it hazardous, as the Device page does.
+            if let Some(index) = self.link_control(changed.first).filter(|_| strip.group == Group::Input) {
+                let control = self.controls[index];
+                let known = control.flags & MIXER_FLAG_UNKNOWN == 0;
+                if !known || (control.value != 0) != paired {
+                    if paired {
+                        self.change_control(device, index, 1);
+                    } else {
+                        self.set_control(device, index, 0);
+                    }
+                }
+            }
         } else {
             self.note(format_args!("that channel has no partner"));
         }
@@ -967,6 +1154,7 @@ impl App {
         self.first_ctl = keep(self.ctl_sel, self.first_ctl, layout.visible_controls(), self.device_rows());
         self.metering.input = self.metering.input.min(self.metering.channels.max(1) - 1);
         self.first_meter = keep(self.metering.bar(), self.first_meter, layout.visible_meters(self), self.metering.bars());
+        self.first_pair = keep(self.analysis.pair, self.first_pair, layout.visible_pairs(), self.analysis.pairs());
     }
 
     /// A mouse button or finger came down at (`x`, `y`); `Some` when it grabbed a fader or a pan control to drag.
@@ -990,42 +1178,26 @@ impl App {
             }
             Hit::Tab(output) => {
                 self.out_sel = output;
-                None
+                Some(self.swipe_from(Swipe::Tabs, x, y, Tap::None))
             }
             Hit::Label(strip) => {
                 self.src_sel = strip;
-                None
+                Some(self.swipe_from(Swipe::Strips, x, y, Tap::None))
             }
             Hit::Fader(strip) => {
                 self.src_sel = strip;
-                self.drag(device, layout, Grab::Fader(strip), x, y);
-                Some(Grab::Fader(strip))
+                Some(Grab::Pressed { strip, x, y })
             }
             Hit::Pan(strip) => {
                 self.src_sel = strip;
                 self.drag(device, layout, Grab::Pan(strip), x, y);
                 Some(Grab::Pan(strip))
             }
-            Hit::Cell(row, col) => {
-                if (row, col) == (self.row, self.col) {
-                    self.open_cell();
-                } else {
-                    self.row = row;
-                    self.col = col;
-                }
-                None
-            }
-            Hit::Control(index) => {
-                if index == self.ctl_sel {
-                    self.change_control(device, index, 1);
-                } else {
-                    self.ctl_sel = index;
-                }
-                None
-            }
+            Hit::Cell(row, col) => Some(self.swipe_from(Swipe::Matrix, x, y, Tap::Cell(row, col))),
+            Hit::Control(index) => Some(self.swipe_from(Swipe::Controls, x, y, Tap::Control(index))),
             Hit::Meter(input) => {
                 self.metering.input = input;
-                None
+                Some(self.swipe_from(Swipe::Meters, x, y, Tap::None))
             }
             Hit::InputControl(index, input) => {
                 self.metering.input = input;
@@ -1036,28 +1208,158 @@ impl App {
                 self.change_control(device, index, 1);
                 None
             }
-            Hit::Yes | Hit::No | Hit::Nothing => None,
+            Hit::Nothing => {
+                // Empty space beside a list still swipes it (below the last strip, between meter columns).
+                let list = match (self.page, self.view) {
+                    (Page::Mixer, View::Outputs) if [layout.strips, layout.swipe_band(), layout.group_band()].iter().any(|r| r.contains(x, y)) => Swipe::Strips,
+                    (Page::Analyzer, _) if layout.an_pairs().contains(x, y) => Swipe::Pairs,
+                    (Page::Mixer, View::Matrix) if layout.body.contains(x, y) => Swipe::Matrix,
+                    (Page::Mixer, View::Device) if layout.body.contains(x, y) => Swipe::Controls,
+                    (Page::Meters, _) if layout.meter_area().contains(x, y) => Swipe::Meters,
+                    _ => return None,
+                };
+                Some(self.swipe_from(list, x, y, Tap::None))
+            }
+            Hit::AnPair(pair) => Some(self.swipe_from(Swipe::Pairs, x, y, Tap::Pair(pair))),
+            Hit::Pick(item) => {
+                self.pick(item);
+                None
+            }
+            Hit::Yes | Hit::No => None,
         }
+    }
+
+    fn swipe_from(&self, list: Swipe, x: i32, y: i32, tap: Tap) -> Grab {
+        let first = match list {
+            Swipe::Strips => self.first_strip,
+            Swipe::Tabs => self.first_tab,
+            Swipe::Matrix => self.first_row,
+            Swipe::Controls => self.first_ctl,
+            Swipe::Meters => self.first_meter,
+            Swipe::Pairs => self.first_pair,
+        };
+        Grab::Swipe { list, x, y, first, first_col: self.first_col, tap }
+    }
+
+    /// The finger or button came up: a fader pressed without moving goes where it was pressed; a tap on a matrix cell
+    /// or a Device row selects it, or opens or changes it when it was already selected.
+    pub fn release(&mut self, device: &mut impl Device, layout: &Layout, grab: Grab) {
+        if self.confirm.is_some() {
+            return;
+        }
+        match grab {
+            Grab::Pressed { strip, x, y } => {
+                self.drag(device, layout, Grab::Fader(strip), x, y);
+            }
+            Grab::Swipe { tap: Tap::Cell(row, col), .. } => {
+                if (row, col) == (self.row, self.col) {
+                    self.open_cell();
+                } else {
+                    self.row = row;
+                    self.col = col;
+                }
+            }
+            Grab::Swipe { tap: Tap::Pair(pair), .. } => self.analysis.set_pair(pair),
+            Grab::Swipe { tap: Tap::Control(index), .. } => {
+                if index == self.ctl_sel {
+                    self.change_control(device, index, 1);
+                } else {
+                    self.ctl_sel = index;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Moves a swiped list so that its content follows the finger, a whole item at a time, and pulls the selection
+    /// into the window (`scroll` would otherwise bring the old one back).
+    fn swipe(&mut self, layout: &Layout, grab: Grab, x: i32, y: i32) -> Grab {
+        let Grab::Swipe { list, x: x0, y: y0, first, first_col, tap } = grab else { return grab };
+        let (dx, dy) = (x - x0, y - y0);
+        if tap != Tap::None && dx.abs() < layout.slop() && dy.abs() < layout.slop() {
+            return grab;
+        }
+        let items = |delta: i32, size: i32| -> isize {
+            let size = size.max(1);
+            (if delta < 0 { -((-delta + size / 2) / size) } else { (delta + size / 2) / size }) as isize
+        };
+        let moved = |first: usize, by: isize, visible: usize, count: usize| -> usize {
+            (first as isize - by).clamp(0, count.saturating_sub(visible) as isize) as usize
+        };
+        let inside = |selected: usize, first: usize, visible: usize| selected.clamp(first, first + visible.max(1) - 1);
+        match list {
+            Swipe::Strips => {
+                let visible = layout.visible_strips();
+                self.first_strip = moved(first, items(dx, layout.strip_w), visible, self.strip_count());
+                self.src_sel = inside(self.src_sel, self.first_strip, visible);
+            }
+            Swipe::Tabs => {
+                let visible = layout.visible_tabs();
+                self.first_tab = moved(first, items(dx, layout.tab_w), visible, self.outputs().len());
+                self.out_sel = inside(self.out_sel, self.first_tab, visible);
+            }
+            Swipe::Matrix => {
+                let (rows, cols) = (layout.visible_rows(), layout.visible_cols());
+                self.first_row = moved(first, items(dy, layout.cell_h), rows, self.sources().len());
+                self.first_col = moved(first_col, items(dx, layout.cell_w), cols, self.outputs().len());
+                self.row = inside(self.row, self.first_row, rows);
+                self.col = inside(self.col, self.first_col, cols);
+            }
+            Swipe::Controls => {
+                let visible = layout.visible_controls();
+                self.first_ctl = moved(first, items(dy, layout.control_h), visible, self.device_rows());
+                self.ctl_sel = inside(self.ctl_sel, self.first_ctl, visible);
+            }
+            Swipe::Meters => {
+                let visible = layout.visible_meters(self);
+                self.first_meter = moved(first, items(dx, layout.meter_column_w(self)), visible, self.metering.bars());
+                let bar = inside(self.metering.bar(), self.first_meter, visible);
+                if bar != self.metering.bar() {
+                    self.metering.input = self.metering.bar_input(bar).unwrap_or(0);
+                    self.metering.fix();
+                }
+            }
+            Swipe::Pairs => {
+                self.first_pair = moved(first, items(dx, layout.an_pair_w()), layout.visible_pairs(), self.analysis.pairs());
+            }
+        }
+        Grab::Swipe { list, x: x0, y: y0, first, first_col, tap: Tap::None }
     }
 
     /// The held button or finger moved to (`x`, `y`): the grabbed fader follows it (0.5 dB steps, the bottom is off), a
     /// grabbed pan control follows it sideways (1% steps), a grabbed gain under a meter one step per half text row.
-    pub fn drag(&mut self, device: &mut impl Device, layout: &Layout, grab: Grab, x: i32, y: i32) {
+    pub fn drag(&mut self, device: &mut impl Device, layout: &Layout, grab: Grab, x: i32, y: i32) -> Grab {
+        match grab {
+            _ if self.confirm.is_some() => return grab,
+            Grab::Swipe { .. } => return self.swipe(layout, grab, x, y),
+            Grab::Pressed { strip, x: x0, y: y0 } => {
+                let (dx, dy) = (x - x0, y - y0);
+                if dy.abs() >= layout.slop() && dy.abs() >= dx.abs() {
+                    return self.drag(device, layout, Grab::Fader(strip), x, y);
+                }
+                if dx.abs() >= layout.slop() {
+                    let swipe = Grab::Swipe { list: Swipe::Strips, x: x0, y: y0, first: self.first_strip, first_col: self.first_col, tap: Tap::None };
+                    return self.swipe(layout, swipe, x, y);
+                }
+                return grab;
+            }
+            _ => {}
+        }
         if let Grab::Control { index, y: from, value } = grab {
-            let Some(control) = self.controls.get(index).filter(|_| self.page == Page::Meters && self.confirm.is_none()) else { return };
+            let Some(control) = self.controls.get(index).filter(|_| self.page == Page::Meters) else { return grab };
             let target = (value + ((from - y) / (layout.row / 2).max(1)) as i64).clamp(control.min, control.max);
             if target != control.value {
                 self.change_control(device, index, target - control.value);
             }
-            return;
+            return grab;
         }
         if self.view != View::Outputs || self.page != Page::Mixer {
-            return;
+            return grab;
         }
         match grab {
-            Grab::Control { .. } => {}
+            Grab::Control { .. } | Grab::Pressed { .. } | Grab::Swipe { .. } | Grab::Held => {}
             Grab::Fader(strip) => {
-                let Some(fader) = layout.fader(strip, self) else { return };
+                let Some(fader) = layout.fader(strip, self) else { return grab };
                 let position = (fader.y + fader.h - y) as f64 / fader.h.max(1) as f64;
                 let db = layout::fader_db(position);
                 self.src_sel = strip;
@@ -1076,7 +1378,7 @@ impl App {
                 );
             }
             Grab::Pan(strip) => {
-                let Some(pan) = layout.pan(strip, self) else { return };
+                let Some(pan) = layout.pan(strip, self) else { return grab };
                 let value = round_pan(((x - pan.x) as f64 / pan.w.max(1) as f64) * 2.0 - 1.0);
                 self.src_sel = strip;
                 self.edit(
@@ -1090,6 +1392,7 @@ impl App {
                 );
             }
         }
+        grab
     }
 }
 

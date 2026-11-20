@@ -11,7 +11,7 @@ const PROMPT: &str = "fos> ";
 const ESCAPE: u8 = 0x1b;
 
 /// Input state of the foreground tape: while a tape runs, typed bytes go to it (`read_key`) instead of the line editor;
-/// Escape kills it, as on the embedded kernel.
+/// Escape asks it to stop (`request_stop`), as on the embedded kernel.
 struct Keys {
     pid: u64,
     buffer: [u8; 64],
@@ -22,6 +22,56 @@ struct Keys {
 }
 /// One per session (`session.rs`).
 static KEYS: [crate::sync::SpinLock<Keys>; crate::session::MAX] = [const { crate::sync::SpinLock::new(Keys { pid: 0, buffer: [0; 64], head: 0, count: 0, escape_tick: 0 }) }; crate::session::MAX];
+
+/// How long a tape asked to stop (Escape, its session closing) has to end by itself before it is killed: long enough to
+/// close a file and drain a writer thread over a slow USB device, short enough that a tape that never looks is not missed.
+const STOP_GRACE_TICKS: u64 = 3 * time::TICK_HZ;
+
+/// Tapes asked to stop: `(pid, tick by which it must have ended)`; 0 is a free entry.
+static STOPS: crate::sync::SpinLock<[(u64, u64); 8]> = crate::sync::SpinLock::new([(0, 0); 8]);
+
+/// Asks process `pid` to end: its `read_key` answers `KEY_ABORT` and `should_abort` true from now on, which is what a tape on
+/// the embedded kernel sees on Escape, so it can close its files and end itself. Asked a second time (a second Escape), or
+/// when it has not ended `STOP_GRACE_TICKS` later (`poll_escape`), it is killed outright.
+pub fn request_stop(pid: u64) {
+    let mut stops = STOPS.lock();
+    if stops.iter().any(|&(asked, _)| asked == pid) {
+        stops.iter_mut().filter(|entry| entry.0 == pid).for_each(|entry| *entry = (0, 0));
+        drop(stops);
+        println!("Process {pid}: asked twice; killed.");
+        return sched::kill(pid);
+    }
+    match stops.iter_mut().find(|entry| entry.0 == 0) {
+        Some(entry) => *entry = (pid, time::ticks() + STOP_GRACE_TICKS),
+        None => {
+            drop(stops);
+            sched::kill(pid);
+        }
+    }
+}
+
+/// Whether process `pid` has been asked to stop (`request_stop`).
+pub fn stop_requested(pid: u64) -> bool {
+    pid != 0 && STOPS.lock().iter().any(|&(asked, _)| asked == pid)
+}
+
+/// Kills the tapes that were asked to stop and are still running at their deadline; forgets the ones that ended.
+fn poll_stops() {
+    let now = time::ticks();
+    let mut stops = STOPS.lock();
+    for entry in stops.iter_mut().filter(|entry| entry.0 != 0) {
+        let (pid, deadline) = *entry;
+        let mut running = false;
+        sched::for_each_process(|p, _, _, _| running |= p == pid);
+        if !running {
+            *entry = (0, 0);
+        } else if now >= deadline {
+            *entry = (0, 0);
+            println!("Process {pid} did not end within {} s of being asked; killed.", STOP_GRACE_TICKS / time::TICK_HZ);
+            sched::kill(pid);
+        }
+    }
+}
 
 /// The foreground tape of session `id` (0 when none).
 pub fn foreground(id: usize) -> u64 {
@@ -86,7 +136,7 @@ fn push_key(keys: &mut Keys, byte: u8) {
     }
 }
 
-/// Routes a byte to the foreground tape; false when there is none. A lone Escape kills the tape, but Escape followed at once
+/// Routes a byte to the foreground tape; false when there is none. A lone Escape asks the tape to stop, but Escape followed at once
 /// by `[` or `O` is a cursor key and goes to the tape as typed (the embedded kernel does the same).
 fn feed_foreground(id: usize, byte: u8) -> bool {
     let mut keys = KEYS[id].lock();
@@ -102,7 +152,7 @@ fn feed_foreground(id: usize, byte: u8) -> bool {
             return true;
         }
         drop(keys);
-        sched::kill(pid);
+        request_stop(pid);
         return true;
     }
     if byte == ESCAPE {
@@ -113,8 +163,10 @@ fn feed_foreground(id: usize, byte: u8) -> bool {
     true
 }
 
-/// A lone Escape that nothing followed in time stops the foreground tape; called from the service loop.
+/// A lone Escape that nothing followed in time asks the foreground tape to stop, and a tape that was asked and did not end in
+/// time is killed; called from the service loop.
 pub fn poll_escape() {
+    poll_stops();
     for id in 0..crate::session::MAX {
         let mut keys = KEYS[id].lock();
         if keys.escape_tick != 0 && time::ticks().saturating_sub(keys.escape_tick) >= ESCAPE_WAIT_TICKS {
@@ -122,7 +174,7 @@ pub fn poll_escape() {
             let pid = keys.pid;
             drop(keys);
             if pid != 0 {
-                sched::kill(pid);
+                request_stop(pid);
             }
         }
     }

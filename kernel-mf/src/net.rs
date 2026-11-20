@@ -21,7 +21,7 @@ use kernel_core::{e1000, netdump::Mac, pci, rtl8139, rtl8168, threecom, virtio_n
 
 use crate::time::{self, TICK_HZ};
 use crate::sync::SpinLock;
-use crate::{config, netfs, pmm, power, sched, shell, slots, vm};
+use crate::{config, netfs, pmm, power, shell, slots, vm};
 
 const ETHERTYPE: [u8; 2] = [0x88, 0xb6];
 const TAG_DISCOVER_REQUEST: u8 = 0x02;
@@ -428,14 +428,14 @@ fn close_terminal(slot: usize) {
     end_foreground_tape(slot);
 }
 
-/// The session in `slot` is over: its foreground tape (an `ed` waiting for keys, say) would never get another key and is killed
-/// rather than left running with its files.
+/// The session in `slot` is over: its foreground tape (an `ed` waiting for keys, say) would never get another key, so it is
+/// asked to stop (and killed if it does not, `shell::request_stop`) rather than left running with its files.
 fn end_foreground_tape(slot: usize) {
     let pid = shell::foreground(slot + 1);
     shell::detach(slot + 1);
     if pid != 0 {
         println!("Session {} ended; stopping its tape (process {pid}).", slot + 1);
-        sched::kill(pid);
+        shell::request_stop(pid);
     }
 }
 

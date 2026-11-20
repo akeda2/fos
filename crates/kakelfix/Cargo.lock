@@ -7,6 +7,25 @@ name = "audio-sample"
 version = "0.1.0"
 
 [[package]]
+name = "audio-screen"
+version = "0.1.0"
+dependencies = [
+ "audio-sample",
+ "audio-wire",
+ "dsp",
+ "gfx",
+ "noise",
+ "tape-rt",
+]
+
+[[package]]
+name = "audio-wire"
+version = "0.1.0"
+dependencies = [
+ "audio-sample",
+]
+
+[[package]]
 name = "dsp"
 version = "0.1.0"
 dependencies = [
@@ -18,11 +37,30 @@ name = "fosfor-abi"
 version = "0.1.0"
 
 [[package]]
+name = "gfx"
+version = "0.1.0"
+dependencies = [
+ "dsp",
+]
+
+[[package]]
+name = "instrument-rt"
+version = "0.1.0"
+dependencies = [
+ "audio-sample",
+ "audio-screen",
+ "gfx",
+ "tape-rt",
+]
+
+[[package]]
 name = "kakelfix"
 version = "0.1.0"
 dependencies = [
  "fosfor-abi",
+ "instrument-rt",
  "mixer-model",
+ "tape-rt",
 ]
 
 [[package]]
@@ -30,4 +68,19 @@ name = "mixer-model"
 version = "0.1.0"
 dependencies = [
  "dsp",
+]
+
+[[package]]
+name = "noise"
+version = "0.1.0"
+dependencies = [
+ "audio-sample",
+ "dsp",
+]
+
+[[package]]
+name = "tape-rt"
+version = "0.1.0"
+dependencies = [
+ "fosfor-abi",
 ]

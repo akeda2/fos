@@ -103,7 +103,7 @@ def run(cpu, smp):
             if found is None or int(found.group(1), 16) >= 512 << 20:
                 failures.append("memtest did not report a physical address inside RAM:\n" + new)
         if not failures:
-            # Escape reaches the foreground tape: gfxcheck would hold its picture for 10 s.
+            # Escape asks the foreground tape to stop: gfxcheck, holding its picture for 10 s, sees should_abort and ends itself.
             mark = len(log)
             qemu.stdin.write(b"tape gfxcheck\n")
             qemu.stdin.flush()
@@ -112,8 +112,11 @@ def run(cpu, smp):
             qemu.stdin.flush()
             if not wait_for("fos> ", 5, mark + 40):
                 failures.append("Escape did not end the foreground tape:\n" + log[mark:].decode("utf8", "replace"))
+            elif "exited with code 0" not in log[mark:].decode("utf8", "replace") or b"killed" in log[mark:]:
+                failures.append("Escape killed gfxcheck instead of letting it end:\n" + log[mark:].decode("utf8", "replace"))
         if not failures:
-            # A tape that polls the USB calls in a loop must not starve the service thread: Escape still reaches it.
+            # A tape that polls the USB calls in a loop must not starve the service thread: Escape still reaches it. usbspin never
+            # looks at should_abort, so the shell kills it once the 3 s grace has passed.
             mark = len(log)
             qemu.stdin.write(b"tape fscheck usbspin\n")
             qemu.stdin.flush()
@@ -123,6 +126,8 @@ def run(cpu, smp):
             qemu.stdin.flush()
             if not wait_for("fos> ", 8, mark + 40):
                 failures.append("a tape polling USB starved the shell; Escape did not end it:\n" + log[mark:].decode("utf8", "replace"))
+            elif "did not end within 3 s" not in log[mark:].decode("utf8", "replace"):
+                failures.append("a tape ignoring Escape was not killed after the grace:\n" + log[mark:].decode("utf8", "replace"))
         if not failures:
             # Keyboard input and fs_read/fs_write together: append a line with ed, save, and read it back in a second session.
             def type_to_ed(lines, expect):
@@ -136,7 +141,7 @@ def run(cpu, smp):
             ok = ok and type_to_ed("tape ed note.txt\n", "ed> ")
             ok = ok and type_to_ed("p\n", "2: hello")
             type_to_ed("q\n", "exited with code 0.")
-            # ESC [ D is a cursor key for the tape, not an Escape: ed must survive it (a lone ESC kills the tape after ~30 ms).
+            # ESC [ D is a cursor key for the tape, not an Escape: ed must survive it (a lone ESC asks the tape to stop after ~30 ms).
             ok2 = type_to_ed("tape ed note.txt\n", "ed> ")
             qemu.stdin.write(b"\x1b[D")
             qemu.stdin.flush()

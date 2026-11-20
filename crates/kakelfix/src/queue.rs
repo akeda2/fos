@@ -13,7 +13,7 @@ use fosfor_abi::tape::MixerControl;
 use mixer_model::{Group, MAX_CHANNELS, MAX_SOURCES};
 
 /// Controls the app shows (`App::controls` holds as many).
-pub const MAX_CONTROLS: usize = 32;
+pub const MAX_CONTROLS: usize = 96;
 const GAINS: usize = MAX_CHANNELS * MAX_SOURCES;
 /// An empty slot. Raw gains stop far below it (`MixerInfo::max`).
 const EMPTY: u32 = u32::MAX;

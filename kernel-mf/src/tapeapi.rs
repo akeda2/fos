@@ -9,13 +9,13 @@
 //! eight, so the table's layout stays the single source of truth: every field after the 8-byte version/size header is one word.
 //!
 //! What a call is worth today: console (`putc`, `puts`), time (`ticks`, `micros`), memory (`alloc`/`free` map zeroed pages into
-//! the process; the address is virtual, not physical), `args`, `should_abort` (the process was killed), `fp_level`, `free_pages`,
+//! the process; the address is virtual, not physical), `args`, `should_abort` (the process was asked to stop or killed), `fp_level`, `free_pages`,
 //! `console_size` and the pixel screen (`gfx_*`). Everything else answers 0 ("none", "failed"), which the tapes read as "this
 //! machine has no such device"; the `fs_*` calls go to `tapefs.rs`, the `nic_*` calls to `tapenet.rs`. Input, files, NICs, USB MIDI/touch and audio (`tapeaudio.rs`) are served; GPIO and I2C answer "no pins" (Pi 4 only) (the drivers are unlocked and CPU-0 only; see docs/big-kernel.md). Processes are single-threaded.
 
 use core::mem::{offset_of, size_of};
 
-use fosfor_abi::tape::{KEY_BASE, KEY_NONE, TAPE_API_VERSION, TapeApi};
+use fosfor_abi::tape::{KEY_ABORT, KEY_BASE, KEY_NONE, TAPE_API_VERSION, TapeApi};
 
 use crate::trap::Frame;
 use crate::{threads, time, fb, fpu, pmm, process, sched, tapeaudio, tapefs, tapenet, tapeserial, tapesys, vm};
@@ -380,9 +380,10 @@ pub fn call(frame: &mut Frame) {
             }
             0
         }
-        SHOULD_ABORT => u64::from(sched::current_killed()),
+        SHOULD_ABORT => u64::from(sched::current_killed() || crate::shell::stop_requested(sched::current_pid())),
         READ_KEY => match crate::shell::take_key(sched::current_pid()) {
             Some(byte) => u64::from(KEY_BASE + u32::from(byte)),
+            None if crate::shell::stop_requested(sched::current_pid()) => u64::from(KEY_ABORT),
             None => u64::from(KEY_NONE),
         },
         SET_INPUT_MODE => 0,

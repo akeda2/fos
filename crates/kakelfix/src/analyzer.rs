@@ -59,6 +59,15 @@ impl Analysis {
         self.channels.div_ceil(2).max(1)
     }
 
+    /// Shows pair `pair` (clamped); what was gathered starts over when it changes.
+    pub fn set_pair(&mut self, pair: usize) {
+        let pair = pair.min(self.pairs() - 1);
+        if pair != self.pair {
+            self.pair = pair;
+            self.restart();
+        }
+    }
+
     pub fn step_pair(&mut self, forward: bool) {
         let pairs = self.pairs();
         let next = if forward { (self.pair + 1) % pairs } else { (self.pair + pairs - 1) % pairs };

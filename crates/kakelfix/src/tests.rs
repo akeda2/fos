@@ -197,6 +197,26 @@ fn pairing_splits_and_rereads_without_writing() {
 }
 
 #[test]
+fn pairing_inputs_follows_and_sets_the_device_link() {
+    let mut device = Fake::new();
+    device.names[1] = "Link 1/2";
+    let mut app = app(&mut device);
+    assert!(!app.mix.paired[Group::Input.idx()][0], "the device's link (off) decides how the inputs start");
+    app.act(&mut device, Action::Pair);
+    assert_eq!((app.message.as_str(), device.controls[1]), ("In 1 paired", 1));
+    app.act(&mut device, Action::Pair);
+    assert_eq!((app.message.as_str(), device.controls[1]), ("In 1 split", 0));
+    app.ask_hazard = true;
+    app.act(&mut device, Action::Pair);
+    assert_eq!((app.confirm, device.controls[1]), (Some((1, 1)), 0), "linking a hazardous pair asks first");
+    // Playback pairs have no device link.
+    app.confirm = None;
+    app.act(&mut device, Action::Right);
+    app.act(&mut device, Action::Pair);
+    assert_eq!((app.message.as_str(), device.controls[1]), ("Play L split", 0));
+}
+
+#[test]
 fn the_mouse_drags_faders_and_pan_and_presses_soft_keys() {
     let mut device = Fake::new();
     let mut app = app(&mut device);
@@ -204,8 +224,10 @@ fn the_mouse_drags_faders_and_pan_and_presses_soft_keys() {
     app.scroll(&layout);
     let fader = layout.fader(1, &app).unwrap();
     let grab = app.press(&mut device, &layout, fader.x + 2, fader.y);
-    assert_eq!(grab, Some(Grab::Fader(1)));
-    assert_eq!(device.gain[0][2], Some(65_381), "the top is +6 dB");
+    assert!(matches!(grab, Some(Grab::Pressed { strip: 1, .. })));
+    assert_eq!(device.gain[0][2], Some(UNITY), "a press alone leaves the fader");
+    app.release(&mut device, &layout, grab.unwrap());
+    assert_eq!(device.gain[0][2], Some(65_381), "a tap sets it: the top is +6 dB");
     app.drag(&mut device, &layout, Grab::Fader(1), fader.x + 2, fader.y + fader.h);
     assert_eq!(device.gain[0][2], Some(0), "the bottom is off");
     app.drag(&mut device, &layout, Grab::Fader(1), fader.x + 2, fader.y + fader.h - (fader.h as f64 * layout::fader_position(0.0)) as i32);
@@ -218,10 +240,59 @@ fn the_mouse_drags_faders_and_pan_and_presses_soft_keys() {
     assert_eq!(app.view, View::Matrix);
     app.scroll(&layout);
     let cell = layout.cell(1, 0, &app).unwrap();
-    app.press(&mut device, &layout, cell.x + 1, cell.y + 1);
+    let grab = app.press(&mut device, &layout, cell.x + 1, cell.y + 1).unwrap();
+    app.release(&mut device, &layout, grab);
     assert_eq!((app.row, app.col, app.view), (1, 0, View::Matrix));
-    app.press(&mut device, &layout, cell.x + 1, cell.y + 1);
+    let grab = app.press(&mut device, &layout, cell.x + 1, cell.y + 1).unwrap();
+    app.release(&mut device, &layout, grab);
     assert_eq!((app.src_sel, app.view), (1, View::Outputs), "a second click opens the send");
+}
+
+#[test]
+fn a_finger_swipes_the_strips_the_matrix_and_the_meters() {
+    let mut device = Fake::new();
+    let mut app = app(&mut device);
+    // A narrow screen shows fewer strips than there are.
+    let layout = Layout::new(320, 720);
+    app.scroll(&layout);
+    let (visible, count) = (layout.visible_strips(), app.strip_count());
+    assert!(visible < count, "{visible} of {count}");
+    // Sideways from a fader: the strips follow the finger and no level changes.
+    let fader = layout.fader(0, &app).unwrap();
+    let (x, y) = (fader.x + 2, fader.y + fader.h / 2);
+    let mut grab = app.press(&mut device, &layout, x, y).unwrap();
+    for step in 1..=4 {
+        grab = app.drag(&mut device, &layout, grab, x - step * layout.strip_w / 2, y + 1);
+    }
+    assert_eq!(app.first_strip, (count - visible).min(2), "two strips' width to the left shows two more");
+    assert!(app.src_sel >= app.first_strip, "the selection stays in view");
+    app.release(&mut device, &layout, grab);
+    app.scroll(&layout);
+    assert_eq!(app.first_strip, (count - visible).min(2), "`scroll` keeps it there");
+    assert_eq!(device.writes, 0, "a swipe writes nothing");
+    // Back to the right, past the start: clamped.
+    let label = layout.label(app.first_strip, &app).unwrap();
+    let grab = app.press(&mut device, &layout, label.x + 2, label.y + 2).unwrap();
+    app.drag(&mut device, &layout, grab, label.x + 2 + 10 * layout.strip_w, label.y + 2);
+    assert_eq!(app.first_strip, 0);
+    // A swipe that starts on the selected matrix cell does not open it (a tap would).
+    app.act(&mut device, Action::View(View::Matrix));
+    app.scroll(&layout);
+    assert_eq!((app.row, app.col), (0, 0));
+    let cell = layout.cell(0, 0, &app).unwrap();
+    let grab = app.press(&mut device, &layout, cell.x + 1, cell.y + 1).unwrap();
+    let grab = app.drag(&mut device, &layout, grab, cell.x + 1 - layout.cell_w, cell.y + 1);
+    app.release(&mut device, &layout, grab);
+    assert_eq!(app.view, View::Matrix);
+    // Meters: more inputs than columns; a swipe to the left shows later inputs.
+    app.metering.channels = 30;
+    app.act(&mut device, Action::Page(Page::Meters));
+    app.scroll(&layout);
+    assert!(layout.visible_meters(&app) < 30);
+    let bar = layout.meter_bar(0, &app).unwrap();
+    let grab = app.press(&mut device, &layout, bar.x + 2, bar.y + 4).unwrap();
+    app.drag(&mut device, &layout, grab, bar.x + 2 - 3 * layout.meter_column_w(&app), bar.y + 4);
+    assert_eq!((app.first_meter, app.metering.input), (3, 3));
 }
 
 #[test]
@@ -465,5 +536,195 @@ fn meter_settings_load_and_save() {
     m.save(|key, value| {
         let _ = write!(text, "{key}={value} ");
     });
-    assert_eq!(text.as_str(), "mt-scale=lufs mt-input=4 ");
+    assert_eq!(text.as_str(), "mt-scale=lufs mt-input=4 mt-show=all ");
+}
+
+#[test]
+fn meters_show_only_the_chosen_inputs() {
+    let mut m = Metering::new();
+    m.channels = 8;
+    m.scale = MeterScale::Dbfs;
+    m.input = 2;
+    m.load(|key| (key == "mt-show").then_some("2,4-5,40"));
+    assert_eq!((m.bars(), m.input), (3, 3), "the selection moves to the next shown input");
+    assert_eq!((m.bar_input(0), m.bar_input(2), m.bar_input(3), m.bar_of(4), m.bar_of(0)), (Some(1), Some(4), None, Some(2), None));
+    m.step(true);
+    assert_eq!(m.input, 4);
+    m.step(true);
+    assert_eq!(m.input, 4, "stays on the last shown input");
+    m.home(false);
+    assert_eq!(m.input, 1);
+    // LUFS: a pair has a bar when either input is shown.
+    m.scale = MeterScale::Lufs;
+    assert_eq!((m.bars(), m.bar_input(1), m.bar_of(3)), (3, Some(2), Some(1)));
+    let mut text = Text::<64>::new();
+    m.save(|key, value| {
+        if key == "mt-show" {
+            let _ = write!(text, "{value}");
+        }
+    });
+    assert_eq!(text.as_str(), "2,4-5");
+    m.show(0);
+    assert_eq!(m.bars(), 4, "showing nothing shows everything");
+}
+
+#[test]
+fn names_keep_their_number_when_cut() {
+    assert_eq!(fit_name("Mic 10", 6).as_str(), "Mic 10");
+    assert_eq!(fit_name("Mic 10", 5).as_str(), "Mic10");
+    assert_eq!(fit_name("ADAT 12", 5).as_str(), "AD 12");
+    assert_eq!(fit_name("Analog 1", 4).as_str(), "An 1");
+    assert_eq!(fit_name("Mic 10", 3).as_str(), "M10");
+    assert_eq!(fit_name("Playback", 4).as_str(), "Play");
+    assert_eq!(fit_name("Mic 10", 2).as_str(), "Mi", "no room for the number");
+}
+
+#[test]
+fn the_meters_picker_chooses_the_inputs_shown() {
+    let mut device = Fake::new();
+    let mut app = app(&mut device);
+    app.metering.channels = 8;
+    app.act(&mut device, Action::Page(Page::Meters));
+    let layout = Layout::new(1280, 800);
+    app.act(&mut device, Action::Channels);
+    assert_eq!(app.picking, Some(0));
+    let groups = app.meter_groups().len();
+    assert_eq!(app.meter_groups()[0].0.as_str(), "All");
+    // A tap on input 3 hides it; a tap on every other input but 1 leaves 1, which then stays.
+    let three = layout.pick(groups + 2, &app).unwrap();
+    assert_eq!(app.press(&mut device, &layout, three.x + 2, three.y + 2), None);
+    assert!(!app.metering.is_shown(2) && app.metering.is_shown(3));
+    for input in (1..8).filter(|&i| i != 2) {
+        let cell = layout.pick(groups + input, &app).unwrap();
+        app.press(&mut device, &layout, cell.x + 2, cell.y + 2);
+    }
+    assert_eq!(app.metering.bars(), 1);
+    let first = layout.pick(groups, &app).unwrap();
+    app.press(&mut device, &layout, first.x + 2, first.y + 2);
+    assert!(app.metering.is_shown(0), "the last input shown stays");
+    // Keys: Right to input 2, Enter shows it; the "All" preset, then Done closes.
+    app.picking = Some(groups);
+    app.act(&mut device, Action::Right);
+    app.act(&mut device, Action::Enter);
+    assert_eq!(app.metering.bars(), 2);
+    app.act(&mut device, Action::Home);
+    app.picking = Some(0);
+    app.act(&mut device, Action::Freeze);
+    assert_eq!(app.metering.bars(), 8);
+    let done = layout.pick(app.pick_items() - 1, &app).unwrap();
+    app.press(&mut device, &layout, done.x + 2, done.y + 2);
+    assert_eq!(app.picking, None);
+    // A page change closes it too.
+    app.act(&mut device, Action::Channels);
+    app.act(&mut device, Action::Page(Page::Mixer));
+    assert_eq!(app.picking, None);
+    assert_eq!(device.writes, 0);
+}
+
+#[test]
+fn analyzer_pair_buttons_tap_and_swipe() {
+    let mut device = Fake::new();
+    let mut app = app(&mut device);
+    app.analysis.channels = 30;
+    app.act(&mut device, Action::Page(Page::Analyzer));
+    let layout = Layout::new(640, 480);
+    app.scroll(&layout);
+    assert!(layout.visible_pairs() < 15);
+    let third = layout.an_pair(2, &app).unwrap();
+    let grab = app.press(&mut device, &layout, third.x + 2, third.y + 2).unwrap();
+    app.release(&mut device, &layout, grab);
+    assert_eq!(app.analysis.pair, 2, "a tap shows that pair");
+    // A swipe to the left reveals later pairs and changes nothing else.
+    let grab = app.press(&mut device, &layout, third.x + 2, third.y + 2).unwrap();
+    let grab = app.drag(&mut device, &layout, grab, third.x + 2 - 3 * layout.an_pair_w(), third.y + 2);
+    app.release(&mut device, &layout, grab);
+    assert_eq!((app.first_pair, app.analysis.pair), (3, 2));
+    // `scroll` brings the shown pair back into view when a key changes it.
+    app.act(&mut device, Action::Left);
+    app.scroll(&layout);
+    assert!(app.first_pair <= app.analysis.pair);
+}
+
+#[test]
+fn the_swipe_band_scrolls_without_touching_a_fader() {
+    let mut device = Fake::new();
+    let mut app = app(&mut device);
+    let layout = Layout::new(320, 720);
+    app.scroll(&layout);
+    let band = layout.swipe_band();
+    assert!(band.h > layout.row && band.y > layout.strips.y + layout.strips.h);
+    let (x, y) = (band.x + band.w - 4, band.y + band.h / 2);
+    let grab = app.press(&mut device, &layout, x, y).unwrap();
+    let grab = app.drag(&mut device, &layout, grab, x - layout.strip_w, y);
+    app.release(&mut device, &layout, grab);
+    assert_eq!(app.first_strip, 1);
+    // A tap there does nothing at all.
+    let before = (app.src_sel, app.first_strip);
+    if let Some(grab) = app.press(&mut device, &layout, x, y) {
+        app.release(&mut device, &layout, grab);
+    }
+    assert_eq!((app.src_sel, app.first_strip, device.writes), (before.0, before.1, 0));
+}
+
+#[test]
+fn a_held_finger_flips_the_inputs_key_once() {
+    use instrument_rt::{TouchTarget, Touches};
+    use tape_rt::TouchEvent;
+    struct Pointing<'a> {
+        app: &'a mut App,
+        device: &'a mut Fake,
+        layout: &'a Layout,
+    }
+    impl TouchTarget for Pointing<'_> {
+        type Grab = Grab;
+        fn down(&mut self, x: i32, y: i32) -> Option<Grab> {
+            Some(self.app.press(self.device, self.layout, x, y).unwrap_or(Grab::Held))
+        }
+        fn moved(&mut self, grab: Grab, x: i32, y: i32) -> Grab {
+            self.app.drag(self.device, self.layout, grab, x, y)
+        }
+        fn up(&mut self, grab: Grab) {
+            self.app.release(self.device, self.layout, grab);
+        }
+    }
+    let mut device = Fake::new();
+    let mut app = app(&mut device);
+    app.metering.channels = 4;
+    app.act(&mut device, Action::Page(Page::Meters));
+    app.act(&mut device, Action::Channels);
+    let layout = Layout::new(1280, 800);
+    let slot = app.soft_keys().iter().position(|k| k.action == Action::Channels).unwrap();
+    let key = layout.soft(&app, slot);
+    let mut touches = Touches::<Grab>::new(1280, 800, 0);
+    let mut target = Pointing { app: &mut app, device: &mut device, layout: &layout };
+    // A touch panel reports a resting finger again and again before it lifts.
+    for down in [true, true, true, true, false] {
+        let event = TouchEvent { panel: 0, id: 1, x: key.x + 4, y: key.y + 4, down, screen: -1 };
+        touches.handle(&event, (1280, 800), &mut target);
+    }
+    assert_eq!(app.picking, None, "closed once, not reopened");
+}
+
+#[test]
+fn looped_back_inputs_are_named_after_their_output() {
+    let mut device = Fake::new();
+    device.names = ["Loopback 3", "Phantom", "Trim"];
+    let mut app = app(&mut device);
+    app.metering.channels = 16;
+    app.metering.load(|key| (key == "mt-loop").then_some("13-14:1,x,16:9"));
+    assert_eq!((app.input_name(12).as_str(), app.input_name(13).as_str(), app.input_name(15).as_str()), ("Loop 1", "Loop 2", "Loop 9"));
+    assert_eq!(app.input_name(2).as_str(), "In 3", "the device's loopback switch is off");
+    app.act(&mut device, Action::View(View::Device));
+    app.act(&mut device, Action::Enter);
+    app.controls = (0..3).filter_map(|i| device.control(i)).collect();
+    assert_eq!(app.input_name(2).as_str(), "Loop 3", "on: capture channel 3 carries output 3");
+    let loops = app.meter_groups().iter().find(|(name, _)| name.as_str() == "Loop").map(|g| g.1);
+    assert_eq!(loops, Some(1 << 2 | 1 << 12 | 1 << 13 | 1 << 15), "a preset for the loops");
+    let mut text = Text::<64>::new();
+    app.metering.save(|key, value| {
+        if key == "mt-loop" {
+            let _ = write!(text, "{value}");
+        }
+    });
+    assert_eq!(text.as_str(), "13-14:1,16:9");
 }

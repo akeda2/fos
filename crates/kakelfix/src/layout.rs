@@ -40,6 +40,9 @@ pub enum Hit {
     /// Meters: an input's bar or name (the input, 0-based), a control cell under it (control index, input).
     Meter(usize),
     InputControl(usize, usize),
+    /// Analyzer: a pair button. Meters: an item of the inputs picker (`App::pick_items`).
+    AnPair(usize),
+    Pick(usize),
     Yes,
     No,
     Nothing,
@@ -115,7 +118,9 @@ impl Layout {
         // One row above the strips names each run of them (inputs, playback, the output's master): the driver may give an input
         // and a playback channel the same name.
         let band = row + 4;
-        let strips = Rect::new(body.x, tabs.y + tabs.h + 8 + band, body.w, body.y + body.h - tabs.y - tabs.h - 8 - band);
+        // Under the strips a band that only swipes them: a finger there never moves a fader.
+        let swipe_h = row * 2 + 8;
+        let strips = Rect::new(body.x, tabs.y + tabs.h + 8 + band, body.w, body.y + body.h - tabs.y - tabs.h - 8 - band - swipe_h - 6);
         Layout {
             width,
             height,
@@ -147,10 +152,58 @@ impl Layout {
         Rect::new(self.keys.x + 8 + indent, y, self.keys.w - 16 - indent, self.key_h - 8)
     }
 
-    /// The Analyzer's plots for `view`: the waveform and the spectrum, each inside the room for its axis labels (six
-    /// columns at the left, a row under the spectrum). Both: the waveform takes the upper two fifths.
-    pub fn analyzer_plots(&self, view: crate::AnView) -> (Option<Rect>, Option<Rect>) {
+    /// The swipe-only band under the strips (Outputs view), and the group names above them, which swipe too.
+    pub fn swipe_band(&self) -> Rect {
+        let y = self.strips.y + self.strips.h + 6;
+        Rect::new(self.strips.x, y, self.strips.w, self.body.y + self.body.h - y)
+    }
+
+    pub fn group_band(&self) -> Rect {
+        Rect::new(self.strips.x, self.tabs.y + self.tabs.h + 4, self.strips.w, self.strips.y - self.tabs.y - self.tabs.h - 4)
+    }
+
+    /// The Analyzer's row of pair buttons along the top of the page.
+    pub fn an_pairs(&self) -> Rect {
+        Rect::new(self.body.x, self.body.y + 4, self.body.w, self.row * 2)
+    }
+
+    pub fn an_pair_w(&self) -> i32 {
+        self.col * 9
+    }
+
+    pub fn visible_pairs(&self) -> usize {
+        (self.an_pairs().w / self.an_pair_w()).max(1) as usize
+    }
+
+    pub fn an_pair(&self, pair: usize, app: &App) -> Option<Rect> {
+        let slot = pair.checked_sub(app.first_pair).filter(|&s| s < self.visible_pairs() && pair < app.analysis.pairs())?;
+        let row = self.an_pairs();
+        Some(Rect::new(row.x + slot as i32 * self.an_pair_w(), row.y, self.an_pair_w() - 6, row.h))
+    }
+
+    /// Meters: the inputs picker's items, group presets on one row, then the inputs in a grid, then Done.
+    pub fn pick(&self, item: usize, app: &App) -> Option<Rect> {
+        let (groups, inputs) = (app.meter_groups().len(), app.metering.channels.max(1));
+        let (w, h, gap) = (self.col * 10, self.row * 2, 6);
         let b = self.body;
+        let per_row = ((b.w - 16) / (w + gap)).max(1) as usize;
+        if item < groups {
+            return Some(Rect::new(b.x + 8 + item as i32 * (w + gap), b.y + self.row + 12, w, h));
+        }
+        let top = b.y + self.row * 5 + 24;
+        if item < groups + inputs {
+            let n = item - groups;
+            return Some(Rect::new(b.x + 8 + (n % per_row) as i32 * (w + gap), top + (n / per_row) as i32 * (h + gap), w, h));
+        }
+        (item == groups + inputs).then(|| Rect::new(b.x + b.w - w - 8, b.y + b.h - h - 8, w, h))
+    }
+
+    /// The Analyzer's plots for `view`: the waveform and the spectrum, each inside the room for its axis labels (six
+    /// columns at the left, a row under the spectrum). Both: the waveform takes the upper two fifths. The pair buttons
+    /// are above them.
+    pub fn analyzer_plots(&self, view: crate::AnView) -> (Option<Rect>, Option<Rect>) {
+        let skip = self.an_pairs().h + 8;
+        let b = Rect::new(self.body.x, self.body.y + skip, self.body.w, self.body.h - skip);
         let (left, top) = (self.col * 6, self.row);
         let plot = |y: i32, h: i32, under: i32| Rect::new(b.x + left, y + top, b.w - left - self.col, h - top - under);
         match view {
@@ -183,7 +236,7 @@ impl Layout {
     pub fn meter_column_w(&self, app: &App) -> i32 {
         let per = app.metering.per_bar() as i32;
         let area = self.meter_area();
-        (area.w / app.metering.bars().max(1) as i32).clamp(self.col * 6 * per, self.col * 10 * per)
+        (area.w / app.metering.bars().max(1) as i32).clamp(self.col * 7 * per, self.col * 10 * per)
     }
 
     pub fn visible_meters(&self, app: &App) -> usize {
@@ -202,9 +255,9 @@ impl Layout {
         self.visible_meters(app).min(app.metering.bars()) as i32 * self.meter_column_w(app) - 6
     }
 
-    /// Height of one control cell under a bar.
+    /// Height of one control cell under a bar: one and a half text rows, a finger's width.
     pub fn meter_cell_h(&self) -> i32 {
-        self.row + 8
+        self.row * 3 / 2 + 10
     }
 
     /// The bar of column `bar`, above its name and control cells.
@@ -223,10 +276,15 @@ impl Layout {
     /// Control cell `row` of `input` under its bar (in LUFS the pair's column is split, left input left).
     pub fn meter_cell(&self, input: usize, row: usize, app: &App) -> Option<Rect> {
         let per = app.metering.per_bar();
-        let name = self.meter_name(input / per, app)?;
+        let name = self.meter_name(app.metering.bar_of(input)?, app)?;
         let w = (name.w - (per as i32 - 1) * 4) / per as i32;
         let x = name.x + (input % per) as i32 * (w + 4);
         Some(Rect::new(x, name.y + self.row + 2 + row as i32 * self.meter_cell_h(), w, self.meter_cell_h() - 4))
+    }
+
+    /// How far a press may wander and still count as a tap (a finger is not still): half a text row.
+    pub fn slop(&self) -> i32 {
+        (self.row / 2).max(4)
     }
 
     pub fn visible_tabs(&self) -> usize {
@@ -276,18 +334,12 @@ impl Layout {
         Some(Rect::new(s.x + 4, s.y + self.row + 12, s.w - 8, self.row))
     }
 
-    /// The dB readout under the fader.
-    pub fn value(&self, strip: usize, app: &App) -> Option<Rect> {
-        let s = self.strip(strip, app)?;
-        Some(Rect::new(s.x, s.y + s.h - self.row - 4, s.w, self.row))
-    }
-
-    /// The fader's travel (the knob's centre moves over it).
+    /// The fader: a flat bar filled from the bottom up to the level, its top the level's position (`fader_position`).
     pub fn fader(&self, strip: usize, app: &App) -> Option<Rect> {
         let s = self.strip(strip, app)?;
-        let top = s.y + 2 * self.row + 12 + self.row / 2 + 4;
-        let bottom = s.y + s.h - self.row - 4 - self.row / 2 - 4;
-        Some(Rect::new(s.x + 4, top, s.w * 3 / 5 - 4, (bottom - top).max(1)))
+        let top = s.y + 2 * self.row + 20;
+        let bottom = s.y + s.h - 4;
+        Some(Rect::new(s.x + 4, top, s.w - 12 - self.col * 2, (bottom - top).max(1)))
     }
 
     /// The level meter beside the fader.
@@ -349,7 +401,8 @@ impl Layout {
             if column.contains(x, y) {
                 // In a pair's column the half clicked picks the input.
                 let half = (x - column.x) * m.per_bar() as i32 / column.w.max(1);
-                return Hit::Meter((bar * m.per_bar() + half as usize).min(m.channels.max(1) - 1));
+                let first = m.bar_input(bar).unwrap_or(0);
+                return Hit::Meter((first + half as usize).min(m.channels.max(1) - 1));
             }
         }
         Hit::Nothing
@@ -369,8 +422,14 @@ impl Layout {
         if let Some(slot) = (0..SOFT_SLOTS).find(|&k| keys[k].kind != SoftKind::Empty && self.soft(app, k).contains(x, y)) {
             return Hit::Soft(slot);
         }
+        if app.page == Page::Meters && app.picking.is_some() {
+            return (0..app.pick_items()).find(|&i| self.pick(i, app).is_some_and(|r| r.contains(x, y))).map_or(Hit::Nothing, Hit::Pick);
+        }
         if app.page == Page::Meters {
             return self.meter_hit(app, x, y);
+        }
+        if app.page == Page::Analyzer {
+            return (0..app.analysis.pairs()).find(|&p| self.an_pair(p, app).is_some_and(|r| r.contains(x, y))).map_or(Hit::Nothing, Hit::AnPair);
         }
         if app.page != Page::Mixer {
             return Hit::Nothing;

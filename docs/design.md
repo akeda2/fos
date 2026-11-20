@@ -1767,13 +1767,24 @@ mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path 
 - **Model** (`crates/mixer-model`, no heap: tapes have none): raw gains become a logical mix (send level, pan and mute per source
   and output pair, masters); stereo pairs of sources and outputs are found from the gains and can be paired or split by hand; pan
   laws. `render` turns the logical mix back into raw crosspoints. Capacity 32 channels per group.
-- **App** (`crates/kakelfix`, host tests): views Outputs (one output's mix as fader strips: label, pan, fader, meter, value; a master
+- **App** (`crates/kakelfix`, host tests): views Outputs (one output's mix as fader strips: label, pan, a flat bar fader filled from the bottom with its dB written on it, meter; a master
   strip when the device has masters; a coloured band above the strips names each run, "Inputs (hardware)" blue, "Playback (from
   tapes)" green, "Output" amber, because a driver may name an input and a playback channel alike), Matrix (sources by outputs) and Device (controls; a HAZARD action such as a mixer reset asks yes/no first, a HAZARD switch such as +48V only when the page's last row "Ask before +48V" is on, saved as `ask-phantom=yes` in `kakelfix.cfg`). Actions
   are shared by keys, mouse and touch; `layout.rs` places everything from the screen size (scale 2 from 1800x1000). Fader travel: the
   top 60% covers +6..-12 dB, the rest down to -60 dB, the bottom 3% is off.
 - **Input**: keys (no F-keys: 1 2 3 pick pages, Tab the view) and `instrument_rt::Touches`, which treats the mouse (touch panel 6,
-  finger 100) and fingers alike; a press on a fader or pan holds it until release; the tape draws the cursor.
+  finger 100) and fingers alike; a press on a fader or pan holds it until release; the tape draws the cursor. Lists follow a
+  swipe (`Grab::Swipe`): the strips, output tabs, matrix, Device rows and meter columns move a whole item per item width dragged,
+  and the selection is pulled into view. A fader press waits for the finger to move half a text row (`Layout::slop`): up or down
+  drags the fader, sideways swipes the strips, and a release without moving sets the fader where it was pressed. Matrix cells and
+  Device rows act on release, so a swipe that starts on one never opens or flips it. A press that acts at once (a soft key, a
+  picker button) or lands on nothing still holds its finger (`Grab::Held`): `Touches` would otherwise offer every later report
+  of a resting finger as a new press, and a toggle such as Inputs flipped once per report. A band under the strips (and the group names
+  above them) only swipes, for scrolling without risking a level. Names cut to fit keep a short last word ("Mic 10" -> "Mic10",
+  `fit_name`), since that is what tells channels apart.
+- **Device links**: a device that links input pairs itself (switches named `Link 1/2`, `Link 3/4`, ...; its own analog settings
+  such as +48V then follow within the pair) decides at start which inputs are shown paired, and `p` on an input strip sets its
+  link too (asking first when the switch is HAZARD and "Ask before +48V" is on). Playback and output pairs stay display-only.
 - **Writes off the drawing thread** (`crates/kakelfix/src/queue.rs`): some devices take milliseconds per mixer write (a USB control
   transfer each, with a pause after it), and the kernel's mixer calls wait for the USB lock while one runs. Where tape threads exist
   (the server kernel, `tape_rt::threads_supported`) the tape starts a writer thread: every crosspoint, master and control has a slot
@@ -1782,7 +1793,8 @@ mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path 
   costs one re-read at the end. A refused write is counted, reported and the device re-read. The embedded kernels write inline.
 - **`kakelfix show`** prints every output's non-zero sends and master and the controls, for tests and headless use.
 - **Analyzer** (`crates/kakelfix/src/analyzer.rs` state, `tapes/kakelfix/src/analyze.rs` capture and drawing): captures from the
-  device (`rate=`, else 48000 when offered) only while the page is open and shows one channel pair (Left/Right or `,` `.` step it)
+  device (`rate=`, else 48000 when offered) only while the page is open and shows one channel pair (Left/Right or `,` `.` step it,
+  or a tap on the row of pair buttons above the plots, which swipes sideways when there are more pairs than fit)
   as Waveform, Spectrum or Both. The waveform is a min/max envelope scrolling in from the right over 1, 5 or 30 s (Up/Down), or
   (`w`) a scope triggered on the left channel's rising zero crossing over 5-50 ms, free-running when nothing crosses; `d` switches
   linear and dB. The spectrum is two `ltas::Analyzer`s (8192-point FFT, 1/3, 1/6, 1/12 octave or raw bins with `f`), peak hold dim
@@ -1799,13 +1811,19 @@ mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path 
   1-based input), and a label holding gain, 48V, Level, Inst, Pad or AutoSet counts ("Loopback N" does not). Left/Right select an
   input; Up/Down and `+`/`-` step its gain (the first number control, else the first list), `h` toggles +48V and `i` its other
   switch (through the same HAZARD rule as the Device page), and a mouse drag on the gain cell changes it. Along the bottom the
-  selected input (pair in LUFS) is read out in large digits (M, S, I and LRA in LUFS) beside its history. Scale and input are saved
-  as `mt-scale` and `mt-input`.
+  selected input (pair in LUFS) is read out in large digits (M, S, I and LRA in LUFS) beside its history. The Inputs soft key (`a`)
+  opens a picker of the inputs shown: presets (All, then one per first word of the names, such as Analog, Mic, ADAT) and a toggle
+  per input (the last one shown stays); arrows move, Enter or space picks, `a` or `n` closes. Scale, input and the inputs shown
+  are saved as `mt-scale`, `mt-input` and `mt-show` (`all` or a list such as `1,3-8`). An input that carries an output back is
+  named after it, "Loop N", so a program mix can be measured (LUFS per pair) before there are output meters: from the device's
+  own "Loopback N" switch (output N to capture channel N) when it is on, or from `mt-loop=13-14:1` in `kakelfix.cfg` for a
+  cable (inputs 13-14 carry outputs 1-2). The picker then has a Loop preset. A digital loop (AES, ADAT) is bit-exact; an
+  analog one reads as its output level and input gain set it.
 - **Test**: `make test-kakelfix` on the loopback: `show` reads the identity mix; in the tape `x` switches the first strip off and a
   mouse click half way up its fader sets -9 dB; with a `play` service playing a tone into loop0, `3` opens the Analyzer and its
   envelope must appear; `4` opens the Meters page and the first bar must light for the tone; `3`, Up then a click on the Quit soft key at once must leave `an-span=30` and an `mt-scale` in `kakelfix.cfg`; `show` reads the result. Then on the server
-  kernel at -smp 4 the same `x` goes through the writer thread and `q` ends the tape through the writer's join (the mf shell's
-  Escape kills a foreground process outright, which loses writes still queued). The mouse is walked exactly: the kernel's pointer
+  kernel at -smp 4 the same `x` goes through the writer thread and a lone Escape typed at once ends the tape through the writer's join, so the
+  queued write is not lost. The mouse is walked exactly: the kernel's pointer
   gain moves a packet of d counts 4d + d|d|/2 pixels.
 - **Only hardware shows**: a real device's write latency under a fast drag, meters from a real driver, touch panels, which
   controls the Meters page finds under each input of a real interface.
@@ -1890,6 +1908,12 @@ rack's SMB use.
 
 The mf shell passes ESC `[` or ESC `O` followed by a letter to the foreground tape as a cursor key; a lone ESC (nothing follows
 within `ESCAPE_WAIT_TICKS`, about 30 ms) stops the tape. `make test-mf-tape` types a cursor key to `ed` and checks it survives.
+
+Stopping is asked, as on the embedded kernel: after a lone Escape (local, serial or `term net`) `should_abort` answers true and
+`read_key` answers `KEY_ABORT` once its queue is empty, so a tape saves and joins its threads (kakelfix flushes its mixer writes).
+A tape still running `STOP_GRACE_TICKS` (3 s) later, or one that gets a second Escape, is killed (`shell::request_stop`,
+`poll_stops`). The `kill PID` command stays immediate. `make test-mf-tape` checks both: gfxcheck ends itself with code 0,
+`fscheck usbspin`, which never asks, is killed after the grace.
 
 ## SIP and SDP for AES67 streams: `audio-net sip`
 

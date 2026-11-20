@@ -186,7 +186,7 @@ impl Bank {
 }
 
 /// A pair's name: "Analog 1/2" for "Analog 1" and "Analog 2", else "A+B"; a last odd input alone.
-fn pair_name(app: &App, pair: usize, inputs: usize) -> Text<24> {
+pub(crate) fn pair_name(app: &App, pair: usize, inputs: usize) -> Text<24> {
     let first = channel_name(app, pair * 2);
     let mut out = Text::new();
     if pair * 2 + 1 >= inputs {
@@ -216,6 +216,9 @@ pub fn draw(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware
     if let Some(reason) = problem {
         return centered(canvas, layout, layout.body, reason, t.dim);
     }
+    if app.picking.is_some() {
+        return picker(canvas, layout, app);
+    }
     let Some(bank) = bank else { return };
     let m = &app.metering;
     let scale = scale_of(m.scale);
@@ -228,7 +231,7 @@ pub fn draw(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware
     }
     let per = m.per_bar();
     for bar in 0..m.bars() {
-        let (Some(column), Some(area)) = (layout.meter_column(bar, app), layout.meter_bar(bar, app)) else { continue };
+        let (Some(column), Some(area), Some(first)) = (layout.meter_column(bar, app), layout.meter_bar(bar, app), m.bar_input(bar)) else { continue };
         let selected = bar == m.bar();
         if selected {
             canvas.fill_rect(column.x - 2, column.y - 14, (column.w + 4) as u32, (column.h + 14) as u32, t.grid);
@@ -236,20 +239,20 @@ pub fn draw(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware
         let bar_w = (area.w - 8).min(layout.col * 3 * per as i32);
         let x = area.x + (area.w - bar_w) / 2;
         let (value, hold, clipped, name) = if m.scale == MeterScale::Lufs {
-            let loudness = &bank.loudness[bar];
-            let clipped = (bar * 2..(bar * 2 + 2).min(bank.inputs)).any(|i| bank.readings[i][0].clipped);
-            (loudness.momentary(), loudness.short_term(), clipped, pair_name(app, bar, bank.inputs))
+            let loudness = &bank.loudness[(first / 2).min(MAX_PAIRS - 1)];
+            let clipped = (first..(first + 2).min(bank.inputs)).any(|i| bank.readings[i][0].clipped);
+            (loudness.momentary(), loudness.short_term(), clipped, pair_name(app, first / 2, bank.inputs))
         } else {
-            let reading = bank.readings[bar.min(MAX_INPUTS - 1)][(m.scale == MeterScale::Nordic) as usize];
+            let reading = bank.readings[first.min(MAX_INPUTS - 1)][(m.scale == MeterScale::Nordic) as usize];
             let mut name = Text::new();
-            let _ = name.write_str(channel_name(app, bar).as_str());
+            let _ = name.write_str(channel_name(app, first).as_str());
             (reading.level, reading.hold, reading.clipped, name)
         };
         draw_bar(canvas, scale, x, bar_w as u32, area.y, area.h as u32, value, hold, clipped);
         if let Some(label) = layout.meter_name(bar, app) {
             centered(canvas, layout, label, name.as_str(), if selected { t.text } else { t.dim });
         }
-        for input in bar * per..((bar + 1) * per).min(m.channels) {
+        for input in first..(first + per).min(m.channels) {
             for (row, &index) in app.input_controls(input).iter().enumerate() {
                 let Some(cell) = layout.meter_cell(input, row, app) else { continue };
                 let control = app.controls[index];
@@ -268,6 +271,36 @@ pub fn draw(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware
     readout(canvas, layout, app, hardware, bank);
 }
 
+/// The inputs picker over the page: presets, then every input lit when shown, then Done; the cursor framed in amber.
+fn picker(canvas: &mut Canvas, layout: &Layout, app: &App) {
+    let t = theme();
+    let b = layout.body;
+    text(canvas, layout, b.x + 8, b.y + 4, "Show on the Meters page:  a preset, or tap inputs on and off", t.text);
+    let groups = app.meter_groups();
+    let m = &app.metering;
+    if let Some(first) = layout.pick(groups.len(), app) {
+        text(canvas, layout, b.x + 8, first.y - layout.row - 6, "Inputs", t.dim);
+    }
+    for item in 0..app.pick_items() {
+        let Some(area) = layout.pick(item, app) else { continue };
+        let (label, lit) = if let Some((name, mask)) = groups.get(item) {
+            (Text::<24>::from(name.as_str()), m.shown & m.all() == *mask)
+        } else if item < groups.len() + m.channels.max(1) {
+            let input = item - groups.len();
+            (Text::from(channel_name(app, input).as_str()), m.is_shown(input))
+        } else {
+            (Text::from("Done"), false)
+        };
+        let cursor = app.picking == Some(item);
+        canvas.fill_rect(area.x, area.y, area.w as u32, area.h as u32, if lit { t.curves[0] } else { t.grid });
+        canvas.rect(area.x, area.y, area.w as u32, area.h as u32, if cursor { t.amber } else { t.frame });
+        if cursor {
+            canvas.rect(area.x + 1, area.y + 1, (area.w - 2).max(0) as u32, (area.h - 2).max(0) as u32, t.amber);
+        }
+        centered(canvas, layout, area, label.as_str(), if lit { t.background } else { t.text });
+    }
+}
+
 /// The selected input (or pair) along the bottom: its name and controls, its levels in large digits, its history.
 fn readout(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware, bank: &Bank) {
     let t = theme();
@@ -277,7 +310,7 @@ fn readout(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware,
     let history_w = (strip.w * 2 / 5).min(HISTORY as i32);
     let chart = Rect::new(strip.x + strip.w - history_w, strip.y + 4, history_w, strip.h - 8);
     let mut line = Text::<64>::new();
-    let name = if m.scale == MeterScale::Lufs { pair_name(app, m.bar(), bank.inputs) } else { Text::from(channel_name(app, m.input).as_str()) };
+    let name = if m.scale == MeterScale::Lufs { pair_name(app, m.input / 2, bank.inputs) } else { Text::from(channel_name(app, m.input).as_str()) };
     let mut x = text(canvas, layout, strip.x, strip.y + 4, name.as_str(), t.text) + layout.col * 2;
     for &index in app.input_controls(m.input).iter() {
         let control = &app.controls[index];
@@ -289,7 +322,7 @@ fn readout(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware,
     let input = m.input.min(MAX_INPUTS - 1);
     match m.scale {
         MeterScale::Lufs => {
-            let loudness = &bank.loudness[m.bar()];
+            let loudness = &bank.loudness[(m.input / 2).min(MAX_PAIRS - 1)];
             let _ = line.write_str("M ");
             level(&mut line, loudness.momentary());
             let _ = line.write_str("  S ");
@@ -323,7 +356,7 @@ fn readout(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware,
     }
     canvas.text_scaled(strip.x, strip.y + layout.row + 8, line.as_str(), layout.scale * 2, t.text);
     let mut values = [0f32; HISTORY];
-    let count = bank.history(m.scale, if m.scale == MeterScale::Lufs { m.bar() * 2 } else { input }, &mut values[..chart.w as usize]);
+    let count = bank.history(m.scale, if m.scale == MeterScale::Lufs { input & !1 } else { input }, &mut values[..chart.w as usize]);
     let scale = scale_of(m.scale);
     draw_history(canvas, scale, chart.x, chart.y, chart.w as u32, chart.h as u32, &values[..count]);
     line.clear();

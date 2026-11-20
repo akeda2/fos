@@ -9,8 +9,8 @@ Embedded kernel (writes made inline):
    channel's envelope (the first curve colour) grows in from the right edge of the upper lane; Quit there ends the tape
  - `4` opens the Meters page on the same capture: input 1's bar (x 81..105, Nordic PPM) lights for the tone; `3` goes back
  - Up (the 30 s span) right before Quit: the Analyzer's settings are in kakelfix.cfg afterwards (saved on quit)
-Server kernel (writes go to the worker thread): `x`, then `q` (the shell's Escape kills a foreground process there, so
-`q` is what ends it through the writer's join), then `show`, at -smp 4.
+Server kernel (writes go to the worker thread): `x`, then at once a lone Escape, which asks the tape to stop (`read_key`
+answers KEY_ABORT, `shell::request_stop`) rather than killing it, so it ends through the writer's join with `x` written; then `show`, at -smp 4.
 QEMU's screen is 1280x800, so kakelfix's layout is at scale 1 (crates/kakelfix/src/layout.rs): soft-key slot 10 (Quit, on
 every page) is at x 1184..1272, y 726..780 (after two half-key gaps between the groups); strip 0's fader travel is x
 12..57, y 152..744. The Analyzer's Both view puts the waveform plot at x 56..1151, y 56..325, the left lane's centre at y 123."""
@@ -40,7 +40,7 @@ CODE = next(p for p in ["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF
 QUIT = (1228, 752)
 METER_BAR = (range(84, 103, 3), range(300, 690, 2))
 LIT = {(0x3c, 0xcf, 0x6a), (0xff, 0xc8, 0x3d), (0xff, 0x4d, 0x4d)}
-ENVELOPE = (range(1000, 1150, 3), range(110, 137))
+ENVELOPE = (range(1000, 1150, 3), range(140, 175))
 BLUE = (0x4a, 0xa3, 0xff)
 FADER_MIDDLE = (32, 448)
 
@@ -229,10 +229,11 @@ def server():
         new = log[mark:].decode("utf8", "replace")
         check("no writer thread" not in new, "mf: the writer thread started", new[-600:])
         type_text(b"x")
-        time.sleep(1)
-        type_text(b"q")
-        check(wait_for("exited with code 0", 20, mark), "mf: `q` ends kakelfix cleanly (the writer finished and joined)",
+        time.sleep(0.2)
+        type_text(b"\x1b")
+        check(wait_for("exited with code 0", 20, mark), "mf: Escape asks kakelfix to stop and it ends cleanly (writer joined)",
               log[mark:].decode("utf8", "replace")[-800:])
+        check(b"killed" not in log[mark:], "mf: Escape did not kill it", log[mark:].decode("utf8", "replace")[-800:])
         wait_for("fos> ", 10, mark)
         mark = len(log)
         type_text(b"tape kakelfix device=loop0 show\n")

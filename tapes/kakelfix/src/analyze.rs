@@ -11,7 +11,7 @@ use gfx::theme::theme;
 use kakelfix::analyzer::{Envelope, FLOOR_DB, SPANS_S, Scope, TIMEBASES_MS};
 use kakelfix::{App, Layout, Page, Rect, Text, WaveMode};
 use ltas::{Analyzer, Config, Mode, Resolution};
-use mixer_model::{Group, lin_to_db};
+use mixer_model::lin_to_db;
 use tape_rt::{FP_AVX2, TapeApi, alloc_bytes, alloc_zeroed};
 
 /// The FFT length: 8192 points is 5.9 Hz per bin at 48 kHz, enough for 1/12 octave down to about 100 Hz.
@@ -169,6 +169,7 @@ pub fn draw(canvas: &mut Canvas, layout: &Layout, app: &App, capture: &mut Captu
     if let Some(reason) = capture.problem() {
         return centered(canvas, layout, layout.body, reason, theme().dim);
     }
+    pair_buttons(canvas, layout, app);
     let Some(b) = &mut capture.buffers else { return };
     let (wave, spectrum) = layout.analyzer_plots(app.analysis.view);
     if let Some(plot) = wave {
@@ -179,15 +180,30 @@ pub fn draw(canvas: &mut Canvas, layout: &Layout, app: &App, capture: &mut Captu
     }
 }
 
+/// The row of pair buttons: tap one to show that pair, swipe the row to reach the rest; the shown pair lit.
+fn pair_buttons(canvas: &mut Canvas, layout: &Layout, app: &App) {
+    let t = theme();
+    let a = &app.analysis;
+    for pair in 0..a.pairs() {
+        let Some(area) = layout.an_pair(pair, app) else { continue };
+        let shown = pair == a.pair;
+        canvas.fill_rect(area.x, area.y, area.w as u32, area.h as u32, if shown { t.grid_major } else { t.grid });
+        canvas.rect(area.x, area.y, area.w as u32, area.h as u32, if shown { t.text } else { t.frame });
+        let name = crate::meters::pair_name(app, pair, a.channels);
+        centered(canvas, layout, area, name.as_str(), if shown { t.text } else { t.dim });
+    }
+    let row = layout.an_pairs();
+    if app.first_pair > 0 {
+        text(canvas, layout, row.x, row.y + row.h, "<", t.dim);
+    }
+    if app.first_pair + layout.visible_pairs() < a.pairs() {
+        text(canvas, layout, row.x + row.w - layout.col * 2, row.y + row.h, ">", t.dim);
+    }
+}
+
 /// A capture channel's name: the mixer's name for that input when it has one, else its number.
 pub(crate) fn channel_name(app: &App, channel: usize) -> Text<16> {
-    if channel < app.mix.n[Group::Input.idx()] {
-        Text::from(app.name(Group::Input, channel))
-    } else {
-        let mut name = Text::new();
-        let _ = write!(name, "In {}", channel + 1);
-        name
-    }
+    app.input_name(channel)
 }
 
 /// 0 at the dB floor, 1 at full scale.

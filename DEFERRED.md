@@ -749,8 +749,6 @@ board's EHCI) before trusting it. The once-a-second audio check can go then.
 - The Analyzer ran on the USB interface (aneby, server kernel); the PCI card and the second USB model are untested.
 - The Mixer page ran on real hardware (a USB interface's driver, on the server kernel, with a PS/2 touchpad); the same
   driver's second model is untested there, and the PCI card's driver has no `Mixer` yet.
-- On the server kernel the shell's Escape kills a foreground tape outright: writes still queued in kakelfix's writer are lost
-  (`q` or the Quit soft key end it cleanly). A tape-visible "please end" before the kill would fix it for every tape.
 - Meters are read by the drawing thread; a device whose meter read is slow (bulk reads under the USB lock) would want them on a
   thread too. The driver caches a set for 50 ms.
 

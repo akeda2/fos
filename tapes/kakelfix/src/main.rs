@@ -39,7 +39,10 @@ kakelfix.cfg also keeps the Analyzer's settings, saved as they change:
 an-view=waveform|spectrum|both an-wave=envelope|scope an-span=1|5|30
 an-timebase=5|10|20|50 an-scale=db|linear an-pair=N
 an-resolution=third|sixth|twelfth|fft, and the Meters page's
-mt-scale=dbfs|nordic|lufs mt-input=N (the same words on the command line)
+mt-scale=dbfs|nordic|lufs mt-input=N mt-show=all|1,3-8 (inputs shown)
+mt-loop=13-14:1 (inputs 13-14 cabled from outputs 1-2: named Loop 1/2;
+a device's own Loopback N switch does this by itself)
+(the same words on the command line)
   show         print every output's sends and the controls, then end
 Keys: Tab next view, 1-4 Mixer/Recorder/Analyzer/Meters, arrows select and
 move (Up/Down: 1 dB), PgUp/PgDn 6 dB, + - 0.1 dB, 0 unity, x off, m mute,
@@ -48,8 +51,12 @@ L pan law, Enter open (Matrix) or change (Device), y n answer, Esc quits.
 Analyzer: Tab view, Left/Right or , . input pair, Up/Down span, space
 freeze, w envelope/scope, d dB/linear, f resolution, r reset.
 Meters: Left/Right input, Up/Down or + - gain, h +48V, i other switch,
-Tab or s scale, r reset (holds, clip, loudness).
-Mouse: click a strip, drag its fader or pan, click soft keys and cells.
+Tab or s scale, r reset (holds, clip, loudness), a pick the inputs shown
+(arrows move, Enter or space picks, a or n closes).
+Analyzer: tap a pair button above the plots; swipe the row for more.
+Mouse/touch: click a strip, drag its fader or pan, click soft keys and cells;
+drag sideways (matrix and Device rows: any way) to scroll a list; the
+band under the strips and the group names above them only scroll.
 "#
 );
 
@@ -115,7 +122,8 @@ extern "C" fn writer(argument: usize) {
 /// The device as the drawing thread sees it.
 pub type Shadowed = Queued<'static, Hardware>;
 
-/// The mouse and fingers act on the app through this: a press on a fader or pan control holds it until release.
+/// The mouse and fingers act on the app through this: a press holds a fader, a pan control or a list being swiped until
+/// release.
 struct Pointing<'a> {
     app: &'a mut App,
     hardware: &'a mut Shadowed,
@@ -126,13 +134,14 @@ impl TouchTarget for Pointing<'_> {
     type Grab = Grab;
     fn down(&mut self, x: i32, y: i32) -> Option<Grab> {
         self.app.scroll(self.layout);
-        self.app.press(self.hardware, self.layout, x, y)
+        Some(self.app.press(self.hardware, self.layout, x, y).unwrap_or(Grab::Held))
     }
     fn moved(&mut self, grab: Grab, x: i32, y: i32) -> Grab {
-        self.app.drag(self.hardware, self.layout, grab, x, y);
-        grab
+        self.app.drag(self.hardware, self.layout, grab, x, y)
     }
-    fn up(&mut self, _grab: Grab) {}
+    fn up(&mut self, grab: Grab) {
+        self.app.release(self.hardware, self.layout, grab);
+    }
 }
 
 fn shape(mixer: &Mixer) -> Shape {
@@ -166,6 +175,7 @@ fn action(key: Key) -> Option<Action> {
         Key::Char(b's') => Action::MeterScale,
         Key::Char(b'h') => Action::Phantom,
         Key::Char(b'i') => Action::InputSwitch,
+        Key::Char(b'a') => Action::Channels,
         Key::Char(b'+') | Key::Char(b'=') => Action::Step(0.1),
         Key::Char(b'-') => Action::Step(-0.1),
         Key::Char(b'0') => Action::Unity,
