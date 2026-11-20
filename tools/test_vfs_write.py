@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Tape ABI 34 `vfs_*` change calls: create, write, truncate, rename, remove and set-owner on an ext4 volume made by mkfs.ext4, driven by
-`fscheck vfswrite`. The host then runs e2fsck on the image (the journal must be clean and the structures consistent) and reads the surviving files back with debugfs. Run with `make test-vfs-write`."""
+`fscheck vfswrite`. The host then runs e2fsck on the image (the journal must be clean and the structures consistent) and reads the surviving files back with debugfs.
+`fscheck mkdirs` makes folders with `vfs_create` on an exFAT volume made by mkfs.exfat (disk4) and on the FOSFS v4 boot volume
+(disk1), as KakelFix's Recorder lays out a take (rec/PROJECT/TAKE/), then streams two files into the take folder at once and
+reads them back; fsck.exfat checks the exFAT volume afterwards. Run with `make test-vfs-write`."""
 
 import shutil
 import hashlib
@@ -30,11 +33,16 @@ def main():
         ext.write_bytes(bytes(64 << 20))
         # A volume made by Linux's own mkfs (journal, checksums), not by the kernel: the writer has to keep it consistent.
         subprocess.run([tool("mkfs.ext4"), "-q", "-F", "-L", "vfswrite", str(ext)], check=True, capture_output=True)
+        exfat = tmp / "exfat.img"
+        exfat.write_bytes(bytes(64 << 20))
+        subprocess.run([tool("mkfs.exfat"), "-L", "recs", str(exfat)], check=True, capture_output=True)
         outputs = {}
 
         def scenario(run):
             outputs["write"] = run("run fscheck vfswrite disk3")
             outputs["ls"] = run("run fscheck vfs disk3")
+            outputs["mkdirs_exfat"] = run("run fscheck mkdirs disk4")
+            outputs["mkdirs_fosfs"] = run("run fscheck mkdirs disk1")
             run("write ext3/shell.txt shell text")
             run("mkdir ext3/shdir")
             run("cp ext3/shell.txt ext3/shdir/copy.txt")
@@ -50,7 +58,29 @@ def main():
             outputs["stat_dir"] = run("stat @vfswrite/shdir")
             outputs["chown_bad"] = run("chown x ext3/shdir")
 
-        boot(tmp, [boot_disk, ext], scenario)
+        boot(tmp, [boot_disk, ext, exfat], scenario)
+        # exFAT says FS_EXISTS for a folder already there; FOSFS v4's mkdir takes an existing folder as done.
+        for volume, again, other_case in [("exfat", "error -6", "error -6"), ("fosfs", "ok", "ok")]:
+            out = outputs[f"mkdirs_{volume}"]
+            for step, wanted in [
+                ("mkdir rec", "ok"),
+                ("mkdir project", "ok"),
+                ("mkdir project again", again),
+                # exFAT names ignore case (the same folder); FOSFS v4 names do not.
+                ("mkdir project other case", other_case),
+                ("mkdir under a missing folder", "error -1"),
+                ("mkdir take", "ok"),
+                ("stat take", "kind 2"),
+            ]:
+                line = next((line for line in out.splitlines() if f"fscheck: {step} ->" in line), "")
+                check(line.endswith(wanted), f"{volume}: {step}: {wanted}", line or out[-600:])
+            check("streams 0: 20000 bytes, 0 wrong" in out and "streams 1: 19900 bytes, 0 wrong" in out,
+                  f"{volume}: two files streamed into the take folder at once read back whole", out[-800:])
+            check("2 entries in the take folder" in out and "in01-08.flac] size 20000" in out,
+                  f"{volume}: the take folder lists both files", out[-800:])
+        if Path(tool("fsck.exfat")).exists():
+            done = subprocess.run([tool("fsck.exfat"), "-n", str(exfat)], capture_output=True, text=True)
+            check(done.returncode == 0, "fsck.exfat finds the exFAT volume consistent", done.stdout + done.stderr)
         out = outputs["write"]
         for step, wanted in [
             ("mkdir sub", "ok ()"),

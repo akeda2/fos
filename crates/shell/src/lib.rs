@@ -70,6 +70,8 @@ pub enum FsError {
     Empty,
     /// The volume or the server refused: read-only, or not allowed for the login (a Samba ACL).
     Denied,
+    /// A file or folder of that name is already there.
+    Exists,
     Failed,
 }
 
@@ -83,6 +85,7 @@ impl fmt::Display for FsError {
             FsError::NoVolume => "no such disk, or no FOSFS data partition or FAT volume on it (see `disks`)",
             FsError::Empty => "an empty file cannot be made on a FAT volume",
             FsError::Denied => "access denied (a read-only volume, or the server does not allow it)",
+            FsError::Exists => "a file or folder of that name is already there",
             FsError::Failed => "the volume could not be read or written (no room, or damaged)",
         })
     }

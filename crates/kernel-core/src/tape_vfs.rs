@@ -321,12 +321,16 @@ fn file_number(writer: &mut Writer, path: &[u8]) -> Result<ext4::Inode, ext4::Er
     writer.resolve(path)?.ok_or(ext4::Error::NotFound)
 }
 
-/// `vfs_create`: a file or folder `make` describes at `reference`; 0 or an `FS_*` code.
+/// `vfs_create`: a file or folder `make` describes at `reference`; 0 or an `FS_*` code. On an ext volume either; elsewhere
+/// a folder only (exFAT, FOSFS v4: what the shell's `mkdir` makes, without owner and mode), since files there are made by
+/// `fs_write` and the `fs_stream_*` calls. FAT32 and FOSFS v3 have no folders to make.
 pub fn create(reference: &[u8], make: &VfsMake) -> isize {
     if remote::is_remote(reference) {
         return remote::create(reference, make);
     }
-    let Some((disk, partition, path)) = ext_target(reference) else { return FS_READ_ONLY };
+    let Some((disk, partition, path)) = ext_target(reference) else {
+        return if make.kind == VFS_DIR { tape_fs::mkdir(reference) } else { FS_READ_ONLY };
+    };
     let (folder, name) = split_leaf(path);
     let done = ext4vol::with_writer(disk, partition, |writer| {
         let parent = parent_number(writer, folder)?;

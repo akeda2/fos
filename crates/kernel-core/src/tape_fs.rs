@@ -418,9 +418,15 @@ pub fn mkdir(reference: &[u8]) -> isize {
         return crate::remote::make_folder(reference);
     }
     if let Some((mut fs, name)) = resolve_fat(reference) {
+        // A `/` left in the name: a folder on the way was not there (`enter_path`), as ext answers it.
+        if name.contains(&b'/') && fs.kind() == fat::Kind::ExFat {
+            return FS_NOT_FOUND;
+        }
         crate::fatvol::stamp(&mut fs);
         return match fs.mkdir(name) {
             Ok(()) => 0,
+            // Here, unlike for files, "already there" is its own answer: a tape that makes a folder it may share wants it.
+            Err(fat::Error::Exists) => FS_EXISTS,
             Err(error) => fat_error(error),
         };
     }
@@ -431,6 +437,8 @@ pub fn mkdir(reference: &[u8]) -> isize {
     match volume.mkdir(name) {
         Ok(()) => 0,
         Err(Error::InvalidName) => FS_BAD_NAME,
+        Err(Error::Exists) => FS_EXISTS,
+        Err(Error::NoDirectory) => FS_NOT_FOUND,
         Err(_) => FS_ERROR,
     }
 }

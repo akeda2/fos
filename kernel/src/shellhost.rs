@@ -19,6 +19,7 @@ fn error(code: isize) -> FsError {
         FS_BAD_NAME => FsError::BadName,
         FS_NO_VOLUME => FsError::NoVolume,
         FS_READ_ONLY => FsError::Denied,
+        FS_EXISTS => FsError::Exists,
         _ => FsError::Failed,
     }
 }

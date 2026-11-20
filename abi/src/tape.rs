@@ -401,6 +401,10 @@ pub struct TapeApi {
     /// `vfs_create(path, path_len, make)` (version 34): makes a file or folder (`VfsMake`: kind, permission bits, owner) in an
     /// existing folder of an ext volume. 0, or `FS_EXISTS`, `FS_NOT_FOUND` (no such folder), `FS_BAD_NAME`, `FS_NO_SPACE`,
     /// `FS_READ_ONLY` (not an ext volume this kernel can change). Every call is committed (journaled) before it returns.
+    /// A folder (`VFS_DIR`) can also be made on an exFAT or FOSFS v4 volume (`diskN/...`, `@LABEL/...`; owner and mode are
+    /// not kept there; an existing folder is `FS_EXISTS` on exFAT, 0 on FOSFS v4, whose `mkdir` takes it as done); files on
+    /// those are made by `fs_write` and `fs_stream_*`, which take paths into folders. Kernels
+    /// built before 2026-11-20 answer `FS_READ_ONLY` for that (no new field, so the version stayed 42).
     pub vfs_create: extern "C" fn(*const u8, usize, *const VfsMake) -> isize,
     /// `vfs_write(path, path_len, offset, data, len)` (version 34): writes into an existing file, growing it (a gap stays a
     /// hole). The count written (a call may take less than `len`: the server kernel's limit is 1 MiB per call, `kernel-mf/src/tapefs.rs` `CHUNK`) or a code.

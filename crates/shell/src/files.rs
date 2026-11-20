@@ -327,6 +327,7 @@ fn mkdir(host: &mut dyn Host, rest: &str) {
     match host.mkdir(reference) {
         Ok(()) => sayln!(host, "Folder {reference} is there."),
         Err(FsError::BadName) => sayln!(host, "mkdir: {reference}: only FOSFS v4 and exFAT volumes have folders; the name is invalid or taken."),
+        Err(FsError::NotFound) => sayln!(host, "mkdir: {reference}: the parent folder is missing."),
         Err(FsError::Failed) => sayln!(host, "mkdir: {reference}: the parent folder is missing, or the volume is full."),
         Err(error) => sayln!(host, "mkdir: {reference}: {error}."),
     }

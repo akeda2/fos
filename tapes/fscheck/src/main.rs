@@ -12,6 +12,7 @@ Prints the bytes read; a count of 0 means the offset is at or past the end.
        tape run fscheck streams NAME1 NAME2   (two open streams, ABI 30; the files are 20000 and 19900 bytes)
        tape run fscheck vfs PATH              (ABI 32: stat PATH, list it if a folder, else read its first 40 bytes)
        tape run fscheck vfswrite DIR          (ABI 34: create, write, truncate, rename, remove under DIR on an ext volume)
+       tape run fscheck mkdirs DISK           (folders by vfs_create on exFAT/FOSFS v4/ext, two streams into one)
        tape run fscheck remove NAME           (create NAME, delete it with fs_remove, check it is gone)
        tape run fscheck info                  (hostname, peer count, disk 1, clock, console size)
        tape run fscheck usbspin               (poll the USB calls until Escape; the shell must stay alive)
@@ -43,6 +44,13 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         return match words.next() {
             Some(path) => vfs_write(path),
             None => println!("Usage: fscheck vfswrite DIR"),
+        };
+    }
+    if arguments.starts_with("mkdirs ") {
+        words.next();
+        return match words.next() {
+            Some(disk) => mkdirs(disk),
+            None => println!("Usage: fscheck mkdirs DISK"),
         };
     }
     if arguments == "serial" {
@@ -278,6 +286,45 @@ fn vfs_write(dir: &str) {
     show("write keep.txt more", tape_rt::vfs_write(path("keep.txt").as_str(), 9, b" more"));
     show("sync", tape_rt::vfs_sync());
     println!("fscheck: vfswrite done");
+}
+
+/// `vfs_create` folders on any volume with folders (exFAT, FOSFS v4, ext), the way KakelFix's Recorder lays out a take:
+/// `DISK/rec/proj-a/take001_2026-11-20_143512/`, then two files streamed into the take folder at once and read back.
+fn mkdirs(disk: &str) {
+    use tape_rt::VFS_DIR;
+    let path = |name: &str| {
+        let mut text = alloc_free::Text::new();
+        text.push(disk);
+        text.push("/");
+        text.push(name);
+        text
+    };
+    let mkdir = |step: &str, name: &str| match tape_rt::vfs_create(path(name).as_str(), VFS_DIR, 0o755, 0, 0) {
+        Ok(()) => println!("fscheck: {step} -> ok"),
+        Err(code) => println!("fscheck: {step} -> error {code}"),
+    };
+    const TAKE: &str = "rec/proj-a/take001_2026-11-20_143512";
+    mkdir("mkdir rec", "rec");
+    mkdir("mkdir project", "rec/proj-a");
+    mkdir("mkdir project again", "rec/proj-a");
+    mkdir("mkdir project other case", "rec/PROJ-A");
+    mkdir("mkdir under a missing folder", "nope/x");
+    mkdir("mkdir take", TAKE);
+    match tape_rt::vfs_stat(path(TAKE).as_str()) {
+        Ok(stat) => println!("fscheck: stat take -> kind {}", stat.kind),
+        Err(code) => println!("fscheck: stat take -> error {code}"),
+    }
+    let mut first = path(TAKE);
+    first.push("/proj-a_take001_in01-08.flac");
+    let mut second = path(TAKE);
+    second.push("/proj-a_take001_in09-16.flac");
+    streams(first.as_str(), second.as_str());
+    let mut index = 0;
+    while let Ok(Some(entry)) = tape_rt::vfs_read_dir(path(TAKE).as_str(), index) {
+        println!("fscheck: take entry [{}] size {}", core::str::from_utf8(entry.name()).unwrap_or("?"), entry.stat.size);
+        index += 1;
+    }
+    println!("fscheck: mkdirs done, {index} entries in the take folder");
 }
 
 /// A path built without an allocator.
