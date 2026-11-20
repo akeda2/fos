@@ -741,11 +741,14 @@ board's EHCI) before trusting it. The once-a-second audio check can go then.
 
 ## KakelFix after milestone one (the Mixer page)
 
-- Recorder page (a placeholder now); a goniometer on the Meters page.
-- The Meters page ran on the USB interface (aneby, server kernel): the per-input controls are found as they should be and
-  +48V with `ask-phantom=yes` asks first. Still open: the gain drag on a touch screen (rack), the second USB model and the
-  PCI card. LUFS per input pair is of little use; loudness belongs on the outputs or a stereo mix, to revisit with the
-  Recorder.
+- **Next: the Recorder page** (a placeholder now; capture owned by the tape), then output and mix meters. A goniometer on
+  the Meters page.
+- Loudness on a program mix: route the mix to an output and switch that output's device loopback on ("Loopback N", or
+  `mt-loop=IN:OUT` for a cable); the input is then named "Loop N" and a "Loop" preset appears. Not yet measured on hardware:
+  LUFS through a real loopback, and whether the second USB model's loopback is post-mixer and bit-exact (its spec lists the
+  open experiments).
+- The Meters page ran on both USB models (aneby, rack, server kernel), touch included: per-input controls, +48V asking
+  first, faders dragged on rack's touch screen, swiping, the inputs picker. The PCI card is untested.
 - The Analyzer ran on the USB interface (aneby, server kernel); the PCI card and the second USB model are untested.
 - The Mixer page ran on real hardware (a USB interface's driver, on the server kernel, with a PS/2 touchpad); the same
   driver's second model is untested there, and the PCI card's driver has no `Mixer` yet.

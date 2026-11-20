@@ -65,6 +65,9 @@ python3 tools/fosadm.py --serial PORT [--fast 921600] put serial FILE [NAME]
   `--kernel` work as before; `--no-store-kernels` and `--tapes-only` skip it; serial hosts never store them.
 
 ## Traps
+- `status`/`deploy` compare the kernel by **size in sectors**, over Ethernet too: a rebuilt kernel of the same sector count
+  reads "current" and is silently not pushed. After a kernel change use `deploy --kernel-only --force-kernel` and check that
+  the slot flipped.
 - A running tape blocks the shell, foscopy and delays KUP's reboot. If a host is stuck, send a lone ESC through term net:
   `(printf '\x1b'; sleep 2) | python3-netraw tools/term_net.py --iface IFACE --mac N --interactive`
 - amd1 runs `ptp master` from its `start` file; after the KUP reboot it starts again. A service

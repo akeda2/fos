@@ -240,6 +240,12 @@ maintainer's memory notes, not in this repository.
 
 ## Conventions
 
+- Working with this maintainer: Nordic keyboards only, so key bindings are plain keys or Ctrl+letter, never AltGr or
+  ANSI-only combinations. `make test-all` runs on landsbro (`gb -of fos`), not locally. `tools/peers.py --forget` before
+  `--discover`. The 79-column cap matters only for the BIOS VGA text screen. kernel-mf stays one implementation on x86_64
+  and aarch64 (Pi 4 only), doing everything the embedded kernel does except the realtime guarantees. Private drivers
+  (`private/`, `docs/private.md`) are never named in the public tree: `python3 tools/check_public.py` before every push.
+
 - A tape with arguments carries its usage as `tape_rt::tape_help!(br#"..."#);` (lines of at most 79 columns): the text
   goes into the `.fos_help` section of its ELF, and the kernel prints it for `help NAME`, `NAME help` and `NAME --help` without
   running the tape (`tape.rs` `show_help`, `abi::elf::section`). Tapes done so far: ebb, ptp, audio-net, record, recorder, play, router,
