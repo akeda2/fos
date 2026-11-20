@@ -87,7 +87,7 @@ pub fn draw(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware
             View::Matrix => matrix(canvas, layout, app),
             View::Device => device(canvas, layout, app, hardware),
         },
-        Page::Recorder => centered(canvas, layout, layout.body, "Recorder: a later milestone", theme().dim),
+        Page::Recorder => crate::record::draw(canvas, layout, app, capture.bank(), capture.problem()),
         Page::Analyzer => crate::analyze::draw(canvas, layout, app, capture),
         Page::Meters => crate::meters::draw(canvas, layout, app, hardware, capture.bank(), capture.problem()),
     }
@@ -117,6 +117,13 @@ fn header(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware) 
     };
     let _ = write!(line, "KakelFix  {}  {page}", hardware.device.mixer.title());
     text(canvas, layout, 8, 4, line.as_str(), t.text);
+    // While a take runs, every page says so.
+    if let Some(lamp) = crate::record::header_lamp(app) {
+        let width = lamp.as_str().len() as i32 * layout.col;
+        let x = layout.keys.x - width - 8;
+        canvas.fill_rect(x - layout.row, 4 + layout.row / 4, (layout.row / 2) as u32, (layout.row / 2) as u32, t.red);
+        text(canvas, layout, x, 4, lamp.as_str(), t.red);
+    }
     line.clear();
     if app.page == Page::Mixer && app.view == View::Outputs {
         let _ = write!(line, "mix sent to output {} (pick the output above)   pan law {}", app.label(&app.output()).as_str(), app.mix.pan_law.name());
@@ -131,6 +138,9 @@ fn header(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware) 
         }
         let wave = if a.wave == WaveMode::Envelope { "envelope" } else { "scope" };
         let _ = write!(line, "   {wave}   {}{}", RESOLUTIONS[a.resolution], if a.frozen { "   FROZEN" } else { "" });
+    } else if app.page == Page::Recorder {
+        let r = &app.recording;
+        let _ = write!(line, "inputs {}   {} Hz   peak meters: {}", r.channels, r.rate, if r.nordic { "Nordic PPM" } else { "dBFS" });
     } else if app.page == Page::Meters {
         let m = &app.metering;
         let _ = write!(line, "inputs {}", m.channels);
@@ -196,8 +206,8 @@ fn footer(canvas: &mut Canvas, layout: &Layout, app: &App) {
         (Page::Mixer, View::Matrix) => "arrows select  Enter or click again: open  +- 0.1 dB  0 x m  p P pair  Tab view  1-4 page",
         (Page::Mixer, View::Device) => "Up/Dn select  Left/Right/Enter or click again: change  Tab view  1-4 page",
         (Page::Analyzer, _) => "Tab view  Left/Right , . or tap pair  Up/Dn span  space freeze  w env/scope  d dB/lin  f resolution  r reset  1-4 page",
+        (Page::Recorder, _) => "R or space record/stop  Left/Right input  Enter arm  a arm all  f format  d disk  Tab scale  r reset  1-4 page",
         (Page::Meters, _) => "Left/Right input  Up/Dn gain  +- gain  h +48V  i switch  Tab or s scale  r reset  a inputs  drag a gain  1-4 page",
-        _ => "1 Mixer  2 Recorder  3 Analyzer  4 Meters  Esc quits",
     };
     text(canvas, layout, 8, layout.footer.y + 4, fit(hint, layout.footer.w / layout.col - 2), theme().dim);
 }

@@ -118,7 +118,7 @@ impl Transcoder {
             bits: 24,
             floor: None,
             meters: [NoiseMeter::new(), NoiseMeter::new(), NoiseMeter::new(), NoiseMeter::new()],
-            quantizers: [Quantizer::new(24, 1), Quantizer::new(24, 1), Quantizer::new(24, 1), Quantizer::new(24, 1), Quantizer::new(24, 1), Quantizer::new(24, 1)],
+            quantizers: [const { Quantizer::new(24, 1) }; file::MAX_CHANNELS],
             chunk: [[0; CHUNK]; file::MAX_CHANNELS],
             done: 0,
             total: 0,

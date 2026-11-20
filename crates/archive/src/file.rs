@@ -5,13 +5,13 @@
 //! is kept in memory so STREAMINFO can be rewritten without reading anything back. The encoder's frames are 4096 samples
 //! (`flac_enc::BLOCK`); samples are collected until a block is full.
 //!
-//! About 360 KiB with all its buffers: keep one in a `static`.
+//! About 420 KiB with all its buffers: keep one in a `static`, or in zeroed heap memory (every field is a plain number).
 
 use audio_rec::recorder::{SECTOR, Sink};
 use flac_enc::{BLOCK, Encoder, Info, max_frame_bytes};
 
-/// Most channels a file can have here (5.1).
-pub const MAX_CHANNELS: usize = 6;
+/// Most channels a file can have here: FLAC's own limit (phono writes up to 5.1, kakelfix's Recorder groups of up to 8 inputs).
+pub const MAX_CHANNELS: usize = 8;
 /// Bytes collected before a write to the disk.
 pub const STAGE: usize = 128 * 1024;
 

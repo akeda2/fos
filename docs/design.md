@@ -1759,7 +1759,7 @@ a real USB mouse is the check (rack). **Real hardware, verified:** piano's built
 `kakelfix` is one graphical tape with four pages (Mixer, Recorder, Analyzer, Meters) chosen with soft keys on the right edge (or 1-4).
 The soft keys follow the page: the page keys first in their own colour, each with its number key (1-4) at the left, the current page's views indented under it (Tab cycles
 them), then that page's actions, Quit last. Milestone one
-is the Mixer page; the Analyzer and the Meters page followed. It knows no device: everything comes through the tape ABI's mixer calls (ABI 41, `mixer_*`), which a driver serves
+is the Mixer page; the Analyzer, the Meters page and the Recorder's first step followed. It knows no device: everything comes through the tape ABI's mixer calls (ABI 41, `mixer_*`), which a driver serves
 by implementing `kernel_core::ext_audio::Mixer` (crosspoint gains of outputs from inputs and playback channels, output masters,
 meters in cdB, named controls with a HAZARD flag, a serial that moves on every change). The loopback devices carry a small software
 mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path runs in QEMU.
@@ -1819,14 +1819,52 @@ mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path 
   own "Loopback N" switch (output N to capture channel N) when it is on, or from `mt-loop=13-14:1` in `kakelfix.cfg` for a
   cable (inputs 13-14 carry outputs 1-2). The picker then has a Loop preset. A digital loop (AES, ADAT) is bit-exact; an
   analog one reads as its output level and input gain set it.
+- **Recorder** (`crates/kakelfix/src/recorder.rs` state, `tapes/kakelfix/src/record.rs` the take and drawing), milestone one, a
+  plain take by hand: Record (or `R` on any page, space on the page) writes the armed inputs to the next free number of
+  `diskN/STEM` (`rec-name=`, default `take`, 1-9 characters; a number is never reused across formats). The format (`f` or
+  the soft key, `rec-format=flac|wav`, `rec-bits=16|20|24`) is FLAC 24 by default: each input unpacked to -1..1 and rounded
+  by `flac_enc::depth::Quantizer` (TPDF dither below 24 bits; at 24 plain rounding, exact for 24-bit capture and for float
+  samples on the 24-bit grid, which every interface here delivers: none has a 32-bit float converter), encoded by
+  `archive::FlacFile` (now 8 channels, FLAC's limit). More than 8 armed inputs are several files, the armed inputs in groups
+  of 8 in input order (`take007-1-8.flac`, `take007-9-16.flac`, ...; a group of 8 or fewer has no suffix), each on its own
+  stream handle (`fs_stream_open2`): 32 inputs are 4 files, `FS_STREAMS`. Each reserves its channels' share of the longest
+  free run (FLAC never needs more than the samples uncompressed). Tags: `ENCODER`, `INPUTS` (`9-16`). WAV keeps the
+  device's samples untouched (float stays float) through `audio_rec::Recorder` and `fs_stream_*`, as the `recorder` tape
+  does: 256 KiB block writes. Either way headers and lengths are checkpointed every 2 s. Encoding runs inline on the
+  drawing thread: about 5.8 M samples a second on one core of an i5-6500 (`cargo test --release -p archive -- --ignored
+  encode_speed`), a quarter of a core for a UFX's 30 inputs at 48 kHz, more than half at 192 kHz (18 inputs). FAT32 is
+  not used for recordings (listed, never chosen, refused): its 4 GiB limit is not carried, so a file that fills means a
+  full disk and ends the take. The disk is chosen as the `recorder` tape does, without FAT32 (exFAT, a FOSFS disk that is
+  not the boot disk, the boot disk; `d` or Next disk steps). At the left the take's status:
+  a REC lamp and clock, file, disk, the room left in the longest free run as time at this format, the format, the armed inputs,
+  bytes written with the disk's speed and slowest write, and the warnings that matter for audio that cannot be taken twice
+  (capture overruns since the take began, red; a capture ring more than a quarter full, amber). At the right, one large peak meter
+  per input (the Meters page's `Bank`, sample peak or Nordic PPM with Tab or `s`, `gfx::meter` bars with hold and clip, as the
+  Linux KakelFix's meter panel) with an arm button under each: tap it, or Enter on the selected input; `a` arms all; arming and
+  the disk are locked during a take, and the last armed input stays. Armed inputs, disk, scale and stem are saved as `rec-ch`,
+  `rec-disk`, `rec-scale`, `rec-name`. **One read loop** (`analyze::Capture::update`) now serves every user of the captured
+  audio: the take, the Meters and Recorder meters, the Analyzer; capture runs while one of those pages is shown *or a take
+  runs*, so a take goes on under the Mixer or Analyzer page, with "REC mm:ss" in red in every page's header. Quitting
+  (Esc, Quit) finishes the files cleanly. The capture ring is asked for at up to 256 MiB (`audio_set_capture_ring`, leaving
+  256 MiB free), which absorbs disk writes, encoding and frames drawn meanwhile. Next: ext4 as a target (a tape call that
+  lists ext volumes and their free space, a `Sink` over `vfs_write`), encoding on its own thread on the server kernel
+  (needed at 192 kHz), a count of float samples off the 24-bit grid, pre-roll and the sound/silence trigger
+  (`audio_rec::preroll`, `silence`), typing the stem on the page. WavPack (lossless float, more than 8 channels a file) is
+  not in the tree; its BSD licence allows vendoring it as libopus is, if a 32-bit float interface needs it.
 - **Test**: `make test-kakelfix` on the loopback: `show` reads the identity mix; in the tape `x` switches the first strip off and a
   mouse click half way up its fader sets -9 dB; with a `play` service playing a tone into loop0, `3` opens the Analyzer and its
-  envelope must appear; `4` opens the Meters page and the first bar must light for the tone; `3`, Up then a click on the Quit soft key at once must leave `an-span=30` and an `mt-scale` in `kakelfix.cfg`; `show` reads the result. Then on the server
+  envelope must appear; `4` opens the Meters page and the first bar must light for the tone; `2` and `R` start a take (the header lamp lights), it
+  must stay lit on the Analyzer page, `2` and `R` stop it, and `disk1/take001.flac` in the image then has a STREAMINFO of 2
+  channels, 48 kHz, 24 bits and seconds of samples, passes the reference `flac -t` (frame CRCs, MD5) and decodes to the tone
+  (its length is not the take's wall time: with a listener loop0 has no clock and `play` runs as fast as the capture
+  drains); a second run with `rec-format=wav rec-ch=2` makes `take002.wav`, input 2 alone as 32-bit float; `3`, Up then a click on the Quit soft key at once must leave `an-span=30` and an `mt-scale` in `kakelfix.cfg`; `show` reads the result. Then on the server
   kernel at -smp 4 the same `x` goes through the writer thread and a lone Escape typed at once ends the tape through the writer's join, so the
   queued write is not lost. The mouse is walked exactly: the kernel's pointer
   gain moves a packet of d counts 4d + d|d|/2 pixels.
 - **Only hardware shows**: a real device's write latency under a fast drag, meters from a real driver, touch panels, which
-  controls the Meters page finds under each input of a real interface.
+  controls the Meters page finds under each input of a real interface; a Recorder take from a real interface to a real disk
+  in real time (no overruns while pages are switched and drawn and FLAC is encoded; a UFX's 30 inputs at 48 kHz in 4 files
+  at once), whether a UC/UFX's float samples sit on the 24-bit grid (24-bit FLAC then bit-exact).
 
 ## Room acoustics: `frt60` (tapes/frt60, crates/rt60)
 

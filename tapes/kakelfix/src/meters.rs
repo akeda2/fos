@@ -11,8 +11,7 @@ use audio_screen::meters::{Channel, Reading};
 use core::fmt::Write;
 use dsp::loudness::Loudness;
 use dsp::pcm::unpack_channel;
-use fosfor_abi::tape::{MIXER_CONTROL_BOOL, MIXER_FLAG_HAZARD, TapeApi};
-use gfx::Canvas;
+use fosfor_abi::tape::{MIXER_CONTROL_BOOL, MIXER_FLAG_HAZARD, TapeApi};use gfx::Canvas;
 use gfx::meter::{Scale, draw_bar, draw_history, draw_scale};
 use gfx::theme::theme;
 use kakelfix::meters::short_label;
@@ -107,40 +106,36 @@ impl Bank {
         self.head = 0;
     }
 
-    /// Feeds every input from what capture has, takes readings and history steps when they are due; true when there was
-    /// audio.
-    pub fn update(&mut self, api: &TapeApi, input: &Input, scratch: &mut [u8], left: &mut [f32], right: &mut [f32], generation: u32) -> bool {
+    /// Feeds every input from `data` (whole device frames, as `audio_read` gave them). `generation` clears the holds,
+    /// clip lamps and loudness when it moves.
+    pub fn feed(&mut self, input: &Input, data: &[u8], left: &mut [f32], right: &mut [f32], generation: u32) {
         if self.seen != generation {
             self.seen = generation;
             self.reset();
         }
-        let frame = input.frame_bytes();
-        if frame == 0 {
-            return false;
-        }
-        let mut fresh = false;
-        loop {
-            let got = (api.audio_read)(scratch.as_mut_ptr(), scratch.len() / frame * frame);
-            if got < frame {
-                break;
+        let unpack = |out: &mut [f32], channel| unpack_channel(data, out, input.channels, input.slot, input.bits, input.float, channel);
+        for pair in 0..self.inputs.div_ceil(2) {
+            let (first, second) = (pair * 2, pair * 2 + 1);
+            let frames = unpack(left, first);
+            self.channels[first].feed(&left[..frames]);
+            if second < self.inputs {
+                unpack(right, second);
+                self.channels[second].feed(&right[..frames]);
+            } else {
+                // A last odd input is measured alone: silence beside it, not itself twice (+3 LU).
+                right[..frames].fill(0.0);
             }
-            fresh = true;
-            let data = &scratch[..got];
-            let unpack = |out: &mut [f32], channel| unpack_channel(data, out, input.channels, input.slot, input.bits, input.float, channel);
-            for pair in 0..self.inputs.div_ceil(2) {
-                let (first, second) = (pair * 2, pair * 2 + 1);
-                let frames = unpack(left, first);
-                self.channels[first].feed(&left[..frames]);
-                if second < self.inputs {
-                    unpack(right, second);
-                    self.channels[second].feed(&right[..frames]);
-                } else {
-                    // A last odd input is measured alone: silence beside it, not itself twice (+3 LU).
-                    right[..frames].fill(0.0);
-                }
-                self.loudness[pair].feed(&left[..frames], &right[..frames]);
-            }
+            self.loudness[pair].feed(&left[..frames], &right[..frames]);
         }
+    }
+
+    /// An input's last reading: sample peak, or the Nordic PPM.
+    pub fn reading(&self, input: usize, nordic: bool) -> Reading {
+        self.readings.get(input).map_or(SILENT, |r| r[nordic as usize])
+    }
+
+    /// Takes readings and history steps when they are due (after a pass of `feed`s).
+    pub fn step(&mut self) {
         let now = tape_rt::micros();
         let since = now.wrapping_sub(self.last_read);
         if since >= READ_STEP_US {
@@ -167,7 +162,6 @@ impl Bank {
             self.head = (self.head + 1) % HISTORY;
             self.filled = (self.filled + 1).min(HISTORY);
         }
-        fresh
     }
 
     /// The newest `out.len()` (at most) history values of the selected input or pair on `kind`'s scale, oldest first.

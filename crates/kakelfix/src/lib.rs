@@ -2,18 +2,20 @@
 //! so the host can test them. The tape reaches the active audio device's mixer (tape ABI 41, `mixer_*`) through the
 //! `Device` trait; `mixer_model` turns its mono crosspoints into stereo strips with dB faders, pan and mute.
 //!
-//! Pages (chosen by the soft keys down the right edge): Mixer, Recorder (a later milestone), Analyzer and Meters. The soft keys
+//! Pages (chosen by the soft keys down the right edge): Mixer, Recorder, Analyzer and Meters. The soft keys
 //! follow the page: the active page's views sit indented under it, its actions below, Quit last. The Mixer page has three
 //! views: Outputs (one output's mix as fader strips, its master at the end), Matrix (every send of every output as a
 //! table) and Device (the device's own settings). The Analyzer shows a captured channel pair as a waveform, a spectrum,
 //! or both (`analyzer`). Meters shows every captured input as a bar (dBFS, Nordic PPM or LUFS per pair) with that
-//! input's gain and switches under it (`meters`).
+//! input's gain and switches under it (`meters`). Recorder records the armed inputs to a WAV file per take, with large
+//! peak meters of every input at the right (`recorder`); a take keeps running while other pages are shown.
 #![no_std]
 
 pub mod analyzer;
 pub mod layout;
 pub mod meters;
 pub mod queue;
+pub mod recorder;
 
 use core::fmt::Write;
 use fosfor_abi::tape::{
@@ -23,6 +25,7 @@ pub use analyzer::{AnView, Analysis, Persisted, WaveMode};
 pub use layout::{Hit, Layout, Rect};
 pub use meters::{MeterScale, Metering};
 pub use queue::{Link, Queued};
+pub use recorder::Recording;
 use mixer_model::{Cell, Group, List, Master, Mixer, PanLaw, Send, Strip, Strips, MAX_CHANNELS};
 pub use mixer_model::{FADER_MAX_DB, FADER_MIN_DB};
 
@@ -81,6 +84,18 @@ impl<const N: usize> Text<N> {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+}
+
+impl<const N: usize> PartialEq for Text<N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl<const N: usize> core::fmt::Debug for Text<N> {
+    fn fmt(&self, out: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(self.as_str(), out)
     }
 }
 
@@ -187,10 +202,13 @@ pub enum Action {
     Resolution,
     /// Meters: the next scale, the selected input's phantom power, its instrument (or other) switch.
     MeterScale,
-    /// Meters: open or close the picker of the inputs shown.
+    /// Meters: open or close the picker of the inputs shown. Recorder: arm every input.
     Channels,
     Phantom,
     InputSwitch,
+    /// Recorder: start or stop a take (from any page), and the next disk to record to.
+    Record,
+    NextDisk,
     Enter,
     Yes,
     No,
@@ -227,6 +245,8 @@ pub enum Swipe {
     Meters,
     /// The Analyzer's pair buttons.
     Pairs,
+    /// The Recorder's meter columns.
+    Recorder,
 }
 
 /// What a press that never moved does on release: a matrix cell or a Device row is selected, or acted on when it
@@ -294,6 +314,7 @@ pub struct App {
     pub first_ctl: usize,
     pub first_meter: usize,
     pub first_pair: usize,
+    pub first_rec: usize,
     /// Meters: the inputs picker is open, its cursor on this item (`pick_items`).
     pub picking: Option<usize>,
     /// A hazardous control change waiting for yes or no: (control, value).
@@ -306,6 +327,7 @@ pub struct App {
     pub controls: List<MixerControl, { queue::MAX_CONTROLS }>,
     pub analysis: Analysis,
     pub metering: Metering,
+    pub recording: Recording,
     pub message: Text<72>,
     pub quit: bool,
     names: [[Text<16>; MAX_CHANNELS]; 3],
@@ -332,6 +354,7 @@ impl App {
             first_ctl: 0,
             first_meter: 0,
             first_pair: 0,
+            first_rec: 0,
             picking: None,
             confirm: None,
             ask_hazard: false,
@@ -339,6 +362,7 @@ impl App {
             controls: List::new(),
             analysis: Analysis::new(),
             metering: Metering::new(),
+            recording: Recording::new(),
             message: Text::new(),
             quit: false,
             names: [[Text::new(); MAX_CHANNELS]; 3],
@@ -577,8 +601,14 @@ impl App {
                 }
                 Page::Analyzer => self.analysis.next_view(),
                 Page::Meters => self.metering.next_scale(),
-                Page::Recorder => {}
+                Page::Recorder => self.recording.nordic = !self.recording.nordic,
             },
+            Action::Record => {
+                if let Err(reason) = self.recording.toggle_take() {
+                    self.note(format_args!("{reason}"));
+                }
+            }
+            _ if self.page == Page::Recorder => self.act_recorder(action),
             _ if self.page == Page::Analyzer => self.act_analyzer(action),
             _ if self.page == Page::Meters => self.act_meters(device, action),
             _ if self.page != Page::Mixer => {}
@@ -597,6 +627,43 @@ impl App {
                 View::Matrix => self.act_matrix(device, action),
                 View::Device => self.act_device(device, action),
             },
+        }
+    }
+
+    /// Recorder keys: Left/Right select an input, Enter arms or disarms it, `a` arms every input, space starts or stops a
+    /// take, `d` the next disk, `f` the next format, `s` the meter scale, `r` clears the holds and clip lamps.
+    fn act_recorder(&mut self, action: Action) {
+        let r = &mut self.recording;
+        let result = match action {
+            Action::Left | Action::Right | Action::Pan(_) => {
+                r.step(matches!(action, Action::Right) || matches!(action, Action::Pan(step) if step > 0.0));
+                Ok(())
+            }
+            Action::Home => {
+                r.home(false);
+                Ok(())
+            }
+            Action::End => {
+                r.home(true);
+                Ok(())
+            }
+            Action::Enter => r.toggle(r.input).map(|_| ()),
+            Action::Channels => r.arm_all(),
+            Action::Freeze => r.toggle_take(),
+            Action::NextDisk | Action::WaveScale => r.next_disk(),
+            Action::Resolution => r.next_encoding(),
+            Action::MeterScale => {
+                r.nordic = !r.nordic;
+                Ok(())
+            }
+            Action::Reset => {
+                self.metering.reset();
+                Ok(())
+            }
+            _ => Ok(()),
+        };
+        if let Err(reason) = result {
+            self.note(format_args!("{reason}"));
         }
     }
 
@@ -842,6 +909,11 @@ impl App {
             put(&mut slot, scale, SoftKind::Action, Action::MeterScale, false);
             put(&mut slot, "Inputs", SoftKind::Action, Action::Channels, self.picking.is_some());
             put(&mut slot, "Reset", SoftKind::Action, Action::Reset, false);
+        } else if self.page == Page::Recorder {
+            let running = self.recording.take.running;
+            put(&mut slot, if running { "Stop" } else { "Record" }, SoftKind::Action, Action::Record, running);
+            put(&mut slot, self.recording.encoding.label(), SoftKind::Action, Action::Resolution, false);
+            put(&mut slot, "Next disk", SoftKind::Action, Action::NextDisk, false);
         }
         slot = SOFT_NAV + SOFT_ACTIONS;
         put(&mut slot, "Quit", SoftKind::Action, Action::Quit, false);
@@ -1155,6 +1227,8 @@ impl App {
         self.metering.input = self.metering.input.min(self.metering.channels.max(1) - 1);
         self.first_meter = keep(self.metering.bar(), self.first_meter, layout.visible_meters(self), self.metering.bars());
         self.first_pair = keep(self.analysis.pair, self.first_pair, layout.visible_pairs(), self.analysis.pairs());
+        self.recording.input = self.recording.input.min(self.recording.channels.max(1) - 1);
+        self.first_rec = keep(self.recording.input, self.first_rec, layout.visible_rec(self), self.recording.channels.max(1));
     }
 
     /// A mouse button or finger came down at (`x`, `y`); `Some` when it grabbed a fader or a pan control to drag.
@@ -1199,6 +1273,17 @@ impl App {
                 self.metering.input = input;
                 Some(self.swipe_from(Swipe::Meters, x, y, Tap::None))
             }
+            Hit::RecMeter(input) => {
+                self.recording.input = input;
+                Some(self.swipe_from(Swipe::Recorder, x, y, Tap::None))
+            }
+            Hit::Arm(input) => {
+                self.recording.input = input;
+                if let Err(reason) = self.recording.toggle(input) {
+                    self.note(format_args!("{reason}"));
+                }
+                None
+            }
             Hit::InputControl(index, input) => {
                 self.metering.input = input;
                 let control = self.controls.get(index)?;
@@ -1216,6 +1301,7 @@ impl App {
                     (Page::Mixer, View::Matrix) if layout.body.contains(x, y) => Swipe::Matrix,
                     (Page::Mixer, View::Device) if layout.body.contains(x, y) => Swipe::Controls,
                     (Page::Meters, _) if layout.meter_area().contains(x, y) => Swipe::Meters,
+                    (Page::Recorder, _) if layout.rec_area().contains(x, y) => Swipe::Recorder,
                     _ => return None,
                 };
                 Some(self.swipe_from(list, x, y, Tap::None))
@@ -1237,6 +1323,7 @@ impl App {
             Swipe::Controls => self.first_ctl,
             Swipe::Meters => self.first_meter,
             Swipe::Pairs => self.first_pair,
+            Swipe::Recorder => self.first_rec,
         };
         Grab::Swipe { list, x, y, first, first_col: self.first_col, tap }
     }
@@ -1321,6 +1408,11 @@ impl App {
             }
             Swipe::Pairs => {
                 self.first_pair = moved(first, items(dx, layout.an_pair_w()), layout.visible_pairs(), self.analysis.pairs());
+            }
+            Swipe::Recorder => {
+                let visible = layout.visible_rec(self);
+                self.first_rec = moved(first, items(dx, layout.rec_column_w(self)), visible, self.recording.channels.max(1));
+                self.recording.input = inside(self.recording.input, self.first_rec, visible);
             }
         }
         Grab::Swipe { list, x: x0, y: y0, first, first_col, tap: Tap::None }

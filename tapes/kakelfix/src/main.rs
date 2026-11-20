@@ -1,13 +1,14 @@
 //! KakelFix: a mixer, recorder and analyzer for the active audio device, driven by mouse, touch or keyboard. The Mixer
 //! page drives the device's hardware mixer (tape ABI 41, `mixer_*`); the Analyzer page captures a channel pair and shows
 //! its waveform and spectrum (`analyze.rs`); the Meters page meters every input with its gain under it (`meters.rs`); the
-//! Recorder comes later. The state, the actions and the layout are in
+//! Recorder page records the armed inputs to WAV files (`record.rs`). The state, the actions and the layout are in
 //! `crates/kakelfix` (host-tested); this file is the device glue, the input loop and `kakelfix show`; `view.rs` draws.
 #![no_std]
 #![no_main]
 
 mod analyze;
 mod meters;
+mod record;
 mod view;
 
 use audio_screen::{Screen, poll_keys};
@@ -26,13 +27,16 @@ tape_rt::tape_help!(
     br#"kakelfix [device=N] [screen=N] [theme=NAME] [rate=HZ] [show]
 The active audio device's mixer on the pixel screen: one output's mix as
 fader strips (Outputs), every send as a table (Matrix) and the device's own
-settings (Device); the Analyzer page shows an input pair's waveform and
-spectrum; the Meters page meters every input (dBFS, Nordic PPM or LUFS)
-with its gain and switches under it. Mouse, touch or keyboard.
+settings (Device); the Recorder page records the armed inputs as FLAC
+(16, 20 or 24 bits; 8 inputs a file) or WAV to diskN/STEMnnn.flac on an
+exFAT or FOSFS disk, with a peak meter per input; the
+Analyzer page shows an input pair's waveform and spectrum; the Meters page
+meters every input (dBFS, Nordic PPM or LUFS) with its gain and switches
+under it. Mouse, touch or keyboard.
   device=N     use audio device N (`audio` lists them; loop0 for a try)
   screen=N     which screen (Pi 4: 1 is the second HDMI output)
   theme=NAME   dark, classic or light
-  rate=HZ      the Analyzer's capture rate (default 48000 if offered)
+  rate=HZ      the capture rate: Recorder, Analyzer, Meters (default 48000)
   ask-phantom=yes  ask before switching phantom power on (Device page's
                last row; kakelfix.cfg keeps it)
 kakelfix.cfg also keeps the Analyzer's settings, saved as they change:
@@ -41,7 +45,9 @@ an-timebase=5|10|20|50 an-scale=db|linear an-pair=N
 an-resolution=third|sixth|twelfth|fft, and the Meters page's
 mt-scale=dbfs|nordic|lufs mt-input=N mt-show=all|1,3-8 (inputs shown)
 mt-loop=13-14:1 (inputs 13-14 cabled from outputs 1-2: named Loop 1/2;
-a device's own Loopback N switch does this by itself)
+a device's own Loopback N switch does this by itself), and the Recorder's:
+rec-name=STEM (1-9 of a-z 0-9 . _ -; default take) rec-ch=all|1-2,9
+rec-disk=N rec-scale=dbfs|nordic rec-format=flac|wav rec-bits=16|20|24
 (the same words on the command line)
   show         print every output's sends and the controls, then end
 Keys: Tab next view, 1-4 Mixer/Recorder/Analyzer/Meters, arrows select and
@@ -50,6 +56,10 @@ move (Up/Down: 1 dB), PgUp/PgDn 6 dB, + - 0.1 dB, 0 unity, x off, m mute,
 L pan law, Enter open (Matrix) or change (Device), y n answer, Esc quits.
 Analyzer: Tab view, Left/Right or , . input pair, Up/Down span, space
 freeze, w envelope/scope, d dB/linear, f resolution, r reset.
+Recorder: R or space record/stop (R on any page), Left/Right input, Enter
+arm it, a arm all, f format, d next disk, Tab or s dBFS/PPM, r reset; tap an
+input's REC button to arm it. A take goes on while other pages are shown;
+Esc ends it cleanly.
 Meters: Left/Right input, Up/Down or + - gain, h +48V, i other switch,
 Tab or s scale, r reset (holds, clip, loudness), a pick the inputs shown
 (arrows move, Enter or space picks, a or n closes).
@@ -198,6 +208,7 @@ fn action(key: Key) -> Option<Action> {
         Key::Char(b'd') => Action::WaveScale,
         Key::Char(b'f') => Action::Resolution,
         Key::Char(b'r') => Action::Reset,
+        Key::Char(b'R') => Action::Record,
         _ => return None,
     })
 }
@@ -259,7 +270,17 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     app.analysis.pair = app.analysis.pair.min(app.analysis.pairs() - 1);
     app.metering.channels = capture.channels().max(1);
     app.metering.load(|key| config.value(key));
-    let persisted = |app: &App| (app.analysis.persisted(), app.metering.persisted());
+    let r = &mut app.recording;
+    r.channels = capture.channels().max(1);
+    r.rate = capture.rate();
+    if let Some(input) = capture.input() {
+        (r.slot, r.bits, r.float) = (input.slot, input.bits, input.float);
+    }
+    r.base = kakelfix::Text::from("take");
+    r.disk_count = record::find_disks(api, &mut r.disks);
+    let wanted_disk = r.load(|key| config.value(key));
+    r.choose_disk(wanted_disk);
+    let persisted = |app: &App| (app.analysis.persisted(), app.metering.persisted(), app.recording.persisted());
     let mut saved = persisted(&app);
     // When the Analyzer's or the Meters page's settings last changed; they are written a second later, so a run of key repeats is one write.
     let mut changed_at = None;
@@ -305,6 +326,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             body.put("ask-phantom", format_args!("{}", if app.ask_hazard { "yes" } else { "no" }));
             app.analysis.save(|key, value| body.put(key, value));
             app.metering.save(|key, value| body.put(key, value));
+            app.recording.save(|key, value| body.put(key, value));
             let result = config.save(api, body.as_str());
             // The Analyzer and Meters save quietly; the +48 V toggle and any failure say so.
             if app.ask_changed || result.is_err() {
@@ -339,7 +361,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             }
         }
         let fresh = capture.update(api, &mut app, &layout);
-        if has_meters || fresh {
+        if has_meters || fresh || capture.taking() {
             screen.mark_dirty();
         }
         if screen.due() {
@@ -360,6 +382,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     }
     capture.stop(api, &mut app);
     screen.close();
+    if app.recording.take.files > 0 {
+        println!("kakelfix: {}", app.message.as_str());
+    }
     if let Some(thread) = writer_thread {
         LINK.stop();
         tape_rt::futex_wake(&LINK.work, 1);

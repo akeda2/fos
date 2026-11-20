@@ -302,3 +302,86 @@ fn the_decoded_file_is_equalised() {
     let ratio = peak(&boosted, "b") as f32 / peak(&flat, "f") as f32;
     assert!((ratio - 2.0).abs() < 0.1, "{ratio}");
 }
+
+/// `channels` channels of a noisy tone at a 20-bit level (an interface's real noise floor), each its own frequency.
+fn multichannel(channels: usize, frames: usize) -> Vec<Vec<i32>> {
+    let mut seed = 777u32;
+    (0..channels)
+        .map(|c| {
+            (0..frames)
+                .map(|i| {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    let noise = ((seed >> 8) as f32 / 16_777_216.0 - 0.5) * 16.0;
+                    let tone = (i as f32 / 48000.0 * (300.0 + 110.0 * c as f32) * 6.2831853).sin() * 2_000_000.0;
+                    (tone + noise) as i32
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn write_multi(chans: &[Vec<i32>], sink: &mut Memory) {
+    let mut file = Box::new(FlacFile::new());
+    file.begin(sink, b"x", 0, Info { sample_rate: 48000, channels: chans.len() as u32, bits: 24 }, &[("INPUTS", "9-16")]).unwrap();
+    let mut at = 0;
+    while at < chans[0].len() {
+        let end = (at + 2048).min(chans[0].len());
+        let refs: Vec<&[i32]> = chans.iter().map(|c| &c[at..end]).collect();
+        file.push(sink, &refs).unwrap();
+        at = end;
+    }
+    file.finish(sink).unwrap();
+}
+
+/// Eight channels, FLAC's limit (kakelfix records groups of up to 8 inputs). Checked with the reference `flac` decoder,
+/// which also verifies the MD5 in STREAMINFO; skipped when the host has none (ours, `audio-decode`, is stereo only).
+#[test]
+fn eight_channels_decode_bit_for_bit_with_the_reference_decoder() {
+    let chans = multichannel(8, 30_000);
+    let mut sink = Memory::new();
+    write_multi(&chans, &mut sink);
+    let Ok(dir) = std::env::temp_dir().canonicalize() else { return };
+    let path = dir.join(format!("archive-8ch-{}.flac", std::process::id()));
+    let raw = path.with_extension("raw");
+    std::fs::write(&path, sink.file()).unwrap();
+    let status = std::process::Command::new("flac")
+        .args(["-d", "-f", "-s", "--force-raw-format", "--endian=little", "--sign=signed", "-o"])
+        .arg(&raw)
+        .arg(&path)
+        .status();
+    let Ok(status) = status else {
+        eprintln!("no `flac` on this host: 8-channel decode not checked");
+        return;
+    };
+    assert!(status.success(), "flac -d (MD5 checked) failed");
+    let bytes = std::fs::read(&raw).unwrap();
+    let _ = (std::fs::remove_file(&path), std::fs::remove_file(&raw));
+    assert_eq!(bytes.len(), 30_000 * 8 * 3);
+    for (i, frame) in bytes.chunks(24).enumerate() {
+        for (c, sample) in frame.chunks(3).enumerate() {
+            let value = i32::from_le_bytes([0, sample[0], sample[1], sample[2]]) >> 8;
+            assert_eq!(value, chans[c][i], "channel {c} frame {i}");
+        }
+    }
+}
+
+/// How fast the encoder runs on this host: `cargo test --release -p archive -- --ignored --nocapture encode_speed`. The
+/// Recorder encodes on its drawing thread, so this is the share of a CPU a take costs (a UFX: 30 inputs at 48 kHz, 1.44 M
+/// samples a second).
+#[test]
+#[ignore]
+fn encode_speed() {
+    let chans = multichannel(8, 48_000 * 10);
+    let mut sink = Memory::new();
+    let began = std::time::Instant::now();
+    write_multi(&chans, &mut sink);
+    let seconds = began.elapsed().as_secs_f64();
+    let samples = 8.0 * 48_000.0 * 10.0;
+    eprintln!(
+        "8 ch x 10 s at 48 kHz, 24-bit: {:.2} s, {:.1} M samples/s, {:.0}x real time for 8 channels, ratio {:.2}",
+        seconds,
+        samples / seconds / 1e6,
+        10.0 / seconds,
+        sink.file().len() as f64 / (samples * 3.0)
+    );
+}

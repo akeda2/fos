@@ -1,14 +1,19 @@
-//! The Analyzer page: capture from the active device while the page is shown, the envelope, scope and two spectra
-//! (`crates/ltas`, left and right) fed from it, and their drawing. Capture starts when the page is entered and stops when
-//! it is left (the Meters page captures too, through `meters::Bank`), so the Mixer page never holds the device's input. The buffers are taken from the heap once, at startup.
+//! Capture from the active device, and the Analyzer page: the envelope, scope and two spectra (`crates/ltas`, left and
+//! right) fed from it, and their drawing. One read loop serves every user of the captured audio: a running take
+//! (`record::Writer`), the Meters and Recorder pages' meters (`meters::Bank`) and the Analyzer. Capture runs while one of
+//! those pages is shown or a take runs, so the Mixer page alone never holds the device's input. The buffers are taken
+//! from the heap once, at startup.
 
+use crate::record::Writer;
 use crate::view::{centered, text};
 use audio_screen::Input;
+use dsp::pcm::unpack_channel;
 use core::fmt::Write;
 use gfx::Canvas;
 use gfx::plot::{Frame, Scale, axis_label, curve, spline};
 use gfx::theme::theme;
 use kakelfix::analyzer::{Envelope, FLOOR_DB, SPANS_S, Scope, TIMEBASES_MS};
+use kakelfix::recorder::Request;
 use kakelfix::{App, Layout, Page, Rect, Text, WaveMode};
 use ltas::{Analyzer, Config, Mode, Resolution};
 use mixer_model::lin_to_db;
@@ -17,12 +22,16 @@ use tape_rt::{FP_AVX2, TapeApi, alloc_bytes, alloc_zeroed};
 /// The FFT length: 8192 points is 5.9 Hz per bin at 48 kHz, enough for 1/12 octave down to about 100 Hz.
 const FFT: usize = 8192;
 const BINS: usize = FFT / 2 + 1;
-/// Frames read per `audio_read`.
-const CHUNK: usize = 2048;
+/// Frames read per `audio_read` (the Recorder's buffers are sized by it).
+pub(crate) const CHUNK: usize = 2048;
 const LOW_HZ: f32 = 20.0;
 const HIGH_HZ: f32 = 20000.0;
 /// The spectrum's dB scale: 0 dBFS at the top, 100 dB down.
 const SCALE: Scale = Scale { db_top: 0.0, db_range: 100.0 };
+/// The capture ring asked for (the kernel gives less if it cannot): what absorbs a slow disk write or a frame drawn
+/// during a take. 256 MiB is 46 s of 30 channels of 32 bits at 48 kHz. Never more than what leaves 256 MiB free.
+const RING_BYTES: usize = 256 << 20;
+const MEMORY_RESERVE: usize = 256 << 20;
 
 struct Buffers {
     scratch: &'static mut [u8],
@@ -43,6 +52,7 @@ pub struct Capture {
     seen: u32,
     columns: usize,
     bank: Option<crate::meters::Bank>,
+    writer: Option<Writer>,
 }
 
 impl Capture {
@@ -71,7 +81,29 @@ impl Capture {
             Ok(input) => crate::meters::Bank::new(api, rate, input.channels),
             Err(_) => None,
         };
-        Capture { input, buffers, rate, running: false, failed: false, seen: 0, columns: 0, bank }
+        let writer = match &input {
+            Ok(input) => Writer::new(api, input, CHUNK * input.frame_bytes()),
+            Err(_) => None,
+        };
+        if input.is_ok() {
+            let spare = ((api.free_pages)() * 4096).saturating_sub(MEMORY_RESERVE);
+            (api.audio_set_capture_ring)(spare.min(RING_BYTES) as u64);
+        }
+        Capture { input, buffers, rate, running: false, failed: false, seen: 0, columns: 0, bank, writer }
+    }
+
+    /// The capture rate (what a take is recorded at).
+    pub fn rate(&self) -> u32 {
+        self.rate
+    }
+
+    pub fn input(&self) -> Option<&Input> {
+        self.input.as_ref().ok()
+    }
+
+    /// Whether a take is being written.
+    pub fn taking(&self) -> bool {
+        self.writer.as_ref().is_some_and(Writer::running)
     }
 
     pub fn channels(&self) -> usize {
@@ -87,19 +119,26 @@ impl Capture {
         match (&self.input, &self.buffers) {
             (Err(reason), _) => Some(reason),
             (Ok(_), None) => Some("out of memory for the analyzer"),
+            _ if self.writer.is_none() => Some("out of memory for the recorder"),
             _ if self.failed => Some("the capture did not start (see the message above)"),
             _ => None,
         }
     }
 
-    /// Starts or stops capture with the page and feeds what arrived; true when there is something new to draw.
+    /// Starts or stops capture with the pages and the take, serves the take's requests and feeds what arrived to the take,
+    /// the meters or the Analyzer; true when there is something new to draw.
     pub fn update(&mut self, api: &TapeApi, app: &mut App, layout: &Layout) -> bool {
-        if app.page != Page::Analyzer && app.page != Page::Meters {
+        let shown = matches!(app.page, Page::Analyzer | Page::Meters | Page::Recorder);
+        let asked = app.recording.request == Some(Request::Start);
+        if !shown && !asked && !self.taking() {
             self.stop(api, app);
             self.failed = false;
             return false;
         }
-        let (Ok(input), Some(b)) = (&self.input, &mut self.buffers) else { return false };
+        let (Ok(input), Some(b)) = (&self.input, &mut self.buffers) else {
+            app.recording.request = None;
+            return false;
+        };
         if !self.running && !self.failed {
             match input.start_capture(api, self.rate) {
                 Ok(()) => {
@@ -109,6 +148,7 @@ impl Capture {
                 }
                 Err(code) => {
                     self.failed = true;
+                    app.recording.request = None;
                     app.message.clear();
                     let _ = write!(app.message, "capture at {} Hz: code {code}", self.rate);
                     return true;
@@ -116,47 +156,73 @@ impl Capture {
             }
         }
         if !self.running {
+            app.recording.request = None;
             return false;
         }
-        if app.page == Page::Meters {
-            let Some(bank) = &mut self.bank else { return false };
-            return bank.update(api, input, b.scratch, &mut b.left[..], &mut b.right[..], app.metering.generation);
+        if let Some(writer) = &mut self.writer {
+            writer.serve(api, app, self.rate);
         }
         let a = app.analysis;
-        let columns = layout.analyzer_plots(a.view).0.map_or(self.columns.max(1), |plot| plot.w.max(1) as usize);
-        if self.seen != a.generation || columns != self.columns {
-            self.seen = a.generation;
-            self.columns = columns;
-            b.envelope.configure(columns, self.rate, SPANS_S[a.span]);
-            b.scope.configure(self.rate, TIMEBASES_MS[a.timebase]);
-            let mut config = Config::new(self.rate);
-            config.hop = FFT / 4;
-            config.tau_s = 0.5;
-            config.avx2 = tape_rt::fp_level() >= FP_AVX2;
-            config.resolution = [Resolution::Third, Resolution::Sixth, Resolution::Twelfth, Resolution::Fft][a.resolution];
-            for spectrum in b.spectra.iter_mut() {
-                spectrum.configure(config);
+        let analyzing = app.page == Page::Analyzer;
+        if analyzing {
+            let columns = layout.analyzer_plots(a.view).0.map_or(self.columns.max(1), |plot| plot.w.max(1) as usize);
+            if self.seen != a.generation || columns != self.columns {
+                self.seen = a.generation;
+                self.columns = columns;
+                b.envelope.configure(columns, self.rate, SPANS_S[a.span]);
+                b.scope.configure(self.rate, TIMEBASES_MS[a.timebase]);
+                let mut config = Config::new(self.rate);
+                config.hop = FFT / 4;
+                config.tau_s = 0.5;
+                config.avx2 = tape_rt::fp_level() >= FP_AVX2;
+                config.resolution = [Resolution::Third, Resolution::Sixth, Resolution::Twelfth, Resolution::Fft][a.resolution];
+                for spectrum in b.spectra.iter_mut() {
+                    spectrum.configure(config);
+                }
             }
         }
-        let pair = a.channels_shown();
+        let metering = matches!(app.page, Page::Meters | Page::Recorder);
+        let (pair, frame) = (a.channels_shown(), input.frame_bytes());
         let mut fresh = false;
-        loop {
-            let got = input.read_pair(api, b.scratch, &mut b.left[..], &mut b.right[..], pair);
-            if got == 0 {
+        while frame != 0 {
+            let got = (api.audio_read)(b.scratch.as_mut_ptr(), b.scratch.len() / frame * frame);
+            if got < frame {
                 break;
             }
             fresh = true;
-            if !a.frozen {
+            let data = &b.scratch[..got];
+            if let Some(writer) = &mut self.writer {
+                writer.push(api, app, data);
+            }
+            if metering {
+                if let Some(bank) = &mut self.bank {
+                    bank.feed(input, data, &mut b.left[..], &mut b.right[..], app.metering.generation);
+                }
+            } else if analyzing && !a.frozen {
+                let unpack = |out: &mut [f32], channel| unpack_channel(data, out, input.channels, input.slot, input.bits, input.float, channel);
+                let got = unpack(&mut b.left[..], pair.0).min(unpack(&mut b.right[..], pair.1));
                 b.envelope.push(&b.left[..got], &b.right[..got]);
                 b.scope.push(&b.left[..got], &b.right[..got]);
                 b.spectra[0].push(&b.left[..got]);
                 b.spectra[1].push(&b.right[..got]);
             }
         }
-        fresh && !a.frozen
+        if metering {
+            if let Some(bank) = &mut self.bank {
+                bank.step();
+            }
+        }
+        if let Some(writer) = &mut self.writer {
+            writer.status(api, app);
+        }
+        shown && fresh && !(analyzing && a.frozen)
     }
 
+    /// Ends a running take, then stops capture.
     pub fn stop(&mut self, api: &TapeApi, app: &mut App) {
+        if let Some(writer) = &mut self.writer {
+            writer.stop(api, app);
+        }
         if self.running {
             (api.audio_stop)();
             self.running = false;

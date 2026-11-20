@@ -346,7 +346,8 @@ fn soft_keys_follow_the_page_and_tab_cycles_its_views() {
     let quit = layout.soft(&app, 10);
     assert!(quit.y > empty.y + empty.h, "a gap before Quit");
     app.act(&mut device, Action::Page(Page::Recorder));
-    let gap = layout.soft(&app, 7);
+    assert_eq!(labels(&app), ["Mixer", "Recorder", "Analyzer", "Meters", "", "", "", "Record", "FLAC 24", "Next disk", "Quit"]);
+    let gap = layout.soft(&app, 5);
     app.press(&mut device, &layout, gap.x + 1, gap.y + 1);
     assert!(!app.quit, "an empty slot does nothing");
     app.press(&mut device, &layout, quit.x + 1, quit.y + 1);
@@ -727,4 +728,204 @@ fn looped_back_inputs_are_named_after_their_output() {
         }
     });
     assert_eq!(text.as_str(), "13-14:1,16:9");
+}
+
+fn disk(number: usize, volume: recorder::Volume, boot: bool, largest: u64) -> recorder::Disk {
+    recorder::Disk { number, volume, boot, largest, free: largest, ..recorder::Disk::EMPTY }
+}
+
+/// A recorder app with four inputs and three disks (the boot FOSFS disk, a spare FOSFS disk, an exFAT stick).
+fn recorder_app(device: &mut Fake) -> App {
+    let mut app = app(device);
+    let r = &mut app.recording;
+    r.channels = 4;
+    r.base = Text::from("take");
+    r.disks[0] = disk(1, recorder::Volume::Fosfs, true, 1 << 30);
+    r.disks[1] = disk(2, recorder::Volume::Fosfs, false, 1 << 30);
+    r.disks[2] = disk(3, recorder::Volume::Exfat, false, 10 << 30);
+    r.disk_count = 3;
+    r.fix();
+    app.act(device, Action::Page(Page::Recorder));
+    app
+}
+
+#[test]
+fn recorder_prefers_exfat_then_a_spare_disk_then_boot() {
+    let mut device = Fake::new();
+    let mut app = recorder_app(&mut device);
+    let r = &mut app.recording;
+    r.choose_disk(None);
+    assert_eq!(r.target().unwrap().number, 3);
+    r.choose_disk(Some(1));
+    assert_eq!(r.target().unwrap().number, 1, "the saved disk wins");
+    r.disks[2].volume = recorder::Volume::None;
+    r.choose_disk(None);
+    assert_eq!(r.target().unwrap().number, 2, "not the boot disk when another FOSFS disk is there");
+    r.choose_disk(Some(3));
+    assert_eq!(r.refusal(), Some("that disk has no volume (format it first)"));
+    // FAT32 is listed but never chosen, not even when it was saved.
+    r.disks[2].volume = recorder::Volume::Fat32;
+    r.choose_disk(Some(3));
+    assert_eq!(r.target().unwrap().number, 2);
+    r.disk = 2;
+    assert_eq!(r.refusal(), Some("FAT32 is not used for recordings: exFAT"));
+}
+
+#[test]
+fn recorder_flac_groups_eight_inputs_a_file() {
+    let mut device = Fake::new();
+    let mut app = recorder_app(&mut device);
+    let r = &mut app.recording;
+    r.channels = 30;
+    r.armed = (1 << 30) - 1;
+    let (groups, count) = r.groups();
+    assert_eq!(count, 4, "30 inputs are four files");
+    assert_eq!(groups[..4], [0xff, 0xff00, 0xff_0000, 0x3f00_0000]);
+    assert_eq!(r.file_name("disk3/", 7, groups[1], count).as_str(), "disk3/take007-9-16.flac");
+    assert_eq!(r.file_name("disk3/", 7, groups[3], count).as_str(), "disk3/take007-25-30.flac");
+    // Gaps: the 8 armed inputs, not 8 numbers, make a group.
+    r.armed = 0b1010_1010_1010_1010_1010;
+    let (groups, count) = r.groups();
+    assert_eq!((count, groups[0], groups[1]), (2, 0b1010_1010_1010_1010, 0b1010_0000_0000_0000_0000));
+    assert_eq!(r.file_name("", 1, groups[1], count).as_str(), "take001-18-20.flac");
+    // Up to 8: one file without a suffix. WAV: always one file, the device's samples.
+    r.armed = 0b11;
+    let (groups, count) = r.groups();
+    assert_eq!((count, r.file_name("disk1/", 1, groups[0], count).as_str()), (1, "disk1/take001.flac"));
+    r.armed = (1 << 30) - 1;
+    app.act(&mut device, Action::Resolution);
+    app.act(&mut device, Action::Resolution);
+    app.act(&mut device, Action::Resolution);
+    let r = &app.recording;
+    assert_eq!(r.encoding, recorder::Encoding::Wav);
+    assert_eq!(r.groups().1, 1);
+    assert_eq!(r.file_name("", 2, r.groups().0[0], 1).as_str(), "take002.wav");
+    assert_eq!(app.soft_keys()[SOFT_NAV + 1].label, "WAV");
+    app.recording.take.running = true;
+    app.act(&mut device, Action::Resolution);
+    assert_eq!(app.message.as_str(), "stop the take to change the format");
+}
+
+#[test]
+fn recorder_arms_inputs_and_keeps_one() {
+    let mut device = Fake::new();
+    let mut app = recorder_app(&mut device);
+    assert_eq!(app.recording.armed & app.recording.all(), 0b11, "the default stays within four inputs");
+    app.act(&mut device, Action::Right);
+    app.act(&mut device, Action::Right);
+    app.act(&mut device, Action::Enter);
+    assert!(app.recording.is_armed(2));
+    app.act(&mut device, Action::Home);
+    app.act(&mut device, Action::Enter);
+    app.act(&mut device, Action::Right);
+    app.act(&mut device, Action::Enter);
+    assert_eq!(app.recording.armed, 0b100);
+    app.act(&mut device, Action::Right);
+    app.act(&mut device, Action::Enter);
+    assert_eq!(app.recording.armed, 0b100, "the last armed input stays");
+    assert_eq!(app.message.as_str(), "a take needs at least one input");
+    app.act(&mut device, Action::Channels);
+    assert_eq!(app.recording.armed_count(), 4);
+    // FLAC 24 is costed uncompressed: 3 bytes a sample.
+    assert_eq!(app.recording.bytes_per_second(), 48_000 * 3 * 4);
+}
+
+#[test]
+fn recorder_takes_lock_the_arming_and_the_disk() {
+    let mut device = Fake::new();
+    let mut app = recorder_app(&mut device);
+    app.recording.choose_disk(None);
+    app.act(&mut device, Action::Freeze);
+    assert_eq!(app.recording.request, Some(recorder::Request::Start));
+    // The tape takes the request and reports the take running.
+    app.recording.request = None;
+    app.recording.take.running = true;
+    assert_eq!(app.soft_keys()[SOFT_NAV].label, "Stop");
+    app.act(&mut device, Action::Enter);
+    assert_eq!(app.message.as_str(), "stop the take to change what it records");
+    app.act(&mut device, Action::NextDisk);
+    assert_eq!(app.message.as_str(), "stop the take to change the disk");
+    // Another page: R still stops it.
+    app.act(&mut device, Action::Page(Page::Analyzer));
+    app.act(&mut device, Action::Record);
+    assert_eq!(app.recording.request, Some(recorder::Request::Stop));
+}
+
+#[test]
+fn recorder_time_left_follows_the_largest_run() {
+    let mut device = Fake::new();
+    let mut app = recorder_app(&mut device);
+    app.recording.choose_disk(None);
+    // Two inputs of 24-bit FLAC at 48 kHz, at most 288000 bytes a second; 10 GiB of room.
+    assert_eq!(app.recording.seconds_left(), Some((10u64 << 30) / 288_000));
+    app.recording.disks[2].largest = u64::MAX;
+    assert_eq!(app.recording.seconds_left(), None, "FAT32 does not say");
+    assert_eq!(recorder::clock(48_000 * 3725, 48_000).as_str(), "1:02:05");
+    assert_eq!(recorder::clock(48_000 * 65, 48_000).as_str(), "01:05");
+    assert_eq!(recorder::duration(3 * 3600 + 20 * 60).as_str(), "3 h 20 min");
+    assert_eq!(recorder::size(3 << 29).as_str(), "1.5 GiB");
+    assert_eq!(recorder::size(640 << 10).as_str(), "640 KiB");
+}
+
+#[test]
+fn recorder_settings_round_trip() {
+    let mut device = Fake::new();
+    let mut app = recorder_app(&mut device);
+    let r = &mut app.recording;
+    let disk = r.load(|key| match key {
+        "rec-ch" => Some("1,3-4"),
+        "rec-scale" => Some("nordic"),
+        "rec-name" => Some("gig"),
+        "rec-disk" => Some("2"),
+        _ => None,
+    });
+    r.choose_disk(disk);
+    assert_eq!((r.armed, r.nordic, r.base.as_str(), r.target().unwrap().number), (0b1101, true, "gig", 2));
+    let mut saved = Text::<96>::new();
+    r.save(|key, value| {
+        let _ = write!(saved, "{key}={value} ");
+    });
+    assert_eq!(saved.as_str(), "rec-ch=1,3-4 rec-disk=2 rec-scale=nordic rec-name=gig rec-format=flac rec-bits=24 ");
+    r.load(|key| match key {
+        "rec-format" => Some("flac"),
+        "rec-bits" => Some("16"),
+        _ => None,
+    });
+    assert_eq!(r.encoding, recorder::Encoding::Flac(16));
+    r.load(|key| (key == "rec-format").then_some("wav"));
+    assert_eq!(r.encoding, recorder::Encoding::Wav);
+    r.load(|key| (key == "rec-bits").then_some("12"));
+    assert_eq!(r.encoding, recorder::Encoding::Wav, "a bad depth changes nothing");
+    // Bad values leave things as they were.
+    r.load(|key| match key {
+        "rec-ch" => Some("5"),
+        "rec-name" => Some("Too-Long-Name"),
+        _ => None,
+    });
+    assert_eq!((r.armed, r.base.as_str()), (0b1101, "gig"));
+    assert!(recorder::valid_base("take_1") && !recorder::valid_base("Take") && !recorder::valid_base(""));
+}
+
+#[test]
+fn recorder_taps_arm_and_swipes_scroll_the_meters() {
+    let mut device = Fake::new();
+    let mut app = recorder_app(&mut device);
+    let layout = Layout::new(1280, 720);
+    let arm = layout.rec_arm(3, &app).expect("four inputs fit");
+    app.press(&mut device, &layout, arm.x + 2, arm.y + 2);
+    assert!(app.recording.is_armed(3));
+    assert_eq!(app.recording.input, 3);
+    let bar = layout.rec_bar(1, &app).unwrap();
+    assert_eq!(layout.hit(&app, bar.x + 2, bar.y + 2), Hit::RecMeter(1));
+    // Thirty inputs do not fit: a swipe to the left shows later ones.
+    app.recording.channels = 30;
+    app.scroll(&layout);
+    let visible = layout.visible_rec(&app);
+    assert!(visible < 30);
+    let area = layout.rec_area();
+    let grab = app.press(&mut device, &layout, area.x + area.w - 4, area.y + 4).unwrap();
+    let grab = app.drag(&mut device, &layout, grab, area.x + area.w - 4 - layout.rec_column_w(&app) * 5, area.y + 4);
+    app.release(&mut device, &layout, grab);
+    assert_eq!(app.first_rec, 5);
+    assert!(app.recording.input >= 5);
 }

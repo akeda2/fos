@@ -40,6 +40,9 @@ pub enum Hit {
     /// Meters: an input's bar or name (the input, 0-based), a control cell under it (control index, input).
     Meter(usize),
     InputControl(usize, usize),
+    /// Recorder: an input's meter or name (selects it), its arm button (arms or disarms it).
+    RecMeter(usize),
+    Arm(usize),
     /// Analyzer: a pair button. Meters: an item of the inputs picker (`App::pick_items`).
     AnPair(usize),
     Pick(usize),
@@ -282,6 +285,71 @@ impl Layout {
         Some(Rect::new(x, name.y + self.row + 2 + row as i32 * self.meter_cell_h(), w, self.meter_cell_h() - 4))
     }
 
+    /// Recorder: the take's status at the left of the page (the clock, the file, the disk, the warnings).
+    pub fn rec_panel(&self) -> Rect {
+        let w = (self.body.w * 2 / 5).max(self.col * 44).min(self.body.w / 2);
+        Rect::new(self.body.x, self.body.y, w, self.body.h)
+    }
+
+    /// Recorder: the meters' area at the right, inside the room for the scale's labels (8x16 font, unscaled, as on the
+    /// Meters page: the scale left and right of the bars, the dBFS column beside the Nordic scale) and its name above.
+    pub fn rec_area(&self) -> Rect {
+        let panel = self.rec_panel();
+        let (left, right, top) = (48, 110, 36);
+        let x = panel.x + panel.w + left;
+        Rect::new(x, self.body.y + top, (self.body.x + self.body.w - right - x).max(self.col * 4), self.body.h - top - 8)
+    }
+
+    /// One input's column: as wide as the inputs allow, at least a short name, at most a broad bar.
+    pub fn rec_column_w(&self, app: &App) -> i32 {
+        (self.rec_area().w / app.recording.channels.max(1) as i32).clamp(self.col * 4, self.col * 12)
+    }
+
+    pub fn visible_rec(&self, app: &App) -> usize {
+        (self.rec_area().w / self.rec_column_w(app)).max(1) as usize
+    }
+
+    /// The bars' width: the visible columns.
+    pub fn rec_span(&self, app: &App) -> i32 {
+        self.visible_rec(app).min(app.recording.channels.max(1)) as i32 * self.rec_column_w(app) - 6
+    }
+
+    /// The whole column of `input`: its bar, its name, its arm button.
+    pub fn rec_column(&self, input: usize, app: &App) -> Option<Rect> {
+        let slot = input.checked_sub(app.first_rec).filter(|&s| s < self.visible_rec(app) && input < app.recording.channels.max(1))?;
+        let (area, w) = (self.rec_area(), self.rec_column_w(app));
+        Some(Rect::new(area.x + slot as i32 * w, area.y, w - 6, area.h))
+    }
+
+    pub fn rec_bar(&self, input: usize, app: &App) -> Option<Rect> {
+        let c = self.rec_column(input, app)?;
+        let under = self.row + 6 + self.meter_cell_h();
+        Some(Rect::new(c.x, c.y, c.w, (c.h - under).max(8)))
+    }
+
+    pub fn rec_name(&self, input: usize, app: &App) -> Option<Rect> {
+        let b = self.rec_bar(input, app)?;
+        Some(Rect::new(b.x, b.y + b.h + 2, b.w, self.row))
+    }
+
+    /// The arm button under an input's name: a finger's size, as the Meters page's control cells.
+    pub fn rec_arm(&self, input: usize, app: &App) -> Option<Rect> {
+        let n = self.rec_name(input, app)?;
+        Some(Rect::new(n.x, n.y + self.row + 4, n.w, self.meter_cell_h() - 4))
+    }
+
+    fn rec_hit(&self, app: &App, x: i32, y: i32) -> Hit {
+        for input in 0..app.recording.channels.max(1) {
+            if self.rec_arm(input, app).is_some_and(|r| r.contains(x, y)) {
+                return Hit::Arm(input);
+            }
+            if self.rec_column(input, app).is_some_and(|r| r.contains(x, y)) {
+                return Hit::RecMeter(input);
+            }
+        }
+        Hit::Nothing
+    }
+
     /// How far a press may wander and still count as a tap (a finger is not still): half a text row.
     pub fn slop(&self) -> i32 {
         (self.row / 2).max(4)
@@ -427,6 +495,9 @@ impl Layout {
         }
         if app.page == Page::Meters {
             return self.meter_hit(app, x, y);
+        }
+        if app.page == Page::Recorder {
+            return self.rec_hit(app, x, y);
         }
         if app.page == Page::Analyzer {
             return (0..app.analysis.pairs()).find(|&p| self.an_pair(p, app).is_some_and(|r| r.contains(x, y))).map_or(Hit::Nothing, Hit::AnPair);
