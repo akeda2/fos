@@ -1830,9 +1830,19 @@ mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path 
   stream handle (`fs_stream_open2`): 32 inputs are 4 files, `FS_STREAMS`. Each reserves its channels' share of the longest
   free run (FLAC never needs more than the samples uncompressed). Tags: `ENCODER`, `INPUTS` (`9-16`). WAV keeps the
   device's samples untouched (float stays float) through `audio_rec::Recorder` and `fs_stream_*`, as the `recorder` tape
-  does: 256 KiB block writes. Either way headers and lengths are checkpointed every 2 s. Encoding runs inline on the
-  drawing thread: about 5.8 M samples a second on one core of an i5-6500 (`cargo test --release -p archive -- --ignored
-  encode_speed`), a quarter of a core for a UFX's 30 inputs at 48 kHz, more than half at 192 kHz (18 inputs). FAT32 is
+  does: 256 KiB block writes. Either way headers and lengths are checkpointed every 2 s. The encoder runs about 5.8 M
+  samples a second on one core of an i5-6500 (`cargo test --release -p archive -- --ignored encode_speed`): a quarter of a
+  core for a UFX's 30 inputs at 48 kHz, more than half at 192 kHz (18 inputs). So encoding and the disk writes run on a
+  **worker thread** where the kernel has tape threads (the server kernel; the panel's Writer row says which): the drawing
+  thread copies each captured block into a 16 MiB ring (`kakelfix::channel::Ring`, one pusher, one taker, no locks) and
+  posts Start/Stop/Quit in a mailbox (`channel::Mailbox`, a sequence lock); the worker (`record::Worker`) takes the ring a
+  capture block at a time, works from a snapshot of the settings taken at Record (`Job`), and posts its `Report` (the
+  take, its messages, the last command it acted on) back. A full ring is never overwritten: the drawing thread then reads
+  no more audio that pass and it waits in the kernel's capture ring; the ring's fill counts in the backlog warning. Stop
+  and Quit are acted on after everything pushed before them, so Escape mid-take closes complete files before the thread
+  is joined. The embedded kernels have no tape threads and pump the same worker inline. The capture read loop reads at most
+  16 blocks a pass (680 ms at 48 kHz): a loopback, which its player refills whenever the tape yields, held the drawing
+  thread for the whole tone before. FAT32 is
   not used for recordings (listed, never chosen, refused): its 4 GiB limit is not carried, so a file that fills means a
   full disk and ends the take. Targets are volumes, named as their files are: `disk3` (FOSFS, exFAT: `fs_stream_*`, a
   reserved run per file) or `ext1` (ext4, `vfs_volume` lists it, `audio_rec::vfs::VfsSink` writes it by path with
@@ -1850,8 +1860,7 @@ mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path 
   audio: the take, the Meters and Recorder meters, the Analyzer; capture runs while one of those pages is shown *or a take
   runs*, so a take goes on under the Mixer or Analyzer page, with "REC mm:ss" in red in every page's header. Quitting
   (Esc, Quit) finishes the files cleanly. The capture ring is asked for at up to 256 MiB (`audio_set_capture_ring`, leaving
-  256 MiB free), which absorbs disk writes, encoding and frames drawn meanwhile. Next: encoding on its own thread on the server kernel
-  (needed at 192 kHz), a count of float samples off the 24-bit grid, pre-roll and the sound/silence trigger
+  256 MiB free), which absorbs disk writes, encoding and frames drawn meanwhile. Next: a count of float samples off the 24-bit grid, pre-roll and the sound/silence trigger
   (`audio_rec::preroll`, `silence`), typing the stem on the page. WavPack (lossless float, more than 8 channels a file) is
   not in the tree; its BSD licence allows vendoring it as libopus is, if a 32-bit float interface needs it.
 - **Test**: `make test-kakelfix` on the loopback: `show` reads the identity mix; in the tape `x` switches the first strip off and a
@@ -1861,7 +1870,9 @@ mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path 
   prefers to the FOSFS boot disk) is then one extent on a volume `e2fsck -fn` passes, and has a STREAMINFO of 2
   channels, 48 kHz, 24 bits and seconds of samples, passes the reference `flac -t` (frame CRCs, MD5) and decodes to the tone
   (its length is not the take's wall time: with a listener loop0 has no clock and `play` runs as fast as the capture
-  drains); a second run with `rec-format=wav rec-ch=2 rec-disk=disk1` makes `disk1/take001.wav` on FOSFS, input 2 alone as 32-bit float; `3`, Up then a click on the Quit soft key at once must leave `an-span=30` and an `mt-scale` in `kakelfix.cfg`; `show` reads the result. Then on the server
+  drains); a second run with `rec-format=wav rec-ch=2 rec-disk=disk1` makes `disk1/take001.wav` on FOSFS, input 2 alone as 32-bit float; on the server kernel a take on the worker thread
+  ended by Escape mid-take is saved ("written on its own thread") as a FLAC `flac -t` passes (with no samples: that kernel
+  lets one process own audio, so no `play` can feed loop0 there); `3`, Up then a click on the Quit soft key at once must leave `an-span=30` and an `mt-scale` in `kakelfix.cfg`; `show` reads the result. Then on the server
   kernel at -smp 4 the same `x` goes through the writer thread and a lone Escape typed at once ends the tape through the writer's join, so the
   queued write is not lost. The mouse is walked exactly: the kernel's pointer
   gain moves a packet of d counts 4d + d|d|/2 pixels.

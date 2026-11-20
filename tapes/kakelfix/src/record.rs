@@ -40,8 +40,10 @@ use flac_enc::depth::Quantizer;
 use gfx::Canvas;
 use gfx::meter::{Scale, draw_bar, draw_scale};
 use gfx::theme::theme;
-use kakelfix::recorder::{Disk, Encoding, GROUP, MAX_DISKS, MAX_GROUPS, Request, Volume, clock, describe_channels, duration, size};
-use kakelfix::{App, Layout, Rect, Text, fit_name};
+use core::sync::atomic::{AtomicU32, Ordering};
+use kakelfix::channel::{Mailbox, Ring};
+use kakelfix::recorder::{Disk, Encoding, GROUP, MAX_DISKS, MAX_GROUPS, Request, Take, Volume, clock, describe_channels, duration, size};
+use kakelfix::{App, Layout, Rect, Recording, Text, fit_name};
 use tape_rt::{AudioBuffer, AudioStats, DISK_EXFAT, DISK_FAT32, DISK_FOSFS, DiskInfo, FS_NOT_FOUND, TapeApi, VFS_FILE, VfsVolume, alloc_bytes, alloc_zeroed};
 
 /// WAV disk writes: 256 KiB blocks (a multiple of the 512-byte sector; the `recorder` tape's size, which real USB sticks
@@ -126,6 +128,264 @@ struct Group {
     quantizers: [Quantizer; GROUP],
 }
 
+/// What a take is to be: the Recorder's settings when Record was pressed, and the capture rate. The worker works from this
+/// copy, never from the page, which the drawing thread keeps changing.
+#[derive(Clone, Copy)]
+pub struct Job {
+    pub recording: Recording,
+    pub rate: u32,
+}
+
+/// What the drawing thread asks of the worker.
+#[derive(Clone, Copy)]
+pub enum Command {
+    None,
+    /// Start a take; the audio pushed into `RING` from now on belongs to it.
+    Start(Job),
+    /// End the take after everything pushed before this.
+    Stop,
+    /// End the take (as `Stop`) and the worker thread.
+    Quit,
+}
+
+/// What the worker tells the drawing thread: the take as the page shows it, its latest message (a new `said` means a new
+/// one), and the last command it has acted on (`COMMANDS` serial).
+#[derive(Clone, Copy, Default)]
+pub struct Report {
+    pub take: Take,
+    pub message: Text<72>,
+    pub said: u32,
+    pub acted: u32,
+}
+
+impl Report {
+    fn say(&mut self, args: core::fmt::Arguments) {
+        self.message.clear();
+        let _ = self.message.write_fmt(args);
+        self.said = self.said.wrapping_add(1);
+    }
+}
+
+/// The captured audio of a take, from the drawing thread to the worker (`Ring`); commands one way, reports the other; a
+/// counter the worker sleeps on (`futex_wait`) and the drawing thread bumps when it pushes or posts.
+static RING: Ring = Ring::new();
+static COMMANDS: Mailbox<Command> = Mailbox::new(Command::None);
+static REPORTS: Mailbox<Report> = Mailbox::new(Report { take: Take { running: false, frames: 0, bytes: 0, files: 0, file: Text::new(), overruns: 0, backlog_percent: 0, worst_ms: 0, kib_per_second: 0 }, message: Text::new(), said: 0, acted: 0 });
+static WORK: AtomicU32 = AtomicU32::new(0);
+/// The worker: created on the drawing thread at startup, then used only by the worker thread (or, where the kernel has
+/// no threads, by the drawing thread itself through `Feed::pump_inline`).
+static mut WORKER: Option<Worker> = None;
+/// The ring holds this much captured audio (or less memory if that is all there is): two seconds or more of any
+/// interface here. Behind it the kernel's capture ring (up to 256 MiB) holds whatever the ring cannot.
+const RING_BYTES: usize = 16 << 20;
+/// The worker thread's stack: `FlacFile::begin` builds a ~100 KiB encoder on it.
+const WORKER_STACK: usize = 512 << 10;
+/// How long quitting waits for the worker to close a take's files.
+const QUIT_WAIT_US: u64 = 20_000_000;
+
+pub struct Worker {
+    writer: Writer,
+    report: Report,
+    seen: u32,
+    quit: bool,
+}
+
+impl Worker {
+    /// Acts on a new command, writes what waits in the ring (a capture block at a time), checkpoints, reports. True if
+    /// there was anything to do.
+    fn pump(&mut self, api: &TapeApi) -> bool {
+        let mut busy = false;
+        let (command, serial) = COMMANDS.read();
+        if serial != self.seen {
+            self.seen = serial;
+            busy = true;
+            match command {
+                Command::Start(job) if !self.writer.running => {
+                    self.writer.start(api, &job, &mut self.report);
+                    if !self.writer.running {
+                        RING.clear(); // pushed for a take that did not start
+                    }
+                }
+                Command::Stop | Command::Quit => {
+                    busy |= self.drain(api);
+                    self.writer.stop(api, &mut self.report);
+                    RING.clear();
+                    self.quit = matches!(command, Command::Quit);
+                }
+                _ => {}
+            }
+            self.report.acted = serial;
+        }
+        busy |= self.drain(api);
+        if self.writer.running {
+            self.writer.checkpoint_if_due(api, &mut self.report);
+        }
+        self.writer.status(api, &mut self.report);
+        REPORTS.post(self.report);
+        busy
+    }
+
+    /// Writes what waits in the ring, at most a capture block at a time (the sample buffers hold `CHUNK` frames).
+    fn drain(&mut self, api: &TapeApi) -> bool {
+        let most = CHUNK * self.writer.input.frame_bytes().max(1);
+        let mut any = false;
+        loop {
+            let piece = RING.peek();
+            if piece.is_empty() {
+                return any;
+            }
+            let length = piece.len().min(most);
+            if self.writer.running {
+                self.writer.push(api, &piece[..length], &mut self.report);
+            }
+            RING.take(length);
+            any = true;
+        }
+    }
+}
+
+/// The worker thread: pumps while there is work, sleeps on `WORK` otherwise, ends after `Command::Quit`.
+extern "C" fn worker_thread(argument: usize) {
+    // SAFETY: the table outlives the tape; the worker static is this thread's alone once it runs (`Feed::new`).
+    let api = unsafe { &*(argument as *const TapeApi) };
+    let Some(worker) = (unsafe { (*(&raw mut WORKER)).as_mut() }) else { return };
+    loop {
+        let seen = WORK.load(Ordering::Acquire);
+        let busy = worker.pump(api);
+        if worker.quit {
+            return;
+        }
+        if !busy {
+            tape_rt::futex_wait(&WORK, seen);
+        }
+    }
+}
+
+/// The drawing thread's side: posts the page's requests, pushes the captured audio while a take wants it, and copies the
+/// worker's reports onto the page.
+pub struct Feed {
+    thread: Option<tape_rt::Thread>,
+    /// The audio goes into the ring: from posting Start until the worker says the take did not start, or Stop is posted.
+    feeding: bool,
+    started: u32,
+    said: u32,
+    running: bool,
+}
+
+impl Feed {
+    /// Builds the worker for capture of `input` (`block`: the most bytes one `audio_read` gives) and, where the kernel runs
+    /// tape threads, starts its thread. None when out of memory.
+    pub fn new(api: &'static TapeApi, input: &Input, block: usize) -> Option<Feed> {
+        let writer = Writer::new(api, input, block)?;
+        let ring = alloc_bytes(api, RING_BYTES).or_else(|| alloc_bytes(api, RING_BYTES / 4))?;
+        RING.attach(ring, input.frame_bytes());
+        // SAFETY: no thread runs yet; from here on only the worker (thread or inline pump) touches the static.
+        unsafe { *(&raw mut WORKER) = Some(Worker { writer, report: Report::default(), seen: 0, quit: false }) };
+        let thread = if tape_rt::threads_supported() { tape_rt::spawn_thread(worker_thread, api as *const TapeApi as usize, WORKER_STACK).ok() } else { None };
+        Some(Feed { thread, feeding: false, started: 0, said: 0, running: false })
+    }
+
+    /// Whether encoding runs on a thread of its own (the server kernel) or inline (the embedded kernels).
+    pub fn threaded(&self) -> bool {
+        self.thread.is_some()
+    }
+
+    /// A take is wanted or still being written: capture must go on.
+    pub fn taking(&self) -> bool {
+        self.feeding || self.running
+    }
+
+    fn post(&self, command: Command) -> u32 {
+        COMMANDS.post(command);
+        WORK.fetch_add(1, Ordering::Release);
+        tape_rt::futex_wake(&WORK, 1);
+        COMMANDS.serial()
+    }
+
+    /// Posts what the page asked for (`Recording::request`).
+    pub fn request(&mut self, api: &TapeApi, app: &mut App, rate: u32) {
+        match app.recording.request.take() {
+            Some(Request::Start) if !self.taking() => {
+                self.started = self.post(Command::Start(Job { recording: app.recording, rate }));
+                self.feeding = true;
+            }
+            Some(Request::Stop) => {
+                self.post(Command::Stop);
+                self.feeding = false;
+            }
+            _ => {}
+        }
+        self.pump_inline(api);
+    }
+
+    /// Room for a block of `bytes` (when a take is fed): if not, the drawing thread leaves the audio in the kernel's ring.
+    pub fn has_room(&self, bytes: usize) -> bool {
+        !self.feeding || RING.has_room(bytes)
+    }
+
+    /// One captured block, while a take wants it.
+    pub fn push(&mut self, api: &TapeApi, data: &[u8]) {
+        if !self.feeding {
+            return;
+        }
+        if RING.push(data) {
+            WORK.fetch_add(1, Ordering::Release);
+            tape_rt::futex_wake(&WORK, 1);
+        }
+        self.pump_inline(api);
+    }
+
+    /// Without a thread the drawing thread is the worker: it writes what it pushed at once.
+    fn pump_inline(&mut self, api: &TapeApi) {
+        if self.thread.is_none() {
+            if let Some(worker) = unsafe { (*(&raw mut WORKER)).as_mut() } {
+                worker.pump(api);
+            }
+        }
+    }
+
+    /// Copies the worker's latest report onto the page; when a take has ended, asks the disk what is free.
+    pub fn sync(&mut self, api: &TapeApi, app: &mut App) {
+        self.pump_inline(api);
+        let (report, _) = REPORTS.read();
+        if self.feeding && report.acted >= self.started && !report.take.running {
+            self.feeding = false; // the take did not start; the message says why
+        }
+        let was = self.running;
+        self.running = report.take.running;
+        let r = &mut app.recording;
+        r.take = report.take;
+        r.take.running = self.feeding || self.running;
+        // The ring's fill counts as backlog too: on the server kernel it is the first to grow behind a slow disk.
+        let ring = (RING.waiting() * 100 / RING.capacity().max(1)) as u32;
+        r.take.backlog_percent = r.take.backlog_percent.max(ring);
+        if was && !self.running {
+            refresh(api, r.disks[..r.disk_count].get_mut(r.disk));
+        }
+        if report.said != self.said {
+            self.said = report.said;
+            app.message = report.message;
+        }
+    }
+
+    /// At the end of the tape: ends a take (its files closed and complete) and the worker thread.
+    pub fn quit(&mut self, api: &TapeApi, app: &mut App) {
+        let serial = self.post(Command::Quit);
+        self.feeding = false;
+        match self.thread.take() {
+            Some(thread) => {
+                let began = tape_rt::micros();
+                while REPORTS.read().0.acted < serial && tape_rt::micros().wrapping_sub(began) < QUIT_WAIT_US {
+                    tape_rt::idle();
+                }
+                thread.join();
+            }
+            None => self.pump_inline(api),
+        }
+        self.sync(api, app);
+    }
+}
+
 pub struct Writer {
     /// The WAV block buffer, as an address: the file's `Recorder` borrows it for as long as it is open.
     staging: usize,
@@ -194,24 +454,15 @@ impl Writer {
         })
     }
 
-    pub fn running(&self) -> bool {
-        self.running
-    }
-
-    /// Acts on what the page asked for (`Recording::request`) and checkpoints a running take. `rate` is the capture's.
-    pub fn serve(&mut self, api: &TapeApi, app: &mut App, rate: u32) {
-        match app.recording.request.take() {
-            Some(Request::Start) if !self.running => self.start(api, app, rate),
-            Some(Request::Stop) => self.stop(api, app),
-            _ => {}
-        }
+    fn checkpoint_if_due(&mut self, api: &TapeApi, report: &mut Report) {
         let now = tape_rt::micros();
-        if self.running && now >= self.next_checkpoint {
-            self.next_checkpoint = now + CHECKPOINT_US;
-            if let Err(code) = self.checkpoint() {
-                say(&mut app.message, format_args!("writing {} failed (code {code}): take stopped", app.recording.take.file.as_str()));
-                self.stop(api, app);
-            }
+        if now < self.next_checkpoint {
+            return;
+        }
+        self.next_checkpoint = now + CHECKPOINT_US;
+        if let Err(code) = self.checkpoint() {
+            report.say(format_args!("writing {} failed (code {code}): take stopped", { report.take.file }.as_str()));
+            self.stop(api, report);
         }
     }
 
@@ -225,14 +476,14 @@ impl Writer {
         Ok(())
     }
 
-    fn start(&mut self, api: &TapeApi, app: &mut App, rate: u32) {
-        let r = &app.recording;
+    fn start(&mut self, api: &TapeApi, job: &Job, report: &mut Report) {
+        let r = &job.recording;
         if let Some(reason) = r.refusal() {
-            return say(&mut app.message, format_args!("{reason}"));
+            return report.say(format_args!("{reason}"));
         }
         self.mask = r.armed & r.all();
         let i = &self.input;
-        self.format = Format { channels: self.mask.count_ones() as u16, rate, slot: i.slot as u16, bits: i.bits as u16, float: i.float };
+        self.format = Format { channels: self.mask.count_ones() as u16, rate: job.rate, slot: i.slot as u16, bits: i.bits as u16, float: i.float };
         self.peak_backlog = 0;
         let mut stats = AudioStats::default();
         (api.audio_stats)(&mut stats);
@@ -240,23 +491,23 @@ impl Writer {
         let mut buffer = AudioBuffer::default();
         (api.audio_buffer)(&mut buffer);
         self.ring_bytes = buffer.ring_bytes;
-        app.recording.take = kakelfix::recorder::Take::default();
-        let opened = match app.recording.encoding {
-            Encoding::Wav => self.open_wav(api, app),
-            Encoding::Flac(bits) => self.open_flac(api, app, bits, rate),
+        report.take = Take::default();
+        let opened = match r.encoding {
+            Encoding::Wav => self.open_wav(api, job, report),
+            Encoding::Flac(bits) => self.open_flac(api, job, report, bits),
         };
         if !opened {
             return;
         }
         self.running = true;
-        app.recording.take.running = true;
+        report.take.running = true;
         self.next_checkpoint = tape_rt::micros() + CHECKPOINT_US;
-        say(&mut app.message, format_args!("recording {}", app.recording.take.file.as_str()));
+        report.say(format_args!("recording {}", { report.take.file }.as_str()));
     }
 
     /// The next take number whose files (one per group) are all free on the target volume; its prefix (`disk3/`, `ext1/`).
-    fn number(&mut self, api: &TapeApi, app: &mut App) -> Option<(u32, Text<16>)> {
-        let r = &app.recording;
+    fn number(&mut self, api: &TapeApi, job: &Job, report: &mut Report) -> Option<(u32, Text<16>)> {
+        let r = &job.recording;
         let disk = r.target()?;
         let prefix = disk.prefix();
         let ext = disk.volume == Volume::Ext;
@@ -283,16 +534,16 @@ impl Writer {
                 })
         };
         let Some(number) = (self.next_number..self.next_number + 1000).find(|&n| free(n)) else {
-            say(&mut app.message, format_args!("no free file name for {}nnn", r.base.as_str()));
+            report.say(format_args!("no free file name for {}nnn", r.base.as_str()));
             return None;
         };
         self.next_number = number + 1;
         Some((number, prefix))
     }
 
-    fn open_wav(&mut self, api: &TapeApi, app: &mut App) -> bool {
-        let Some((number, prefix)) = self.number(api, app) else { return false };
-        let r = &app.recording;
+    fn open_wav(&mut self, api: &TapeApi, job: &Job, report: &mut Report) -> bool {
+        let Some((number, prefix)) = self.number(api, job, report) else { return false };
+        let r = &job.recording;
         let name = r.file_name(prefix.as_str(), number, self.mask, 1);
         let ext = r.target().is_some_and(|d| d.volume == Volume::Ext);
         // No `Recorder` holds the static now: the last take's was finished (consumed) before this one.
@@ -302,12 +553,12 @@ impl Writer {
         match Recorder::begin(sink, staging, self.format, name.as_str().as_bytes(), 0) {
             Ok(recorder) => {
                 self.wav = Some(recorder);
-                app.recording.take.file = Text::from(name.as_str());
-                app.recording.take.files = 1;
+                report.take.file = Text::from(name.as_str());
+                report.take.files = 1;
                 true
             }
             Err(error) => {
-                say(&mut app.message, format_args!("cannot create {} (code {})", name.as_str(), error.0));
+                report.say(format_args!("cannot create {} (code {})", name.as_str(), error.0));
                 false
             }
         }
@@ -316,9 +567,9 @@ impl Writer {
     /// Opens one FLAC file per group. Each reserves its share of the disk's longest free run (by its channel count; FLAC
     /// never needs more than the samples uncompressed), since a stream given 0 would take the whole run and leave the
     /// next none.
-    fn open_flac(&mut self, api: &TapeApi, app: &mut App, bits: u32, rate: u32) -> bool {
-        let Some((number, prefix)) = self.number(api, app) else { return false };
-        let r = &app.recording;
+    fn open_flac(&mut self, api: &TapeApi, job: &Job, report: &mut Report, bits: u32) -> bool {
+        let Some((number, prefix)) = self.number(api, job, report) else { return false };
+        let r = &job.recording;
         let (groups, count) = r.groups();
         let largest = r.target().map_or(u64::MAX, |d| d.largest);
         let ext = r.target().is_some_and(|d| d.volume == Volume::Ext);
@@ -336,9 +587,9 @@ impl Writer {
             group.sink = if ext { Out::vfs() } else { Out::Stream(StreamSink::with_handle(api.fs_stream_open2, api.fs_stream_write2, api.fs_stream_close2, tape_rt::micros, archive::file::STAGE / 2)) };
             group.mask = mask;
             group.quantizers = core::array::from_fn(|c| Quantizer::new(bits, 0x9E37_79B9u32.wrapping_mul((g * GROUP + c) as u32 + 1)));
-            let info = Info { sample_rate: rate, channels, bits };
+            let info = Info { sample_rate: job.rate, channels, bits };
             if let Err(error) = group.file.begin(&mut group.sink, name.as_str().as_bytes(), reserve, info, &tags) {
-                say(&mut app.message, format_args!("cannot create {} ({})", name.as_str(), Problem(error)));
+                report.say(format_args!("cannot create {} ({})", name.as_str(), Problem(error)));
                 for opened in self.groups[..g].iter_mut() {
                     opened.file.abandon(&mut opened.sink);
                 }
@@ -349,20 +600,20 @@ impl Writer {
             }
         }
         self.open_groups = count;
-        app.recording.take.file = Text::from(first.as_str());
-        app.recording.take.files = count as u32;
+        report.take.file = Text::from(first.as_str());
+        report.take.files = count as u32;
         true
     }
 
-    /// Appends the armed channels of `data` (whole device frames).
-    pub fn push(&mut self, api: &TapeApi, app: &mut App, data: &[u8]) {
+    /// Appends the armed channels of `data` (whole device frames, at most `CHUNK` of them).
+    fn push(&mut self, api: &TapeApi, data: &[u8], report: &mut Report) {
         if !self.running {
             return;
         }
         let failed = if self.open_groups > 0 { self.push_flac(data) } else { self.push_wav(data) };
         if let Err(problem) = failed {
-            say(&mut app.message, format_args!("writing {} failed ({problem}): take stopped", app.recording.take.file.as_str()));
-            self.stop(api, app);
+            report.say(format_args!("writing {} failed ({problem}): take stopped", { report.take.file }.as_str()));
+            self.stop(api, report);
         }
     }
 
@@ -385,7 +636,9 @@ impl Writer {
 
     fn push_flac(&mut self, data: &[u8]) -> Result<(), Problem> {
         let i = &self.input;
-        let frames = (data.len() / i.frame_bytes().max(1)).min(CHUNK);
+        let frames = data.len() / i.frame_bytes().max(1);
+        debug_assert!(frames <= CHUNK, "the worker hands over at most a capture block");
+        let frames = frames.min(CHUNK);
         let shift = 24 - self.bits;
         for group in self.groups[..self.open_groups].iter_mut() {
             let mut used = 0;
@@ -404,17 +657,17 @@ impl Writer {
         Ok(())
     }
 
-    /// Ends the take: the last blocks, the final headers and lengths; then asks the disk what it has free.
-    pub fn stop(&mut self, api: &TapeApi, app: &mut App) {
+    /// Ends the take: the last blocks, the final headers and lengths.
+    fn stop(&mut self, api: &TapeApi, report: &mut Report) {
         if !self.running {
             return;
         }
-        self.status(api, app);
+        self.status(api, report);
         let (mut bytes, mut frames) = (0, 0);
         if let Some(wav) = self.wav.take() {
             match wav.finish() {
                 Ok(summary) => (bytes, frames) = (summary.bytes, summary.frames),
-                Err(error) => say(&mut app.message, format_args!("closing {} failed (code {})", app.recording.take.file.as_str(), error.0)),
+                Err(error) => report.say(format_args!("closing {} failed (code {})", { report.take.file }.as_str(), error.0)),
             }
         }
         for group in self.groups[..self.open_groups].iter_mut() {
@@ -425,30 +678,29 @@ impl Writer {
                 }
                 Err(error) => {
                     group.file.abandon(&mut group.sink);
-                    say(&mut app.message, format_args!("closing a file of {} failed ({})", app.recording.take.file.as_str(), Problem(error)));
+                    report.say(format_args!("closing a file of {} failed ({})", { report.take.file }.as_str(), Problem(error)));
                 }
             }
         }
         self.open_groups = 0;
         self.running = false;
-        let r = &mut app.recording;
-        r.take.running = false;
-        r.take.frames = frames;
-        r.take.bytes = bytes;
+        let t = &mut report.take;
+        t.running = false;
+        t.frames = frames;
+        t.bytes = bytes;
         let seconds = clock(frames, self.format.rate);
-        let (files, file) = (r.take.files, r.take.file);
-        refresh(api, r.disks[..r.disk_count].get_mut(r.disk));
-        if app.message.as_str().starts_with("recording") || app.message.is_empty() {
+        let (files, file) = (t.files, t.file);
+        if report.message.as_str().starts_with("recording") || report.message.is_empty() {
             if files > 1 {
-                say(&mut app.message, format_args!("saved {files} files, {}: {}", seconds.as_str(), file.as_str()));
+                report.say(format_args!("saved {files} files, {}: {}", seconds.as_str(), file.as_str()));
             } else {
-                say(&mut app.message, format_args!("saved {}, {}", file.as_str(), seconds.as_str()));
+                report.say(format_args!("saved {}, {}", file.as_str(), seconds.as_str()));
             }
         }
     }
 
-    /// Brings the page's figures up to date: length, bytes, the disk's speed, lost audio, the backlog.
-    pub fn status(&mut self, api: &TapeApi, app: &mut App) {
+    /// Brings the take's figures up to date: length, bytes, the disk's speed, lost audio, the kernel's backlog.
+    fn status(&mut self, api: &TapeApi, report: &mut Report) {
         if !self.running {
             return;
         }
@@ -457,7 +709,7 @@ impl Writer {
         let mut buffer = AudioBuffer::default();
         (api.audio_buffer)(&mut buffer);
         self.peak_backlog = self.peak_backlog.max(buffer.available_bytes);
-        let t = &mut app.recording.take;
+        let t = &mut report.take;
         // The disk's speed over every file of the take: bytes and time of the big writes, summed.
         let (mut written, mut spent, mut worst) = (0u64, 0u64, 0u64);
         let mut tally = |sink: &Out| {
@@ -506,11 +758,6 @@ fn code(error: archive::Error) -> i32 {
         archive::Error::Sink(code) => code,
         _ => -1,
     }
-}
-
-fn say(message: &mut Text<72>, args: core::fmt::Arguments) {
-    message.clear();
-    let _ = message.write_fmt(args);
 }
 
 fn volume(kind: u32) -> Volume {
@@ -587,18 +834,18 @@ fn scale(nordic: bool) -> &'static Scale {
     if nordic { &Scale::NORDIC } else { &Scale::DBFS }
 }
 
-pub fn draw(canvas: &mut Canvas, layout: &Layout, app: &App, bank: Option<&Bank>, problem: Option<&str>) {
+pub fn draw(canvas: &mut Canvas, layout: &Layout, app: &App, bank: Option<&Bank>, problem: Option<&str>, threaded: bool) {
     if let Some(reason) = problem {
         return centered(canvas, layout, layout.body, reason, theme().dim);
     }
-    panel(canvas, layout, app);
+    panel(canvas, layout, app, threaded);
     if let Some(bank) = bank {
         meters(canvas, layout, app, bank);
     }
 }
 
 /// The take at the left: a large REC lamp and clock, then the file, the disk, the room left, the format, the warnings.
-fn panel(canvas: &mut Canvas, layout: &Layout, app: &App) {
+fn panel(canvas: &mut Canvas, layout: &Layout, app: &App, threaded: bool) {
     let t = theme();
     let r = &app.recording;
     let panel = layout.rec_panel();
@@ -679,6 +926,7 @@ fn panel(canvas: &mut Canvas, layout: &Layout, app: &App) {
     describe_channels(r.armed & r.all(), r.channels.min(32), &mut line);
     let _ = write!(line, " ({} of {})", r.armed_count(), r.channels);
     row(canvas, "Inputs", line.as_str(), t.text);
+    row(canvas, "Writer", if threaded { "own thread (encodes and writes)" } else { "inline (no tape threads here)" }, t.dim);
     if running || r.take.files > 0 {
         line.clear();
         let _ = write!(line, "{}", size(r.take.bytes).as_str());

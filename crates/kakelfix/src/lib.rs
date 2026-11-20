@@ -12,6 +12,7 @@
 #![no_std]
 
 pub mod analyzer;
+pub mod channel;
 pub mod layout;
 pub mod meters;
 pub mod queue;

@@ -155,6 +155,8 @@ pub struct Recording {
     pub float: bool,
     pub request: Option<Request>,
     pub take: Take,
+    /// Takes asked for since the tape started (for the line it prints when it ends).
+    pub asked: u32,
 }
 
 impl Recording {
@@ -174,6 +176,7 @@ impl Recording {
             bits: 24,
             float: false,
             request: None,
+            asked: 0,
             take: Take { running: false, frames: 0, bytes: 0, files: 0, file: Text::new(), overruns: 0, backlog_percent: 0, worst_ms: 0, kib_per_second: 0 },
         }
     }
@@ -349,6 +352,7 @@ impl Recording {
             return Err(reason);
         }
         self.request = Some(Request::Start);
+        self.asked += 1;
         Ok(())
     }
 

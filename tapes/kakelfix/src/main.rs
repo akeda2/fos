@@ -381,10 +381,13 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             tape_rt::idle();
         }
     }
-    capture.stop(api, &mut app);
+    let threaded = capture.threaded();
+    capture.quit(api, &mut app);
     screen.close();
     if app.recording.take.files > 0 {
-        println!("kakelfix: {}", app.message.as_str());
+        println!("kakelfix: {} ({})", app.message.as_str(), if threaded { "written on its own thread" } else { "written inline" });
+    } else if app.recording.asked > 0 {
+        println!("kakelfix: a take was asked for but none was recorded: {}", app.message.as_str());
     }
     if let Some(thread) = writer_thread {
         LINK.stop();

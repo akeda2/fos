@@ -87,7 +87,7 @@ pub fn draw(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware
             View::Matrix => matrix(canvas, layout, app),
             View::Device => device(canvas, layout, app, hardware),
         },
-        Page::Recorder => crate::record::draw(canvas, layout, app, capture.bank(), capture.problem()),
+        Page::Recorder => crate::record::draw(canvas, layout, app, capture.bank(), capture.problem(), capture.threaded()),
         Page::Analyzer => crate::analyze::draw(canvas, layout, app, capture),
         Page::Meters => crate::meters::draw(canvas, layout, app, hardware, capture.bank(), capture.problem()),
     }

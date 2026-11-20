@@ -21,6 +21,11 @@ Embedded kernel (writes made inline):
    boot volume, disk1/take001.wav, one channel of loop0's 32-bit float at 48 kHz, holding the tone
 Server kernel (writes go to the worker thread): `x`, then at once a lone Escape, which asks the tape to stop (`read_key`
 answers KEY_ABORT, `shell::request_stop`) rather than killing it, so it ends through the writer's join with `x` written; then `show`, at -smp 4.
+Then, on an image of its own: a Recorder take (`2`, `R`) on the Recorder's worker thread, ended by Escape while it still
+records: the worker drains what it was given and closes the file before the join. The tape says the take was written on
+its own thread, and disk1/take001.flac in the image is a FLAC that `flac -t` passes. It holds no samples: the server
+kernel lets one process own audio at a time (`kernel-mf/src/tapeaudio.rs`, AUDIO_BUSY), so no `play` can feed loop0
+while kakelfix captures; encoding real audio is the embedded run's, through the same worker code inline.
 QEMU's screen is 1280x800, so kakelfix's layout is at scale 1 (crates/kakelfix/src/layout.rs): soft-key slot 10 (Quit, on
 every page) is at x 1184..1272, y 726..780 (after two half-key gaps between the groups); strip 0's fader travel is x
 12..57, y 152..744. The Analyzer's Both view puts the waveform plot at x 56..1151, y 56..325, the left lane's centre at y 123."""
@@ -47,6 +52,8 @@ from test_usb_audio import write_wav  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 TAPE = ROOT / "build/fosfor/tapes/kakelfix"
 PLAY = ROOT / "build/fosfor/tapes/play"
+LOADER = ROOT / "build/cargo-target/x86_64-unknown-uefi/release/fosfor-loader.efi"
+MF_KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fosfor-kernel-mf"
 MF_IMAGE = Path(os.environ.get("FOSFOR_IMAGE_MF_KAKELFIX", ROOT / "build/fosfor-mf/fosfor-kakelfix.img"))
 CODE = next(p for p in ["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_CODE.fd",
                         "/usr/share/edk2/ovmf/OVMF_CODE.fd"] if Path(p).exists())
@@ -118,13 +125,19 @@ def lamp(machine, name):
 
 
 def toggle_take(machine, want_on):
-    """`R` until the lamp says the take is on (or off): a term net keystroke is occasionally lost, and `R` toggles."""
-    deadline = time.monotonic() + 12
+    """`R` until the lamp says the take is on (or off): a term net keystroke is occasionally lost, and `R` toggles, so
+    each press gets 5 s to show (starting a take finds a free name and opens its files first) before it is sent again."""
+    deadline = time.monotonic() + 20
     while True:
-        send(machine, b"R", 1.5)
-        lit = lamp(machine, "rec.ppm")
-        if (lit >= 20) == want_on or time.monotonic() > deadline:
-            return lit
+        send(machine, b"R", 0.5)
+        shown = time.monotonic() + 5
+        while True:
+            lit = lamp(machine, "rec.ppm")
+            if (lit >= 20) == want_on or time.monotonic() > deadline:
+                return lit
+            if time.monotonic() > shown:
+                break
+            machine.pump(0.5)
 
 
 def take_wav(blob):
@@ -147,7 +160,7 @@ def tool(name):
     return shutil.which(name) or f"/usr/sbin/{name}"
 
 
-def take_flac(blob, folder, name):
+def take_flac(blob, folder, name, sound=True):
     """(channels, rate, bits, total samples) from a FLAC's STREAMINFO; with the reference `flac` on the host, also its
     integrity test (frame CRCs and the MD5 of the samples) and whether the decoded samples hold anything but zeros."""
     check(blob[:4] == b"fLaC" and blob[4] & 0x7F == 0, f"{name} starts with fLaC and STREAMINFO", blob[:8].hex())
@@ -164,7 +177,8 @@ def take_flac(blob, folder, name):
     subprocess.run(["flac", "-d", "-s", "-f", "--force-raw-format", "--endian=little", "--sign=signed", "-o", str(raw), str(path)], check=True)
     samples = raw.read_bytes()
     check(len(samples) == total * channels * bits // 8, f"{name} decodes to its STREAMINFO length ({len(samples)} bytes)")
-    check(any(samples), f"{name} holds the tone (not all zero)")
+    if sound:
+        check(any(samples), f"{name} holds the tone (not all zero)")
     return channels, rate, bits, total
 
 
@@ -375,7 +389,60 @@ def server():
     finally:
         qemu.kill()
         qemu.wait()
-        tmp.cleanup()
+    server_take(tmp)
+    tmp.cleanup()
+
+
+def server_take(tmp):
+    """A take on the server kernel: FLAC encoded and written on the Recorder's worker thread, ended by Escape mid-take."""
+    folder = Path(tmp.name)
+    image = folder / "take.img"
+    subprocess.run([sys.executable, str(ROOT / "tools/build_image.py"), "--loader", str(LOADER), "--kernel", str(MF_KERNEL), "--output", str(image),
+                    "--bios-stage1", str(ROOT / "build/bios/stage1.bin"), "--bios-stage2", str(ROOT / "build/bios/stage2.bin"),
+                    "--file", f"kakelfix={TAPE}"], check=True, capture_output=True)
+    qemu = subprocess.Popen(
+        ["qemu-system-x86_64", "-cpu", "max", "-machine", "q35", "-m", "1024", "-smp", "4", "-display", "none",
+         "-nic", "user,model=e1000", "-serial", "stdio", "-monitor", "none", "-no-reboot",
+         "-drive", f"if=pflash,format=raw,readonly=on,file={CODE}", "-drive", f"format=raw,file={image}"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    log = b""
+
+    def wait_for(text, timeout, start=0):
+        nonlocal log
+        end = time.time() + timeout
+        while time.time() < end and text.encode() not in log[start:]:
+            if select.select([qemu.stdout], [], [], 0.2)[0]:
+                data = os.read(qemu.stdout.fileno(), 4096)
+                if not data:
+                    break
+                log += data
+        return text.encode() in log[start:]
+
+    def type_text(data, pause=0.5):
+        qemu.stdin.write(data)
+        qemu.stdin.flush()
+        wait_for("\x00never", pause)
+
+    try:
+        check(wait_for("fos> ", 150), "mf take: shell prompt", log[-800:].decode("utf8", "replace"))
+        mark = len(log)
+        type_text(b"tape kakelfix device=loop0 rec-disk=disk1\n", 4)
+        type_text(b"2", 1)
+        type_text(b"R", 5)
+        type_text(b"\x1b")
+        done = wait_for("exited with code 0", 30, mark)
+        text = log[mark:].decode("utf8", "replace")
+        check(done, "mf take: Escape mid-take ends kakelfix cleanly", text[-800:])
+        check(re.search(r"kakelfix: saved disk1/take001\.flac, \S+ \(written on its own thread\)", text),
+              "mf take: the take was saved, written on the worker thread", text[-800:])
+        check("CPU exception" not in text and "killed" not in text, "mf take: no fault, not killed", text[-800:])
+    finally:
+        qemu.kill()
+        qemu.wait()
+    files = fosfs_files(image)
+    check("take001.flac" in files, "mf take: disk1/take001.flac is in the image", str(sorted(files)))
+    channels, rate, bits, total = take_flac(files["take001.flac"], folder, "mf-take001.flac", sound=False)
+    check((channels, rate, bits) == (2, 48000, 24), f"mf take: 2 channels, 48 kHz, 24 bits ({total} samples: nothing plays into loop0)")
 
 
 def main():

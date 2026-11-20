@@ -4,7 +4,7 @@
 //! those pages is shown or a take runs, so the Mixer page alone never holds the device's input. The buffers are taken
 //! from the heap once, at startup.
 
-use crate::record::Writer;
+use crate::record::Feed;
 use crate::view::{centered, text};
 use audio_screen::Input;
 use dsp::pcm::unpack_channel;
@@ -24,6 +24,11 @@ const FFT: usize = 8192;
 const BINS: usize = FFT / 2 + 1;
 /// Frames read per `audio_read` (the Recorder's buffers are sized by it).
 pub(crate) const CHUNK: usize = 2048;
+/// Reads per pass of the main loop, at most: 680 ms of audio at 48 kHz, 170 ms at 192 kHz, far more than a frame's worth,
+/// so a pass keeps up while the screen is still drawn. Without a bound a source faster than real time (a loopback, which
+/// its player refills whenever the tape yields) or a backlog after a stall would hold the loop until it ran dry; what is
+/// not read waits in the kernel's capture ring.
+const READS_PER_PASS: usize = 16;
 const LOW_HZ: f32 = 20.0;
 const HIGH_HZ: f32 = 20000.0;
 /// The spectrum's dB scale: 0 dBFS at the top, 100 dB down.
@@ -52,12 +57,12 @@ pub struct Capture {
     seen: u32,
     columns: usize,
     bank: Option<crate::meters::Bank>,
-    writer: Option<Writer>,
+    feed: Option<Feed>,
 }
 
 impl Capture {
     /// `rate` is the `rate=` argument (0: 48 kHz when the device offers it, else its first rate).
-    pub fn new(api: &TapeApi, rate: u32) -> Capture {
+    pub fn new(api: &'static TapeApi, rate: u32) -> Capture {
         let input = Input::query(api, 1);
         let buffers = input.as_ref().ok().and_then(|input| {
             Some(Buffers {
@@ -81,15 +86,15 @@ impl Capture {
             Ok(input) => crate::meters::Bank::new(api, rate, input.channels),
             Err(_) => None,
         };
-        let writer = match &input {
-            Ok(input) => Writer::new(api, input, CHUNK * input.frame_bytes()),
+        let feed = match &input {
+            Ok(input) => Feed::new(api, input, CHUNK * input.frame_bytes()),
             Err(_) => None,
         };
         if input.is_ok() {
             let spare = ((api.free_pages)() * 4096).saturating_sub(MEMORY_RESERVE);
             (api.audio_set_capture_ring)(spare.min(RING_BYTES) as u64);
         }
-        Capture { input, buffers, rate, running: false, failed: false, seen: 0, columns: 0, bank, writer }
+        Capture { input, buffers, rate, running: false, failed: false, seen: 0, columns: 0, bank, feed }
     }
 
     /// The capture rate (what a take is recorded at).
@@ -101,9 +106,14 @@ impl Capture {
         self.input.as_ref().ok()
     }
 
-    /// Whether a take is being written.
+    /// Whether a take is wanted or still being written.
     pub fn taking(&self) -> bool {
-        self.writer.as_ref().is_some_and(Writer::running)
+        self.feed.as_ref().is_some_and(Feed::taking)
+    }
+
+    /// Whether a take is encoded and written on a thread of its own (the server kernel) rather than inline.
+    pub fn threaded(&self) -> bool {
+        self.feed.as_ref().is_some_and(Feed::threaded)
     }
 
     pub fn channels(&self) -> usize {
@@ -119,7 +129,7 @@ impl Capture {
         match (&self.input, &self.buffers) {
             (Err(reason), _) => Some(reason),
             (Ok(_), None) => Some("out of memory for the analyzer"),
-            _ if self.writer.is_none() => Some("out of memory for the recorder"),
+            _ if self.feed.is_none() => Some("out of memory for the recorder"),
             _ if self.failed => Some("the capture did not start (see the message above)"),
             _ => None,
         }
@@ -159,8 +169,8 @@ impl Capture {
             app.recording.request = None;
             return false;
         }
-        if let Some(writer) = &mut self.writer {
-            writer.serve(api, app, self.rate);
+        if let Some(feed) = &mut self.feed {
+            feed.request(api, app, self.rate);
         }
         let a = app.analysis;
         let analyzing = app.page == Page::Analyzer;
@@ -184,15 +194,22 @@ impl Capture {
         let metering = matches!(app.page, Page::Meters | Page::Recorder);
         let (pair, frame) = (a.channels_shown(), input.frame_bytes());
         let mut fresh = false;
-        while frame != 0 {
+        for _ in 0..READS_PER_PASS {
+            if frame == 0 {
+                break;
+            }
+            // A take whose ring is full: the audio stays in the kernel's capture ring until the worker catches up.
+            if self.feed.as_ref().is_some_and(|feed| !feed.has_room(b.scratch.len() / frame * frame)) {
+                break;
+            }
             let got = (api.audio_read)(b.scratch.as_mut_ptr(), b.scratch.len() / frame * frame);
             if got < frame {
                 break;
             }
             fresh = true;
             let data = &b.scratch[..got];
-            if let Some(writer) = &mut self.writer {
-                writer.push(api, app, data);
+            if let Some(feed) = &mut self.feed {
+                feed.push(api, data);
             }
             if metering {
                 if let Some(bank) = &mut self.bank {
@@ -212,22 +229,28 @@ impl Capture {
                 bank.step();
             }
         }
-        if let Some(writer) = &mut self.writer {
-            writer.status(api, app);
+        if let Some(feed) = &mut self.feed {
+            feed.sync(api, app);
         }
         shown && fresh && !(analyzing && a.frozen)
     }
 
-    /// Ends a running take, then stops capture.
+    /// Stops capture (a take keeps it running: `update` only stops when none is wanted).
     pub fn stop(&mut self, api: &TapeApi, app: &mut App) {
-        if let Some(writer) = &mut self.writer {
-            writer.stop(api, app);
-        }
         if self.running {
             (api.audio_stop)();
             self.running = false;
             app.analysis.rate = 0;
         }
+    }
+
+    /// At the end of the tape: ends a take (the worker drains what it was given, closes the files) and its thread, then
+    /// stops capture.
+    pub fn quit(&mut self, api: &TapeApi, app: &mut App) {
+        if let Some(feed) = &mut self.feed {
+            feed.quit(api, app);
+        }
+        self.stop(api, app);
     }
 }
 
