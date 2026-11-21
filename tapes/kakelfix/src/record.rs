@@ -1122,7 +1122,7 @@ fn meters(canvas: &mut Canvas, layout: &Layout, app: &App, bank: &Bank) {
     let r = &app.recording;
     let scale = scale(r.nordic);
     let area = layout.rec_area();
-    let Some(first) = layout.rec_bar(app.first_rec, app) else { return };
+    let Some(first) = (0..r.channels.max(1)).find_map(|slot| layout.rec_bar(r.input_at(slot), app)) else { return };
     // The scale names itself at both sides; the header says sample peak or Nordic PPM.
     draw_scale(canvas, scale, area.x, layout.rec_span(app) as u32, first.y, first.h as u32);
     for input in 0..r.channels.max(1) {
@@ -1150,11 +1150,24 @@ fn meters(canvas: &mut Canvas, layout: &Layout, app: &App, bank: &Bank) {
         let ink = if armed && r.take.running { t.background } else if armed { t.red } else { t.dim };
         centered(canvas, layout, arm, if armed { "REC" } else { "-" }, ink);
     }
-    if app.first_rec > 0 {
-        text(canvas, layout, area.x, area.y + area.h - layout.row, "<", t.dim);
+    // The armed group and the others: a line in the gap between them.
+    let window = layout.rec_window(app);
+    if window.pinned > 0 {
+        let x = area.x + window.pinned as i32 * layout.rec_column_w(app) + window.gap / 2 - 3;
+        let height = layout.rec_column(r.input_at(0), app).map_or(first.h, |column| column.h);
+        canvas.fill_rect(x, area.y, 1, height as u32, t.frame);
     }
-    if app.first_rec + layout.visible_rec(app) < r.channels {
-        text(canvas, layout, area.x + area.w - layout.col, area.y + area.h - layout.row, ">", t.dim);
+    if let Some(scroll) = layout.rec_scroll(app) {
+        let last = window.count - window.shown;
+        for (button, symbol, live) in [(scroll.back, "<", app.first_rec > 0), (scroll.forward, ">", app.first_rec < last)] {
+            canvas.fill_rect(button.x, button.y, button.w as u32, button.h as u32, t.grid);
+            canvas.rect(button.x, button.y, button.w as u32, button.h as u32, t.frame);
+            centered(canvas, layout, button, symbol, if live { t.text } else { t.dim });
+        }
+        let (track, thumb) = (scroll.track, scroll.thumb);
+        canvas.fill_rect(track.x, track.y, track.w as u32, track.h as u32, t.off);
+        canvas.rect(track.x, track.y, track.w as u32, track.h as u32, t.frame);
+        canvas.fill_rect(thumb.x + 2, thumb.y + 3, (thumb.w - 4).max(1) as u32, (thumb.h - 6).max(1) as u32, t.dim);
     }
 }
 

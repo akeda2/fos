@@ -238,13 +238,31 @@ impl Recording {
         Ok(())
     }
 
+    /// Where `input` stands on the page: the armed inputs first, in input order, then the rest (`input_at` is the
+    /// inverse). Arming an input moves its column from the right-hand group into the left-hand one.
+    pub fn slot_of(&self, input: usize) -> usize {
+        let armed = self.armed & self.all();
+        let below = if input >= 32 { armed } else { armed & ((1u32 << input) - 1) };
+        let before = below.count_ones() as usize;
+        if self.is_armed(input) { before } else { armed.count_ones() as usize + input - before }
+    }
+
+    /// The input shown at `slot` (see `slot_of`); the last one for a slot past the end.
+    pub fn input_at(&self, slot: usize) -> usize {
+        let (count, armed) = (self.channels.max(1), self.armed_count());
+        let slot = slot.min(count - 1);
+        let mut inputs = (0..count).filter(|&input| self.is_armed(input) == (slot < armed));
+        inputs.nth(if slot < armed { slot } else { slot - armed }).unwrap_or(count - 1)
+    }
+
+    /// The next or previous column on the page (Left/Right walk the page's order, not the input numbers).
     pub fn step(&mut self, forward: bool) {
-        let last = self.channels.max(1) - 1;
-        self.input = if forward { (self.input + 1).min(last) } else { self.input.saturating_sub(1) };
+        let (slot, last) = (self.slot_of(self.input), self.channels.max(1) - 1);
+        self.input = self.input_at(if forward { (slot + 1).min(last) } else { slot.saturating_sub(1) });
     }
 
     pub fn home(&mut self, end: bool) {
-        self.input = if end { self.channels.max(1) - 1 } else { 0 };
+        self.input = self.input_at(if end { self.channels.max(1) - 1 } else { 0 });
     }
 
     /// The disk takes go to now, if there is one.

@@ -44,6 +44,8 @@ pub enum Hit {
     RecMeter(usize),
     Arm(usize),
     RecRow(RecRow),
+    /// Recorder: a part of the scroll bar under the meters.
+    RecScroll(Scroll),
     /// Recorder: a transport button under the take clock (Record starts a take, Stop stops it).
     Transport(Transport),
     /// Analyzer: a pair button. Meters: an item of the inputs picker (`App::pick_items`).
@@ -65,6 +67,37 @@ pub enum Transport {
 
 impl Transport {
     pub const ALL: [Transport; 2] = [Transport::Record, Transport::Stop];
+}
+
+/// How the Recorder's columns fill the meters' area (`Layout::rec_window`): the armed inputs pinned at the left, then a
+/// gap, then `shown` of the `count` other inputs, which scroll.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RecWindow {
+    pub pinned: usize,
+    pub shown: usize,
+    pub count: usize,
+    pub gap: i32,
+}
+
+/// The Recorder's scroll bar (`Layout::rec_scroll`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RecScroll {
+    pub bar: Rect,
+    pub back: Rect,
+    pub forward: Rect,
+    pub track: Rect,
+    pub thumb: Rect,
+}
+
+/// What a press on the scroll bar does: one column back or forward (the arrows), a page (the track beside the thumb),
+/// or the thumb grabbed to drag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Scroll {
+    Back,
+    Forward,
+    PageBack,
+    PageForward,
+    Thumb,
 }
 
 /// The rows of the Recorder's panel, top to bottom under the take clock and the transport buttons. Four can be tapped (`tappable`): Project
@@ -366,7 +399,7 @@ impl Layout {
     }
 
     /// One input's column: as wide as the inputs allow, at least an arm button a finger can hit (6 characters: 48 pixels
-    /// at scale 1; more inputs than fit are swiped to), at most a broad bar.
+    /// at scale 1; more inputs than fit scroll, `rec_window`), at most a broad bar.
     pub fn rec_column_w(&self, app: &App) -> i32 {
         (self.rec_area().w / app.recording.channels.max(1) as i32).clamp(self.col * 6, self.col * 12)
     }
@@ -376,20 +409,76 @@ impl Layout {
         self.row * 3 - 4
     }
 
+    /// How the Recorder's columns share the meters' area (`rec_window`).
     pub fn visible_rec(&self, app: &App) -> usize {
-        (self.rec_area().w / self.rec_column_w(app)).max(1) as usize
+        let window = self.rec_window(app);
+        window.pinned + window.shown
     }
 
-    /// The bars' width: the visible columns.
+    /// The armed inputs are pinned at the left (`Recording::slot_of`), all of them, as long as they leave room for at least
+    /// one more column; the rest come after a gap and scroll (`App::first_rec` is the first of them shown). When the armed
+    /// inputs do not fit, or every input is armed (or none), nothing is pinned and the whole row scrolls.
+    pub fn rec_window(&self, app: &App) -> RecWindow {
+        let (count, armed) = (app.recording.channels.max(1), app.recording.armed_count());
+        let (width, w) = (self.rec_area().w, self.rec_column_w(app));
+        let gap = self.col * 2;
+        let fit = ((width - gap) / w).max(1) as usize;
+        if armed > 0 && armed < count && armed < fit {
+            return RecWindow { pinned: armed, shown: (fit - armed).min(count - armed), count: count - armed, gap };
+        }
+        let fit = (width / w).max(1) as usize;
+        RecWindow { pinned: 0, shown: fit.min(count), count, gap: 0 }
+    }
+
+    /// The bars' width: the visible columns and the gap between the groups.
     pub fn rec_span(&self, app: &App) -> i32 {
-        self.visible_rec(app).min(app.recording.channels.max(1)) as i32 * self.rec_column_w(app) - 6
+        let window = self.rec_window(app);
+        (window.pinned + window.shown) as i32 * self.rec_column_w(app) + window.gap - 6
     }
 
-    /// The whole column of `input`: its bar, its name, its arm button.
+    /// The height of the scroll bar under the meters (`rec_scroll`): two text rows, a fingertip at the arrows. Kept free
+    /// whether or not it is shown, so the bars do not change height when an input is armed.
+    fn rec_scroll_h(&self) -> i32 {
+        self.row * 2 + 4
+    }
+
+    /// The whole column of `input`: its bar, its name, its arm button. None when it is scrolled out of view.
     pub fn rec_column(&self, input: usize, app: &App) -> Option<Rect> {
-        let slot = input.checked_sub(app.first_rec).filter(|&s| s < self.visible_rec(app) && input < app.recording.channels.max(1))?;
+        if input >= app.recording.channels.max(1) {
+            return None;
+        }
+        let window = self.rec_window(app);
+        let slot = app.recording.slot_of(input);
+        let x = if slot < window.pinned {
+            slot as i32
+        } else {
+            let shown = (slot - window.pinned).checked_sub(app.first_rec).filter(|&k| k < window.shown)?;
+            (window.pinned + shown) as i32
+        };
         let (area, w) = (self.rec_area(), self.rec_column_w(app));
-        Some(Rect::new(area.x + slot as i32 * w, area.y, w - 6, area.h))
+        let gap = if slot < window.pinned { 0 } else { window.gap };
+        Some(Rect::new(area.x + x * w + gap, area.y, w - 6, area.h - self.rec_scroll_h() - 4))
+    }
+
+    /// The scroll bar under the scrolling columns, when they do not all fit: the whole bar, its back and forward arrows,
+    /// its track and the thumb in it (the part shown). A click or tap on an arrow moves one column, on the track beside
+    /// the thumb a page, and the thumb can be dragged: a touchpad clicks, it does not swipe.
+    pub fn rec_scroll(&self, app: &App) -> Option<RecScroll> {
+        let window = self.rec_window(app);
+        if window.count <= window.shown {
+            return None;
+        }
+        let (area, w) = (self.rec_area(), self.rec_column_w(app));
+        let x = area.x + window.pinned as i32 * w + window.gap;
+        let bar = Rect::new(x, area.y + area.h - self.rec_scroll_h() + 4, window.shown as i32 * w - 6, self.rec_scroll_h() - 4);
+        let arrow = (self.col * 5).min(bar.w / 3);
+        let back = Rect::new(bar.x, bar.y, arrow, bar.h);
+        let forward = Rect::new(bar.x + bar.w - arrow, bar.y, arrow, bar.h);
+        let track = Rect::new(back.x + back.w + 4, bar.y, (forward.x - 4 - (back.x + back.w + 4)).max(1), bar.h);
+        let (count, first) = (window.count as i32, app.first_rec.min(window.count - window.shown) as i32);
+        let thumb_w = (track.w * window.shown as i32 / count).max(self.col * 2).min(track.w);
+        let thumb_x = track.x + (track.w - thumb_w) * first / (count - window.shown as i32).max(1);
+        Some(RecScroll { bar, back, forward, track, thumb: Rect::new(thumb_x, track.y, thumb_w, track.h) })
     }
 
     pub fn rec_bar(&self, input: usize, app: &App) -> Option<Rect> {
@@ -415,6 +504,22 @@ impl Layout {
         }
         if let Some(row) = RecRow::ALL.into_iter().find(|&row| row.tappable() && self.rec_row(row).contains(x, y)) {
             return Hit::RecRow(row);
+        }
+        if let Some(scroll) = self.rec_scroll(app) {
+            let part = if scroll.back.contains(x, y) {
+                Some(Scroll::Back)
+            } else if scroll.forward.contains(x, y) {
+                Some(Scroll::Forward)
+            } else if scroll.thumb.contains(x, y) {
+                Some(Scroll::Thumb)
+            } else if scroll.track.contains(x, y) {
+                Some(if x < scroll.thumb.x { Scroll::PageBack } else { Scroll::PageForward })
+            } else {
+                None
+            };
+            if let Some(part) = part {
+                return Hit::RecScroll(part);
+            }
         }
         for input in 0..app.recording.channels.max(1) {
             if self.rec_arm(input, app).is_some_and(|r| r.contains(x, y)) {

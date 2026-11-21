@@ -24,7 +24,7 @@ use fosfor_abi::tape::{
     MixerControl, MIXER_CONTROL_ACTION, MIXER_CONTROL_BOOL, MIXER_CONTROL_ENUM, MIXER_FLAG_HAZARD, MIXER_FLAG_READONLY, MIXER_FLAG_UNKNOWN,
 };
 pub use analyzer::{AnView, Analysis, Persisted, WaveMode};
-pub use layout::{Hit, Layout, RecRow, Rect, Transport};
+pub use layout::{Hit, Layout, RecRow, RecScroll, RecWindow, Rect, Scroll, Transport};
 pub use meters::{MeterScale, Metering};
 pub use queue::{Link, Queued};
 pub use recorder::Recording;
@@ -262,8 +262,9 @@ pub enum Swipe {
     Meters,
     /// The Analyzer's pair buttons.
     Pairs,
-    /// The Recorder's meter columns.
+    /// The Recorder's meter columns, and the thumb of their scroll bar.
     Recorder,
+    RecThumb,
 }
 
 /// What a press that never moved does on release: a matrix cell or a Device row is selected, or acted on when it
@@ -1369,7 +1370,30 @@ impl App {
         self.first_meter = keep(self.metering.bar(), self.first_meter, layout.visible_meters(self), self.metering.bars());
         self.first_pair = keep(self.analysis.pair, self.first_pair, layout.visible_pairs(), self.analysis.pairs());
         self.recording.input = self.recording.input.min(self.recording.channels.max(1) - 1);
-        self.first_rec = keep(self.recording.input, self.first_rec, layout.visible_rec(self), self.recording.channels.max(1));
+        let window = layout.rec_window(self);
+        match self.recording.slot_of(self.recording.input).checked_sub(window.pinned) {
+            Some(shown) => self.first_rec = keep(shown, self.first_rec, window.shown, window.count),
+            None => self.first_rec = self.first_rec.min(window.count.saturating_sub(window.shown)),
+        }
+    }
+
+    /// The Recorder's scrolling columns moved: a selected input among them that went out of view is replaced by the
+    /// nearest one shown (`scroll` would otherwise bring the old one back). A pinned (armed) selection stays.
+    fn rec_pull(&mut self, layout: &Layout) {
+        let window = layout.rec_window(self);
+        let r = &mut self.recording;
+        if let Some(shown) = r.slot_of(r.input).checked_sub(window.pinned) {
+            let inside = shown.clamp(self.first_rec, self.first_rec + window.shown.max(1) - 1);
+            r.input = r.input_at(window.pinned + inside);
+        }
+    }
+
+    /// Moves the Recorder's scrolling columns by `by` (negative: back), within their range.
+    fn rec_scroll_by(&mut self, layout: &Layout, by: isize) {
+        let window = layout.rec_window(self);
+        let last = window.count.saturating_sub(window.shown) as isize;
+        self.first_rec = (self.first_rec as isize + by).clamp(0, last) as usize;
+        self.rec_pull(layout);
     }
 
     /// A mouse button or finger came down at (`x`, `y`); `Some` when it grabbed a fader or a pan control to drag.
@@ -1426,6 +1450,17 @@ impl App {
                 self.recording.input = input;
                 if let Err(reason) = self.recording.toggle(input) {
                     self.note(format_args!("{reason}"));
+                }
+                None
+            }
+            Hit::RecScroll(part) => {
+                let page = layout.rec_window(self).shown.max(1) as isize;
+                match part {
+                    Scroll::Back => self.rec_scroll_by(layout, -1),
+                    Scroll::Forward => self.rec_scroll_by(layout, 1),
+                    Scroll::PageBack => self.rec_scroll_by(layout, -page),
+                    Scroll::PageForward => self.rec_scroll_by(layout, page),
+                    Scroll::Thumb => return Some(self.swipe_from(Swipe::RecThumb, x, y, Tap::None)),
                 }
                 None
             }
@@ -1487,7 +1522,7 @@ impl App {
             Swipe::Controls => self.first_ctl,
             Swipe::Meters => self.first_meter,
             Swipe::Pairs => self.first_pair,
-            Swipe::Recorder => self.first_rec,
+            Swipe::Recorder | Swipe::RecThumb => self.first_rec,
         };
         Grab::Swipe { list, x, y, first, first_col: self.first_col, tap }
     }
@@ -1574,9 +1609,19 @@ impl App {
                 self.first_pair = moved(first, items(dx, layout.an_pair_w()), layout.visible_pairs(), self.analysis.pairs());
             }
             Swipe::Recorder => {
-                let visible = layout.visible_rec(self);
-                self.first_rec = moved(first, items(dx, layout.rec_column_w(self)), visible, self.recording.channels.max(1));
-                self.recording.input = inside(self.recording.input, self.first_rec, visible);
+                let window = layout.rec_window(self);
+                self.first_rec = moved(first, items(dx, layout.rec_column_w(self)), window.shown, window.count);
+                self.rec_pull(layout);
+            }
+            // The thumb follows the pointer along the track: the other way round from swiping the columns themselves.
+            Swipe::RecThumb => {
+                let Some(scroll) = layout.rec_scroll(self) else { return grab };
+                let window = layout.rec_window(self);
+                let room = (scroll.track.w - scroll.thumb.w).max(1);
+                let by = dx * window.count.saturating_sub(window.shown) as i32;
+                let by = if by < 0 { -((-by + room / 2) / room) } else { (by + room / 2) / room };
+                self.first_rec = moved(first, -(by as isize), window.shown, window.count);
+                self.rec_pull(layout);
             }
         }
         Grab::Swipe { list, x: x0, y: y0, first, first_col, tap: Tap::None }

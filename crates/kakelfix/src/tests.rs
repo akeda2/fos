@@ -817,12 +817,17 @@ fn recorder_arms_inputs_and_keeps_one() {
     app.act(&mut device, Action::Right);
     app.act(&mut device, Action::Enter);
     assert!(app.recording.is_armed(2));
+    // Disarmed, input 1 moves out of the armed group at the left, and the selection goes with it: the page now shows
+    // 2 | 1 3 4 (0-based: 1 | 0 2 3 after the second disarm below).
     app.act(&mut device, Action::Home);
     app.act(&mut device, Action::Enter);
-    app.act(&mut device, Action::Right);
+    assert_eq!((app.recording.input, app.recording.slot_of(0)), (0, 2));
+    app.act(&mut device, Action::Home);
     app.act(&mut device, Action::Enter);
     assert_eq!(app.recording.armed, 0b100);
-    app.act(&mut device, Action::Right);
+    assert_eq!([0, 1, 2, 3].map(|slot| app.recording.input_at(slot)), [2, 0, 1, 3]);
+    app.act(&mut device, Action::Home);
+    assert_eq!(app.recording.input, 2);
     app.act(&mut device, Action::Enter);
     assert_eq!(app.recording.armed, 0b100, "the last armed input stays");
     assert_eq!(app.message.as_str(), "a take needs at least one input");
@@ -998,7 +1003,65 @@ fn recorder_taps_arm_and_swipes_scroll_the_meters() {
     let grab = app.drag(&mut device, &layout, grab, area.x + area.w - 4 - layout.rec_column_w(&app) * 5, area.y + 4);
     app.release(&mut device, &layout, grab);
     assert_eq!(app.first_rec, 5);
-    assert!(app.recording.input >= 5);
+    assert_eq!(app.recording.input, 3, "an armed (pinned) selection stays selected");
+}
+
+#[test]
+fn armed_inputs_stay_in_view_and_the_rest_scroll_by_clicks() {
+    let mut device = Fake::new();
+    let mut app = recorder_app(&mut device);
+    let layout = Layout::new(1280, 800);
+    app.recording.channels = 30;
+    app.recording.armed = 1 << 4 | 1 << 20 | 1 << 27;
+    app.scroll(&layout);
+    let window = layout.rec_window(&app);
+    assert_eq!((window.pinned, window.count), (3, 27));
+    assert!(window.shown >= 4 && window.shown < 27, "{window:?}");
+    // The armed inputs at the left, in input order, then a gap, then the others from input 1.
+    let x = |app: &App, input: usize| layout.rec_column(input, app).map(|c| c.x);
+    let w = layout.rec_column_w(&app);
+    assert!(x(&app, 4) < x(&app, 20) && x(&app, 20) < x(&app, 27));
+    assert_eq!(x(&app, 0).unwrap() - x(&app, 27).unwrap(), w + window.gap);
+    assert!(x(&app, 1) > x(&app, 0) && x(&app, 3) > x(&app, 2) && x(&app, 5) > x(&app, 3));
+    assert_eq!(layout.rec_column(26, &app), None, "scrolled out of view");
+    // Arming input 2 moves its column to the left group; disarming 20 moves it back among the others.
+    let arm = layout.rec_arm(2, &app).unwrap();
+    app.press(&mut device, &layout, arm.x + 4, arm.y + 4);
+    assert!(app.recording.is_armed(2));
+    assert!(x(&app, 2) < x(&app, 4), "input 2 now leads the armed group");
+    let arm = layout.rec_arm(20, &app).unwrap();
+    app.press(&mut device, &layout, arm.x + 4, arm.y + 4);
+    assert!(!app.recording.is_armed(20) && x(&app, 2) < x(&app, 4) && x(&app, 4) < x(&app, 27) && x(&app, 27) < x(&app, 0));
+    // The scroll bar: clicks a touchpad can make. An arrow moves one column, the track a page, the armed group stays.
+    let scroll = layout.rec_scroll(&app).expect("27 others do not fit");
+    assert!(scroll.bar.x > x(&app, 27).unwrap() && scroll.back.h >= layout.row * 2 - 4);
+    app.press(&mut device, &layout, scroll.forward.x + 4, scroll.forward.y + 4);
+    assert_eq!(app.first_rec, 1);
+    assert!(x(&app, 0).is_none() && x(&app, 1).is_some() && x(&app, 2).is_some() && x(&app, 27).is_some());
+    let shown = layout.rec_window(&app).shown;
+    let scroll = layout.rec_scroll(&app).unwrap();
+    app.press(&mut device, &layout, scroll.track.x + scroll.track.w - 2, scroll.track.y + 4);
+    assert_eq!(app.first_rec, 1 + shown);
+    app.press(&mut device, &layout, scroll.back.x + 4, scroll.back.y + 4);
+    assert_eq!(app.first_rec, shown);
+    // The thumb dragged to the end of the track shows the last of the others.
+    let scroll = layout.rec_scroll(&app).unwrap();
+    let grab = app.press(&mut device, &layout, scroll.thumb.x + 2, scroll.thumb.y + 4).expect("the thumb is grabbed");
+    let grab = app.drag(&mut device, &layout, grab, scroll.track.x + scroll.track.w + 50, scroll.thumb.y + 4);
+    app.release(&mut device, &layout, grab);
+    let window = layout.rec_window(&app);
+    assert_eq!(app.first_rec, window.count - window.shown);
+    assert!(layout.rec_column(29, &app).is_some());
+    // Keys walk the page's order: from the last armed input Right goes to the first other one shown.
+    app.recording.input = 27;
+    app.act(&mut device, Action::Right);
+    assert_eq!((app.recording.input, app.recording.slot_of(app.recording.input)), (0, 3));
+    app.scroll(&layout);
+    assert_eq!(app.first_rec, 0, "the selection is brought into view");
+    // Every input armed (or more armed than fit): nothing pinned, the whole row scrolls.
+    app.recording.armed = app.recording.all();
+    assert_eq!(layout.rec_window(&app).pinned, 0);
+    assert_eq!(layout.rec_window(&app).gap, 0);
 }
 
 /// Rack's boot disk: FOSFS (the boot volume) and ext4 over the rest, as `install ... ext4` makes it. The ext volume is a

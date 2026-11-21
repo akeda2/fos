@@ -64,8 +64,9 @@ Recorder: R record, S stop (both on any page), space record or stop,
 Left/Right input, Enter arm it, a arm all, f format, d next disk, p type the
 project (every key is text then: Enter keeps, Tab cancels, empty = made up),
 Tab or s dBFS/PPM, r reset; tap Record or Stop, an input's REC button to arm
-it, the Project, Disk, Format or Inputs row to change it. A take goes on
-while other pages are shown; Esc ends it cleanly.
+it, the Project, Disk, Format or Inputs row to change it. Armed inputs stand
+at the left; the others scroll (swipe, or the < > bar under them). A take
+goes on while other pages are shown; Esc ends it cleanly.
 Meters: Left/Right input, Up/Down or + - gain, h +48V, i other switch,
 Tab or s scale, r reset (holds, clip, loudness), a pick the inputs shown
 (arrows move, Enter or space picks, a or n closes).

@@ -1875,7 +1875,13 @@ mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path 
   (`layout::Transport`), Record (a red disc, lit on a red field while the take runs) and Stop (a square), as on a tape
   machine: Record never stops a take, so a bounced press cannot end what it started (`R` records and `S` stops on any
   page; space on the Recorder page still does either). Play is to come after Stop. Arm buttons are a fingertip, 3 text rows by at least 6
-  characters (44 x 48 pixels at scale 1); inputs that do not fit are swiped to. The Project, Disk, Format and Inputs rows are framed buttons (type the project, next disk, next
+  characters (44 x 48 pixels at scale 1). The armed inputs stand together at the left (`Recording::slot_of`), pinned
+  while they fit, so every input a take records is in view; the others follow after a gap and a line, and scroll: a swipe
+  or a drag over them, or the scroll bar under them (`Layout::rec_scroll`: arrows move a column, the track beside the
+  thumb a page, the thumb drags), which is what a touchpad needs: the PS/2 touchpad is a plain three-byte mouse here,
+  so a drag means holding its button, and the kernel reports no wheel. Arming an input moves its column into the left
+  group, disarming moves it back; Left/Right walk the page's order. All inputs armed (or more than fit): nothing is
+  pinned and the whole row scrolls. The Project, Disk, Format and Inputs rows are framed buttons (type the project, next disk, next
   format, arm all); the action soft keys are Record, Stop and Project. `p` (or the row, or the soft key) types the
   project: every key then goes to the field (`App::type_project`), so `R` and space are text, not a take; only
   A-Z a-z 0-9 - _ are taken (a space or another character is refused with a word), at most 20; Enter keeps (empty: none,
