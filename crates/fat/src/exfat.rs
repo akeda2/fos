@@ -7,6 +7,9 @@
 use crate::name;
 use crate::{Device, Entry, Error, Fs, Kind, SECTOR, Stream, Time, Visit};
 
+/// Bitmap sectors read and written per transfer by `bitmap_mark` (4 KiB: 32768 clusters a transfer).
+const BITMAP_BATCH: usize = 8;
+
 fn le16(bytes: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([bytes[at], bytes[at + 1]])
 }
@@ -173,26 +176,38 @@ impl<D: Device> Fs<D> {
         Ok(())
     }
 
-    /// Marks `count` clusters from `start` allocated or free in the bitmap.
+    /// Marks `count` clusters from `start` allocated or free in the bitmap, up to `BITMAP_BATCH` sectors per read and write:
+    /// a USB stick takes a multi-sector write in about the time of one sector, and marking a big run sector by sector cost
+    /// hundreds of transfers (seconds on a stick, before a take's first byte). A cut in between leaves fewer clusters
+    /// marked than the file will need, which the entry set does not point at yet (`exfat_create` writes it after this).
     fn bitmap_mark(&mut self, start: u32, count: u32, allocated: bool) -> Result<(), Error> {
-        let mut cluster = start;
-        let end = start + count;
-        let mut sector = [0u8; SECTOR];
+        let bits_per_sector = SECTOR as u64 * 8;
         let bitmap_lba = self.cluster_lba(self.bitmap_cluster);
+        let mut buffer = [0u8; BITMAP_BATCH * SECTOR];
+        let (mut cluster, end) = (u64::from(start), u64::from(start) + u64::from(count));
         while cluster < end {
-            let bit = u64::from(cluster - 2);
-            let index = bit / (SECTOR as u64 * 8);
-            self.device.read(bitmap_lba + index, &mut sector)?;
-            while cluster < end && u64::from(cluster - 2) / (SECTOR as u64 * 8) == index {
-                let bit = (u64::from(cluster - 2) % (SECTOR as u64 * 8)) as usize;
+            let first = (cluster - 2) / bits_per_sector;
+            let last = (end - 1 - 2) / bits_per_sector;
+            let sectors = (last - first + 1).min(BITMAP_BATCH as u64) as usize;
+            let bytes = &mut buffer[..sectors * SECTOR];
+            self.device.read(bitmap_lba + first, bytes)?;
+            let stop = end.min(2 + (first + sectors as u64) * bits_per_sector);
+            while cluster < stop {
+                let bit = (cluster - 2 - first * bits_per_sector) as usize;
+                // Whole bytes where the run covers them, else bit by bit.
+                if bit % 8 == 0 && cluster + 8 <= stop {
+                    bytes[bit / 8] = if allocated { 0xff } else { 0 };
+                    cluster += 8;
+                    continue;
+                }
                 if allocated {
-                    sector[bit / 8] |= 1 << (bit % 8);
+                    bytes[bit / 8] |= 1 << (bit % 8);
                 } else {
-                    sector[bit / 8] &= !(1 << (bit % 8));
+                    bytes[bit / 8] &= !(1 << (bit % 8));
                 }
                 cluster += 1;
             }
-            self.device.write(bitmap_lba + index, &sector)?;
+            self.device.write(bitmap_lba + first, bytes)?;
         }
         Ok(())
     }

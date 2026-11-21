@@ -663,3 +663,56 @@ fn exfat_unicode_names() {
     drop(fs);
     fsck(&path, &["fsck.exfat", "-n"]);
 }
+
+/// A device that counts its transfers.
+struct Counting(FileDevice, usize, usize);
+
+impl Device for Counting {
+    fn read(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
+        self.1 += 1;
+        self.0.read(lba, buffer)
+    }
+    fn write(&mut self, lba: u64, buffer: &[u8]) -> Result<(), Error> {
+        self.2 += 1;
+        self.0.write(lba, buffer)
+    }
+}
+
+#[test]
+fn reserving_a_big_exfat_run_takes_few_transfers() {
+    if !tool("mkfs.exfat") {
+        return;
+    }
+    // 512 MiB in 4 KiB clusters: a 32 KiB bitmap, 64 sectors. Taking the whole free run and giving most of it back
+    // marked those sector by sector (128 transfers each way, seconds on a USB stick); in batches it is a handful.
+    let path = scratch("exfat5.img");
+    let _cleanup = Cleanup(path.clone());
+    make_image(&path, 512, &["mkfs.exfat", "-c", "4096"]);
+    let device = Counting(FileDevice(OpenOptions::new().read(true).write(true).open(&path).unwrap()), 0, 0);
+    let mut fs = Fs::mount(device).unwrap();
+    let (before, _) = fs.free_space().unwrap();
+    let start = (fs.device().1, fs.device().2);
+    let stream = fs.create(b"take.wav", 0).unwrap();
+    assert!(stream.capacity() > 400 << 20);
+    let writes = fs.device().2 - start.1;
+    assert!(writes <= 12, "{writes} writes to reserve the run");
+    let data = pattern(0, 3 << 20);
+    fs.write(&stream, 0, &data, data.len() as u64).unwrap();
+    let start = fs.device().2;
+    fs.finish(&stream, b"take.wav", data.len() as u64).unwrap();
+    assert!(fs.device().2 - start <= 12, "{} writes to give the rest back", fs.device().2 - start);
+    let (after, _) = fs.free_space().unwrap();
+    assert_eq!(before - after, 3 << 20, "exactly the file's clusters stay marked");
+    // A run that starts and ends inside a byte, across a batch boundary: 3 clusters short of 32768 + 5.
+    let odd = fs.create(b"odd.bin", (32768 + 5) * 4096).unwrap();
+    fs.write(&odd, 0, &data[..4096], 4096).unwrap();
+    fs.finish(&odd, b"odd.bin", 4096).unwrap();
+    assert_eq!(before - fs.free_space().unwrap().0, (3 << 20) + 4096);
+    drop(fs);
+    fsck(&path, &["fsck.exfat", "-n"]);
+    let mut fs = open(&path);
+    let file = fs.find(b"take.wav").unwrap().unwrap();
+    let mut back = vec![0u8; data.len()];
+    fs.read(&file, 0, &mut back).unwrap();
+    assert!(back == data);
+}
