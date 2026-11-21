@@ -346,7 +346,7 @@ fn soft_keys_follow_the_page_and_tab_cycles_its_views() {
     let quit = layout.soft(&app, 10);
     assert!(quit.y > empty.y + empty.h, "a gap before Quit");
     app.act(&mut device, Action::Page(Page::Recorder));
-    assert_eq!(labels(&app), ["Mixer", "Recorder", "Analyzer", "Meters", "", "", "", "Record", "Project", "Arm all", "Quit"]);
+    assert_eq!(labels(&app), ["Mixer", "Recorder", "Analyzer", "Meters", "", "", "", "Record", "Stop", "Project", "Quit"]);
     let gap = layout.soft(&app, 5);
     app.press(&mut device, &layout, gap.x + 1, gap.y + 1);
     assert!(!app.quit, "an empty slot does nothing");
@@ -842,14 +842,16 @@ fn recorder_takes_lock_the_arming_and_the_disk() {
     // The tape takes the request and reports the take running.
     app.recording.request = None;
     app.recording.take.running = true;
-    assert_eq!(app.soft_keys()[SOFT_NAV].label, "Stop");
+    assert!(app.soft_keys()[SOFT_NAV].active, "Record is lit");
     app.act(&mut device, Action::Enter);
     assert_eq!(app.message.as_str(), "stop the take to change what it records");
     app.act(&mut device, Action::NextDisk);
     assert_eq!(app.message.as_str(), "stop the take to change the disk");
-    // Another page: R still stops it.
+    // Another page: R again leaves it running, S stops it.
     app.act(&mut device, Action::Page(Page::Analyzer));
     app.act(&mut device, Action::Record);
+    assert_eq!(app.recording.request, None);
+    app.act(&mut device, Action::Stop);
     assert_eq!(app.recording.request, Some(recorder::Request::Stop));
 }
 
@@ -1174,20 +1176,34 @@ fn recorder_panel_rows_are_buttons() {
 }
 
 #[test]
-fn the_rec_button_starts_and_stops_and_arm_buttons_take_a_finger() {
+fn record_and_stop_are_two_buttons_and_arm_buttons_take_a_finger() {
     let mut device = Fake::new();
     let mut app = recorder_app(&mut device);
     app.recording.choose_disk(None);
     let layout = Layout::new(1280, 800);
-    let button = layout.rec_button();
-    assert_eq!(layout.hit(&app, button.x + button.w / 2, button.y + button.h / 2), Hit::RecButton);
-    app.press(&mut device, &layout, button.x + 10, button.y + 10);
+    let (record, stop) = (layout.rec_transport(Transport::Record), layout.rec_transport(Transport::Stop));
+    assert_eq!(layout.hit(&app, record.x + record.w / 2, record.y + record.h / 2), Hit::Transport(Transport::Record));
+    assert_eq!(layout.hit(&app, stop.x + stop.w / 2, stop.y + stop.h / 2), Hit::Transport(Transport::Stop));
+    assert!(record.x + record.w < stop.x && record.y == stop.y && record.h >= 44, "side by side, a fingertip high");
+    assert!(record.y > layout.rec_panel().y + layout.rec_big(), "under the take clock");
+    // Stop with no take does nothing; Record asks for one.
+    app.press(&mut device, &layout, stop.x + 10, stop.y + 10);
+    assert_eq!(app.recording.request, None);
+    app.press(&mut device, &layout, record.x + 10, record.y + 10);
     assert_eq!(app.recording.request, Some(recorder::Request::Start));
     app.recording.request = None;
     app.recording.take.running = true;
-    app.press(&mut device, &layout, button.x + 10, button.y + 10);
+    // A second press of Record (a bounce) leaves the take running; only Stop stops it.
+    app.press(&mut device, &layout, record.x + 10, record.y + 10);
+    assert_eq!(app.recording.request, None);
+    app.press(&mut device, &layout, stop.x + 10, stop.y + 10);
     assert_eq!(app.recording.request, Some(recorder::Request::Stop));
-    assert!(layout.rec_row(RecRow::File).y >= button.y + button.h, "the rows start under it");
+    // The soft keys are Record and Stop too; space still toggles.
+    let labels = app.soft_keys().map(|key| key.label);
+    assert!(labels.contains(&"Record") && labels.contains(&"Stop"), "{labels:?}");
+    assert!(layout.rec_row(RecRow::File).y >= record.y + record.h, "the rows start under them");
+    let last = layout.rec_row(RecRow::Warning);
+    assert!(last.y + last.h <= layout.rec_panel().y + layout.rec_panel().h, "the last row fits");
     // The UC's 18 inputs: each arm button at least 48 x 44 pixels; the rest of the inputs are swiped to.
     app.recording.channels = 18;
     let arm = layout.rec_arm(0, &app).unwrap();

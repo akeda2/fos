@@ -60,12 +60,12 @@ move (Up/Down: 1 dB), PgUp/PgDn 6 dB, + - 0.1 dB, 0 unity, x off, m mute,
 L pan law, Enter open (Matrix) or change (Device), y n answer, Esc quits.
 Analyzer: Tab view, Left/Right or , . input pair, Up/Down span, space
 freeze, w envelope/scope, d dB/linear, f resolution, r reset.
-Recorder: R or space record/stop (R on any page), Left/Right input, Enter
-arm it, a arm all, f format, d next disk, p type the project (every key is
-text then: Enter keeps, Tab cancels, empty = made up), Tab or s dBFS/PPM, r
-reset; tap an input's REC button to arm it, tap the Project, Disk, Format or
-Inputs row to change it. A take goes on while other pages are shown; Esc
-ends it cleanly.
+Recorder: R record, S stop (both on any page), space record or stop,
+Left/Right input, Enter arm it, a arm all, f format, d next disk, p type the
+project (every key is text then: Enter keeps, Tab cancels, empty = made up),
+Tab or s dBFS/PPM, r reset; tap Record or Stop, an input's REC button to arm
+it, the Project, Disk, Format or Inputs row to change it. A take goes on
+while other pages are shown; Esc ends it cleanly.
 Meters: Left/Right input, Up/Down or + - gain, h +48V, i other switch,
 Tab or s scale, r reset (holds, clip, loudness), a pick the inputs shown
 (arrows move, Enter or space picks, a or n closes).
@@ -227,6 +227,7 @@ fn action(key: Key) -> Option<Action> {
         Key::Char(b'f') => Action::Resolution,
         Key::Char(b'r') => Action::Reset,
         Key::Char(b'R') => Action::Record,
+        Key::Char(b'S') => Action::Stop,
         _ => return None,
     })
 }

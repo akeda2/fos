@@ -44,8 +44,8 @@ pub enum Hit {
     RecMeter(usize),
     Arm(usize),
     RecRow(RecRow),
-    /// Recorder: the big REC/STOP button at the top of the panel (starts or stops a take).
-    RecButton,
+    /// Recorder: a transport button under the take clock (Record starts a take, Stop stops it).
+    Transport(Transport),
     /// Analyzer: a pair button. Meters: an item of the inputs picker (`App::pick_items`).
     AnPair(usize),
     Pick(usize),
@@ -54,7 +54,20 @@ pub enum Hit {
     Nothing,
 }
 
-/// The rows of the Recorder's panel, top to bottom under the REC lamp and clock. Four can be tapped (`tappable`): Project
+/// The Recorder's transport buttons, side by side under the take clock, as on a tape machine: Record (a red disc) and
+/// Stop (a square) are two buttons, so a bounced press never stops the take it started. Play comes after Stop when there
+/// is playback.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Transport {
+    Record,
+    Stop,
+}
+
+impl Transport {
+    pub const ALL: [Transport; 2] = [Transport::Record, Transport::Stop];
+}
+
+/// The rows of the Recorder's panel, top to bottom under the take clock and the transport buttons. Four can be tapped (`tappable`): Project
 /// types a project name, Disk and Format step, Inputs arms every input.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RecRow {
@@ -319,22 +332,27 @@ impl Layout {
         Rect::new(self.body.x, self.body.y, w, self.body.h)
     }
 
-    /// Recorder: the height of the REC lamp and take clock at the top of the panel (the 8x16 font at three times the scale).
+    /// Recorder: the height of the take's state and clock at the top of the panel (the 8x16 font at three times the
+    /// scale). It is only shown, never tapped.
     pub fn rec_big(&self) -> i32 {
         16 * 3 * self.scale as i32
     }
 
-    /// Recorder: the REC/STOP button, the lamp and the take clock at the top of the panel.
-    pub fn rec_button(&self) -> Rect {
+    /// Recorder: a transport button, under the take clock: an equal share of the panel's width each, three text rows tall
+    /// (a fingertip).
+    pub fn rec_transport(&self, button: Transport) -> Rect {
         let panel = self.rec_panel();
-        Rect::new(panel.x + 4, panel.y + 4, panel.w - 8, self.rec_big() + 8)
+        let (count, gap) = (Transport::ALL.len() as i32, self.col);
+        let w = (panel.w - 8 - gap * (count - 1)) / count;
+        Rect::new(panel.x + 4 + button as i32 * (w + gap), panel.y + 12 + self.rec_big(), w, self.row * 3)
     }
 
     /// Recorder: a row of the panel, two text rows tall so a finger can hit the ones that can be tapped.
     pub fn rec_row(&self, row: RecRow) -> Rect {
         let panel = self.rec_panel();
         let height = self.row * 2;
-        let top = panel.y + 8 + self.rec_big() + self.row;
+        let buttons = self.rec_transport(Transport::Record);
+        let top = buttons.y + buttons.h + self.row / 2;
         Rect::new(panel.x + 4, top + row as i32 * height, panel.w - 8, height - 4)
     }
 
@@ -392,8 +410,8 @@ impl Layout {
     }
 
     fn rec_hit(&self, app: &App, x: i32, y: i32) -> Hit {
-        if self.rec_button().contains(x, y) {
-            return Hit::RecButton;
+        if let Some(button) = Transport::ALL.into_iter().find(|&button| self.rec_transport(button).contains(x, y)) {
+            return Hit::Transport(button);
         }
         if let Some(row) = RecRow::ALL.into_iter().find(|&row| row.tappable() && self.rec_row(row).contains(x, y)) {
             return Hit::RecRow(row);

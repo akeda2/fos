@@ -45,7 +45,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use kakelfix::channel::{Mailbox, Ring};
 use kakelfix::naming::{self, FileName, ProjectName, Stamp};
 use kakelfix::recorder::{Disk, Encoding, GROUP, MAX_DISKS, MAX_GROUPS, Request, Take, Volume, clock, describe_channels, duration, size};
-use kakelfix::{App, Layout, RecRow, Recording, Text, fit_name};
+use kakelfix::{App, Layout, RecRow, Recording, Text, Transport, fit_name};
 use tape_rt::{AudioBuffer, AudioStats, DISK_EXFAT, DISK_FAT32, DISK_FOSFS, DiskInfo, FS_EXISTS, TapeApi, VFS_DIR, VFS_FILE, VfsVolume, alloc_bytes, alloc_zeroed};
 
 /// WAV disk writes: 256 KiB blocks (a multiple of the 512-byte sector; the `recorder` tape's size, which real USB sticks
@@ -919,34 +919,62 @@ pub fn draw(canvas: &mut Canvas, layout: &Layout, app: &App, bank: Option<&Bank>
     }
 }
 
-/// The take at the left: a large REC lamp and take clock, then a row each (`RecRow`, the geometry `Layout::rec_row`, which
-/// taps use too): the file, the project, the disk, the room left, the format, the inputs, the wall clock, the writer, what
-/// was written, the warning that matters. Rows that can be tapped are framed, with a `>` at the right.
+/// One transport button: framed like every button, its symbol in the middle and its name beside it. Record is a red disc
+/// (lit, on a dark red field, while the take runs); Stop a square, dim while there is nothing to stop.
+fn transport(canvas: &mut Canvas, layout: &Layout, button: Transport, running: bool) {
+    let t = theme();
+    let area = layout.rec_transport(button);
+    let (lit, name) = match button {
+        Transport::Record => (running, "Record"),
+        Transport::Stop => (false, "Stop"),
+    };
+    let field = if lit { gfx::theme::mix(t.grid, t.red, 35, 100) } else { t.grid };
+    canvas.fill_rect(area.x, area.y, area.w as u32, area.h as u32, field);
+    canvas.rect(area.x, area.y, area.w as u32, area.h as u32, if lit { t.red } else { t.frame });
+    if lit {
+        canvas.rect(area.x + 1, area.y + 1, (area.w - 2) as u32, (area.h - 2) as u32, t.red);
+    }
+    // The symbol: as tall as half the button; then the name, the pair centred together.
+    let size = area.h / 2;
+    let width = size + layout.col + name.len() as i32 * layout.col;
+    let (sx, cy) = (area.x + (area.w - width).max(0) / 2, area.y + area.h / 2);
+    let label = match button {
+        Transport::Record => {
+            gfx::dial::fill_disc(canvas, sx + size / 2, cy, size / 2, t.red);
+            t.text
+        }
+        Transport::Stop => {
+            let colour = if running { t.text } else { t.dim };
+            canvas.fill_rect(sx + size / 8, cy - size * 3 / 8, (size * 3 / 4) as u32, (size * 3 / 4) as u32, colour);
+            colour
+        }
+    };
+    text(canvas, layout, sx + size + layout.col, cy - layout.row / 2, name, label);
+}
+
+/// The take at the left: its state and clock in large type (shown only, never a button), the transport buttons under it
+/// (Record, a red disc; Stop, a square; `Layout::rec_transport`), then a row each (`RecRow`, the geometry
+/// `Layout::rec_row`, which taps use too): the file, the project, the disk, the room left, the format, the inputs, the
+/// wall clock, the writer, what was written, the warning that matters. Rows that can be tapped are framed, with a `>` at
+/// the right.
 fn panel(canvas: &mut Canvas, layout: &Layout, app: &App, threaded: bool) {
     let t = theme();
     let r = &app.recording;
-    let panel = layout.rec_panel();
-    let (x0, y0) = (panel.x + 4, panel.y + 8);
     let big = layout.scale * 3;
     let big_row = layout.rec_big();
     let running = r.take.running;
-    // The lamp and the take clock are one big button: a tap starts or stops the take, as `R` does.
-    let button = layout.rec_button();
-    canvas.fill_rect(button.x, button.y, button.w as u32, button.h as u32, t.grid);
-    canvas.rect(button.x, button.y, button.w as u32, button.h as u32, if running { t.red } else { t.frame });
-    if running {
-        canvas.rect(button.x + 1, button.y + 1, (button.w - 2) as u32, (button.h - 2) as u32, t.red);
-    }
-    let (x0, y0) = (x0 + layout.col / 2, y0 + 2);
-    let lamp = if running { t.red } else { t.off };
-    canvas.fill_rect(x0, y0 + big_row / 4, (big_row / 2) as u32, (big_row / 2) as u32, lamp);
-    let x = x0 + big_row * 3 / 4;
+    // The state: a small lamp, REC or STOPPED, the take clock. No frame, so it does not look like something to press.
+    let panel = layout.rec_panel();
+    let (x0, y0) = (panel.x + 4 + layout.col / 2, panel.y + 8);
+    let lamp = big_row / 5;
+    gfx::dial::fill_disc(canvas, x0 + lamp, y0 + big_row / 2, lamp, if running { t.red } else { t.off });
+    let x = x0 + lamp * 2 + layout.col;
     canvas.text_scaled(x, y0, if running { "REC" } else { "STOP" }, big, if running { t.red } else { t.dim });
     let time = clock(r.take.frames, r.rate);
     canvas.text_scaled(x + 8 * big as i32 * 5, y0, time.as_str(), big, if running { t.text } else { t.dim });
-    let hint = if running { "tap to stop" } else { "tap to record" };
-    let hint_x = button.x + button.w - (hint.len() as i32 + 1) * layout.col;
-    text(canvas, layout, hint_x, button.y + button.h - layout.row - 4, hint, if running { t.red } else { t.dim });
+    for button in Transport::ALL {
+        transport(canvas, layout, button, running);
+    }
     let row = |canvas: &mut Canvas, which: RecRow, value: &str, colour: u32, frame: Option<u32>| {
         let area = layout.rec_row(which);
         let y = area.y + (area.h - layout.row) / 2;

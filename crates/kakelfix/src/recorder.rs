@@ -347,10 +347,10 @@ impl Recording {
         }
     }
 
-    /// Asks for a take to start, or to stop when one runs.
-    pub fn toggle_take(&mut self) -> Result<(), &'static str> {
-        if self.take.running {
-            self.request = Some(Request::Stop);
+    /// Asks for a take to start (Record). Nothing when one runs or is already asked for: a second press, or a bounce,
+    /// never stops it; only Stop does.
+    pub fn start_take(&mut self) -> Result<(), &'static str> {
+        if self.take.running || self.request.is_some() {
             return Ok(());
         }
         if let Some(reason) = self.refusal() {
@@ -359,6 +359,22 @@ impl Recording {
         self.request = Some(Request::Start);
         self.asked += 1;
         Ok(())
+    }
+
+    /// Asks for the running take to stop (Stop). Nothing when none runs.
+    pub fn stop_take(&mut self) {
+        if self.take.running {
+            self.request = Some(Request::Stop);
+        }
+    }
+
+    /// Space on the Recorder page: Stop when a take runs, else Record.
+    pub fn toggle_take(&mut self) -> Result<(), &'static str> {
+        if self.take.running {
+            self.stop_take();
+            return Ok(());
+        }
+        self.start_take()
     }
 
     /// What is saved: the armed inputs, the volume's name, the meter scale, the project, the root folder, the format.

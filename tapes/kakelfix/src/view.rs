@@ -207,7 +207,7 @@ fn footer(canvas: &mut Canvas, layout: &Layout, app: &App) {
         (Page::Mixer, View::Device) => "Up/Dn select  Left/Right/Enter or click again: change  Tab view  1-4 page",
         (Page::Analyzer, _) => "Tab view  Left/Right , . or tap pair  Up/Dn span  space freeze  w env/scope  d dB/lin  f resolution  r reset  1-4 page",
         (Page::Recorder, _) if app.editing.is_some() => "typing the project: A-Z a-z 0-9 - _  Backspace erase  Enter keep (empty: made up)  Tab cancel",
-        (Page::Recorder, _) => "R or space record/stop  Left/Right input  Enter arm  a arm all  p project  f format  d disk  Tab scale  r reset  1-4 page",
+        (Page::Recorder, _) => "R record  S stop  Left/Right input  Enter arm  a arm all  p project  f format  d disk  Tab scale  r reset  1-4 page",
         (Page::Meters, _) => "Left/Right input  Up/Dn gain  +- gain  h +48V  i switch  Tab or s scale  r reset  a inputs  drag a gain  1-4 page",
     };
     text(canvas, layout, 8, layout.footer.y + 4, fit(hint, layout.footer.w / layout.col - 2), theme().dim);

@@ -1820,7 +1820,7 @@ mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path 
   cable (inputs 13-14 carry outputs 1-2). The picker then has a Loop preset. A digital loop (AES, ADAT) is bit-exact; an
   analog one reads as its output level and input gain set it.
 - **Recorder** (`crates/kakelfix/src/recorder.rs` state, `tapes/kakelfix/src/record.rs` the take and drawing), milestone one, a
-  plain take by hand: Record (or `R` on any page, space on the page) writes the armed inputs into a folder of their own
+  plain take by hand: Record (or `R` on any page, space on the page; Stop or `S` ends it) writes the armed inputs into a folder of their own
   (`kakelfix::naming`): `ROOT/PROJECT/take007_2026-11-20_143512/PROJECT_take007_2026-11-20_143512_in01-08.flac`. The root
   (`rec-root=`, default `recordings`, `a/b` for deeper) is the same on every disk; the project (`rec-project=`, up to 20 of
   ASCII letters, digits, `-`, `_`) is found again whatever its case (exFAT ignores case, ext4 not; both must reach the same
@@ -1871,10 +1871,12 @@ mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path 
   (Esc, Quit) finishes the files cleanly. The capture ring is asked for at up to 256 MiB (`audio_set_capture_ring`, leaving
   256 MiB free), which absorbs disk writes, encoding and frames drawn meanwhile. Next: a count of float samples off the 24-bit grid, pre-roll and the sound/silence trigger
   (`audio_rec::preroll`, `silence`).
-  **Touch and typing**: the REC lamp and take clock at the top are one big button (tap: start or stop, as `R`; "tap to
-  record"/"tap to stop" in it, a red frame while recording). Arm buttons are a fingertip, 3 text rows by at least 6
+  **Touch and typing**: the take's state and clock at the top are shown only; under them are two transport buttons
+  (`layout::Transport`), Record (a red disc, lit on a red field while the take runs) and Stop (a square), as on a tape
+  machine: Record never stops a take, so a bounced press cannot end what it started (`R` records and `S` stops on any
+  page; space on the Recorder page still does either). Play is to come after Stop. Arm buttons are a fingertip, 3 text rows by at least 6
   characters (44 x 48 pixels at scale 1); inputs that do not fit are swiped to. The Project, Disk, Format and Inputs rows are framed buttons (type the project, next disk, next
-  format, arm all); the action soft keys are Record/Stop, Project and Arm all. `p` (or the row, or the soft key) types the
+  format, arm all); the action soft keys are Record, Stop and Project. `p` (or the row, or the soft key) types the
   project: every key then goes to the field (`App::type_project`), so `R` and space are text, not a take; only
   A-Z a-z 0-9 - _ are taken (a space or another character is refused with a word), at most 20; Enter keeps (empty: none,
   made up at the next take; the stem unchanged keeps a made-up project's timestamp), Tab cancels; the soft keys are Keep

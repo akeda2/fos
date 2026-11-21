@@ -24,7 +24,7 @@ use fosfor_abi::tape::{
     MixerControl, MIXER_CONTROL_ACTION, MIXER_CONTROL_BOOL, MIXER_CONTROL_ENUM, MIXER_FLAG_HAZARD, MIXER_FLAG_READONLY, MIXER_FLAG_UNKNOWN,
 };
 pub use analyzer::{AnView, Analysis, Persisted, WaveMode};
-pub use layout::{Hit, Layout, RecRow, Rect};
+pub use layout::{Hit, Layout, RecRow, Rect, Transport};
 pub use meters::{MeterScale, Metering};
 pub use queue::{Link, Queued};
 pub use recorder::Recording;
@@ -208,8 +208,10 @@ pub enum Action {
     Channels,
     Phantom,
     InputSwitch,
-    /// Recorder: start or stop a take (from any page), and the next disk to record to.
+    /// Recorder: start a take, stop it (each from any page; two actions, so a bounced button never stops what it
+    /// started), and the next disk to record to.
     Record,
+    Stop,
     NextDisk,
     Enter,
     Yes,
@@ -644,10 +646,11 @@ impl App {
                 Page::Recorder => self.recording.nordic = !self.recording.nordic,
             },
             Action::Record => {
-                if let Err(reason) = self.recording.toggle_take() {
+                if let Err(reason) = self.recording.start_take() {
                     self.note(format_args!("{reason}"));
                 }
             }
+            Action::Stop => self.recording.stop_take(),
             _ if self.page == Page::Recorder => self.act_recorder(action),
             _ if self.page == Page::Analyzer => self.act_analyzer(action),
             _ if self.page == Page::Meters => self.act_meters(device, action),
@@ -1006,11 +1009,12 @@ impl App {
             put(&mut slot, "Keep", SoftKind::Action, Action::Enter, false);
             put(&mut slot, "Cancel", SoftKind::Action, Action::No, false);
         } else if self.page == Page::Recorder {
-            // Format and disk are panel rows to tap (and `f`, `d`); the project too, but it has a key of its own here.
+            // Format, disk and arm all are panel rows to tap (and `f`, `d`, `a`); the project too, but it has a key of
+            // its own here. Record and Stop are two keys, as on the panel.
             let running = self.recording.take.running;
-            put(&mut slot, if running { "Stop" } else { "Record" }, SoftKind::Action, Action::Record, running);
+            put(&mut slot, "Record", SoftKind::Action, Action::Record, running);
+            put(&mut slot, "Stop", SoftKind::Action, Action::Stop, false);
             put(&mut slot, "Project", SoftKind::Action, Action::Pair, false);
-            put(&mut slot, "Arm all", SoftKind::Action, Action::Channels, false);
         }
         slot = SOFT_NAV + SOFT_ACTIONS;
         put(&mut slot, "Quit", SoftKind::Action, Action::Quit, false);
@@ -1425,8 +1429,12 @@ impl App {
                 }
                 None
             }
-            Hit::RecButton => {
-                self.act(device, Action::Record);
+            Hit::Transport(button) => {
+                let action = match button {
+                    Transport::Record => Action::Record,
+                    Transport::Stop => Action::Stop,
+                };
+                self.act(device, action);
                 None
             }
             Hit::RecRow(row) => {

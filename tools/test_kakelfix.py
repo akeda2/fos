@@ -133,11 +133,12 @@ def lamp(machine, name):
 
 
 def toggle_take(machine, want_on):
-    """`R` until the lamp says the take is on (or off): a term net keystroke is occasionally lost, and `R` toggles, so
-    each press gets 5 s to show (starting a take finds a free name and opens its files first) before it is sent again."""
+    """`R` (record) or `S` (stop) until the lamp says the take is on (or off): a term net keystroke is occasionally lost,
+    so each press gets 5 s to show (starting a take finds a free name and opens its files first) before it is sent
+    again. Neither toggles, so a press sent again never undoes the first."""
     deadline = time.monotonic() + 20
     while True:
-        send(machine, b"R", 0.5)
+        send(machine, b"R" if want_on else b"S", 0.5)
         shown = time.monotonic() + 5
         while True:
             lit = lamp(machine, "rec.ppm")
