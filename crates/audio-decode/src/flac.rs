@@ -1,15 +1,16 @@
-//! FLAC decoder (RFC 9639): mono or stereo, 8 to 24 bits, any sample rate, block sizes up to `MAX_BLOCK`.
+//! FLAC decoder (RFC 9639): up to `C` channels (2 unless asked for more; FLAC allows 8), 8 to 24 bits, any sample rate, block sizes up to `MAX_BLOCK`.
 //!
 //! The stream is `fLaC`, metadata blocks (STREAMINFO is the one we need; the rest is skipped), then frames. A frame is a
 //! header (block size, rate, channel layout), one subframe per channel (constant, verbatim, fixed polynomial predictor or
 //! LPC, each followed by a Rice-coded residual) and a CRC-16. Channels may be stored as left/side, side/right or mid/side
-//! and are turned back into left/right here.
+//! and are turned back into left/right here; more than two channels are always stored independently.
 //!
 //! Frames are decoded one at a time from a small refill buffer, so memory use does not depend on the file or the
 //! frame size. The frame CRCs are not checked: a transport that corrupts data (TCP does not) would show as noise, and a
 //! frame header that does not parse is an error. Seeking is not implemented yet except `rewind`.
 //!
-//! The decoder is large (two channels of `MAX_BLOCK` samples): keep it in a `static`, build it with `Decoder::new` and
+//! The decoder is large (`C` channels of `MAX_BLOCK` samples, 64 KiB each): keep it in a `static` or a `Box`, build it with
+//! `Decoder::new` and
 //! call `open`.
 
 use crate::tags::Tags;
@@ -21,7 +22,7 @@ pub const MAX_BLOCK: usize = 16384;
 /// Bytes fetched from the source at a time.
 const INPUT: usize = 32768;
 
-pub struct Decoder<S: Source> {
+pub struct Decoder<S: Source, const C: usize = 2> {
     source: S,
     buffer: [u8; INPUT],
     position: usize,
@@ -45,12 +46,12 @@ pub struct Decoder<S: Source> {
     table: [(u64, u64); SEEK_POINTS],
     table_len: usize,
     /// The decoded block: `samples[channel][..n]`, left/right already restored. Valid after `next_block` returned `n`.
-    pub samples: [[i32; MAX_BLOCK]; 2],
+    pub samples: [[i32; MAX_BLOCK]; C],
 }
 
 const SEEK_POINTS: usize = 128;
 
-impl<S: Source> Decoder<S> {
+impl<S: Source, const C: usize> Decoder<S, C> {
     pub const fn new(source: S) -> Self {
         Decoder {
             source,
@@ -71,7 +72,7 @@ impl<S: Source> Decoder<S> {
             pending: false,
             table: [(0, 0); SEEK_POINTS],
             table_len: 0,
-            samples: [[0; MAX_BLOCK]; 2],
+            samples: [[0; MAX_BLOCK]; C],
         }
     }
 
@@ -129,8 +130,8 @@ impl<S: Source> Decoder<S> {
         if !have_streaminfo {
             return Err(Error::Format("no STREAMINFO block"));
         }
-        if self.channels > 2 {
-            return Err(Error::Unsupported("more than two channels"));
+        if self.channels as usize > C {
+            return Err(Error::Unsupported(if C == 2 { "more than two channels" } else { "more channels than this decoder holds" }));
         }
         if self.bits_per_sample > 24 || self.bits_per_sample < 4 {
             return Err(Error::Unsupported("sample size above 24 bits"));
@@ -339,7 +340,11 @@ impl<S: Source> Decoder<S> {
         }
         self.align();
         self.read_bits(16)?; // frame CRC-16
-        let [left, right] = &mut self.samples;
+        if assignment < 8 {
+            return Ok(Some(block));
+        }
+        let (first, rest) = self.samples.split_at_mut(1);
+        let (left, right) = (&mut first[0], &mut rest[0]);
         match assignment {
             8 => {
                 for i in 0..block {
@@ -591,7 +596,7 @@ impl<S: Source> Decoder<S> {
     }
 }
 
-impl<S: Source> Decode for Decoder<S> {
+impl<S: Source, const C: usize> Decode for Decoder<S, C> {
     fn open(&mut self) -> Result<(), Error> {
         Decoder::open(self)
     }

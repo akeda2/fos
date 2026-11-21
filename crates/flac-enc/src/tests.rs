@@ -50,7 +50,7 @@ fn encode(info: Info, data: &[Vec<i32>], block: usize) -> Vec<u8> {
 }
 
 fn decode(file: &[u8]) -> (Vec<Vec<i32>>, u64) {
-    let mut d = Box::new(Decoder::new(file));
+    let mut d = Box::new(Decoder::<_, 8>::new(file));
     d.open().unwrap();
     let ch = d.channels as usize;
     let mut out = vec![Vec::new(); ch];
@@ -133,7 +133,7 @@ fn rejects_bad_input() {
     assert_eq!(enc.encode_frame(&[&[1, 2], &[1, 2]], &mut small), Err(Error::OutputTooSmall));
 }
 
-/// ffmpeg checks every CRC and reads more than two channels, which the in-tree decoder does not. Skipped when it
+/// ffmpeg checks every CRC, which the in-tree decoder does not. Skipped when it
 /// is not installed.
 #[test]
 fn ffmpeg_reads_multichannel() {
@@ -358,4 +358,16 @@ fn lpc_shrinks_a_tonal_file() {
         }
     }
     assert!((file.len() as u64 * 8) < fixed_bits * 9 / 10, "{} bytes vs fixed {} bytes", file.len(), fixed_bits / 8);
+}
+
+#[test]
+fn multichannel_round_trips_through_the_in_tree_decoder() {
+    // KakelFix writes up to 8 inputs a file; its Play page reads them back with `Decoder<_, 8>`.
+    for (ch, bits) in [(3, 16), (4, 20), (6, 24), (8, 24)] {
+        let data = signal(ch, 10_000, bits, 300, 0);
+        let file = encode(Info { sample_rate: 48000, channels: ch as u32, bits }, &data, BLOCK);
+        let (back, total) = decode(&file);
+        assert_eq!(total, 10_000, "{ch} channels");
+        assert!(back == data, "{ch} channels, {bits} bits");
+    }
 }

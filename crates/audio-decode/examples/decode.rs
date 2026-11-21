@@ -7,7 +7,7 @@ use std::io::Write;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let data = std::fs::read(&args[1]).unwrap();
-    let mut decoder = Box::new(Decoder::new(&data[..]));
+    let mut decoder = Box::new(Decoder::<_, 2>::new(&data[..]));
     decoder.open().unwrap();
     eprintln!("{} Hz, {} channels, {} bits, {} samples", decoder.sample_rate, decoder.channels, decoder.bits_per_sample, decoder.total_samples);
     if args.get(3).map(String::as_str) == Some("frames") {
