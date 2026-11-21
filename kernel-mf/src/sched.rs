@@ -245,6 +245,16 @@ pub fn wake_interrupt() {
     switch_away(true);
 }
 
+/// Whether the caller may give the CPU away while it waits (`yield_now`): the scheduler runs and the caller is an ordinary
+/// thread, not a CPU's idle thread (which is never queued) or the boot context before the scheduler exists.
+pub fn may_yield() -> bool {
+    let guard = SCHED.lock();
+    let Some(sched) = guard.as_ref() else { return false };
+    let cpu_index = this_cpu();
+    let current = sched.current[cpu_index];
+    current != NO_THREAD && current != sched.idle[cpu_index]
+}
+
 /// Gives the CPU to the next ready thread, if there is one; the caller stays ready.
 pub fn yield_now() {
     let flags = cpu::interrupts_save_and_disable();

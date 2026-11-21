@@ -21,6 +21,14 @@ use crate::sync::SpinLock;
 /// The thread (id + 1) that holds the USB lock, 0 for none. A plain flag, not a `SpinLock`: that one keeps interrupts off, and the
 /// controller code waits on timer ticks, which only advance while interrupts are on.
 static OWNER: AtomicUsize = AtomicUsize::new(0);
+/// A ticket lock: a caller takes the next ticket (`NEXT`) and holds the lock when `SERVING` reaches it. Callers get the lock in the
+/// order they asked. A plain compare-and-swap was not fair: a thread that releases and at once takes it again (a disk writer, one
+/// transfer after another) nearly always won over a waiter, worst of all when both are pinned to CPU 0, where the waiter only runs
+/// while the holder is preempted mid-transfer. On aneby that starved a tape's `audio_read` for seconds while it wrote to a USB
+/// stick on the USB audio interface's controller, and the capture FIFO overflowed. Now a waiter is next after at most the transfer in
+/// flight. A ticket is never abandoned: a killed thread ends only on its way back to ring 3 (`process::check_killed`).
+static NEXT: AtomicUsize = AtomicUsize::new(0);
+static SERVING: AtomicUsize = AtomicUsize::new(0);
 
 pub struct UsbGuard {
     taken: bool,
@@ -37,32 +45,53 @@ pub fn lock() -> UsbGuard {
     if OWNER.load(Ordering::Acquire) == me {
         return UsbGuard { taken: false };
     }
-    while OWNER.compare_exchange(0, me, Ordering::AcqRel, Ordering::Relaxed).is_err() {
-        // A tape's system call arrives with interrupts off, and the holder may be a thread this CPU preempted: let the timer
-        // tick through the wait, or the holder never runs again.
-        let was_on = crate::cpu::interrupts_save_and_disable();
-        crate::cpu::interrupts_enable();
-        core::hint::spin_loop();
-        if !was_on {
-            crate::cpu::interrupts_disable();
+    let ticket = NEXT.fetch_add(1, Ordering::AcqRel);
+    if SERVING.load(Ordering::Acquire) != ticket {
+        // A thread gives its CPU away while it waits: the holder is often on the same CPU (both pinned to CPU 0). The boot
+        // context and idle threads cannot be queued, so they spin, letting the timer tick through the wait: a tape's system
+        // call arrives with interrupts off, and the holder may be a thread this CPU preempted.
+        let yielding = crate::sched::may_yield();
+        while SERVING.load(Ordering::Acquire) != ticket {
+            if yielding {
+                let was_on = crate::cpu::interrupts_save_and_disable();
+                crate::cpu::interrupts_enable();
+                crate::sched::yield_now();
+                core::hint::spin_loop();
+                if !was_on {
+                    crate::cpu::interrupts_disable();
+                }
+            } else {
+                let was_on = crate::cpu::interrupts_save_and_disable();
+                crate::cpu::interrupts_enable();
+                core::hint::spin_loop();
+                if !was_on {
+                    crate::cpu::interrupts_disable();
+                }
+            }
         }
     }
+    OWNER.store(me, Ordering::Release);
     UsbGuard { taken: true }
 }
 
-/// The lock if nobody else holds it, without waiting.
+/// The lock if nobody holds it or waits for it, without waiting (an interrupt handler's poll, the PS/2 mouse).
 pub fn try_lock() -> Option<UsbGuard> {
     let me = crate::sched::current_id() + 1;
     if OWNER.load(Ordering::Acquire) == me {
         return Some(UsbGuard { taken: false });
     }
-    OWNER.compare_exchange(0, me, Ordering::AcqRel, Ordering::Relaxed).is_ok().then_some(UsbGuard { taken: true })
+    // Free means every ticket handed out has been served and given back: then `SERVING` cannot move under us.
+    let serving = SERVING.load(Ordering::Acquire);
+    NEXT.compare_exchange(serving, serving.wrapping_add(1), Ordering::AcqRel, Ordering::Relaxed).ok()?;
+    OWNER.store(me, Ordering::Release);
+    Some(UsbGuard { taken: true })
 }
 
 impl Drop for UsbGuard {
     fn drop(&mut self) {
         if self.taken {
             OWNER.store(0, Ordering::Release);
+            SERVING.fetch_add(1, Ordering::AcqRel);
         }
     }
 }
@@ -135,14 +164,8 @@ pub fn init() {
 /// The host's `poll` hook, which kernel-core also calls from interrupt handlers: waiting for the lock there could spin forever
 /// (the holder is a thread this CPU cannot resume), so a busy lock means someone is polling already and this pass is skipped.
 fn poll_nowait() {
-    let me = crate::sched::current_id() + 1;
-    let reentrant = OWNER.load(Ordering::Acquire) == me;
-    if !reentrant && OWNER.compare_exchange(0, me, Ordering::AcqRel, Ordering::Relaxed).is_err() {
-        return;
-    }
-    usb_hid::poll();
-    if !reentrant {
-        OWNER.store(0, Ordering::Release);
+    if let Some(_usb) = try_lock() {
+        usb_hid::poll();
     }
 }
 
