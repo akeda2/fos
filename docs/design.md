@@ -1894,6 +1894,26 @@ mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path 
   request (on the server kernel a second one kills), so it cannot mean "cancel". Refused during a take. There is no
   on-screen keyboard: kakelfix is started from a keyboard (or serial, `term net`) anyway. WavPack (lossless float, more than 8 channels a file) is
   not in the tree; its BSD licence allows vendoring it as libopus is, if a 32-bit float interface needs it.
+- **Play page** (key 5, `crates/kakelfix/src/play.rs` for what the host tests, `tapes/kakelfix/src/play.rs` for reading and
+  playing): the projects under the Recorder's disk and root folder (by name, ignoring case) and the picked project's takes
+  (newest first), read with `vfs_read_dir` on any volume; a take's files are found by their names (`play::take_file`:
+  `_inNN` or `_inNN-MM`), FLAC decoded with `audio_decode::flac::Decoder<_, 8>` (the decoder's channel count is a const
+  generic, 2 unless asked: the other tapes keep their size) and WAV read as the Recorder writes it (`play::WavLayout`:
+  RIFF or RF64, PCM, float or extensible, samples left-justified in their slot). One row per input holds the take's
+  overview (min/max per column, `play::Overview`), filled by a second set of readers a bounded amount per pass while the
+  page is used; the play head is a line across the rows, a tap or a drag on them seeks there. The inputs listened to
+  (tap a name, or `,` `.` and `m`; inputs 1 and 2 at first) go alternately left and right, one alone to both sides, each
+  side divided by the inputs it sums (`Playing::gains`, never louder than full scale), to an output pair: the first
+  output named Phones, else the last Analog pair (the first USB model's phones), else the first pair; `o` or the Output
+  row steps it and `play-out=N` keeps it. What plays is shown as the Analyzer's scrolling envelope of the two sides.
+  Playback runs on the drawing thread, kept `AHEAD_MS` (150 ms) ahead of the device by the playback ring's room
+  (`AudioInfo::playback_space`), so a pause, seek or stop is heard at once. The stream is started with playback whenever
+  the device has a playback side (`analyze::Capture`: a stream's sides are fixed at its start, so playing while a take
+  records needs it from the start); a playback end someone else holds (a loopback another tape plays into) refuses it
+  and capture starts alone, and the page says playback is not available. Not yet: peak files written beside a take
+  (the overview from them at once), playing a take that is being recorded (a FLAC file has no length until Stop, a WAV
+  one only what its last checkpoint says), jog (audio following the finger). `make test-kakelfix` records a take on
+  `loop1` while the Play page plays an earlier one into it, and finds the played audio in the new take.
 - **Test**: `make test-kakelfix` on the loopback: `show` reads the identity mix; in the tape `x` switches the first strip off and a
   mouse click half way up its fader sets -9 dB; with a `play` service playing a tone into loop0, `3` opens the Analyzer and its
   envelope must appear; `4` opens the Meters page and the first bar must light for the tone; `2` and `R` start a take (the header lamp lights), it

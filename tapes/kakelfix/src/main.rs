@@ -8,6 +8,7 @@
 
 mod analyze;
 mod meters;
+mod play;
 mod record;
 mod view;
 
@@ -18,7 +19,7 @@ use fosfor_abi::tape::{
 use instrument_rt::{TouchTarget, Touches};
 use core::fmt::Write;
 use core::sync::atomic::Ordering;
-use kakelfix::{Action, App, Device, Edit, Grab, Layout, Link, Page, Queued, Shape, View};
+use kakelfix::{Action, App, Device, Edit, Grab, Layout, Link, Page, PlayState, Queued, Shape, View};
 use mixer_model::{Group, lin_to_db};
 use tape_rt::mixer::Mixer;
 use tape_rt::{Key, KeyDecoder, TapeApi, print, println};
@@ -54,7 +55,7 @@ rec-disk=ext1|disk3 rec-scale=dbfs|nordic rec-format=flac|wav
 rec-bits=16|20|24
 (the same words on the command line)
   show         print every output's sends and the controls, then end
-Keys: Tab next view, 1-4 Mixer/Recorder/Analyzer/Meters, arrows select and
+Keys: Tab next view, 1-5 Mixer/Recorder/Analyzer/Meters/Play, arrows select and
 move (Up/Down: 1 dB), PgUp/PgDn 6 dB, + - 0.1 dB, 0 unity, x off, m mute,
 , . pan, c centre, o O next/previous output, p pair source, P pair output,
 L pan law, Enter open (Matrix) or change (Device), y n answer, Esc quits.
@@ -70,6 +71,10 @@ goes on while other pages are shown; Esc ends it cleanly.
 Meters: Left/Right input, Up/Down or + - gain, h +48V, i other switch,
 Tab or s scale, r reset (holds, clip, loudness), a pick the inputs shown
 (arrows move, Enter or space picks, a or n closes).
+Play: Up/Down a project or take, Tab the other list, Enter opens, space
+plays or pauses, Left/Right 1 s, PgUp/PgDn 10 s, Home/End, , . an input and
+m listens to it, o output pair (play-out=N; default the phones), r reads the
+disk again; tap the overview to go there, an input's name to listen.
 Analyzer: tap a pair button above the plots; swipe the row for more.
 Mouse/touch: click a strip, drag its fader or pan, click soft keys and cells;
 drag sideways (matrix and Device rows: any way) to scroll a list; the
@@ -201,6 +206,7 @@ fn action(key: Key) -> Option<Action> {
         Key::Char(b'2') => Action::Page(Page::Recorder),
         Key::Char(b'3') => Action::Page(Page::Analyzer),
         Key::Char(b'4') => Action::Page(Page::Meters),
+        Key::Char(b'5') => Action::Page(Page::Play),
         Key::Char(b's') => Action::MeterScale,
         Key::Char(b'h') => Action::Phantom,
         Key::Char(b'i') => Action::InputSwitch,
@@ -296,11 +302,14 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     app.analysis.load(|key| config.value(key));
     app.analysis.pair = app.analysis.pair.min(app.analysis.pairs() - 1);
     app.metering.load(|key| config.value(key));
+    app.playing.load(|key| config.value(key));
+    let mut player = play::Player::new(api);
+    let mut playback = None;
     let r = &mut app.recording;
     r.disk_count = record::find_disks(api, &mut r.disks);
     let wanted_disk = r.load(|key| config.value(key));
     r.choose_disk(wanted_disk);
-    let persisted = |app: &App| (app.analysis.persisted(), app.metering.persisted(), app.recording.persisted(), app.rate);
+    let persisted = |app: &App| (app.analysis.persisted(), app.metering.persisted(), app.recording.persisted(), app.rate, app.playing.output);
     let mut saved = persisted(&app);
     // When the Analyzer's or the Meters page's settings last changed; they are written a second later, so a run of key repeats is one write.
     let mut changed_at = None;
@@ -355,6 +364,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             app.analysis.save(|key, value| body.put(key, value));
             app.metering.save(|key, value| body.put(key, value));
             app.recording.save(|key, value| body.put(key, value));
+            app.playing.save(|key, value| body.put(key, value));
             let result = config.save(api, body.as_str());
             // The Analyzer and Meters save quietly; the +48 V toggle and any failure say so.
             if app.ask_changed || result.is_err() {
@@ -401,6 +411,15 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         if has_meters || fresh || capture.taking() {
             screen.mark_dirty();
         }
+        if let Some(player) = player.as_deref_mut() {
+            if capture.playback() != playback {
+                playback = capture.playback();
+                player.set_output(&mut app, playback);
+            }
+            if player.update(api, &mut app, &layout) || app.page == Page::Play && app.playing.state == PlayState::Playing {
+                screen.mark_dirty();
+            }
+        }
         if screen.due() {
             let now = tape_rt::micros();
             let seconds = (now.wrapping_sub(last_draw) as f32 / 1e6).clamp(0.001, 1.0);
@@ -411,7 +430,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             }
             app.scroll(&layout);
             let mut canvas = screen.frame();
-            view::draw(&mut canvas, &layout, &app, &hardware, &meters, &mut capture, touches.pointer());
+            view::draw(&mut canvas, &layout, &app, &hardware, &meters, &mut capture, player.as_deref(), touches.pointer());
             screen.present();
         } else {
             tape_rt::idle();

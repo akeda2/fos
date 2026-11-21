@@ -16,6 +16,7 @@ pub mod channel;
 pub mod layout;
 pub mod meters;
 pub mod naming;
+pub mod play;
 pub mod queue;
 pub mod recorder;
 
@@ -24,7 +25,8 @@ use fosfor_abi::tape::{
     MixerControl, MIXER_CONTROL_ACTION, MIXER_CONTROL_BOOL, MIXER_CONTROL_ENUM, MIXER_FLAG_HAZARD, MIXER_FLAG_READONLY, MIXER_FLAG_UNKNOWN,
 };
 pub use analyzer::{AnView, Analysis, Persisted, WaveMode};
-pub use layout::{Hit, Layout, RecRow, RecScroll, RecWindow, Rect, Scroll, Transport};
+pub use layout::{Hit, Layout, PlayButton, RecRow, RecScroll, RecWindow, Rect, Scroll, Transport};
+pub use play::{Focus, PlayRequest, PlayState, Playing};
 pub use meters::{MeterScale, Metering};
 pub use queue::{Link, Queued};
 pub use recorder::Recording;
@@ -57,6 +59,8 @@ pub struct Shape {
     pub masters: bool,
     pub controls: usize,
 }
+
+impl<const N: usize> Eq for Text<N> {}
 
 /// A short text with a fixed capacity; writes past the end are cut at a character boundary.
 #[derive(Clone, Copy)]
@@ -161,6 +165,8 @@ pub enum Page {
     Recorder,
     Analyzer,
     Meters,
+    /// A take from the disk, played to an output pair (`play`), also while a take records.
+    Play,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -212,6 +218,8 @@ pub enum Action {
     /// started), and the next disk to record to.
     Record,
     Stop,
+    /// Play: stop playing and go back to the take's start (not `Stop`, which ends a recording from any page).
+    PlayStop,
     NextDisk,
     Enter,
     Yes,
@@ -250,6 +258,8 @@ pub enum Grab {
     /// reports are moves, not fresh presses, until it lifts (`instrument_rt::Touches` re-offers a finger that holds
     /// nothing, which made a toggle such as Inputs flip once per report).
     Held,
+    /// Play: the take's overview, followed by the finger: playing goes where it points (seek, not jog).
+    Seek,
 }
 
 /// The lists a finger or the mouse can swipe.
@@ -280,8 +290,8 @@ pub enum Tap {
 
 /// Soft-key slots down the right edge: `SOFT_NAV` for the pages with the active page's views under it, then
 /// `SOFT_ACTIONS` for that page's actions, then Quit, with half a key between the groups.
-pub const SOFT_SLOTS: usize = 11;
-pub const SOFT_NAV: usize = 7;
+pub const SOFT_SLOTS: usize = 12;
+pub const SOFT_NAV: usize = 8;
 pub const SOFT_ACTIONS: usize = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -333,6 +343,9 @@ pub struct App {
     pub first_meter: usize,
     pub first_pair: usize,
     pub first_rec: usize,
+    /// Play: the first project and take shown in the lists.
+    pub first_project: usize,
+    pub first_take: usize,
     /// Meters: the inputs picker is open, its cursor on this item (`pick_items`).
     pub picking: Option<usize>,
     /// A hazardous control change waiting for yes or no: (control, value).
@@ -351,6 +364,7 @@ pub struct App {
     pub analysis: Analysis,
     pub metering: Metering,
     pub recording: Recording,
+    pub playing: Playing,
     /// The project name being typed on the Recorder page, while it is (`type_project`).
     pub editing: Option<Text<{ naming::MAX_PROJECT }>>,
     pub message: Text<72>,
@@ -380,6 +394,8 @@ impl App {
             first_meter: 0,
             first_pair: 0,
             first_rec: 0,
+            first_project: 0,
+            first_take: 0,
             picking: None,
             confirm: None,
             ask_hazard: false,
@@ -391,6 +407,7 @@ impl App {
             analysis: Analysis::new(),
             metering: Metering::new(),
             recording: Recording::new(),
+            playing: Playing::new(),
             editing: None,
             message: Text::new(),
             quit: false,
@@ -623,6 +640,10 @@ impl App {
                 self.page = page;
                 self.picking = None;
                 self.message.clear();
+                // The lists are read when the page is first shown (and with `r`): the disk may have new takes.
+                if page == Page::Play && self.playing.project_count == 0 && self.playing.request.is_none() {
+                    self.playing.request = Some(PlayRequest::List);
+                }
             }
             Action::View(view) => {
                 self.page = Page::Mixer;
@@ -645,6 +666,12 @@ impl App {
                 Page::Analyzer => self.analysis.next_view(),
                 Page::Meters => self.metering.next_scale(),
                 Page::Recorder => self.recording.nordic = !self.recording.nordic,
+                Page::Play => {
+                    self.playing.focus = match self.playing.focus {
+                        Focus::Projects => Focus::Takes,
+                        Focus::Takes => Focus::Projects,
+                    }
+                }
             },
             Action::Record => {
                 if let Err(reason) = self.recording.start_take() {
@@ -652,6 +679,7 @@ impl App {
                 }
             }
             Action::Stop => self.recording.stop_take(),
+            _ if self.page == Page::Play => self.act_play(action),
             _ if self.page == Page::Recorder => self.act_recorder(action),
             _ if self.page == Page::Analyzer => self.act_analyzer(action),
             _ if self.page == Page::Meters => self.act_meters(device, action),
@@ -672,6 +700,69 @@ impl App {
                 View::Device => self.act_device(device, action),
             },
         }
+    }
+
+    /// Play keys: Up/Down a project or take, Tab the other list, Enter opens (a project's takes, or the take), space
+    /// plays or pauses (opening the picked take first), Left/Right 1 s, PgUp/PgDn 10 s, Home/End the start and end, `,` `.`
+    /// a row and `m` listens to it or not, `o` the next output pair, `r` reads the disk again.
+    fn act_play(&mut self, action: Action) {
+        let p = &mut self.playing;
+        let step = |at: usize, count: usize, down: bool| if down { (at + 1).min(count.saturating_sub(1)) } else { at.saturating_sub(1) };
+        match action {
+            Action::Up | Action::Down => {
+                let down = action == Action::Down;
+                match p.focus {
+                    Focus::Projects => {
+                        let next = step(p.project, p.project_count, down);
+                        if next != p.project {
+                            p.project = next;
+                            p.take = 0;
+                            p.request = Some(PlayRequest::List);
+                        }
+                    }
+                    Focus::Takes => p.take = step(p.take, p.take_count, down),
+                }
+            }
+            Action::Enter => match p.focus {
+                Focus::Projects => p.focus = Focus::Takes,
+                Focus::Takes => self.open_take(false),
+            },
+            Action::Freeze => self.play_pause(),
+            Action::PlayStop => {
+                if p.open.is_some() {
+                    p.request = Some(PlayRequest::Stop);
+                }
+            }
+            Action::Left | Action::Right if p.open.is_some() => p.seek_by(if action == Action::Right { 1 } else { -1 }),
+            Action::Step(db) if p.open.is_some() => p.seek_by(if db > 0.0 { -10 } else { 10 }),
+            Action::Home if p.open.is_some() => p.seek_to(0.0),
+            Action::End if p.open.is_some() => p.seek_to(1.0),
+            Action::NextOutput | Action::PrevOutput => p.next_output(),
+            Action::Pan(step) if p.row_count > 0 => p.row = if step > 0.0 { (p.row + 1).min(p.row_count - 1) } else { p.row.saturating_sub(1) },
+            Action::Mute => p.toggle_listen(p.row),
+            Action::Reset => p.request = Some(PlayRequest::List),
+            _ => {}
+        }
+    }
+
+    /// Opens the take picked in the list (`then_play`: and plays it once open).
+    pub fn open_take(&mut self, then_play: bool) {
+        let p = &mut self.playing;
+        if p.take >= p.take_count {
+            return self.note(format_args!("no take to open"));
+        }
+        p.autoplay = then_play;
+        p.request = Some(PlayRequest::Open);
+    }
+
+    /// Play/Pause: plays the open take from where it is, pauses it, or opens the picked take and plays it.
+    pub fn play_pause(&mut self) {
+        let p = &mut self.playing;
+        let picked = p.projects.get(p.project).zip(p.takes.get(p.take)).map(|(project, take)| (*project, *take));
+        if p.open.is_none() || (p.state == PlayState::Stopped && picked != p.open && p.take < p.take_count) {
+            return self.open_take(true);
+        }
+        p.request = Some(if p.state == PlayState::Playing { PlayRequest::Pause } else { PlayRequest::Play });
     }
 
     /// Recorder keys: Left/Right select an input, Enter arms or disarms it, `a` arms every input, space starts or stops a
@@ -992,6 +1083,7 @@ impl App {
             }
         }
         put(&mut slot, "Meters", SoftKind::Page, Action::Page(Page::Meters), self.page == Page::Meters);
+        put(&mut slot, "Play", SoftKind::Page, Action::Page(Page::Play), self.page == Page::Play);
         slot = SOFT_NAV;
         if mixer {
             put(&mut slot, "Pair", SoftKind::Action, Action::Pair, false);
@@ -1006,6 +1098,11 @@ impl App {
             put(&mut slot, scale, SoftKind::Action, Action::MeterScale, false);
             put(&mut slot, "Inputs", SoftKind::Action, Action::Channels, self.picking.is_some());
             put(&mut slot, "Reset", SoftKind::Action, Action::Reset, false);
+        } else if self.page == Page::Play {
+            let playing = self.playing.state == PlayState::Playing;
+            put(&mut slot, if playing { "Pause" } else { "Play" }, SoftKind::Action, Action::Freeze, playing);
+            put(&mut slot, "Stop", SoftKind::Action, Action::PlayStop, false);
+            put(&mut slot, "Output", SoftKind::Action, Action::NextOutput, false);
         } else if self.page == Page::Recorder && self.editing.is_some() {
             put(&mut slot, "Keep", SoftKind::Action, Action::Enter, false);
             put(&mut slot, "Cancel", SoftKind::Action, Action::No, false);
@@ -1370,6 +1467,9 @@ impl App {
         self.first_meter = keep(self.metering.bar(), self.first_meter, layout.visible_meters(self), self.metering.bars());
         self.first_pair = keep(self.analysis.pair, self.first_pair, layout.visible_pairs(), self.analysis.pairs());
         self.recording.input = self.recording.input.min(self.recording.channels.max(1) - 1);
+        let p = &self.playing;
+        self.first_project = keep(p.project, self.first_project, layout.play_visible(), p.project_count);
+        self.first_take = keep(p.take, self.first_take, layout.play_visible(), p.take_count);
         let window = layout.rec_window(self);
         match self.recording.slot_of(self.recording.input).checked_sub(window.pinned) {
             Some(shown) => self.first_rec = keep(shown, self.first_rec, window.shown, window.count),
@@ -1385,6 +1485,14 @@ impl App {
         if let Some(shown) = r.slot_of(r.input).checked_sub(window.pinned) {
             let inside = shown.clamp(self.first_rec, self.first_rec + window.shown.max(1) - 1);
             r.input = r.input_at(window.pinned + inside);
+        }
+    }
+
+    /// Play: goes to the point of the take under `x` on the overview.
+    fn seek_at(&mut self, layout: &Layout, x: i32) {
+        let wave = layout.play_wave();
+        if self.playing.open.is_some() && wave.w > 0 {
+            self.playing.seek_to((x - wave.x) as f32 / wave.w as f32);
         }
     }
 
@@ -1451,6 +1559,54 @@ impl App {
                 if let Err(reason) = self.recording.toggle(input) {
                     self.note(format_args!("{reason}"));
                 }
+                None
+            }
+            Hit::PlayItem(focus, index) => {
+                let p = &mut self.playing;
+                p.focus = focus;
+                match focus {
+                    Focus::Projects if index < p.project_count => {
+                        if index != p.project {
+                            p.project = index;
+                            p.take = 0;
+                            p.request = Some(PlayRequest::List);
+                        }
+                    }
+                    // A tap on the take picked opens it; on another, picks it.
+                    Focus::Takes if index < p.take_count => {
+                        if index == p.take {
+                            self.open_take(false);
+                        } else {
+                            p.take = index;
+                        }
+                    }
+                    _ => {}
+                }
+                None
+            }
+            Hit::PlayLabel(row) => {
+                self.playing.row = row;
+                self.playing.toggle_listen(row);
+                None
+            }
+            Hit::PlayWave => {
+                self.seek_at(layout, x);
+                Some(Grab::Seek)
+            }
+            Hit::PlayButton(button) => {
+                let p = &mut self.playing;
+                match button {
+                    PlayButton::Play => self.play_pause(),
+                    PlayButton::Stop => self.act(device, Action::PlayStop),
+                    PlayButton::Start if p.open.is_some() => p.seek_to(0.0),
+                    PlayButton::Back if p.open.is_some() => p.seek_by(-10),
+                    PlayButton::Forward if p.open.is_some() => p.seek_by(10),
+                    _ => {}
+                }
+                None
+            }
+            Hit::PlayOutput => {
+                self.playing.next_output();
                 None
             }
             Hit::RecScroll(part) => {
@@ -1633,6 +1789,10 @@ impl App {
         match grab {
             _ if self.confirm.is_some() => return grab,
             Grab::Swipe { .. } => return self.swipe(layout, grab, x, y),
+            Grab::Seek => {
+                self.seek_at(layout, x);
+                return grab;
+            }
             Grab::Pressed { strip, x: x0, y: y0 } => {
                 let (dx, dy) = (x - x0, y - y0);
                 if dy.abs() >= layout.slop() && dy.abs() >= dx.abs() {
@@ -1658,7 +1818,7 @@ impl App {
             return grab;
         }
         match grab {
-            Grab::Control { .. } | Grab::Pressed { .. } | Grab::Swipe { .. } | Grab::Held => {}
+            Grab::Control { .. } | Grab::Pressed { .. } | Grab::Swipe { .. } | Grab::Held | Grab::Seek => {}
             Grab::Fader(strip) => {
                 let Some(fader) = layout.fader(strip, self) else { return grab };
                 let position = (fader.y + fader.h - y) as f64 / fader.h.max(1) as f64;

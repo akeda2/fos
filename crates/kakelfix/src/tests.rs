@@ -331,22 +331,22 @@ fn soft_keys_follow_the_page_and_tab_cycles_its_views() {
     let mut app = app(&mut device);
     let layout = Layout::new(1280, 720);
     let labels = |app: &App| app.soft_keys().map(|k| k.label);
-    assert_eq!(labels(&app), ["Mixer", "Outputs", "Matrix", "Device", "Recorder", "Analyzer", "Meters", "Pair", "Pan law", "", "Quit"]);
+    assert_eq!(labels(&app), ["Mixer", "Outputs", "Matrix", "Device", "Recorder", "Analyzer", "Meters", "Play", "Pair", "Pan law", "", "Quit"]);
     let analyzer = layout.soft(&app, 5);
     app.press(&mut device, &layout, analyzer.x + 1, analyzer.y + 1);
     assert_eq!(app.page, Page::Analyzer);
-    assert_eq!(labels(&app), ["Mixer", "Recorder", "Analyzer", "Waveform", "Spectrum", "Both", "Meters", "Freeze", "Wave: Env", "Reset", "Quit"]);
+    assert_eq!(labels(&app), ["Mixer", "Recorder", "Analyzer", "Waveform", "Spectrum", "Both", "Meters", "Play", "Freeze", "Wave: Env", "Reset", "Quit"]);
     assert!(layout.soft(&app, 3).x > layout.soft(&app, 2).x, "views are indented");
     app.act(&mut device, Action::NextView);
     assert_eq!((app.page, app.analysis.view), (Page::Analyzer, AnView::Waveform));
     let spectrum = layout.soft(&app, 4);
     app.press(&mut device, &layout, spectrum.x + 1, spectrum.y + 1);
     assert_eq!(app.analysis.view, AnView::Spectrum);
-    let empty = layout.soft(&app, 9);
-    let quit = layout.soft(&app, 10);
+    let empty = layout.soft(&app, 10);
+    let quit = layout.soft(&app, 11);
     assert!(quit.y > empty.y + empty.h, "a gap before Quit");
     app.act(&mut device, Action::Page(Page::Recorder));
-    assert_eq!(labels(&app), ["Mixer", "Recorder", "Analyzer", "Meters", "", "", "", "Record", "Stop", "Project", "Quit"]);
+    assert_eq!(labels(&app), ["Mixer", "Recorder", "Analyzer", "Meters", "Play", "", "", "", "Record", "Stop", "Project", "Quit"]);
     let gap = layout.soft(&app, 5);
     app.press(&mut device, &layout, gap.x + 1, gap.y + 1);
     assert!(!app.quit, "an empty slot does nothing");
@@ -373,7 +373,7 @@ fn analyzer_keys_step_pair_and_span_and_restart_the_buffers() {
     app.act(&mut device, Action::Down);
     assert_eq!((app.analysis.wave, app.analysis.timebase, app.analysis.span), (WaveMode::Scope, 0, 2));
     app.act(&mut device, Action::Freeze);
-    assert!(app.analysis.frozen && app.soft_keys()[7].active);
+    assert!(app.analysis.frozen && app.soft_keys()[SOFT_NAV].active);
     app.act(&mut device, Action::Mute);
     assert_eq!(device.writes, 0, "mixer keys do nothing on the Analyzer page");
 }
@@ -466,7 +466,7 @@ fn meters_keys_select_inputs_change_gain_and_ask_for_phantom() {
     app.metering.channels = 2;
     app.act(&mut device, Action::Page(Page::Meters));
     assert_eq!(app.soft_keys()[3].label, "Meters");
-    assert_eq!(app.soft_keys()[7].label, "Scale: PPM");
+    assert_eq!(app.soft_keys()[SOFT_NAV].label, "Scale: PPM");
     app.act(&mut device, Action::Up);
     app.act(&mut device, Action::Step(6.0));
     assert_eq!(device.controls[2], 7, "Up and PgUp step the selected input's gain");
@@ -1282,4 +1282,195 @@ fn warnings_wrap_at_spaces() {
     assert!(wrap("short", 40).eq(["short"]));
     assert!(wrap("abcdefghij", 4).eq(["abcd", "efgh", "ij"]), "a word longer than a line is cut");
     assert_eq!(wrap("", 4).count(), 0);
+}
+
+#[test]
+fn a_takes_files_say_which_inputs_they_hold() {
+    use play::take_file;
+    let file = take_file("Konsert_take007_2026-11-20_143512_in09-16.flac").unwrap();
+    assert_eq!((file.first, file.channels, file.flac), (8, 8, true));
+    let file = take_file("mink-owl_take002_2026-11-20_143512_in05.wav").unwrap();
+    assert_eq!((file.first, file.channels, file.flac), (4, 1, false));
+    for other in ["Konsert_take007_2026-11-20_143512_in01-08.peaks", "notes.txt", "x_in00.wav", "x_in05-03.flac", "x_in1-2.wav", "x_in33.wav"] {
+        assert_eq!(take_file(other), None, "{other}");
+    }
+}
+
+#[test]
+fn wav_headers_as_the_recorder_writes_them_are_read() {
+    use audio_rec::wav::{Format, header_len, write_header};
+    use play::WavLayout;
+    let mut head = [0u8; 512];
+    // Two float channels (plain IEEE float), 18 channels of 24 bits in 4-byte slots (extensible), past 4 GiB (RF64).
+    for (format, data) in [
+        (Format { channels: 2, rate: 48_000, slot: 4, bits: 32, float: true }, 4_800u64 * 8),
+        (Format { channels: 18, rate: 96_000, slot: 4, bits: 24, float: false }, 960 * 72),
+        (Format { channels: 2, rate: 48_000, slot: 2, bits: 16, float: false }, 5u64 << 30),
+    ] {
+        let length = write_header(&mut head, &format, data);
+        assert_eq!(length, header_len(&format));
+        let layout = WavLayout::parse(&head, length as u64 + data).unwrap();
+        assert_eq!((layout.channels, layout.rate, layout.slot, layout.float), (format.channels, format.rate, format.slot, format.float));
+        assert_eq!((layout.data_offset, layout.data_bytes), (length as u64, data));
+        // A file cut short (still being written) has the frames that are there.
+        let short = WavLayout::parse(&head, length as u64 + 1000).unwrap();
+        assert_eq!(short.data_bytes, 1000 / short.frame_bytes() * short.frame_bytes());
+    }
+    let float = WavLayout { data_offset: 0, data_bytes: 8, channels: 2, rate: 48_000, slot: 4, float: true };
+    let frame = [0.5f32.to_le_bytes(), (-0.25f32).to_le_bytes()].concat();
+    assert_eq!((float.sample(&frame, 0), float.sample(&frame, 1)), (0.5, -0.25));
+    // 24 bits left-justified in 4 bytes, and 16-bit samples: full scale is -1.
+    let left = WavLayout { slot: 4, float: false, ..float };
+    assert_eq!(left.sample(&0x8000_0000u32.to_le_bytes(), 0), -1.0);
+    assert_eq!(left.sample(&0x4000_0000u32.to_le_bytes(), 0), 0.5);
+    let short = WavLayout { slot: 2, float: false, ..float };
+    assert_eq!(short.sample(&(-16384i16).to_le_bytes(), 0), -0.5);
+    assert_eq!(WavLayout::parse(b"RIFX\0\0\0\0WAVE", 100), None);
+}
+
+#[test]
+fn listened_inputs_alternate_left_and_right() {
+    let mut p = Playing::new();
+    let file = |name: &str| play::take_file(name).unwrap();
+    p.set_files(&[file("a_take001_2026-11-20_143512_in09-10.flac"), file("a_take001_2026-11-20_143512_in01-08.flac")]);
+    assert_eq!(&p.rows[..p.row_count], &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(p.listen, 0b11, "inputs 1 and 2, the usual stereo pair");
+    let gains = p.gains();
+    assert_eq!((gains[0], gains[1], gains[2]), ([1.0, 0.0], [0.0, 1.0], [0.0, 0.0]));
+    assert_eq!(Playing::mix(&gains, &[0.5, -0.5, 1.0]), (0.5, -0.5));
+    // One input alone: both sides. Three: 1 and 3 share the left at half each, 2 has the right.
+    p.listen = 0b100;
+    assert_eq!(p.gains()[2], [1.0, 1.0]);
+    p.listen = 0b111;
+    let gains = p.gains();
+    assert_eq!((gains[0], gains[1], gains[2]), ([0.5, 0.0], [0.0, 1.0], [0.5, 0.0]));
+    assert_eq!(Playing::mix(&gains, &[1.0, 1.0, 1.0]), (1.0, 1.0), "never louder than full scale");
+    p.toggle_listen(1);
+    assert_eq!(p.listen, 0b101);
+}
+
+#[test]
+fn the_overview_fills_as_the_take_is_read() {
+    let mut overview = play::Overview::new();
+    overview.configure(2, 48_000 * 60);
+    assert_eq!(overview.columns(), play::OVERVIEW_COLUMNS);
+    assert_eq!(overview.column(0, 0), None, "nothing read yet");
+    overview.push(0, 0, &[0.25, -0.5, 0.1]);
+    let (low, high) = overview.column(0, 0).unwrap();
+    assert!((low + 0.5).abs() < 1e-3 && (high - 0.25).abs() < 1e-3);
+    assert_eq!(overview.column(1, 0), None);
+    assert!(overview.progress() == 0.0, "the slowest row decides");
+    overview.push(1, 0, &[0.0; 48_000 * 60]);
+    overview.push(0, 3, &[0.0; 48_000 * 60 - 3]);
+    assert_eq!(overview.progress(), 1.0);
+    assert!(overview.column(1, play::OVERVIEW_COLUMNS - 1).is_some());
+    // A take shorter than the columns gets a column per frame.
+    overview.configure(1, 100);
+    assert_eq!(overview.columns(), 100);
+}
+
+#[test]
+fn the_phones_are_the_default_output() {
+    let ufx = ["Analog 1", "Analog 2", "Analog 3", "Analog 4", "Analog 5", "Analog 6", "Analog 7", "Analog 8", "Phones 9", "Phones 10", "AES L", "AES R"];
+    assert_eq!(play::default_output(ufx.len(), |i| ufx[i]), 8);
+    let uc = ["Analog 1", "Analog 2", "Analog 3", "Analog 4", "Analog 5", "Analog 6", "Analog 7", "Analog 8", "SPDIF L", "SPDIF R", "ADAT 1", "ADAT 2"];
+    assert_eq!(play::default_output(uc.len(), |i| uc[i]), 6, "the first model's phones are its analog 7/8");
+    let loopback = ["Out L", "Out R"];
+    assert_eq!(play::default_output(2, |i| loopback[i]), 0);
+    let mut p = Playing::new();
+    (p.outputs, p.output) = (4, Some(0));
+    p.next_output();
+    assert_eq!(p.output, Some(2));
+    p.next_output();
+    assert_eq!(p.output, Some(0), "wraps");
+    let mut saved = Text::<32>::new();
+    p.save(|key, value| {
+        let _ = write!(saved, "{key}={value}");
+    });
+    assert_eq!(saved.as_str(), "play-out=1");
+    let mut back = Playing::new();
+    back.load(|key| (key == "play-out").then_some("9"));
+    assert_eq!(back.output, Some(8));
+}
+
+/// A Play page with two projects and three takes listed, as the tape would fill it.
+fn play_app(device: &mut Fake) -> App {
+    let mut app = recorder_app(device);
+    app.act(device, Action::Page(Page::Play));
+    let p = &mut app.playing;
+    assert_eq!(p.request, Some(PlayRequest::List), "the lists are read when the page is first shown");
+    p.request = None;
+    (p.projects[0], p.projects[1], p.project_count) = (naming::ProjectName::from("Konsert"), naming::ProjectName::from("RecLive"), 2);
+    for (index, take) in ["take003_2026-11-21_101500", "take002_2026-11-21_100000", "take001_2026-11-20_190000"].iter().enumerate() {
+        p.takes[index] = play::TakeName::from(take);
+    }
+    p.take_count = 3;
+    app
+}
+
+#[test]
+fn the_play_page_picks_opens_and_plays_a_take() {
+    let mut device = Fake::new();
+    let mut app = play_app(&mut device);
+    let layout = Layout::new(1280, 800);
+    let labels = app.soft_keys().map(|k| k.label);
+    assert_eq!(&labels[4..], &["Play", "", "", "", "Play", "Stop", "Output", "Quit"]);
+    // Keys: Down picks the next project (and asks for its takes); Enter goes to the takes, Down, Enter opens one.
+    app.act(&mut device, Action::Down);
+    assert_eq!((app.playing.project, app.playing.request), (1, Some(PlayRequest::List)));
+    app.playing.request = None;
+    app.act(&mut device, Action::Enter);
+    assert_eq!(app.playing.focus, Focus::Takes);
+    app.act(&mut device, Action::Down);
+    app.act(&mut device, Action::Enter);
+    assert_eq!((app.playing.take, app.playing.request, app.playing.autoplay), (1, Some(PlayRequest::Open), false));
+    // The tape opens it.
+    let p = &mut app.playing;
+    (p.request, p.open, p.length, p.rate) = (None, Some((p.projects[1], p.takes[1])), 48_000 * 60, 48_000);
+    // Space plays it, again pauses; Right goes on a second; S would stop a recording, so playback stops with its own key.
+    app.act(&mut device, Action::Freeze);
+    assert_eq!(app.playing.request, Some(PlayRequest::Play));
+    app.playing.state = PlayState::Playing;
+    assert_eq!(app.soft_keys()[SOFT_NAV].label, "Pause");
+    app.act(&mut device, Action::Freeze);
+    assert_eq!(app.playing.request, Some(PlayRequest::Pause));
+    app.act(&mut device, Action::Right);
+    assert_eq!(app.playing.request, Some(PlayRequest::Seek(48_000)));
+    app.act(&mut device, Action::Step(-6.0));
+    assert_eq!(app.playing.request, Some(PlayRequest::Seek(48_000 * 11)));
+    app.act(&mut device, Action::PlayStop);
+    assert_eq!(app.playing.request, Some(PlayRequest::Stop));
+    // Space on another take picked while stopped opens that one and plays it.
+    app.playing.state = PlayState::Stopped;
+    app.act(&mut device, Action::Up);
+    app.act(&mut device, Action::Freeze);
+    assert_eq!((app.playing.request, app.playing.autoplay), (Some(PlayRequest::Open), true));
+    // Touch: a take tapped once is picked, twice opened; the overview seeks where it is touched and follows a drag.
+    app.playing.request = None;
+    let take = layout.play_item(Focus::Takes, 2, &app).unwrap();
+    app.press(&mut device, &layout, take.x + 4, take.y + 4);
+    assert_eq!((app.playing.take, app.playing.request), (2, None));
+    app.press(&mut device, &layout, take.x + 4, take.y + 4);
+    assert_eq!(app.playing.request, Some(PlayRequest::Open));
+    app.playing.set_files(&[play::take_file("RecLive_take002_2026-11-21_100000_in01-02.flac").unwrap()]);
+    let wave = layout.play_wave();
+    let grab = app.press(&mut device, &layout, wave.x + wave.w / 4, wave.y + 4);
+    assert_eq!(grab, Some(Grab::Seek));
+    assert_eq!(app.playing.request, Some(PlayRequest::Seek(48_000 * 15)));
+    app.drag(&mut device, &layout, Grab::Seek, wave.x + wave.w / 2, wave.y + 4);
+    assert_eq!(app.playing.request, Some(PlayRequest::Seek(48_000 * 30)));
+    // An input's name toggles listening to it; the output row steps the pair.
+    let row = layout.play_row(1, &app).unwrap();
+    app.press(&mut device, &layout, row.x + 2, row.y + 2);
+    assert_eq!(app.playing.listen, 0b01);
+    (app.playing.outputs, app.playing.output) = (18, Some(6));
+    let output = layout.play_output();
+    app.press(&mut device, &layout, output.x + 4, output.y + 4);
+    assert_eq!(app.playing.output, Some(8));
+    // Everything fits: the lists above the output row, the rows above the live envelope, the buttons inside the page.
+    let last = layout.play_item(Focus::Takes, 2, &app).unwrap();
+    assert!(last.y + last.h <= layout.play_output().y);
+    let stop = layout.play_button(PlayButton::Forward);
+    assert!(stop.x + stop.w <= layout.body.x + layout.body.w && stop.y + stop.h <= layout.body.y + layout.body.h);
+    assert!(layout.play_wave().y + layout.play_wave().h <= layout.play_live().y);
 }

@@ -96,6 +96,7 @@ name = "kakelfix-tape"
 version = "0.1.0"
 dependencies = [
  "archive",
+ "audio-decode",
  "audio-rec",
  "audio-screen",
  "dsp",

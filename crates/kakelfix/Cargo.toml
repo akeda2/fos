@@ -14,3 +14,4 @@ mixer-model = { path = "../mixer-model" }
 [dev-dependencies]
 instrument-rt = { path = "../instrument-rt" }
 tape-rt = { path = "../tape-rt" }
+audio-rec = { path = "../audio-rec" }

@@ -18,6 +18,7 @@ fosfor-abi = { path = "../../abi" }
 gfx = { path = "../../crates/gfx" }
 instrument-rt = { path = "../../crates/instrument-rt" }
 kakelfix = { path = "../../crates/kakelfix" }
+audio-decode = { path = "../../crates/audio-decode" }
 ltas = { path = "../../crates/ltas" }
 mixer-model = { path = "../../crates/mixer-model" }
 

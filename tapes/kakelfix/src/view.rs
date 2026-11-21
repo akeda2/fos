@@ -78,7 +78,7 @@ fn level_colour(db: f32) -> u32 {
     }
 }
 
-pub fn draw(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware, meters: &Meters, capture: &mut crate::analyze::Capture, pointer: Option<(i32, i32)>) {
+pub fn draw(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware, meters: &Meters, capture: &mut crate::analyze::Capture, player: Option<&crate::play::Player>, pointer: Option<(i32, i32)>) {
     header(canvas, layout, app, hardware);
     soft_keys(canvas, layout, app);
     match app.page {
@@ -90,6 +90,7 @@ pub fn draw(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware
         Page::Recorder => crate::record::draw(canvas, layout, app, capture.bank(), capture.problem(), capture.threaded()),
         Page::Analyzer => crate::analyze::draw(canvas, layout, app, capture),
         Page::Meters => crate::meters::draw(canvas, layout, app, hardware, capture.bank(), capture.problem()),
+        Page::Play => crate::play::draw(canvas, layout, app, player),
     }
     footer(canvas, layout, app);
     if let Some((index, value)) = app.confirm {
@@ -114,6 +115,7 @@ fn header(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware) 
             AnView::Both => "Analyzer / Both",
         },
         (Page::Meters, _) => "Meters",
+        (Page::Play, _) => "Play",
     };
     let _ = write!(line, "KakelFix  {}  {page}", hardware.device.mixer.title());
     text(canvas, layout, 8, 4, line.as_str(), t.text);
@@ -141,6 +143,12 @@ fn header(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware) 
     } else if app.page == Page::Recorder {
         let r = &app.recording;
         let _ = write!(line, "inputs {}   {} Hz   peak meters: {}", r.channels, r.rate, if r.nordic { "Nordic PPM" } else { "dBFS" });
+    } else if app.page == Page::Play {
+        let p = &app.playing;
+        let _ = write!(line, "{} take(s) of {} project(s)", p.take_count, p.project_count);
+        if p.open.is_some() {
+            let _ = write!(line, "   {} inputs, {} listened   {} Hz", p.row_count, p.listen.count_ones(), p.rate);
+        }
     } else if app.page == Page::Meters {
         let m = &app.metering;
         let _ = write!(line, "inputs {}", m.channels);
@@ -162,7 +170,7 @@ fn header(canvas: &mut Canvas, layout: &Layout, app: &App, hardware: &Hardware) 
 }
 
 /// Pages (Mixer, Recorder, Analyzer) in the page colour; the active page's views indented under it, joined to it by a
-/// line, each page key with its number key (1-4); actions (Pair, Freeze, Quit, ...) with a plain frame.
+/// line, each page key with its number key (1-5); actions (Pair, Freeze, Quit, ...) with a plain frame.
 fn soft_keys(canvas: &mut Canvas, layout: &Layout, app: &App) {
     let t = theme();
     let page_colour = t.curves[1];
@@ -188,7 +196,7 @@ fn soft_keys(canvas: &mut Canvas, layout: &Layout, app: &App) {
         };
         box_(canvas, area, if key.active { t.grid_major } else { t.grid }, frame);
         if let (SoftKind::Page, Action::Page(page)) = (key.kind, key.action) {
-            // The page's key (1-4) at the left; the name centred in what is left.
+            // The page's key (1-5) at the left; the name centred in what is left.
             let digit = [b'1' + page as u8];
             let digit = core::str::from_utf8(&digit).unwrap_or("");
             text(canvas, layout, area.x + layout.col / 2, area.y + (area.h - layout.row) / 2, digit, label);
@@ -202,13 +210,14 @@ fn soft_keys(canvas: &mut Canvas, layout: &Layout, app: &App) {
 
 fn footer(canvas: &mut Canvas, layout: &Layout, app: &App) {
     let hint = match (app.page, app.view) {
-        (Page::Mixer, View::Outputs) => "Up/Dn 1 dB  PgUp/PgDn 6  +- 0.1  0 unity  x off  m mute  , . pan  o output  p pair  Tab view  1-4 page",
-        (Page::Mixer, View::Matrix) => "arrows select  Enter or click again: open  +- 0.1 dB  0 x m  p P pair  Tab view  1-4 page",
-        (Page::Mixer, View::Device) => "Up/Dn select  Left/Right/Enter or click again: change  Tab view  1-4 page",
-        (Page::Analyzer, _) => "Tab view  Left/Right , . or tap pair  Up/Dn span  space freeze  w env/scope  d dB/lin  f resolution  r reset  1-4 page",
+        (Page::Mixer, View::Outputs) => "Up/Dn 1 dB  PgUp/PgDn 6  +- 0.1  0 unity  x off  m mute  , . pan  o output  p pair  Tab view  1-5 page",
+        (Page::Mixer, View::Matrix) => "arrows select  Enter or click again: open  +- 0.1 dB  0 x m  p P pair  Tab view  1-5 page",
+        (Page::Mixer, View::Device) => "Up/Dn select  Left/Right/Enter or click again: change  Tab view  1-5 page",
+        (Page::Analyzer, _) => "Tab view  Left/Right , . or tap pair  Up/Dn span  space freeze  w env/scope  d dB/lin  f resolution  r reset  1-5 page",
         (Page::Recorder, _) if app.editing.is_some() => "typing the project: A-Z a-z 0-9 - _  Backspace erase  Enter keep (empty: made up)  Tab cancel",
-        (Page::Recorder, _) => "R record  S stop  Left/Right input  Enter arm  a arm all  p project  f format  d disk  Tab scale  r reset  1-4 page",
-        (Page::Meters, _) => "Left/Right input  Up/Dn gain  +- gain  h +48V  i switch  Tab or s scale  r reset  a inputs  drag a gain  1-4 page",
+        (Page::Recorder, _) => "R record  S stop  Left/Right input  Enter arm  a arm all  p project  f format  d disk  Tab scale  r reset  1-5 page",
+        (Page::Play, _) => "Up/Dn pick  Tab list  Enter open  space play/pause  Left/Right 1s  PgUp/Dn 10s  Home/End  , . row  m listen  o output  r reread  1-5 page",
+        (Page::Meters, _) => "Left/Right input  Up/Dn gain  +- gain  h +48V  i switch  Tab or s scale  r reset  a inputs  drag a gain  1-5 page",
     };
     text(canvas, layout, 8, layout.footer.y + 4, fit(hint, layout.footer.w / layout.col - 2), theme().dim);
 }

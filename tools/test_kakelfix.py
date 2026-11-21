@@ -343,6 +343,31 @@ def embedded():
             machine.pump(0.3)
             monitor(str(machine.monitor), "mouse_button 0")
             machine.wait_for("fos>", since=start + 10, timeout=10)
+            # The Play page plays a take while another records: kakelfix on loop1 (nobody else plays into it, so the
+            # stream starts with playback) records project PlayBack and plays the earlier WAV take with the tone into
+            # loop1, so what it records is what it plays.
+            start = len(machine.text())
+            send(machine, b"run kakelfix device=loop1 rec-format=wav rec-ch=all rec-disk=ext2 rec-project=PlayBack\n", 4)
+            send(machine, b"2", 1)
+            lit = toggle_take(machine, True)
+            check(lit >= 20, f"a take on loop1 starts ({lit} pixels)")
+            send(machine, b"5", 2)
+            # Projects are listed by name, ignoring case; the take wanted is the first project's newest (take002, WAV).
+            # PlayBack is listed too: its take began before the page was shown.
+            for _ in range(sorted([project, "RecLive", "PlayBack"], key=str.lower).index(project)):
+                send(machine, b"\x1b[B", 1)
+            send(machine, b"\r", 1)
+            send(machine, b" ", 3)
+            lit = lamp(machine, "play.ppm")
+            check(lit >= 20, f"the take goes on while the Play page plays ({lit} pixels)")
+            machine.pump(2)
+            lit = toggle_take(machine, False)
+            check(lit < 20, f"the take on loop1 stops ({lit} pixels)")
+            pointer_to(machine, *QUIT)
+            monitor(str(machine.monitor), "mouse_button 1")
+            machine.pump(0.3)
+            monitor(str(machine.monitor), "mouse_button 0")
+            machine.wait_for("fos>", since=start + 10, timeout=10)
         finally:
             machine.stop()
         fsck = subprocess.run([tool("e2fsck"), "-fn", str(ext)], capture_output=True, text=True)
@@ -351,7 +376,7 @@ def embedded():
         tree.mkdir()
         subprocess.run([tool("debugfs"), "-R", f"rdump /recordings {tree}", str(ext)], check=True, capture_output=True)
         files = {str(path.relative_to(tree)): path for path in tree.rglob("*") if path.is_file()}
-        check(sorted(p.name for p in (tree / "recordings").iterdir()) == sorted([project, "RecLive"]), f"two project folders, {project} and RecLive", str(sorted(files)))
+        check(sorted(p.name for p in (tree / "recordings").iterdir()) == sorted([project, "RecLive", "PlayBack"]), f"three project folders, {project}, RecLive and PlayBack", str(sorted(files)))
         stamp = r"\d{4}-\d\d-\d\d_\d{6}"
         stem = project.rsplit("_", 2)[0]
         flac_name = next((name for name in files if re.fullmatch(rf"recordings/{project}/take001_({stamp})/{stem}_take001_\1_in01-02\.flac", name)), None)
@@ -360,7 +385,9 @@ def embedded():
         check(wav_name, "the WAV take is take002 of the same project, though named in capitals", str(sorted(files)))
         typed = next((name for name in files if re.fullmatch(rf"recordings/RecLive/take001_({stamp})/RecLive_take001_\1_in02\.wav", name)), None)
         check(typed, "the typed project RecLive (R kept, the space refused) holds its take001", str(sorted(files)))
-        check(len(files) == 3, f"nothing else was written ({len(files)} files)", str(sorted(files)))
+        played = next((name for name in files if re.fullmatch(rf"recordings/PlayBack/take001_({stamp})/PlayBack_take001_\1_in01-02\.wav", name)), None)
+        check(played, "the take recorded while playing is PlayBack's take001", str(sorted(files)))
+        check(len(files) == 4, f"nothing else was written ({len(files)} files)", str(sorted(files)))
         extents = subprocess.run([tool("debugfs"), "-R", f"ex /{flac_name}", str(ext)], capture_output=True, text=True).stdout
         pieces = len([line for line in extents.splitlines() if re.match(r"\s*\d+/\s*\d+", line)])
         check(1 <= pieces <= 3, f"the FLAC file is {pieces} extent(s): written in one piece", extents[-600:])
@@ -371,6 +398,9 @@ def embedded():
         check((channels, rate, align) == (1, 48000, 4), f"the WAV take is input 2 alone, 32-bit float, 48 kHz though rate=44100 was asked ({channels}, {rate}, {align})")
         check(size % align == 0 and size > 48000 * 4, f"the WAV take holds whole frames ({size / 192000:.1f} s)")
         check(sound, "the WAV take holds the tone (not all zero)")
+        channels, rate, align, size, sound = take_wav(files[played].read_bytes())
+        check((channels, rate) == (2, 48000), f"the take recorded while playing has loop1's two channels ({channels}, {rate})")
+        check(sound, "what the Play page played came back through loop1 into the take (not all zero)")
 
 
 def exfat_tree(path: Path):

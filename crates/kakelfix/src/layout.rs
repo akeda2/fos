@@ -1,7 +1,7 @@
 //! Where everything is on the screen, in pixels, and what a point hits. Text is the 8x16 console font, doubled on large
 //! screens. Soft keys run down the right edge; the page fills the rest under a two-line header, above a one-line footer.
 
-use crate::{App, Page, SOFT_ACTIONS, SOFT_NAV, SOFT_SLOTS, SoftKind, View};
+use crate::{App, Focus, Page, SOFT_ACTIONS, SOFT_NAV, SOFT_SLOTS, SoftKind, View};
 
 const GLYPH_W: i32 = 8;
 const GLYPH_H: i32 = 16;
@@ -46,6 +46,13 @@ pub enum Hit {
     RecRow(RecRow),
     /// Recorder: a part of the scroll bar under the meters.
     RecScroll(Scroll),
+    /// Play: a project or take in the lists (`index` counts from the list's start), the output row, an input's name
+    /// (listen or not), the take's overview (go there), a transport button.
+    PlayItem(Focus, usize),
+    PlayOutput,
+    PlayLabel(usize),
+    PlayWave,
+    PlayButton(PlayButton),
     /// Recorder: a transport button under the take clock (Record starts a take, Stop stops it).
     Transport(Transport),
     /// Analyzer: a pair button. Meters: an item of the inputs picker (`App::pick_items`).
@@ -67,6 +74,20 @@ pub enum Transport {
 
 impl Transport {
     pub const ALL: [Transport; 2] = [Transport::Record, Transport::Stop];
+}
+
+/// The Play page's transport, under the take: to the start, 10 s back, play or pause, stop, 10 s on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PlayButton {
+    Start,
+    Back,
+    Play,
+    Stop,
+    Forward,
+}
+
+impl PlayButton {
+    pub const ALL: [PlayButton; 5] = [PlayButton::Start, PlayButton::Back, PlayButton::Play, PlayButton::Stop, PlayButton::Forward];
 }
 
 /// How the Recorder's columns fill the meters' area (`Layout::rec_window`): the armed inputs pinned at the left, then a
@@ -498,6 +519,121 @@ impl Layout {
         Some(Rect::new(n.x, n.y + self.row + 4, n.w, self.rec_arm_h()))
     }
 
+    /// Play: the lists at the left (as wide as the Recorder's panel): projects over takes, the output row at the foot.
+    pub fn play_panel(&self) -> Rect {
+        self.rec_panel()
+    }
+
+    /// Play: list items shown at once in each list (two text rows each, a finger high).
+    pub fn play_visible(&self) -> usize {
+        let panel = self.play_panel();
+        let room = panel.h - 2 * self.row - (self.row * 2 + 12);
+        ((room / 2) / (self.row * 2)).max(1) as usize
+    }
+
+    /// Play: list item `index` of `focus`'s list, when it is scrolled into view.
+    pub fn play_item(&self, focus: Focus, index: usize, app: &App) -> Option<Rect> {
+        let (first, count) = match focus {
+            Focus::Projects => (app.first_project, app.playing.project_count),
+            Focus::Takes => (app.first_take, app.playing.take_count),
+        };
+        let shown = index.checked_sub(first).filter(|&k| k < self.play_visible() && index < count)?;
+        let panel = self.play_panel();
+        let list_h = self.row + self.play_visible() as i32 * self.row * 2;
+        let top = panel.y + 4 + if focus == Focus::Takes { list_h + self.row / 2 } else { 0 } + self.row;
+        Some(Rect::new(panel.x + 4, top + shown as i32 * self.row * 2, panel.w - 8, self.row * 2 - 4))
+    }
+
+    /// Play: the title line over `focus`'s list.
+    pub fn play_title(&self, focus: Focus) -> Rect {
+        let panel = self.play_panel();
+        let list_h = self.row + self.play_visible() as i32 * self.row * 2;
+        let top = panel.y + 4 + if focus == Focus::Takes { list_h + self.row / 2 } else { 0 };
+        Rect::new(panel.x + 4, top, panel.w - 8, self.row)
+    }
+
+    /// Play: the output pair's row at the foot of the lists (a tap: the next pair).
+    pub fn play_output(&self) -> Rect {
+        let panel = self.play_panel();
+        Rect::new(panel.x + 4, panel.y + panel.h - self.row * 2 - 8, panel.w - 8, self.row * 2)
+    }
+
+    /// Play: the take's side of the page, right of the lists.
+    pub fn play_area(&self) -> Rect {
+        let panel = self.play_panel();
+        let x = panel.x + panel.w + self.col * 2;
+        Rect::new(x, self.body.y + 4, self.body.x + self.body.w - 8 - x, self.body.h - 8)
+    }
+
+    /// Play: a transport button, in a row along the foot of the take's side, three text rows tall.
+    pub fn play_button(&self, button: PlayButton) -> Rect {
+        let area = self.play_area();
+        let count = PlayButton::ALL.len() as i32;
+        let w = ((area.w - self.col * (count - 1)) / count).min(self.col * 12);
+        Rect::new(area.x + button as i32 * (w + self.col), area.y + area.h - self.row * 3, w, self.row * 3)
+    }
+
+    /// Play: what is playing now, as a scrolling envelope of the two sides (the Analyzer's), over the transport.
+    pub fn play_live(&self) -> Rect {
+        let area = self.play_area();
+        let h = self.row * 6;
+        Rect::new(area.x, area.y + area.h - self.row * 3 - self.row / 2 - h, area.w, h)
+    }
+
+    /// Play: the take's rows (one per input, its name at the left) between the title line and the live envelope.
+    fn play_rows(&self) -> Rect {
+        let (area, live) = (self.play_area(), self.play_live());
+        let top = area.y + self.row * 2;
+        Rect::new(area.x, top, area.w, live.y - self.row - top)
+    }
+
+    /// Play: the width of the input names at the left of the rows.
+    fn play_label_w(&self) -> i32 {
+        self.col * 9
+    }
+
+    /// Play: the overview's part of the rows (where a tap or a drag goes in the take).
+    pub fn play_wave(&self) -> Rect {
+        let rows = self.play_rows();
+        let label = self.play_label_w();
+        Rect::new(rows.x + label, rows.y, rows.w - label, rows.h)
+    }
+
+    /// Play: row `row` of the open take: the name at the left, its envelope in `play_wave`'s columns. Rows share the
+    /// height (at most four text rows each, at least one).
+    pub fn play_row(&self, row: usize, app: &App) -> Option<Rect> {
+        let count = app.playing.row_count;
+        if row >= count {
+            return None;
+        }
+        let rows = self.play_rows();
+        let h = (rows.h / count as i32).clamp(self.row, self.row * 4);
+        let y = rows.y + row as i32 * h;
+        (y + h <= rows.y + rows.h + 1).then(|| Rect::new(rows.x, y, rows.w, h))
+    }
+
+    fn play_hit(&self, app: &App, x: i32, y: i32) -> Hit {
+        for focus in [Focus::Projects, Focus::Takes] {
+            let count = if focus == Focus::Projects { app.playing.project_count } else { app.playing.take_count };
+            if let Some(index) = (0..count).find(|&i| self.play_item(focus, i, app).is_some_and(|r| r.contains(x, y))) {
+                return Hit::PlayItem(focus, index);
+            }
+        }
+        if self.play_output().contains(x, y) {
+            return Hit::PlayOutput;
+        }
+        if let Some(button) = PlayButton::ALL.into_iter().find(|&b| self.play_button(b).contains(x, y)) {
+            return Hit::PlayButton(button);
+        }
+        if self.play_wave().contains(x, y) {
+            return Hit::PlayWave;
+        }
+        if let Some(row) = (0..app.playing.row_count).find(|&r| self.play_row(r, app).is_some_and(|r| r.contains(x, y))) {
+            return Hit::PlayLabel(row);
+        }
+        Hit::Nothing
+    }
+
     fn rec_hit(&self, app: &App, x: i32, y: i32) -> Hit {
         if let Some(button) = Transport::ALL.into_iter().find(|&button| self.rec_transport(button).contains(x, y)) {
             return Hit::Transport(button);
@@ -680,6 +816,9 @@ impl Layout {
         }
         if app.page == Page::Recorder {
             return self.rec_hit(app, x, y);
+        }
+        if app.page == Page::Play {
+            return self.play_hit(app, x, y);
         }
         if app.page == Page::Analyzer {
             return (0..app.analysis.pairs()).find(|&p| self.an_pair(p, app).is_some_and(|r| r.contains(x, y))).map_or(Hit::Nothing, Hit::AnPair);

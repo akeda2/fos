@@ -739,21 +739,31 @@ must not race an in-flight disk transfer or audio refill (mf has several CPUs); 
 `test-usb-kbd-replug` pin today's behaviour and change with it. Verify on the real hubs (Realtek 0bda:0401, the AMD
 board's EHCI) before trusting it. The once-a-second audio check can go then.
 
-## KakelFix after milestone one (the Mixer page)
+## KakelFix (2026-11-21)
 
-- **Next: the Recorder page** (a placeholder now; capture owned by the tape), then output and mix meters. A goniometer on
-  the Meters page.
+Done: the Mixer, Meters, Analyzer and Recorder pages (`docs/design.md` "KakelFix"). The Recorder writes takes as FLAC or
+WAV into project and take folders on exFAT or ext4, from a writer thread, with Record and Stop buttons, armed inputs pinned
+at the left and a scroll bar for the rest. Still open:
+
+- **Play page, next steps** (the page itself is done: `docs/design.md` "Play page"): peak files written beside a take by
+  the Recorder, so the overview is there at once; playing the take being recorded (up to its last checkpoint); jog
+  (audio following the finger: varispeed); a zoomed view under the overview. Not yet heard on hardware: playback on a
+  USB interface while it records.
+- Recorder: pre-roll (`audio_rec::preroll`), the sound/silence trigger (`audio_rec::silence`), a count of float samples
+  off the 24-bit grid.
+- Output and mix meters; a goniometer on the Meters page.
 - Loudness on a program mix: route the mix to an output and switch that output's device loopback on ("Loopback N", or
   `mt-loop=IN:OUT` for a cable); the input is then named "Loop N" and a "Loop" preset appears. Not yet measured on hardware:
   LUFS through a real loopback, and whether the second USB model's loopback is post-mixer and bit-exact (its spec lists the
   open experiments).
-- The Meters page ran on both USB models (aneby, rack, server kernel), touch included: per-input controls, +48V asking
-  first, faders dragged on rack's touch screen, swiping, the inputs picker. The PCI card is untested.
-- The Analyzer ran on the USB interface (aneby, server kernel); the PCI card and the second USB model are untested.
-- The Mixer page ran on real hardware (a USB interface's driver, on the server kernel, with a PS/2 touchpad); the same
-  driver's second model is untested there, and the PCI card's driver has no `Mixer` yet.
-- Meters are read by the drawing thread; a device whose meter read is slow (bulk reads under the USB lock) would want them on a
-  thread too. The driver caches a set for 50 ms.
+- Meters are read by the drawing thread; a device whose meter read is slow (bulk reads under the USB lock) would want them on
+  a thread too. The driver caches a set for 50 ms. The USB lock is fair since 2026-11-21, so a disk writer no longer starves
+  them.
+- Hardware not yet tried: the PCI card on any page (its driver has no `Mixer` yet); the second USB model on the Mixer and
+  Analyzer pages. Done on the USB interfaces (server kernel): Mixer, Meters (touch included), Analyzer, Recorder (takes to
+  ext4 and to an exFAT stick).
+- To decide: whether loopbacks are exempt from the one-audio-owner rule on the server kernel; WavPack (float files of more
+  than 8 channels) only if needed.
 
 ## Debug tools on the server kernel (2026-10)
 

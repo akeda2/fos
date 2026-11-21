@@ -14,7 +14,7 @@ use gfx::plot::{Frame, Scale, axis_label, curve, spline};
 use gfx::theme::theme;
 use kakelfix::analyzer::{Envelope, FLOOR_DB, SPANS_S, Scope, TIMEBASES_MS};
 use kakelfix::recorder::Request;
-use kakelfix::{App, Layout, Page, Rect, Text, WaveMode};
+use kakelfix::{App, Layout, Page, PlayState, Rect, Text, WaveMode};
 use ltas::{Analyzer, Config, Mode, Resolution};
 use mixer_model::lin_to_db;
 use tape_rt::{FP_AVX2, TapeApi, alloc_bytes, alloc_zeroed};
@@ -55,6 +55,8 @@ pub struct Capture {
     /// The rate the meter bank was set up for.
     bank_rate: u32,
     running: bool,
+    /// The stream was started with its playback side too (the Play page plays into it).
+    playback: bool,
     failed: bool,
     seen: u32,
     columns: usize,
@@ -103,7 +105,7 @@ impl Capture {
             let spare = ((api.free_pages)() * 4096).saturating_sub(MEMORY_RESERVE);
             (api.audio_set_capture_ring)(spare.min(RING_BYTES) as u64);
         }
-        Capture { input, buffers, rate, bank_rate: rate, running: false, failed: false, seen: 0, columns: 0, bank, feed }
+        Capture { input, buffers, rate, bank_rate: rate, running: false, playback: false, failed: false, seen: 0, columns: 0, bank, feed }
     }
 
     /// The capture rate (what a take is recorded at).
@@ -176,12 +178,19 @@ impl Capture {
         }
     }
 
+    /// The device's playback side while the stream runs with it: (channels, slot bytes, float).
+    pub fn playback(&self) -> Option<(usize, usize, bool)> {
+        let input = self.input.as_ref().ok().filter(|_| self.running && self.playback)?;
+        Some((input.playback_channels, input.playback_slot, input.playback_float))
+    }
+
     /// Starts or stops capture with the pages and the take, serves the take's requests and feeds what arrived to the take,
     /// the meters or the Analyzer; true when there is something new to draw.
     pub fn update(&mut self, api: &TapeApi, app: &mut App, layout: &Layout) -> bool {
-        let shown = matches!(app.page, Page::Analyzer | Page::Meters | Page::Recorder);
+        let shown = matches!(app.page, Page::Analyzer | Page::Meters | Page::Recorder | Page::Play);
         let asked = app.recording.request == Some(Request::Start);
-        if !shown && !asked && !self.taking() {
+        let playing = app.playing.state == PlayState::Playing;
+        if !shown && !asked && !self.taking() && !playing {
             self.stop(api, app);
             self.failed = false;
             return false;
@@ -191,7 +200,12 @@ impl Capture {
             return false;
         };
         if !self.running && !self.failed {
-            match input.start_capture(api, self.rate) {
+            // With playback when the device has it, so the Play page can play while a take records: a stream's sides
+            // are fixed when it starts. A playback end held by someone else (a loopback another tape plays into)
+            // refuses it, and capture starts alone.
+            self.playback = input.playback_ok() && (api.audio_start)(self.rate, 1, 1) == 0;
+            let started = if self.playback { Ok(()) } else { input.start_capture(api, self.rate) };
+            match started {
                 Ok(()) => {
                     self.running = true;
                     app.analysis.rate = self.rate;
@@ -283,6 +297,7 @@ impl Capture {
         if self.running {
             (api.audio_stop)();
             self.running = false;
+            self.playback = false;
             app.analysis.rate = 0;
         }
     }
