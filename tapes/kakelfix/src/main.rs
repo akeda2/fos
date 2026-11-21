@@ -437,7 +437,13 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         }
     }
     let threaded = capture.threaded();
+    if let Some(player) = player.as_deref_mut() {
+        player.quit();
+    }
     capture.quit(api, &mut app);
+    if let Some(line) = player.as_deref().and_then(|player| player.summary(&app)) {
+        println!("{}", line.as_str());
+    }
     screen.close();
     if app.recording.take.files > 0 {
         println!("kakelfix: {} ({})", app.message.as_str(), if threaded { "written on its own thread" } else { "written inline" });

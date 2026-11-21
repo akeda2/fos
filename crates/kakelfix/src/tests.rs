@@ -1351,7 +1351,7 @@ fn listened_inputs_alternate_left_and_right() {
 
 #[test]
 fn the_overview_fills_as_the_take_is_read() {
-    let mut overview = play::Overview::new();
+    let overview = play::Overview::new();
     overview.configure(2, 48_000 * 60);
     assert_eq!(overview.columns(), play::OVERVIEW_COLUMNS);
     assert_eq!(overview.column(0, 0), None, "nothing read yet");
@@ -1367,6 +1367,20 @@ fn the_overview_fills_as_the_take_is_read() {
     // A take shorter than the columns gets a column per frame.
     overview.configure(1, 100);
     assert_eq!(overview.columns(), 100);
+    // One push over many columns, starting mid-column: each column gets the lowest and highest of its own frames.
+    overview.configure(1, 4096 * 10);
+    let mut ramp = [0f32; 4096 * 3];
+    for (n, sample) in ramp.iter_mut().enumerate() {
+        *sample = n as f32 / (4096.0 * 3.0);
+    }
+    overview.push(0, 20, &ramp);
+    let per = 4096 * 10 / play::OVERVIEW_COLUMNS as u64; // 40 frames a column
+    let column = 100;
+    let (low, high) = overview.column(0, column).unwrap();
+    let first = (column as u64 * per - 20) as f32 / (4096.0 * 3.0);
+    let last = ((column as u64 + 1) * per - 1 - 20) as f32 / (4096.0 * 3.0);
+    assert!((low - first).abs() < 1e-4 && (high - last).abs() < 1e-4, "{low} {high} vs {first} {last}");
+    assert!(overview.column(0, 0).is_some() && overview.column(0, 400).is_none());
 }
 
 #[test]
@@ -1473,4 +1487,68 @@ fn the_play_page_picks_opens_and_plays_a_take() {
     let stop = layout.play_button(PlayButton::Forward);
     assert!(stop.x + stop.w <= layout.body.x + layout.body.w && stop.y + stop.h <= layout.body.y + layout.body.h);
     assert!(layout.play_wave().y + layout.play_wave().h <= layout.play_live().y);
+}
+
+#[test]
+fn the_recorder_logs_peaks_and_they_get_coarser_rather_than_run_out() {
+    use peaks::{EMPTY, FIRST_FRAMES_PER_PEAK, Header, PeakLog, unpack};
+    let mut cells = [0u32; 2 * 64];
+    let mut log = PeakLog::new(&mut cells);
+    log.start(2);
+    // Two blocks that cross a peak boundary in the middle: 700 frames, then 400.
+    let per = FIRST_FRAMES_PER_PEAK as usize;
+    for (length, value) in [(700usize, 0.5f32), (400, -0.25)] {
+        log.reserve(length);
+        let left = [value; 700];
+        let right = [-value; 700];
+        log.fold(0, &left[..length]);
+        log.fold(1, &right[..length]);
+        log.advance(length);
+    }
+    assert_eq!((log.frames(), log.peaks(), log.frames_per_peak() as usize), (1100, 3, per));
+    let mut body = [0u8; 3 * 2 * 4];
+    assert_eq!(log.body(0, 2, 0, &mut body), body.len());
+    let cell = |peak: usize, channel: usize| unpack(u32::from_le_bytes(body[(peak * 2 + channel) * 4..][..4].try_into().unwrap()));
+    assert_eq!(cell(0, 0), (16383, 16383), "the first peak saw only the first block");
+    assert_eq!(cell(1, 0), (-8191, 16383), "the second straddles both blocks");
+    assert_eq!(cell(1, 1), (-16383, 8191));
+    assert_eq!(cell(2, 0), (-8191, -8191));
+    // Input 1 alone, for a file of that input.
+    let mut one = [0u8; 3 * 4];
+    assert_eq!(log.body(1, 1, 0, &mut one), one.len());
+    assert_eq!(unpack(u32::from_le_bytes(one[4..8].try_into().unwrap())), (-16383, 8191));
+    // Past the 64 peaks the cells hold, pairs merge: the frames per peak double, nothing is lost.
+    log.reserve(per * 70);
+    let ramp = [0.1f32; 512 * 70];
+    log.fold(0, &ramp[..per * 70]);
+    log.fold(1, &ramp[..per * 70]);
+    log.advance(per * 70);
+    assert_eq!(log.frames_per_peak() as usize, per * 2);
+    assert!(log.peaks() <= 64);
+    let mut merged = [0u8; 4];
+    log.body(0, 1, 0, &mut merged);
+    assert_eq!(unpack(u32::from_le_bytes(merged)), (-8191, 16383), "the first two peaks, merged");
+    assert_ne!(u32::from_le_bytes(merged), EMPTY);
+    // The header goes out and comes back; a file shorter than its peaks, or another file, is refused.
+    let header = log.header(1, 48_000);
+    let mut bytes = [0u8; peaks::HEADER];
+    header.write(&mut bytes);
+    let length = peaks::HEADER as u64 + header.peaks * 4;
+    assert_eq!(Header::parse(&bytes, length), Some(header));
+    assert_eq!(Header::parse(&bytes, length - 1), None);
+    assert_eq!(Header::parse(b"RIFF\0\0\0\0WAVEfmt ", 1 << 20), None);
+    assert_eq!(peaks::file_name("Konsert_take007_2026-11-20_143512_in01-08.flac").unwrap().as_str(), "Konsert_take007_2026-11-20_143512_in01-08.peaks");
+}
+
+#[test]
+fn a_peak_spans_every_column_it_covers() {
+    let overview = play::Overview::new();
+    overview.configure(1, 100);
+    overview.push_range(0, 10, 30, -100, 200);
+    assert_eq!(overview.column(0, 9), None);
+    let (low, high) = overview.column(0, 25).unwrap();
+    assert!((low * 32767.0 + 100.0).abs() < 1.0 && (high * 32767.0 - 200.0).abs() < 1.0);
+    assert!(overview.column(0, 39).is_some() && overview.column(0, 40).is_none());
+    overview.push_range(0, 40, 60, 0, 0);
+    assert_eq!(overview.progress(), 1.0);
 }

@@ -745,9 +745,9 @@ Done: the Mixer, Meters, Analyzer and Recorder pages (`docs/design.md` "KakelFix
 WAV into project and take folders on exFAT or ext4, from a writer thread, with Record and Stop buttons, armed inputs pinned
 at the left and a scroll bar for the rest. Still open:
 
-- **Play page, next steps** (the page itself is done: `docs/design.md` "Play page"): peak files written beside a take by
-  the Recorder, so the overview is there at once; playing the take being recorded (up to its last checkpoint); jog
-  (audio following the finger: varispeed); a zoomed view under the overview. Not yet heard on hardware: playback on a
+- **Play page, next steps** (the page and the Recorder's peak files are done: `docs/design.md` "Play page"): playing the
+  take being recorded (up to its last checkpoint; its peaks could come from the writer's log); jog (audio following the
+  finger: varispeed); a zoomed view under the overview (the peak files hold 512-frame peaks for it). Not yet heard on hardware: playback on a
   USB interface while it records.
 - Recorder: pre-roll (`audio_rec::preroll`), the sound/silence trigger (`audio_rec::silence`), a count of float samples
   off the 24-bit grid.

@@ -44,6 +44,7 @@ use gfx::theme::theme;
 use core::sync::atomic::{AtomicU32, Ordering};
 use kakelfix::channel::{Mailbox, Ring};
 use kakelfix::naming::{self, FileName, ProjectName, Stamp};
+use kakelfix::peaks::{self, PeakLog};
 use kakelfix::recorder::{Disk, Encoding, GROUP, MAX_DISKS, MAX_GROUPS, Request, Take, Volume, clock, describe_channels, duration, size};
 use kakelfix::{App, Layout, RecRow, Recording, Text, Transport, fit_name, wrap};
 use tape_rt::{AudioBuffer, AudioStats, DISK_EXFAT, DISK_FAT32, DISK_FOSFS, DiskInfo, FS_EXISTS, TapeApi, VFS_DIR, VFS_FILE, VfsVolume, alloc_bytes, alloc_zeroed};
@@ -159,6 +160,8 @@ struct Group {
     file: &'static mut FlacFile,
     sink: Out,
     mask: u32,
+    /// Its file's name (for its peak file beside it).
+    name: FileName,
     quantizers: [Quantizer; GROUP],
 }
 
@@ -473,7 +476,17 @@ pub struct Writer {
     started_us: u64,
     ring_bytes: u64,
     peak_backlog: u64,
+    /// The take's peaks (`kakelfix::peaks`), written beside its files when it stops; its folder and the WAV file's name.
+    peaks: PeakLog<'static>,
+    folder: Text<{ naming::MAX_PATH }>,
+    wav_name: FileName,
+    /// The take is on an ext volume (its peak files go through the path calls, else a stream).
+    ext: bool,
 }
+
+/// Memory for a take's peaks: 4 M cells, about 3 hours of 32 inputs at the first resolution (a longer take's peaks are
+/// merged, `PeakLog`).
+const PEAK_CELLS: usize = 4 << 20;
 
 impl Writer {
     /// For capture of `input`'s format; `block` is the most bytes one `audio_read` gives (at most `CHUNK` frames). None
@@ -489,10 +502,14 @@ impl Writer {
                 file: alloc_zeroed(api)?,
                 sink: Out::vfs(),
                 mask: 0,
+                name: FileName::new(),
                 quantizers: [const { Quantizer::new(24, 1) }; GROUP],
             })
         };
         let groups = [group()?, group()?, group()?, group()?];
+        let cells = alloc_bytes(api, PEAK_CELLS * 4)?;
+        // SAFETY: a fresh allocation of `PEAK_CELLS` u32s, 4-aligned (the heap gives pages), the writer's for good.
+        let cells = unsafe { core::slice::from_raw_parts_mut(cells.as_mut_ptr() as *mut u32, PEAK_CELLS) };
         Some(Writer {
             staging,
             select: alloc_bytes(api, block)?,
@@ -512,6 +529,10 @@ impl Writer {
             started_us: 0,
             ring_bytes: 0,
             peak_backlog: 0,
+            peaks: PeakLog::new(cells),
+            folder: Text::new(),
+            wav_name: FileName::new(),
+            ext: false,
         })
     }
 
@@ -563,6 +584,7 @@ impl Writer {
         if !opened {
             return;
         }
+        self.peaks.start(self.mask.count_ones() as usize);
         self.running = true;
         report.take.running = true;
         self.next_checkpoint = tape_rt::micros() + CHECKPOINT_US;
@@ -627,6 +649,7 @@ impl Writer {
         let leaf = naming::file_name(place.project.as_str(), place.number, &place.now, self.mask, r.extension());
         let name = naming::join(&[place.folder.as_str(), leaf.as_str()]);
         let ext = r.target().is_some_and(|d| d.volume == Volume::Ext);
+        (self.folder, self.wav_name, self.ext) = (Text::from(place.folder.as_str()), leaf, ext);
         // No `Recorder` holds the static now: the last take's was finished (consumed) before this one.
         let sink = unsafe { (*(&raw mut SINK)).insert(if ext { Out::vfs() } else { Out::Stream(StreamSink::new(api.fs_stream_open, api.fs_stream_write, api.fs_stream_close, tape_rt::micros, STAGING / 2)) }) };
         // Only one `Recorder` holds the staging block at a time: the last one was finished (consumed) before this.
@@ -656,6 +679,7 @@ impl Writer {
         let ext = r.target().is_some_and(|d| d.volume == Volume::Ext);
         let armed = self.mask.count_ones().max(1) as u64;
         self.bits = bits;
+        (self.folder, self.ext) = (Text::from(place.folder.as_str()), ext);
         let mut first = FileName::new();
         for (g, &mask) in groups[..count].iter().enumerate() {
             let channels = mask.count_ones();
@@ -668,6 +692,7 @@ impl Writer {
             let group = &mut self.groups[g];
             group.sink = if ext { Out::vfs() } else { Out::Stream(StreamSink::with_handle(api.fs_stream_open2, api.fs_stream_write2, api.fs_stream_close2, tape_rt::micros, archive::file::STAGE / 2)) };
             group.mask = mask;
+            group.name = leaf;
             group.quantizers = core::array::from_fn(|c| Quantizer::new(bits, 0x9E37_79B9u32.wrapping_mul((g * GROUP + c) as u32 + 1)));
             let info = Info { sample_rate: job.rate, channels, bits };
             if let Err(error) = group.file.begin(&mut group.sink, name.as_str().as_bytes(), reserve, info, &tags) {
@@ -692,7 +717,10 @@ impl Writer {
         if !self.running {
             return;
         }
+        let frames = (data.len() / self.input.frame_bytes().max(1)).min(CHUNK);
+        self.peaks.reserve(frames);
         let failed = if self.open_groups > 0 { self.push_flac(data) } else { self.push_wav(data) };
+        self.peaks.advance(frames);
         if let Err(problem) = failed {
             report.say(format_args!("writing {} failed ({problem}): take stopped", { report.take.file }.as_str()));
             self.stop(api, report);
@@ -700,6 +728,11 @@ impl Writer {
     }
 
     fn push_wav(&mut self, data: &[u8]) -> Result<(), Problem> {
+        let i = &self.input;
+        for (k, channel) in (0..32).filter(|&c| self.mask & 1 << c != 0).enumerate() {
+            let got = unpack_channel(data, &mut self.floats[..], i.channels, i.slot, i.bits, i.float, channel).min(CHUNK);
+            self.peaks.fold(k, &self.floats[..got]);
+        }
         let (channels, slot) = (self.input.channels, self.input.slot);
         let full = if channels >= 32 { u32::MAX } else { (1u32 << channels) - 1 };
         let block: &[u8] = if self.mask == full {
@@ -722,10 +755,13 @@ impl Writer {
         debug_assert!(frames <= CHUNK, "the worker hands over at most a capture block");
         let frames = frames.min(CHUNK);
         let shift = 24 - self.bits;
+        let mut armed = 0;
         for group in self.groups[..self.open_groups].iter_mut() {
             let mut used = 0;
             for channel in (0..32).filter(|&c| group.mask & 1 << c != 0) {
                 let got = unpack_channel(data, &mut self.floats[..], i.channels, i.slot, i.bits, i.float, channel).min(frames);
+                self.peaks.fold(armed, &self.floats[..got]);
+                armed += 1;
                 let (out, quantizer) = (&mut self.ints[used], &mut group.quantizers[used]);
                 for (sample, &x) in out[..got].iter_mut().zip(&self.floats[..got]) {
                     *sample = quantizer.quantize(x) >> shift;
@@ -764,6 +800,27 @@ impl Writer {
                 }
             }
         }
+        // The peak files, beside the audio files (now closed, so a stream is free on exFAT); without them the Play page
+        // reads the audio.
+        let mut peaks_failed = None;
+        if self.peaks.frames() > 0 {
+            let mut first = 0;
+            let files: [(FileName, usize); MAX_GROUPS] = core::array::from_fn(|g| {
+                if self.open_groups == 0 {
+                    (if g == 0 { self.wav_name } else { FileName::new() }, if g == 0 { self.mask.count_ones() as usize } else { 0 })
+                } else if g < self.open_groups {
+                    (self.groups[g].name, self.groups[g].mask.count_ones() as usize)
+                } else {
+                    (FileName::new(), 0)
+                }
+            });
+            for (name, channels) in files.into_iter().filter(|&(_, channels)| channels > 0) {
+                if let Err(code) = self.write_peaks(api, name.as_str(), first, channels) {
+                    peaks_failed = Some(code);
+                }
+                first += channels;
+            }
+        }
         self.open_groups = 0;
         self.running = false;
         let t = &mut report.take;
@@ -779,6 +836,44 @@ impl Writer {
                 report.say(format_args!("saved {}, {}", file.as_str(), seconds.as_str()));
             }
         }
+        if let Some(code) = peaks_failed {
+            report.say(format_args!("saved; its peak file could not be written (code {code}): Play reads the audio"));
+        }
+    }
+
+    /// Writes the peak file of audio file `audio` (inputs `first..first + channels` of the take), in the staging block's
+    /// pieces (the WAV file that used it is closed).
+    fn write_peaks(&mut self, api: &TapeApi, audio: &str, first: usize, channels: usize) -> Result<(), i32> {
+        let Some(leaf) = peaks::file_name(audio) else { return Ok(()) };
+        let path = naming::join(&[self.folder.as_str(), leaf.as_str()]);
+        let header = self.peaks.header(channels, self.format.rate);
+        let total = header.offset(header.peaks);
+        let mut sink = if self.ext { Out::vfs() } else { Out::Stream(StreamSink::new(api.fs_stream_open, api.fs_stream_write, api.fs_stream_close, tape_rt::micros, STAGING / 2)) };
+        sink.open(path.as_str().as_bytes(), total)?;
+        // SAFETY: no `Recorder` holds the staging block now (the take's WAV file, if any, was finished above).
+        let block = unsafe { core::slice::from_raw_parts_mut(self.staging as *mut u8, STAGING) };
+        let mut at = 0u64;
+        while at < total {
+            let mut filled = 0;
+            if at == 0 {
+                let mut head = [0u8; peaks::HEADER];
+                header.write(&mut head);
+                block[..peaks::HEADER].copy_from_slice(&head);
+                filled = peaks::HEADER;
+            }
+            let body_at = (at + filled as u64).saturating_sub(peaks::HEADER as u64);
+            filled += self.peaks.body(first, channels, body_at, &mut block[filled..]);
+            let last = at + filled as u64 >= total;
+            if let Err(code) = sink.write(at, &block[..filled], if last { total } else { 0 }) {
+                let _ = sink.close(0);
+                return Err(code);
+            }
+            at += filled as u64;
+            if filled == 0 {
+                break;
+            }
+        }
+        sink.close(total)
     }
 
     /// Brings the take's figures up to date: length, bytes, the disk's speed, lost audio, the kernel's backlog.

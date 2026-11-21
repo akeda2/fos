@@ -3,9 +3,11 @@
 //! inputs listened to mixed to the output pair (`kakelfix::play::Playing::mix`) and written to the device's playback
 //! side, the whole take read through a second time in the background for its overview.
 //!
-//! Everything runs on the drawing thread, a bounded amount per pass: playback is kept about `AHEAD_MS` ahead of the
-//! device, the overview reads `SCAN_FRAMES` a pass. Capture is read in the same loop, so a pass never blocks for long:
-//! a disk read is one `vfs_read` of at most `CHUNK` bytes.
+//! Playback runs on the drawing thread, a bounded amount per pass: it is kept about `AHEAD_MS` ahead of the device.
+//! The overview is read by a thread of its own where the kernel runs tape threads (the server kernel): `Scanner`, which
+//! reads `SCAN_FRAMES` of each file at a time and rests (`tape_rt::idle`) in between, so the drawing thread keeps the
+//! CPU even when both are pinned to the same one. Without threads the drawing thread scans for at most `INLINE_US` a
+//! pass. The overview is redrawn at most every `REDRAW_US` while it fills.
 //!
 //! The stream is started with playback when the device has a playback side (`analyze::Capture`); when it is not (a
 //! loopback whose playback end another tape holds), the page says so and only shows takes.
@@ -14,11 +16,13 @@ use crate::view::{centered, text};
 use audio_decode::flac::Decoder;
 use audio_decode::{Source, SourceError};
 use core::fmt::Write;
+use core::sync::atomic::{AtomicU32, Ordering};
 use fosfor_abi::tape::{AudioInfo, TapeApi, VFS_DIR};
 use gfx::Canvas;
 use gfx::theme::theme;
 use kakelfix::analyzer::Envelope;
 use kakelfix::naming::{self, MAX_PATH, ProjectName};
+use kakelfix::peaks;
 use kakelfix::play::{MAX_FILES, MAX_LIST, MAX_ROWS, Overview, TakeFile, TakeName, WavLayout, default_output, take_file};
 use kakelfix::{App, Focus, Layout, PlayButton, PlayRequest, PlayState, Playing, Rect, Text};
 use mixer_model::Group;
@@ -27,8 +31,15 @@ use tape_rt::alloc_zeroed;
 /// Playback is kept this far ahead of the device: enough to ride out a slow pass, little enough that a pause, a seek or
 /// a stop is heard at once.
 const AHEAD_MS: u64 = 150;
-/// Frames the overview reads per pass, for each file.
-const SCAN_FRAMES: usize = 32_768;
+/// Frames the overview reads of each file before it rests (thread) or looks at the time (inline).
+const SCAN_FRAMES: usize = 8_192;
+/// The most the drawing thread scans a pass when there is no scanner thread.
+const INLINE_US: u64 = 3_000;
+/// How often the page is redrawn for the overview's progress alone.
+const REDRAW_US: u64 = 250_000;
+/// How long `hold` waits for the scanner to let go of its readers (it does within one read).
+const HOLD_US: u64 = 500_000;
+const SCANNER_STACK: usize = 64 * 1024;
 /// The most bytes one disk read asks for.
 const CHUNK: usize = 64 * 1024;
 /// Frames mixed and written per step.
@@ -145,11 +156,23 @@ impl Reader {
 /// The page's tape side (one, from the heap): readers for playing and for the overview, the overview and the live envelope.
 pub struct Player {
     play: [Option<Reader>; MAX_FILES],
-    scan: [Option<Reader>; MAX_FILES],
+    /// The scanner's thread, when the kernel runs tape threads (started with the first take).
+    thread: Option<tape_rt::Thread>,
+    tried_thread: bool,
+    /// The overview was read on the scanner thread (kept after `quit` joins it, for the summary).
+    threaded: bool,
+    /// The scanner thread holds off (`hold` succeeded, `release` not yet called): its static is the drawing thread's.
+    held: bool,
+    /// When the page was last redrawn for the overview's progress.
+    shown_at: u64,
+    /// Frames played since the tape started (for the line it prints at the end).
+    played: u64,
+    /// Files of the open take whose overview comes from their peak file.
+    from_peaks: usize,
     /// Decoders and WAV buffers made so far (they are kept for the next take; the heap gives nothing back).
     decoders: [Option<&'static mut Flac>; 2 * MAX_FILES],
     buffers: [Option<&'static mut WavBuffer>; 2 * MAX_FILES],
-    overview: &'static mut Overview,
+    overview: &'static Overview,
     live: &'static mut Envelope,
     live_columns: usize,
     /// Each file's channel to row (`rows[file][channel]`).
@@ -169,7 +192,9 @@ impl Player {
     pub fn new(api: &TapeApi) -> Option<&'static mut Player> {
         let player: &'static mut Player = alloc_zeroed(api)?;
         // Everything in it is numbers or `None` (all zero bytes) except the two buffers, which are numbers too.
-        player.overview = alloc_zeroed(api)?;
+        let overview: &'static mut Overview = alloc_zeroed(api)?;
+        // Zero bytes are no overview at all (no rows); `configure` gives it its shape when a take opens.
+        player.overview = overview;
         player.live = alloc_zeroed(api)?;
         Some(player)
     }
@@ -253,9 +278,81 @@ impl Player {
             fresh |= self.pump(api, app);
         }
         if app.playing.open.is_some() && self.overview.progress() < 1.0 {
-            fresh |= self.scan();
+            if self.thread.is_none() {
+                // No thread: a few milliseconds of it a pass.
+                let began = tape_rt::micros();
+                // SAFETY: without a thread the scanner is the drawing thread's alone.
+                if let Some(scanner) = unsafe { (*(&raw mut SCANNER)).as_mut() } {
+                    while tape_rt::micros().wrapping_sub(began) < INLINE_US && scanner.step() {}
+                }
+            }
+            let now = tape_rt::micros();
+            if now.wrapping_sub(self.shown_at) >= REDRAW_US || self.overview.progress() >= 1.0 {
+                self.shown_at = now;
+                fresh = true;
+            }
         }
         fresh
+    }
+
+    /// Asks the scanner thread to let go of its readers and waits until it has (true), so the drawing thread may change
+    /// them. Without a thread there is nothing to wait for.
+    fn hold(&mut self) -> bool {
+        if self.thread.is_none() {
+            return true;
+        }
+        let job = JOB.fetch_add(1, Ordering::AcqRel) + 1;
+        tape_rt::futex_wake(&JOB, 1);
+        let began = tape_rt::micros();
+        while HELD.load(Ordering::Acquire) != job {
+            if tape_rt::micros().wrapping_sub(began) >= HOLD_US {
+                // Leave it odd: the scanner holds off when it gets there, and the next `hold` waits again.
+                return false;
+            }
+            tape_rt::idle();
+        }
+        self.held = true;
+        true
+    }
+
+    /// Lets the scanner thread go on with the readers it has now.
+    fn release(&mut self) {
+        self.held = false;
+        if self.thread.is_some() && JOB.load(Ordering::Acquire) & 1 == 1 {
+            JOB.fetch_add(1, Ordering::AcqRel);
+            tape_rt::futex_wake(&JOB, 1);
+        }
+    }
+
+    /// The line printed when the tape ends, if a take was opened: what was played and how much of the overview read.
+    pub fn summary(&self, app: &App) -> Option<Text<160>> {
+        let (project, take) = app.playing.open?;
+        let mut line = Text::new();
+        let rate = u64::from(app.playing.rate.max(1));
+        let _ = write!(
+            line,
+            "kakelfix: played {} / {}: {}.{} s, overview read {}% ({})",
+            project.as_str(),
+            take.as_str(),
+            self.played / rate,
+            self.played % rate * 10 / rate,
+            (self.overview.progress() * 100.0) as u32,
+            match (self.from_peaks, app.playing.file_count) {
+                (0, _) => if self.threaded { "from the audio, on its own thread" } else { "from the audio, inline" },
+                (n, files) if n == files => "from its peak file",
+                _ => "partly from peak files",
+            }
+        );
+        Some(line)
+    }
+
+    /// At the end of the tape: stops the scanner thread.
+    pub fn quit(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            JOB.store(QUIT, Ordering::Release);
+            tape_rt::futex_wake(&JOB, 1);
+            thread.join();
+        }
     }
 
     /// The projects under the root folder of the Recorder's disk, sorted by name, and the takes of the picked one, the
@@ -301,8 +398,20 @@ impl Player {
         }
         (p.state, p.open, p.position, p.length) = (PlayState::Stopped, None, 0, 0);
         self.play = [const { None }; MAX_FILES];
-        self.scan = [const { None }; MAX_FILES];
         self.problem = None;
+        if !self.tried_thread {
+            self.tried_thread = true;
+            if tape_rt::threads_supported() {
+                self.thread = tape_rt::spawn_thread(scanner_thread, 0, SCANNER_STACK).ok();
+                self.threaded = self.thread.is_some();
+            }
+        }
+        // The scanner's readers use decoders that are about to be reused: it lets go of them first.
+        if !self.hold() {
+            return self.fail(app, "the overview's reader did not stop (try again)");
+        }
+        // SAFETY: held (or no thread): the drawing thread has the scanner to itself until `release`.
+        unsafe { *(&raw mut SCANNER) = None };
         let (project, take) = (p.projects[p.project], p.takes[p.take]);
         let folder = naming::join(&[base_path_of(&app.recording).as_str(), project.as_str(), take.as_str()]);
         let mut files = [TakeFile { name: naming::FileName::new(), first: 0, channels: 0, flac: false }; MAX_FILES];
@@ -319,24 +428,35 @@ impl Player {
             return self.fail(app, "no audio files in this take");
         }
         let (mut rate, mut length) = (0u32, u64::MAX);
+        let mut scans: [Option<ScanSource>; MAX_FILES] = [const { None }; MAX_FILES];
+        self.from_peaks = 0;
         for index in 0..p.file_count {
             let file = p.files[index];
             let path = naming::join(&[folder.as_str(), file.name.as_str()]);
             let size = tape_rt::vfs_stat(path.as_str()).map(|stat| stat.size).unwrap_or(0);
-            for scan in [false, true] {
-                let reader = match self.reader(api, file, path, size, 2 * index + scan as usize) {
+            let mut scan = peak_source(folder.as_str(), file).map(|source| {
+                self.from_peaks += 1;
+                source
+            });
+            for scanning in [false, true] {
+                if scanning && scan.is_some() {
+                    continue;
+                }
+                let reader = match self.reader(api, file, path, size, 2 * index + scanning as usize) {
                     Ok(reader) => reader,
                     Err(reason) => return self.fail(app, reason),
                 };
-                if !scan {
+                if scanning {
+                    scan = Some(ScanSource::Audio(reader.0));
+                } else {
                     if rate != 0 && reader.1 != rate {
                         return self.fail(app, "the take's files differ in sample rate");
                     }
                     (rate, length) = (reader.1, length.min(reader.2));
+                    self.play[index] = Some(reader.0);
                 }
-                let slot = if scan { &mut self.scan[index] } else { &mut self.play[index] };
-                *slot = Some(reader.0);
             }
+            scans[index] = scan;
             for channel in 0..usize::from(file.channels).min(8) {
                 self.rows[index][channel] = p.row_of(file.first + channel as u8).unwrap_or(0) as u8;
             }
@@ -344,12 +464,22 @@ impl Player {
         (p.rate, p.length, p.open) = (rate, length, Some((project, take)));
         self.overview.configure(p.row_count, length);
         self.live_columns = 0;
+        self.shown_at = 0;
+        // SAFETY: still held: the scanner gets its readers, then goes.
+        unsafe { *(&raw mut SCANNER) = Some(Scanner { readers: scans, rows: self.rows, overview: self.overview }) };
+        self.release();
     }
 
     fn fail(&mut self, app: &mut App, reason: &'static str) {
         self.problem = Some(reason);
         self.play = [const { None }; MAX_FILES];
-        self.scan = [const { None }; MAX_FILES];
+        // The scanner keeps no readers when it is the drawing thread's to change; a scanner that did not stop is left
+        // reading the old take (nothing shows it) and let go.
+        if self.thread.is_none() || self.held {
+            // SAFETY: held, or no thread.
+            unsafe { *(&raw mut SCANNER) = None };
+        }
+        self.release();
         app.playing.open = None;
         app.message.clear();
         let _ = app.message.write_str(reason);
@@ -497,6 +627,7 @@ impl Player {
             let frames = sent / frame_bytes.max(1);
             self.live.push(&sides[0][..frames], &sides[1][..frames]);
             self.written += frames as u64;
+            self.played += frames as u64;
             if frames < made {
                 // The ring is full after all: the frames not taken are played again from here next pass.
                 let back = self.started + self.written;
@@ -510,12 +641,65 @@ impl Player {
         true
     }
 
-    /// Reads the take on for the overview: `SCAN_FRAMES` of each file.
-    fn scan(&mut self) -> bool {
+}
+
+/// What the overview reads of a file: its peak file (`kakelfix::peaks`, written by the Recorder beside it), or the audio.
+enum ScanSource {
+    Peaks { path: Text<MAX_PATH>, header: peaks::Header, next: u64, channels: usize },
+    Audio(Reader),
+}
+
+/// The overview's reader: a second reader of each file, read from start to end into the overview. Owned by the scanner
+/// thread while `JOB` is even, by the drawing thread while the scanner holds off (`Player::hold`) or when there is no
+/// thread.
+struct Scanner {
+    readers: [Option<ScanSource>; MAX_FILES],
+    rows: [[u8; 8]; MAX_FILES],
+    overview: &'static Overview,
+}
+
+static mut SCANNER: Option<Scanner> = None;
+/// Even: the scanner may read; odd: it holds off and says so in `HELD`; `QUIT`: it ends.
+static JOB: AtomicU32 = AtomicU32::new(0);
+static HELD: AtomicU32 = AtomicU32::new(u32::MAX - 1);
+const QUIT: u32 = u32::MAX;
+
+impl Scanner {
+    /// Reads `SCAN_FRAMES` more of each file into the overview; false when every file is read through.
+    fn step(&mut self) -> bool {
         let mut any = false;
         let mut samples = [0f32; 1024];
-        for (file, reader) in self.scan.iter_mut().enumerate() {
-            let Some(reader) = reader else { continue };
+        for (file, source) in self.readers.iter_mut().enumerate() {
+            let reader = match source {
+                Some(ScanSource::Audio(reader)) => reader,
+                Some(ScanSource::Peaks { path, header, next, channels }) => {
+                    // A piece of the peak file: every peak of it spans its columns.
+                    let mut bytes = [0u8; 16 * 1024];
+                    let cell = 4 * *channels;
+                    let count = ((header.peaks - *next) as usize).min(bytes.len() / cell);
+                    let got = if count == 0 { 0 } else { tape_rt::vfs_read(path.as_str(), header.offset(*next), &mut bytes[..count * cell]).unwrap_or(0) / cell };
+                    let per = u64::from(header.frames_per_peak);
+                    for peak in 0..got {
+                        let at = (*next + peak as u64) * per;
+                        let frames = per.min(header.frames.saturating_sub(at));
+                        for channel in 0..*channels {
+                            let word = u32::from_le_bytes(bytes[peak * cell + channel * 4..][..4].try_into().unwrap_or([0; 4]));
+                            let (low, high) = peaks::unpack(word);
+                            self.overview.push_range(usize::from(self.rows[file][channel]), at, frames, low, high);
+                        }
+                    }
+                    *next += got as u64;
+                    if got == 0 {
+                        // Read through (or a read failed): its rows count as read to the end.
+                        for channel in 0..*channels {
+                            self.overview.push_range(usize::from(self.rows[file][channel]), self.overview.frames(), 0, 0, 0);
+                        }
+                    }
+                    any |= got > 0;
+                    continue;
+                }
+                None => continue,
+            };
             let mut moved = false;
             let mut left = SCAN_FRAMES;
             while left > 0 {
@@ -544,6 +728,41 @@ impl Player {
         }
         any
     }
+}
+
+/// The scanner thread: reads while there is a take to read, rests between steps so the drawing thread keeps its CPU,
+/// holds off when asked (`JOB` odd), sleeps when done, ends at `QUIT`.
+extern "C" fn scanner_thread(_: usize) {
+    loop {
+        let job = JOB.load(Ordering::Acquire);
+        if job == QUIT {
+            return;
+        }
+        if job & 1 == 1 {
+            HELD.store(job, Ordering::Release);
+            tape_rt::futex_wait(&JOB, job);
+            continue;
+        }
+        // SAFETY: `JOB` is even: the scanner is this thread's until the drawing thread makes it odd and waits for `HELD`.
+        let busy = unsafe { (*(&raw mut SCANNER)).as_mut() }.is_some_and(Scanner::step);
+        if busy {
+            tape_rt::idle();
+        } else {
+            tape_rt::futex_wait(&JOB, job);
+        }
+    }
+}
+
+/// The peak file beside `file` in `folder`, when there is one that fits it (its channels; the Recorder writes one when a
+/// take stops).
+fn peak_source(folder: &str, file: TakeFile) -> Option<ScanSource> {
+    let leaf = peaks::file_name(file.name.as_str())?;
+    let path = naming::join(&[folder, leaf.as_str()]);
+    let size = tape_rt::vfs_stat(path.as_str()).ok()?.size;
+    let mut head = [0u8; peaks::HEADER];
+    let got = tape_rt::vfs_read(path.as_str(), 0, &mut head).ok()?;
+    let header = peaks::Header::parse(&head[..got], size)?;
+    (header.channels == u32::from(file.channels)).then_some(ScanSource::Peaks { path, header, next: 0, channels: usize::from(file.channels) })
 }
 
 /// Writes `value` (-1..1) into a playback slot: a float, or an integer left-justified in the slot's bytes.

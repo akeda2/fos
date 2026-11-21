@@ -368,6 +368,9 @@ def embedded():
             machine.pump(0.3)
             monitor(str(machine.monitor), "mouse_button 0")
             machine.wait_for("fos>", since=start + 10, timeout=10)
+            said = machine.text()[start:]
+            check(re.search(rf"kakelfix: played {re.escape(project)} / take002_\S+: \d+\.\d s, overview read 100% \(from its peak file\)", said),
+                  "the played take's overview came from the peak file the Recorder wrote beside it", said[-600:])
         finally:
             machine.stop()
         fsck = subprocess.run([tool("e2fsck"), "-fn", str(ext)], capture_output=True, text=True)
@@ -387,7 +390,12 @@ def embedded():
         check(typed, "the typed project RecLive (R kept, the space refused) holds its take001", str(sorted(files)))
         played = next((name for name in files if re.fullmatch(rf"recordings/PlayBack/take001_({stamp})/PlayBack_take001_\1_in01-02\.wav", name)), None)
         check(played, "the take recorded while playing is PlayBack's take001", str(sorted(files)))
-        check(len(files) == 4, f"nothing else was written ({len(files)} files)", str(sorted(files)))
+        audio = [name for name in files if not name.endswith(".peaks")]
+        check(len(audio) == 4, f"nothing else was written ({len(audio)} audio files)", str(sorted(files)))
+        for name in audio:
+            peak_name = name.rsplit(".", 1)[0] + ".peaks"
+            check(peak_name in files, f"{name.rsplit('/', 1)[1]} has its peak file beside it", str(sorted(files)))
+        check(len(files) == 8, f"and nothing more ({len(files)} files)", str(sorted(files)))
         extents = subprocess.run([tool("debugfs"), "-R", f"ex /{flac_name}", str(ext)], capture_output=True, text=True).stdout
         pieces = len([line for line in extents.splitlines() if re.match(r"\s*\d+/\s*\d+", line)])
         check(1 <= pieces <= 3, f"the FLAC file is {pieces} extent(s): written in one piece", extents[-600:])
@@ -398,6 +406,14 @@ def embedded():
         check((channels, rate, align) == (1, 48000, 4), f"the WAV take is input 2 alone, 32-bit float, 48 kHz though rate=44100 was asked ({channels}, {rate}, {align})")
         check(size % align == 0 and size > 48000 * 4, f"the WAV take holds whole frames ({size / 192000:.1f} s)")
         check(sound, "the WAV take holds the tone (not all zero)")
+        for name, frames in [(flac_name, total), (wav_name, size // align)]:
+            blob = files[name.rsplit(".", 1)[0] + ".peaks"].read_bytes()
+            version, peak_channels, peak_rate, per, peaks, peak_frames = struct.unpack_from("<IIIIQQ", blob, 8)
+            check(blob[:8] == b"FOSPEAKS" and version == 1, f"{name.rsplit('/', 1)[1]}: the peak file has its header", blob[:16].hex())
+            check(peak_frames == frames and peaks == -(-frames // per) and len(blob) == 64 + peaks * peak_channels * 4,
+                  f"its peaks cover every frame ({peak_frames} of {frames}, {peaks} peaks of {per})")
+            lows = [struct.unpack_from("<h", blob, 64 + 4 * n)[0] for n in range(peaks * peak_channels)]
+            check(peak_rate == 48000 and min(lows) < -1000, f"and hold the tone (lowest {min(lows)})")
         channels, rate, align, size, sound = take_wav(files[played].read_bytes())
         check((channels, rate) == (2, 48000), f"the take recorded while playing has loop1's two channels ({channels}, {rate})")
         check(sound, "what the Play page played came back through loop1 into the take (not all zero)")
@@ -511,6 +527,7 @@ def server():
         qemu.kill()
         qemu.wait()
     server_take(tmp)
+    server_play(tmp)
     tmp.cleanup()
 
 
@@ -573,6 +590,91 @@ def server_take(tmp):
     check(name, "mf take: fos/takes/mf-test/take001_TIME/mf-test_take001_TIME_in01-02.flac on the exFAT disk (root two deep)", str(sorted(files)))
     channels, rate, bits, total = take_flac(files[name], folder, "mf-take001.flac", sound=False)
     check((channels, rate, bits) == (2, 48000, 24), f"mf take: 2 channels, 48 kHz, 24 bits ({total} samples: nothing plays into loop0)")
+
+
+def server_play(tmp):
+    """The Play page on the server kernel: a tone take made on the host on an ext4 disk is opened and played into loop1;
+    its overview is read by the scanner thread (the server kernel runs tape threads), the page stays responsive."""
+    folder = Path(tmp.name)
+    image = folder / "play.img"
+    subprocess.run([sys.executable, str(ROOT / "tools/build_image.py"), "--loader", str(LOADER), "--kernel", str(MF_KERNEL), "--output", str(image),
+                    "--bios-stage1", str(ROOT / "build/bios/stage1.bin"), "--bios-stage2", str(ROOT / "build/bios/stage2.bin"),
+                    "--file", f"kakelfix={TAPE}"], check=True, capture_output=True)
+    ext = folder / "plays.img"
+    ext.write_bytes(bytes(64 << 20))
+    subprocess.run([tool("mkfs.ext4"), "-q", "-F", "-L", "plays", str(ext)], check=True, capture_output=True)
+    take = "take001_2026-11-21_120000"
+    name = f"Tone_{take}_in01-02.wav"
+    tone = folder / name
+    write_wav(tone, 48000, 2, 2, 1000, 20)
+    for command in ["mkdir recordings", "mkdir recordings/Tone", f"mkdir recordings/Tone/{take}", f"write {tone} recordings/Tone/{take}/{name}"]:
+        subprocess.run([tool("debugfs"), "-w", "-R", command, str(ext)], check=True, capture_output=True)
+    # disk3: exFAT, where a take recorded while the tone plays gets its peak file through a stream.
+    exfat = folder / "playtakes.img"
+    exfat.write_bytes(bytes(64 << 20))
+    subprocess.run([tool("mkfs.exfat"), "-L", "takes", str(exfat)], check=True, capture_output=True)
+    qemu = subprocess.Popen(
+        ["qemu-system-x86_64", "-cpu", "max", "-machine", "q35", "-m", "1024", "-smp", "4", "-display", "none",
+         "-nic", "user,model=e1000", "-serial", "stdio", "-monitor", "none", "-no-reboot",
+         "-drive", f"if=pflash,format=raw,readonly=on,file={CODE}", "-drive", f"format=raw,file={image}",
+         "-drive", f"format=raw,file={ext}", "-drive", f"format=raw,file={exfat}"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    log = b""
+
+    def wait_for(text, timeout, start=0):
+        nonlocal log
+        end = time.time() + timeout
+        while time.time() < end and text.encode() not in log[start:]:
+            if select.select([qemu.stdout], [], [], 0.2)[0]:
+                data = os.read(qemu.stdout.fileno(), 4096)
+                if not data:
+                    break
+                log += data
+        return text.encode() in log[start:]
+
+    def type_text(data, pause=0.5):
+        qemu.stdin.write(data)
+        qemu.stdin.flush()
+        wait_for("\x00never", pause)
+
+    try:
+        check(wait_for("fos> ", 150), "mf play: shell prompt", log[-800:].decode("utf8", "replace"))
+        mark = len(log)
+        type_text(b"tape kakelfix device=loop1 rec-disk=ext2 rec-root=recordings\n", 4)
+        # The Play page lists Tone; Enter goes to its takes, Enter opens take001, space plays it.
+        type_text(b"5", 2)
+        type_text(b"\r", 1)
+        type_text(b"\r", 2)
+        type_text(b" ", 2)
+        # While it plays: the Recorder's next disk (the exFAT one), a take of what loop1 hears, stopped.
+        type_text(b"2", 1)
+        type_text(b"d", 1)
+        type_text(b"R", 3)
+        type_text(b"S", 3)
+        type_text(b"\x1b")
+        done = wait_for("exited with code 0", 30, mark)
+        text = log[mark:].decode("utf8", "replace")
+        check(done, "mf play: Escape while playing ends kakelfix cleanly", text[-800:])
+        played = re.search(rf"kakelfix: played Tone / {take}: (\d+)\.\d s, overview read (\d+)% \(from the audio, on its own thread\)", text)
+        check(played, "mf play: the take (no peak file: made on the host) was played, its overview read from the audio on the scanner thread", text[-800:])
+        check(played and int(played.group(1)) >= 1, f"mf play: seconds of it were played ({played and played.group(1)} s)", text[-800:])
+        check(played and int(played.group(2)) == 100, f"mf play: the whole take's overview was read ({played and played.group(2)}%)", text[-800:])
+        check("CPU exception" not in text and "killed" not in text, "mf play: no fault, not killed", text[-800:])
+    finally:
+        qemu.kill()
+        qemu.wait()
+    files = exfat_tree(exfat)
+    audio = next((name for name in files if re.fullmatch(r"recordings/[a-z]+-[a-z]+_[\d_-]+/take001_[\d_-]+/\S+_in01-02\.flac", name)), None)
+    check(audio, "mf play: the take recorded while playing is on the exFAT disk", str(sorted(files)))
+    blob = files.get(audio.rsplit(".", 1)[0] + ".peaks", b"") if audio else b""
+    check(blob[:8] == b"FOSPEAKS", "mf play: its peak file is beside it, written through a stream", str(sorted(files)))
+    if blob[:8] == b"FOSPEAKS":
+        _, channels, _, per, peaks, frames = struct.unpack_from("<IIIIQQ", blob, 8)
+        check(channels == 2 and peaks == -(-frames // per) and len(blob) >= 64 + peaks * 8 and frames > 0,
+              f"mf play: the peak file covers the take ({frames} frames, {peaks} peaks)")
+    if Path(tool("fsck.exfat")).exists():
+        fsck = subprocess.run([tool("fsck.exfat"), "-n", str(exfat)], capture_output=True, text=True)
+        check(fsck.returncode == 0, "mf play: fsck.exfat finds the exFAT volume consistent", (fsck.stdout + fsck.stderr)[-800:])
 
 
 def main():

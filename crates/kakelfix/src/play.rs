@@ -7,6 +7,8 @@
 //! (`default_output`) and the page's state (`Playing`). Reading, decoding and playing are the tape's (`tapes/kakelfix/src/play.rs`).
 
 use crate::Text;
+use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize};
 use crate::naming::{FileName, ProjectName};
 
 /// Projects and takes listed (the newest first; older ones are not shown).
@@ -134,70 +136,128 @@ impl WavLayout {
 
 /// A take's inputs at a glance: the lowest and highest sample of each input per column, over the whole take. Filled as
 /// the take is read through (`push`, any order); a column not reached yet is empty.
+///
+/// One thread fills it (the tape's scanner) while another draws it, so every field is an atomic: a cell is one `u32`
+/// holding (lowest, highest) as two `i16`, read and written whole. The reader can see a column a moment before or after
+/// a push, never a torn one; `configure` while it draws shows a frame of the old take at worst.
 pub struct Overview {
-    rows: usize,
-    frames: u64,
-    per_column: u64,
-    columns: usize,
-    data: [[[i16; 2]; OVERVIEW_COLUMNS]; MAX_ROWS],
-    reached: [u64; MAX_ROWS],
+    rows: AtomicUsize,
+    frames: AtomicU64,
+    per_column: AtomicU64,
+    columns: AtomicUsize,
+    data: [[AtomicU32; OVERVIEW_COLUMNS]; MAX_ROWS],
+    reached: [AtomicU64; MAX_ROWS],
+}
+
+/// A cell nothing was pushed into: lowest above highest.
+const EMPTY_CELL: u32 = pack(i16::MAX, i16::MIN);
+
+const fn pack(low: i16, high: i16) -> u32 {
+    (low as u16 as u32) | ((high as u16 as u32) << 16)
+}
+
+fn unpack(cell: u32) -> (i16, i16) {
+    (cell as u16 as i16, (cell >> 16) as u16 as i16)
 }
 
 impl Overview {
     pub const fn new() -> Self {
-        Overview { rows: 0, frames: 0, per_column: 1, columns: 0, data: [[[0; 2]; OVERVIEW_COLUMNS]; MAX_ROWS], reached: [0; MAX_ROWS] }
+        Overview {
+            rows: AtomicUsize::new(0),
+            frames: AtomicU64::new(0),
+            per_column: AtomicU64::new(1),
+            columns: AtomicUsize::new(0),
+            data: [const { [const { AtomicU32::new(EMPTY_CELL) }; OVERVIEW_COLUMNS] }; MAX_ROWS],
+            reached: [const { AtomicU64::new(0) }; MAX_ROWS],
+        }
     }
 
     /// Empties it for a take of `rows` inputs and `frames` frames.
-    pub fn configure(&mut self, rows: usize, frames: u64) {
-        self.rows = rows.min(MAX_ROWS);
-        self.frames = frames;
-        self.per_column = frames.div_ceil(OVERVIEW_COLUMNS as u64).max(1);
-        self.columns = (frames.div_ceil(self.per_column) as usize).min(OVERVIEW_COLUMNS);
-        for row in &mut self.data[..self.rows] {
-            row.fill([i16::MAX, i16::MIN]);
+    pub fn configure(&self, rows: usize, frames: u64) {
+        let rows = rows.min(MAX_ROWS);
+        let per_column = frames.div_ceil(OVERVIEW_COLUMNS as u64).max(1);
+        // Nothing is shown while it is emptied (rows 0), then the new shape.
+        self.rows.store(0, Relaxed);
+        for row in &self.data[..rows] {
+            for cell in row {
+                cell.store(EMPTY_CELL, Relaxed);
+            }
         }
-        self.reached = [0; MAX_ROWS];
+        for reached in &self.reached {
+            reached.store(0, Relaxed);
+        }
+        self.frames.store(frames, Relaxed);
+        self.per_column.store(per_column, Relaxed);
+        self.columns.store((frames.div_ceil(per_column) as usize).min(OVERVIEW_COLUMNS), Relaxed);
+        self.rows.store(rows, Release);
     }
 
-    /// Takes `samples` of `row` that start at frame `at`.
-    pub fn push(&mut self, row: usize, at: u64, samples: &[f32]) {
-        if row >= self.rows {
+    /// Takes `samples` of `row` that start at frame `at`. One thread pushes at a time.
+    pub fn push(&self, row: usize, at: u64, samples: &[f32]) {
+        if row >= self.rows.load(Acquire) {
             return;
         }
-        for (index, &sample) in samples.iter().enumerate() {
-            let column = ((at + index as u64) / self.per_column) as usize;
-            if column >= self.columns {
+        let (per_column, columns) = (self.per_column.load(Relaxed), self.columns.load(Relaxed));
+        let mut index = 0;
+        while index < samples.len() {
+            let column = ((at + index as u64) / per_column) as usize;
+            if column >= columns {
                 break;
             }
-            let value = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
-            let cell = &mut self.data[row][column];
-            *cell = [cell[0].min(value), cell[1].max(value)];
+            // The samples of this column in this push, folded first: one atomic update a column, not a sample.
+            let end = (((column as u64 + 1) * per_column).saturating_sub(at) as usize).min(samples.len());
+            let (mut low, mut high) = unpack(self.data[row][column].load(Relaxed));
+            for &sample in &samples[index..end.max(index + 1)] {
+                let value = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+                (low, high) = (low.min(value), high.max(value));
+            }
+            self.data[row][column].store(pack(low, high), Relaxed);
+            index = end.max(index + 1);
         }
-        self.reached[row] = self.reached[row].max(at + samples.len() as u64);
+        self.reached[row].fetch_max(at + samples.len() as u64, Release);
+    }
+
+    /// Takes a peak: `row`'s lowest and highest sample (scaled to 32767) over the `frames` frames from `at`.
+    pub fn push_range(&self, row: usize, at: u64, frames: u64, low: i16, high: i16) {
+        if row >= self.rows.load(Acquire) || frames == 0 || low > high {
+            self.reached[row.min(MAX_ROWS - 1)].fetch_max(at + frames, Release);
+            return;
+        }
+        let (per_column, columns) = (self.per_column.load(Relaxed), self.columns.load(Relaxed));
+        let (first, last) = ((at / per_column) as usize, ((at + frames - 1) / per_column) as usize);
+        for column in first..=last.min(columns.saturating_sub(1)) {
+            let (old_low, old_high) = unpack(self.data[row][column].load(Relaxed));
+            self.data[row][column].store(pack(old_low.min(low), old_high.max(high)), Relaxed);
+        }
+        self.reached[row].fetch_max(at + frames, Release);
     }
 
     /// Columns of the take (at most `OVERVIEW_COLUMNS`; fewer for a very short take).
     pub fn columns(&self) -> usize {
-        self.columns
+        self.columns.load(Relaxed)
     }
 
     pub fn frames(&self) -> u64 {
-        self.frames
+        self.frames.load(Relaxed)
     }
 
     /// Column `column` of `row` as (lowest, highest) in -1..1; None where nothing was read yet.
     pub fn column(&self, row: usize, column: usize) -> Option<(f32, f32)> {
-        let [low, high] = *self.data.get(row)?.get(column)?;
-        (row < self.rows && column < self.columns && low <= high).then(|| (f32::from(low) / 32767.0, f32::from(high) / 32767.0))
+        if row >= self.rows.load(Acquire) || column >= self.columns() {
+            return None;
+        }
+        let (low, high) = unpack(self.data[row][column].load(Relaxed));
+        (low <= high).then(|| (f32::from(low) / 32767.0, f32::from(high) / 32767.0))
     }
 
     /// How far the slowest row has been read, 0..=1.
     pub fn progress(&self) -> f32 {
-        if self.rows == 0 || self.frames == 0 {
+        let (rows, frames) = (self.rows.load(Acquire), self.frames());
+        if rows == 0 || frames == 0 {
             return 0.0;
         }
-        self.reached[..self.rows].iter().min().map_or(0.0, |&least| (least as f32 / self.frames as f32).min(1.0))
+        let least = self.reached[..rows].iter().map(|r| r.load(Acquire)).min().unwrap_or(0);
+        (least as f32 / frames as f32).min(1.0)
     }
 }
 

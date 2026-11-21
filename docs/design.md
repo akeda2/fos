@@ -1900,8 +1900,17 @@ mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path 
   `_inNN` or `_inNN-MM`), FLAC decoded with `audio_decode::flac::Decoder<_, 8>` (the decoder's channel count is a const
   generic, 2 unless asked: the other tapes keep their size) and WAV read as the Recorder writes it (`play::WavLayout`:
   RIFF or RF64, PCM, float or extensible, samples left-justified in their slot). One row per input holds the take's
-  overview (min/max per column, `play::Overview`), filled by a second set of readers a bounded amount per pass while the
-  page is used; the play head is a line across the rows, a tap or a drag on them seeks there. The inputs listened to
+  overview (min/max per column, `play::Overview`, atomics: one thread fills it, the drawing thread reads it), filled from
+  the take's peak files when it has them, else by a second set of readers through the audio. That reading is a thread of
+  its own on the server kernel (`play::Scanner`: 8192 frames of each file, then `tape_rt::idle` so the drawing thread
+  keeps a CPU both are pinned to; a new take makes it let go of its readers first, `JOB`/`HELD`), and 3 ms a pass on the
+  drawing thread where there are no tape threads; the page is redrawn for its progress at most four times a second (it
+  ran on the drawing thread at first, 32768 frames of every file a pass, and the page crawled on aneby).
+  **Peak files** (`kakelfix::peaks`): the Recorder folds every armed input's lowest and highest sample per 512 frames
+  into memory as it records (`PeakLog`, 16 MiB, about 3 hours of 32 inputs; a longer take merges pairs and doubles the
+  frames per peak, so it never runs out) and, when the take stops and its files are closed, writes one
+  `..._in01-08.peaks` beside each audio file (a 64-byte `FOSPEAKS` header, then i16 pairs per input per peak), through
+  the path calls on ext4 and a stream on exFAT. A take cut short has none, and the page reads its audio; the play head is a line across the rows, a tap or a drag on them seeks there. The inputs listened to
   (tap a name, or `,` `.` and `m`; inputs 1 and 2 at first) go alternately left and right, one alone to both sides, each
   side divided by the inputs it sums (`Playing::gains`, never louder than full scale), to an output pair: the first
   output named Phones, else the last Analog pair (the first USB model's phones), else the first pair; `o` or the Output
@@ -1910,10 +1919,12 @@ mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path 
   (`AudioInfo::playback_space`), so a pause, seek or stop is heard at once. The stream is started with playback whenever
   the device has a playback side (`analyze::Capture`: a stream's sides are fixed at its start, so playing while a take
   records needs it from the start); a playback end someone else holds (a loopback another tape plays into) refuses it
-  and capture starts alone, and the page says playback is not available. Not yet: peak files written beside a take
-  (the overview from them at once), playing a take that is being recorded (a FLAC file has no length until Stop, a WAV
+  and capture starts alone, and the page says playback is not available. Not yet: playing a take that is being recorded (a FLAC file has no length until Stop, a WAV
   one only what its last checkpoint says), jog (audio following the finger). `make test-kakelfix` records a take on
-  `loop1` while the Play page plays an earlier one into it, and finds the played audio in the new take.
+  `loop1` while the Play page plays an earlier one into it, and finds the played audio in the new take; checks every
+  take's peak file (header, every frame covered, the tone in it) and that the Play page took the overview from it; on
+  the server kernel plays a take made on the host (no peak file: read on the scanner thread) and records one to exFAT
+  while it plays (its peak file through a stream).
 - **Test**: `make test-kakelfix` on the loopback: `show` reads the identity mix; in the tape `x` switches the first strip off and a
   mouse click half way up its fader sets -9 dB; with a `play` service playing a tone into loop0, `3` opens the Analyzer and its
   envelope must appear; `4` opens the Meters page and the first bar must light for the tone; `2` and `R` start a take (the header lamp lights), it

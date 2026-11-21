@@ -16,6 +16,7 @@ pub mod channel;
 pub mod layout;
 pub mod meters;
 pub mod naming;
+pub mod peaks;
 pub mod play;
 pub mod queue;
 pub mod recorder;
