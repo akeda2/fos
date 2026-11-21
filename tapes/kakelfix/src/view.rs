@@ -216,7 +216,7 @@ fn footer(canvas: &mut Canvas, layout: &Layout, app: &App) {
         (Page::Analyzer, _) => "Tab view  Left/Right , . or tap pair  Up/Dn span  space freeze  w env/scope  d dB/lin  f resolution  r reset  1-5 page",
         (Page::Recorder, _) if app.editing.is_some() => "typing the project: A-Z a-z 0-9 - _  Backspace erase  Enter keep (empty: made up)  Tab cancel",
         (Page::Recorder, _) => "R record  S stop  Left/Right input  Enter arm  a arm all  p project  f format  d disk  Tab scale  r reset  1-5 page",
-        (Page::Play, _) => "Up/Dn pick  Tab list  Enter open  space play/pause  Left/Right 1s  PgUp/Dn 10s  Home/End  , . row  m listen  o output  r reread  1-5 page",
+        (Page::Play, _) => "Up/Dn pick  Tab list  Enter open  space play/pause  Left/Right 1s  PgUp/Dn 10s  Home/End  , . row  m listen  o output  d disk  r reread  1-5 page",
         (Page::Meters, _) => "Left/Right input  Up/Dn gain  +- gain  h +48V  i switch  Tab or s scale  r reset  a inputs  drag a gain  1-5 page",
     };
     text(canvas, layout, 8, layout.footer.y + 4, fit(hint, layout.footer.w / layout.col - 2), theme().dim);
@@ -283,9 +283,15 @@ fn outputs(canvas: &mut Canvas, layout: &Layout, app: &App, meters: &Meters) {
                 box_(canvas, area, t.off, t.frame);
                 let mid = area.x + area.w / 2;
                 canvas.line(mid, area.y, mid, area.y + area.h - 1, t.grid_major);
-                let at = area.x + ((pan + 1.0) / 2.0 * (area.w - 4) as f64) as i32;
-                canvas.fill_rect(at, area.y + 1, 4, (area.h - 2).max(1) as u32, t.text);
-                centered(canvas, layout, area, format_pan(pan).as_str(), t.dim);
+                // A thumb along the top half, the value under it; the centre line turns bright at C.
+                if pan == 0.0 {
+                    canvas.line(mid, area.y, mid, area.y + area.h - 1, t.text);
+                }
+                let half = area.h / 2;
+                let at = area.x + 1 + ((pan + 1.0) / 2.0 * (area.w - 8) as f64) as i32;
+                canvas.fill_rect(at, area.y + 2, 6, (half - 2).max(1) as u32, t.text);
+                let value = Rect::new(area.x, area.y + half, area.w, area.h - half);
+                centered(canvas, layout, value, format_pan(pan).as_str(), t.dim);
             }
         }
         // A flat bar: the whole column is the fader, filled from the bottom to the level, the dB written on it.

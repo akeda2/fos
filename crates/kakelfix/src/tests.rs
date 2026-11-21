@@ -233,7 +233,10 @@ fn the_mouse_drags_faders_and_pan_and_presses_soft_keys() {
     app.drag(&mut device, &layout, Grab::Fader(1), fader.x + 2, fader.y + fader.h - (fader.h as f64 * layout::fader_position(0.0)) as i32);
     assert_eq!(app.strip_level(1).0, 0.0);
     let pan = layout.pan(1, &app).unwrap();
-    assert_eq!(app.press(&mut device, &layout, pan.x, pan.y + 1), Some(Grab::Pan(1)));
+    let grab = app.press(&mut device, &layout, pan.x + pan.w / 2, pan.y + 1);
+    assert_eq!(grab, Some(Grab::Pan { strip: 1, x: pan.x + pan.w / 2, value: 0.0, moved: false }));
+    let grab = app.drag(&mut device, &layout, grab.unwrap(), pan.x + pan.w / 2 - layout.slop(), pan.y + 1);
+    app.drag(&mut device, &layout, grab, pan.x + pan.w / 2 - layout.slop() - 3 * pan.w, pan.y + 1);
     assert_eq!(device.gain[1][3], Some(0), "hard left on a pair turns the right side off");
     let matrix = layout.soft(&app, 2);
     assert_eq!(app.press(&mut device, &layout, matrix.x + 1, matrix.y + 1), None);
@@ -1483,10 +1486,98 @@ fn the_play_page_picks_opens_and_plays_a_take() {
     assert_eq!(app.playing.output, Some(8));
     // Everything fits: the lists above the output row, the rows above the live envelope, the buttons inside the page.
     let last = layout.play_item(Focus::Takes, 2, &app).unwrap();
-    assert!(last.y + last.h <= layout.play_output().y);
+    assert!(last.y + last.h <= layout.play_disk().y);
     let stop = layout.play_button(PlayButton::Forward);
     assert!(stop.x + stop.w <= layout.body.x + layout.body.w && stop.y + stop.h <= layout.body.y + layout.body.h);
     assert!(layout.play_wave().y + layout.play_wave().h <= layout.play_live().y);
+}
+
+#[test]
+fn a_pan_moves_by_the_drag_sticks_at_centre_and_a_double_tap_centres_it() {
+    // The detent: from C a small drag leaves it at C, a longer one leaves; the ends are where they were.
+    assert_eq!(pan_from_drag(0.0, 0.05), 0.0);
+    assert_eq!(pan_from_drag(0.0, -PAN_DETENT), 0.0);
+    assert!(pan_from_drag(0.0, 0.2) > 0.1);
+    assert_eq!(pan_from_drag(0.0, 1.0), 1.0);
+    assert_eq!(pan_from_drag(-0.5, 0.0), -0.5, "no drag, no change");
+    assert_eq!(pan_from_drag(-0.05, 0.06), 0.0, "coming back towards C it stops there");
+    assert_eq!(pan_from_drag(0.3, 5.0), 1.0);
+
+    let mut device = Fake::new();
+    let mut app = app(&mut device);
+    let layout = Layout::new(1280, 720);
+    app.scroll(&layout);
+    let pan = layout.pan(1, &app).unwrap();
+    assert!(pan.h >= layout.row * 2, "a finger high");
+    assert!(pan.y + pan.h <= layout.fader(1, &app).unwrap().y);
+    let (mid, y) = (pan.x + pan.w / 2, pan.y + pan.h / 2);
+    // Pressing anywhere does not move it; a drag moves it from where it was.
+    let grab = app.press(&mut device, &layout, pan.x + 2, y).unwrap();
+    assert_eq!(app.strip_level(1).1, 0.0, "a press alone leaves the pan");
+    let grab = app.drag(&mut device, &layout, grab, pan.x + 2 + layout.slop() - 1, y);
+    assert_eq!(app.strip_level(1).1, 0.0, "within the slop nothing moves");
+    let grab = app.drag(&mut device, &layout, grab, pan.x + 2 + layout.slop(), y);
+    assert_eq!(app.strip_level(1).1, 0.0, "crossing the slop does not jump");
+    let grab = app.drag(&mut device, &layout, grab, pan.x + 2 + layout.slop() + pan.w / 2, y);
+    let right = app.strip_level(1).1;
+    assert!(right > 0.3 && right < 0.6, "half a width is about a quarter of the range: {right}");
+    app.release(&mut device, &layout, grab);
+    assert_eq!(app.pan_tap, None, "a drag is not a tap");
+    // A tap, then another soon after: back to C.
+    let grab = app.press(&mut device, &layout, mid, y).unwrap();
+    app.release(&mut device, &layout, grab);
+    assert_eq!(app.strip_level(1).1, right, "one tap leaves it");
+    app.tick(&mut device);
+    let grab = app.press(&mut device, &layout, mid, y).unwrap();
+    app.release(&mut device, &layout, grab);
+    assert_eq!(app.strip_level(1).1, 0.0, "a double tap centres it");
+    // Two taps far apart do not.
+    let grab = app.press(&mut device, &layout, mid, y).unwrap();
+    app.drag(&mut device, &layout, grab, mid + pan.w, y);
+    let grab = app.press(&mut device, &layout, mid, y).unwrap();
+    app.release(&mut device, &layout, grab);
+    for _ in 0..=PAN_DOUBLE_TAP {
+        app.tick(&mut device);
+    }
+    let moved = app.strip_level(1).1;
+    let grab = app.press(&mut device, &layout, mid, y).unwrap();
+    app.release(&mut device, &layout, grab);
+    assert_eq!(app.strip_level(1).1, moved);
+}
+
+#[test]
+fn the_play_page_has_a_disk_of_its_own() {
+    let mut device = Fake::new();
+    let mut app = play_app(&mut device);
+    let layout = Layout::new(1280, 800);
+    let r = &mut app.recording;
+    r.disks[0] = disk(1, recorder::Volume::Fosfs, true, 1 << 30);
+    r.disks[1] = disk(2, recorder::Volume::None, false, 1 << 30);
+    r.disks[2] = disk(3, recorder::Volume::Exfat, false, 10 << 30);
+    (r.disk_count, r.disk) = (3, 2);
+    // Until one is picked here it follows the Recorder's.
+    assert_eq!(app.play_disk().map(|d| d.number), Some(3));
+    app.playing.focus = Focus::Takes;
+    // `d` steps to the next disk with a volume (disk2 has none), wrapping, and reads the lists afresh.
+    app.act(&mut device, Action::WaveScale);
+    assert_eq!(app.play_disk().map(|d| d.number), Some(1));
+    let p = &app.playing;
+    assert_eq!((p.request, p.project_count, p.take_count, p.focus), (Some(PlayRequest::List), 0, 0, Focus::Projects));
+    assert_eq!(app.recording.disk, 2, "the Recorder's disk stays");
+    // The Recorder changing disk does not move the Play page's.
+    app.recording.disk = 0;
+    assert_eq!(app.play_disk().map(|d| d.number), Some(1));
+    // Tapping the Disk row steps it too; it sits between the lists and the output row.
+    let row = layout.play_disk();
+    app.press(&mut device, &layout, row.x + 4, row.y + 4);
+    assert_eq!(app.play_disk().map(|d| d.number), Some(3));
+    assert!(row.y + row.h <= layout.play_output().y);
+    // A picked disk that goes away: back to the Recorder's.
+    app.recording.disk_count = 1;
+    assert_eq!(app.play_disk().map(|d| d.number), Some(1));
+    // With one disk there is nothing to step to.
+    app.act(&mut device, Action::WaveScale);
+    assert!(app.message.as_str().contains("no other disk"));
 }
 
 #[test]

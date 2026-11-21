@@ -320,6 +320,9 @@ pub struct Playing {
     pub take_count: usize,
     pub take: usize,
     pub focus: Focus,
+    /// The disk the lists are read from (its volume and number), when one was picked on the page; None follows the
+    /// Recorder's disk (`App::play_disk`).
+    pub disk: Option<(crate::recorder::Volume, usize)>,
     /// The open take: its project and folder, its files, and its inputs as rows (input numbers, 0-based, ascending).
     pub open: Option<(ProjectName, TakeName)>,
     pub files: [TakeFile; MAX_FILES],
@@ -354,6 +357,7 @@ impl Playing {
             take_count: 0,
             take: 0,
             focus: Focus::Projects,
+            disk: None,
             open: None,
             files: [TakeFile::EMPTY; MAX_FILES],
             file_count: 0,

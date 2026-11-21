@@ -73,12 +73,14 @@ Tab or s scale, r reset (holds, clip, loudness), a pick the inputs shown
 (arrows move, Enter or space picks, a or n closes).
 Play: Up/Down a project or take, Tab the other list, Enter opens, space
 plays or pauses, Left/Right 1 s, PgUp/PgDn 10 s, Home/End, , . an input and
-m listens to it, o output pair (play-out=N; default the phones), r reads the
-disk again; tap the overview to go there, an input's name to listen.
+m listens to it, o output pair (play-out=N; default the phones), d next disk
+(else the Recorder's), r reads the disk again; tap the overview to go there,
+an input's name to listen, the Disk or Output row to change it.
 Analyzer: tap a pair button above the plots; swipe the row for more.
 Mouse/touch: click a strip, drag its fader or pan, click soft keys and cells;
-drag sideways (matrix and Device rows: any way) to scroll a list; the
-band under the strips and the group names above them only scroll.
+a pan moves by the drag and sticks at C; double-tap it to centre it. Drag
+sideways (matrix and Device rows: any way) to scroll a list; the band under
+the strips and the group names above them only scroll.
 "#
 );
 

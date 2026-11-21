@@ -242,11 +242,13 @@ pub enum Edit {
 }
 
 /// What a held mouse button or finger is moving.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Grab {
     /// The fader of strip n (sources, then the master).
     Fader(usize),
-    Pan(usize),
+    /// A pan control pressed at `x` when the pan was `value`: it moves by how far the finger goes, not to where it is,
+    /// once it has gone further than `Layout::slop` (`moved`); a release that never moved is a tap.
+    Pan { strip: usize, x: i32, value: f64, moved: bool },
     /// A control under a meter, dragged up or down from where it was pressed (`y`) and what it was (`value`).
     Control { index: usize, y: i32, value: i64 },
     /// A fader pressed at (`x`, `y`) and not moved yet: up or down makes it `Fader`, sideways a swipe of the strips, and
@@ -347,6 +349,10 @@ pub struct App {
     /// Play: the first project and take shown in the lists.
     pub first_project: usize,
     pub first_take: usize,
+    /// `tick`s so far (one each 100 ms), and the strip whose pan was last tapped and when: a second tap soon after
+    /// centres it.
+    pub ticks: u32,
+    pub pan_tap: Option<(usize, u32)>,
     /// Meters: the inputs picker is open, its cursor on this item (`pick_items`).
     pub picking: Option<usize>,
     /// A hazardous control change waiting for yes or no: (control, value).
@@ -397,6 +403,8 @@ impl App {
             first_rec: 0,
             first_project: 0,
             first_take: 0,
+            ticks: 0,
+            pan_tap: None,
             picking: None,
             confirm: None,
             ask_hazard: false,
@@ -494,6 +502,7 @@ impl App {
 
     /// Reads the device again when someone else changed it (its serial moved); true if it did.
     pub fn tick(&mut self, device: &mut impl Device) -> bool {
+        self.ticks = self.ticks.wrapping_add(1);
         if device.serial() == self.seen {
             return false;
         }
@@ -739,11 +748,39 @@ impl App {
             Action::Home if p.open.is_some() => p.seek_to(0.0),
             Action::End if p.open.is_some() => p.seek_to(1.0),
             Action::NextOutput | Action::PrevOutput => p.next_output(),
+            Action::NextDisk | Action::WaveScale => self.next_play_disk(),
             Action::Pan(step) if p.row_count > 0 => p.row = if step > 0.0 { (p.row + 1).min(p.row_count - 1) } else { p.row.saturating_sub(1) },
             Action::Mute => p.toggle_listen(p.row),
             Action::Reset => p.request = Some(PlayRequest::List),
             _ => {}
         }
+    }
+
+    /// The disk the Play page lists takes from: the one picked on the page while it is there, else the Recorder's.
+    pub fn play_disk(&self) -> Option<&recorder::Disk> {
+        let r = &self.recording;
+        let picked = self.playing.disk.and_then(|(volume, number)| r.disks[..r.disk_count].iter().find(|d| d.volume == volume && d.number == number));
+        picked.or_else(|| r.target())
+    }
+
+    /// The Play page's next disk (wrapping; any disk with a volume, read-only ones too): the lists are read from it.
+    /// What plays goes on playing.
+    pub fn next_play_disk(&mut self) {
+        let r = &self.recording;
+        let disks = &r.disks[..r.disk_count];
+        let usable = |d: &&recorder::Disk| d.volume != recorder::Volume::None;
+        if disks.iter().filter(usable).count() < 2 {
+            self.message.clear();
+            let _ = self.message.write_str("there is no other disk to play from");
+            return;
+        }
+        let at = self.play_disk().and_then(|now| disks.iter().position(|d| d.volume == now.volume && d.number == now.number)).unwrap_or(0);
+        let Some(next) = (1..=disks.len()).map(|k| &disks[(at + k) % disks.len()]).find(usable) else { return };
+        let p = &mut self.playing;
+        p.disk = Some((next.volume, next.number));
+        (p.project, p.take, p.project_count, p.take_count, p.focus) = (0, 0, 0, 0, Focus::Projects);
+        (self.first_project, self.first_take) = (0, 0);
+        p.request = Some(PlayRequest::List);
     }
 
     /// Opens the take picked in the list (`then_play`: and plays it once open).
@@ -1542,8 +1579,7 @@ impl App {
             }
             Hit::Pan(strip) => {
                 self.src_sel = strip;
-                self.drag(device, layout, Grab::Pan(strip), x, y);
-                Some(Grab::Pan(strip))
+                Some(Grab::Pan { strip, x, value: self.strip_level(strip).1, moved: false })
             }
             Hit::Cell(row, col) => Some(self.swipe_from(Swipe::Matrix, x, y, Tap::Cell(row, col))),
             Hit::Control(index) => Some(self.swipe_from(Swipe::Controls, x, y, Tap::Control(index))),
@@ -1608,6 +1644,10 @@ impl App {
             }
             Hit::PlayOutput => {
                 self.playing.next_output();
+                None
+            }
+            Hit::PlayDisk => {
+                self.next_play_disk();
                 None
             }
             Hit::RecScroll(part) => {
@@ -1693,6 +1733,16 @@ impl App {
         match grab {
             Grab::Pressed { strip, x, y } => {
                 self.drag(device, layout, Grab::Fader(strip), x, y);
+            }
+            // A tap on a pan control; a second one within PAN_DOUBLE_TAP ticks centres it.
+            Grab::Pan { strip, moved: false, .. } => {
+                if self.pan_tap.is_some_and(|(at, when)| at == strip && self.ticks.wrapping_sub(when) <= PAN_DOUBLE_TAP) {
+                    self.pan_tap = None;
+                    self.src_sel = strip;
+                    self.act(device, Action::Center);
+                } else {
+                    self.pan_tap = Some((strip, self.ticks));
+                }
             }
             Grab::Swipe { tap: Tap::Cell(row, col), .. } => {
                 if (row, col) == (self.row, self.col) {
@@ -1839,10 +1889,19 @@ impl App {
                     },
                 );
             }
-            Grab::Pan(strip) => {
+            Grab::Pan { strip, x: from, value: start, moved } => {
                 let Some(pan) = layout.pan(strip, self) else { return grab };
-                let value = round_pan(((x - pan.x) as f64 / pan.w.max(1) as f64) * 2.0 - 1.0);
+                let dx = x - from;
+                if !moved && dx.abs() < layout.slop() {
+                    return grab;
+                }
+                // The control's width is half the range; the drag starts at the slop's edge so the pan does not jump.
+                let dx = if moved { dx } else { 0 };
+                let from = if moved { from } else { x };
+                let value = round_pan(pan_from_drag(start, dx as f64 / pan.w.max(1) as f64));
                 self.src_sel = strip;
+                self.pan_tap = None;
+                let grab = Grab::Pan { strip, x: from, value: start, moved: true };
                 self.edit(
                     device,
                     |send| {
@@ -1851,11 +1910,26 @@ impl App {
                         changed
                     },
                     |_| false,
-                );
+                );                return grab;
             }
         }
         grab
     }
+}
+
+/// Ticks (100 ms) within which a second tap on a pan control centres it.
+pub const PAN_DOUBLE_TAP: u32 = 4;
+/// Half the width of the centre detent, in finger travel (the control's width is 1.0): the pan stays at C while the
+/// finger is within it, so centre is easy to find and to leave alone.
+pub const PAN_DETENT: f64 = 0.08;
+
+/// The pan after a drag of `delta` (in control widths) from `start`. The finger moves along a line where the detent is a
+/// stretch of `2 * PAN_DETENT` around centre; outside it the pan follows, reaching the ends at the same place as before.
+pub fn pan_from_drag(start: f64, delta: f64) -> f64 {
+    let d = PAN_DETENT;
+    let finger = if start == 0.0 { 0.0 } else { start.signum() * (start.abs().min(1.0) * (1.0 - d) + d) };
+    let at = (finger + delta).clamp(-1.0, 1.0);
+    if at.abs() <= d { 0.0 } else { at.signum() * (at.abs() - d) / (1.0 - d) }
 }
 
 fn round_pan(pan: f64) -> f64 {

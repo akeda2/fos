@@ -50,6 +50,7 @@ pub enum Hit {
     /// (listen or not), the take's overview (go there), a transport button.
     PlayItem(Focus, usize),
     PlayOutput,
+    PlayDisk,
     PlayLabel(usize),
     PlayWave,
     PlayButton(PlayButton),
@@ -519,7 +520,8 @@ impl Layout {
         Some(Rect::new(n.x, n.y + self.row + 4, n.w, self.rec_arm_h()))
     }
 
-    /// Play: the lists at the left (as wide as the Recorder's panel): projects over takes, the output row at the foot.
+    /// Play: the lists at the left (as wide as the Recorder's panel): projects over takes, the disk and output rows at the
+    /// foot.
     pub fn play_panel(&self) -> Rect {
         self.rec_panel()
     }
@@ -527,7 +529,7 @@ impl Layout {
     /// Play: list items shown at once in each list (two text rows each, a finger high).
     pub fn play_visible(&self) -> usize {
         let panel = self.play_panel();
-        let room = panel.h - 2 * self.row - (self.row * 2 + 12);
+        let room = panel.h - 2 * self.row - 2 * (self.row * 2 + 12);
         ((room / 2) / (self.row * 2)).max(1) as usize
     }
 
@@ -556,6 +558,12 @@ impl Layout {
     pub fn play_output(&self) -> Rect {
         let panel = self.play_panel();
         Rect::new(panel.x + 4, panel.y + panel.h - self.row * 2 - 8, panel.w - 8, self.row * 2)
+    }
+
+    /// Play: the disk's row over the output row (a tap: the next disk).
+    pub fn play_disk(&self) -> Rect {
+        let output = self.play_output();
+        Rect::new(output.x, output.y - output.h - 8, output.w, output.h)
     }
 
     /// Play: the take's side of the page, right of the lists.
@@ -621,6 +629,9 @@ impl Layout {
         }
         if self.play_output().contains(x, y) {
             return Hit::PlayOutput;
+        }
+        if self.play_disk().contains(x, y) {
+            return Hit::PlayDisk;
         }
         if let Some(button) = PlayButton::ALL.into_iter().find(|&b| self.play_button(b).contains(x, y)) {
             return Hit::PlayButton(button);
@@ -715,15 +726,16 @@ impl Layout {
         Some(Rect::new(s.x, s.y, s.w, self.row + 8))
     }
 
+    /// The pan control under the name: two text rows tall, a finger's height (dragged sideways, `Grab::Pan`).
     pub fn pan(&self, strip: usize, app: &App) -> Option<Rect> {
         let s = self.strip(strip, app)?;
-        Some(Rect::new(s.x + 4, s.y + self.row + 12, s.w - 8, self.row))
+        Some(Rect::new(s.x + 4, s.y + self.row + 12, s.w - 8, self.row * 2))
     }
 
     /// The fader: a flat bar filled from the bottom up to the level, its top the level's position (`fader_position`).
     pub fn fader(&self, strip: usize, app: &App) -> Option<Rect> {
         let s = self.strip(strip, app)?;
-        let top = s.y + 2 * self.row + 20;
+        let top = s.y + 3 * self.row + 20;
         let bottom = s.y + s.h - 4;
         Some(Rect::new(s.x + 4, top, s.w - 12 - self.col * 2, (bottom - top).max(1)))
     }

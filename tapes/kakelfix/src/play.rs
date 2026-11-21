@@ -355,7 +355,7 @@ impl Player {
         }
     }
 
-    /// The projects under the root folder of the Recorder's disk, sorted by name, and the takes of the picked one, the
+    /// The projects under the root folder of the page's disk, sorted by name, and the takes of the picked one, the
     /// newest first.
     fn list(&mut self, app: &mut App) {
         let base = base_path(app);
@@ -392,6 +392,7 @@ impl Player {
 
     /// Opens the take picked in the list: its files, two readers each (play, overview).
     fn open(&mut self, api: &TapeApi, app: &mut App) {
+        let base = base_path(app);
         let p = &mut app.playing;
         if p.project >= p.project_count || p.take >= p.take_count {
             return;
@@ -413,7 +414,7 @@ impl Player {
         // SAFETY: held (or no thread): the drawing thread has the scanner to itself until `release`.
         unsafe { *(&raw mut SCANNER) = None };
         let (project, take) = (p.projects[p.project], p.takes[p.take]);
-        let folder = naming::join(&[base_path_of(&app.recording).as_str(), project.as_str(), take.as_str()]);
+        let folder = naming::join(&[base.as_str(), project.as_str(), take.as_str()]);
         let mut files = [TakeFile { name: naming::FileName::new(), first: 0, channels: 0, flac: false }; MAX_FILES];
         let mut count = 0;
         each_entry(folder.as_str(), |name, is_folder| {
@@ -777,14 +778,10 @@ fn put_sample(slot: &mut [u8], value: f32, float: bool) {
     slot[..width].copy_from_slice(&word[4 - width..]);
 }
 
-/// `ext1/recordings`: where the Recorder's projects are on its disk.
+/// `ext1/recordings`: where the projects are on the Play page's disk (the Recorder's unless one was picked here).
 fn base_path(app: &App) -> Text<MAX_PATH> {
-    base_path_of(&app.recording)
-}
-
-fn base_path_of(r: &kakelfix::Recording) -> Text<MAX_PATH> {
-    let prefix = r.target().map_or(Text::new(), |disk| disk.prefix());
-    naming::join(&[prefix.as_str(), r.root()])
+    let prefix = app.play_disk().map_or(Text::new(), |disk| disk.prefix());
+    naming::join(&[prefix.as_str(), app.recording.root()])
 }
 
 /// Every entry of folder `path`: its name and whether it is a folder.
@@ -827,6 +824,28 @@ pub fn draw(canvas: &mut Canvas, layout: &Layout, app: &App, player: Option<&Pla
             text(canvas, layout, item.x + layout.col * 3 / 2, y, shown, if picked { t.text } else { t.dim });
         }
     }
+    // The disk the lists are from, a button.
+    let row = layout.play_disk();
+    canvas.fill_rect(row.x, row.y, row.w as u32, row.h as u32, t.grid);
+    canvas.rect(row.x, row.y, row.w as u32, row.h as u32, t.frame);
+    let mut line = Text::<128>::new();
+    match app.play_disk() {
+        Some(disk) => {
+            let _ = write!(line, "Disk    {} {}", disk.name().as_str(), disk.volume.name());
+            if !disk.label.is_empty() {
+                let _ = write!(line, " @{}", disk.label.as_str());
+            }
+            let _ = write!(line, " {}", disk.model.as_str().trim());
+        }
+        None => {
+            let _ = line.write_str("Disk    none");
+        }
+    }
+    let room = ((row.w - layout.col * 3) / layout.col).max(1) as usize;
+    let shown = line.as_str().char_indices().nth(room).map_or(line.as_str(), |(end, _)| &line.as_str()[..end]);
+    let y = row.y + (row.h - layout.row) / 2;
+    text(canvas, layout, row.x + layout.col / 2, y, shown, if app.play_disk().is_some() { t.text } else { t.dim });
+    text(canvas, layout, row.x + row.w - layout.col * 2, y, ">", t.dim);
     // The output pair, a button.
     let row = layout.play_output();
     canvas.fill_rect(row.x, row.y, row.w as u32, row.h as u32, t.grid);
