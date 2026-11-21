@@ -1710,6 +1710,24 @@ pub fn keep(selected: usize, first: usize, visible: usize, count: usize) -> usiz
     first.min(count.saturating_sub(visible))
 }
 
+/// `message` in lines of at most `width` characters, broken at spaces (a word longer than a line is cut).
+pub fn wrap(message: &str, width: usize) -> impl Iterator<Item = &str> {
+    let mut rest = message.trim_start();
+    core::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let cut = if rest.len() <= width {
+            rest.len()
+        } else {
+            rest[..=width].rfind(' ').filter(|&space| space > 0).unwrap_or(width)
+        };
+        let (line, tail) = rest.split_at(cut);
+        rest = tail.trim_start();
+        Some(line.trim_end())
+    })
+}
+
 /// A send or master level as text: "?" unknown, "mute", "off", else "+1.5".
 pub fn format_db(db: f64, mute: bool, unknown: bool) -> Text<8> {
     let mut text = Text::new();

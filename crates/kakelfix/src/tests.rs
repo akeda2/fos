@@ -1273,3 +1273,13 @@ fn record_and_stop_are_two_buttons_and_arm_buttons_take_a_finger() {
     assert!(arm.w >= 42 && arm.h >= 44, "{} x {}", arm.w, arm.h);
     assert!(layout.visible_rec(&app) >= 8 && layout.visible_rec(&app) < 18);
 }
+
+#[test]
+fn warnings_wrap_at_spaces() {
+    let message = "AUDIO LOST: 5.4 s missing from the take (43292 overruns): capture was not read in time";
+    assert!(wrap(message, 40).eq(["AUDIO LOST: 5.4 s missing from the take", "(43292 overruns): capture was not read", "in time"]));
+    assert!(wrap(message, 40).all(|line| line.len() <= 40));
+    assert!(wrap("short", 40).eq(["short"]));
+    assert!(wrap("abcdefghij", 4).eq(["abcd", "efgh", "ij"]), "a word longer than a line is cut");
+    assert_eq!(wrap("", 4).count(), 0);
+}

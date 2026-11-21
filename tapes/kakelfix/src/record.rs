@@ -45,7 +45,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use kakelfix::channel::{Mailbox, Ring};
 use kakelfix::naming::{self, FileName, ProjectName, Stamp};
 use kakelfix::recorder::{Disk, Encoding, GROUP, MAX_DISKS, MAX_GROUPS, Request, Take, Volume, clock, describe_channels, duration, size};
-use kakelfix::{App, Layout, RecRow, Recording, Text, Transport, fit_name};
+use kakelfix::{App, Layout, RecRow, Recording, Text, Transport, fit_name, wrap};
 use tape_rt::{AudioBuffer, AudioStats, DISK_EXFAT, DISK_FAT32, DISK_FOSFS, DiskInfo, FS_EXISTS, TapeApi, VFS_DIR, VFS_FILE, VfsVolume, alloc_bytes, alloc_zeroed};
 
 /// WAV disk writes: 256 KiB blocks (a multiple of the 512-byte sector; the `recorder` tape's size, which real USB sticks
@@ -209,7 +209,7 @@ impl Report {
 static RING: Ring = Ring::new();
 static COMMANDS: Mailbox<Command> = Mailbox::new(Command::None);
 static REPORTS: Mailbox<Report> = Mailbox::new(Report {
-    take: Take { running: false, frames: 0, bytes: 0, files: 0, file: Text::new(), overruns: 0, backlog_percent: 0, worst_ms: 0, kib_per_second: 0 },
+    take: Take { running: false, frames: 0, bytes: 0, files: 0, file: Text::new(), overruns: 0, lost_ms: 0, backlog_percent: 0, worst_ms: 0, kib_per_second: 0 },
     message: Text::new(),
     said: 0,
     acted: 0,
@@ -467,6 +467,10 @@ pub struct Writer {
     input: Input,
     next_checkpoint: u64,
     overruns_at_start: u64,
+    /// The device's captured-byte count and the time when the take started: what the device delivered since, against
+    /// the time that passed, is the audio lost (`Take::lost_ms`), whatever unit the driver counts overruns in.
+    captured_at_start: u64,
+    started_us: u64,
     ring_bytes: u64,
     peak_backlog: u64,
 }
@@ -504,6 +508,8 @@ impl Writer {
             input: Input { ..*input },
             next_checkpoint: 0,
             overruns_at_start: 0,
+            captured_at_start: 0,
+            started_us: 0,
             ring_bytes: 0,
             peak_backlog: 0,
         })
@@ -545,6 +551,7 @@ impl Writer {
         let mut stats = AudioStats::default();
         (api.audio_stats)(&mut stats);
         self.overruns_at_start = stats.capture_overruns;
+        (self.captured_at_start, self.started_us) = (stats.capture_bytes, tape_rt::micros());
         let mut buffer = AudioBuffer::default();
         (api.audio_buffer)(&mut buffer);
         self.ring_bytes = buffer.ring_bytes;
@@ -808,6 +815,12 @@ impl Writer {
             }
         }
         t.overruns = stats.capture_overruns.saturating_sub(self.overruns_at_start);
+        t.lost_ms = 0;
+        let per_second = self.input.frame_bytes() as u64 * u64::from(self.format.rate);
+        if t.overruns > 0 && per_second > 0 {
+            let captured_ms = stats.capture_bytes.saturating_sub(self.captured_at_start) * 1000 / per_second;
+            t.lost_ms = (tape_rt::micros().saturating_sub(self.started_us) / 1000).saturating_sub(captured_ms);
+        }
         t.backlog_percent = if self.ring_bytes == 0 { 0 } else { (buffer.available_bytes * 100 / self.ring_bytes) as u32 };
         t.kib_per_second = if spent == 0 { 0 } else { written * 1000 / 1024 / (spent / 1000).max(1) };
         t.worst_ms = worst / 1000;
@@ -1107,12 +1120,29 @@ fn panel(canvas: &mut Canvas, layout: &Layout, app: &App, threaded: bool) {
     }
     // What matters most when audio cannot be taken twice: lost audio, then a disk falling behind.
     line.clear();
+    // The device dropped what nobody read in time (a stalled reader, or a ring full behind a slow disk).
     if r.take.overruns > 0 {
-        let _ = write!(line, "AUDIO LOST: {} overrun(s), the disk did not keep up", r.take.overruns);
-        row(canvas, RecRow::Warning, line.as_str(), t.red, None);
+        let lost = r.take.lost_ms;
+        let _ = write!(line, "AUDIO LOST: {}.{} s missing from the take ({} overruns): capture was not read in time", lost / 1000, lost % 1000 / 100, r.take.overruns);
+        warning(canvas, layout, line.as_str(), t.red);
     } else if running && r.take.backlog_percent >= 25 {
         let _ = write!(line, "disk falling behind: {}% of the capture ring waits", r.take.backlog_percent);
-        row(canvas, RecRow::Warning, line.as_str(), t.amber, None);
+        warning(canvas, layout, line.as_str(), t.amber);
+    }
+}
+
+/// The warning at the foot of the panel, word-wrapped over the panel's width and as many text rows as are left under it.
+fn warning(canvas: &mut Canvas, layout: &Layout, message: &str, colour: u32) {
+    let (area, panel) = (layout.rec_row(RecRow::Warning), layout.rec_panel());
+    let x = area.x + layout.col / 2;
+    let width = ((area.w - layout.col) / layout.col).max(8) as usize;
+    let mut y = area.y + 2;
+    for line in wrap(message, width) {
+        if y + layout.row > panel.y + panel.h {
+            break;
+        }
+        text(canvas, layout, x, y, line, colour);
+        y += layout.row;
     }
 }
 

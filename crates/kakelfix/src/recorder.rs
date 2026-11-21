@@ -123,8 +123,10 @@ pub struct Take {
     /// Files so far, and the first of them (its own name, without the folders).
     pub files: u32,
     pub file: FileName,
-    /// Capture overruns since the take began: audio that never reached the file.
+    /// Capture overruns since the take began: audio that never reached the file. The unit is the driver's (a USB audio
+    /// interface may count microframes), so the page shows `lost_ms`: the take's wall time less the audio the device delivered.
     pub overruns: u64,
+    pub lost_ms: u64,
     /// Audio waiting in the kernel's capture ring, as a share of it (a disk falling behind shows here first).
     pub backlog_percent: u32,
     /// The slowest single block write of the take in ms, and the disk's average speed in KiB/s.
@@ -181,7 +183,7 @@ impl Recording {
             float: false,
             request: None,
             asked: 0,
-            take: Take { running: false, frames: 0, bytes: 0, files: 0, file: Text::new(), overruns: 0, backlog_percent: 0, worst_ms: 0, kib_per_second: 0 },
+            take: Take { running: false, frames: 0, bytes: 0, files: 0, file: Text::new(), overruns: 0, lost_ms: 0, backlog_percent: 0, worst_ms: 0, kib_per_second: 0 },
         }
     }
 

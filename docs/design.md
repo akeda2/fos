@@ -1868,7 +1868,11 @@ mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path 
   `rec-disk`, `rec-scale`, `rec-project`, `rec-root`. **One read loop** (`analyze::Capture::update`) now serves every user of the captured
   audio: the take, the Meters and Recorder meters, the Analyzer; capture runs while one of those pages is shown *or a take
   runs*, so a take goes on under the Mixer or Analyzer page, with "REC mm:ss" in red in every page's header. Quitting
-  (Esc, Quit) finishes the files cleanly. The capture ring is asked for at up to 256 MiB (`audio_set_capture_ring`, leaving
+  (Esc, Quit) finishes the files cleanly. Lost audio is shown as time (`Take::lost_ms`: the take's wall time less what the device's
+  `capture_bytes` says it delivered), since drivers count overruns in their own units (a USB audio interface in microframes),
+  and the warning wraps over the foot of the panel. An exFAT take reserves the volume's longest free run; marking it in
+  the allocation bitmap goes 8 sectors a transfer (`exfat::bitmap_mark`), not sector by sector, which cost seconds on a
+  USB stick at Record and at Stop. The capture ring is asked for at up to 256 MiB (`audio_set_capture_ring`, leaving
   256 MiB free), which absorbs disk writes, encoding and frames drawn meanwhile. Next: a count of float samples off the 24-bit grid, pre-roll and the sound/silence trigger
   (`audio_rec::preroll`, `silence`).
   **Touch and typing**: the take's state and clock at the top are shown only; under them are two transport buttons
