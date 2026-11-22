@@ -153,6 +153,22 @@ impl Nic {
         }
     }
 
+    /// Queues a frame without telling the card yet where the driver can (`E1000::send_deferred`); every other card sends
+    /// at once. Call `kick` when the burst is queued.
+    pub fn send_deferred(&mut self, frame: &[u8]) -> bool {
+        match self {
+            Nic::E1000(nic) => nic.send_deferred(frame),
+            _ => self.send(frame),
+        }
+    }
+
+    /// Sends what `send_deferred` queued.
+    pub fn kick(&mut self) {
+        if let Nic::E1000(nic) = self {
+            nic.kick();
+        }
+    }
+
     pub fn send(&mut self, frame: &[u8]) -> bool {
         match self {
             Nic::E1000(nic) => nic.send(frame),

@@ -41,6 +41,9 @@ const CACHE_BYTES: usize = 64 * 1024;
 /// A worker that slept this many ticks (10 ms each) or more drops its read buffer: the bound on how stale a read-ahead
 /// can be when something other than this export writes the disk.
 const IDLE_TICKS: u64 = 2;
+/// Replies queued per doorbell (`E1000::send_deferred`): one register write, which leaves the guest under a hypervisor,
+/// for this many frames, without holding replies back for a whole batch of disk work.
+const KICK_EVERY: usize = 8;
 /// The flusher looks every `FLUSH_TICK` ticks (10 ms each) and flushes a disk that has not been written for `FLUSH_AFTER`.
 const FLUSH_TICK: u64 = 2;
 const FLUSH_AFTER: u64 = 5;
@@ -305,6 +308,8 @@ extern "C" fn worker(index: usize) {
         }
         let mut disk = BlockDisk(export.disk);
         let mut cached = cache.on(&mut disk);
+        // NICs with replies queued but not yet kicked (bit per NIC), and how many replies.
+        let (mut unkicked, mut queued_replies) = (0u32, 0usize);
         for _ in 0..BATCH {
             let started = crate::cpu::cycles();
             let Some((nic, length)) = pop(slot, &mut request) else { break };
@@ -321,11 +326,21 @@ extern "C" fn worker(index: usize) {
             }
             if reply_length > 0 {
                 let _nics = net::lock_nics();
-                nicctl::nic_send(nic, &reply[..reply_length]);
+                nicctl::nic_send_deferred(nic, &reply[..reply_length]);
+                unkicked |= 1 << nic.min(31);
+                queued_replies += 1;
+                if queued_replies >= KICK_EVERY {
+                    kick(unkicked);
+                    (unkicked, queued_replies) = (0, 0);
+                }
             }
             slot.stats.send_us.fetch_add(crate::cpu::cycles().saturating_sub(handled), Ordering::Relaxed);
             slot.stats.frames.fetch_add(1, Ordering::Relaxed);
             slot.stats.serve_us.fetch_add(crate::cpu::cycles().saturating_sub(started), Ordering::Relaxed);
+        }
+        if unkicked != 0 {
+            let _nics = net::lock_nics();
+            kick(unkicked);
         }
         // Acknowledged writes never outlive the batch in RAM: the flusher and `unexport` only see what reached the drive.
         if !cached.settle() {
@@ -509,6 +524,13 @@ pub fn command(mut words: core::str::SplitWhitespace) {
             None => crate::println!("aoe shelf N: N is 0..65534."),
         },
         Some(_) => crate::println!("{usage}"),
+    }
+}
+
+/// Rings the doorbell of every NIC in `mask` (bit n: NIC n). The caller holds the NIC lock.
+fn kick(mask: u32) {
+    for nic in (0..32).filter(|nic| mask >> nic & 1 != 0) {
+        nicctl::nic_kick(nic);
     }
 }
 

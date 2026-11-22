@@ -281,6 +281,9 @@ const RX_COUNT: usize = 1024;
 /// the wire idle. 128 (the ring still fits its page) keeps a burst queued while the tape is away.
 const TX_COUNT: usize = 128;
 const BUFFER_SIZE: usize = 2048;
+/// The most frames `send_deferred` leaves on the ring before it writes the tail itself: far below `TX_COUNT`, so the ring
+/// never fills with frames the card was not told about.
+const DEFER_LIMIT: usize = 32;
 /// 1514 plus a 4-byte VLAN tag: a tagged full-size frame must cross a bridge intact.
 pub const MAX_FRAME: usize = 1518;
 /// Transmit buffers hold one whole jumbo frame (12 KiB, page-aligned): 128 of them are 1.5 MiB per card. Receive keeps
@@ -406,6 +409,10 @@ pub struct E1000 {
     max_frame: usize,
     /// Frames dropped whole because they did not fit the caller's buffer or the MTU. Never delivered truncated.
     pub jumbo_dropped: u64,
+    /// `send_deferred` is queueing: `send` leaves the tail register (the doorbell) alone and counts the frame in `deferred`.
+    defer_doorbell: bool,
+    /// Frames on the ring the card has not been told about yet (`kick` tells it).
+    deferred: usize,
     /// Multi-descriptor frames joined whole and within the MTU (before the caller's buffer is considered).
     pub jumbo_joined: u64,
     tx_next: usize,
@@ -663,7 +670,7 @@ impl E1000 {
             write(registers, r.rdt, (RX_COUNT - 1) as u32);
         }
 
-        Ok(E1000 { registers, variant, r, index, delivery: Delivery::Polled, mac, rx_ring, tx_ring, rx_buffers, tx_buffers, rx_next: 0, rx_in_frame: false, rx_bad: false, assembly_len: 0, assembly: 0, rx_stamp: 0, max_frame: MAX_FRAME, jumbo_dropped: 0, jumbo_joined: 0, tx_next: 0, frames_received: 0, frames_sent: 0, frames_dropped_no_link: 0, link_checks: 0, link_ok: true, ts_on: false, ts_all: false, last_stamp: 0, ts_clock: pch_clock(device.id), ts_offset: 0, mc_users: [0; 4096], vlan_ids: [0; 128], promiscuous: false, tx_offload: false, tx_ctx: [false; TX_COUNT] })
+        Ok(E1000 { registers, variant, r, index, delivery: Delivery::Polled, mac, rx_ring, tx_ring, rx_buffers, tx_buffers, rx_next: 0, rx_in_frame: false, rx_bad: false, assembly_len: 0, assembly: 0, rx_stamp: 0, max_frame: MAX_FRAME, jumbo_dropped: 0, jumbo_joined: 0, defer_doorbell: false, deferred: 0, tx_next: 0, frames_received: 0, frames_sent: 0, frames_dropped_no_link: 0, link_checks: 0, link_ok: true, ts_on: false, ts_all: false, last_stamp: 0, ts_clock: pch_clock(device.id), ts_offset: 0, mc_users: [0; 4096], vlan_ids: [0; 128], promiscuous: false, tx_offload: false, tx_ctx: [false; TX_COUNT] })
     }
 
     /// Sets the MTU (the payload size: 1500 is standard, up to `JUMBO_MAX_MTU`); false when `mtu` is out of range or the
@@ -1325,9 +1332,38 @@ impl E1000 {
             write_volatile(core::ptr::addr_of_mut!((*descriptor).status), 0);
         }
         self.tx_next = (self.tx_next + 1) % TX_COUNT;
-        write(self.registers, self.r.tdt, self.tx_next as u32);
+        if self.defer_doorbell {
+            self.deferred += 1;
+        } else {
+            // Also tells the card about any frames `send_deferred` left: the tail covers everything before it.
+            write(self.registers, self.r.tdt, self.tx_next as u32);
+            self.deferred = 0;
+        }
         self.frames_sent += 1;
         true
+    }
+
+    /// Like `send`, but does not write the tail register (TDT). Writing it is what makes the card fetch descriptors, and
+    /// under a hypervisor every register write leaves the guest (on the server kernel under KVM the send was most of an
+    /// AoE frame's cost, docs/block-sharing.md), so a sender with several frames queues them and calls `kick` once.
+    /// Frames queued and never kicked would hold their ring slots forever, so after `DEFER_LIMIT` of them this kicks by
+    /// itself; any ordinary `send` (or the offload and timestamp paths) writes the tail too and so sends them as well.
+    pub fn send_deferred(&mut self, frame: &[u8]) -> bool {
+        if self.deferred >= DEFER_LIMIT {
+            self.kick();
+        }
+        self.defer_doorbell = true;
+        let sent = self.send(frame);
+        self.defer_doorbell = false;
+        sent
+    }
+
+    /// Tells the card about the frames `send_deferred` queued (one TDT write).
+    pub fn kick(&mut self) {
+        if self.deferred != 0 {
+            write(self.registers, self.r.tdt, self.tx_next as u32);
+            self.deferred = 0;
+        }
     }
 
     /// Unmasks the receive/link causes, raises one cause by hand (link status through ICS)

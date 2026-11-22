@@ -304,6 +304,17 @@ pub fn nic_send(index: usize, frame: &[u8]) -> bool {
     nic::at(index).is_some_and(|nic| nic.send(frame))
 }
 
+/// `nic_send` without the doorbell where the card allows it (`Nic::send_deferred`); `nic_kick` sends the burst.
+pub fn nic_send_deferred(index: usize, frame: &[u8]) -> bool {
+    nic::at(index).is_some_and(|nic| nic.send_deferred(frame))
+}
+
+pub fn nic_kick(index: usize) {
+    if let Some(nic) = nic::at(index) {
+        nic.kick();
+    }
+}
+
 pub fn nic_set_promiscuous(index: usize, on: bool) -> bool {
     if !on && nic::has_virtual(index) {
         return true; // the virtual interfaces need it

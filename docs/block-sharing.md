@@ -242,10 +242,20 @@ buffers in front of the disk.
 - What a frame costs now is the send: 44 us of 48 at window 16 (the NIC lock, which the spinning service thread and
   `net-rx` also take, and one e1000 doorbell per reply).
 
+**One doorbell for several replies.** `E1000::send_deferred` queues a frame without writing the tail register (TDT), and
+`kick` writes it once for all of them (`Nic::send_deferred`/`kick`, `nicctl::nic_send_deferred`/`nic_kick`; other
+cards send at once). Any ordinary `send` writes the tail as well, which covers deferred frames, and `send_deferred` kicks
+by itself after 32 unannounced frames so the ring never fills with them. The AoE worker queues each reply deferred and
+kicks every 8 replies and at the end of each batch. Under KVM, window 16: **reads 20,900 -> 32,700 frames/s (33.5 MB/s),
+writes 20,000 -> 29,500 (30.2 MB/s)**; serving a frame costs 15 to 19 us instead of 48. Windows 1 and 4 do not change:
+they are bound by the round trip, not the send. Checked: `test-nic`, `test-jumbo`, `test-mf-aoe`, `-net`, `-netfs`,
+`-smbd`, `-httpd`. Only real hardware can say what a TDT write costs on silicon (a posted PCIe write, far less than a
+VM exit), so the gain there will be smaller.
+
 Not done, in the order I would do it:
 
-1. **One doorbell for several replies** (44 of 48 us a frame now): a send call that queues several frames before telling
-   the card, and the NIC lock taken once per batch instead of once per reply.
+1. **Find what limits window 16 now** (32,700 frames/s while a frame costs 19 us to serve: the receive side, QEMU or the
+   Python initiator), and measure against a real initiator (item 4).
 2. **Per-controller locking** in the block layer, if the measurements say serial disk access is the limit.
 3. Jumbo frames on this path: `nicctl` drains into 1600-byte buffers and the target assumes MTU 1500.
 4. Interoperability with the Linux `aoe` module and `vblade` as a peer (the host has the module, version 85; loading it
