@@ -254,15 +254,109 @@ VM exit), so the gain there will be smaller.
 
 Not done, in the order I would do it:
 
-1. **Find what limits window 16 now** (32,700 frames/s while a frame costs 19 us to serve: the receive side, QEMU or the
-   Python initiator), and measure against a real initiator (item 4).
-2. **Per-controller locking** in the block layer, if the measurements say serial disk access is the limit.
-3. Jumbo frames on this path: `nicctl` drains into 1600-byte buffers and the target assumes MTU 1500.
-4. Interoperability with the Linux `aoe` module and `vblade` as a peer (the host has the module, version 85; loading it
-   needs root, so a manual step).
-5. The initiator: `block::Backend::Aoe`, a virtual disk like `Md`, with retransmit and a window.
+**The Linux `aoe` module as initiator** (section 9, 2026-11-22, host kernel 7.3, AoE v85, KVM, 2 guest CPUs, MTU 1500):
+discovery, content, the read-only refusal, raw writes, ext4 and `e2fsck` all pass (details in section 9). The module
+picks 1024-byte data frames (2 sectors, as advertised) and keeps 16 frames in flight (`bufcount`): **reads 58 MB/s
+(about 57,000 frames/s), writes 50 MB/s (about 49,000)**, against 32,700 and 29,500 from `bench_mf_aoe.py` at the same
+window. So most of the window-16 ceiling seen above was the Python initiator. The guest's counters during that run: serve
+13 us a frame (send 10-11 of it), 16-19 frames per worker wake-up, 64 read-ahead frames per disk command, 16 written
+frames per disk write; the service thread still drained a third of the frames (`net-rx` the rest).
 
-## 9. Open questions
+Not done, in the order I would do it:
+
+1. **Per-controller locking** in the block layer, if measurements on hardware say serial disk access is the limit.
+2. Jumbo frames on this path: `nicctl` drains into 1600-byte buffers and the target assumes MTU 1500.
+3. `vblade` as a peer, and the Linux test on real hardware (a fos machine exporting to a Linux box over a real switch).
+4. The initiator: `block::Backend::Aoe`, a virtual disk like `Md`, with retransmit and a window.
+
+## 9. Testing against Linux
+
+The host's own `aoe` module as the initiator, against the server kernel in QEMU. Not automated: loading a kernel module
+and reading `/dev/etherd` need root, so a person runs the `sudo` lines. `tools/aoe_linux.py` (`make run-mf-aoe-tap`) does
+the rest: a scratch data disk of random bytes in `build/aoe-linux/data.img` with its SHA-256 in `data.sha256`, a boot image
+that exports it read-only as shelf 5 slot 2, and QEMU (KVM) with that disk and an e1000 on a tap device, the guest shell on
+the terminal (Ctrl-A X quits). No host block device is involved; the module is limited to the tap device so it never
+broadcasts AoE on the lab network (`enp0s31f6`), where the fos machines are.
+
+**Once, as root**: a tap device you own, and the module bound to it only.
+
+```sh
+sudo ip tuntap add dev fosaoe0 mode tap user $USER
+sudo ip link set fosaoe0 up
+lsmod | grep -q '^aoe ' && sudo rmmod aoe        # if it is loaded with other interfaces
+sudo modprobe aoe aoe_iflist=fosaoe0
+cat /sys/module/aoe/parameters/aoe_iflist        # expect: fosaoe0
+```
+
+**Terminal A**: `make run-mf-aoe-tap`. Expect `aoe: disk 2 exported read-only as shelf 5 slot 2.` before the prompt.
+
+**Terminal B**: `tools/aoe_linux_host.sh` runs the steps below in order. It pauses once for the guest commands, writes only
+after checking that the device is the scratch disk, and logs to `build/aoe-linux/host.log`. By hand, step by step (each
+line says what to expect):
+
+```sh
+# 1. Discovery: the module broadcasts Query Config on fosaoe0, the guest answers.
+echo | sudo tee /dev/etherd/discover
+ls -l /dev/etherd/                               # e5.2 appears
+sudo dmesg | grep -i aoe | tail -3               # a line naming e5.2 and 131072 sectors (64 MiB)
+
+# 2. Size and content, read through AoE.
+sudo blockdev --getsize64 /dev/etherd/e5.2       # 67108864
+sudo sha256sum /dev/etherd/e5.2; cat build/aoe-linux/data.sha256    # the same digest
+
+# 3. Read throughput (then `aoe` in terminal A shows the counters).
+sudo dd if=/dev/etherd/e5.2 of=/dev/null bs=1M iflag=direct status=progress
+
+# 4. The export is read-only: a write fails with an I/O error and changes nothing.
+sudo dd if=/dev/zero of=/dev/etherd/e5.2 bs=4k count=1 oflag=direct    # expect an Input/output error
+sudo blockdev --flushbufs /dev/etherd/e5.2; sudo sha256sum /dev/etherd/e5.2   # still the digest of step 2
+```
+
+In terminal A: `aoe unexport 2`, then `aoe export 2 rw confirm`. Back in terminal B:
+
+```sh
+echo | sudo tee /dev/etherd/discover             # in case the module gave up on it while it was gone
+
+# 5. Raw writes: 8 MiB at 16 MiB, read back through AoE (buffers dropped first, so the read reaches the
+#    target) and found in the disk image itself.
+head -c 8M /dev/urandom > /tmp/aoe-pattern
+sudo dd if=/tmp/aoe-pattern of=/dev/etherd/e5.2 bs=1M seek=16 oflag=direct conv=fsync status=progress
+sudo blockdev --flushbufs /dev/etherd/e5.2
+sudo cmp -n 8388608 -i 0:16777216 /tmp/aoe-pattern /dev/etherd/e5.2 && echo "read back: same"
+sleep 1; cmp -n 8388608 -i 0:16777216 /tmp/aoe-pattern build/aoe-linux/data.img && echo "in the image: same"
+
+# 6. A file system: ext4 made, used and checked through AoE.
+sudo mkfs.ext4 -q -F /dev/etherd/e5.2
+sudo mount /dev/etherd/e5.2 /mnt
+sudo cp -r docs crates/aoe/src /mnt/ && sha256sum crates/aoe/src/lib.rs && sudo sha256sum /mnt/src/lib.rs   # the same digest
+sudo umount /mnt
+sudo blockdev --flushbufs /dev/etherd/e5.2; sudo e2fsck -fn /dev/etherd/e5.2               # clean
+
+# 7. Write throughput (overwrites the file system: a scratch disk).
+sudo dd if=/dev/zero of=/dev/etherd/e5.2 bs=1M count=32 oflag=direct status=progress
+```
+
+After quitting QEMU, `e2fsck -fn build/aoe-linux/data.img` (no root needed) checks what step 6 left, unless step 7 ran.
+
+**Cleanup** (as root): `sudo umount /mnt` if still mounted, `sudo rmmod aoe`, `sudo ip link del fosaoe0`.
+
+**What to bring back**: the `dmesg` lines from step 1 and any `aoe:` errors later, whether the digests and `cmp` agree, the
+`dd` rates of steps 3 and 7, and the guest's `aoe` output after steps 3 and 7.
+
+**Run on 2026-11-22** (host kernel 7.3.0, `aoe` v85, KVM): every step passed.
+
+- Discovery: `aoe: e5.2: setting 1024 byte data frames`, `5254001234d5 e5.2 v0001 has 131072 sectors`.
+- Content: the SHA-256 through AoE equals `data.sha256`; reads 58 MB/s.
+- Read-only: the 4 KiB write fails with `EIO` and the digest is unchanged. The module logs `ata error cmd=34h stat=51h`
+  four times (WRITE DMA EXT; DRDY, DSC, ERR), one per 1 KiB frame, and the guest counts 4 errors.
+- The gap between `unexport` and `export 2 rw confirm` did no harm: the module kept the device and used it again.
+- Raw writes read back the same through AoE and in `data.img` (50 MB/s with `fsync`); ext4 made, filled, remounted,
+  compared and checked clean; writes 50 MB/s.
+- `aoe: unknown ioctl 0x80280215` and `0x5395`: host programs (udev, blkid, mkfs) asking the block driver for things it
+  does not implement. Local to the host; nothing reaches the wire.
+- Nothing came back "unknown command": the module asks only Query Config and ATA.
+
+## 10. Open questions
 
 - RTL8168 jumbo (per-chip limits table, `RMS`, buffer size) is not done.
 - Does the recorder want the initiator on the embedded kernel too, or mf only? (Leaning mf only.)
