@@ -21,6 +21,20 @@ static mut SWEDISH: bool = false;
 static mut NO_MSI: bool = false;
 static mut MD_AUTO: bool = false;
 static mut MD_WAIT: u64 = 10;
+/// `aoe-shelf N` in `settings`: the shelf number the AoE target answers as (default from NIC 1's MAC).
+static mut AOE_SHELF: Option<u16> = None;
+/// Bit n set: `aoe-export n` in `settings` (disk n is exported read-only after boot).
+static mut AOE_EXPORTS: u32 = 0;
+
+/// `aoe-shelf N` in `settings`.
+pub fn aoe_shelf() -> Option<u16> {
+    unsafe { AOE_SHELF }
+}
+
+/// The disks `aoe-export N` lines named, as a bit mask (bit N for disk N).
+pub fn aoe_exports() -> u32 {
+    unsafe { AOE_EXPORTS }
+}
 
 /// `md auto` in `settings`: a thread assembles a Linux md array at boot (see `mdvol`).
 pub fn md_auto() -> bool {
@@ -199,6 +213,16 @@ pub fn load() {
             if line.split_whitespace().next() == Some("no-msi") {
                 unsafe { NO_MSI = true };
                 println!("settings: no-msi -- devices are polled.");
+            }
+            if let Some(key @ ("aoe-shelf" | "aoe-export")) = line.split_whitespace().next() {
+                match line.split_whitespace().nth(1).and_then(|word| word.parse::<u16>().ok()) {
+                    Some(number) if key == "aoe-shelf" && number != 0xffff => unsafe { AOE_SHELF = Some(number) },
+                    Some(number @ 1..=31) if key == "aoe-export" => {
+                        unsafe { AOE_EXPORTS |= 1 << number };
+                        println!("settings: aoe-export {number} -- disk {number} is served read-only over AoE after boot.");
+                    }
+                    _ => println!("settings: `{line}` ignored (aoe-shelf 0..65534 | aoe-export 1..31)."),
+                }
             }
             if line.split_whitespace().next() == Some("md") {
                 let mut parts = line.split_whitespace().skip(1);

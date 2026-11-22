@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "aoe"
+version = "0.1.0"
+
+[[package]]
 name = "fosfor-abi"
 version = "0.1.0"
 
@@ -38,6 +42,7 @@ dependencies = [
 name = "fosfor-kernel-mf"
 version = "0.1.0"
 dependencies = [
+ "aoe",
  "fosfor-abi",
  "fosfor-fat",
  "fosfor-hal",

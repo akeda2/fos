@@ -504,6 +504,7 @@ pub fn run_command(line: &str) {
         "install" => crate::install::command(words),
         "bootcode" => crate::bootcode::command(words),
         "md" => crate::mdvol::command(words),
+        "aoe" => crate::aoetarget::command(words),
         "shutdown" | "halt" => {
             println!("Powering off.");
             crate::mdvol::stop_all();

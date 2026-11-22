@@ -76,6 +76,7 @@ mod shell;
 mod shellhost;
 mod script;
 mod sysshell;
+mod aoetarget;
 mod mdvol;
 mod top;
 #[path = "../../kernel/src/formatshell.rs"]
@@ -218,6 +219,7 @@ fn boot_services(info: &BootInfo, century: u8) -> ! {
     if config::md_auto() {
         sched::spawn("md-assemble", mdvol::assemble_thread, 0);
     }
+    aoetarget::init();
     sched::spawn("service", service_thread, 0).expect("the service thread");
     println!("kernel-mf: slice 8 reached the end of boot; entering the service loop.");
     // The boot context is the idle thread: it runs when nothing else is ready and sleeps until the next interrupt.
