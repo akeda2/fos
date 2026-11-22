@@ -1,0 +1,14 @@
+[package]
+name = "aoe"
+version = "0.1.0"
+edition = "2024"
+description = "ATA over Ethernet (AoE rev 1.0): the frame format and a target that answers from a block device"
+license = "MIT"
+
+[lib]
+name = "aoe"
+path = "src/lib.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
