@@ -171,22 +171,44 @@ Workers serve up to 8 frames per hold of the disk lock. Reading the drivers show
 - So disk transfers are serial across all exports and everything else, however many workers there are. More workers
   would not read two disks at once, and several requests in flight to one disk is not possible with these drivers. Doing
   that means locks per controller in the drivers, a change in the core of the kernel, not in this module.
-- A contended `SleepMutex` may cost a timer tick (10 ms) to wake, which would cap throughput near 100 lock acquisitions a
-  second while the shell or a tape holds the disk. Seen, not yet proven: the same test read 17,799 frames in the time it read
-  164 when the guest shell was also reading. Measure before changing anything.
+
+**Measured** (`tools/bench_mf_aoe.py`, 2026-11-22: QEMU without KVM on a 4-core host, a Python initiator with a window of
+16 reads or writes of 2 sectors, MTU 1500; the host's `/dev/kvm` was not usable by the build user, so read the numbers as
+relative, not as what hardware does):
+
+| What changed | idle, 1 outstanding | idle, window 16 | shell printing | shell reading the disk |
+| --- | --- | --- | --- | --- |
+| first version (threads pinned to CPU 0 by `sched::spawn`) | 98 frames/s | 3,100 | 150 | 0 |
+| `sched::spawn_any` for the workers (committed) | 1,600 | 10,500 (10.7 MB/s) | 217 | 0 |
+| plus a thread that only drains the NICs (experiment, not kept) | | 10,900 | 10,400 | 10,300 |
+
+- A round trip of 10 ms (98 a second with one frame outstanding) was the scheduler's tick: `spawn` pins a thread to CPU 0,
+  where the service thread spins on `yield_now`. Unpinned workers run on an idle CPU at once. Writes behave like reads (10.8k
+  idle). Not the disk lock, and not `SleepMutex` (it wakes at once).
+- **Any shell command on the service thread stops AoE.** `service_thread` drains the NICs (`net::poll`) and also runs the
+  shell's commands, so while a command prints or reads a disk nothing is drained and no frame reaches a worker. The same
+  holds for every network service on mf (KUP, the net terminal, tapes' FIFOs) during a long command.
+- A thread that only drains the NICs fixes it: 10,400 frames/s while the shell prints, 10,300 while it reads the disk.
+  As written (spinning, holding the NIC lock almost all the time) it broke `make test-mf-sysrq`: the SysRq rescue drains
+  with `try_lock` and never gets the lock. So the real change is a drain thread that waits for the NIC (its interrupt wakes
+  it, or a short sleep when idle) and holds the lock only while it drains. That moves `handle_frame` (terminal, discovery,
+  KUP) off the service thread; the rescue path already runs it from another CPU under the NIC lock, so it is meant to
+  tolerate that, but it needs `test-mf-net`, `test-mf-netfs`, `test-mf-sessions`, `test-mf-sysrq` and the tape network
+  tests (`test-mf-smbd`, `test-mf-httpd`) to pass, and on real hardware a look at the idle CPU use.
 
 Not done, in the order I would do it:
 
-1. **Measure** AoE throughput at MTU 1500 and 9000, alone and with the shell using the disk (and whether the 164-against-17,799 gap
-   is the wake-up latency above).
-2. **Batch inside the crate**: gather the 1 KiB frames of one initiator request into one block transfer (a 4 KiB write is
-   four frames at MTU 1500), and read ahead. This is where the real gain is at 1500, and it answers the read-modify-write point in
-   section 2.
-3. **Per-controller locking** in the block layer, if the measurements say serial disk access is the limit.
-4. Jumbo frames on this path: `nicctl` drains into 1600-byte buffers and the target assumes MTU 1500.
-5. Interoperability with the Linux `aoe` module and `vblade` as a peer (the host has the module, version 85; loading it
+1. **A NIC drain thread on mf** as above (a change in `kernel-mf/src/net.rs` and `main.rs`, not in the `kernel-core`
+   crate), then measure again.
+2. **Measure with KVM** (the numbers above are TCG), at MTU 1500 and 9000.
+3. **Batch inside the crate**: gather the 1 KiB frames of one initiator request into one block transfer (a 4 KiB write is
+   four frames at MTU 1500), and read ahead. This is where the real gain is at 1500, and it answers the read-modify-write
+   point in section 2.
+4. **Per-controller locking** in the block layer, if the measurements say serial disk access is the limit.
+5. Jumbo frames on this path: `nicctl` drains into 1600-byte buffers and the target assumes MTU 1500.
+6. Interoperability with the Linux `aoe` module and `vblade` as a peer (the host has the module, version 85; loading it
    needs root, so a manual step).
-6. The initiator: `block::Backend::Aoe`, a virtual disk like `Md`, with retransmit and a window.
+7. The initiator: `block::Backend::Aoe`, a virtual disk like `Md`, with retransmit and a window.
 
 ## 9. Open questions
 

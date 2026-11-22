@@ -239,12 +239,12 @@ fn flush_slot(slot: &Slot) {
 
 fn start_threads(index: usize) -> bool {
     if !SLOTS[index].started.load(Ordering::Acquire) {
-        if sched::spawn("aoe", worker, index).is_none() {
+        if sched::spawn_any("aoe", worker, index).is_none() {
             return false;
         }
         SLOTS[index].started.store(true, Ordering::Release);
     }
-    if !FLUSHER.swap(true, Ordering::AcqRel) && sched::spawn("aoe-flush", flusher, 0).is_none() {
+    if !FLUSHER.swap(true, Ordering::AcqRel) && sched::spawn_any("aoe-flush", flusher, 0).is_none() {
         FLUSHER.store(false, Ordering::Release);
         return false;
     }
