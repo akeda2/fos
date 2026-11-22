@@ -211,20 +211,26 @@ first numbers are relative; the KVM numbers follow):
 
 - With `net-rx` a busy shell now costs at most about 10 percent, not 97 or 100.
 - One frame outstanding gives 4,530 frames/s: a round trip of about 220 microseconds, so the 10 ms tick is gone. From window 4
-  up the rate stays at about 6,600 whatever the window (1 to 64) and whatever the guest's CPU count (2 or 4), so a stage that
-  costs about 150 microseconds a frame limits it. Under TCG the same guest code reached 10,900, so it is neither the
-  Python initiator nor the number of CPUs. Not yet found. A guess, not a result: with a fast guest each frame gets its
-  own interrupt and two thread wake-ups (`net-rx`, then the worker), where a slow guest batched frames per wake-up. To find it:
-  count frames per wake-up in `rx_thread` and the worker, and try the worker draining its queue longer before it sleeps.
+  up the rate stays at about 6,500 whatever the window (1 to 64) and whatever the guest's CPU count (2 or 4).
+- **Where the time goes** (`aoe` prints per-worker counters, `aoe reset` clears them, `bench_mf_aoe.py --stats` shows them
+  per run). At window 16 a worker never sleeps (one wake-up for 19,516 frames), `net-rx` runs within about 60 us of the
+  interrupt, the disk lock costs nothing, and serving a frame costs 153 us: **121 us for the disk transfer and the reply,
+  31 us for the send** (NIC lock and the e1000's doorbell). 1 / 153 us is the 6,500 ceiling. So the limit is one AHCI
+  command per 1 KiB frame (in QEMU each command is several register writes that leave the guest), and to a lesser
+  degree one doorbell per reply. Wake-ups, which I had guessed at, are not it.
+- The counters are kept in TSC cycles and converted when printed. A first version read `time::micros()`, which under
+  KVM's default CPU model (no invariant TSC) reads the ACPI PM timer through an I/O port: six reads a frame cost about
+  40 us and pushed the ceiling down to 4,700.
 - **One CPU: 100 frames/s with one frame outstanding**, a 10 ms round trip again (3,100 with window 16). With a single CPU
   every wake-up waits for the scheduler tick. A server has more CPUs; not looked at further.
 
 Not done, in the order I would do it:
 
-1. **Find the 150 microseconds a frame** under KVM (see above), then measure again at MTU 9000 once jumbo frames reach this path.
-2. **Batch inside the crate**: gather the 1 KiB frames of one initiator request into one block transfer (a 4 KiB write is
+1. **Batch inside the crate** (the measurement says this is the limit): read ahead into a cache so one disk command serves
+   many frames, and gather the 1 KiB frames of one initiator request into one block transfer (a 4 KiB write is
    four frames at MTU 1500), and read ahead. This is where the real gain is at 1500, and it answers the read-modify-write
    point in section 2.
+2. **One doorbell for several replies** (31 us a frame now): a send call that queues several frames before telling the card.
 3. **Per-controller locking** in the block layer, if the measurements say serial disk access is the limit.
 4. Jumbo frames on this path: `nicctl` drains into 1600-byte buffers and the target assumes MTU 1500.
 5. Interoperability with the Linux `aoe` module and `vblade` as a peer (the host has the module, version 85; loading it

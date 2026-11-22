@@ -70,7 +70,42 @@ struct Slot {
     dirty: AtomicBool,
     last_write: AtomicU64,
     export: SleepMutex<Option<Export>>,
+    stats: Stats,
 }
+
+/// Where a worker's time goes (`aoe` shows it, `aoe reset` clears it). Kept in CPU cycles (`cpu::cycles`, the TSC), which
+/// cost nothing to read, and turned into microseconds only when printed: `time::micros` may read the ACPI PM timer through an
+/// I/O port (no invariant TSC, as under KVM's default CPU model), which cost the very path it measured about 40 us a frame: how often it woke and how many frames it took per
+/// wake-up, how long a frame waited in the queue before the worker ran, how long it waited for the disk lock, and how long
+/// serving it took (disk, reply, send).
+struct Stats {
+    wakes: AtomicU64,
+    frames: AtomicU64,
+    wake_us: AtomicU64,
+    lock_us: AtomicU64,
+    serve_us: AtomicU64,
+    /// Of `serve_us`: the target's own work (the disk transfer and the reply), and the send (NIC lock and the driver).
+    handle_us: AtomicU64,
+    send_us: AtomicU64,
+    /// When the first frame was queued into an empty queue (µs), 0 for none.
+    queued_at: AtomicU64,
+}
+
+impl Stats {
+    const fn new() -> Stats {
+        Stats { wakes: AtomicU64::new(0), frames: AtomicU64::new(0), wake_us: AtomicU64::new(0), lock_us: AtomicU64::new(0), serve_us: AtomicU64::new(0), handle_us: AtomicU64::new(0), send_us: AtomicU64::new(0), queued_at: AtomicU64::new(0) }
+    }
+
+    fn reset(&self) {
+        for counter in [&self.wakes, &self.frames, &self.wake_us, &self.lock_us, &self.serve_us, &self.handle_us, &self.send_us] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// AoE frames by the thread that drained them from the NIC.
+static FROM_RX: AtomicU64 = AtomicU64::new(0);
+static FROM_SERVICE: AtomicU64 = AtomicU64::new(0);
 
 impl Slot {
     const fn new() -> Slot {
@@ -81,6 +116,7 @@ impl Slot {
             dirty: AtomicBool::new(false),
             last_write: AtomicU64::new(0),
             export: SleepMutex::new(None),
+            stats: Stats::new(),
         }
     }
 }
@@ -107,6 +143,7 @@ pub fn enqueue(nic: usize, frame: &[u8], wake: bool) {
     if shelf != 0xffff && shelf != self::shelf() {
         return;
     }
+    if net::draining_from_rx_thread() { &FROM_RX } else { &FROM_SERVICE }.fetch_add(1, Ordering::Relaxed);
     for (index, entry) in SLOTS.iter().enumerate() {
         let number = entry.number.load(Ordering::Acquire);
         if number == 0 || (slot != 0xff && slot != number) {
@@ -123,6 +160,9 @@ pub fn enqueue(nic: usize, frame: &[u8], wake: bool) {
                 queue.lengths[at] = frame.len() as u16;
                 queue.nics[at] = nic as u8;
                 queue.count += 1;
+                if queue.count == 1 {
+                    let _ = entry.stats.queued_at.compare_exchange(0, crate::cpu::cycles().max(1), Ordering::AcqRel, Ordering::Relaxed);
+                }
                 true
             }
         };
@@ -186,17 +226,27 @@ extern "C" fn worker(index: usize) {
         let waiting = slot.inbox.lock().count;
         if waiting == 0 {
             sched::wait_while(WAKE_KEY + index, || slot.inbox.lock().count == 0);
+            slot.stats.wakes.fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        // Only an ATA command needs the disk (and so the lock); a Query Config is answered from memory.
+        let queued = slot.stats.queued_at.swap(0, Ordering::AcqRel);
+        let before_lock = crate::cpu::cycles();
+        if queued != 0 {
+            slot.stats.wake_us.fetch_add(before_lock.saturating_sub(queued), Ordering::Relaxed);
+        }
         let _disks = tapefs::lock();
         let mut guard = slot.export.lock();
+        slot.stats.lock_us.fetch_add(crate::cpu::cycles().saturating_sub(before_lock), Ordering::Relaxed);
         for _ in 0..BATCH {
+            let started = crate::cpu::cycles();
             let Some((nic, length)) = pop(slot, &mut request) else { break };
             let (Some(export), Some(mac)) = (guard.as_mut(), net::mac(nic)) else { continue };
             export.target.mac = mac;
             let writes = export.target.writes;
+            let handle_start = crate::cpu::cycles();
             let reply_length = export.target.handle(&request[..length], &mut BlockDisk(export.disk), &mut reply);
+            let handled = crate::cpu::cycles();
+            slot.stats.handle_us.fetch_add(handled.saturating_sub(handle_start), Ordering::Relaxed);
             if export.target.writes != writes {
                 slot.last_write.store(crate::arch::ticks(), Ordering::Relaxed);
                 slot.dirty.store(true, Ordering::Release);
@@ -205,6 +255,9 @@ extern "C" fn worker(index: usize) {
                 let _nics = net::lock_nics();
                 nicctl::nic_send(nic, &reply[..reply_length]);
             }
+            slot.stats.send_us.fetch_add(crate::cpu::cycles().saturating_sub(handled), Ordering::Relaxed);
+            slot.stats.frames.fetch_add(1, Ordering::Relaxed);
+            slot.stats.serve_us.fetch_add(crate::cpu::cycles().saturating_sub(started), Ordering::Relaxed);
         }
     }
 }
@@ -325,9 +378,19 @@ pub fn init() {
 }
 
 pub fn command(mut words: core::str::SplitWhitespace) {
-    let usage = "aoe [export N [rw confirm] | unexport N | shelf N]: serve disk N to Linux and other fos hosts (ATA over Ethernet).";
+    let usage = "aoe [export N [rw confirm] | unexport N | shelf N | reset]: serve disks over ATA over Ethernet.";
     match words.next() {
         None => list(),
+        Some("reset") => {
+            for slot in SLOTS.iter() {
+                slot.stats.reset();
+                slot.inbox.lock().dropped = 0;
+            }
+            FROM_RX.store(0, Ordering::Relaxed);
+            FROM_SERVICE.store(0, Ordering::Relaxed);
+            net::reset_rx_stats();
+            crate::println!("aoe: counters cleared.");
+        }
         Some("export") => {
             let Some(number) = words.next().and_then(|word| word.parse::<usize>().ok()) else { return crate::println!("{usage}") };
             let writable = match (words.next(), words.next()) {
@@ -373,7 +436,16 @@ pub fn command(mut words: core::str::SplitWhitespace) {
     }
 }
 
+/// TSC cycles per microsecond, measured against `time::micros` over 10 ms (only when printing the counters).
+fn cycles_per_us() -> u64 {
+    let (cycles, micros) = (crate::cpu::cycles(), crate::time::micros());
+    crate::arch::busy_wait_ms(10);
+    let elapsed = crate::time::micros().saturating_sub(micros).max(1);
+    (crate::cpu::cycles().wrapping_sub(cycles) / elapsed).max(1)
+}
+
 fn list() {
+    let rate = cycles_per_us();
     crate::println!("aoe: shelf {}, {} disk(s) exported.", shelf(), ACTIVE.load(Ordering::Acquire));
     for slot in SLOTS.iter() {
         let guard = slot.export.lock();
@@ -390,5 +462,21 @@ fn list() {
             export.target.errors,
             slot.inbox.lock().dropped
         );
+        let stats = &slot.stats;
+        let (wakes, frames) = (stats.wakes.load(Ordering::Relaxed), stats.frames.load(Ordering::Relaxed));
+        let per = |total: &AtomicU64| total.load(Ordering::Relaxed) / frames.max(1) / rate;
+        crate::println!("    worker: {wakes} wake-ups, {frames} frames ({} per wake-up)", frames / wakes.max(1));
+        crate::println!("    queued to running {} us a wake-up", stats.wake_us.load(Ordering::Relaxed) / wakes.max(1) / rate);
+        crate::println!("    per frame: disk lock {} us, serve {} us", per(&stats.lock_us), per(&stats.serve_us));
+        crate::println!("      of which disk and reply {} us, send {} us", per(&stats.handle_us), per(&stats.send_us));
     }
+    let rx = &net::RX_STATS;
+    let wakes = rx.wakes.load(Ordering::Relaxed);
+    crate::println!("  frames drained by net-rx {}, by the service thread {}", FROM_RX.load(Ordering::Relaxed), FROM_SERVICE.load(Ordering::Relaxed));
+    crate::println!(
+        "  net-rx: {} interrupts, {wakes} wake-ups, {} us to run (max {})",
+        rx.events.load(Ordering::Relaxed),
+        rx.latency_us.load(Ordering::Relaxed) / wakes.max(1) / rate,
+        rx.latency_max_us.load(Ordering::Relaxed) / rate
+    );
 }

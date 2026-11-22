@@ -97,6 +97,7 @@ def main():
     parser.add_argument("--seconds", type=float, default=4)
     parser.add_argument("--window", type=int, default=16)
     parser.add_argument("--kvm", action="store_true", help="run QEMU with -enable-kvm")
+    parser.add_argument("--stats", action="store_true", help="print the target's counters (`aoe`) after each window run")
     parser.add_argument("--smp", type=int, default=2, help="CPUs of the guest (the test default is 2)")
     parser.add_argument("--windows", default="", help="comma list of windows to run the idle read/write scenario with (instead of the default matrix)")
     args = parser.parse_args()
@@ -128,8 +129,14 @@ def main():
                         guest.command("aoe unexport 2", "no longer exported")
                         guest.command("aoe export 2 rw confirm", "READ-WRITE")
                     for window in (int(word) for word in args.windows.split(",")):
+                        guest.command("aoe reset", "cleared")
                         done, elapsed, timeouts, errors = run_window(args.seconds, window, direction == "write")
                         print(f"{window:7d} {direction:9} {done / elapsed:9.0f} {done * 1024 / elapsed / 1e6:7.2f} {timeouts:7d} {errors:7d}")
+                        if args.stats:
+                            _, text = guest.command("aoe", "net-rx:")
+                            for line in text.splitlines():
+                                if any(key in line for key in ("worker:", "queued to", "per frame", "of which", "drained by", "net-rx:")):
+                                    print("        " + line.strip())
                 return
             print(f"window {args.window}, {args.seconds:g} s per run, 2 sectors (1 KiB) per frame, MTU 1500")
             print(f"{'':10} {'direction':9} {'frames/s':>9} {'MB/s':>7} {'resent':>7} {'errors':>7}")

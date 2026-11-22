@@ -13,7 +13,7 @@
 //!
 //! Not served yet: GPIO and the `tapesync` client command (`DEFERRED.md`). Everything runs on the boot CPU.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use kernel_core::nic::{self, Nic};
 use kernel_core::nicctl;
@@ -939,9 +939,37 @@ pub fn poll() {
 static RX_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 const RX_KEY: usize = 0x6e65_7478;
 
+/// What the receive thread did, for `aoe` (and anyone measuring the receive path): interrupts seen, times it woke, and the
+/// time from the first interrupt of a round to the thread running (summed, and the largest), in TSC cycles (`aoe` converts).
+pub struct RxStats {
+    pub events: AtomicU64,
+    pub wakes: AtomicU64,
+    pub latency_us: AtomicU64,
+    pub latency_max_us: AtomicU64,
+}
+
+pub static RX_STATS: RxStats = RxStats { events: AtomicU64::new(0), wakes: AtomicU64::new(0), latency_us: AtomicU64::new(0), latency_max_us: AtomicU64::new(0) };
+/// When the first interrupt since the thread last woke arrived (TSC cycles), 0 for none.
+static RX_EVENT_AT: AtomicU64 = AtomicU64::new(0);
+/// Set while `rx_thread` drains (under the NIC lock, so whoever else drains sees it clear).
+static RX_DRAINING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether the frame being handled was drained by the receive thread (true) or the service thread. Valid under the NIC lock.
+pub fn draining_from_rx_thread() -> bool {
+    RX_DRAINING.load(Ordering::Relaxed)
+}
+
+pub fn reset_rx_stats() {
+    for counter in [&RX_STATS.events, &RX_STATS.wakes, &RX_STATS.latency_us, &RX_STATS.latency_max_us] {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
 /// A NIC interrupted (`Platform::net_event`, from its interrupt handler): wake the receive thread. `wake_all` takes only the
 /// scheduler's lock, which every holder takes with interrupts off, so an interrupt handler may call it.
 pub fn rx_event() {
+    RX_STATS.events.fetch_add(1, Ordering::Relaxed);
+    let _ = RX_EVENT_AT.compare_exchange(0, crate::cpu::cycles().max(1), Ordering::AcqRel, Ordering::Relaxed);
     RX_PENDING.store(true, Ordering::Release);
     crate::sched::wake_all(RX_KEY);
 }
@@ -956,8 +984,17 @@ pub extern "C" fn rx_thread(_: usize) {
         crate::sched::wait_while(RX_KEY, || !RX_PENDING.load(Ordering::Acquire));
         // Cleared first: an interrupt that arrives while draining sets it again and the next round picks that frame up.
         RX_PENDING.store(false, Ordering::Release);
+        RX_STATS.wakes.fetch_add(1, Ordering::Relaxed);
+        let at = RX_EVENT_AT.swap(0, Ordering::AcqRel);
+        if at != 0 {
+            let waited = crate::cpu::cycles().saturating_sub(at);
+            RX_STATS.latency_us.fetch_add(waited, Ordering::Relaxed);
+            RX_STATS.latency_max_us.fetch_max(waited, Ordering::Relaxed);
+        }
         let _nics = lock_nics();
+        RX_DRAINING.store(true, Ordering::Relaxed);
         nicctl::drain_nics_to_fifo();
+        RX_DRAINING.store(false, Ordering::Relaxed);
     }
 }
 
