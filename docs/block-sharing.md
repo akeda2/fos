@@ -173,8 +173,8 @@ Workers serve up to 8 frames per hold of the disk lock. Reading the drivers show
   that means locks per controller in the drivers, a change in the core of the kernel, not in this module.
 
 **Measured** (`tools/bench_mf_aoe.py`, 2026-11-22: QEMU without KVM on a 4-core host, a Python initiator with a window of
-16 reads or writes of 2 sectors, MTU 1500; the host's `/dev/kvm` was not usable by the build user, so read the numbers as
-relative, not as what hardware does):
+16 reads or writes of 2 sectors, MTU 1500; the host's `/dev/kvm` was not usable by the build user at that point, so these
+first numbers are relative; the KVM numbers follow):
 
 | What changed | idle, 1 outstanding | idle, window 16 | shell printing | shell reading the disk |
 | --- | --- | --- | --- | --- |
@@ -202,9 +202,26 @@ relative, not as what hardware does):
   thread last went round N ms ago") instead of the timer interrupt. The rescue is still tested by the deadhang case (a CPU
   with interrupts off cannot take the NIC interrupt), and it remains the backstop when the drain is stuck.
 
+**Under KVM** (same benchmark, same host, 2026-11-22, after the user joined the `kvm` group; guest CPUs 2, window 16):
+
+| | idle | shell printing | shell reading a disk |
+| --- | --- | --- | --- |
+| reads | 6,455 frames/s (6.6 MB/s) | 6,388 | 5,848 |
+| writes | 6,284 | 6,175 | 5,807 |
+
+- With `net-rx` a busy shell now costs at most about 10 percent, not 97 or 100.
+- One frame outstanding gives 4,530 frames/s: a round trip of about 220 microseconds, so the 10 ms tick is gone. From window 4
+  up the rate stays at about 6,600 whatever the window (1 to 64) and whatever the guest's CPU count (2 or 4), so a stage that
+  costs about 150 microseconds a frame limits it. Under TCG the same guest code reached 10,900, so it is neither the
+  Python initiator nor the number of CPUs. Not yet found. A guess, not a result: with a fast guest each frame gets its
+  own interrupt and two thread wake-ups (`net-rx`, then the worker), where a slow guest batched frames per wake-up. To find it:
+  count frames per wake-up in `rx_thread` and the worker, and try the worker draining its queue longer before it sleeps.
+- **One CPU: 100 frames/s with one frame outstanding**, a 10 ms round trip again (3,100 with window 16). With a single CPU
+  every wake-up waits for the scheduler tick. A server has more CPUs; not looked at further.
+
 Not done, in the order I would do it:
 
-1. **Measure with KVM** (the numbers above are TCG), at MTU 1500 and 9000.
+1. **Find the 150 microseconds a frame** under KVM (see above), then measure again at MTU 9000 once jumbo frames reach this path.
 2. **Batch inside the crate**: gather the 1 KiB frames of one initiator request into one block transfer (a 4 KiB write is
    four frames at MTU 1500), and read ahead. This is where the real gain is at 1500, and it answers the read-modify-write
    point in section 2.
