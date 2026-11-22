@@ -177,6 +177,30 @@ impl Nic {
         }
     }
 
+    /// Sets the MTU (jumbo frames above 1500). Only the e1000 family so far; false elsewhere, or when the size is refused.
+    pub fn set_mtu(&mut self, mtu: usize) -> bool {
+        match self {
+            Nic::E1000(nic) => nic.set_mtu(mtu),
+            _ => false,
+        }
+    }
+
+    /// Jumbo frames joined from several buffers, and frames dropped whole for size (e1000 family only).
+    pub fn jumbo_counters(&self) -> Option<(u64, u64)> {
+        match self {
+            Nic::E1000(nic) => Some((nic.jumbo_joined, nic.jumbo_dropped)),
+            _ => None,
+        }
+    }
+
+    /// The MTU in force, and the largest `set_mtu` accepts for this card (1500, 1500 where jumbo is not supported).
+    pub fn mtu(&self) -> (usize, usize) {
+        match self {
+            Nic::E1000(nic) => (nic.mtu(), crate::e1000::JUMBO_MAX_MTU),
+            _ => (1500, 1500),
+        }
+    }
+
     pub fn set_promiscuous(&mut self, on: bool) {
         match self {
             Nic::E1000(nic) => nic.set_promiscuous(on),

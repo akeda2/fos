@@ -283,6 +283,14 @@ const TX_COUNT: usize = 128;
 const BUFFER_SIZE: usize = 2048;
 /// 1514 plus a 4-byte VLAN tag: a tagged full-size frame must cross a bridge intact.
 pub const MAX_FRAME: usize = 1518;
+/// Transmit buffers hold one whole jumbo frame (12 KiB, page-aligned): 128 of them are 1.5 MiB per card. Receive keeps
+/// `BUFFER_SIZE` and lets the card spread a big frame over several descriptors (`E1000::receive` joins them).
+const TX_BUFFER_SIZE: usize = 12288;
+/// Largest MTU `set_mtu` accepts: under what every variant can receive with `RCTL.LPE` (82574L and I219 about 9 KB,
+/// I350 about 9.2 KB, 82540 16 KB), so one limit is safe on all of them. docs/block-sharing.md section 6.
+pub const JUMBO_MAX_MTU: usize = 9000;
+/// Ethernet header (14) plus a VLAN tag (4): what a frame is on top of the MTU.
+const FRAME_OVERHEAD: usize = 18;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -382,7 +390,23 @@ pub struct E1000 {
     tx_buffers: u64,
     rx_next: usize,
     /// Inside an oversize frame that spans several buffers (RCTL.LPE lets it in): drop it up to its last descriptor.
-    rx_skipping: bool,
+    /// The last descriptor did not end its frame: the next one continues it (a frame over `BUFFER_SIZE`).
+    rx_in_frame: bool,
+    /// The frame being received is to be dropped (no assembly buffer, or it outgrew the MTU).
+    rx_bad: bool,
+    /// Bytes of the current multi-descriptor frame collected in `assembly`.
+    assembly_len: usize,
+    /// Physical address of the buffer a multi-descriptor frame is joined in; 0 until `set_mtu` raised the MTU. Needed
+    /// because the card may finish a frame's first descriptor before its last, so the pieces outlive one `receive` call.
+    assembly: u64,
+    /// The I350 timestamp of the frame being received (read from its first buffer).
+    rx_stamp: u64,
+    /// Largest frame (header and VLAN tag included) `send` accepts and the join buffer holds: `MAX_FRAME` until `set_mtu`.
+    max_frame: usize,
+    /// Frames dropped whole because they did not fit the caller's buffer or the MTU. Never delivered truncated.
+    pub jumbo_dropped: u64,
+    /// Multi-descriptor frames joined whole and within the MTU (before the caller's buffer is considered).
+    pub jumbo_joined: u64,
     tx_next: usize,
     pub frames_received: u64,
     pub frames_sent: u64,
@@ -578,7 +602,7 @@ impl E1000 {
         let pages_per_buffer = (BUFFER_SIZE as u64) / memory::FRAME; // 2 KiB: half a page
         let _ = pages_per_buffer;
         let rx_buffers = memory::allocate_contiguous((RX_COUNT * BUFFER_SIZE) as u64 / memory::FRAME, limit).ok_or(Error::OutOfMemory)?;
-        let tx_buffers = memory::allocate_contiguous((TX_COUNT * BUFFER_SIZE) as u64 / memory::FRAME, limit).ok_or(Error::OutOfMemory)?;
+        let tx_buffers = memory::allocate_contiguous((TX_COUNT * TX_BUFFER_SIZE) as u64 / memory::FRAME, limit).ok_or(Error::OutOfMemory)?;
 
         for index in 0..RX_COUNT {
             let descriptor = Descriptor { address: rx_buffers + (index * BUFFER_SIZE) as u64, length: 0, word: 0, status: 0, errors_or_css: 0, special: 0 };
@@ -586,7 +610,7 @@ impl E1000 {
         }
         for index in 0..TX_COUNT {
             // status = DD: "this transmit descriptor is free"
-            let descriptor = Descriptor { address: tx_buffers + (index * BUFFER_SIZE) as u64, length: 0, word: 0, status: DESCRIPTOR_DONE, errors_or_css: 0, special: 0 };
+            let descriptor = Descriptor { address: tx_buffers + (index * TX_BUFFER_SIZE) as u64, length: 0, word: 0, status: DESCRIPTOR_DONE, errors_or_css: 0, special: 0 };
             unsafe { write_volatile((memory::phys_to_virt(tx_ring) as *mut Descriptor).add(index), descriptor) };
         }
 
@@ -638,7 +662,35 @@ impl E1000 {
             write(registers, r.rdt, (RX_COUNT - 1) as u32);
         }
 
-        Ok(E1000 { registers, variant, r, index, delivery: Delivery::Polled, mac, rx_ring, tx_ring, rx_buffers, tx_buffers, rx_next: 0, rx_skipping: false, tx_next: 0, frames_received: 0, frames_sent: 0, frames_dropped_no_link: 0, link_checks: 0, link_ok: true, ts_on: false, ts_all: false, last_stamp: 0, ts_clock: pch_clock(device.id), ts_offset: 0, mc_users: [0; 4096], vlan_ids: [0; 128], promiscuous: false, tx_offload: false, tx_ctx: [false; TX_COUNT] })
+        Ok(E1000 { registers, variant, r, index, delivery: Delivery::Polled, mac, rx_ring, tx_ring, rx_buffers, tx_buffers, rx_next: 0, rx_in_frame: false, rx_bad: false, assembly_len: 0, assembly: 0, rx_stamp: 0, max_frame: MAX_FRAME, jumbo_dropped: 0, jumbo_joined: 0, tx_next: 0, frames_received: 0, frames_sent: 0, frames_dropped_no_link: 0, link_checks: 0, link_ok: true, ts_on: false, ts_all: false, last_stamp: 0, ts_clock: pch_clock(device.id), ts_offset: 0, mc_users: [0; 4096], vlan_ids: [0; 128], promiscuous: false, tx_offload: false, tx_ctx: [false; TX_COUNT] })
+    }
+
+    /// Sets the MTU (the payload size: 1500 is standard, up to `JUMBO_MAX_MTU`); false when `mtu` is out of range or the
+    /// join buffer cannot be allocated. Above 1500 the card receives big frames as several 2 KiB descriptors (`RCTL.LPE`
+    /// is always on) and `receive` joins them; `send` takes frames up to `mtu + 18` bytes. Every switch port and the
+    /// peer on the path must carry the same size, or the frames vanish without a trace: this is opt-in, never default.
+    /// QEMU's e1000 takes jumbo frames; what only real silicon can show (the 82574L and I219 split their packet buffer
+    /// between receive and transmit, and Linux changes `PBA` for jumbo; the I350's `RLPML`) is in docs/block-sharing.md.
+    pub fn set_mtu(&mut self, mtu: usize) -> bool {
+        if !(1500..=JUMBO_MAX_MTU).contains(&mtu) {
+            return false;
+        }
+        let max_frame = mtu + FRAME_OVERHEAD;
+        if self.assembly == 0 && max_frame > MAX_FRAME {
+            let pages = (JUMBO_MAX_MTU + FRAME_OVERHEAD).div_ceil(memory::FRAME as usize) as u64;
+            let Some(buffer) = memory::allocate_contiguous(pages, Some(1u64 << 32)) else { return false };
+            self.assembly = buffer;
+        }
+        self.max_frame = max_frame;
+        // A frame half-received under the old size is abandoned with the rest of it.
+        self.rx_bad = self.rx_in_frame;
+        self.assembly_len = 0;
+        true
+    }
+
+    /// The MTU in force (1500 until `set_mtu`).
+    pub fn mtu(&self) -> usize {
+        self.max_frame - FRAME_OVERHEAD
     }
 
     /// Promiscuous mode: receive every frame on the wire, not only ours and broadcasts
@@ -885,7 +937,7 @@ impl E1000 {
     /// Sends `frame` with an advanced descriptor that asks for a transmit stamp, and returns it
     /// as (sent, stamp); the stamp is 0 when none came within a bounded wait. One at a time.
     pub fn send_stamped(&mut self, frame: &[u8]) -> (bool, u64) {
-        if !self.ts_supported() || frame.len() > MAX_FRAME || !self.link_up() {
+        if !self.ts_supported() || frame.len() > self.max_frame || !self.link_up() {
             return (false, 0);
         }
         let _ = read(self.registers, REG_TXSTMPH);
@@ -895,7 +947,7 @@ impl E1000 {
                 return (false, 0);
             }
             let descriptor = unsafe { (memory::phys_to_virt(self.tx_ring) as *mut Descriptor).add(self.tx_next) };
-            let buffer = memory::phys_to_virt(self.tx_buffers + (self.tx_next * BUFFER_SIZE) as u64) as *mut u8;
+            let buffer = memory::phys_to_virt(self.tx_buffers + (self.tx_next * TX_BUFFER_SIZE) as u64) as *mut u8;
             let length = frame.len().max(60);
             unsafe {
                 core::ptr::write_bytes(buffer, 0, length);
@@ -920,7 +972,7 @@ impl E1000 {
             return (false, 0);
         }
         let descriptor = unsafe { (memory::phys_to_virt(self.tx_ring) as *mut Descriptor).add(self.tx_next) };
-        let buffer = memory::phys_to_virt(self.tx_buffers + (self.tx_next * BUFFER_SIZE) as u64) as *mut u8;
+        let buffer = memory::phys_to_virt(self.tx_buffers + (self.tx_next * TX_BUFFER_SIZE) as u64) as *mut u8;
         let length = frame.len().max(60);
         unsafe {
             core::ptr::write_bytes(buffer, 0, length);
@@ -1040,6 +1092,7 @@ impl E1000 {
     /// ring is empty.
     pub fn receive(&mut self, out: &mut [u8]) -> Option<usize> {
         let advanced = self.variant == Variant::I350;
+        let mut frame_length = 0;
         loop {
             let descriptor = unsafe { (memory::phys_to_virt(self.rx_ring) as *mut Descriptor).add(self.rx_next) };
             let buffer = memory::phys_to_virt(self.rx_buffers + (self.rx_next * BUFFER_SIZE) as u64) as *const u8;
@@ -1055,18 +1108,64 @@ impl E1000 {
             if !done {
                 return None;
             }
-            let skip = if stamped { TS_HEADER.min(length) } else { 0 };
-            let length = (length - skip).min(BUFFER_SIZE - skip).min(out.len());
-            let keep = !self.rx_skipping && end_of_packet;
-            let mut stamp = 0;
-            if keep {
-                unsafe { core::ptr::copy_nonoverlapping(buffer.add(skip), out.as_mut_ptr(), length) };
-                if stamped {
-                    let (low, high) = unsafe { (read_volatile(buffer.add(8) as *const u32), read_volatile(buffer.add(12) as *const u32)) };
-                    stamp = (u64::from(low) | u64::from(high) << 32) & 0xff_ffff_ffff;
+            // A frame's first buffer starts with the I350's timestamp header when it is stamped; later ones never do.
+            let first = !self.rx_in_frame;
+            let skip = if stamped && first { TS_HEADER.min(length) } else { 0 };
+            let chunk = (length - skip).min(BUFFER_SIZE - skip);
+            if first {
+                self.rx_stamp = 0;
+            }
+            if first && stamped {
+                let (low, high) = unsafe { (read_volatile(buffer.add(8) as *const u32), read_volatile(buffer.add(12) as *const u32)) };
+                self.rx_stamp = (u64::from(low) | u64::from(high) << 32) & 0xff_ffff_ffff;
+            }
+            let mut keep = false;
+            if first && end_of_packet {
+                // The usual case: the whole frame is in this one buffer. A frame the caller's buffer cannot hold is
+                // cut as before when it is within the old 1518-byte limit (a tagged frame, a 1514-byte caller), and
+                // dropped otherwise: a jumbo frame is never handed over truncated.
+                if chunk <= out.len() || chunk <= MAX_FRAME {
+                    let count = chunk.min(out.len());
+                    unsafe { core::ptr::copy_nonoverlapping(buffer.add(skip), out.as_mut_ptr(), count) };
+                    keep = true;
+                    frame_length = count;
+                } else {
+                    self.jumbo_dropped += 1;
+                }
+            } else {
+                // A frame spread over several buffers: join the pieces. Without a join buffer (MTU never raised) the
+                // frame is dropped, which is what the card's LPE bit alone used to mean here.
+                if first {
+                    self.assembly_len = 0;
+                    self.rx_bad = self.assembly == 0;
+                }
+                if !self.rx_bad {
+                    if self.assembly_len + chunk > self.max_frame {
+                        self.rx_bad = true;
+                    } else {
+                        let joined = memory::phys_to_virt(self.assembly) as *mut u8;
+                        unsafe { core::ptr::copy_nonoverlapping(buffer.add(skip), joined.add(self.assembly_len), chunk) };
+                        self.assembly_len += chunk;
+                    }
+                }
+                if end_of_packet {
+                    if !self.rx_bad {
+                        self.jumbo_joined += 1;
+                    }
+                    if self.rx_bad || self.assembly_len > out.len() {
+                        self.jumbo_dropped += 1;
+                    } else {
+                        let joined = memory::phys_to_virt(self.assembly) as *const u8;
+                        unsafe { core::ptr::copy_nonoverlapping(joined, out.as_mut_ptr(), self.assembly_len) };
+                        keep = true;
+                        frame_length = self.assembly_len;
+                    }
+                    self.assembly_len = 0;
+                    self.rx_bad = false;
                 }
             }
-            self.rx_skipping = !end_of_packet;
+            let stamp = self.rx_stamp;
+            self.rx_in_frame = !end_of_packet;
             // Hand the buffer back. The advanced write-back overwrote the buffer address, so it is written again.
             if advanced {
                 unsafe {
@@ -1085,12 +1184,12 @@ impl E1000 {
                 // in arrival order, and PTP events are tens of ms apart).
                 self.last_stamp = if self.ts_all {
                     stamp
-                } else if self.ts_on && is_ptp_event(&out[..length]) {
+                } else if self.ts_on && is_ptp_event(&out[..frame_length]) {
                     self.ts_rx_stamp().unwrap_or(0)
                 } else {
                     0
                 };
-                return Some(length);
+                return Some(frame_length);
             }
         }
     }
@@ -1121,7 +1220,7 @@ impl E1000 {
         }
         if self.tx_ctx[slot] {
             let own = unsafe { (memory::phys_to_virt(self.tx_ring) as *mut Descriptor).add(slot) };
-            let free = Descriptor { address: self.tx_buffers + (slot * BUFFER_SIZE) as u64, length: 0, word: 0, status: DESCRIPTOR_DONE, errors_or_css: 0, special: 0 };
+            let free = Descriptor { address: self.tx_buffers + (slot * TX_BUFFER_SIZE) as u64, length: 0, word: 0, status: DESCRIPTOR_DONE, errors_or_css: 0, special: 0 };
             unsafe { write_volatile(own, free) };
             self.tx_ctx[slot] = false;
         }
@@ -1166,7 +1265,7 @@ impl E1000 {
             sum = (sum & 0xffff) + (sum >> 16);
         }
         let length = (14 + total).max(60);
-        let buffer = memory::phys_to_virt(self.tx_buffers + (data * BUFFER_SIZE) as u64) as *mut u8;
+        let buffer = memory::phys_to_virt(self.tx_buffers + (data * TX_BUFFER_SIZE) as u64) as *mut u8;
         unsafe {
             core::ptr::write_bytes(buffer, 0, length);
             core::ptr::copy_nonoverlapping(frame.as_ptr(), buffer, 14 + total);
@@ -1191,7 +1290,7 @@ impl E1000 {
     /// Queues one frame (padded to the 60-byte minimum). Returns false if the ring
     /// stays full, which means the link is down or the card is wedged.
     pub fn send(&mut self, frame: &[u8]) -> bool {
-        if frame.len() > MAX_FRAME {
+        if frame.len() > self.max_frame {
             return false;
         }
         if self.tx_offload {
@@ -1215,7 +1314,7 @@ impl E1000 {
             return false;
         }
         let descriptor = unsafe { (memory::phys_to_virt(self.tx_ring) as *mut Descriptor).add(self.tx_next) };
-        let buffer = memory::phys_to_virt(self.tx_buffers + (self.tx_next * BUFFER_SIZE) as u64) as *mut u8;
+        let buffer = memory::phys_to_virt(self.tx_buffers + (self.tx_next * TX_BUFFER_SIZE) as u64) as *mut u8;
         let length = frame.len().max(60);
         unsafe {
             core::ptr::write_bytes(buffer, 0, length);

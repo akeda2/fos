@@ -4,7 +4,7 @@
 
 use fosfor_shell::Command;
 
-/// `nic park|unpark|phy|ts|csum|vlan|mcast|regs`: the x86-only, chip-specific forms. False for any other `nic` word,
+/// `nic park|unpark|phy|ts|csum|vlan|mcast|mtu|regs`: the x86-only, chip-specific forms. False for any other `nic` word,
 /// which the shared `nic` command (`nicshell.rs`) answers.
 pub fn nic(rest: &str) -> bool {
     let mut words = rest.split_whitespace();
@@ -14,6 +14,7 @@ pub fn nic(rest: &str) -> bool {
         Some("ts") => crate::term::nic_timestamp_test(words.next(), words.next(), words.next()),
         Some("csum") => crate::term::nic_checksum_test(words.next()),
         Some("vlan") => crate::term::nic_vlan_test(words.next(), words.next(), words.next()),
+        Some("mtu") => crate::term::nic_mtu(words.next(), words.next(), words.next()),
         Some("mcast") => crate::term::nic_multicast_test(words.next(), words.next(), words.next()),
         Some("regs") => crate::term::nic_regs(words.next().and_then(|word| word.parse::<usize>().ok())),
         _ => return false,

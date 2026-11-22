@@ -1141,6 +1141,67 @@ pub(crate) fn drain_nics(mut visit: impl FnMut(usize, &[u8])) {
     }
 }
 
+/// `nic mtu N [SIZE | send LEN | listen]`: shows or sets the MTU of interface N (and what jumbo frames the card has
+/// joined or dropped). Above 1500 (jumbo frames, up to 9000 on the e1000 family) every switch port and the peer must
+/// carry the size too; see docs/block-sharing.md. Most of the stack still has 1600-byte buffers (a frame a caller's
+/// buffer cannot hold is dropped and counted, never cut), so only the block-sharing work is meant to use more than 1500.
+///
+/// `send LEN` broadcasts one frame of LEN bytes (ethertype 0x88b5, byte i of the payload is i mod 251) and `listen` takes
+/// frames for 5 s into a buffer that holds a jumbo frame, printing each frame over 1518 bytes with its length and byte
+/// sum: the pair `tools/test_jumbo.py` uses to check both directions without touching the rest of the stack.
+pub(crate) fn nic_mtu(number: Option<&str>, argument: Option<&str>, length: Option<&str>) {
+    static mut BIG: [u8; 9100] = [0; 9100];
+    let Some(index) = number.and_then(|word| word.parse::<usize>().ok()).filter(|n| (1..=nic_count()).contains(n)) else {
+        return crate::println!("nic mtu N [SIZE | send LEN | listen]: show or set interface N's MTU (jumbo up to 9000: e1000 family).");
+    };
+    let Some(nic) = nic_at(index - 1) else { return };
+    match argument {
+        Some("send") => {
+            let Some(size) = length.and_then(|word| word.parse::<usize>().ok()).filter(|n| (60..=9100).contains(n)) else {
+                return crate::println!("nic mtu N send LEN: LEN is 60..9100 bytes, header included.");
+            };
+            let frame = unsafe { &mut *core::ptr::addr_of_mut!(BIG) };
+            frame[0..6].copy_from_slice(&[0xff; 6]);
+            if !nic_mac(index - 1, (&mut frame[6..12]).try_into().unwrap()) {
+                return;
+            }
+            frame[12..14].copy_from_slice(&[0x88, 0xb5]);
+            for (at, byte) in frame[14..size].iter_mut().enumerate() {
+                *byte = (at % 251) as u8;
+            }
+            let sent = nic_send(index - 1, &frame[..size]);
+            return crate::println!("nic {index}: frame of {size} bytes: {}.", if sent { "sent" } else { "REFUSED (over the MTU?)" });
+        }
+        Some("listen") => {
+            let buffer = unsafe { &mut *core::ptr::addr_of_mut!(BIG) };
+            let end = timer::ticks() + 5 * timer::TICK_HZ;
+            let mut seen = 0;
+            while timer::ticks() < end {
+                let Some(count) = nic_at(index - 1).and_then(|nic| nic.receive(buffer)) else { continue };
+                if count > 1518 {
+                    let sum: u32 = buffer[..count].iter().map(|&byte| u32::from(byte)).sum();
+                    crate::println!("nic {index}: jumbo frame of {count} bytes, byte sum {sum}.");
+                    seen += 1;
+                }
+            }
+            return crate::println!("nic {index}: listened 5 s, {seen} jumbo frame(s).");
+        }
+        Some(word) => {
+            let Ok(mtu) = word.parse::<usize>() else { return crate::println!("nic mtu: '{word}' is not a number.") };
+            if !nic.set_mtu(mtu) {
+                let (_, largest) = nic.mtu();
+                return crate::println!("nic {index}: MTU {mtu} refused (1500..{largest} on this interface).");
+            }
+        }
+        None => {}
+    }
+    let (mtu, largest) = nic.mtu();
+    crate::println!("nic {index}: MTU {mtu} (largest {largest}).");
+    if let Some((joined, dropped)) = nic.jumbo_counters() {
+        crate::println!("nic {index}: {joined} jumbo frame(s) joined, {dropped} dropped for size.");
+    }
+}
+
 /// `nic csum N`: turns transmit checksum offload on for interface N and broadcasts three IPv4 UDP frames (payloads of 5,
 /// 26 and 27 bytes: a padded short frame, even and odd lengths) whose UDP checksum field is 0, so the card must fill it
 /// in. A host on the same segment can check the sums (`tools/test_tx_offload.py`). Offload goes off again afterwards.
