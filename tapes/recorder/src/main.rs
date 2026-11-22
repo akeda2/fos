@@ -724,7 +724,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let block_buffer = unsafe { &mut *(&raw mut BLOCK_BUFFER) };
     *detectors = [Ppm::new(); MAX_CHANNELS];
     *clips = [false; MAX_CHANNELS];
-    unsafe { SINK = Some(StreamSink::new(api.fs_stream_open, api.fs_stream_write, api.fs_stream_close, tape_rt::micros, CHUNK / 2)) };
+    unsafe { SINK = Some(tape_rt::sink::stream(CHUNK / 2)) };
     meters.clear();
     meters.set_rows_per_call(6); // a page of 12 in two calls; they go to the console as one write each
     for channel in 0..channels.min(MAX_CHANNELS) {

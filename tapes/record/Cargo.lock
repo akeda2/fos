@@ -36,5 +36,6 @@ dependencies = [
 name = "tape-rt"
 version = "0.1.0"
 dependencies = [
+ "audio-rec",
  "fosfor-abi",
 ]

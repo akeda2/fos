@@ -12,6 +12,8 @@ pub mod channel;
 pub mod config;
 pub mod mixer;
 pub mod save;
+#[cfg(feature = "record")]
+pub mod sink;
 #[cfg(feature = "decode")]
 pub mod source;
 pub mod text;

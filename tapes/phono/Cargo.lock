@@ -134,5 +134,6 @@ name = "tape-rt"
 version = "0.1.0"
 dependencies = [
  "audio-decode",
+ "audio-rec",
  "fosfor-abi",
 ]

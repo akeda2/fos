@@ -8,7 +8,10 @@ edition = "2024"
 [dependencies]
 fosfor-abi = { path = "../../abi" }
 audio-decode = { path = "../audio-decode", optional = true }
+audio-rec = { path = "../audio-rec", optional = true }
 
 [features]
 # `source`: files on disk as decoder sources (audio-decode).
 decode = ["dep:audio-decode"]
+# `sink`: the sinks a recording tape writes its files through (audio-rec).
+record = ["dep:audio-rec"]

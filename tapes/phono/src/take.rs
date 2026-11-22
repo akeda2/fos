@@ -122,16 +122,9 @@ fn name_error(error: names::NameError, message: &mut Line<64>) {
 
 impl Archive {
     pub fn new(api: &'static TapeApi, name: &str) -> Archive {
-        let (take, decode) = match tape_rt::multi_stream_table() {
-            Some(api) => (
-                StreamSink::with_handle(api.fs_stream_open2, api.fs_stream_write2, api.fs_stream_close2, tape_rt::micros, 64 * 1024),
-                StreamSink::with_handle(api.fs_stream_open2, api.fs_stream_write2, api.fs_stream_close2, tape_rt::micros, 64 * 1024),
-            ),
-            None => (
-                StreamSink::new(api.fs_stream_open, api.fs_stream_write, api.fs_stream_close, tape_rt::micros, 64 * 1024),
-                StreamSink::new(api.fs_stream_open, api.fs_stream_write, api.fs_stream_close, tape_rt::micros, 64 * 1024),
-            ),
-        };
+        // Two files at once (the take and its decoded copy) on streams of their own where the kernel has them.
+        let own = || tape_rt::sink::stream_handle(64 * 1024).unwrap_or_else(|| tape_rt::sink::stream(64 * 1024));
+        let (take, decode) = (own(), own());
         unsafe {
             *core::ptr::addr_of_mut!(SINK) = Some(take);
             *core::ptr::addr_of_mut!(OUT_SINK) = Some(decode);

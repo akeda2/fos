@@ -500,7 +500,7 @@ test: image
 	cargo +nightly-2026-09-13 test --manifest-path crates/tape-echo/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/instrument-rt/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-screen/Cargo.toml
-	cargo +nightly-2026-09-13 test --manifest-path crates/tape-rt/Cargo.toml
+	cargo +nightly-2026-09-13 test --manifest-path crates/tape-rt/Cargo.toml --features decode,record
 	for tape in router nettest ed ip-chat telnet ptp fterm organ strings tape-echo epiano phono compander; do RUST_MIN_STACK=33554432 cargo +nightly-2026-09-13 test --lib --manifest-path tapes/$$tape/Cargo.toml || exit 1; done
 	python3 tools/test_boot.py
 ifeq ($(PRIVATE),1)

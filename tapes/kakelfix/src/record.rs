@@ -18,8 +18,8 @@
 //! FAT32 and FOSFS are not offered (`Recording::refusal`), so a file that fills is a full disk: the take ends.
 //!
 //! Where: `ROOT/PROJECT/take007_TIME/` (`kakelfix::naming`), its folders made by the worker as the take starts (`place`).
-//! Volumes: exFAT through `fs_stream_*` (`audio_rec::stream::StreamSink`, a reserved contiguous run per file), ext4 through
-//! `vfs_*` by path (`audio_rec::vfs::VfsSink`, `ext1/recordings/...`): there a file grows as it is written, and
+//! Volumes (`tape_rt::sink`, `audio_rec::out::Out`): exFAT through `fs_stream_*` (a reserved contiguous run per file), ext4
+//! through `vfs_*` by path (`ext1/recordings/...`): there a file grows as it is written, and
 //! `vfs_reserve` (ABI 42) gives each of a take's files its own region of the volume, so four files written in turn do not
 //! alternate extent by extent (which reaches the driver's extent limit after about 170 MiB each).
 
@@ -30,8 +30,6 @@ use archive::FlacFile;
 use audio_rec::recorder::Recorder;
 use audio_rec::select;
 use audio_rec::recorder::Sink;
-use audio_rec::stream::StreamSink;
-use audio_rec::vfs::{Files, VfsSink};
 use audio_rec::wav::Format;
 use audio_screen::Input;
 use core::fmt::Write;
@@ -43,11 +41,12 @@ use gfx::meter::{Scale, draw_bar, draw_scale};
 use gfx::theme::theme;
 use core::sync::atomic::{AtomicU32, Ordering};
 use tape_rt::channel::{Mailbox, Ring};
+use tape_rt::sink::{self, TapeFiles};
 use kakelfix::naming::{self, FileName, ProjectName, Stamp};
 use kakelfix::peaks::{self, PeakLog};
 use kakelfix::recorder::{Disk, Encoding, GROUP, MAX_DISKS, MAX_GROUPS, Request, Take, Volume, clock, describe_channels, duration, size};
 use kakelfix::{App, Layout, RecRow, Recording, Text, Transport, fit_name, wrap};
-use tape_rt::{AudioBuffer, AudioStats, DISK_EXFAT, DISK_FAT32, DISK_FOSFS, DiskInfo, FS_EXISTS, TapeApi, VFS_DIR, VFS_FILE, VfsVolume, alloc_bytes, alloc_zeroed};
+use tape_rt::{AudioBuffer, AudioStats, DISK_EXFAT, DISK_FAT32, DISK_FOSFS, DiskInfo, FS_EXISTS, TapeApi, VFS_DIR, VfsVolume, alloc_bytes, alloc_zeroed};
 
 /// WAV disk writes: 256 KiB blocks (a multiple of the 512-byte sector; the `recorder` tape's size, which real USB sticks
 /// and SATA disks take at full speed). FLAC files stage `archive::file::STAGE` (128 KiB) each.
@@ -57,67 +56,8 @@ const CHECKPOINT_US: u64 = 2_000_000;
 /// What a FLAC file reserves when the disk does not say how long its longest free run is.
 const FALLBACK_RESERVE: u64 = 1 << 30;
 
-/// The ext volume's file calls, by path (`tape_rt::vfs_*`).
-pub struct TapeFiles;
-
-impl Files for TapeFiles {
-    fn create(&mut self, path: &str) -> Result<(), i32> {
-        tape_rt::vfs_create(path, VFS_FILE, 0o644, 0, 0).map_err(|code| code as i32)
-    }
-    fn reserve(&mut self, path: &str, bytes: u64) -> Result<(), i32> {
-        tape_rt::vfs_reserve(path, bytes).map_err(|code| code as i32)
-    }
-    fn write(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<usize, i32> {
-        tape_rt::vfs_write(path, offset, data).map_err(|code| code as i32)
-    }
-    fn truncate(&mut self, path: &str, size: u64) -> Result<(), i32> {
-        tape_rt::vfs_truncate(path, size).map_err(|code| code as i32)
-    }
-    fn sync(&mut self) -> Result<(), i32> {
-        tape_rt::vfs_sync().map_err(|code| code as i32)
-    }
-}
-
-/// Where a file of a take goes: a stream (FOSFS, exFAT) or an ext volume's file by path.
-pub enum Out {
-    Stream(StreamSink),
-    Vfs(VfsSink<TapeFiles>),
-}
-
-impl Out {
-    fn vfs() -> Out {
-        Out::Vfs(VfsSink::new(TapeFiles, tape_rt::micros, archive::file::STAGE / 2))
-    }
-
-    /// The big writes so far: bytes, time spent, the slowest one (µs).
-    fn speed(&self) -> (u64, u64, u64) {
-        match self {
-            Out::Stream(sink) => (sink.bytes, sink.write_us, sink.write_max_us),
-            Out::Vfs(sink) => (sink.bytes, sink.write_us, sink.write_max_us),
-        }
-    }
-}
-
-impl Sink for Out {
-    fn open(&mut self, name: &[u8], reserve: u64) -> Result<u64, i32> {
-        match self {
-            Out::Stream(sink) => sink.open(name, reserve),
-            Out::Vfs(sink) => sink.open(name, reserve),
-        }
-    }
-    fn write(&mut self, offset: u64, data: &[u8], length: u64) -> Result<(), i32> {
-        match self {
-            Out::Stream(sink) => sink.write(offset, data, length),
-            Out::Vfs(sink) => sink.write(offset, data, length),
-        }
-    }
-    fn close(&mut self, length: u64) -> Result<(), i32> {
-        match self {
-            Out::Stream(sink) => sink.close(length),
-            Out::Vfs(sink) => sink.close(length),
-        }
-    }
-}
+/// Where a file of a take goes: a stream (FOSFS, exFAT) or an ext volume's file by path (`tape_rt::sink`).
+type Out = audio_rec::out::Out<TapeFiles>;
 
 /// The sink a WAV take writes through. A `Recorder` borrows it for as long as the file is open, so it lives in a static,
 /// like the `recorder` tape's; it is set for the take's volume before the file opens.
@@ -500,7 +440,7 @@ impl Writer {
         let group = || -> Option<Group> {
             Some(Group {
                 file: alloc_zeroed(api)?,
-                sink: Out::vfs(),
+                sink: Out::Vfs(sink::vfs(archive::file::STAGE / 2)),
                 mask: 0,
                 name: FileName::new(),
                 quantizers: [const { Quantizer::new(24, 1) }; GROUP],
@@ -578,8 +518,8 @@ impl Writer {
         self.ring_bytes = buffer.ring_bytes;
         report.take = Take::default();
         let opened = match r.encoding {
-            Encoding::Wav => self.open_wav(api, job, report),
-            Encoding::Flac(bits) => self.open_flac(api, job, report, bits),
+            Encoding::Wav => self.open_wav(job, report),
+            Encoding::Flac(bits) => self.open_flac(job, report, bits),
         };
         if !opened {
             return;
@@ -643,7 +583,7 @@ impl Writer {
         Some(Place { folder: take_path, project, number, now })
     }
 
-    fn open_wav(&mut self, api: &TapeApi, job: &Job, report: &mut Report) -> bool {
+    fn open_wav(&mut self, job: &Job, report: &mut Report) -> bool {
         let Some(place) = self.place(job, report) else { return false };
         let r = &job.recording;
         let leaf = naming::file_name(place.project.as_str(), place.number, &place.now, self.mask, r.extension());
@@ -651,7 +591,7 @@ impl Writer {
         let ext = r.target().is_some_and(|d| d.volume == Volume::Ext);
         (self.folder, self.wav_name, self.ext) = (Text::from(place.folder.as_str()), leaf, ext);
         // No `Recorder` holds the static now: the last take's was finished (consumed) before this one.
-        let sink = unsafe { (*(&raw mut SINK)).insert(if ext { Out::vfs() } else { Out::Stream(StreamSink::new(api.fs_stream_open, api.fs_stream_write, api.fs_stream_close, tape_rt::micros, STAGING / 2)) }) };
+        let sink = unsafe { (*(&raw mut SINK)).insert(if ext { Out::Vfs(sink::vfs(STAGING / 2)) } else { Out::Stream(sink::stream(STAGING / 2)) }) };
         // Only one `Recorder` holds the staging block at a time: the last one was finished (consumed) before this.
         let staging = unsafe { core::slice::from_raw_parts_mut(self.staging as *mut u8, STAGING) };
         match Recorder::begin(sink, staging, self.format, name.as_str().as_bytes(), 0) {
@@ -671,7 +611,7 @@ impl Writer {
     /// Opens one FLAC file per group. Each reserves its share of the disk's longest free run (by its channel count; FLAC
     /// never needs more than the samples uncompressed), since a stream given 0 would take the whole run and leave the
     /// next none.
-    fn open_flac(&mut self, api: &TapeApi, job: &Job, report: &mut Report, bits: u32) -> bool {
+    fn open_flac(&mut self, job: &Job, report: &mut Report, bits: u32) -> bool {
         let Some(place) = self.place(job, report) else { return false };
         let r = &job.recording;
         let (groups, count) = r.groups();
@@ -690,7 +630,9 @@ impl Writer {
             describe_channels(mask, 32, &mut inputs);
             let tags = [("ENCODER", "Fosfor OS kakelfix"), ("INPUTS", inputs.as_str())];
             let group = &mut self.groups[g];
-            group.sink = if ext { Out::vfs() } else { Out::Stream(StreamSink::with_handle(api.fs_stream_open2, api.fs_stream_write2, api.fs_stream_close2, tape_rt::micros, archive::file::STAGE / 2)) };
+            // A stream of its own per file (ABI 30; KakelFix needs a later kernel anyway).
+            let stage = archive::file::STAGE / 2;
+            group.sink = if ext { Out::Vfs(sink::vfs(stage)) } else { Out::Stream(sink::stream_handle(stage).unwrap_or_else(|| sink::stream(stage))) };
             group.mask = mask;
             group.name = leaf;
             group.quantizers = core::array::from_fn(|c| Quantizer::new(bits, 0x9E37_79B9u32.wrapping_mul((g * GROUP + c) as u32 + 1)));
@@ -815,7 +757,7 @@ impl Writer {
                 }
             });
             for (name, channels) in files.into_iter().filter(|&(_, channels)| channels > 0) {
-                if let Err(code) = self.write_peaks(api, name.as_str(), first, channels) {
+                if let Err(code) = self.write_peaks(name.as_str(), first, channels) {
                     peaks_failed = Some(code);
                 }
                 first += channels;
@@ -843,12 +785,12 @@ impl Writer {
 
     /// Writes the peak file of audio file `audio` (inputs `first..first + channels` of the take), in the staging block's
     /// pieces (the WAV file that used it is closed).
-    fn write_peaks(&mut self, api: &TapeApi, audio: &str, first: usize, channels: usize) -> Result<(), i32> {
+    fn write_peaks(&mut self, audio: &str, first: usize, channels: usize) -> Result<(), i32> {
         let Some(leaf) = naming::peak_file(audio) else { return Ok(()) };
         let path = naming::join(&[self.folder.as_str(), leaf.as_str()]);
         let header = self.peaks.header(channels, self.format.rate);
         let total = header.offset(header.peaks);
-        let mut sink = if self.ext { Out::vfs() } else { Out::Stream(StreamSink::new(api.fs_stream_open, api.fs_stream_write, api.fs_stream_close, tape_rt::micros, STAGING / 2)) };
+        let mut sink = if self.ext { Out::Vfs(sink::vfs(STAGING / 2)) } else { Out::Stream(sink::stream(STAGING / 2)) };
         sink.open(path.as_str().as_bytes(), total)?;
         // SAFETY: no `Recorder` holds the staging block now (the take's WAV file, if any, was finished above).
         let block = unsafe { core::slice::from_raw_parts_mut(self.staging as *mut u8, STAGING) };

@@ -100,7 +100,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         return println!("record: out of memory.");
     }
     let staging: &'static mut [u8] = unsafe { core::slice::from_raw_parts_mut(staging_address as *mut u8, CHUNK) };
-    unsafe { SINK = Some(StreamSink::new(api.fs_stream_open, api.fs_stream_write, api.fs_stream_close, tape_rt::micros, CHUNK / 2)) };
+    unsafe { SINK = Some(tape_rt::sink::stream(CHUNK / 2)) };
     let sink = unsafe { (*(&raw mut SINK)).as_mut().unwrap() };
     let mut recorder = match Recorder::begin(sink, staging, format, file_name, wanted) {
         Ok(recorder) => recorder,

@@ -22,7 +22,7 @@ gfx = { path = "../../crates/gfx" }
 instrument-rt = { path = "../../crates/instrument-rt" }
 outfx = { path = "../../crates/outfx" }
 phono = { path = "../../crates/phono" }
-tape-rt = { path = "../../crates/tape-rt", features = ["decode"] }
+tape-rt = { path = "../../crates/tape-rt", features = ["decode", "record"] }
 
 [profile.release]
 panic = "abort"
