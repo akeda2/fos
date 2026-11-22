@@ -126,6 +126,8 @@ def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] 
                     wait_for(len(commands) + 2)
                 if usb_keys and monitor.exists():
                     # QEMU's usb-kbd: keys typed through the monitor reach the shell as USB HID reports.
+                    # The keys end in Enter, so the shell answers with one more prompt than there is now.
+                    prompts = log.read_bytes().lower().count(b"fos> ")
                     with socket.socket(socket.AF_UNIX) as sock:
                         sock.settimeout(10)
                         sock.connect(str(monitor))
@@ -133,7 +135,7 @@ def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] 
                         for key in usb_keys:
                             sock.sendall(f"sendkey {key}\n".encode())
                             time.sleep(0.4)
-                    wait_for(len(commands) + 2)
+                    wait_for(prompts + 1)
                 time.sleep(1)  # let the console repaint reach the screen
                 if screendump is not None and monitor.exists():
                     with socket.socket(socket.AF_UNIX) as sock:

@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import wave
+from wavread import open_wav
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -22,7 +23,7 @@ C3 = 130.81
 
 
 def samples(path):
-    with wave.open(str(path), "rb") as w:
+    with open_wav(path) as w:
         channels, width, rate, frames = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
         raw = w.readframes(frames)
     check(width == 2, f"the recording is 16-bit (got {width})")

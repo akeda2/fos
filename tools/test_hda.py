@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import wave
+from wavread import open_wav
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -46,7 +47,7 @@ def make_image(tmp, files):
 
 
 def read_wav(path):
-    with wave.open(str(path)) as recording:
+    with open_wav(path) as recording:
         rate, channels, count = recording.getframerate(), recording.getnchannels(), recording.getnframes()
         samples = struct.unpack(f"<{count * channels}h", recording.readframes(count))[::channels]
     return rate, samples

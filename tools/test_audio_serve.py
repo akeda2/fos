@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 import wave
+from wavread import open_wav
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -133,7 +134,7 @@ def main():
                 check("codec_name=opus" in probe.stdout and "channels=2" in probe.stdout, "ffprobe sees a stereo Opus stream", probe.stdout + probe.stderr)
                 wav_path = Path(tmp) / "got.wav"
                 subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(ogg_path), "-ac", "1", "-ar", "48000", str(wav_path)], check=True)
-                with wave.open(str(wav_path)) as wav:
+                with open_wav(wav_path) as wav:
                     frames = wav.readframes(wav.getnframes())
                 samples = struct.unpack(f"<{len(frames) // 2}h", frames)[4800:]
                 crossings = sum(1 for a, b in zip(samples, samples[1:]) if a < 0 <= b)

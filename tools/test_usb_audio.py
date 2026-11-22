@@ -15,6 +15,7 @@ import struct
 import sys
 import tempfile
 import wave
+from wavread import open_wav
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -48,7 +49,7 @@ def main():
         check("no capture stream" in text.split("audio capture 2")[-1], "capture is refused cleanly when the device has no input", text[-400:])
 
         if wav.exists() and wav.stat().st_size > 44:
-            with wave.open(str(wav)) as recording:
+            with open_wav(wav) as recording:
                 rate, channels, width, count = recording.getframerate(), recording.getnchannels(), recording.getsampwidth(), recording.getnframes()
                 data = recording.readframes(count)
             samples = struct.unpack(f"<{count * channels}h", data)[::channels]
@@ -100,7 +101,7 @@ def segments(samples, rate):
 
 
 def tone_hz(path):
-    with wave.open(str(path)) as recording:
+    with open_wav(path) as recording:
         rate, channels, count = recording.getframerate(), recording.getnchannels(), recording.getnframes()
         samples = struct.unpack(f"<{count * channels}h", recording.readframes(count))[::channels]
     loud = [value for value in samples if abs(value) > 500]
@@ -143,7 +144,7 @@ def play_tapes_test():
         check("Playing a.wav: 48000 Hz, 2 channel(s), 16-bit" in text and "Finished" in text, "`play` plays a stereo 16-bit WAV file", text[-1500:])
         check("Playing b.wav: 48000 Hz, 1 channel(s), 24-bit" in text, "and a mono 24-bit file (converted to the device's format)", text[-1500:])
         check("cannot read missing.wav" in text, "a missing file is reported", text[-500:])
-        with wave.open(str(wav)) as recording:
+        with open_wav(wav) as recording:
             rate, channels, count = recording.getframerate(), recording.getnchannels(), recording.getnframes()
             samples = struct.unpack(f"<{count * channels}h", recording.readframes(count))[::channels]
         # QEMU's WAV backend only writes while a stream runs, so the gap between the two tapes may not be

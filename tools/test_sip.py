@@ -10,6 +10,7 @@ import struct
 import sys
 import tempfile
 import wave
+from wavread import open_wav
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -64,7 +65,7 @@ def main():
         finally:
             b.stop()
             a.stop()
-        with wave.open(str(wav)) as recording:
+        with open_wav(wav) as recording:
             rate, channels, count = recording.getframerate(), recording.getnchannels(), recording.getnframes()
             samples = struct.unpack(f"<{count * channels}h", recording.readframes(count))[::channels]
         loud = [i for i, value in enumerate(samples) if abs(value) > 500]

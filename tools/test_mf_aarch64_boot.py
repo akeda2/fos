@@ -10,7 +10,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_aarch64_boot as base  # noqa: E402
 
-IMAGE = Path(os.environ.get("FOSFOR_IMAGE", base.ROOT / "build/fosfor-mf-aarch64/fosfor-qemu.img"))
+# Not FOSFOR_IMAGE: tools/run_tests.py sets that to the x86 image's per-worker copy for every test, and AAVMF cannot boot
+# an x86 image (it stops in its boot menu). The boots here use snapshot=on, so workers may share this one image.
+IMAGE = Path(os.environ.get("FOSFOR_IMAGE_MF_A64", base.ROOT / "build/fosfor-mf-aarch64/fosfor-qemu.img"))
 
 
 EL0_LINE = re.compile(r"EL0: hello ok, bad pointer ok, page fault ok, stack guard ok, undefined instruction ok, preempted spinner ok, "
@@ -37,7 +39,11 @@ def main() -> None:
     server = http.server.ThreadingHTTPServer(("0.0.0.0", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
-    text = base.boot(IMAGE, commands=("web -d 10.0.2.2:%d/" % port, "ed t.txt", "a", "hello", "from ed", ".", "w", "q", "cat t.txt", "fterm help", "version", "cpuinfo", "uptime", "nic", "run hello", "run thrcheck", "run netcheck", "fscheck readme.txt 0 7", "run httpd &0", "io r8 0x60", "usb", "disks"), usb=True, cpus=4,
+    text = base.boot(IMAGE, commands=("web -d 10.0.2.2:%d/" % port, "fterm help", "version", "cpuinfo", "uptime", "nic", "run hello", "run thrcheck", "run netcheck", "fscheck readme.txt 0 7", "run httpd &0", "io r8 0x60", "usb", "disks"), usb=True, cpus=4,
+                     # ed answers with its own `ed> ` prompt, not the shell's, so it is driven here, where each line waits for what
+                     # it prints (the commands above wait for a shell prompt, which a line typed into ed never brings).
+                     steps=(("ed t.txt\r", "ed> "), ("a\r", "finish with"), ("hello\r", "hello"), ("from ed\r", "from ed"), (".\r", "ed> "),
+                            ("w\r", "written t.txt"), ("q\r", "fos> "), ("cat t.txt\r", "from ed")),
                      usb_keys=("c", "p", "u", "i", "n", "f", "o", "ret"))
     base.check("server kernel (mf, slice 8): running from the UEFI loader at EL" in text, "the mf kernel starts on aarch64", text)
     base.check("Physical memory:" in text, "the physical allocator is up", text)

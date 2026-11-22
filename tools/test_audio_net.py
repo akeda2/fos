@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import wave
+from wavread import open_wav
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -353,7 +354,7 @@ def main():
         finally:
             receiver.stop()
             sender.stop()
-        with wave.open(str(wav)) as recording:
+        with open_wav(wav) as recording:
             rate, channels, count = recording.getframerate(), recording.getnchannels(), recording.getnframes()
             samples = struct.unpack(f"<{count * channels}h", recording.readframes(count))[::channels]
         loud = [i for i, value in enumerate(samples) if abs(value) > 500]
@@ -413,7 +414,7 @@ def duplex_test():
             a.stop()
             b.stop()
         for name, wav, wanted in (("A", wav_a, 880), ("B", wav_b, 440)):
-            with wave.open(str(wav)) as recording:
+            with open_wav(wav) as recording:
                 rate, channels, count = recording.getframerate(), recording.getnchannels(), recording.getnframes()
                 samples = struct.unpack(f"<{count * channels}h", recording.readframes(count))[::channels]
             loud = [i for i, value in enumerate(samples) if abs(value) > 500]
@@ -599,7 +600,7 @@ def peers_test():
         finally:
             a.stop()
             b.stop()
-        with wave.open(str(wav)) as recording:
+        with open_wav(wav) as recording:
             rate, channels, count = recording.getframerate(), recording.getnchannels(), recording.getnframes()
             samples = struct.unpack(f"<{count * channels}h", recording.readframes(count))[::channels]
         loud = [i for i, value in enumerate(samples) if abs(value) > 500]
@@ -828,7 +829,7 @@ def duplex_names_test():
             c.stop()
             d.stop()
         for name, wanted in (("c", 880), ("d", 440)):
-            with wave.open(str(wavs[name])) as recording:
+            with open_wav(wavs[name]) as recording:
                 rate, channels, count = recording.getframerate(), recording.getnchannels(), recording.getnframes()
                 samples = struct.unpack(f"<{count * channels}h", recording.readframes(count))[::channels]
             loud = [i for i, value in enumerate(samples) if abs(value) > 500]

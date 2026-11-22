@@ -12,6 +12,7 @@ import sys
 import zlib
 import tempfile
 import wave
+from wavread import open_wav
 import time
 from pathlib import Path
 
@@ -48,7 +49,7 @@ def split_devices():
         finally:
             machine.stop()
         check(wav.exists() and wav.stat().st_size > 44, "the USB output recorded the generator", "no wav file")
-        with wave.open(str(wav)) as recording:
+        with open_wav(wav) as recording:
             count, rate = recording.getnframes(), recording.getframerate()
             data = struct.unpack(f"<{count * recording.getnchannels()}h", recording.readframes(count))[:: recording.getnchannels()]
         loud = [v for v in data if abs(v) > 500]
