@@ -1300,38 +1300,6 @@ fn a_takes_files_say_which_inputs_they_hold() {
 }
 
 #[test]
-fn wav_headers_as_the_recorder_writes_them_are_read() {
-    use audio_rec::wav::{Format, header_len, write_header};
-    use play::WavLayout;
-    let mut head = [0u8; 512];
-    // Two float channels (plain IEEE float), 18 channels of 24 bits in 4-byte slots (extensible), past 4 GiB (RF64).
-    for (format, data) in [
-        (Format { channels: 2, rate: 48_000, slot: 4, bits: 32, float: true }, 4_800u64 * 8),
-        (Format { channels: 18, rate: 96_000, slot: 4, bits: 24, float: false }, 960 * 72),
-        (Format { channels: 2, rate: 48_000, slot: 2, bits: 16, float: false }, 5u64 << 30),
-    ] {
-        let length = write_header(&mut head, &format, data);
-        assert_eq!(length, header_len(&format));
-        let layout = WavLayout::parse(&head, length as u64 + data).unwrap();
-        assert_eq!((layout.channels, layout.rate, layout.slot, layout.float), (format.channels, format.rate, format.slot, format.float));
-        assert_eq!((layout.data_offset, layout.data_bytes), (length as u64, data));
-        // A file cut short (still being written) has the frames that are there.
-        let short = WavLayout::parse(&head, length as u64 + 1000).unwrap();
-        assert_eq!(short.data_bytes, 1000 / short.frame_bytes() * short.frame_bytes());
-    }
-    let float = WavLayout { data_offset: 0, data_bytes: 8, channels: 2, rate: 48_000, slot: 4, float: true };
-    let frame = [0.5f32.to_le_bytes(), (-0.25f32).to_le_bytes()].concat();
-    assert_eq!((float.sample(&frame, 0), float.sample(&frame, 1)), (0.5, -0.25));
-    // 24 bits left-justified in 4 bytes, and 16-bit samples: full scale is -1.
-    let left = WavLayout { slot: 4, float: false, ..float };
-    assert_eq!(left.sample(&0x8000_0000u32.to_le_bytes(), 0), -1.0);
-    assert_eq!(left.sample(&0x4000_0000u32.to_le_bytes(), 0), 0.5);
-    let short = WavLayout { slot: 2, float: false, ..float };
-    assert_eq!(short.sample(&(-16384i16).to_le_bytes(), 0), -0.5);
-    assert_eq!(WavLayout::parse(b"RIFX\0\0\0\0WAVE", 100), None);
-}
-
-#[test]
 fn listened_inputs_alternate_left_and_right() {
     let mut p = Playing::new();
     let file = |name: &str| play::take_file(name).unwrap();
@@ -1581,54 +1549,9 @@ fn the_play_page_has_a_disk_of_its_own() {
 }
 
 #[test]
-fn the_recorder_logs_peaks_and_they_get_coarser_rather_than_run_out() {
-    use peaks::{EMPTY, FIRST_FRAMES_PER_PEAK, Header, PeakLog, unpack};
-    let mut cells = [0u32; 2 * 64];
-    let mut log = PeakLog::new(&mut cells);
-    log.start(2);
-    // Two blocks that cross a peak boundary in the middle: 700 frames, then 400.
-    let per = FIRST_FRAMES_PER_PEAK as usize;
-    for (length, value) in [(700usize, 0.5f32), (400, -0.25)] {
-        log.reserve(length);
-        let left = [value; 700];
-        let right = [-value; 700];
-        log.fold(0, &left[..length]);
-        log.fold(1, &right[..length]);
-        log.advance(length);
-    }
-    assert_eq!((log.frames(), log.peaks(), log.frames_per_peak() as usize), (1100, 3, per));
-    let mut body = [0u8; 3 * 2 * 4];
-    assert_eq!(log.body(0, 2, 0, &mut body), body.len());
-    let cell = |peak: usize, channel: usize| unpack(u32::from_le_bytes(body[(peak * 2 + channel) * 4..][..4].try_into().unwrap()));
-    assert_eq!(cell(0, 0), (16383, 16383), "the first peak saw only the first block");
-    assert_eq!(cell(1, 0), (-8191, 16383), "the second straddles both blocks");
-    assert_eq!(cell(1, 1), (-16383, 8191));
-    assert_eq!(cell(2, 0), (-8191, -8191));
-    // Input 1 alone, for a file of that input.
-    let mut one = [0u8; 3 * 4];
-    assert_eq!(log.body(1, 1, 0, &mut one), one.len());
-    assert_eq!(unpack(u32::from_le_bytes(one[4..8].try_into().unwrap())), (-16383, 8191));
-    // Past the 64 peaks the cells hold, pairs merge: the frames per peak double, nothing is lost.
-    log.reserve(per * 70);
-    let ramp = [0.1f32; 512 * 70];
-    log.fold(0, &ramp[..per * 70]);
-    log.fold(1, &ramp[..per * 70]);
-    log.advance(per * 70);
-    assert_eq!(log.frames_per_peak() as usize, per * 2);
-    assert!(log.peaks() <= 64);
-    let mut merged = [0u8; 4];
-    log.body(0, 1, 0, &mut merged);
-    assert_eq!(unpack(u32::from_le_bytes(merged)), (-8191, 16383), "the first two peaks, merged");
-    assert_ne!(u32::from_le_bytes(merged), EMPTY);
-    // The header goes out and comes back; a file shorter than its peaks, or another file, is refused.
-    let header = log.header(1, 48_000);
-    let mut bytes = [0u8; peaks::HEADER];
-    header.write(&mut bytes);
-    let length = peaks::HEADER as u64 + header.peaks * 4;
-    assert_eq!(Header::parse(&bytes, length), Some(header));
-    assert_eq!(Header::parse(&bytes, length - 1), None);
-    assert_eq!(Header::parse(b"RIFF\0\0\0\0WAVEfmt ", 1 << 20), None);
-    assert_eq!(peaks::file_name("Konsert_take007_2026-11-20_143512_in01-08.flac").unwrap().as_str(), "Konsert_take007_2026-11-20_143512_in01-08.peaks");
+fn a_peak_file_is_named_after_its_audio_file() {
+    let name = naming::peak_file("Konsert_take007_2026-11-20_143512_in01-08.flac").unwrap();
+    assert_eq!(name.as_str(), "Konsert_take007_2026-11-20_143512_in01-08.peaks");
 }
 
 #[test]

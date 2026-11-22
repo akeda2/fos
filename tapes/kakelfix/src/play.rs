@@ -1,7 +1,7 @@
-//! The Play page's tape side: the projects and takes on the Recorder's disk (under its root folder), a take's files read
-//! through the path calls (`vfs_read`, any volume), FLAC decoded (up to 8 channels a file) or WAV read as it is, the
-//! inputs listened to mixed to the output pair (`kakelfix::play::Playing::mix`) and written to the device's playback
-//! side, the whole take read through a second time in the background for its overview.
+//! The Play page's tape side: the projects and takes on the page's disk (under its root folder), a take's files read
+//! through the path calls (`tape_rt::source::FileSource`, any volume) and decoded (`audio_decode`: FLAC up to 8 channels
+//! a file, WAV every input of the take), the inputs listened to mixed to the output pair (`kakelfix::play::Playing::mix`)
+//! and written to the device's playback side, the whole take read through a second time in the background for its overview.
 //!
 //! Playback runs on the drawing thread, a bounded amount per pass: it is kept about `AHEAD_MS` ahead of the device.
 //! The overview is read by a thread of its own where the kernel runs tape threads (the server kernel): `Scanner`, which
@@ -13,20 +13,20 @@
 //! loopback whose playback end another tape holds), the page says so and only shows takes.
 
 use crate::view::{centered, text};
-use audio_decode::flac::Decoder;
-use audio_decode::{Source, SourceError};
+use audio_decode::{Decode, flac, wav};
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU32, Ordering};
 use fosfor_abi::tape::{AudioInfo, TapeApi, VFS_DIR};
 use gfx::Canvas;
 use gfx::theme::theme;
 use kakelfix::analyzer::Envelope;
 use kakelfix::naming::{self, MAX_PATH, ProjectName};
 use kakelfix::peaks;
-use kakelfix::play::{MAX_FILES, MAX_LIST, MAX_ROWS, Overview, TakeFile, TakeName, WavLayout, default_output, take_file};
+use kakelfix::play::{MAX_FILES, MAX_LIST, MAX_ROWS, Overview, TakeFile, TakeName, default_output, take_file};
 use kakelfix::{App, Focus, Layout, PlayButton, PlayRequest, PlayState, Playing, Rect, Text};
 use mixer_model::Group;
 use tape_rt::alloc_zeroed;
+use tape_rt::channel::Handover;
+use tape_rt::source::FileSource;
 
 /// Playback is kept this far ahead of the device: enough to ride out a slow pass, little enough that a pause, a seek or
 /// a stop is heard at once.
@@ -40,40 +40,20 @@ const REDRAW_US: u64 = 250_000;
 /// How long `hold` waits for the scanner to let go of its readers (it does within one read).
 const HOLD_US: u64 = 500_000;
 const SCANNER_STACK: usize = 64 * 1024;
-/// The most bytes one disk read asks for.
-const CHUNK: usize = 64 * 1024;
 /// Frames mixed and written per step.
 const STEP: usize = 512;
 /// Seconds the live envelope spans.
 const LIVE_S: f32 = 4.0;
 
-/// A file of the take, read by path (`vfs_read`: exFAT, ext4, FOSFS alike).
-pub struct VfsFile {
-    path: Text<MAX_PATH>,
-    size: u64,
-}
+type Flac = flac::Decoder<FileSource, 8>;
+/// A WAV take is one file of every armed input.
+type Wav = wav::Decoder<FileSource, { MAX_ROWS }>;
 
-impl Source for VfsFile {
-    fn size(&self) -> u64 {
-        self.size
-    }
-
-    fn read_at(&mut self, offset: u64, out: &mut [u8]) -> Result<usize, SourceError> {
-        let length = out.len().min(CHUNK);
-        tape_rt::vfs_read(self.path.as_str(), offset, &mut out[..length]).map_err(|_| SourceError)
-    }
-}
-
-type Flac = Decoder<VfsFile, 8>;
-
-/// Where a reader's frames come from: a FLAC decoder's block, or WAV bytes read in.
+/// Where a reader's frames come from: a decoder's block.
 enum Kind {
     Flac(&'static mut Flac),
-    Wav { layout: WavLayout, bytes: &'static mut WavBuffer, path: Text<MAX_PATH> },
+    Wav(&'static mut Wav),
 }
-
-/// WAV bytes read in at a time (whole frames of up to 32 four-byte channels).
-struct WavBuffer([u8; 4 * MAX_ROWS * 1024]);
 
 /// One file read from start to end: its frames come out a block at a time (`frames`), `at` is the take's frame of the
 /// block's first.
@@ -92,10 +72,7 @@ impl Reader {
     fn sample(&self, channel: usize, index: usize) -> f32 {
         match &self.kind {
             Kind::Flac(decoder) => decoder.samples[channel][index] as f32 * self.scale,
-            Kind::Wav { layout, bytes, .. } => {
-                let frame = layout.frame_bytes() as usize;
-                layout.sample(&bytes.0[index * frame..index * frame + frame], channel)
-            }
+            Kind::Wav(decoder) => decoder.sample(channel, index),
         }
     }
 
@@ -106,23 +83,12 @@ impl Reader {
         }
         self.at += self.end as u64;
         (self.start, self.end) = (0, 0);
-        match &mut self.kind {
-            Kind::Flac(decoder) => {
-                if let Ok(Some(count)) = decoder.next_block() {
-                    self.end = count;
-                }
-            }
-            Kind::Wav { layout, bytes, path } => {
-                let frame = layout.frame_bytes();
-                let left = layout.frames().saturating_sub(self.at);
-                let frames = (bytes.0.len() as u64 / frame).min((CHUNK as u64 / frame).max(1)).min(left) as usize;
-                let want = frames * frame as usize;
-                if want > 0 {
-                    if let Ok(got) = tape_rt::vfs_read(path.as_str(), layout.data_offset + self.at * frame, &mut bytes.0[..want]) {
-                        self.end = got / frame as usize;
-                    }
-                }
-            }
+        let block = match &mut self.kind {
+            Kind::Flac(decoder) => decoder.next_block(),
+            Kind::Wav(decoder) => decoder.next_block(),
+        };
+        if let Ok(Some(count)) = block {
+            self.end = count;
         }
         self.end
     }
@@ -146,8 +112,10 @@ impl Reader {
                 (self.at, self.end) = (first, count);
                 self.start = (frame.saturating_sub(first) as usize).min(count);
             }
-            Kind::Wav { .. } => {
-                (self.at, self.start, self.end) = (frame, 0, 0);
+            // Exact: the next block starts at the frame.
+            Kind::Wav(decoder) => {
+                let first = decoder.seek(frame).unwrap_or(0);
+                (self.at, self.start, self.end) = (first, 0, 0);
             }
         }
     }
@@ -169,9 +137,9 @@ pub struct Player {
     played: u64,
     /// Files of the open take whose overview comes from their peak file.
     from_peaks: usize,
-    /// Decoders and WAV buffers made so far (they are kept for the next take; the heap gives nothing back).
+    /// Decoders made so far (they are kept for the next take; the heap gives nothing back). A WAV take is one file.
     decoders: [Option<&'static mut Flac>; 2 * MAX_FILES],
-    buffers: [Option<&'static mut WavBuffer>; 2 * MAX_FILES],
+    wavs: [Option<&'static mut Wav>; 2],
     overview: &'static Overview,
     live: &'static mut Envelope,
     live_columns: usize,
@@ -282,7 +250,7 @@ impl Player {
                 // No thread: a few milliseconds of it a pass.
                 let began = tape_rt::micros();
                 // SAFETY: without a thread the scanner is the drawing thread's alone.
-                if let Some(scanner) = unsafe { (*(&raw mut SCANNER)).as_mut() } {
+                if let Some(scanner) = unsafe { SCANNER.state() }.as_mut() {
                     while tape_rt::micros().wrapping_sub(began) < INLINE_US && scanner.step() {}
                 }
             }
@@ -301,26 +269,15 @@ impl Player {
         if self.thread.is_none() {
             return true;
         }
-        let job = JOB.fetch_add(1, Ordering::AcqRel) + 1;
-        tape_rt::futex_wake(&JOB, 1);
-        let began = tape_rt::micros();
-        while HELD.load(Ordering::Acquire) != job {
-            if tape_rt::micros().wrapping_sub(began) >= HOLD_US {
-                // Leave it odd: the scanner holds off when it gets there, and the next `hold` waits again.
-                return false;
-            }
-            tape_rt::idle();
-        }
-        self.held = true;
-        true
+        self.held = SCANNER.hold(HOLD_US);
+        self.held
     }
 
     /// Lets the scanner thread go on with the readers it has now.
     fn release(&mut self) {
         self.held = false;
-        if self.thread.is_some() && JOB.load(Ordering::Acquire) & 1 == 1 {
-            JOB.fetch_add(1, Ordering::AcqRel);
-            tape_rt::futex_wake(&JOB, 1);
+        if self.thread.is_some() {
+            SCANNER.release();
         }
     }
 
@@ -349,8 +306,7 @@ impl Player {
     /// At the end of the tape: stops the scanner thread.
     pub fn quit(&mut self) {
         if let Some(thread) = self.thread.take() {
-            JOB.store(QUIT, Ordering::Release);
-            tape_rt::futex_wake(&JOB, 1);
+            SCANNER.quit();
             thread.join();
         }
     }
@@ -412,7 +368,7 @@ impl Player {
             return self.fail(app, "the overview's reader did not stop (try again)");
         }
         // SAFETY: held (or no thread): the drawing thread has the scanner to itself until `release`.
-        unsafe { *(&raw mut SCANNER) = None };
+        unsafe { *SCANNER.state() = None };
         let (project, take) = (p.projects[p.project], p.takes[p.take]);
         let folder = naming::join(&[base.as_str(), project.as_str(), take.as_str()]);
         let mut files = [TakeFile { name: naming::FileName::new(), first: 0, channels: 0, flac: false }; MAX_FILES];
@@ -467,7 +423,7 @@ impl Player {
         self.live_columns = 0;
         self.shown_at = 0;
         // SAFETY: still held: the scanner gets its readers, then goes.
-        unsafe { *(&raw mut SCANNER) = Some(Scanner { readers: scans, rows: self.rows, overview: self.overview }) };
+        unsafe { *SCANNER.state() = Some(Scanner { readers: scans, rows: self.rows, overview: self.overview }) };
         self.release();
     }
 
@@ -478,7 +434,7 @@ impl Player {
         // reading the old take (nothing shows it) and let go.
         if self.thread.is_none() || self.held {
             // SAFETY: held, or no thread.
-            unsafe { *(&raw mut SCANNER) = None };
+            unsafe { *SCANNER.state() = None };
         }
         self.release();
         app.playing.open = None;
@@ -493,7 +449,7 @@ impl Player {
                 self.decoders[which] = Some(alloc_zeroed(api).ok_or("out of memory for the FLAC decoder")?);
             }
             let decoder: &'static mut Flac = unsafe { &mut *(self.decoders[which].as_deref_mut().unwrap() as *mut Flac) };
-            *decoder.source() = VfsFile { path, size };
+            *decoder.source() = FileSource::vfs(path.as_str(), size).ok_or("a file of the take has too long a path")?;
             decoder.open().map_err(|_| "a file of the take is not FLAC the decoder can read")?;
             if decoder.total_samples == 0 {
                 return Err("a FLAC file of the take has no length yet (still being recorded?)");
@@ -504,21 +460,22 @@ impl Player {
             let (rate, frames, scale) = (decoder.sample_rate, decoder.total_samples, 1.0 / (1u64 << (decoder.bits_per_sample - 1)) as f32);
             Ok((Reader { kind: Kind::Flac(decoder), file, start: 0, end: 0, at: 0, scale }, rate, frames))
         } else {
-            let mut head = [0u8; 512];
-            let got = tape_rt::vfs_read(path.as_str(), 0, &mut head).map_err(|_| "a file of the take cannot be read")?;
             // The Recorder writes a WAV header with its first block: a take that has none yet is still starting.
-            if got < 64 {
+            if size < 64 {
                 return Err("this take is being recorded and has nothing on disk yet");
             }
-            let layout = WavLayout::parse(&head[..got], size).ok_or("a file of the take is not a WAV file the page can read")?;
-            if layout.channels != u16::from(file.channels) {
+            let slot = which % 2;
+            if self.wavs[slot].is_none() {
+                self.wavs[slot] = Some(alloc_zeroed(api).ok_or("out of memory for the WAV reader")?);
+            }
+            let decoder: &'static mut Wav = unsafe { &mut *(self.wavs[slot].as_deref_mut().unwrap() as *mut Wav) };
+            *decoder.source() = FileSource::vfs(path.as_str(), size).ok_or("a file of the take has too long a path")?;
+            decoder.open().map_err(|_| "a file of the take is not a WAV file the page can read")?;
+            if decoder.channels() != u32::from(file.channels) {
                 return Err("a WAV file's channels differ from its name");
             }
-            if self.buffers[which].is_none() {
-                self.buffers[which] = Some(alloc_zeroed(api).ok_or("out of memory for the WAV buffer")?);
-            }
-            let bytes: &'static mut WavBuffer = unsafe { &mut *(self.buffers[which].as_deref_mut().unwrap() as *mut WavBuffer) };
-            Ok((Reader { kind: Kind::Wav { layout, bytes, path }, file, start: 0, end: 0, at: 0, scale: 1.0 }, layout.rate, layout.frames()))
+            let (rate, frames) = (decoder.sample_rate(), decoder.total_samples());
+            Ok((Reader { kind: Kind::Wav(decoder), file, start: 0, end: 0, at: 0, scale: 1.0 }, rate, frames))
         }
     }
 
@@ -651,19 +608,15 @@ enum ScanSource {
 }
 
 /// The overview's reader: a second reader of each file, read from start to end into the overview. Owned by the scanner
-/// thread while `JOB` is even, by the drawing thread while the scanner holds off (`Player::hold`) or when there is no
-/// thread.
+/// thread except while the drawing thread holds it (`Player::hold`, `tape_rt::channel::Handover`), and by the drawing
+/// thread alone when there is no thread.
 struct Scanner {
     readers: [Option<ScanSource>; MAX_FILES],
     rows: [[u8; 8]; MAX_FILES],
     overview: &'static Overview,
 }
 
-static mut SCANNER: Option<Scanner> = None;
-/// Even: the scanner may read; odd: it holds off and says so in `HELD`; `QUIT`: it ends.
-static JOB: AtomicU32 = AtomicU32::new(0);
-static HELD: AtomicU32 = AtomicU32::new(u32::MAX - 1);
-const QUIT: u32 = u32::MAX;
+static SCANNER: Handover<Option<Scanner>> = Handover::new(None);
 
 impl Scanner {
     /// Reads `SCAN_FRAMES` more of each file into the overview; false when every file is read through.
@@ -732,32 +685,15 @@ impl Scanner {
 }
 
 /// The scanner thread: reads while there is a take to read, rests between steps so the drawing thread keeps its CPU,
-/// holds off when asked (`JOB` odd), sleeps when done, ends at `QUIT`.
+/// holds off when asked, sleeps when done, ends at `quit` (`Handover::run`).
 extern "C" fn scanner_thread(_: usize) {
-    loop {
-        let job = JOB.load(Ordering::Acquire);
-        if job == QUIT {
-            return;
-        }
-        if job & 1 == 1 {
-            HELD.store(job, Ordering::Release);
-            tape_rt::futex_wait(&JOB, job);
-            continue;
-        }
-        // SAFETY: `JOB` is even: the scanner is this thread's until the drawing thread makes it odd and waits for `HELD`.
-        let busy = unsafe { (*(&raw mut SCANNER)).as_mut() }.is_some_and(Scanner::step);
-        if busy {
-            tape_rt::idle();
-        } else {
-            tape_rt::futex_wait(&JOB, job);
-        }
-    }
+    SCANNER.run(|scanner| scanner.as_mut().is_some_and(Scanner::step));
 }
 
 /// The peak file beside `file` in `folder`, when there is one that fits it (its channels; the Recorder writes one when a
 /// take stops).
 fn peak_source(folder: &str, file: TakeFile) -> Option<ScanSource> {
-    let leaf = peaks::file_name(file.name.as_str())?;
+    let leaf = naming::peak_file(file.name.as_str())?;
     let path = naming::join(&[folder, leaf.as_str()]);
     let size = tape_rt::vfs_stat(path.as_str()).ok()?.size;
     let mut head = [0u8; peaks::HEADER];

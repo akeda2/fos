@@ -12,11 +12,11 @@
 #![no_std]
 
 pub mod analyzer;
-pub mod channel;
 pub mod layout;
 pub mod meters;
 pub mod naming;
-pub mod peaks;
+/// The peak files (`audio_rec::peak_file`): the Recorder writes them, the Play page reads them.
+pub use audio_rec::peak_file as peaks;
 pub mod play;
 pub mod queue;
 pub mod recorder;

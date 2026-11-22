@@ -13,7 +13,7 @@ audio-rec = { path = "../../crates/audio-rec" }
 audio-screen = { path = "../../crates/audio-screen" }
 dsp = { path = "../../crates/dsp" }
 flac-enc = { path = "../../crates/flac-enc" }
-tape-rt = { path = "../../crates/tape-rt" }
+tape-rt = { path = "../../crates/tape-rt", features = ["decode"] }
 fosfor-abi = { path = "../../abi" }
 gfx = { path = "../../crates/gfx" }
 instrument-rt = { path = "../../crates/instrument-rt" }

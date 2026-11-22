@@ -1,10 +1,12 @@
-//! Peak files: the lowest and highest sample of each input over every `frames_per_peak` frames of a take, written by the
-//! Recorder beside each audio file (`Konsert_take007_..._in01-08.peaks` beside `..._in01-08.flac`), so the Play page
-//! shows a take's overview at once instead of reading the whole take.
+//! Peak files: the lowest and highest sample of each channel over every `frames_per_peak` frames of an audio file,
+//! written beside it with the same name and `.peaks` for the extension (`take007_in01-08.peaks` beside
+//! `take007_in01-08.flac`), so a player shows the file's overview at once instead of reading all of it. KakelFix's
+//! Recorder writes them and its Play page reads them; any recorder or player can.
 //!
-//! The Recorder collects them while it records (`PeakLog`, in memory; a long take makes them coarser rather than running
-//! out of room) and writes the files when the take stops, after the audio files are closed. A take cut short (power,
-//! crash) has none, and the Play page reads the audio instead.
+//! A recorder collects them while it records (`PeakLog`, in memory; a long take makes them coarser rather than running
+//! out of room) and writes the file when the take stops, after the audio file is closed. A take cut short (power,
+//! crash) has none, and a player reads the audio instead. A `PeakLog` can hold more channels than one file: `header`
+//! and `body` give the file of any run of them (a take split into files of a few channels each).
 //!
 //! The file, all little-endian:
 //!
@@ -87,12 +89,14 @@ impl Header {
     }
 }
 
-/// A peak file's name beside its audio file: the same name with `.peaks` for the extension.
-pub fn file_name(audio: &str) -> Option<crate::naming::FileName> {
-    let stem = audio.rsplit_once('.')?.0;
-    let mut name = crate::naming::FileName::from(stem);
-    let _ = core::fmt::Write::write_str(&mut name, ".peaks");
-    (name.as_str().len() == stem.len() + 6).then_some(name)
+/// A peak file's extension.
+pub const EXTENSION: &str = ".peaks";
+
+/// A peak file's name beside audio file `audio`, written to `out` (the same name with `EXTENSION` for the extension);
+/// false when `audio` has no extension or `out` had no room (a fixed-size name drops what does not fit).
+pub fn file_name(audio: &str, out: &mut impl core::fmt::Write) -> bool {
+    let Some((stem, _)) = audio.rsplit_once('.') else { return false };
+    out.write_str(stem).is_ok() && out.write_str(EXTENSION).is_ok()
 }
 
 /// The peaks of a take as it is recorded: `channels` inputs, a cell per input per peak in `cells` (the caller's memory).
@@ -209,5 +213,68 @@ impl<'a> PeakLog<'a> {
             chunk.copy_from_slice(&cell.to_le_bytes());
         }
         end - start
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_log_keeps_peaks_and_gets_coarser_rather_than_run_out() {
+        let mut cells = [0u32; 2 * 64];
+        let mut log = PeakLog::new(&mut cells);
+        log.start(2);
+        // Two blocks that cross a peak boundary in the middle: 700 frames, then 400.
+        let per = FIRST_FRAMES_PER_PEAK as usize;
+        for (length, value) in [(700usize, 0.5f32), (400, -0.25)] {
+            log.reserve(length);
+            let left = [value; 700];
+            let right = [-value; 700];
+            log.fold(0, &left[..length]);
+            log.fold(1, &right[..length]);
+            log.advance(length);
+        }
+        assert_eq!((log.frames(), log.peaks(), log.frames_per_peak() as usize), (1100, 3, per));
+        let mut body = [0u8; 3 * 2 * 4];
+        assert_eq!(log.body(0, 2, 0, &mut body), body.len());
+        let cell = |peak: usize, channel: usize| unpack(u32::from_le_bytes(body[(peak * 2 + channel) * 4..][..4].try_into().unwrap()));
+        assert_eq!(cell(0, 0), (16383, 16383), "the first peak saw only the first block");
+        assert_eq!(cell(1, 0), (-8191, 16383), "the second straddles both blocks");
+        assert_eq!(cell(1, 1), (-16383, 8191));
+        assert_eq!(cell(2, 0), (-8191, -8191));
+        // Channel 1 alone, for a file of that channel.
+        let mut one = [0u8; 3 * 4];
+        assert_eq!(log.body(1, 1, 0, &mut one), one.len());
+        assert_eq!(unpack(u32::from_le_bytes(one[4..8].try_into().unwrap())), (-16383, 8191));
+        // Past the 64 peaks the cells hold, pairs merge: the frames per peak double, nothing is lost.
+        log.reserve(per * 70);
+        let ramp = [0.1f32; 512 * 70];
+        log.fold(0, &ramp[..per * 70]);
+        log.fold(1, &ramp[..per * 70]);
+        log.advance(per * 70);
+        assert_eq!(log.frames_per_peak() as usize, per * 2);
+        assert!(log.peaks() <= 64);
+        let mut merged = [0u8; 4];
+        log.body(0, 1, 0, &mut merged);
+        assert_eq!(unpack(u32::from_le_bytes(merged)), (-8191, 16383), "the first two peaks, merged");
+        assert_ne!(u32::from_le_bytes(merged), EMPTY);
+        // The header goes out and comes back; a file shorter than its peaks, or another file, is refused.
+        let header = log.header(1, 48_000);
+        let mut bytes = [0u8; HEADER];
+        header.write(&mut bytes);
+        let length = HEADER as u64 + header.peaks * 4;
+        assert_eq!(Header::parse(&bytes, length), Some(header));
+        assert_eq!(Header::parse(&bytes, length - 1), None);
+        assert_eq!(Header::parse(b"RIFF\0\0\0\0WAVEfmt ", 1 << 20), None);
+        assert_eq!(header.offset(2), HEADER as u64 + 8);
+    }
+
+    #[test]
+    fn the_name_is_the_audio_file_s_with_peaks_for_the_extension() {
+        let mut name = String::new();
+        assert!(file_name("Konsert_take007_2026-11-20_143512_in01-08.flac", &mut name));
+        assert_eq!(name, "Konsert_take007_2026-11-20_143512_in01-08.peaks");
+        assert!(!file_name("no-extension", &mut String::new()));
     }
 }

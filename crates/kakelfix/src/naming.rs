@@ -40,6 +40,13 @@ pub type ProjectName = Text<40>;
 /// Room for a take's file name (at most 60 characters, see above).
 pub type FileName = Text<64>;
 
+/// The peak file beside audio file `audio` (`audio_rec::peak_file`): its name with `.peaks`; None when it does not fit.
+pub fn peak_file(audio: &str) -> Option<FileName> {
+    let mut name = FileName::new();
+    let stem = audio.rsplit_once('.')?.0;
+    (audio_rec::peak_file::file_name(audio, &mut name) && name.as_str().len() == stem.len() + audio_rec::peak_file::EXTENSION.len()).then_some(name)
+}
+
 /// A moment as the machine's wall clock gives it (local time).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Stamp {

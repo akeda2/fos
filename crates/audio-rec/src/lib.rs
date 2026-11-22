@@ -5,9 +5,11 @@
 //! - `preroll`: a ring that always holds the last few seconds, so a take can begin before the moment it was asked for;
 //! - `silence`: the trigger that starts a take on sound and ends it on silence, with configurable timing;
 //! - `peaks`: feeding the meters from the device's own sample format;
+//! - `peak_file`: a take's overview beside it (`.peaks`), so a player need not read the whole take to draw it;
 //! - `stream` and `vfs`: `Sink`s over the kernel's file calls (FOSFS and FAT streams; ext volumes by path).
 #![cfg_attr(not(test), no_std)]
 
+pub mod peak_file;
 pub mod peaks;
 pub mod preroll;
 pub mod recorder;

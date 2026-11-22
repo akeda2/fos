@@ -2,7 +2,7 @@
 //! take, played to an output pair of the device while capture (and a take) goes on.
 //!
 //! What is here is what the tape needs and the host can test: which files make up a take and which inputs each holds
-//! (`take_file`), a WAV header as the Recorder writes it (`WavLayout`), how the inputs listened to are mixed to the two
+//! (`take_file`), how the inputs listened to are mixed to the two
 //! sides of the output pair (`Playing::mix`), the whole-take overview (`Overview`), the default output pair
 //! (`default_output`) and the page's state (`Playing`). Reading, decoding and playing are the tape's (`tapes/kakelfix/src/play.rs`).
 
@@ -53,85 +53,6 @@ pub fn take_file(name: &str) -> Option<TakeFile> {
         return None;
     }
     Some(TakeFile { name: FileName::from(name), first: first - 1, channels: last - first + 1, flac })
-}
-
-/// Where a WAV file's samples are, as the Recorder writes them (`audio_rec::wav`): RIFF or RF64 (`ds64`), plain PCM,
-/// IEEE float or WAVE_FORMAT_EXTENSIBLE, samples left-justified in `slot` bytes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct WavLayout {
-    pub data_offset: u64,
-    pub data_bytes: u64,
-    pub channels: u16,
-    pub rate: u32,
-    pub slot: u16,
-    pub float: bool,
-}
-
-impl WavLayout {
-    pub fn frame_bytes(&self) -> u64 {
-        u64::from(self.channels) * u64::from(self.slot)
-    }
-
-    pub fn frames(&self) -> u64 {
-        self.data_bytes / self.frame_bytes().max(1)
-    }
-
-    /// Reads the header from the file's first bytes (`head`, 512 cover any header the Recorder writes) and the file's
-    /// length on disk (`file_bytes`: a take still being written, or cut short, has fewer bytes than its header says).
-    pub fn parse(head: &[u8], file_bytes: u64) -> Option<WavLayout> {
-        let u16_at = |at: usize| Some(u16::from_le_bytes(head.get(at..at + 2)?.try_into().ok()?));
-        let u32_at = |at: usize| Some(u32::from_le_bytes(head.get(at..at + 4)?.try_into().ok()?));
-        let u64_at = |at: usize| Some(u64::from_le_bytes(head.get(at..at + 8)?.try_into().ok()?));
-        let rf64 = match head.get(..4)? {
-            b"RIFF" => false,
-            b"RF64" => true,
-            _ => return None,
-        };
-        if head.get(8..12)? != b"WAVE" {
-            return None;
-        }
-        let (mut at, mut big_data, mut format) = (12usize, None, None);
-        while at + 8 <= head.len() {
-            let (id, size) = (head.get(at..at + 4)?, u32_at(at + 4)?);
-            let body = at + 8;
-            match id {
-                b"ds64" if rf64 => big_data = Some(u64_at(body + 8)?),
-                b"fmt " => {
-                    let tag = u16_at(body)?;
-                    let tag = if tag == 0xfffe { u16_at(body + 24)? } else { tag };
-                    let bits = u16_at(body + 14)?;
-                    format = Some((tag, u16_at(body + 2)?, u32_at(body + 4)?, bits.div_ceil(8).max(u16_at(body + 12)? / u16_at(body + 2)?.max(1))));
-                }
-                b"data" => {
-                    let (tag, channels, rate, slot) = format?;
-                    if channels == 0 || slot == 0 || !(tag == 1 || tag == 3) || (tag == 3 && slot != 4) || slot > 4 {
-                        return None;
-                    }
-                    let stated = if rf64 && size == u32::MAX { big_data? } else { u64::from(size) };
-                    let data_offset = body as u64;
-                    let present = file_bytes.saturating_sub(data_offset);
-                    let layout = WavLayout { data_offset, data_bytes: stated.min(present), channels, rate, slot, float: tag == 3 };
-                    return Some(WavLayout { data_bytes: layout.data_bytes / layout.frame_bytes() * layout.frame_bytes(), ..layout });
-                }
-                _ => {}
-            }
-            at = body + size as usize + (size as usize & 1);
-        }
-        None
-    }
-
-    /// Sample `channel` of the frame at `frame` (its bytes) as -1..1.
-    pub fn sample(&self, frame: &[u8], channel: usize) -> f32 {
-        let slot = usize::from(self.slot);
-        let bytes = &frame[channel * slot..channel * slot + slot];
-        if self.float {
-            return f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        }
-        // Left-justified: the sample's top byte is the slot's last, so it reads as a full-width signed number.
-        let mut word = [0u8; 4];
-        word[4 - slot..].copy_from_slice(bytes);
-        i32::from_le_bytes(word) as f32 / 2_147_483_648.0
-    }
 }
 
 /// A take's inputs at a glance: the lowest and highest sample of each input per column, over the whole take. Filled as

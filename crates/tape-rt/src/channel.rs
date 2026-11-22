@@ -1,12 +1,15 @@
-//! What the Recorder's drawing thread and its worker (the thread that encodes and writes a take) share: a ring of captured
-//! bytes and two mailboxes. No locks: each has one writer and one reader, and on the server kernel the two run on
-//! different CPUs at once.
+//! What a tape's threads share (`spawn_thread`, the server kernel): rings and mailboxes with no locks, each with one
+//! writer and one reader that may run on different CPUs at once, and a handover for work a thread does in the
+//! background. KakelFix's Recorder (a ring of captured audio to the thread that encodes and writes it, commands one way
+//! and the take's status the other) and its Play page (the overview read on a thread of its own) use them.
 //!
-//! - `Ring`: the drawing thread pushes whole blocks of device frames, the worker takes them. The capacity is a whole
+//! - `Ring`: one thread pushes whole blocks of device frames, the other takes them. The capacity is a whole
 //!   number of frames, so a contiguous run the worker sees is whole frames too. A push that does not fit is refused
 //!   whole; the drawing thread then leaves the audio in the kernel's capture ring (far larger) instead of dropping it.
 //! - `Mailbox<T>`: a value with a serial number, written by one side, read by the other; a reader sees each value whole
-//!   (a sequence lock), and knows from the serial whether it is new. Commands go one way, the take's status the other.
+//!   (a sequence lock), and knows from the serial whether it is new.
+//! - `Handover<T>`: state a worker thread works through a step at a time (`run`), which the drawing thread can take back
+//!   for a moment (`hold`, change it, `release`), e.g. to replace the files a background reader reads, and stop (`quit`).
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
@@ -167,6 +170,92 @@ impl<T: Copy> Mailbox<T> {
 
 // SAFETY: one writer, readers check the sequence (above); `T` is `Copy` plain data.
 unsafe impl<T: Copy + Send> Sync for Mailbox<T> {}
+
+/// Work a background thread does a step at a time, on state the drawing thread can take back (`hold`) whenever it
+/// needs to change it. One worker (`run`), one other side. No step is ever cut short: `hold` waits for the one running.
+///
+/// `job` is even while the worker may work, odd while the other side holds it (or wants to), `QUIT` to end; `held` is
+/// the odd `job` the worker last stopped for, so the other side knows it has stopped for *this* hold.
+pub struct Handover<T> {
+    job: AtomicU32,
+    held: AtomicU32,
+    state: UnsafeCell<T>,
+}
+
+const QUIT: u32 = u32::MAX;
+
+impl<T> Handover<T> {
+    pub const fn new(state: T) -> Handover<T> {
+        Handover { job: AtomicU32::new(0), held: AtomicU32::new(u32::MAX - 1), state: UnsafeCell::new(state) }
+    }
+
+    /// The worker's loop: `step` while it returns true (resting a tick between steps, `idle`, so a drawing thread on the
+    /// same CPU keeps up), sleeping when it returns false until the state is changed; stopping for a `hold`; returning
+    /// at `quit`.
+    pub fn run(&self, mut step: impl FnMut(&mut T) -> bool) {
+        loop {
+            let job = self.job.load(Ordering::Acquire);
+            if job == QUIT {
+                return;
+            }
+            if job & 1 == 1 {
+                self.held.store(job, Ordering::Release);
+                crate::futex_wait(&self.job, job);
+                continue;
+            }
+            // SAFETY: `job` is even: the state is this thread's until the other side makes it odd and waits for `held`.
+            if step(unsafe { &mut *self.state.get() }) {
+                crate::idle();
+            } else {
+                crate::futex_wait(&self.job, job);
+            }
+        }
+    }
+
+    /// Stops the worker after the step it is in, waiting up to `timeout_us`; true when it has stopped and the state is
+    /// the caller's (`state`) until `release`. On a timeout the worker still stops when it gets there, and the next
+    /// `hold` waits for it again.
+    pub fn hold(&self, timeout_us: u64) -> bool {
+        let job = self.job.load(Ordering::Acquire);
+        let job = if job & 1 == 1 { job } else { self.job.fetch_add(1, Ordering::AcqRel) + 1 };
+        crate::futex_wake(&self.job, 1);
+        let began = crate::micros();
+        while self.held.load(Ordering::Acquire) != job {
+            if crate::micros().wrapping_sub(began) >= timeout_us {
+                return false;
+            }
+            crate::idle();
+        }
+        true
+    }
+
+    /// The state, while held (or when no worker was started).
+    ///
+    /// # Safety
+    /// The caller has `hold` succeed (and no `release` since), or no thread runs `run`; and keeps one reference at a time.
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn state(&self) -> &mut T {
+        unsafe { &mut *self.state.get() }
+    }
+
+    /// Lets the worker go on (with the state as the caller left it).
+    pub fn release(&self) {
+        let job = self.job.load(Ordering::Acquire);
+        if job != QUIT && job & 1 == 1 {
+            self.job.store(job.wrapping_add(1) % QUIT, Ordering::Release);
+            crate::futex_wake(&self.job, 1);
+        }
+    }
+
+    /// Ends `run` (after the step it is in); join the thread after.
+    pub fn quit(&self) {
+        self.job.store(QUIT, Ordering::Release);
+        crate::futex_wake(&self.job, 1);
+    }
+}
+
+// SAFETY: the state is the worker's while `job` is even and the other side's only after `held` says the worker stopped.
+unsafe impl<T: Send> Sync for Handover<T> {}
 
 #[cfg(test)]
 mod tests {

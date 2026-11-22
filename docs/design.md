@@ -1841,7 +1841,7 @@ mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path 
   samples a second on one core of an i5-6500 (`cargo test --release -p archive -- --ignored encode_speed`): a quarter of a
   core for a UFX's 30 inputs at 48 kHz, more than half at 192 kHz (18 inputs). So encoding and the disk writes run on a
   **worker thread** where the kernel has tape threads (the server kernel; the panel's Writer row says which): the drawing
-  thread copies each captured block into a 16 MiB ring (`kakelfix::channel::Ring`, one pusher, one taker, no locks) and
+  thread copies each captured block into a 16 MiB ring (`tape_rt::channel::Ring`, one pusher, one taker, no locks) and
   posts Start/Stop/Quit in a mailbox (`channel::Mailbox`, a sequence lock); the worker (`record::Worker`) takes the ring a
   capture block at a time, works from a snapshot of the settings taken at Record (`Job`), and posts its `Report` (the
   take, its messages, the last command it acted on) back. A full ring is never overwritten: the drawing thread then reads
@@ -1906,7 +1906,7 @@ mixer (2 playback channels, 2 outputs, masters, a Dim switch) so the whole path 
   keeps a CPU both are pinned to; a new take makes it let go of its readers first, `JOB`/`HELD`), and 3 ms a pass on the
   drawing thread where there are no tape threads; the page is redrawn for its progress at most four times a second (it
   ran on the drawing thread at first, 32768 frames of every file a pass, and the page crawled on aneby).
-  **Peak files** (`kakelfix::peaks`): the Recorder folds every armed input's lowest and highest sample per 512 frames
+  **Peak files** (`audio_rec::peak_file`, for any recorder and player): the Recorder folds every armed input's lowest and highest sample per 512 frames
   into memory as it records (`PeakLog`, 16 MiB, about 3 hours of 32 inputs; a longer take merges pairs and doubles the
   frames per peak, so it never runs out) and, when the take stops and its files are closed, writes one
   `..._in01-08.peaks` beside each audio file (a 64-byte `FOSPEAKS` header, then i16 pairs per input per peak), through

@@ -5,12 +5,15 @@
 //! `#[unsafe(no_mangle)] pub extern "C" fn tape_main(api: &'static TapeApi)`; this crate
 //! supplies the rest. The API pointer is also stored globally (`api()`), so helper
 //! functions deep in a tape can print or poll without it being threaded through.
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 pub mod abort;
+pub mod channel;
 pub mod config;
 pub mod mixer;
 pub mod save;
+#[cfg(feature = "decode")]
+pub mod source;
 pub mod text;
 
 pub use fosfor_abi::tape::*;

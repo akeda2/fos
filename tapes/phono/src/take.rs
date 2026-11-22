@@ -11,7 +11,7 @@ use archive::names::{self, Name};
 use archive::transcode::{Error as DecodeError, Job};
 use archive::{FlacFile, Names, Progress, Transcoder};
 use audio_decode::flac::Decoder;
-use audio_decode::{Source, SourceError};
+use tape_rt::source::FileSource;
 use audio_rec::stream::StreamSink;
 use core::fmt::Write;
 use flac_enc::Info;
@@ -33,7 +33,7 @@ static mut FILE: FlacFile = FlacFile::new();
 static mut SINK: Option<StreamSink> = None;
 static mut OUT_FILE: FlacFile = FlacFile::new();
 static mut OUT_SINK: Option<StreamSink> = None;
-static mut DECODER: Decoder<RawFile> = Decoder::new(RawFile::none());
+static mut DECODER: Decoder<FileSource> = Decoder::new(FileSource::none());
 static mut TRANSCODER: Transcoder = Transcoder::new();
 /// The decode pass has its own decoder and equaliser, so what is heard is not touched by it.
 static mut PASS_SURROUND: Surround = Surround::new();
@@ -53,29 +53,6 @@ fn out_file() -> &'static mut FlacFile {
 
 fn out_sink() -> &'static mut StreamSink {
     unsafe { (*core::ptr::addr_of_mut!(OUT_SINK)).as_mut().expect("sink") }
-}
-
-/// The raw take as a decoder source: every read is an `fs_read_at` of the piece asked for.
-pub struct RawFile {
-    name: Name,
-    size: u64,
-}
-
-impl RawFile {
-    const fn none() -> RawFile {
-        RawFile { name: Name::new(), size: 0 }
-    }
-}
-
-impl Source for RawFile {
-    fn size(&self) -> u64 {
-        self.size
-    }
-
-    fn read_at(&mut self, offset: u64, out: &mut [u8]) -> Result<usize, SourceError> {
-        let name = core::str::from_utf8(self.name.as_bytes()).map_err(|_| SourceError)?;
-        tape_rt::read_file_at(name, offset, out).map_err(|_| SourceError)
-    }
 }
 
 /// What the decode pass was started with (settings can change while it runs).
@@ -314,7 +291,8 @@ impl Archive {
             return say(message, format_args!("cannot find {}", raw.as_str()));
         };
         let (decoder, surround, transcoder) = unsafe { (&mut *core::ptr::addr_of_mut!(DECODER), &mut *core::ptr::addr_of_mut!(PASS_SURROUND), &mut *core::ptr::addr_of_mut!(TRANSCODER)) };
-        *decoder = Decoder::new(RawFile { name: raw, size: length });
+        let Some(source) = FileSource::fs(raw.as_str(), length) else { return };
+        *decoder = Decoder::new(source);
         if decoder.open().is_err() {
             return say(message, format_args!("{} is not a FLAC file", raw.as_str()));
         }

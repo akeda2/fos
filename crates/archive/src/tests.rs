@@ -81,7 +81,7 @@ fn write_raw(frames: &[Vec<i32>; 2], bits: u32, sink: &mut Memory) -> Vec<u8> {
 }
 
 fn decode_all(bytes: &[u8]) -> (Vec<Vec<i32>>, u32, u64) {
-    let mut dec = Box::new(Decoder::new(Bytes(bytes)));
+    let mut dec = Box::new(Decoder::<_, 2>::new(Bytes(bytes)));
     dec.open().unwrap();
     let mut out = vec![Vec::new(), Vec::new()];
     while let Some(n) = dec.next_block().unwrap() {
@@ -113,7 +113,7 @@ fn a_checkpointed_file_is_complete_up_to_the_checkpoint() {
     file.checkpoint(&mut sink).unwrap();
     // No finish: a reset here. The length and STREAMINFO were made to agree at the checkpoint.
     let (decoded, _, total) = {
-        let mut dec = Box::new(Decoder::new(Bytes(sink.file())));
+        let mut dec = Box::new(Decoder::<_, 2>::new(Bytes(sink.file())));
         dec.open().unwrap();
         let total = dec.total_samples;
         let mut count = 0u64;
@@ -186,7 +186,7 @@ fn transcode(raw: &[u8], settings: SurroundSettings, depth: Depth) -> (Vec<u8>, 
 }
 
 fn transcode_trim(raw: &[u8], settings: SurroundSettings, depth: Depth, trim_db: f32) -> (Vec<u8>, Report) {
-    let mut dec = Box::new(Decoder::new(Bytes(raw)));
+    let mut dec = Box::new(Decoder::<_, 2>::new(Bytes(raw)));
     dec.open().unwrap();
     let mut surround = Box::new(Surround::new());
     surround.tune(dec.sample_rate, settings);
@@ -219,7 +219,7 @@ fn a_noisy_take_gets_a_lower_depth_than_a_quiet_floor() {
     let (out, report) = transcode(&raw, settings(Mode::Qs, Layout::Quad40), Depth::Auto);
     assert_eq!(report.bits, 16, "{report:?}");
     assert!(report.floor_dbfs.unwrap() > -60.0);
-    let mut dec = Box::new(Decoder::new(Bytes(&out)));
+    let mut dec = Box::new(Decoder::<_, 2>::new(Bytes(&out)));
     assert!(dec.open().is_err(), "the in-tree decoder only takes stereo; four channels are checked with ffmpeg");
 
     // A near-silent, low-noise take keeps more bits.
@@ -245,7 +245,7 @@ fn surround_off_and_a_mono_take_are_refused() {
     let frames = signal(5000, 1000.0);
     let mut sink = Memory::new();
     let raw = write_raw(&frames, 24, &mut sink);
-    let mut dec = Box::new(Decoder::new(Bytes(&raw)));
+    let mut dec = Box::new(Decoder::<_, 2>::new(Bytes(&raw)));
     dec.open().unwrap();
     let mut surround = Box::new(Surround::new());
     surround.tune(48000, settings(Mode::Off, Layout::Quad40));

@@ -42,7 +42,7 @@ use gfx::Canvas;
 use gfx::meter::{Scale, draw_bar, draw_scale};
 use gfx::theme::theme;
 use core::sync::atomic::{AtomicU32, Ordering};
-use kakelfix::channel::{Mailbox, Ring};
+use tape_rt::channel::{Mailbox, Ring};
 use kakelfix::naming::{self, FileName, ProjectName, Stamp};
 use kakelfix::peaks::{self, PeakLog};
 use kakelfix::recorder::{Disk, Encoding, GROUP, MAX_DISKS, MAX_GROUPS, Request, Take, Volume, clock, describe_channels, duration, size};
@@ -844,7 +844,7 @@ impl Writer {
     /// Writes the peak file of audio file `audio` (inputs `first..first + channels` of the take), in the staging block's
     /// pieces (the WAV file that used it is closed).
     fn write_peaks(&mut self, api: &TapeApi, audio: &str, first: usize, channels: usize) -> Result<(), i32> {
-        let Some(leaf) = peaks::file_name(audio) else { return Ok(()) };
+        let Some(leaf) = naming::peak_file(audio) else { return Ok(()) };
         let path = naming::join(&[self.folder.as_str(), leaf.as_str()]);
         let header = self.peaks.header(channels, self.format.rate);
         let total = header.offset(header.peaks);
