@@ -534,12 +534,21 @@ fn kick(mask: u32) {
     }
 }
 
-/// TSC cycles per microsecond, measured against `time::micros` over 10 ms (only when printing the counters).
+/// TSC cycles per microsecond, measured against `time::micros` over 10 ms the first time the counters are printed and
+/// kept: measured afresh each time it came out a unit or two different, and every printed figure (a max that can only
+/// grow included) moved with it.
 fn cycles_per_us() -> u64 {
+    static RATE: AtomicU64 = AtomicU64::new(0);
+    let known = RATE.load(Ordering::Relaxed);
+    if known != 0 {
+        return known;
+    }
     let (cycles, micros) = (crate::cpu::cycles(), crate::time::micros());
     crate::arch::busy_wait_ms(10);
     let elapsed = crate::time::micros().saturating_sub(micros).max(1);
-    (crate::cpu::cycles().wrapping_sub(cycles) / elapsed).max(1)
+    let rate = (crate::cpu::cycles().wrapping_sub(cycles) / elapsed).max(1);
+    RATE.store(rate, Ordering::Relaxed);
+    rate
 }
 
 fn list() {

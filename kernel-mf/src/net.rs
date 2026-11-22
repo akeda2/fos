@@ -980,6 +980,10 @@ pub fn rx_event() {
 /// without interrupts (polled) is still only served there. The NIC lock is held only while draining, never while waiting,
 /// because the SysRq rescue drains with a `try_lock` and must find it free (a thread that spun on the NICs starved it).
 pub extern "C" fn rx_thread(_: usize) {
+    // NIC interrupts are on from `net::init`, a second or more before this thread is spawned (the self-test runs in
+    // between): an event stamped then is no wake-up latency, so it is dropped. `RX_PENDING` stays set, so frames that
+    // arrived meanwhile are still drained in the first round.
+    RX_EVENT_AT.store(0, Ordering::Release);
     loop {
         crate::sched::wait_while(RX_KEY, || !RX_PENDING.load(Ordering::Acquire));
         // Cleared first: an interrupt that arrives while draining sets it again and the next round picks that frame up.
