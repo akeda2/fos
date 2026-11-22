@@ -1,47 +1,54 @@
 //! The AoE target of the server kernel: serves disks to Linux (`aoe` module, `vblade`'s initiators) and to other fos hosts
 //! as ATA over Ethernet (ethertype 0x88a2). The protocol is `crates/aoe`; this is the glue (docs/block-sharing.md).
 //!
-//! Frames never reach a disk from the receive path. `frame_hook` runs with the NIC lock held, and a disk read there would
-//! stall every interface (and the audio drivers that share the lock), so it only copies the frame into a small queue and
-//! wakes the `aoe` thread. That thread asks the disk, builds the reply and sends it. A full queue drops the frame: the
-//! initiator retransmits, as it would for a frame lost on the wire.
+//! **Threads.** Frames never reach a disk from the receive path. `frame_hook` runs with the NIC lock held, and a disk read
+//! there would stall every interface (and the audio drivers that share the lock), so it only copies the frame into the
+//! queue of the export it is for and wakes that export's worker thread. Each export has its own queue and its own worker,
+//! so a disk that is slow or has a backlog (a USB stick) fills only its own queue and drops only its own frames; the
+//! initiator retransmits, as it would for a frame lost on the wire. One more thread (`aoe-flush`) flushes written disks
+//! after a pause in writing.
 //!
-//! Writes go to the drive with `block::write_deferred` and are flushed when the queue runs empty (the initiator paused) and
-//! on FLUSH CACHE; the IDENTIFY data says there is a write cache, which is what lets the initiator rely on that.
+//! **The disk lock.** The block drivers keep their state in statics, poll, and do one command at a time, so every disk user
+//! in this kernel (the shell, tapes, NETFS, KUP) takes `tapefs::lock()`. So does the worker, around each batch of up to
+//! `BATCH` frames, and the flusher around a flush. The consequence is that disk transfers of all exports and of everything
+//! else are serial however many workers there are: the threads isolate queues and keep the network side moving, they do
+//! not make two disks read at once. That would need locks per controller in the drivers (docs/block-sharing.md).
+//!
+//! **Writes** go to the drive with `block::write_deferred`. The IDENTIFY data says there is a write cache, so the initiator
+//! may rely on FLUSH CACHE; the flusher also flushes a disk `FLUSH_AFTER` ticks after its last write, and `unexport` does.
 //!
 //! Exports are read-only unless `rw confirm` is given, and disk 1 (the boot disk) is never writable. Nothing stops a second
 //! writer: do not mount an exported disk here or on another host while it is exported `rw`.
 
 use crate::sched::{self, SleepMutex};
 use crate::sync::SpinLock;
-use crate::{block, net};
+use crate::{block, net, tapefs};
 use aoe::{Disk, Target};
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use alloc::vec;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use kernel_core::nicctl;
 
 const MAX_EXPORTS: usize = 8;
 const QUEUE: usize = 32;
 const FRAME: usize = 1600;
+/// Frames a worker handles per hold of the disk lock: fewer lock round trips under load, and still short enough that the
+/// shell or a tape waiting for the disk is not kept out for long.
+const BATCH: usize = 8;
+/// The flusher looks every `FLUSH_TICK` ticks (10 ms each) and flushes a disk that has not been written for `FLUSH_AFTER`.
+const FLUSH_TICK: u64 = 2;
+const FLUSH_AFTER: u64 = 5;
 /// The Ethernet payload size the target assumes: jumbo frames do not reach the receive path yet (`nicctl` drains into
 /// 1600-byte buffers), so it advertises 2 sectors per frame.
 const MTU: usize = 1500;
 /// What `aoe-shelf` and the shell leave to the machine: derived from NIC 1's MAC.
 const AUTO_SHELF: u32 = u32::MAX;
-const WAKE_KEY: usize = 0xa0e0_0001;
+const WAKE_KEY: usize = 0xa0e0_0000;
 
 struct Export {
     /// 0-based index in the block layer; the slot is this plus one, the disk number `disks` shows.
     disk: usize,
     target: Target,
-    /// Written since the last flush.
-    dirty: bool,
 }
-
-static EXPORTS: SleepMutex<[Option<Export>; MAX_EXPORTS]> = SleepMutex::new([const { None }; MAX_EXPORTS]);
-static SHELF: AtomicU32 = AtomicU32::new(AUTO_SHELF);
-static RUNNING: AtomicBool = AtomicBool::new(false);
-/// True while at least one disk is exported: only then does `frame_hook` take 0x88a2 frames (otherwise a tape may have them).
-static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 struct Queue {
     frames: [[u8; FRAME]; QUEUE],
@@ -52,59 +59,96 @@ struct Queue {
     dropped: u64,
 }
 
-static INBOX: SpinLock<Queue> = SpinLock::new(Queue { frames: [[0; FRAME]; QUEUE], lengths: [0; QUEUE], nics: [0; QUEUE], head: 0, count: 0, dropped: 0 });
+/// One export: its queue (written by `frame_hook`, read by its worker), its worker thread and the facts the hook and the
+/// flusher read without taking a sleeping lock.
+struct Slot {
+    inbox: SpinLock<Queue>,
+    /// The slot number the export answers to, 0 while the slot is free: what the hook routes by.
+    number: AtomicU8,
+    started: AtomicBool,
+    /// Written since the last flush, and the tick of the last write.
+    dirty: AtomicBool,
+    last_write: AtomicU64,
+    export: SleepMutex<Option<Export>>,
+}
 
-// The `aoe` thread is the only user of these two.
-static mut REQUEST: [u8; FRAME] = [0; FRAME];
-static mut REPLY: [u8; FRAME] = [0; FRAME];
+impl Slot {
+    const fn new() -> Slot {
+        Slot {
+            inbox: SpinLock::new(Queue { frames: [[0; FRAME]; QUEUE], lengths: [0; QUEUE], nics: [0; QUEUE], head: 0, count: 0, dropped: 0 }),
+            number: AtomicU8::new(0),
+            started: AtomicBool::new(false),
+            dirty: AtomicBool::new(false),
+            last_write: AtomicU64::new(0),
+            export: SleepMutex::new(None),
+        }
+    }
+}
+
+static SLOTS: [Slot; MAX_EXPORTS] = [const { Slot::new() }; MAX_EXPORTS];
+static SHELF: AtomicU32 = AtomicU32::new(AUTO_SHELF);
+/// How many disks are exported: only while it is above 0 does `frame_hook` take 0x88a2 frames (otherwise a tape may have them).
+static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+static FLUSHER: AtomicBool = AtomicBool::new(false);
 
 /// Whether `frame_hook` should hand 0x88a2 frames to this module.
 pub fn wanted() -> bool {
-    ACTIVE.load(Ordering::Acquire)
+    ACTIVE.load(Ordering::Acquire) > 0
 }
 
-/// Queues a received AoE frame for the thread. Runs under the NIC lock and possibly in the SysRq rescue's interrupt context:
-/// no disk, no sleeping; the wake-up is left out when `wake` is false (the thread polls once more when it next runs).
+/// Queues a received AoE frame for the export(s) it is addressed to (a broadcast Query Config goes to all). Runs under the NIC
+/// lock and possibly in the SysRq rescue's interrupt context: no disk, no sleeping; the wake-up is left out when `wake` is
+/// false (the worker finds the frame the next time it runs).
 pub fn enqueue(nic: usize, frame: &[u8], wake: bool) {
-    if frame.len() > FRAME {
+    if frame.len() > FRAME || frame.len() < 24 {
         return;
     }
-    let pushed = {
-        let mut queue = INBOX.lock();
-        if queue.count == QUEUE {
-            queue.dropped += 1;
-            false
-        } else {
-            let at = (queue.head + queue.count) % QUEUE;
-            queue.frames[at][..frame.len()].copy_from_slice(frame);
-            queue.lengths[at] = frame.len() as u16;
-            queue.nics[at] = nic as u8;
-            queue.count += 1;
-            true
+    let (shelf, slot) = (u16::from_be_bytes([frame[16], frame[17]]), frame[18]);
+    if shelf != 0xffff && shelf != self::shelf() {
+        return;
+    }
+    for (index, entry) in SLOTS.iter().enumerate() {
+        let number = entry.number.load(Ordering::Acquire);
+        if number == 0 || (slot != 0xff && slot != number) {
+            continue;
         }
-    };
-    if pushed && wake {
-        sched::wake_all(WAKE_KEY);
+        let pushed = {
+            let mut queue = entry.inbox.lock();
+            if queue.count == QUEUE {
+                queue.dropped += 1;
+                false
+            } else {
+                let at = (queue.head + queue.count) % QUEUE;
+                queue.frames[at][..frame.len()].copy_from_slice(frame);
+                queue.lengths[at] = frame.len() as u16;
+                queue.nics[at] = nic as u8;
+                queue.count += 1;
+                true
+            }
+        };
+        if pushed && wake {
+            sched::wake_all(WAKE_KEY + index);
+        }
     }
 }
 
-/// Takes the oldest queued frame into `REQUEST`; (nic, length).
-fn pop() -> Option<(usize, usize)> {
-    let mut queue = INBOX.lock();
+/// Takes the oldest queued frame of `slot` into `buffer`; (nic, length).
+fn pop(slot: &Slot, buffer: &mut [u8]) -> Option<(usize, usize)> {
+    let mut queue = slot.inbox.lock();
     if queue.count == 0 {
         return None;
     }
     let head = queue.head;
     let length = usize::from(queue.lengths[head]);
-    let request = unsafe { &mut *core::ptr::addr_of_mut!(REQUEST) };
-    request[..length].copy_from_slice(&queue.frames[head][..length]);
+    buffer[..length].copy_from_slice(&queue.frames[head][..length]);
     let nic = usize::from(queue.nics[head]);
     queue.head = (head + 1) % QUEUE;
     queue.count -= 1;
     Some((nic, length))
 }
 
-/// The block layer as the target's disk (512-byte sectors, bounds already checked by the target and by `block`).
+/// The block layer as the target's disk (512-byte sectors, bounds already checked by the target and by `block`). Only used
+/// with the disk lock held.
 struct BlockDisk(usize);
 
 impl Disk for BlockDisk {
@@ -133,42 +177,59 @@ pub fn shelf() -> u16 {
     u16::from_be_bytes([mac[4], mac[5]]).min(0xfffe)
 }
 
-extern "C" fn thread(_: usize) {
+/// One worker per export: sleeps until its queue has a frame, then serves up to `BATCH` frames under one hold of the disk lock.
+extern "C" fn worker(index: usize) {
+    let slot = &SLOTS[index];
+    let mut request = vec![0u8; FRAME];
+    let mut reply = vec![0u8; FRAME];
     loop {
-        match pop() {
-            Some((nic, length)) => serve(nic, length),
-            None => {
-                flush_dirty();
-                sched::wait_while(WAKE_KEY, || INBOX.lock().count == 0);
+        let waiting = slot.inbox.lock().count;
+        if waiting == 0 {
+            sched::wait_while(WAKE_KEY + index, || slot.inbox.lock().count == 0);
+            continue;
+        }
+        // Only an ATA command needs the disk (and so the lock); a Query Config is answered from memory.
+        let _disks = tapefs::lock();
+        let mut guard = slot.export.lock();
+        for _ in 0..BATCH {
+            let Some((nic, length)) = pop(slot, &mut request) else { break };
+            let (Some(export), Some(mac)) = (guard.as_mut(), net::mac(nic)) else { continue };
+            export.target.mac = mac;
+            let writes = export.target.writes;
+            let reply_length = export.target.handle(&request[..length], &mut BlockDisk(export.disk), &mut reply);
+            if export.target.writes != writes {
+                slot.last_write.store(crate::arch::ticks(), Ordering::Relaxed);
+                slot.dirty.store(true, Ordering::Release);
+            }
+            if reply_length > 0 {
+                let _nics = net::lock_nics();
+                nicctl::nic_send(nic, &reply[..reply_length]);
             }
         }
     }
 }
 
-fn serve(nic: usize, length: usize) {
-    let Some(mac) = net::mac(nic) else { return };
-    let request = unsafe { &*core::ptr::addr_of!(REQUEST) };
-    let request = &request[..length];
-    let reply = unsafe { &mut *core::ptr::addr_of_mut!(REPLY) };
-    let mut exports = EXPORTS.lock();
-    for export in exports.iter_mut().flatten() {
-        export.target.mac = mac;
-        let writes = export.target.writes;
-        let reply_length = export.target.handle(request, &mut BlockDisk(export.disk), reply);
-        export.dirty |= export.target.writes != writes;
-        if reply_length > 0 {
-            let _nics = net::lock_nics();
-            nicctl::nic_send(nic, &reply[..reply_length]);
+/// Flushes every written disk that has had no write for `FLUSH_AFTER` ticks, so the initiator's data reaches the drive even
+/// if it never sends FLUSH CACHE (Linux's `aoe` does not).
+extern "C" fn flusher(_: usize) {
+    loop {
+        sched::sleep_ticks(FLUSH_TICK);
+        let now = crate::arch::ticks();
+        for slot in SLOTS.iter() {
+            if slot.dirty.load(Ordering::Acquire) && now.wrapping_sub(slot.last_write.load(Ordering::Relaxed)) >= FLUSH_AFTER {
+                flush_slot(slot);
+            }
         }
     }
 }
 
-/// The initiator paused: put what it wrote on the platters (or flash).
-fn flush_dirty() {
-    let mut exports = EXPORTS.lock();
-    for export in exports.iter_mut().flatten() {
-        if export.dirty {
-            export.dirty = false;
+/// Flushes the disk of `slot` if it was written. Takes the disk lock, then the slot's (the order `worker` uses).
+fn flush_slot(slot: &Slot) {
+    let _disks = tapefs::lock();
+    let guard = slot.export.lock();
+    // Cleared before the flush: a write that lands after it sets the flag again.
+    if slot.dirty.swap(false, Ordering::AcqRel) {
+        if let Some(export) = guard.as_ref() {
             if block::flush(export.disk).is_err() {
                 crate::println!("aoe: flushing disk {} failed.", export.disk + 1);
             }
@@ -176,12 +237,15 @@ fn flush_dirty() {
     }
 }
 
-fn start_thread() -> bool {
-    if RUNNING.swap(true, Ordering::AcqRel) {
-        return true;
+fn start_threads(index: usize) -> bool {
+    if !SLOTS[index].started.load(Ordering::Acquire) {
+        if sched::spawn("aoe", worker, index).is_none() {
+            return false;
+        }
+        SLOTS[index].started.store(true, Ordering::Release);
     }
-    if sched::spawn("aoe", thread, 0).is_none() {
-        RUNNING.store(false, Ordering::Release);
+    if !FLUSHER.swap(true, Ordering::AcqRel) && sched::spawn("aoe-flush", flusher, 0).is_none() {
+        FLUSHER.store(false, Ordering::Release);
         return false;
     }
     true
@@ -202,45 +266,46 @@ pub fn export(number: usize, writable: bool) -> Result<(), ExportError> {
     if writable && number == 1 {
         return Err(ExportError::BootDiskWritable);
     }
-    {
-        let mut exports = EXPORTS.lock();
-        if exports.iter().flatten().any(|export| export.disk == disk) {
-            return Err(ExportError::AlreadyExported);
-        }
-        let Some(free) = exports.iter_mut().find(|entry| entry.is_none()) else { return Err(ExportError::TableFull) };
-        let mut target = Target::new(shelf(), number as u8, [0; 6], MTU);
-        target.read_only = !writable;
-        if let Some(info) = block::get(disk) {
-            let model = core::str::from_utf8(&info.model).unwrap_or("").trim();
-            aoe::set_text(&mut target.model, model.as_bytes());
-        }
-        let serial = alloc::format!("FOS{:04X}{:02X}", shelf(), number);
-        aoe::set_text(&mut target.serial, serial.as_bytes());
-        *free = Some(Export { disk, target, dirty: false });
+    if SLOTS.iter().any(|slot| usize::from(slot.number.load(Ordering::Acquire)) == number) {
+        return Err(ExportError::AlreadyExported);
     }
-    if !start_thread() {
-        remove(number);
+    let Some(index) = SLOTS.iter().position(|slot| slot.number.load(Ordering::Acquire) == 0) else { return Err(ExportError::TableFull) };
+    if !start_threads(index) {
         return Err(ExportError::NoThread);
     }
-    ACTIVE.store(true, Ordering::Release);
+    let slot = &SLOTS[index];
+    let mut target = Target::new(shelf(), number as u8, [0; 6], MTU);
+    target.read_only = !writable;
+    if let Some(info) = block::get(disk) {
+        let model = core::str::from_utf8(&info.model).unwrap_or("").trim();
+        aoe::set_text(&mut target.model, model.as_bytes());
+    }
+    let serial = alloc::format!("FOS{:04X}{:02X}", shelf(), number);
+    aoe::set_text(&mut target.serial, serial.as_bytes());
+    // Frames queued for an earlier export of this slot are stale.
+    {
+        let mut queue = slot.inbox.lock();
+        queue.count = 0;
+        queue.dropped = 0;
+    }
+    slot.dirty.store(false, Ordering::Release);
+    *slot.export.lock() = Some(Export { disk, target });
+    slot.number.store(number as u8, Ordering::Release);
+    ACTIVE.fetch_add(1, Ordering::AcqRel);
     Ok(())
 }
 
-/// Stops exporting disk `number`; false when it was not exported. What it had queued is still answered or dropped.
+/// Stops exporting disk `number`; false when it was not exported. Frames still queued are dropped, written data is flushed.
 pub fn remove(number: usize) -> bool {
-    let mut exports = EXPORTS.lock();
-    let mut found = false;
-    for entry in exports.iter_mut() {
-        if entry.as_ref().is_some_and(|export| export.disk + 1 == number) {
-            if let Some(export) = entry.as_ref().filter(|export| export.dirty) {
-                let _ = block::flush(export.disk);
-            }
-            *entry = None;
-            found = true;
-        }
-    }
-    ACTIVE.store(exports.iter().any(|entry| entry.is_some()), Ordering::Release);
-    found
+    let Some(slot) = SLOTS.iter().find(|slot| usize::from(slot.number.load(Ordering::Acquire)) == number) else { return false };
+    // Stop routing first, then let the worker finish what it holds (the slot's lock), then flush and clear.
+    slot.number.store(0, Ordering::Release);
+    ACTIVE.fetch_sub(1, Ordering::AcqRel);
+    flush_slot(slot);
+    let _disks = tapefs::lock();
+    *slot.export.lock() = None;
+    slot.inbox.lock().count = 0;
+    true
 }
 
 /// After boot: exports the disks `aoe-export N` lines in `settings` named (read-only; writable only by the shell).
@@ -295,8 +360,10 @@ pub fn command(mut words: core::str::SplitWhitespace) {
         Some("shelf") => match words.next().and_then(|word| word.parse::<u16>().ok()).filter(|&shelf| shelf != 0xffff) {
             Some(number) => {
                 SHELF.store(u32::from(number), Ordering::Relaxed);
-                for export in EXPORTS.lock().iter_mut().flatten() {
-                    export.target.shelf = number;
+                for slot in SLOTS.iter() {
+                    if let Some(export) = slot.export.lock().as_mut() {
+                        export.target.shelf = number;
+                    }
                 }
                 crate::println!("aoe: shelf {number}.");
             }
@@ -307,23 +374,21 @@ pub fn command(mut words: core::str::SplitWhitespace) {
 }
 
 fn list() {
-    let exports = EXPORTS.lock();
-    crate::println!("aoe: shelf {}, {} disk(s) exported.", shelf(), exports.iter().flatten().count());
-    for export in exports.iter().flatten() {
+    crate::println!("aoe: shelf {}, {} disk(s) exported.", shelf(), ACTIVE.load(Ordering::Acquire));
+    for slot in SLOTS.iter() {
+        let guard = slot.export.lock();
+        let Some(export) = guard.as_ref() else { continue };
         let sectors = block::get(export.disk).map_or(0, |disk| disk.sectors);
         crate::println!(
-            "  disk {}: slot {}, {} MiB, {}; {} reads, {} writes, {} errors",
+            "  disk {}: slot {}, {} MiB, {}; {} reads, {} writes, {} errors, {} frame(s) dropped",
             export.disk + 1,
             export.target.slot,
             sectors >> 11,
             if export.target.read_only { "read-only" } else { "READ-WRITE" },
             export.target.reads,
             export.target.writes,
-            export.target.errors
+            export.target.errors,
+            slot.inbox.lock().dropped
         );
-    }
-    let dropped = INBOX.lock().dropped;
-    if dropped > 0 {
-        crate::println!("  {dropped} frame(s) dropped because the queue was full.");
     }
 }

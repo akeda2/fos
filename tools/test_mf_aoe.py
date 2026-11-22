@@ -2,7 +2,7 @@
 """The server kernel's AoE target (`make test-mf-aoe`, docs/block-sharing.md). The host plays an AoE initiator over the
 QEMU multicast-socket network (no root needed) against a guest that serves a second disk.
 
-Boot 1: `aoe-shelf 5` and `aoe-export 2` in settings. A broadcast Query Config finds shelf 5 slot 2; IDENTIFY gives the
+Boot 1: `aoe-shelf 5`, `aoe-export 2` and `aoe-export 3` in settings. A broadcast Query Config finds shelf 5 slot 2; IDENTIFY gives the
 disk's capacity; reads of the first, a middle and the last sector match the host's file; an out-of-range read and a write
 to the read-only export are aborted and change nothing. In the shell: `rw` without `confirm` is refused, so is disk 1
 writable; `aoe unexport 2` and `aoe export 2 rw confirm` make it writable; a two-sector write lands in the disk image
@@ -16,6 +16,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -38,11 +39,11 @@ def check(ok, text, detail=""):
 
 
 class Guest:
-    def __init__(self, boot_image, data_image):
+    def __init__(self, boot_image, data_images):
         args = ["qemu-system-x86_64", "-cpu", "max", "-machine", "q35", "-m", "1024", "-smp", "2", "-display", "none",
                 "-serial", "stdio", "-monitor", "none", "-no-reboot",
                 "-drive", f"if=pflash,format=raw,readonly=on,file={CODE}", "-drive", f"format=raw,file={boot_image},snapshot=on",
-                "-drive", f"format=raw,file={data_image}",
+                *[arg for image in data_images for arg in ("-drive", f"format=raw,file={image}")],
                 "-netdev", f"socket,id=net0,mcast={GROUP}:{PORT}", "-device", "e1000,netdev=net0,mac=52:54:00:12:34:c1"]
         self.qemu = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.log = b""
@@ -123,8 +124,11 @@ def main():
         data = os.urandom(SECTORS * 512)
         disk = tmp / "data.img"
         disk.write_bytes(data)
-        boot = build_image(tmp, "aoe-shelf 5\naoe-export 2\n")
-        guest = Guest(boot, disk)
+        data3 = os.urandom(SECTORS * 512)
+        disk3 = tmp / "data3.img"
+        disk3.write_bytes(data3)
+        boot = build_image(tmp, "aoe-shelf 5\naoe-export 2\naoe-export 3\n")
+        guest = Guest(boot, [disk, disk3])
         host = Initiator()
         try:
             check(guest.wait_for("fos> ", 150), "the guest booted to the prompt", guest.log[-800:].decode("utf8", "replace"))
@@ -178,6 +182,46 @@ def main():
 
             ok, text = guest.command("aoe", "disk 2")
             check(ok and "READ-WRITE" in text and "1 writes" in text, "`aoe` lists the export with its counters", text)
+
+            # The flusher: a write nobody flushes still reaches the drive after a pause in writing.
+            late = bytes(reversed(range(256))) * 2
+            reply = host.ata(2, 0x34, 100, 1, late, write=True)
+            check(reply is not None and ata_status(reply) == (0x50, 0), "a write with no FLUSH CACHE is accepted", reply)
+            time.sleep(1.5)
+            check(disk.read_bytes()[100 * 512:101 * 512] == late, "and the flusher puts it on the disk after a pause")
+
+            # Two exports at once, each with its own queue and worker.
+            reply = host.ata(3, 0x24, 9, 2)
+            check(reply is not None and reply[36:36 + 1024] == data3[9 * 512:11 * 512], "disk 3, exported by settings, is served beside disk 2", reply and reply[24:36].hex())
+
+            # AoE reads on disk 3 while the guest shell reads the boot disk: the disk lock keeps the two apart.
+            bad = []
+            stop = threading.Event()
+
+            def hammer():
+                rng = random.Random(1)
+                while not stop.is_set():
+                    lba = rng.randrange(0, SECTORS - 2)
+                    answer = host.ata(3, 0x24, lba, 2)
+                    if answer is None or answer[36:36 + 1024] != data3[lba * 512:(lba + 2) * 512]:
+                        bad.append(lba)
+                        return
+                    hammer.count += 1
+            hammer.count = 0
+            thread = threading.Thread(target=hammer)
+            thread.start()
+            shell_ok = True
+            for _ in range(6):
+                ok, text = guest.command("sector disk1 0 4", "disk1 sector 3:", 30)
+                shell_ok = shell_ok and ok and "read failed" not in text
+            stop.set()
+            thread.join()
+            check(not bad and hammer.count > 50, f"{hammer.count} AoE reads on disk 3 were all correct while the shell read disk 1", bad)
+            check(shell_ok, "and the shell's disk reads kept working")
+
+            ok, text = guest.command("aoe unexport 2", "no longer exported")
+            reply = host.ata(3, 0x24, 0, 1)
+            check(ok and reply is not None and reply[36:36 + 512] == data3[:512], "unexporting disk 2 leaves disk 3 answering", text)
         finally:
             guest.kill()
     if failures:

@@ -151,9 +151,9 @@ the next is looked at.
 The kernel side is `kernel-mf/src/aoetarget.rs` (server kernel only, which is also the only place it will run):
 
 - `net.rs::frame_hook` takes 0x88a2 frames while a disk is exported and only queues them (it runs under the NIC lock; a
-  disk read there would stall every interface and the audio drivers). The `aoe` thread reads or writes the disk through
-  `block::`, builds the reply with `crates/aoe` and sends it. A full queue drops the frame; the initiator retransmits.
-- Writes use `block::write_deferred` and the drive is flushed when the queue runs empty and on FLUSH CACHE (EXT).
+  disk read there would stall every interface and the audio drivers). The export's worker thread reads or writes the disk
+  through `block::` under the disk lock, builds the reply with `crates/aoe` and sends it. A full queue drops the frame.
+- Writes use `block::write_deferred`; the drive is flushed on FLUSH CACHE (EXT) and by a flusher thread after a pause in writing.
 - Shell: `aoe` (list with counters), `aoe export N [rw confirm]`, `aoe unexport N`, `aoe shelf N`. Disk N is slot N of the
   shelf. `rw` needs `confirm` on the same line, and disk 1 is never writable. Settings: `aoe-shelf N`, `aoe-export N`
   (read-only, applied after boot; docs/config.md).
@@ -161,17 +161,31 @@ The kernel side is `kernel-mf/src/aoetarget.rs` (server kernel only, which is al
   Config, IDENTIFY, reads (first, middle, last sector) against the host's file, aborts (out of range, read-only write),
   the shell's refusals, a two-sector write that reaches the disk image after FLUSH.
 
-Not done, in the order I would do it (threads are free here, so these are design choices, not limits):
+**Threads, and what they can and cannot do.** Each export has its own queue and worker thread (a slow disk fills only
+its own queue), and an `aoe-flush` thread flushes a written disk 50 ms after its last write (and `unexport` does).
+Workers serve up to 8 frames per hold of the disk lock. Reading the drivers showed what threads cannot do:
 
-1. **One worker thread per export** with its own queue, routed by shelf and slot in the hook. Now one thread serves every
-   disk, so a slow USB stick holds up the NVMe behind it.
-2. **A flusher thread** with a real timer instead of "flush when the queue runs empty" (which flushes after every request
-   from an initiator that waits for each answer). Flush after, say, 50 ms without a write, and on FLUSH.
-3. **Several requests in flight per disk** (a small pool), so a disk with a deep queue (NVMe) is kept busy; the order of
-   replies does not matter to AoE (the tag matches them), only a write and a later read of the same sectors must stay in order.
+- Every disk user in mf (shell, tapes, NETFS, KUP) takes the one `tapefs::lock()`, because the AHCI, NVMe and USB drivers
+  keep their state in statics, poll and run one command at a time. The first version of the target did not take it, which
+  could have raced with any other disk user on the same controller. It does now.
+- So disk transfers are serial across all exports and everything else, however many workers there are. More workers
+  would not read two disks at once, and several requests in flight to one disk is not possible with these drivers. Doing
+  that means locks per controller in the drivers, a change in the core of the kernel, not in this module.
+- A contended `SleepMutex` may cost a timer tick (10 ms) to wake, which would cap throughput near 100 lock acquisitions a
+  second while the shell or a tape holds the disk. Seen, not yet proven: the same test read 17,799 frames in the time it read
+  164 when the guest shell was also reading. Measure before changing anything.
+
+Not done, in the order I would do it:
+
+1. **Measure** AoE throughput at MTU 1500 and 9000, alone and with the shell using the disk (and whether the 164-against-17,799 gap
+   is the wake-up latency above).
+2. **Batch inside the crate**: gather the 1 KiB frames of one initiator request into one block transfer (a 4 KiB write is
+   four frames at MTU 1500), and read ahead. This is where the real gain is at 1500, and it answers the read-modify-write point in
+   section 2.
+3. **Per-controller locking** in the block layer, if the measurements say serial disk access is the limit.
 4. Jumbo frames on this path: `nicctl` drains into 1600-byte buffers and the target assumes MTU 1500.
 5. Interoperability with the Linux `aoe` module and `vblade` as a peer (the host has the module, version 85; loading it
-   needs root, so a manual step), then a throughput measurement at MTU 1500 and 9000.
+   needs root, so a manual step).
 6. The initiator: `block::Backend::Aoe`, a virtual disk like `Md`, with retransmit and a window.
 
 ## 9. Open questions
