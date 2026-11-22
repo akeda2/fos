@@ -121,6 +121,9 @@ impl Platform for Mf {
         None
     }
     fn msi_detach_intx(&self, _vector: u8, _context: usize) {}
+    fn net_event(&self) {
+        crate::net::rx_event();
+    }
     fn interrupt_target(&self) -> u32 {
         0
     }

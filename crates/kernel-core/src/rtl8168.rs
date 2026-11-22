@@ -88,6 +88,7 @@ fn isr(index: usize) {
     write16(base, REG_ISR, status);
     crate::msi::claim();
     ISR[index].interrupts.fetch_add(1, Ordering::Relaxed);
+    crate::hal::net_event();
     if status & ISR_TOK != 0 {
         write16(base, REG_IMR, INTERRUPT_MASK); // the self-test's extra cause is no longer wanted
     }

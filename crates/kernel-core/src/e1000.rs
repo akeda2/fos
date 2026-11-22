@@ -356,6 +356,7 @@ fn isr(index: usize) {
     }
     crate::msi::claim();
     state.interrupts.fetch_add(1, Ordering::Relaxed);
+    crate::hal::net_event();
     if cause & ICR_RXO != 0 {
         state.overruns.fetch_add(1, Ordering::Relaxed);
     }

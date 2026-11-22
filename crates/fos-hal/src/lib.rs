@@ -153,6 +153,10 @@ pub trait Platform: Sync {
     /// The interrupt controller id MSI messages are addressed to, and the range of GSIs the I/O APIC serves.
     fn interrupt_target(&self) -> u32;
     fn gsi_range(&self) -> (u32, u32);
+    /// A NIC raised an interrupt (a frame arrived, the ring ran low, a link change): called from the driver's interrupt
+    /// handler, so it must not sleep, print or take a lock that is held with interrupts on. The server kernel wakes its
+    /// receive thread here. A platform that polls its NICs leaves it out.
+    fn net_event(&self) {}
 }
 
 static mut PLATFORM: Option<&'static dyn Platform> = None;
@@ -435,6 +439,13 @@ pub mod msi {
         if let Some(platform) = super::platform() {
             platform.msi_detach_intx(vector, context);
         }
+    }
+}
+
+/// Tells the platform a NIC interrupted (see `Platform::net_event`). Call it from a NIC's interrupt handler.
+pub fn net_event() {
+    if let Some(platform) = platform() {
+        platform.net_event();
     }
 }
 

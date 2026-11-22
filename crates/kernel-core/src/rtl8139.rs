@@ -138,6 +138,7 @@ fn isr(index: usize) {
     write16(base, REG_ISR, status);
     crate::msi::claim();
     ISR[index].interrupts.fetch_add(1, Ordering::Relaxed);
+    crate::hal::net_event();
     if status & ISR_TIMEOUT != 0 {
         write32(base, REG_TIMERINT, 0); // the self-test's cause: one shot, not wanted again
     }

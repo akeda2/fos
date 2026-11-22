@@ -180,7 +180,8 @@ relative, not as what hardware does):
 | --- | --- | --- | --- | --- |
 | first version (threads pinned to CPU 0 by `sched::spawn`) | 98 frames/s | 3,100 | 150 | 0 |
 | `sched::spawn_any` for the workers (committed) | 1,600 | 10,500 (10.7 MB/s) | 217 | 0 |
-| plus a thread that only drains the NICs (experiment, not kept) | | 10,900 | 10,400 | 10,300 |
+| plus a `net-rx` thread woken by the NIC interrupt (committed) | | 10,900 | 5,300 | 3,500 |
+| (a thread that spun on the NICs, not kept: it starved the SysRq rescue) | | 10,900 | 10,400 | 10,300 |
 
 - A round trip of 10 ms (98 a second with one frame outstanding) was the scheduler's tick: `spawn` pins a thread to CPU 0,
   where the service thread spins on `yield_now`. Unpinned workers run on an idle CPU at once. Writes behave like reads (10.8k
@@ -188,27 +189,30 @@ relative, not as what hardware does):
 - **Any shell command on the service thread stops AoE.** `service_thread` drains the NICs (`net::poll`) and also runs the
   shell's commands, so while a command prints or reads a disk nothing is drained and no frame reaches a worker. The same
   holds for every network service on mf (KUP, the net terminal, tapes' FIFOs) during a long command.
-- A thread that only drains the NICs fixes it: 10,400 frames/s while the shell prints, 10,300 while it reads the disk.
-  As written (spinning, holding the NIC lock almost all the time) it broke `make test-mf-sysrq`: the SysRq rescue drains
-  with `try_lock` and never gets the lock. So the real change is a drain thread that waits for the NIC (its interrupt wakes
-  it, or a short sleep when idle) and holds the lock only while it drains. That moves `handle_frame` (terminal, discovery,
-  KUP) off the service thread; the rescue path already runs it from another CPU under the NIC lock, so it is meant to
-  tolerate that, but it needs `test-mf-net`, `test-mf-netfs`, `test-mf-sessions`, `test-mf-sysrq` and the tape network
-  tests (`test-mf-smbd`, `test-mf-httpd`) to pass, and on real hardware a look at the idle CPU use.
+- **The `net-rx` thread** (`net::rx_thread`) drains the NICs when one interrupts. Each NIC driver's interrupt handler calls
+  `fos_hal::net_event()` (a defaulted `Platform` method: the embedded kernel and the Pi ignore it) and mf's implementation
+  wakes the thread. It holds the NIC lock only while draining, never while waiting; a thread that spun on the NICs
+  gave the best numbers (10,400 and 10,300) but starved the SysRq rescue, which drains with `try_lock`.
+  With it a shell command no longer stops the network: 5,300 frames/s while the shell prints (was 217) and 3,500 while it
+  reads a disk (was 0). The rest of the gap to idle is the shell's own work competing for the two CPUs of the test guest
+  (and TCG): not tuned. A guest with more CPUs than the host has free (`--smp 4` on this 4-core host) only measures the host.
+- The service thread still drains too: a NIC that has no interrupts (polled) is only served there. Frame handlers
+  (terminal, discovery, KUP) now run on either thread, always under the NIC lock.
+- `make test-mf-sysrq` changed: with the service thread spinning, the receive thread answers SysRq (the dump says "service
+  thread last went round N ms ago") instead of the timer interrupt. The rescue is still tested by the deadhang case (a CPU
+  with interrupts off cannot take the NIC interrupt), and it remains the backstop when the drain is stuck.
 
 Not done, in the order I would do it:
 
-1. **A NIC drain thread on mf** as above (a change in `kernel-mf/src/net.rs` and `main.rs`, not in the `kernel-core`
-   crate), then measure again.
-2. **Measure with KVM** (the numbers above are TCG), at MTU 1500 and 9000.
-3. **Batch inside the crate**: gather the 1 KiB frames of one initiator request into one block transfer (a 4 KiB write is
+1. **Measure with KVM** (the numbers above are TCG), at MTU 1500 and 9000.
+2. **Batch inside the crate**: gather the 1 KiB frames of one initiator request into one block transfer (a 4 KiB write is
    four frames at MTU 1500), and read ahead. This is where the real gain is at 1500, and it answers the read-modify-write
    point in section 2.
-4. **Per-controller locking** in the block layer, if the measurements say serial disk access is the limit.
-5. Jumbo frames on this path: `nicctl` drains into 1600-byte buffers and the target assumes MTU 1500.
-6. Interoperability with the Linux `aoe` module and `vblade` as a peer (the host has the module, version 85; loading it
+3. **Per-controller locking** in the block layer, if the measurements say serial disk access is the limit.
+4. Jumbo frames on this path: `nicctl` drains into 1600-byte buffers and the target assumes MTU 1500.
+5. Interoperability with the Linux `aoe` module and `vblade` as a peer (the host has the module, version 85; loading it
    needs root, so a manual step).
-7. The initiator: `block::Backend::Aoe`, a virtual disk like `Md`, with retransmit and a window.
+6. The initiator: `block::Backend::Aoe`, a virtual disk like `Md`, with retransmit and a window.
 
 ## 9. Open questions
 

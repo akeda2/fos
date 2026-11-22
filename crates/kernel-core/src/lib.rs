@@ -22,7 +22,7 @@ pub mod msi {
 
 /// Interrupt routing facts, where the shared code expects them (`crate::hal::...`).
 pub mod hal {
-    pub use fos_hal::{gsi_range, interrupt_target};
+    pub use fos_hal::{gsi_range, interrupt_target, net_event};
 }
 
 pub mod ahci;

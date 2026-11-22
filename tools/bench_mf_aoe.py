@@ -97,14 +97,20 @@ def main():
     parser.add_argument("--seconds", type=float, default=4)
     parser.add_argument("--window", type=int, default=16)
     parser.add_argument("--kvm", action="store_true", help="run QEMU with -enable-kvm")
+    parser.add_argument("--smp", type=int, default=2, help="CPUs of the guest (the test default is 2)")
     parser.add_argument("--windows", default="", help="comma list of windows to run the idle read/write scenario with (instead of the default matrix)")
     args = parser.parse_args()
-    if args.kvm:
-        orig = base.subprocess.Popen
+    orig = base.subprocess.Popen
 
-        def popen(command, *a, **k):
-            return orig(command[:1] + ["-enable-kvm"] + command[1:], *a, **k)
-        base.subprocess.Popen = popen
+    def popen(command, *a, **k):
+        command = list(command)
+        if "-smp" not in command:
+            return orig(command, *a, **k)
+        command[command.index("-smp") + 1] = str(args.smp)
+        if args.kvm:
+            command = command[:1] + ["-enable-kvm"] + command[1:]
+        return orig(command, *a, **k)
+    base.subprocess.Popen = popen
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         disk = tmp / "data.img"

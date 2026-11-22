@@ -220,6 +220,8 @@ fn boot_services(info: &BootInfo, century: u8) -> ! {
         sched::spawn("md-assemble", mdvol::assemble_thread, 0);
     }
     aoetarget::init();
+    // Drains the NICs on their interrupts, so a long shell command on the service thread does not stop the network.
+    sched::spawn_any("net-rx", net::rx_thread, 0);
     sched::spawn("service", service_thread, 0).expect("the service thread");
     println!("kernel-mf: slice 8 reached the end of boot; entering the service loop.");
     // The boot context is the idle thread: it runs when nothing else is ready and sleeps until the next interrupt.

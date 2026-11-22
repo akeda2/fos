@@ -3,7 +3,8 @@
 
  1. `trace` and `sysrq` in a `term net` session: every CPU with a backtrace, the threads, memory, recent trace events.
  2. A bare SysRq request (tag 0x24, no session) is answered with the dump as DATA frames ending in the end line.
- 3. `debug hang now` (the service thread spins, interrupts on): after two seconds the timer interrupt answers SysRq instead.
+ 3. `debug hang now` (the service thread spins, interrupts on): SysRq is still answered, by the receive thread, with a line
+    saying how long ago the service thread last went round.
  4. `debug deadhang now` (interrupts off as well): another CPU answers, and the hung CPU, stopped by an NMI, shows
     "interrupts OFF" with the shell's frames in its backtrace.
 QEMU only: whether a real board delivers the NMI to a CPU with interrupts off is for hardware."""
@@ -62,8 +63,11 @@ def main():
             shell.send(0x21, b"debug hang now\n")
             time.sleep(3)
             dump = sysrq(asker)
-            check(dump is not None and "answered from the timer interrupt" in dump,
-                  "with the service thread spinning, the timer interrupt answers", (dump or asker.seen.decode(errors="replace"))[-2500:])
+            # The receive thread (net-rx) drains the NICs on their interrupts, so it answers while the service thread spins;
+            # the timer interrupt answers only when the drain is stuck too (the deadhang below).
+            check(dump is not None and ("answered from the timer interrupt" in dump or "service thread last went round" in dump),
+                  "with the service thread spinning, SysRq is still answered and says the service thread is behind",
+                  (dump or asker.seen.decode(errors="replace"))[-2500:])
             check("cpu" in dump and "(service)" in dump and "interrupts on" in dump, "and shows the spinning service thread", dump)
         finally:
             machine.stop()

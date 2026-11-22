@@ -167,6 +167,7 @@ fn isr(index: usize) {
     issue_command(base, ACK_INTERRUPT | status | STATUS_INT_LATCH);
     crate::msi::claim();
     ISR[index].interrupts.fetch_add(1, Ordering::Relaxed);
+    crate::hal::net_event();
     if status & STATUS_HOST_ERROR != 0 {
         FATAL[index].store(true, Ordering::Release);
         HOST_ERRORS[index].fetch_add(1, Ordering::Relaxed);

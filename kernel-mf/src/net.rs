@@ -933,6 +933,34 @@ pub fn poll() {
     }
 }
 
+// ---- the receive thread ----
+
+/// Set by a NIC's interrupt handler (`rx_event`), cleared by `rx_thread` before it drains.
+static RX_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+const RX_KEY: usize = 0x6e65_7478;
+
+/// A NIC interrupted (`Platform::net_event`, from its interrupt handler): wake the receive thread. `wake_all` takes only the
+/// scheduler's lock, which every holder takes with interrupts off, so an interrupt handler may call it.
+pub fn rx_event() {
+    RX_PENDING.store(true, Ordering::Release);
+    crate::sched::wake_all(RX_KEY);
+}
+
+/// Drains the NICs when one of them interrupts, so frames are handled while the service thread is busy with a shell command
+/// (a long `fsck`, a screenful of output) or anything else that keeps it away from `poll`: KUP, the network terminal, the
+/// tapes' receive queues and the AoE target would all stand still behind it. The service thread keeps draining too: a NIC
+/// without interrupts (polled) is still only served there. The NIC lock is held only while draining, never while waiting,
+/// because the SysRq rescue drains with a `try_lock` and must find it free (a thread that spun on the NICs starved it).
+pub extern "C" fn rx_thread(_: usize) {
+    loop {
+        crate::sched::wait_while(RX_KEY, || !RX_PENDING.load(Ordering::Acquire));
+        // Cleared first: an interrupt that arrives while draining sets it again and the next round picks that frame up.
+        RX_PENDING.store(false, Ordering::Release);
+        let _nics = lock_nics();
+        nicctl::drain_nics_to_fifo();
+    }
+}
+
 /// Service-loop work: restart after an accepted kernel update.
 pub fn housekeeping() {
     unsafe {
