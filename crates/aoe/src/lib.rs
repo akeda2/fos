@@ -19,6 +19,8 @@
 
 #![no_std]
 
+pub mod cache;
+
 pub const ETHERTYPE: u16 = 0x88a2;
 pub const SECTOR: usize = 512;
 const ETHERNET: usize = 14;
@@ -326,3 +328,5 @@ fn identify(target: &Target, sectors: u64, sector: &mut [u8]) {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod cache_tests;

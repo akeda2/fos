@@ -219,6 +219,27 @@ def main():
             check(not bad and hammer.count > 50, f"{hammer.count} AoE reads on disk 3 were all correct while the shell read disk 1", bad)
             check(shell_ok, "and the shell's disk reads kept working")
 
+            # The worker's cache (crates/aoe/src/cache.rs) against the real block layer: a long sequential read (read-ahead
+            # fills of 64 KiB) and a run of consecutive writes (gathered into few disk writes).
+            good = True
+            for lba in range(1000, 1400, 2):
+                answer = host.ata(3, 0x24, lba, 2)
+                good = good and answer is not None and answer[36:36 + 1024] == data3[lba * 512:(lba + 2) * 512]
+            check(good, "200 sequential reads on disk 3 match the host's file (read-ahead)")
+            run = os.urandom(32 * 512)
+            good = True
+            for part in range(16):
+                answer = host.ata(2, 0x34, 3000 + part * 2, 2, run[part * 1024:(part + 1) * 1024], write=True)
+                good = good and answer is not None and ata_status(answer) == (0x50, 0)
+            for part in range(16):
+                answer = host.ata(2, 0x24, 3000 + part * 2, 2)
+                good = good and answer is not None and answer[36:36 + 1024] == run[part * 1024:(part + 1) * 1024]
+            check(good, "16 consecutive writes are accepted and read back through AoE")
+            time.sleep(1.5)
+            check(disk.read_bytes()[3000 * 512:3032 * 512] == run, "and they reach the disk image (gathered, then flushed)")
+            ok, text = guest.command("aoe", "disk commands")
+            check(ok and "frames from read-ahead" in text and "FAILED" not in text, "`aoe` shows the cache's counters", text)
+
             ok, text = guest.command("aoe unexport 2", "no longer exported")
             reply = host.ata(3, 0x24, 0, 1)
             check(ok and reply is not None and reply[36:36 + 512] == data3[:512], "unexporting disk 2 leaves disk 3 answering", text)

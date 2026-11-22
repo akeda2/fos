@@ -23,6 +23,7 @@
 use crate::sched::{self, SleepMutex};
 use crate::sync::SpinLock;
 use crate::{block, net, tapefs};
+use aoe::cache::{Cache, CacheStats};
 use aoe::{Disk, Target};
 use alloc::vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -32,8 +33,14 @@ const MAX_EXPORTS: usize = 8;
 const QUEUE: usize = 32;
 const FRAME: usize = 1600;
 /// Frames a worker handles per hold of the disk lock: fewer lock round trips under load, and still short enough that the
-/// shell or a tape waiting for the disk is not kept out for long.
-const BATCH: usize = 8;
+/// shell or a tape waiting for the disk is not kept out for long (with the cache most frames of a batch are memory copies).
+const BATCH: usize = 32;
+/// Each worker's read-ahead and write-gather buffers (`aoe::cache`): one disk command of up to 64 KiB instead of one per
+/// 1 KiB frame.
+const CACHE_BYTES: usize = 64 * 1024;
+/// A worker that slept this many ticks (10 ms each) or more drops its read buffer: the bound on how stale a read-ahead
+/// can be when something other than this export writes the disk.
+const IDLE_TICKS: u64 = 2;
 /// The flusher looks every `FLUSH_TICK` ticks (10 ms each) and flushes a disk that has not been written for `FLUSH_AFTER`.
 const FLUSH_TICK: u64 = 2;
 const FLUSH_AFTER: u64 = 5;
@@ -71,6 +78,8 @@ struct Slot {
     last_write: AtomicU64,
     export: SleepMutex<Option<Export>>,
     stats: Stats,
+    /// Moves on every export into this slot, so the worker drops a read buffer that belonged to the previous disk.
+    generation: AtomicU64,
 }
 
 /// Where a worker's time goes (`aoe` shows it, `aoe reset` clears it). Kept in CPU cycles (`cpu::cycles`, the TSC), which
@@ -87,19 +96,55 @@ struct Stats {
     /// Of `serve_us`: the target's own work (the disk transfer and the reply), and the send (NIC lock and the driver).
     handle_us: AtomicU64,
     send_us: AtomicU64,
+    /// The cache's counters (`aoe::cache::CacheStats`), added after every batch.
+    disk_reads: AtomicU64,
+    disk_writes: AtomicU64,
+    read_hits: AtomicU64,
+    gathered: AtomicU64,
+    write_errors: AtomicU64,
     /// When the first frame was queued into an empty queue (µs), 0 for none.
     queued_at: AtomicU64,
 }
 
 impl Stats {
     const fn new() -> Stats {
-        Stats { wakes: AtomicU64::new(0), frames: AtomicU64::new(0), wake_us: AtomicU64::new(0), lock_us: AtomicU64::new(0), serve_us: AtomicU64::new(0), handle_us: AtomicU64::new(0), send_us: AtomicU64::new(0), queued_at: AtomicU64::new(0) }
+        Stats { wakes: AtomicU64::new(0), frames: AtomicU64::new(0), wake_us: AtomicU64::new(0), lock_us: AtomicU64::new(0), serve_us: AtomicU64::new(0), handle_us: AtomicU64::new(0),
+            send_us: AtomicU64::new(0),
+            disk_reads: AtomicU64::new(0),
+            disk_writes: AtomicU64::new(0),
+            read_hits: AtomicU64::new(0),
+            gathered: AtomicU64::new(0),
+            write_errors: AtomicU64::new(0),
+            queued_at: AtomicU64::new(0),
+        }
     }
 
     fn reset(&self) {
-        for counter in [&self.wakes, &self.frames, &self.wake_us, &self.lock_us, &self.serve_us, &self.handle_us, &self.send_us] {
+        for counter in [
+            &self.wakes,
+            &self.frames,
+            &self.wake_us,
+            &self.lock_us,
+            &self.serve_us,
+            &self.handle_us,
+            &self.send_us,
+            &self.disk_reads,
+            &self.disk_writes,
+            &self.read_hits,
+            &self.gathered,
+            &self.write_errors,
+        ] {
             counter.store(0, Ordering::Relaxed);
         }
+    }
+
+    /// Adds what the worker's cache counted since `before`.
+    fn add_cache(&self, now: &CacheStats, before: &CacheStats) {
+        self.disk_reads.fetch_add(now.disk_reads - before.disk_reads, Ordering::Relaxed);
+        self.disk_writes.fetch_add(now.disk_writes - before.disk_writes, Ordering::Relaxed);
+        self.read_hits.fetch_add(now.read_hits - before.read_hits, Ordering::Relaxed);
+        self.gathered.fetch_add(now.gathered - before.gathered, Ordering::Relaxed);
+        self.write_errors.fetch_add(now.write_errors - before.write_errors, Ordering::Relaxed);
     }
 }
 
@@ -117,6 +162,7 @@ impl Slot {
             last_write: AtomicU64::new(0),
             export: SleepMutex::new(None),
             stats: Stats::new(),
+            generation: AtomicU64::new(0),
         }
     }
 }
@@ -222,10 +268,20 @@ extern "C" fn worker(index: usize) {
     let slot = &SLOTS[index];
     let mut request = vec![0u8; FRAME];
     let mut reply = vec![0u8; FRAME];
+    let (mut read_buffer, mut gather_buffer) = (vec![0u8; CACHE_BYTES], vec![0u8; CACHE_BYTES]);
+    let mut cache = Cache::new(&mut read_buffer, &mut gather_buffer);
+    let mut generation = u64::MAX;
+    let mut reported = CacheStats::default();
     loop {
         let waiting = slot.inbox.lock().count;
         if waiting == 0 {
+            // The read buffer survives a short pause (an initiator with one request outstanding pauses after every frame),
+            // but not a long one: something else may write the disk meanwhile (a local user of an exported disk).
+            let slept = crate::arch::ticks();
             sched::wait_while(WAKE_KEY + index, || slot.inbox.lock().count == 0);
+            if crate::arch::ticks().wrapping_sub(slept) >= IDLE_TICKS {
+                cache.invalidate();
+            }
             slot.stats.wakes.fetch_add(1, Ordering::Relaxed);
             continue;
         }
@@ -237,14 +293,26 @@ extern "C" fn worker(index: usize) {
         let _disks = tapefs::lock();
         let mut guard = slot.export.lock();
         slot.stats.lock_us.fetch_add(crate::cpu::cycles().saturating_sub(before_lock), Ordering::Relaxed);
+        let Some(export) = guard.as_mut() else {
+            // Unexported while frames waited: they are dropped.
+            while pop(slot, &mut request).is_some() {}
+            continue;
+        };
+        let now = slot.generation.load(Ordering::Acquire);
+        if now != generation {
+            cache.invalidate();
+            generation = now;
+        }
+        let mut disk = BlockDisk(export.disk);
+        let mut cached = cache.on(&mut disk);
         for _ in 0..BATCH {
             let started = crate::cpu::cycles();
             let Some((nic, length)) = pop(slot, &mut request) else { break };
-            let (Some(export), Some(mac)) = (guard.as_mut(), net::mac(nic)) else { continue };
+            let Some(mac) = net::mac(nic) else { continue };
             export.target.mac = mac;
             let writes = export.target.writes;
             let handle_start = crate::cpu::cycles();
-            let reply_length = export.target.handle(&request[..length], &mut BlockDisk(export.disk), &mut reply);
+            let reply_length = export.target.handle(&request[..length], &mut cached, &mut reply);
             let handled = crate::cpu::cycles();
             slot.stats.handle_us.fetch_add(handled.saturating_sub(handle_start), Ordering::Relaxed);
             if export.target.writes != writes {
@@ -259,6 +327,13 @@ extern "C" fn worker(index: usize) {
             slot.stats.frames.fetch_add(1, Ordering::Relaxed);
             slot.stats.serve_us.fetch_add(crate::cpu::cycles().saturating_sub(started), Ordering::Relaxed);
         }
+        // Acknowledged writes never outlive the batch in RAM: the flusher and `unexport` only see what reached the drive.
+        if !cached.settle() {
+            crate::println!("aoe: writing gathered sectors to disk {} failed; the next FLUSH reports it.", export.disk + 1);
+        }
+        let stats = cache.stats;
+        slot.stats.add_cache(&stats, &reported);
+        reported = stats;
     }
 }
 
@@ -342,6 +417,7 @@ pub fn export(number: usize, writable: bool) -> Result<(), ExportError> {
         queue.dropped = 0;
     }
     slot.dirty.store(false, Ordering::Release);
+    slot.generation.fetch_add(1, Ordering::AcqRel);
     *slot.export.lock() = Some(Export { disk, target });
     slot.number.store(number as u8, Ordering::Release);
     ACTIVE.fetch_add(1, Ordering::AcqRel);
@@ -469,6 +545,12 @@ fn list() {
         crate::println!("    queued to running {} us a wake-up", stats.wake_us.load(Ordering::Relaxed) / wakes.max(1) / rate);
         crate::println!("    per frame: disk lock {} us, serve {} us", per(&stats.lock_us), per(&stats.serve_us));
         crate::println!("      of which disk and reply {} us, send {} us", per(&stats.handle_us), per(&stats.send_us));
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        crate::println!("    disk commands: {} reads, {} frames from read-ahead", load(&stats.disk_reads), load(&stats.read_hits));
+        crate::println!("    disk commands: {} writes, {} frames gathered", load(&stats.disk_writes), load(&stats.gathered));
+        if load(&stats.write_errors) > 0 {
+            crate::println!("    {} gathered write run(s) FAILED after they were acknowledged", load(&stats.write_errors));
+        }
     }
     let rx = &net::RX_STATS;
     let wakes = rx.wakes.load(Ordering::Relaxed);

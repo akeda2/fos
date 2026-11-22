@@ -135,7 +135,7 @@ def main():
                         if args.stats:
                             _, text = guest.command("aoe", "net-rx:")
                             for line in text.splitlines():
-                                if any(key in line for key in ("worker:", "queued to", "per frame", "of which", "drained by", "net-rx:")):
+                                if any(key in line for key in ("worker:", "queued to", "per frame", "of which", "disk commands", "FAILED", "drained by", "net-rx:")):
                                     print("        " + line.strip())
                 return
             print(f"window {args.window}, {args.seconds:g} s per run, 2 sectors (1 KiB) per frame, MTU 1500")

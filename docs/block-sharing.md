@@ -224,18 +224,33 @@ first numbers are relative; the KVM numbers follow):
 - **One CPU: 100 frames/s with one frame outstanding**, a 10 ms round trip again (3,100 with window 16). With a single CPU
   every wake-up waits for the scheduler tick. A server has more CPUs; not looked at further.
 
+**Batching** (`crates/aoe/src/cache.rs`, `aoe::cache::Cache`, host-tested): each worker puts a cache with two 64 KiB
+buffers in front of the disk.
+
+- A read that starts where the previous one ended fills the read buffer with one disk command of up to 64 KiB; the following
+  reads are memory copies. Other reads go straight to the disk (random reads pay nothing extra). A write updates the read
+  buffer where they overlap. The worker drops the buffer after sleeping 2 ticks or more (the bound on staleness when
+  something else writes the disk) and when another export takes its slot.
+- Consecutive writes are gathered into one disk command and acknowledged from RAM, as a drive's write cache would. The run
+  is written out before an overlapping read, on FLUSH, when a write does not continue it, and at the end of every batch
+  (32 frames) while the worker still holds the disk lock, so acknowledged data never outlives the batch and the flusher and
+  `unexport` see everything. A run that fails after its frames were acknowledged is counted and makes the next FLUSH fail.
+- Under KVM, window 16: **reads 6,500 -> 20,900 frames/s (21.4 MB/s), writes 6,300 -> 20,000 (20.5 MB/s)**; window 4 about
+  19,000 for reads; one frame outstanding 4,700 -> 6,800 for reads (read-ahead now hits) and 4,600 -> 6,150 for writes
+  (the reply goes out before the run reaches the disk). 61,421 read frames took 1,060 disk reads; 59,844 write frames 1,901
+  disk writes. With the shell busy: 18,500 to 19,200 for reads, 16,200 to 17,800 for writes.
+- What a frame costs now is the send: 44 us of 48 at window 16 (the NIC lock, which the spinning service thread and
+  `net-rx` also take, and one e1000 doorbell per reply).
+
 Not done, in the order I would do it:
 
-1. **Batch inside the crate** (the measurement says this is the limit): read ahead into a cache so one disk command serves
-   many frames, and gather the 1 KiB frames of one initiator request into one block transfer (a 4 KiB write is
-   four frames at MTU 1500), and read ahead. This is where the real gain is at 1500, and it answers the read-modify-write
-   point in section 2.
-2. **One doorbell for several replies** (31 us a frame now): a send call that queues several frames before telling the card.
-3. **Per-controller locking** in the block layer, if the measurements say serial disk access is the limit.
-4. Jumbo frames on this path: `nicctl` drains into 1600-byte buffers and the target assumes MTU 1500.
-5. Interoperability with the Linux `aoe` module and `vblade` as a peer (the host has the module, version 85; loading it
+1. **One doorbell for several replies** (44 of 48 us a frame now): a send call that queues several frames before telling
+   the card, and the NIC lock taken once per batch instead of once per reply.
+2. **Per-controller locking** in the block layer, if the measurements say serial disk access is the limit.
+3. Jumbo frames on this path: `nicctl` drains into 1600-byte buffers and the target assumes MTU 1500.
+4. Interoperability with the Linux `aoe` module and `vblade` as a peer (the host has the module, version 85; loading it
    needs root, so a manual step).
-6. The initiator: `block::Backend::Aoe`, a virtual disk like `Md`, with retransmit and a window.
+5. The initiator: `block::Backend::Aoe`, a virtual disk like `Md`, with retransmit and a window.
 
 ## 9. Open questions
 
