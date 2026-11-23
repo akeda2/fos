@@ -167,7 +167,7 @@ fn fat_by_label<'a>(selector: &'a [u8], path: &'a [u8], directory: bool) -> Opti
 
 /// A FAT32/exFAT volume named by a reference `diskN/NAME`; on exFAT, `diskN/rec/take1` is the file `take1` of the
 /// folder `rec`, which is entered, and the name returned is the last component.
-fn resolve_fat(reference: &[u8]) -> Option<(crate::fatvol::Fs, &[u8])> {
+pub(crate) fn resolve_fat(reference: &[u8]) -> Option<(crate::fatvol::Fs, &[u8])> {
     let (selector, path) = split_selector(reference);
     if selector.is_empty() || selector.starts_with(b"@") {
         let (mut fs, rest) = fat_by_label(selector, path, false)?;

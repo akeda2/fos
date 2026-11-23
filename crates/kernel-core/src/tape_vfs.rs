@@ -651,3 +651,73 @@ pub fn each_entry(reference: &[u8], each: &mut dyn FnMut(&[u8], u64, bool, Optio
         index += 1;
     }
 }
+
+// ---- where a file lies, for exporting it as a disk (mf's `aoe export FILE`) ----
+
+/// A file found by `file_map`: the disk (0-based) its sectors are on, its size in bytes and what holds it.
+pub struct FileOnDisk {
+    pub disk: usize,
+    pub size: u64,
+    pub volume: &'static str,
+}
+
+/// Where the file `reference` lies: calls `each(sectors, Some(first disk sector))` or `each(sectors, None)` (sectors that
+/// read as zeros: a hole, or an ext4 extent never written) in file order, covering at least the file's size, rounded up
+/// to whole sectors. FOSFS and ext2/3/4 files; FAT, exFAT and remote files are refused with a reason. The map is what the
+/// volume says now: the caller keeps it valid (mf's AoE target keeps every other writer off those sectors).
+pub fn file_map(reference: &[u8], each: &mut dyn FnMut(u64, Option<u64>)) -> Result<FileOnDisk, &'static str> {
+    if remote::is_remote(reference) {
+        return Err("a remote file cannot be exported");
+    }
+    if let Some((shared, path)) = ext(reference) {
+        let inode = match shared.fs.resolve(path) {
+            Ok(Some(inode)) if inode.is_file() => inode,
+            Ok(Some(_)) => return Err("not a file"),
+            Ok(None) | Err(ext4::Error::NotFound | ext4::Error::NotADirectory) => return Err("not found"),
+            Err(_) => return Err("the ext volume could not be read"),
+        };
+        let size = shared.fs.block_size() as u64;
+        let per_block = size / 512;
+        let blocks = inode.size.div_ceil(size);
+        let base = shared.partition.base;
+        let mut logical = 0;
+        while logical < blocks {
+            let (count, place) = match shared.fs.map(&inode, logical) {
+                Ok(ext4::Mapping::Data { block, blocks }) => (blocks, Some(base + block * per_block)),
+                Ok(ext4::Mapping::Hole { blocks } | ext4::Mapping::Zeros { blocks }) => (blocks, None),
+                Err(ext4::Error::Unsupported) => return Err("the file's data is stored inline"),
+                Err(_) => return Err("the file's block map could not be read"),
+            };
+            let count = count.clamp(1, blocks - logical);
+            each(count * per_block, place);
+            logical += count;
+        }
+        return Ok(FileOnDisk { disk: shared.disk, size: inode.size, volume: "ext" });
+    }
+    if is_ext_reference(reference) {
+        return Err("the ext volume could not be opened");
+    }
+    if tape_fs::resolve_fat(reference).is_some() {
+        return Err("a FAT or exFAT file cannot be exported (FOSFS and ext only)");
+    }
+    let (volume, name) = tape_fs::resolve_file(reference, true).map_err(|_| "no volume")?;
+    let entry = match volume.find(name) {
+        Ok(Some(entry)) if !entry.is_dir => entry,
+        Ok(Some(_)) => return Err("not a file"),
+        Ok(None) => return Err("not found"),
+        Err(_) => return Err("the volume could not be read"),
+    };
+    let mut left = entry.length.div_ceil(512);
+    for &(start, count) in entry.extents() {
+        if left == 0 {
+            break;
+        }
+        let count = u64::from(count).min(left);
+        each(count, Some(volume.base + start));
+        left -= count;
+    }
+    if left > 0 {
+        return Err("the file's extents are shorter than its length");
+    }
+    Ok(FileOnDisk { disk: volume.disk, size: entry.length, volume: "FOSFS" })
+}

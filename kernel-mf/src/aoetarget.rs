@@ -19,13 +19,24 @@
 //!
 //! Exports are read-only unless `rw confirm` is given, and disk 1 (the boot disk) is never writable. Nothing stops a second
 //! writer: do not mount an exported disk here or on another host while it is exported `rw`.
+//!
+//! **A file as an export** (`aoe export diskN/path`, FOSFS and ext files): the file system is asked once where the file
+//! lies (`tape_vfs::file_map`), and the worker serves that map through `aoe::filedisk::FileDisk`, so a frame costs what it
+//! does for a whole disk. The map stays right because nothing else may write those sectors while the export lasts: the
+//! block layer refuses every other write or TRIM that touches them (`guarded`), read-only exports included. Deleting or
+//! rewriting the file here still changes the file system, but its old sectors stay out of use, so such a change fails on
+//! the refused write instead of landing in the export or the export landing in another file.
 
 use crate::sched::{self, SleepMutex};
 use crate::sync::SpinLock;
 use crate::{block, net, tapefs};
 use aoe::cache::{Cache, CacheStats};
+use aoe::filedisk::{self, FileDisk, Place, Run};
 use aoe::{Disk, Target};
+use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use kernel_core::nicctl;
 
@@ -53,11 +64,31 @@ const MTU: usize = 1500;
 /// What `aoe-shelf` and the shell leave to the machine: derived from NIC 1's MAC.
 const AUTO_SHELF: u32 = u32::MAX;
 const WAKE_KEY: usize = 0xa0e0_0000;
+/// Slot numbers a file export takes when none is given: above any disk number, so `aoe export N` keeps slot N.
+const FILE_SLOTS: core::ops::RangeInclusive<u8> = 100..=254;
 
 struct Export {
-    /// 0-based index in the block layer; the slot is this plus one, the disk number `disks` shows.
+    /// 0-based index in the block layer: the disk exported, or the one the exported file is on. For a whole disk the slot
+    /// is this plus one, the disk number `disks` shows.
     disk: usize,
     target: Target,
+    /// A file export's map; `None` for a whole disk.
+    file: Option<FileExport>,
+}
+
+struct FileExport {
+    /// The reference it was exported by, as typed.
+    name: String,
+    volume: &'static str,
+    runs: Vec<Run>,
+    /// The file's size in whole sectors: what the export serves (a partial last sector is left out).
+    sectors: u64,
+}
+
+/// The disk sectors of an exported file, sorted, which nothing but the export may write (`guarded`).
+struct Guard {
+    disk: usize,
+    ranges: Vec<(u64, u64)>,
 }
 
 struct Queue {
@@ -85,6 +116,10 @@ struct Slot {
     stats: Stats,
     /// Moves on every export into this slot, so the worker drops a read buffer that belonged to the previous disk.
     generation: AtomicU64,
+    /// A file export's sectors (a spin lock: the block layer asks on every write, possibly with the disk lock held).
+    guard: SpinLock<Option<Box<Guard>>>,
+    /// Writes and TRIMs of other users that touched them and were refused.
+    refused: AtomicU64,
 }
 
 /// Where a worker's time goes (`aoe` shows it, `aoe reset` clears it). Kept in CPU cycles (`cpu::cycles`, the TSC), which
@@ -168,6 +203,8 @@ impl Slot {
             export: SleepMutex::new(None),
             stats: Stats::new(),
             generation: AtomicU64::new(0),
+            guard: SpinLock::new(None),
+            refused: AtomicU64::new(0),
         }
     }
 }
@@ -177,6 +214,34 @@ static SHELF: AtomicU32 = AtomicU32::new(AUTO_SHELF);
 /// How many disks are exported: only while it is above 0 does `frame_hook` take 0x88a2 frames (otherwise a tape may have them).
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static FLUSHER: AtomicBool = AtomicBool::new(false);
+/// How many slots have a guard: the block layer's check costs one load while no file is exported.
+static GUARDS: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether sectors `lba..lba + sectors` of disk index `disk` include any of an exported file's: then the block layer refuses
+/// the write or TRIM (only the export itself writes them, through `block::write_exported`). Counted, and said once per export.
+pub fn guarded(disk: usize, lba: u64, sectors: u64) -> bool {
+    if GUARDS.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let end = lba.saturating_add(sectors);
+    for slot in SLOTS.iter() {
+        let hit = match slot.guard.lock().as_ref() {
+            Some(guard) if guard.disk == disk => {
+                let index = guard.ranges.partition_point(|&(start, count)| start + count <= lba);
+                guard.ranges.get(index).is_some_and(|&(start, _)| start < end)
+            }
+            _ => false,
+        };
+        if hit {
+            if slot.refused.fetch_add(1, Ordering::Relaxed) == 0 {
+                crate::println!("aoe: refused a write to disk {} sector {lba}:", disk + 1);
+                crate::println!("     it holds a file exported as slot {}.", slot.number.load(Ordering::Relaxed));
+            }
+            return true;
+        }
+    }
+    false
+}
 
 /// Whether `frame_hook` should hand 0x88a2 frames to this module.
 pub fn wanted() -> bool {
@@ -249,8 +314,9 @@ impl Disk for BlockDisk {
     fn read(&mut self, lba: u64, buffer: &mut [u8]) -> bool {
         block::read(self.0, lba, buffer).is_ok()
     }
+    /// The export's own write: the one that may touch an exported file's sectors.
     fn write(&mut self, lba: u64, data: &[u8]) -> bool {
-        block::write_deferred(self.0, lba, data).is_ok()
+        block::write_exported(self.0, lba, data).is_ok()
     }
     fn flush(&mut self) -> bool {
         block::flush(self.0).is_ok()
@@ -308,21 +374,38 @@ extern "C" fn worker(index: usize) {
             cache.invalidate();
             generation = now;
         }
-        let mut disk = BlockDisk(export.disk);
-        let mut cached = cache.on(&mut disk);
+        let Export { disk: index_on, target, file } = &mut **export;
+        let mut whole = BlockDisk(*index_on);
+        let mut in_file;
+        let disk: &mut dyn Disk = match file {
+            None => &mut whole,
+            Some(file) => match FileDisk::new(&mut whole, &file.runs, file.sectors) {
+                Some(found) => {
+                    in_file = found;
+                    &mut in_file
+                }
+                // The disk under the file shrank (a detached AoE disk): nothing can be served.
+                None => {
+                    while pop(slot, &mut request).is_some() {}
+                    continue;
+                }
+            },
+        };
+        let mut cached = cache.on(disk);
+        let writes_before = target.writes;
         // NICs with replies queued but not yet kicked (bit per NIC), and how many replies.
         let (mut unkicked, mut queued_replies) = (0u32, 0usize);
         for _ in 0..BATCH {
             let started = crate::cpu::cycles();
             let Some((nic, length)) = pop(slot, &mut request) else { break };
             let Some(mac) = net::mac(nic) else { continue };
-            export.target.mac = mac;
-            let writes = export.target.writes;
+            target.mac = mac;
+            let writes = target.writes;
             let handle_start = crate::cpu::cycles();
-            let reply_length = export.target.handle(&request[..length], &mut cached, &mut reply);
+            let reply_length = target.handle(&request[..length], &mut cached, &mut reply);
             let handled = crate::cpu::cycles();
             slot.stats.handle_us.fetch_add(handled.saturating_sub(handle_start), Ordering::Relaxed);
-            if export.target.writes != writes {
+            if target.writes != writes {
                 slot.last_write.store(crate::arch::ticks(), Ordering::Relaxed);
                 slot.dirty.store(true, Ordering::Release);
             }
@@ -346,7 +429,11 @@ extern "C" fn worker(index: usize) {
         }
         // Acknowledged writes never outlive the batch in RAM: the flusher and `unexport` only see what reached the drive.
         if !cached.settle() {
-            crate::println!("aoe: writing gathered sectors to disk {} failed; the next FLUSH reports it.", export.disk + 1);
+            crate::println!("aoe: writing gathered sectors to disk {} failed; the next FLUSH reports it.", *index_on + 1);
+        }
+        // A file on an ext volume written behind its back: the kept mount and its read cache may hold the old blocks.
+        if target.writes != writes_before && file.as_ref().is_some_and(|file| file.volume == "ext") {
+            kernel_core::ext4vol::wrote_behind(*index_on);
         }
         let stats = cache.stats;
         slot.stats.add_cache(&stats, &reported);
@@ -403,6 +490,8 @@ pub enum ExportError {
     TableFull,
     BootDiskWritable,
     NoThread,
+    /// A file export and a writable whole-disk export of the same disk: two writers.
+    DiskShared,
 }
 
 /// Exports disk number `number` (1-based, as `disks` lists them) as slot `number` of this machine's shelf.
@@ -414,12 +503,20 @@ pub fn export(number: usize, writable: bool) -> Result<(), ExportError> {
     if SLOTS.iter().any(|slot| usize::from(slot.number.load(Ordering::Acquire)) == number) {
         return Err(ExportError::AlreadyExported);
     }
-    let Some(index) = SLOTS.iter().position(|slot| slot.number.load(Ordering::Acquire) == 0) else { return Err(ExportError::TableFull) };
-    if !start_threads(index) {
-        return Err(ExportError::NoThread);
+    if writable && files_on(disk) {
+        return Err(ExportError::DiskShared);
     }
-    let slot = &SLOTS[index];
-    let mut target = Target::new(shelf(), number as u8, [0; 6], MTU);
+    let mut target = new_target(number as u8, writable);
+    if let Some(info) = block::get(disk) {
+        let model = core::str::from_utf8(&info.model).unwrap_or("").trim();
+        aoe::set_text(&mut target.model, model.as_bytes());
+    }
+    install(Export { disk, target, file: None }, None).map(|_| ())
+}
+
+/// A target for slot `number` of this shelf, with the queue size advertised, before its model text is set.
+fn new_target(number: u8, writable: bool) -> Target {
+    let mut target = Target::new(shelf(), number, [0; 6], MTU);
     target.read_only = !writable;
     // What the queue holds (the crate's default says 16). An initiator that keeps that many in flight leaves the worker the
     // next frames queued when it ends a batch, instead of the two sides taking turns (KVM, window 16 -> 32: 15.5 -> 19.5
@@ -427,12 +524,18 @@ pub fn export(number: usize, writable: bool) -> Result<(), ExportError> {
     // beyond that is idle wire (rack to aneby through an I350, raw reads: 106 MB/s at 32, 113 at 64, no resends). More
     // initiators than one share the queue; a frame it has no room for is dropped and resent, as before.
     target.bufcount = QUEUE as u16;
-    if let Some(info) = block::get(disk) {
-        let model = core::str::from_utf8(&info.model).unwrap_or("").trim();
-        aoe::set_text(&mut target.model, model.as_bytes());
-    }
     let serial = alloc::format!("FOS{:04X}{:02X}", shelf(), number);
     aoe::set_text(&mut target.serial, serial.as_bytes());
+    target
+}
+
+/// Puts `export` into a free slot, with its guard, and starts serving it; the slot's index.
+fn install(export: Export, guard: Option<Box<Guard>>) -> Result<usize, ExportError> {
+    let Some(index) = SLOTS.iter().position(|slot| slot.number.load(Ordering::Acquire) == 0) else { return Err(ExportError::TableFull) };
+    if !start_threads(index) {
+        return Err(ExportError::NoThread);
+    }
+    let slot = &SLOTS[index];
     // Frames queued for an earlier export of this slot are stale.
     {
         let mut queue = slot.inbox.lock();
@@ -440,11 +543,110 @@ pub fn export(number: usize, writable: bool) -> Result<(), ExportError> {
         queue.dropped = 0;
     }
     slot.dirty.store(false, Ordering::Release);
+    slot.refused.store(0, Ordering::Relaxed);
+    if guard.is_some() {
+        *slot.guard.lock() = guard;
+        GUARDS.fetch_add(1, Ordering::AcqRel);
+    }
     slot.generation.fetch_add(1, Ordering::AcqRel);
-    *slot.export.lock() = Some(alloc::boxed::Box::new(Export { disk, target }));
-    slot.number.store(number as u8, Ordering::Release);
+    let number = export.target.slot;
+    *slot.export.lock() = Some(Box::new(export));
+    slot.number.store(number, Ordering::Release);
     ACTIVE.fetch_add(1, Ordering::AcqRel);
-    Ok(())
+    Ok(index)
+}
+
+/// Whether a file on disk index `disk` is exported.
+fn files_on(disk: usize) -> bool {
+    SLOTS.iter().any(|slot| slot.guard.lock().as_ref().is_some_and(|guard| guard.disk == disk))
+}
+
+/// Whether disk index `disk` is exported whole and writable.
+fn exported_writable(disk: usize) -> bool {
+    SLOTS.iter().any(|slot| slot.export.lock().as_ref().is_some_and(|export| export.file.is_none() && export.disk == disk && !export.target.read_only))
+}
+
+/// Why a file could not be exported.
+#[derive(Debug, PartialEq)]
+pub enum FileError {
+    /// What the file system said (not found, FAT, ...).
+    Lookup(&'static str),
+    /// Smaller than one sector.
+    TooSmall,
+    /// `rw` asked for a file with this many sectors that have no disk sectors behind them (holes, unwritten extents).
+    Holes(u64),
+    /// The map does not fit the disk or leaves gaps: a damaged file system.
+    BadMap,
+    SlotTaken,
+    NoFreeSlot,
+    Export(ExportError),
+}
+
+/// What `export_file` did: the slot, the size in sectors, the disk (0-based) and how many runs the map has.
+pub struct FileExported {
+    pub slot: u8,
+    pub sectors: u64,
+    pub disk: usize,
+    pub runs: usize,
+    pub zeros: u64,
+    pub tail: u64,
+}
+
+/// Exports the file `reference` (a FOSFS or ext file: `diskN/path`, `@LABEL/path`, `extN/path`, a bare name) as slot `slot`
+/// (or the first free one from 100), read-only unless `writable`. Looking the file up, checking it and guarding its sectors
+/// happen under the disk lock, so no write lands between the map and the guard.
+pub fn export_file(reference: &str, slot: Option<u8>, writable: bool) -> Result<FileExported, FileError> {
+    let _disks = tapefs::lock();
+    let mut runs: Vec<Run> = Vec::new();
+    let found = kernel_core::tape_vfs::file_map(reference.as_bytes(), &mut |sectors, at| {
+        let place = at.map_or(Place::Zeros, Place::Disk);
+        if !filedisk::extend(runs.last_mut(), sectors, place) {
+            let start = runs.last().map_or(0, |run| run.start + run.sectors);
+            runs.push(Run { start, sectors, place });
+        }
+    })
+    .map_err(FileError::Lookup)?;
+    let sectors = found.size / 512;
+    if sectors == 0 {
+        return Err(FileError::TooSmall);
+    }
+    let disk_sectors = block::get(found.disk).map_or(0, |disk| disk.sectors);
+    let on_disk = runs.iter().all(|run| match run.place {
+        Place::Disk(at) => at.checked_add(run.sectors).is_some_and(|end| end <= disk_sectors),
+        Place::Zeros => true,
+    });
+    if !filedisk::covers(&runs, sectors) || !on_disk {
+        return Err(FileError::BadMap);
+    }
+    let zeros = filedisk::zero_sectors(&runs, sectors);
+    if writable && zeros > 0 {
+        return Err(FileError::Holes(zeros));
+    }
+    let number = match slot {
+        Some(number) if SLOTS.iter().any(|entry| entry.number.load(Ordering::Acquire) == number) => return Err(FileError::SlotTaken),
+        Some(number) => number,
+        None => FILE_SLOTS.clone().find(|&number| SLOTS.iter().all(|entry| entry.number.load(Ordering::Acquire) != number)).ok_or(FileError::NoFreeSlot)?,
+    };
+    if exported_writable(found.disk) {
+        return Err(FileError::Export(ExportError::DiskShared));
+    }
+    let mut target = new_target(number, writable);
+    // The model text: the file's own name, as much as fits.
+    let leaf = reference.rsplit('/').next().unwrap_or(reference);
+    aoe::set_text(&mut target.model, leaf.as_bytes());
+    let mut ranges: Vec<(u64, u64)> = runs
+        .iter()
+        .filter_map(|run| match run.place {
+            Place::Disk(at) => Some((at, run.sectors)),
+            Place::Zeros => None,
+        })
+        .collect();
+    ranges.sort_unstable();
+    let count = runs.len();
+    let file = FileExport { name: String::from(reference), volume: found.volume, runs, sectors };
+    let guard = Box::new(Guard { disk: found.disk, ranges });
+    install(Export { disk: found.disk, target, file: Some(file) }, Some(guard)).map_err(FileError::Export)?;
+    Ok(FileExported { slot: number, sectors, disk: found.disk, runs: count, zeros, tail: found.size % 512 })
 }
 
 /// Stops exporting disk `number`; false when it was not exported. Frames still queued are dropped, written data is flushed.
@@ -457,6 +659,9 @@ pub fn remove(number: usize) -> bool {
     let _disks = tapefs::lock();
     *slot.export.lock() = None;
     slot.inbox.lock().count = 0;
+    if slot.guard.lock().take().is_some() {
+        GUARDS.fetch_sub(1, Ordering::AcqRel);
+    }
     true
 }
 
@@ -478,7 +683,8 @@ pub fn init() {
 
 pub fn command(mut words: core::str::SplitWhitespace) {
     let usage = "ATA over Ethernet: serve this machine's disks, or use another's.\n\
-                 aoe [export N [rw confirm] | unexport N | shelf N | reset]\n\
+                 aoe [export N [rw confirm] | unexport SLOT | shelf N | reset]\n\
+                 aoe export FILE [slot N] [rw confirm]   (a FOSFS or ext file)\n\
                  aoe [discover | attach SHELF.SLOT [rw] [MAC] | detach SHELF.SLOT]";
     match words.next() {
         None => list(),
@@ -494,7 +700,8 @@ pub fn command(mut words: core::str::SplitWhitespace) {
             crate::println!("aoe: counters cleared.");
         }
         Some("export") => {
-            let Some(number) = words.next().and_then(|word| word.parse::<usize>().ok()) else { return crate::println!("{usage}") };
+            let Some(what) = words.next() else { return crate::println!("{usage}") };
+            let Ok(number) = what.parse::<usize>() else { return command_file(what, words, usage) };
             let writable = match (words.next(), words.next()) {
                 (None, _) => false,
                 (Some("rw"), Some("confirm")) => true,
@@ -515,11 +722,12 @@ pub fn command(mut words: core::str::SplitWhitespace) {
                 Err(ExportError::TableFull) => crate::println!("aoe: {MAX_EXPORTS} disks are exported already."),
                 Err(ExportError::BootDiskWritable) => crate::println!("aoe: disk 1 is the boot disk and is never exported writable."),
                 Err(ExportError::NoThread) => crate::println!("aoe: could not start the target thread."),
+                Err(ExportError::DiskShared) => crate::println!("aoe: a file on disk {number} is exported; disk {number} cannot be written as well."),
             }
         }
         Some("unexport") => match words.next().and_then(|word| word.parse::<usize>().ok()) {
-            Some(number) if remove(number) => crate::println!("aoe: disk {number} is no longer exported."),
-            Some(number) => crate::println!("aoe: disk {number} is not exported."),
+            Some(number) if remove(number) => crate::println!("aoe: slot {number} is no longer exported."),
+            Some(number) => crate::println!("aoe: nothing is exported as slot {number}."),
             None => crate::println!("{usage}"),
         },
         Some("shelf") => match words.next().and_then(|word| word.parse::<u16>().ok()).filter(|&shelf| shelf != 0xffff) {
@@ -535,6 +743,51 @@ pub fn command(mut words: core::str::SplitWhitespace) {
             None => crate::println!("aoe shelf N: N is 0..65534."),
         },
         Some(_) => crate::println!("{usage}"),
+    }
+}
+
+/// `aoe export FILE [slot N] [rw confirm]`.
+fn command_file(reference: &str, mut words: core::str::SplitWhitespace, usage: &str) {
+    let (mut slot, mut writable, mut confirmed) = (None, false, false);
+    while let Some(word) = words.next() {
+        match word {
+            "slot" => match words.next().and_then(|word| word.parse::<u8>().ok()).filter(|&number| (1..255).contains(&number)) {
+                Some(number) => slot = Some(number),
+                None => return crate::println!("aoe: slot N: N is 1..254."),
+            },
+            "rw" => writable = true,
+            "confirm" if writable => confirmed = true,
+            _ => return crate::println!("{usage}"),
+        }
+    }
+    if writable && !confirmed {
+        crate::println!("aoe: `rw` lets every machine on this network write {reference}.");
+        return crate::println!("     Add `confirm` after `rw` to do it.");
+    }
+    match export_file(reference, slot, writable) {
+        Ok(done) => {
+            crate::println!("aoe: {reference} exported {} as shelf {} slot {}:", if writable { "READ-WRITE" } else { "read-only" }, shelf(), done.slot);
+            crate::println!("     {} sectors ({} MiB) on disk {}, in {} run(s).", done.sectors, done.sectors >> 11, done.disk + 1, done.runs);
+            if done.zeros > 0 {
+                crate::println!("     {} sector(s) are holes: they read as zeros.", done.zeros);
+            }
+            if done.tail > 0 {
+                crate::println!("     The last {} byte(s) are not a whole sector and are not served.", done.tail);
+            }
+            crate::println!("     Its sectors take no other writes here until `aoe unexport {}`.", done.slot);
+        }
+        Err(FileError::Lookup(why)) => crate::println!("aoe: {reference}: {why}."),
+        Err(FileError::TooSmall) => crate::println!("aoe: {reference} is smaller than one sector."),
+        Err(FileError::Holes(count)) => {
+            crate::println!("aoe: {reference} has {count} sector(s) with no disk space behind them (holes");
+            crate::println!("     or unwritten extents): it can be exported read-only, not rw.");
+        }
+        Err(FileError::BadMap) => crate::println!("aoe: {reference}: its block map does not fit the disk (run fsck)."),
+        Err(FileError::SlotTaken) => crate::println!("aoe: that slot is taken (see `aoe`)."),
+        Err(FileError::NoFreeSlot) => crate::println!("aoe: slots 100..254 are all taken; give one with `slot N`."),
+        Err(FileError::Export(ExportError::DiskShared)) => crate::println!("aoe: the disk under {reference} is exported rw as a whole."),
+        Err(FileError::Export(ExportError::TableFull)) => crate::println!("aoe: {MAX_EXPORTS} exports exist already."),
+        Err(FileError::Export(error)) => crate::println!("aoe: cannot export {reference}: {error:?}."),
     }
 }
 
@@ -568,11 +821,23 @@ fn list() {
     for slot in SLOTS.iter() {
         let guard = slot.export.lock();
         let Some(export) = guard.as_ref() else { continue };
-        let sectors = block::get(export.disk).map_or(0, |disk| disk.sectors);
+        let sectors = match &export.file {
+            Some(file) => {
+                crate::println!("  file {} ({} on disk {}, {} run(s)):", file.name, file.volume, export.disk + 1, file.runs.len());
+                let refused = slot.refused.load(Ordering::Relaxed);
+                if refused > 0 {
+                    crate::println!("    {refused} other write(s) to its sectors refused");
+                }
+                file.sectors
+            }
+            None => block::get(export.disk).map_or(0, |disk| disk.sectors),
+        };
+        let label = match export.file {
+            Some(_) => alloc::format!("  slot {}", export.target.slot),
+            None => alloc::format!("disk {}: slot {}", export.disk + 1, export.target.slot),
+        };
         crate::println!(
-            "  disk {}: slot {}, {} MiB, {}; {} reads, {} writes, {} errors, {} frame(s) dropped",
-            export.disk + 1,
-            export.target.slot,
+            "  {label}, {} MiB, {}; {} reads, {} writes, {} errors, {} frame(s) dropped",
             sectors >> 11,
             if export.target.read_only { "read-only" } else { "READ-WRITE" },
             export.target.reads,

@@ -153,14 +153,26 @@ pub fn read(disk: usize, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
     Ok(())
 }
 
-/// Writes whole sectors to `lba`.
+/// Writes whole sectors to `lba`. Sectors of a file the AoE target exports are refused (`aoetarget::guarded`): only the
+/// export writes them while it lasts.
 pub fn write(disk: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
+    unguarded(disk, lba, buffer)?;
     write_with(disk, lba, buffer, true)
 }
 
 /// Writes without flushing a SATA drive's cache (`flush` does); the other drivers ignore the difference.
 pub fn write_deferred(disk: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
+    unguarded(disk, lba, buffer)?;
     write_with(disk, lba, buffer, false)
+}
+
+/// `write_deferred` for the AoE target itself, the one writer an exported file's sectors take.
+pub fn write_exported(disk: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
+    write_with(disk, lba, buffer, false)
+}
+
+fn unguarded(disk: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
+    if crate::aoetarget::guarded(disk, lba, (buffer.len() / 512) as u64) { Err(Error::Device) } else { Ok(()) }
 }
 
 /// Makes the writes so far durable (SATA: FLUSH CACHE).
@@ -203,6 +215,10 @@ pub fn discard(disk: usize, ranges: &[(u64, u64)]) -> Result<(), Error> {
     let info = get(disk).ok_or(Error::NoSuchDisk)?;
     if ranges.iter().any(|&(lba, sectors)| lba.checked_add(sectors).map_or(true, |end| end > info.sectors)) {
         return Err(Error::OutOfRange);
+    }
+    // A file system that frees an exported file's blocks may TRIM them; that would erase what the export serves.
+    if ranges.iter().any(|&(lba, sectors)| crate::aoetarget::guarded(disk, lba, sectors)) {
+        return Err(Error::Unsupported);
     }
     match info.backend {
         Backend::Ahci(drive) => drive.discard(ranges).map_err(|error| if error == ahci::Error::Unsupported { Error::Unsupported } else { Error::Device }),

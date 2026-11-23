@@ -229,6 +229,16 @@ pub fn shared_disk() -> Option<usize> {
     unsafe { (*core::ptr::addr_of!(OPEN)).map(|(disk, _)| disk).or_else(|| (*core::ptr::addr_of!(SHARED)).as_ref().map(|shared| shared.disk)) }
 }
 
+/// Something wrote file data on disk index `disk` behind this module's back (mf's AoE target writing an exported file):
+/// drops the kept volume and the read cache when they are that disk's, so a later read here sees the new data. The
+/// caller holds the file lock, as for every other call here.
+pub fn wrote_behind(disk: usize) {
+    if shared_disk() == Some(disk) {
+        forget_shared();
+        cache().clear();
+    }
+}
+
 /// Drops the kept volume: after the tape side wrote to it, or the disk went away.
 pub fn forget_shared() {
     let _ = commit_pending();

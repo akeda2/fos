@@ -113,6 +113,12 @@ impl Entry {
         &self.name[..self.name_length]
     }
 
+    /// Where the file's sectors are: (first sector, counted from the volume's start, and how many), in file order. A v3
+    /// file has one; a v4 file up to three. The last may hold more sectors than `length` needs.
+    pub fn extents(&self) -> &[(u64, u32)] {
+        &self.extents[..self.extent_count]
+    }
+
     /// The first (for a stream: only) extent's start sector.
     fn start(&self) -> u64 {
         self.extents[0].0

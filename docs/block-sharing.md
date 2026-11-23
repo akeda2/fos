@@ -154,8 +154,9 @@ The kernel side is `kernel-mf/src/aoetarget.rs` (server kernel only, which is al
   disk read there would stall every interface and the audio drivers). The export's worker thread reads or writes the disk
   through `block::` under the disk lock, builds the reply with `crates/aoe` and sends it. A full queue drops the frame.
 - Writes use `block::write_deferred`; the drive is flushed on FLUSH CACHE (EXT) and by a flusher thread after a pause in writing.
-- Shell: `aoe` (list with counters), `aoe export N [rw confirm]`, `aoe unexport N`, `aoe shelf N`. Disk N is slot N of the
-  shelf. `rw` needs `confirm` on the same line, and disk 1 is never writable. Settings: `aoe-shelf N`, `aoe-export N`
+- Shell: `aoe` (list with counters), `aoe export N [rw confirm]`, `aoe export FILE [slot N] [rw confirm]` (a FOSFS or
+  ext file, "A file as an export" below), `aoe unexport SLOT`, `aoe shelf N`. Disk N is slot N of the shelf; a file takes
+  the first free slot from 100. `rw` needs `confirm` on the same line, and disk 1 is never writable as a whole. Settings: `aoe-shelf N`, `aoe-export N`
   (read-only, applied after boot; docs/config.md).
 - `make test-mf-aoe` (`tools/test_mf_aoe.py`): the host is the initiator over the QEMU multicast-socket network. Query
   Config, IDENTIFY, reads (first, middle, last sector) against the host's file, aborts (out of range, read-only write),
@@ -265,10 +266,51 @@ Not done, in the order I would do it:
 1. **Per-controller locking** in the block layer, if measurements on hardware say serial disk access is the limit.
 2. Jumbo frames on this path: `nicctl` drains into 1600-byte buffers and the target assumes MTU 1500.
 3. `vblade` as a peer, and the Linux test on real hardware (a fos machine exporting to a Linux box over a real switch).
-4. A file as an export (a `Backend` over a contiguous file or ext4 extents): only whole disks are exported now.
+4. FAT and exFAT files as exports (FOSFS and ext files are done), and file exports in `settings`.
 
 Small requests (128 KiB reads at 90 MB/s against 113 in 1 MiB ones) are done: read-ahead in the initiator, "Read-ahead"
 below.
+
+### A file as an export
+
+```
+aoe export FILE [slot N] [rw confirm]    FILE: diskN/path, @LABEL/path, extN/path or a name on the boot volume
+```
+
+A disk image kept as a file (a VM's disk, a test volume, an installer image) can be served without giving the whole disk
+away. FOSFS and ext2/3/4 files work; FAT, exFAT and remote (`//NAME/...`) files are refused for now.
+
+- **Asked once.** At export time `tape_vfs::file_map` asks the file system where the file lies: FOSFS gives up to three
+  extents, ext4 its extent tree (or ext2/3's block pointers) through `Fs::map`. The answer becomes a list of runs in file
+  order: so many sectors at this disk sector, or so many that read as zeros (a hole, or an extent allocated but never
+  written). Adjacent runs are merged (`filedisk::extend`): ext4 stores at most 32768 blocks per extent, so a large
+  file in one piece arrives as many extents and is kept as one run.
+- **Served like a disk.** The worker puts `aoe::filedisk::FileDisk` between the target and the block layer: a request is
+  split where it crosses from one run into the next (found by binary search), zero runs read as zeros, and a write
+  that touches one is refused as a whole. No file-system code runs per frame, and the worker's cache sits on top as
+  for a disk. The export is the file's size in whole sectors; a partial last sector is not served (the shell says so).
+- **`rw` only without holes.** Writing into a hole would need the file system to allocate, which an export cannot do, so
+  a file with any is exported read-only or not at all ("has N sector(s) with no disk space behind them").
+- **The guard.** The map is a snapshot, so it must not go stale: while a file is exported, `block::write`,
+  `write_deferred` and TRIM refuse every request that touches its sectors (`aoetarget::guarded`, a sorted range list
+  per export, one atomic load while there is none). Only the export writes them (`block::write_exported`). This holds
+  for read-only exports too. Removing or replacing the file here still works on the file system, but its old sectors
+  stay out of use: a file written onto them fails on the refused write ("aoe: refused a write to disk N sector S", and
+  `aoe` counts them) instead of the export serving another file's data, or writing into it. `aoe unexport` lifts it.
+- **Kept mounts.** An ext volume the tape calls keep mounted (`ext4vol::shared`) caches blocks; after a batch that wrote
+  an ext file the worker drops that mount and its cache (`ext4vol::wrote_behind`), so a tape (an SMB server) reading
+  the file here sees the new data. FOSFS keeps no data cache.
+- A file export and a writable whole-disk export of the same disk refuse each other (two writers). A file on the boot
+  disk may be exported `rw`: only its own sectors become writable.
+
+`make test-mf-aoe-file` (`tools/test_mf_aoe_file.py`): a FOSFS file on the boot volume read-only (size, reads, a refused
+write, the partial last sector); an ext4 file `rw` (reads, a write that a tape then reads through the kept mount, and
+the guest's `sha256` of the changed file; without `wrote_behind` the tape read the old data); a sparse ext4 file
+(`rw` refused, holes read as zeros); and the guard (an exported file removed and a new one written by first fit onto
+its sectors: refused, the export still serves the old data, writable again after `unexport`). `crates/aoe` has host
+tests for the run splitting, zero runs, merging and a target serving a file through the cache.
+
+Not checked on hardware yet; the per-frame path is the whole-disk one with a run lookup added.
 
 ### The initiator (`aoe::initiator`, `kernel-mf/src/aoedisk.rs`)
 
