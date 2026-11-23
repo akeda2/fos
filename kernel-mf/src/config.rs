@@ -29,6 +29,14 @@ static mut AOE_EXPORTS: u32 = 0;
 /// `aoe-export @LABEL [slot N]` lines in `settings`: the label and the slot asked for (else the disk's number at boot).
 static mut AOE_LABELS: alloc::vec::Vec<(alloc::string::String, Option<u8>)> = alloc::vec::Vec::new();
 
+/// `aoe-attach SHELF.SLOT [rw] [MAC]` lines in `settings`: targets this machine attaches at the end of boot.
+static mut AOE_ATTACH: alloc::vec::Vec<crate::aoedisk::Wanted> = alloc::vec::Vec::new();
+
+/// The `aoe-attach` targets, in order.
+pub fn aoe_attach() -> alloc::vec::Vec<crate::aoedisk::Wanted> {
+    unsafe { (*core::ptr::addr_of!(AOE_ATTACH)).clone() }
+}
+
 /// `aoe-shelf N` in `settings`.
 pub fn aoe_shelf() -> Option<u16> {
     unsafe { AOE_SHELF }
@@ -232,6 +240,16 @@ pub fn load() {
             if line.split_whitespace().next() == Some("no-msi") {
                 unsafe { NO_MSI = true };
                 println!("settings: no-msi -- devices are polled.");
+            }
+            if line.split_whitespace().next() == Some("aoe-attach") {
+                match crate::aoedisk::parse_wanted(line.split_whitespace().skip(1)) {
+                    Some(wanted) => {
+                        let mode = if wanted.writable { "READ-WRITE" } else { "read-only" };
+                        println!("settings: aoe-attach e{}.{} -- attached {mode} at the end of boot.", wanted.shelf, wanted.slot);
+                        unsafe { (*core::ptr::addr_of_mut!(AOE_ATTACH)).push(wanted) };
+                    }
+                    None => println!("settings: `{line}` ignored (aoe-attach SHELF.SLOT [rw] [MAC])."),
+                }
             }
             if line.split_whitespace().next() == Some("aoe-export") && line.split_whitespace().nth(1).is_some_and(|word| word.starts_with('@')) {
                 match parse_label_export(&mut line.split_whitespace().skip(1)) {

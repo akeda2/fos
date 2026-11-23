@@ -33,6 +33,7 @@ use crate::{block, net};
 use aoe::initiator::{self, Address, Failure, Kind, Op, Response, Transfer};
 use aoe::readahead::ReadAhead;
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use kernel_core::{nic, nicctl};
 
@@ -50,6 +51,10 @@ const STALE_TICKS: u64 = 2;
 /// How long `aoe discover` listens for Query Config replies.
 const DISCOVER_TICKS: u64 = 50;
 const MAX_FOUND: usize = 16;
+/// How long the boot waits for `aoe-attach` targets (link, then an answer) before `start` runs: 10 s. What has not
+/// answered by then is looked for by the `aoe-attach` thread every `RETRY_TICKS` (10 s), for as long as it takes.
+const BOOT_WAIT_TICKS: u64 = 1000;
+const RETRY_TICKS: u64 = 1000;
 const WAKE_KEY: usize = 0xa0e1_0000;
 /// What the `aoe-ahead` thread of each remote sleeps on.
 const AHEAD_KEY: usize = 0xa0e2_0000;
@@ -509,6 +514,8 @@ pub fn flush(index: usize) -> Result<(), block::Error> {
 
 /// Broadcasts Query Config on every NIC with a link and listens `DISCOVER_TICKS`; the targets that answered, in order.
 fn discover() -> ([Option<Found>; MAX_FOUND], usize) {
+    // One listener at a time: the `aoe-attach` thread and the shell share `DISCOVERY`.
+    let _one = DISCOVERING.lock();
     {
         let mut discovery = DISCOVERY.lock();
         discovery.listening = true;
@@ -546,6 +553,11 @@ fn our_mac(mac: [u8; 6]) -> bool {
     (0..nic::count()).any(|index| nic::at(index).is_some_and(|card| card.mac() == mac))
 }
 
+/// Serialises discovery runs (`discover`).
+static DISCOVERING: SleepMutex<()> = SleepMutex::new(());
+/// Serialises attaches: picking a free entry and registering its disk is not safe twice at once.
+static ATTACHING: SleepMutex<()> = SleepMutex::new(());
+
 #[derive(Debug)]
 pub enum AttachError {
     NotFound,
@@ -559,6 +571,7 @@ pub enum AttachError {
 /// Attaches `shelf.slot` (found by a discovery run here): IDENTIFY for its size, then a disk number. Returns the 0-based
 /// block index. A target with several NICs answers on each; `via` picks the one to use by its MAC, else the first answer is.
 fn attach(shelf: u16, slot: u8, writable: bool, via: Option<[u8; 6]>) -> Result<usize, AttachError> {
+    let _one = ATTACHING.lock();
     let (found, _) = discover();
     let target = found
         .iter()
@@ -720,6 +733,11 @@ fn mac_text(mac: [u8; 6]) -> alloc::string::String {
 
 /// The `aoe` listing's part about attached disks. `rate` is TSC cycles per microsecond.
 pub fn list(rate: u64) {
+    // A copy: no printing with the spin lock held.
+    let pending: Vec<Wanted> = PENDING.lock().clone();
+    for wanted in &pending {
+        crate::println!("  waiting for e{}.{} (settings; looked for every {} s)", wanted.shelf, wanted.slot, RETRY_TICKS / 100);
+    }
     for entry in ENTRIES.iter() {
         let Some(route) = entry.inbox.lock().route else { continue };
         let guard = entry.remote.lock();
@@ -765,6 +783,120 @@ pub fn list(rate: u64) {
     }
 }
 
+/// A target to attach, as `aoe attach` and `aoe-attach` in `settings` give it: `SHELF.SLOT [rw] [MAC]`.
+#[derive(Clone, Copy)]
+pub struct Wanted {
+    pub shelf: u16,
+    pub slot: u8,
+    pub writable: bool,
+    /// Which of the target's NICs to use, by its MAC (a target with several answers on each).
+    pub via: Option<[u8; 6]>,
+}
+
+/// `SHELF.SLOT [rw] [MAC]`; None when the words are something else.
+pub fn parse_wanted<'a>(mut words: impl Iterator<Item = &'a str>) -> Option<Wanted> {
+    let (shelf, slot) = parse_address(words.next())?;
+    let mut wanted = Wanted { shelf, slot, writable: false, via: None };
+    for word in words {
+        match word {
+            "rw" => wanted.writable = true,
+            _ => wanted.via = Some(parse_mac(word)?),
+        }
+    }
+    Some(wanted)
+}
+
+fn say_attached(wanted: &Wanted, disk: usize) {
+    let (shelf, slot) = (wanted.shelf, wanted.slot);
+    let sectors = block::get(disk).map_or(0, |info| info.sectors);
+    let mode = if wanted.writable { "READ-WRITE" } else { "read-only" };
+    crate::println!("aoe: e{shelf}.{slot} is disk {}, {} MiB, {mode}.", disk + 1, sectors >> 11);
+    if wanted.writable {
+        crate::println!("     No other machine may write it while it is attached here.");
+    }
+}
+
+fn say_failed(wanted: &Wanted, error: &AttachError) {
+    let (shelf, slot) = (wanted.shelf, wanted.slot);
+    match error {
+        AttachError::NotFound => {
+            let from = if wanted.via.is_some() { " from that MAC" } else { "" };
+            crate::println!("aoe: no target e{shelf}.{slot} answered{from} (see `aoe discover`).");
+        }
+        AttachError::Ours => crate::println!("aoe: e{shelf}.{slot} is this machine's own export."),
+        AttachError::Attached => crate::println!("aoe: e{shelf}.{slot} is already attached."),
+        AttachError::TableFull => crate::println!("aoe: {MAX_REMOTES} disks are attached already."),
+        AttachError::Identify(failure) => crate::println!("aoe: e{shelf}.{slot} did not answer IDENTIFY ({failure:?})."),
+        AttachError::NoDiskNumber => crate::println!("aoe: no free disk number."),
+    }
+}
+
+/// `aoe-attach` targets from `settings` that have not answered yet; the `aoe-attach` thread keeps trying them.
+static PENDING: SpinLock<Vec<Wanted>> = SpinLock::new(Vec::new());
+
+/// One try at a `settings` target: true when it is settled (attached, or refused for a reason a retry cannot change,
+/// which is printed); false when it did not answer, to try again.
+fn settle(wanted: &Wanted) -> bool {
+    match attach(wanted.shelf, wanted.slot, wanted.writable, wanted.via) {
+        Ok(disk) => {
+            say_attached(wanted, disk);
+            true
+        }
+        Err(AttachError::NotFound | AttachError::Identify(_)) => false,
+        // Attached by hand meanwhile.
+        Err(AttachError::Attached) => true,
+        Err(error) => {
+            say_failed(wanted, &error);
+            true
+        }
+    }
+}
+
+/// At the end of boot, before `start` runs (the service thread): attaches the `aoe-attach` targets in `settings`, so the
+/// `start` file and the services find their disks. A NIC's link takes a few seconds to come up and the target may be
+/// booting too, so it tries for up to `BOOT_WAIT_TICKS`; what is still missing then is left to the `aoe-attach` thread,
+/// and the boot goes on without it.
+pub fn attach_from_settings() {
+    let mut left = crate::config::aoe_attach();
+    if left.is_empty() {
+        return;
+    }
+    crate::println!("aoe: attaching {} target(s) from settings (up to {} s).", left.len(), BOOT_WAIT_TICKS / 100);
+    let deadline = crate::arch::ticks() + BOOT_WAIT_TICKS;
+    loop {
+        left.retain(|wanted| !settle(wanted));
+        if left.is_empty() || crate::arch::ticks() >= deadline {
+            break;
+        }
+        sched::sleep_ticks(100);
+    }
+    if left.is_empty() {
+        return;
+    }
+    for wanted in &left {
+        crate::println!("aoe: e{}.{} has not answered; it is looked for every {} s.", wanted.shelf, wanted.slot, RETRY_TICKS / 100);
+    }
+    *PENDING.lock() = left;
+    if sched::spawn_any("aoe-attach", retry_thread, 0).is_none() {
+        crate::println!("aoe: could not start the aoe-attach thread; `aoe attach` them by hand.");
+        PENDING.lock().clear();
+    }
+}
+
+/// Tries the pending `settings` targets every `RETRY_TICKS` and ends when none is left.
+extern "C" fn retry_thread(_: usize) {
+    loop {
+        sched::sleep_ticks(RETRY_TICKS);
+        let mut left: Vec<Wanted> = PENDING.lock().clone();
+        left.retain(|wanted| !settle(wanted));
+        let done = left.is_empty();
+        *PENDING.lock() = left;
+        if done {
+            sched::exit();
+        }
+    }
+}
+
 /// `aoe discover`, `aoe attach SHELF.SLOT [rw]`, `aoe detach SHELF.SLOT`: true when `word` was one of them.
 pub fn command(word: &str, words: &mut core::str::SplitWhitespace) -> bool {
     match word {
@@ -793,38 +925,14 @@ pub fn command(word: &str, words: &mut core::str::SplitWhitespace) -> bool {
             }
         }
         "attach" => {
-            let Some((shelf, slot)) = parse_address(words.next()) else {
-                crate::println!("aoe attach SHELF.SLOT [rw] [MAC]   (`aoe discover` lists them)");
+            let Some(wanted) = parse_wanted(words.by_ref()) else {
+                crate::println!("aoe attach SHELF.SLOT [rw] [MAC]   (`aoe discover` lists them;");
+                crate::println!("     MAC: which of the target's NICs)");
                 return true;
             };
-            let (mut writable, mut via, mut bad) = (false, None, false);
-            for word in words.by_ref() {
-                match word {
-                    "rw" => writable = true,
-                    _ => match parse_mac(word) {
-                        Some(mac) => via = Some(mac),
-                        None => bad = true,
-                    },
-                }
-            }
-            if bad {
-                crate::println!("aoe attach SHELF.SLOT [rw] [MAC]   (MAC: which of the target's NICs)");
-                return true;
-            }
-            match attach(shelf, slot, writable, via) {
-                Ok(disk) => {
-                    let sectors = block::get(disk).map_or(0, |info| info.sectors);
-                    crate::println!("aoe: e{shelf}.{slot} is disk {}, {} MiB, {}.", disk + 1, sectors >> 11, if writable { "READ-WRITE" } else { "read-only" });
-                    if writable {
-                        crate::println!("     No other machine may write it while it is attached here.");
-                    }
-                }
-                Err(AttachError::NotFound) => crate::println!("aoe: no target e{shelf}.{slot} answered{} (see `aoe discover`).", if via.is_some() { " from that MAC" } else { "" }),
-                Err(AttachError::Ours) => crate::println!("aoe: e{shelf}.{slot} is this machine's own export."),
-                Err(AttachError::Attached) => crate::println!("aoe: e{shelf}.{slot} is already attached."),
-                Err(AttachError::TableFull) => crate::println!("aoe: {MAX_REMOTES} disks are attached already."),
-                Err(AttachError::Identify(failure)) => crate::println!("aoe: e{shelf}.{slot} did not answer IDENTIFY ({failure:?})."),
-                Err(AttachError::NoDiskNumber) => crate::println!("aoe: no free disk number."),
+            match attach(wanted.shelf, wanted.slot, wanted.writable, wanted.via) {
+                Ok(disk) => say_attached(&wanted, disk),
+                Err(error) => say_failed(&wanted, &error),
             }
         }
         "detach" => match parse_address(words.next()) {

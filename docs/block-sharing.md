@@ -329,8 +329,17 @@ aoe discover                  Query Config on every NIC with a link; lists SHELF
 aoe attach SHELF.SLOT [rw] [MAC]  IDENTIFY, then a disk number; read-only unless rw; MAC picks the target's NIC
 aoe detach SHELF.SLOT         requests fail from now on; attaching the same target again gives the same disk number
 aoe                           also lists the attached disks: NIC, sectors a frame, window, requests, frames, resends,
-                              read-ahead fetched and used, what the aoe-ahead thread did
+                              read-ahead fetched and used, what the aoe-ahead thread did, and settings targets not found yet
 ```
+
+**At boot**: `aoe-attach SHELF.SLOT [rw] [MAC]` in `settings` (one line per target, same words as `aoe attach`). The
+service thread attaches them before the `start` file runs, so `start` and the services find the disks. A NIC's link takes
+a few seconds after boot and the target may be booting as well, so it tries for up to 10 s. A target still missing then
+does not hold up the boot: it is printed, `aoe` lists it as "waiting for", and an `aoe-attach` thread looks for it every
+10 s until it answers (then it prints the disk number as `aoe attach` would) and ends when none is left. A refusal a
+retry cannot change (this machine's own export, no free disk number) is printed once and dropped. `rw` here is the same
+decision as `rw` on the command line, written down. `make test-mf-aoe-initiator` boots the initiator with one target that
+answers (its `start` file's `disks` lists it) and one that does not, which it attaches once the target exports that slot.
 
 - **The protocol half** is `crates/aoe/src/initiator.rs`, `no_std` and host-tested against the crate's own `Target` over
   a simulated link that loses requests and replies and reorders them (`initiator_tests.rs`). `Transfer` is one block

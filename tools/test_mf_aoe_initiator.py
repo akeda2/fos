@@ -3,7 +3,11 @@
 on one QEMU multicast segment (docs/block-sharing.md, "The initiator").
 
 - t (the target, 52:54:00:12:34:e1): boots with `aoe-shelf 5` / `aoe-export 2` and a scratch data disk of random bytes.
-- i (the initiator, 52:54:00:12:34:e2): only its boot disk, which carries `big.bin` (192 KiB of random bytes).
+- i (the initiator, 52:54:00:12:34:e2): only its boot disk, which carries `big.bin` (192 KiB of random bytes), a `start`
+  file that runs `disks`, and `aoe-attach 5.2` / `aoe-attach 5.9` in settings. It boots once t is at its prompt.
+
+Boot-time attach: e5.2 is disk 2 before `start` runs (its `disks` lists it); e5.9 does not exist, so the boot goes on after
+the wait and `aoe` says it is still looked for; at the end t exports a disk as slot 9 and i attaches it by itself.
 
 Checks: discovery lists e5.2 with its limits; attach makes it disk 2 with the right size; raw sectors read through AoE
 match the data image; a write to the read-only attach fails without touching the wire; then, with the export rw and the
@@ -120,11 +124,23 @@ def main():
         digest = hashlib.sha256(big).hexdigest()
         t = Guest("t", build_image(tmp / "t", "aoe-shelf 5\naoe-export 2\n"), [disk] + ([ext] if ext else []),
                   "52:54:00:12:34:e1")
-        i = Guest("i", build_image(tmp / "i", "", [("big.bin", tmp / "big.bin")]), [], "52:54:00:12:34:e2")
+        (tmp / "start").write_text("disks\n")
+        i = None
         try:
-            for guest in (t, i):
-                if not guest.wait_for("fos> ", 150):
-                    raise SystemExit(f"{guest.name} never reached the prompt: {guest.log[-2000:]!r}")
+            if not t.wait_for("fos> ", 150):
+                raise SystemExit(f"t never reached the prompt: {t.log[-2000:]!r}")
+            i = Guest("i", build_image(tmp / "i", "aoe-attach 5.2\naoe-attach 5.9\n", [("big.bin", tmp / "big.bin"), ("start", tmp / "start")]),
+                      [], "52:54:00:12:34:e2")
+            if not i.wait_for("fos> ", 150):
+                raise SystemExit(f"i never reached the prompt: {i.log[-2000:]!r}")
+            boot = i.log.decode("utf8", "replace")
+            attached, started = boot.find("aoe: e5.2 is disk 2, 8 MiB, read-only."), boot.find("start> disks")
+            check(attached >= 0, "`aoe-attach 5.2` in settings attaches e5.2 as disk 2 at boot", boot[-1500:])
+            check(0 <= attached < started and "disk2: 8 MiB" in boot[started:], "before `start` runs, whose `disks` lists it", boot[-1500:])
+            check("aoe: e5.9 has not answered; it is looked for every 10 s." in boot, "a missing target does not stop the boot", boot[-1500:])
+            ok, text = i.command("aoe", "waiting for e5.9", 20)
+            check(ok, "`aoe` shows the target still looked for", text[-600:])
+            ok, text = i.command("aoe detach 5.2", "detached", 20)
 
             ok, text = i.command("aoe discover", "e5.2", 20)
             check(ok and "52:54:00:12:34:e1" in text and "2 sector(s) a frame, bufcount 64" in text,
@@ -214,9 +230,19 @@ def main():
                 ok, text = i.command("aoe attach 5.3", "is disk 3", 30)
                 ok, text = i.command("ls ext3/", "b.txt", 30)
                 check(ok, "after detach and attach the initiator lists b.txt (no stale ext4 mount)", text[-400:])
+
+            # The `aoe-attach 5.9` from settings: once t serves slot 9, the aoe-attach thread finds it (every 10 s).
+            ok, text = t.command("aoe export 2 slot 9", "slot 9", 20)
+            check(ok and "read-only" in text, "t exports disk 2 as slot 9", text[-400:])
+            i.log = b""
+            ok = i.wait_for("aoe: e5.9 is disk", 30)
+            check(ok, "the initiator attaches e5.9 by itself once it answers", i.log[-600:].decode("utf8", "replace"))
+            ok, text = i.command("aoe", "attached e5.9", 20)
+            check(ok and "waiting for" not in text, "and no longer waits for it", text[-600:])
         finally:
             for guest in (t, i):
-                guest.kill()
+                if guest is not None:
+                    guest.kill()
     for failure in failures:
         print("FAIL:", failure)
     if failures:
