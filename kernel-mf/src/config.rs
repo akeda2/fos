@@ -26,6 +26,9 @@ static mut AOE_SHELF: Option<u16> = None;
 /// Bit n set: `aoe-export n` in `settings` (disk n is exported read-only after boot).
 static mut AOE_EXPORTS: u32 = 0;
 
+/// `aoe-export @LABEL [slot N]` lines in `settings`: the label and the slot asked for (else the disk's number at boot).
+static mut AOE_LABELS: alloc::vec::Vec<(alloc::string::String, Option<u8>)> = alloc::vec::Vec::new();
+
 /// `aoe-shelf N` in `settings`.
 pub fn aoe_shelf() -> Option<u16> {
     unsafe { AOE_SHELF }
@@ -34,6 +37,22 @@ pub fn aoe_shelf() -> Option<u16> {
 /// The disks `aoe-export N` lines named, as a bit mask (bit N for disk N).
 pub fn aoe_exports() -> u32 {
     unsafe { AOE_EXPORTS }
+}
+
+/// The volumes `aoe-export @LABEL [slot N]` lines named, in order.
+pub fn aoe_export_labels() -> alloc::vec::Vec<(alloc::string::String, Option<u8>)> {
+    unsafe { (*core::ptr::addr_of!(AOE_LABELS)).clone() }
+}
+
+/// `@LABEL [slot N]` after `aoe-export`: the label and the slot; None when the words are something else.
+fn parse_label_export<'a>(words: &mut impl Iterator<Item = &'a str>) -> Option<(alloc::string::String, Option<u8>)> {
+    let label = words.next()?.strip_prefix('@').filter(|label| !label.is_empty() && !label.contains('/'))?;
+    let slot = match (words.next(), words.next()) {
+        (None, _) => None,
+        (Some("slot"), Some(number)) => Some(number.parse::<u8>().ok().filter(|number| (1..255).contains(number))?),
+        _ => return None,
+    };
+    words.next().is_none().then(|| (alloc::string::String::from(label), slot))
 }
 
 /// `md auto` in `settings`: a thread assembles a Linux md array at boot (see `mdvol`).
@@ -214,7 +233,18 @@ pub fn load() {
                 unsafe { NO_MSI = true };
                 println!("settings: no-msi -- devices are polled.");
             }
-            if let Some(key @ ("aoe-shelf" | "aoe-export")) = line.split_whitespace().next() {
+            if line.split_whitespace().next() == Some("aoe-export") && line.split_whitespace().nth(1).is_some_and(|word| word.starts_with('@')) {
+                match parse_label_export(&mut line.split_whitespace().skip(1)) {
+                    Some((label, slot)) => {
+                        match slot {
+                            Some(number) => println!("settings: aoe-export @{label} slot {number} -- served read-only after boot."),
+                            None => println!("settings: aoe-export @{label} -- its disk is served read-only after boot."),
+                        }
+                        unsafe { (*core::ptr::addr_of_mut!(AOE_LABELS)).push((label, slot)) };
+                    }
+                    None => println!("settings: `{line}` ignored (aoe-export @LABEL [slot 1..254])."),
+                }
+            } else if let Some(key @ ("aoe-shelf" | "aoe-export")) = line.split_whitespace().next() {
                 match line.split_whitespace().nth(1).and_then(|word| word.parse::<u16>().ok()) {
                     Some(number) if key == "aoe-shelf" && number != 0xffff => unsafe { AOE_SHELF = Some(number) },
                     Some(number @ 1..=31) if key == "aoe-export" => {

@@ -2,6 +2,8 @@
 """A file as an AoE export on the server kernel (`make test-mf-aoe-file`, docs/block-sharing.md "A file as an export").
 The host is the initiator over the QEMU multicast-socket network, as in test_mf_aoe.py.
 
+- A whole disk by its volume's label: `aoe-export @fileexp slot 30` in settings exports disk 2 at boot; the same disk is
+  refused a second slot (by label or number), an unknown label is refused, and `aoe export @fileexp slot 31` works.
 - A FOSFS file on the boot volume (1 MiB and 300 bytes): exported read-only by its bare name, it takes slot 100; IDENTIFY
   says 2048 sectors (the partial last sector is left out), reads match the host's file, a write is aborted.
 - An ext4 file (mkfs.ext4 -d) exported `rw confirm` as slot 7: reads match, a write lands in the file. A tape
@@ -34,9 +36,9 @@ def check(ok, text, detail=""):
         failures.append(f"{text}: {detail}")
 
 
-def build_image(tmp, files):
+def build_image(tmp, files, settings_text="aoe-shelf 5\n"):
     settings = tmp / "settings"
-    settings.write_text("aoe-shelf 5\n")
+    settings.write_text(settings_text)
     out = tmp / "boot.img"
     extra = [arg for name, path in files for arg in ("--file", f"{name}={path}")]
     subprocess.run([sys.executable, str(ROOT / "tools/build_image.py"), "--loader", os.environ["LOADER_EFI"], "--kernel", os.environ["KERNEL_MF_ELF"],
@@ -71,9 +73,11 @@ def main():
         tmp = Path(tmp)
         image_data = os.urandom((1 << 20) + 300)
         (tmp / "img.bin").write_bytes(image_data)
-        boot = build_image(tmp, [("img.bin", tmp / "img.bin"), ("fscheck", ROOT / "build/fosfor/tapes/fscheck")])
-
         have_ext = Path(mkfs).exists()
+        # A whole disk named by its volume's label, with a slot of its own (disk numbers can change between boots).
+        settings_text = "aoe-shelf 5\n" + ("aoe-export @fileexp slot 30\n" if have_ext else "")
+        boot = build_image(tmp, [("img.bin", tmp / "img.bin"), ("fscheck", ROOT / "build/fosfor/tapes/fscheck")], settings_text)
+
         ext = tmp / "ext.img"
         disk_data = b"\xff" * 64 + os.urandom((2 << 20) - 64)
         sparse_head, sparse_tail = os.urandom(4096), os.urandom(4096)
@@ -96,6 +100,7 @@ def main():
         host = Initiator()
         try:
             check(guest.wait_for("fos> ", 150), "the guest booted to the prompt", guest.log[-800:].decode("utf8", "replace"))
+            boot_log = guest.log.decode("utf8", "replace")
 
             # --- a FOSFS file on the boot volume, read-only ---
             ok, text = guest.command("aoe export img.bin", "aoe:")
@@ -110,6 +115,22 @@ def main():
             check(reply is not None and ata_status(reply) == (0x51, 4), "a write to the read-only file export is aborted", reply)
             ok, text = guest.command("sha256 img.bin", "img.bin")
             check(ok and hashlib.sha256(image_data).hexdigest() in text, "and the file is unchanged", text)
+
+            # --- a whole disk by its volume's label ---
+            if have_ext:
+                check("aoe: @fileexp (disk 2) exported read-only as shelf 5 slot 30" in boot_log, "`aoe-export @fileexp slot 30` in settings exports disk 2 at boot")
+                check(sectors_of(host, 30) == 65536, "slot 30 is the whole 32 MiB disk", sectors_of(host, 30))
+                ok, text = guest.command("aoe export @fileexp", "aoe:")
+                check(ok and "exported already" in text, "the same disk is not exported twice by label", text)
+                ok, text = guest.command("aoe export 2 slot 31", "aoe:")
+                check(ok and "exported already" in text, "nor by number under another slot", text)
+                ok, text = guest.command("aoe export @nosuchlabel", "aoe:")
+                check(ok and "no volume is labelled @nosuchlabel" in text, "an unknown label is refused", text)
+                guest.command("aoe unexport 30", "no longer exported")
+                ok, text = guest.command("aoe export @fileexp slot 31", "aoe:")
+                check(ok and "disk 2 exported read-only as shelf 5 slot 31" in text, "`aoe export @fileexp slot 31` from the shell", text)
+                check(sectors_of(host, 31) == 65536 and sectors_of(host, 30) is None, "slot 31 answers, slot 30 no longer does")
+                guest.command("aoe unexport 31", "no longer exported")
 
             # --- an ext4 file, rw ---
             if have_ext:

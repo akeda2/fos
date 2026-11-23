@@ -154,10 +154,16 @@ The kernel side is `kernel-mf/src/aoetarget.rs` (server kernel only, which is al
   disk read there would stall every interface and the audio drivers). The export's worker thread reads or writes the disk
   through `block::` under the disk lock, builds the reply with `crates/aoe` and sends it. A full queue drops the frame.
 - Writes use `block::write_deferred`; the drive is flushed on FLUSH CACHE (EXT) and by a flusher thread after a pause in writing.
-- Shell: `aoe` (list with counters), `aoe export N [rw confirm]`, `aoe export FILE [slot N] [rw confirm]` (a FOSFS or
-  ext file, "A file as an export" below), `aoe unexport SLOT`, `aoe shelf N`. Disk N is slot N of the shelf; a file takes
-  the first free slot from 100. `rw` needs `confirm` on the same line, and disk 1 is never writable as a whole. Settings: `aoe-shelf N`, `aoe-export N`
+- Shell: `aoe` (list with counters), `aoe export N|@LABEL [slot N] [rw confirm]`, `aoe export FILE [slot N] [rw confirm]`
+  (a FOSFS or ext file, "A file as an export" below), `aoe unexport SLOT`, `aoe shelf N`. A whole disk is slot N of the
+  shelf unless `slot` says otherwise; a file takes the first free slot from 100. `rw` needs `confirm` on the same line,
+  and disk 1 is never writable as a whole. Settings: `aoe-shelf N`, `aoe-export N`, `aoe-export @LABEL [slot N]`
   (read-only, applied after boot; docs/config.md).
+- `@LABEL` names the disk that holds the volume with that label (FOSFS, FAT/exFAT or ext, in that order), and the whole
+  disk is exported, partition table included, as with a number. Disk numbers follow discovery order and can change
+  when a disk is added, but a label stays with its volume. The slot is the address initiators attach to (`e64598.2`),
+  so give a label export a fixed `slot`; without one it takes the disk's number at boot. One disk is exported whole
+  under one slot only: a second `aoe export` of it, by label or number, is refused.
 - `make test-mf-aoe` (`tools/test_mf_aoe.py`): the host is the initiator over the QEMU multicast-socket network. Query
   Config, IDENTIFY, reads (first, middle, last sector) against the host's file, aborts (out of range, read-only write),
   the shell's refusals, a two-sector write that reaches the disk image after FLUSH.

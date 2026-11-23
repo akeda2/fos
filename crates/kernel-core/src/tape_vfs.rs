@@ -60,6 +60,22 @@ fn label_disk(selector: &[u8]) -> Option<usize> {
 static mut LABEL_CACHE: [([u8; 32], usize, usize, usize); 4] = [([0; 32], 0, 0, 0); 4];
 static mut LABEL_NEXT: usize = 0;
 
+/// The disk index (0-based) of the volume labelled `label`, whatever its kind: FOSFS first, then FAT/exFAT, then ext (the
+/// order `@LABEL/` names are looked up in). For things that work on whole disks but are better named by a label, whose
+/// disk number can change from one boot to the next (`aoe export @LABEL`). Under the disk lock, like the file calls.
+pub fn disk_labelled(label: &[u8]) -> Option<usize> {
+    if label.is_empty() {
+        return None;
+    }
+    if let Some((number, _)) = storage::volume_labelled(label) {
+        return Some(number - 1);
+    }
+    if let Some((number, _)) = tape_fs::fat_labelled(label) {
+        return Some(number - 1);
+    }
+    ext_disk_labelled(label)
+}
+
 fn ext_disk_labelled(label: &[u8]) -> Option<usize> {
     // SAFETY: reached only from the serialised file calls, like `ext4vol::shared`.
     let cache = unsafe { &mut *core::ptr::addr_of_mut!(LABEL_CACHE) };
