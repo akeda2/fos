@@ -78,8 +78,11 @@ struct Remote {
 struct Entry {
     inbox: SpinLock<Queue>,
     /// `None` while the entry is free or detached; held for a whole request.
-    remote: SleepMutex<Option<Remote>>,
-    /// The block-layer index this entry was registered as (it keeps it across detach and attach), `usize::MAX` for none.
+    /// Boxed so that `None` is a null pointer (an `Option<Remote>` may mark it with a non-zero byte, see `disk`).
+    remote: SleepMutex<Option<Box<Remote>>>,
+    /// The block-layer index this entry was registered as, plus one (it keeps it across detach and attach); 0 for none.
+    /// Zero rather than `u64::MAX` for "none" keeps `ENTRIES` all zeros, so its 400 KiB of buffers sit in `.bss` and not
+    /// in the kernel image.
     disk: AtomicU64,
     requests: AtomicU64,
     frames: AtomicU64,
@@ -105,7 +108,7 @@ impl Entry {
         Entry {
             inbox: SpinLock::new(Queue { route: None, arrived_at: 0, frames: [[0; FRAME]; QUEUE], lengths: [0; QUEUE], head: 0, count: 0, dropped: 0 }),
             remote: SleepMutex::new(None),
-            disk: AtomicU64::new(u64::MAX),
+            disk: AtomicU64::new(0),
             requests: AtomicU64::new(0),
             frames: AtomicU64::new(0),
             resent: AtomicU64::new(0),
@@ -396,7 +399,7 @@ fn attach(shelf: u16, slot: u8, writable: bool) -> Result<usize, AttachError> {
     // The entry this target had before (it keeps its disk number), else one never used.
     let index = (0..MAX_REMOTES)
         .find(|&index| LAST_ROUTE.lock()[index] == Some(route))
-        .or_else(|| (0..MAX_REMOTES).find(|&index| ENTRIES[index].disk.load(Ordering::Relaxed) == u64::MAX && LAST_ROUTE.lock()[index].is_none()))
+        .or_else(|| (0..MAX_REMOTES).find(|&index| ENTRIES[index].disk.load(Ordering::Relaxed) == 0 && LAST_ROUTE.lock()[index].is_none()))
         .ok_or(AttachError::TableFull)?;
     let mut ours = [0u8; 6];
     {
@@ -446,15 +449,16 @@ fn attach(shelf: u16, slot: u8, writable: bool) -> Result<usize, AttachError> {
     let text = trim(&geometry.model);
     let room = (40 - prefix).min(text.len());
     model[prefix..prefix + room].copy_from_slice(&text[..room]);
-    *entry.remote.lock() = Some(remote);
+    *entry.remote.lock() = Some(Box::new(remote));
     LAST_ROUTE.lock()[index] = Some(route);
     let disk = match entry.disk.load(Ordering::Relaxed) {
-        u64::MAX => block::register(block::Backend::Aoe(index), geometry.sectors, model, "aoe"),
-        known => block::set_virtual(known as usize, geometry.sectors, model).then_some(known as usize),
+        0 => block::register(block::Backend::Aoe(index), geometry.sectors, model, "aoe"),
+        known => block::set_virtual(known as usize - 1, geometry.sectors, model).then_some(known as usize - 1),
     };
     match disk {
         Some(disk) => {
-            entry.disk.store(disk as u64, Ordering::Relaxed);
+            entry.disk.store(disk as u64 + 1, Ordering::Relaxed);
+            forget_mount();
             Ok(disk)
         }
         None => {
@@ -473,6 +477,16 @@ fn trim(text: &[u8]) -> &[u8] {
     &text[..end]
 }
 
+/// Drops the ext volume this kernel keeps mounted (`ext4vol::shared`), committing what it has pending first. Attaching a
+/// target again gives it the same disk number, and the kept mount is only re-read when the number changes, so without this
+/// a re-attached disk would list the folders it had before (seen on hardware: a file written on the target meanwhile was
+/// missing until `disks` happened to remount). Under the disk lock, like every other use of that state.
+fn forget_mount() {
+    let _disk = crate::tapefs::lock();
+    let _ = kernel_core::ext4vol::commit_pending();
+    kernel_core::ext4vol::forget_shared();
+}
+
 fn detach_route(index: usize) {
     let mut queue = ENTRIES[index].inbox.lock();
     queue.route = None;
@@ -486,6 +500,7 @@ fn detach(shelf: u16, slot: u8) -> bool {
     for (index, entry) in ENTRIES.iter().enumerate() {
         let matches = entry.inbox.lock().route.is_some_and(|route| route.shelf == shelf && route.slot == slot);
         if matches {
+            forget_mount();
             *entry.remote.lock() = None;
             detach_route(index);
             return true;
@@ -516,7 +531,7 @@ pub fn list(rate: u64) {
             "  attached e{}.{} as disk {}: {} MiB, {}, {}",
             route.shelf,
             route.slot,
-            entry.disk.load(Ordering::Relaxed) + 1,
+            entry.disk.load(Ordering::Relaxed),
             remote.sectors >> 11,
             if remote.writable { "READ-WRITE" } else { "read-only" },
             mac_text(route.mac)

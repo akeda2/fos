@@ -265,8 +265,10 @@ Not done, in the order I would do it:
 1. **Per-controller locking** in the block layer, if measurements on hardware say serial disk access is the limit.
 2. Jumbo frames on this path: `nicctl` drains into 1600-byte buffers and the target assumes MTU 1500.
 3. `vblade` as a peer, and the Linux test on real hardware (a fos machine exporting to a Linux box over a real switch).
-4. The initiator's speed: about two thirds of what the Python benchmark gets from the same target (below). Under KVM
-   the target's worker still sleeps between bursts (about 400 us a wake-up); real hardware should wake it faster.
+4. The initiator's speed: about 41 MB/s between two real machines (below), against 90 MB/s from the disk locally. The
+   target serves 17 frames a wake-up and the initiator takes an interrupt per 2.5 frames: interrupt moderation or
+   polling while a request is in flight would be the next step. Jumbo frames (item 2) would quarter the frame count.
+5. A file as an export (a `Backend` over a contiguous file or ext4 extents): only whole disks are exported now.
 
 ### The initiator (`aoe::initiator`, `kernel-mf/src/aoedisk.rs`)
 
@@ -325,11 +327,25 @@ under the Python benchmark at window 16 14,700 -> 29,700 frames/s (the target's 
 interrupt before, 34 us after). A brief spin before sleeping (300 us) was tried first and gained nothing once wake-ups
 worked, so it is not in.
 
+**On hardware** (2026-11-23): rack exporting its `kvart` disk (ext4 on SATA) read-only through its RTL8168H, aneby
+attaching it over one gigabit switch. `sha256` of a 694 MB file on that volume: **16.9 s, about 41 MB/s**, the same digest
+as rack's local `sha256` (7.7 s, about 90 MB/s, the disk's and hash's own ceiling). 678,533 frames, none resent or
+dropped. Wake-ups cost little on real CPUs: the initiator took a reply 1 us after it arrived (55 us under KVM), the
+target's worker ran 57 us after its frames were queued (about 400 us under KVM), 66 us from a burst sent to its first
+reply. The worker still served only 17 frames a wake-up, and aneby took one interrupt per 2.5 frames, so per-frame
+interrupt and wake-up work is the next limit, not the window.
+
+The same run found a **stale ext4 mount**: the shell keeps one ext volume mounted between commands
+(`ext4vol::shared`) and only re-reads it when the disk number changes. Re-attaching a target gives it its old number
+on purpose, so a file rack had written meanwhile was missing on aneby until `disks` happened to remount. Attach and
+detach now commit and drop that mount (`aoedisk::forget_mount`, under the disk lock).
+
 `make test-mf-aoe-initiator` (two guests on one QEMU segment): discovery and its limits, attach and the size, raw sectors
 read through AoE against the data image (first, last and two others), a refused write on a read-only attach, detach and
 the same disk number on re-attach, `format` of a FOSFS v4 volume over AoE, a 192 KiB file copied on with the host's
 SHA-256, read back after detach and attach, the same file found by the target on its own disk, and a target that stops
-answering failing the read in 5.6 s. Only real hardware can say what the resend timing does on a busy switch.
+answering failing the read in 5.6 s; with the host's `mkfs.ext4`, an ext4 disk changed on the target and re-attached lists
+the new file (it fails without the fix above). Only real hardware can say what the resend timing does on a busy switch.
 
 ## 9. Testing against Linux
 

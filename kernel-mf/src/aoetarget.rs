@@ -79,7 +79,9 @@ struct Slot {
     /// Written since the last flush, and the tick of the last write.
     dirty: AtomicBool,
     last_write: AtomicU64,
-    export: SleepMutex<Option<Export>>,
+    /// Boxed so that `None` is a null pointer: an `Option<Export>` may mark `None` with a non-zero byte, which would
+    /// move all of `SLOTS` (400 KiB of frame buffers) from `.bss` into the kernel image.
+    export: SleepMutex<Option<alloc::boxed::Box<Export>>>,
     stats: Stats,
     /// Moves on every export into this slot, so the worker drops a read buffer that belonged to the previous disk.
     generation: AtomicU64,
@@ -438,7 +440,7 @@ pub fn export(number: usize, writable: bool) -> Result<(), ExportError> {
     }
     slot.dirty.store(false, Ordering::Release);
     slot.generation.fetch_add(1, Ordering::AcqRel);
-    *slot.export.lock() = Some(Export { disk, target });
+    *slot.export.lock() = Some(alloc::boxed::Box::new(Export { disk, target }));
     slot.number.store(number as u8, Ordering::Release);
     ACTIVE.fetch_add(1, Ordering::AcqRel);
     Ok(())

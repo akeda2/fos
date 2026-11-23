@@ -8,13 +8,16 @@ on one QEMU multicast segment (docs/block-sharing.md, "The initiator").
 Checks: discovery lists e5.2 with its limits; attach makes it disk 2 with the right size; raw sectors read through AoE
 match the data image; a write to the read-only attach fails without touching the wire; then, with the export rw and the
 attach rw: a FOSFS v4 volume made over the network, a file copied onto it with the host's SHA-256, read back after a
-detach and attach (same disk number); the target sees the same file on its own disk after unexporting; and a request to a
-target that has gone fails after the resends instead of hanging.
+detach and attach (same disk number); the target sees the same file on its own disk after unexporting; a request to a
+target that has gone fails after the resends instead of hanging; and an ext4 disk (the target's disk 3, when the host has
+mkfs.ext4) attached, changed on the target, detached and attached again lists the new file (the kept ext4 mount is
+dropped on attach; it once kept listing the old folder because the disk number stays the same).
 """
 
 import hashlib
 import os
 import select
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -100,10 +103,22 @@ def main():
         data = os.urandom(SECTORS * 512)
         disk = tmp / "data.img"
         disk.write_bytes(data)
+        # An ext4 disk for the remount check (whole disk, no partition table), if the host can make one.
+        mkfs = shutil.which("mkfs.ext4") or "/usr/sbin/mkfs.ext4"
+        ext = tmp / "ext.img"
+        if Path(mkfs).exists():
+            (tmp / "extroot").mkdir()
+            (tmp / "extroot/a.txt").write_text("first\n")
+            ext.write_bytes(bytes(8 << 20))
+            subprocess.run([mkfs, "-q", "-F", "-L", "remext", "-d", str(tmp / "extroot"), str(ext)], check=True,
+                           capture_output=True)
+        else:
+            ext = None
         big = os.urandom(192 * 1024)
         (tmp / "big.bin").write_bytes(big)
         digest = hashlib.sha256(big).hexdigest()
-        t = Guest("t", build_image(tmp / "t", "aoe-shelf 5\naoe-export 2\n"), [disk], "52:54:00:12:34:e1")
+        t = Guest("t", build_image(tmp / "t", "aoe-shelf 5\naoe-export 2\n"), [disk] + ([ext] if ext else []),
+                  "52:54:00:12:34:e1")
         i = Guest("i", build_image(tmp / "i", "", [("big.bin", tmp / "big.bin")]), [], "52:54:00:12:34:e2")
         try:
             for guest in (t, i):
@@ -174,6 +189,23 @@ def main():
                   text[-400:])
             ok, text = i.command("aoe", "attached e5.2", 20)
             check(ok and "1 failed" in text, "and counts it as failed", text[-600:])
+
+            # An ext4 volume changed on the target while attached here: after detach and attach the new file shows.
+            if ext is None:
+                print("SKIP: no mkfs.ext4, so no ext4 remount check")
+            else:
+                ok, text = t.command("aoe export 3", "read-only", 20)
+                ok, text = i.command("aoe attach 5.3", "is disk 3", 30)
+                check(ok, "the ext4 disk attaches as disk 3", text[-400:])
+                ok, text = i.command("ls ext3/", "a.txt", 30)
+                check(ok and "b.txt" not in text, "its folder lists a.txt", text[-400:])
+                ok, text = t.command("cp ext3/a.txt ext3/b.txt", "fos", 30)
+                ok, text = t.command("ls ext3/", "b.txt", 30)
+                check(ok, "the target writes b.txt on its own disk", text[-400:])
+                ok, text = i.command("aoe detach 5.3", "detached", 20)
+                ok, text = i.command("aoe attach 5.3", "is disk 3", 30)
+                ok, text = i.command("ls ext3/", "b.txt", 30)
+                check(ok, "after detach and attach the initiator lists b.txt (no stale ext4 mount)", text[-400:])
         finally:
             for guest in (t, i):
                 guest.kill()
