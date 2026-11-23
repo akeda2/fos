@@ -332,8 +332,8 @@ attaching it over one gigabit switch. `sha256` of a 694 MB file on that volume: 
 as rack's local `sha256` (7.7 s, about 90 MB/s, the disk's and hash's own ceiling). 678,533 frames, none resent or
 dropped. Wake-ups cost little on real CPUs: the initiator took a reply 1 us after it arrived (55 us under KVM), the
 target's worker ran 57 us after its frames were queued (about 400 us under KVM), 66 us from a burst sent to its first
-reply. The worker still served only 17 frames a wake-up, and aneby took one interrupt per 2.5 frames, so per-frame
-interrupt and wake-up work is the next limit, not the window.
+reply. The worker served only 17 frames a wake-up and aneby took one interrupt per 2.5 frames, which looked like the
+next limit; the raw reads below showed it was the window and the RTL8168 instead.
 
 **Raw reads and the NICs** (`readspeed diskN [MIB] [KIB]`, new: the block layer only, no file system, no hashing).
 Most of the 16.9 s above was not the network: rack's `kvart` reads 456 MB/s locally, so its 90 MB/s `sha256` was the
@@ -343,6 +343,7 @@ hash, and `sha256` reads and hashes in turn. Raw over AoE, 1 MiB requests:
 | --- | --- | --- | --- |
 | RTL8168H, doorbell per frame | 91 MB/s | | 8 us, 4 us |
 | RTL8168H, deferred doorbell | 91 MB/s | 90 MB/s | 5 us, 1 us |
+| RTL8168H, also max read request 4096 | | 113 MB/s | |
 | I350 | 106 MB/s | 113 MB/s | 4 us, 0 us |
 
 Gigabit carries at most about 118 MB/s of 1 KiB AoE payload, so through the I350 at window 64 the link is about 96% used,
@@ -353,12 +354,18 @@ it arrived. What mattered:
   the wire idle; 64 hides it. The target now advertises a 64-frame queue (it shares it between initiators).
 - **The RTL8168's doorbell.** Its `TPPOLL` is an I/O-port write, non-posted on PCIe, about 4 us a frame. It now has
   `send_deferred` and `kick` like the e1000 family (one doorbell per burst, at most 8 frames held back; a frame that
-  finds its slot still owned rings first). That freed rack's CPU but not the link: this 8168H path stays at 90 MB/s at
-  either window, with no drops or errors counted. All of rack's NICs are on the same switch as aneby, so the limit is
-  the 8168H or its driver (its transmit ring is 32 descriptors; it also carries the `web`, `smb` and `ssh` virtual
-  NICs, which put it in promiscuous mode).
-- `sha256` of the 694 MB file through the I350 at window 64: 15.7 s (16.9 before), about half of it reading and half
-  hashing.
+  finds its slot still owned rings first). That freed rack's CPU but not the link, and neither did removing the
+  card's virtual NICs (`vnic del`).
+- **The RTL8168's PCIe read requests.** At 90 MB/s each 1 KiB frame took 11.25 us against 8.7 us of wire time: the
+  card spends the difference fetching the frame by DMA, and the firmware had left Max_Read_Request_Size at 512 bytes
+  (`pci 04:00.0`, Device Control 0x2010; `pci BB:DD.F` now dumps all 256 bytes, so the PCIe capability shows). The
+  driver sets 4096, as Linux's r8169 did (`rtl_tx_performance_tweak`): 113 MB/s, the same as the I350. ASPM was already
+  off (Link Control 0x0140).
+- **The RTL8168's transmit ring**, 32 -> 256 descriptors (r8169's size): the rate is the same, but with 32 `send` found
+  the ring full 493,366 times in 1.3 million frames and spun for the card with the NIC lock held; with 256, never
+  (`nic` shows the count).
+- `sha256` of the 694 MB file at window 64: 15.7 s through the I350, 14.6 s through the 8168H after the fixes (16.9
+  before), about half of it reading and half hashing.
 
 `aoe attach SHELF.SLOT [rw] MAC` picks which of a target's NICs to use; without it the first answer wins. Attach
 matches a target by shelf.slot, so the same disk cannot be attached twice through two NICs, and it keeps its disk

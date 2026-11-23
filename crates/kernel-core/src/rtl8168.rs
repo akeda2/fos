@@ -141,7 +141,11 @@ const DESCRIPTOR_BYTES: usize = 16;
 /// Deep enough to ride out a consumer that is off the CPU for a few milliseconds while the peer bursts a full TCP window
 /// (a 64-entry ring, 0.8 ms at 1 Gb/s, overflowed under an SFTP upload and wedged the receiver).
 const RX_COUNT: usize = 256;
-const TX_COUNT: usize = 32;
+/// 256 like Linux's r8169 (`NUM_TX_DESC`). 32 was enough for one frame at a time, but the AoE target keeps up to 64
+/// replies of 1 KiB in flight per initiator, and a burst larger than the ring makes `send` spin for the card with the NIC
+/// lock held (every interface waits). Rack's 8168H serving AoE at 113 MB/s: 32 entries found full 493,366 times in about
+/// 1.3 million frames, 256 never; the rate was the same.
+const TX_COUNT: usize = 256;
 /// The most frames `send_deferred` queues before it rings the doorbell itself: a quarter of the ring, so the ring never
 /// fills with frames the card was not told about (the AoE target kicks every 8 anyway).
 const DEFER_LIMIT: usize = 8;
@@ -157,6 +161,22 @@ pub enum Error {
     NotResponding,
     ResetTimedOut,
     OutOfMemory,
+}
+
+/// Raises the card's PCI Express Max_Read_Request_Size (Device Control bits 14:12, at the PCIe capability + 8) to 4096
+/// bytes; returns the size now set, 0 when there is no PCIe capability. To send a frame the card reads it from RAM by DMA,
+/// in requests of at most this size, and the fetch costs time the wire is not used: on rack's 8168H (the firmware left
+/// 512 bytes) a 1 KiB AoE reply took 11.25 us against 8.7 us of wire time, and raw AoE reads through it stayed at
+/// 90 MB/s; at 4096 they reach 113 MB/s, as through the machine's I350 (about 96% of gigabit for 1 KiB payloads). Linux's
+/// r8169 raised the same field to 4096 on these chips (`rtl_tx_performance_tweak`). A read request may be
+/// larger than Max_Payload_Size; completions are split by the root port as the spec allows, so this is safe on any port.
+/// Device Status shares the dword and its bits clear when written as 1, so its half is written as zeros.
+fn raise_read_request(device: &pci::Device) -> u32 {
+    let Some(capability) = device.find_capability(0x10) else { return 0 };
+    let control = device.read32(capability + 8) & 0xffff;
+    let control = (control & !(0x7 << 12)) | (5 << 12);
+    device.write32(capability + 8, control);
+    128 << ((device.read32(capability + 8) >> 12) & 0x7)
 }
 
 fn read8(base: u16, register: u16) -> u8 {
@@ -224,6 +244,10 @@ pub struct Rtl8168 {
     pub frames_sent: u64,
     pub frames_dropped_no_link: u64,
     pub recoveries: u32,
+    /// The PCI Express Max_Read_Request_Size in bytes after `raise_read_request` (0: no PCIe capability).
+    pub read_request: u32,
+    /// Times `send` found its next descriptor still the card's (the ring full) and had to wait.
+    pub tx_ring_full: u64,
     recovery_pending: bool,
     /// Tick at which `receive` first found the ring empty with an overflow cause still latched (0: not seen).
     stall_since: u64,
@@ -261,6 +285,7 @@ impl Rtl8168 {
         // Memory decoding is not needed (the I/O BAR is used) but I/O decoding and bus mastering are.
         let command = device.read32(4);
         device.write32(4, (command & 0xffff) | 0x5);
+        let read_request = raise_read_request(device);
         let io_base = device.io_bar(0).ok_or(Error::NoIoBar)?;
         let tx_config = read32(io_base, REG_TXCONFIG);
         if tx_config == 0xffff_ffff {
@@ -302,6 +327,8 @@ impl Rtl8168 {
             frames_sent: 0,
             frames_dropped_no_link: 0,
             recoveries: 0,
+            read_request,
+            tx_ring_full: 0,
             recovery_pending: false,
             stall_since: 0,
             link_checks: 0,
@@ -431,6 +458,8 @@ impl Rtl8168 {
             ),
             None => crate::println!("   rtl8168: chip version {:#05x}, no link, {} recoveries", self.version, self.recoveries),
         }
+        crate::println!("   rtl8168: transmit ring ({TX_COUNT}) found full {} time(s)", self.tx_ring_full);
+        crate::println!("   rtl8168: PCIe max read request {} bytes", self.read_request);
     }
 
     /// `nic regs`: the registers that matter when a link or interrupt misbehaves, and the ring
@@ -598,9 +627,12 @@ impl Rtl8168 {
         }
         let ring = self.rings + TX_RING_OFFSET;
         let index = self.tx_next;
-        if self.deferred != 0 && read_opts1(ring, index) & DESC_OWN != 0 {
-            // The slot is still the card's: it may be waiting for frames it was never told about, so tell it first.
-            self.kick();
+        if read_opts1(ring, index) & DESC_OWN != 0 {
+            self.tx_ring_full += 1;
+            if self.deferred != 0 {
+                // The slot is still the card's: it may be waiting for frames it was never told about, so tell it first.
+                self.kick();
+            }
         }
         for _ in 0..1_000_000u32 {
             if read_opts1(ring, index) & DESC_OWN == 0 {

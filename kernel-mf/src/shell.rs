@@ -708,7 +708,8 @@ fn pci_inspect<'a>(mut words: impl Iterator<Item = &'a str>) {
     };
     println!("{:04x}:{:04x} class {:02x}{:02x}{:02x} rev {:02x}", device.vendor, device.id, device.class, device.subclass, device.interface, device.revision);
     println!("subsystem {:04x}:{:04x}, command/status {:08x}, interrupt line {}", pci::read32(bus, slot, function, 0x2e) & 0xffff, pci::read32(bus, slot, function, 0x2c) >> 16, device.read32(4), device.interrupt_line());
-    for row in 0..8u8 {
+    // All 256 bytes of the standard space: capabilities such as PCI Express (link control, ASPM) often sit above 0x80.
+    for row in 0..16u8 {
         let mut line = alloc::format!("{:02x}:", row * 16);
         for column in 0..4 {
             line += &alloc::format!(" {:08x}", device.read32(row * 16 + column * 4));
