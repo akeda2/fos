@@ -111,7 +111,7 @@ def main():
                     raise SystemExit(f"{guest.name} never reached the prompt: {guest.log[-2000:]!r}")
 
             ok, text = i.command("aoe discover", "e5.2", 20)
-            check(ok and "52:54:00:12:34:e1" in text and "2 sector(s) a frame, bufcount 16" in text,
+            check(ok and "52:54:00:12:34:e1" in text and "2 sector(s) a frame, bufcount 32" in text,
                   "discover lists e5.2 with the target's MAC and limits", text[-600:])
             ok, text = i.command("aoe attach 5.2", "is disk 2", 30)
             check(ok and "8 MiB, read-only" in text, "attach makes it disk 2, 8 MiB, read-only", text[-600:])

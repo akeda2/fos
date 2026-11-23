@@ -419,6 +419,11 @@ pub fn export(number: usize, writable: bool) -> Result<(), ExportError> {
     let slot = &SLOTS[index];
     let mut target = Target::new(shelf(), number as u8, [0; 6], MTU);
     target.read_only = !writable;
+    // What the queue holds (the crate's default says 16). An initiator that keeps 32 in flight leaves the worker the next
+    // frames queued when it ends a batch, instead of the two sides taking turns: our initiator under KVM wrote 17.0 ->
+    // 20.9 MiB/s and read 15.5 -> 19.5. More initiators than one share the queue; a frame it has no room for is dropped
+    // and resent, as before.
+    target.bufcount = QUEUE as u16;
     if let Some(info) = block::get(disk) {
         let model = core::str::from_utf8(&info.model).unwrap_or("").trim();
         aoe::set_text(&mut target.model, model.as_bytes());

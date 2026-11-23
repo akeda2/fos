@@ -19,7 +19,9 @@
 //! that needs the disk lock the waiting caller may hold.
 //!
 //! Requests to one remote are serial (its `SleepMutex`); each keeps up to `window` frames in flight, which is where the
-//! speed comes from.
+//! speed comes from. Running requests side by side would gain little: `cp` and `sha256` ask for 1 MiB at a time, about
+//! 1000 frames, so a request's empty start and draining end are a few percent of it. What counts is that the window is
+//! larger than what the target's worker serves in one wake-up (measured: docs/block-sharing.md, "Speed").
 
 use crate::sched::{self, SleepMutex};
 use crate::sync::SpinLock;
@@ -31,10 +33,10 @@ use kernel_core::{nic, nicctl};
 
 const MAX_REMOTES: usize = 4;
 /// Replies a remote's queue holds: above the largest window, so a full window of replies is never dropped here.
-const QUEUE: usize = 32;
+const QUEUE: usize = 64;
 const FRAME: usize = 1600;
 /// The most frames in flight per request, whatever the target's `bufcount` says (and never more than the queue holds).
-const MAX_WINDOW: usize = 16;
+const MAX_WINDOW: usize = 32;
 const TIMEOUT_TICKS: u64 = 2;
 const MAX_TRIES: u8 = 8;
 /// How long `aoe discover` listens for Query Config replies.

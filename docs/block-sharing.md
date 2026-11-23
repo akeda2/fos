@@ -265,9 +265,8 @@ Not done, in the order I would do it:
 1. **Per-controller locking** in the block layer, if measurements on hardware say serial disk access is the limit.
 2. Jumbo frames on this path: `nicctl` drains into 1600-byte buffers and the target assumes MTU 1500.
 3. `vblade` as a peer, and the Linux test on real hardware (a fos machine exporting to a Linux box over a real switch).
-4. The initiator's speed: about half of what the Python benchmark gets from the same target (below). Requests are serial
-   per remote disk, so each request starts with an empty window and ends draining it; several requests in flight, or
-   read-ahead in the initiator, would keep the target fed.
+4. The initiator's speed: about two thirds of what the Python benchmark gets from the same target (below). Under KVM
+   the target's worker still sleeps between bursts (about 400 us a wake-up); real hardware should wake it faster.
 
 ### The initiator (`aoe::initiator`, `kernel-mf/src/aoedisk.rs`)
 
@@ -294,7 +293,7 @@ aoe                           also lists the attached disks: NIC, sectors a fram
   initiator's part only copies the reply into the queue of the remote it is from and wakes it. With a polled NIC (no
   interrupt, so `net-rx` never runs for it) the waiter drains the NICs itself every tick.
 - **Time** is in ticks (10 ms): first resend after 2 ticks, 8 sends in all, so a target that has gone fails a request
-  after about 5 s (5.6 s measured) instead of hanging the caller. The window is the target's `bufcount`, at most 16;
+  after about 5 s (5.6 s measured) instead of hanging the caller. The window is the target's `bufcount`, at most 32;
   sectors per frame the least of what the target advertises, what our MTU carries and the 1600-byte reply buffer.
 - **Safety.** Read-only unless `rw` (a write then fails here, before the wire). A target with one of this machine's own
   MACs is refused: that is our own export, whose worker needs the disk lock the waiting caller may hold. Nothing stops two
@@ -307,6 +306,15 @@ file onto a FOSFS volume on the attached disk **15.5 MiB/s**, `sha256` of it rea
 initiator against the same target in the same setup reaches 29,700 frames/s (30 MB/s) at window 16. The initiator's
 counters (`aoe`): about 380 us from a burst sent to its first reply, about 55 us from a reply's arrival to the request
 taking it.
+
+**Window 32.** The requests are large (`cp` and `sha256` ask for 1 MiB, about 1000 frames), so running several at once
+would gain little. The cost was that the two sides took turns: the initiator sent 16 frames, the target's worker woke
+(about 300 us under KVM), served 16 and slept, and the initiator woke for the replies and sent 16 more. The target's
+queue holds 32 frames per export but it advertised the crate's `bufcount` of 16; it now advertises 32, and the
+initiator keeps up to 32 in flight (its reply queue holds 64), so the worker more often finds the next frames already
+queued. With a 16 MiB file: window 16 wrote 17.0 and read 15.5 MiB/s (1908 worker wake-ups), window 32 20.9 and 19.5
+(850), window 64 21.6 and 20.9 (256 wake-ups, but 4 frames resent and twice the queue memory), so 32 it is. Linux's `aoe`
+module takes the advertised `bufcount` as its window too.
 
 Measuring it found a **scheduler bug that cost every mf machine**: CPU 0 had no registered idle thread (its boot context
 idled by convention only), so the wake IPI never went to CPU 0 and a thread pinned there that another CPU woke waited for
