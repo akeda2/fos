@@ -16,6 +16,7 @@ dropped on attach; it once kept listing the old folder because the disk number s
 
 import hashlib
 import os
+import re
 import select
 import shutil
 import subprocess
@@ -151,6 +152,10 @@ def main():
             check(ok and hex_row(data, 0, 0) in text, "and sector 0 is unchanged", text[-400:])
             ok, text = i.command("aoe", "attached e5.2", 20)
             check(ok and " 0 resent, 0 failed" in text, "the counters show no resends on a clean link", text[-600:])
+            # readspeed's 128 KiB requests continue each other, so all but the first two come from read-ahead.
+            ahead = re.search(r"read ahead (\d+) KiB, of it used (\d+) KiB", text)
+            check(ahead is not None and int(ahead.group(2)) >= 3 * 1024,
+                  f"read-ahead serves sequential reads ({ahead.group(0) if ahead else 'no line'})", text[-600:])
 
             # Writable on both ends.
             ok, text = t.command("aoe unexport 2", "no longer exported", 20)
@@ -172,7 +177,8 @@ def main():
             ok, text = i.command("sha256 @remote/big.bin", digest, 120)
             check(ok, "and again after detach and attach", text[-600:])
             ok, text = i.command("aoe", "attached e5.2", 20)
-            print("        " + "\n        ".join(line.strip() for line in text.splitlines() if "requests" in line or "window" in line))
+            print("        " + "\n        ".join(line.strip() for line in text.splitlines()
+                                             if "requests" in line or "window" in line or "read ahead" in line))
 
             # The target's own view of its disk, once nobody else writes it.
             ok, text = i.command("aoe detach 5.2", "detached", 20)

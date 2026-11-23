@@ -60,13 +60,16 @@ pub fn sector(rest: &str) {
 /// network, for an AoE disk) alone; the request size shows what each request's start and end cost. Read-only. The disk
 /// lock is taken per request, so tapes and the target's workers get in between.
 pub fn readspeed(rest: &str) {
-    const USAGE: &str = "Usage: readspeed diskN [MIB 1-4096] [KIB 4-4096]   (read-only)";
+    const USAGE: &str = "Usage: readspeed diskN [MIB 1-4096] [KIB 4-4096] [US 0-100000]   (read-only)";
     let mut words = rest.split_whitespace();
     let disk = words.next().and_then(|word| word.strip_prefix("disk")).and_then(|digits| digits.parse::<usize>().ok());
     let mib = words.next().map_or(Some(64), |word| word.parse::<u64>().ok());
     let kib = words.next().map_or(Some(1024), |word| word.parse::<usize>().ok());
-    let (Some(disk), Some(mib), Some(kib)) = (disk, mib, kib) else { return println!("{USAGE}") };
-    if disk == 0 || !(1..=4096).contains(&mib) || !(4..=4096).contains(&kib) || kib % 4 != 0 {
+    // Busy work after each request, as a reader that decodes or hashes each block does: shows whether reading goes on
+    // meanwhile (the AoE initiator's read-ahead thread).
+    let work = words.next().map_or(Some(0), |word| word.parse::<u64>().ok());
+    let (Some(disk), Some(mib), Some(kib), Some(work)) = (disk, mib, kib, work) else { return println!("{USAGE}") };
+    if disk == 0 || !(1..=4096).contains(&mib) || !(4..=4096).contains(&kib) || kib % 4 != 0 || work > 100_000 {
         return println!("{USAGE}");
     }
     let Some(sectors) = crate::block::get(disk - 1).map(|info| info.sectors) else {
@@ -87,11 +90,21 @@ pub fn readspeed(rest: &str) {
             return println!("readspeed: disk{disk} sector {lba}: read failed ({error:?}).");
         }
         lba += count as u64;
+        if work > 0 {
+            let until = crate::arch::micros() + work;
+            while crate::arch::micros() < until {
+                core::hint::spin_loop();
+            }
+        }
     }
     let micros = (crate::arch::micros() - begin).max(1);
     let bytes = total * 512;
     println!("disk{disk}: {} MiB in {kib} KiB requests, {}.{:03} s, {} MB/s ({} KB/s)",
         bytes >> 20, micros / 1_000_000, micros / 1000 % 1000, bytes / micros, bytes * 1000 / micros);
+    if work > 0 {
+        let requests = total.div_ceil(per);
+        println!("  of it {} ms of work ({work} us after each of {requests} requests)", requests * work / 1000);
+    }
 }
 
 pub fn mount(rest: &str) {

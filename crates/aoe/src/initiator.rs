@@ -286,6 +286,17 @@ impl Transfer {
     /// whose reply is overdue first (or the failure, when it has had its tries), else a new frame while the window has room.
     /// `data` is the whole write buffer (ignored by the other operations). 0 when there is nothing to send now.
     pub fn next(&mut self, now: u64, to: &Address, data: &[u8], out: &mut [u8]) -> usize {
+        self.next_limited(now, to, data, out, true)
+    }
+
+    /// Frames sent and not yet answered.
+    pub fn in_flight(&self) -> usize {
+        self.slots[..self.window].iter().filter(|slot| slot.busy).count()
+    }
+
+    /// `next`, but a new frame only when `may_start`; an overdue frame is resent either way. Lets several transfers share
+    /// one window (`readahead::ReadAhead`): the caller says whether the shared window has room.
+    pub fn next_limited(&mut self, now: u64, to: &Address, data: &[u8], out: &mut [u8], may_start: bool) -> usize {
         if self.failed.is_some() {
             return 0;
         }
@@ -303,7 +314,7 @@ impl Transfer {
                 return self.build(slot.frame, to, data, out);
             }
         }
-        if self.next < self.frames {
+        if may_start && self.next < self.frames {
             if let Some(index) = (0..self.window).find(|&index| !self.slots[index].busy) {
                 let frame = self.next;
                 self.next += 1;
@@ -318,6 +329,16 @@ impl Transfer {
     /// resent frame or one from another device is ignored and gives false). A read's sectors go into `buffer`, which is
     /// the whole read buffer (512 bytes for Identify).
     pub fn receive(&mut self, to: &Address, response: &Response, buffer: &mut [u8]) -> bool {
+        self.take(to, response, Some(buffer))
+    }
+
+    /// Takes a reply as `receive` does but keeps none of its data: for a transfer the caller has given up on whose frames
+    /// are still in flight (`readahead`), so they are counted as answered without a buffer to put them in.
+    pub fn discard(&mut self, to: &Address, response: &Response) -> bool {
+        self.take(to, response, None)
+    }
+
+    fn take(&mut self, to: &Address, response: &Response, buffer: Option<&mut [u8]>) -> bool {
         if response.source != to.target || response.shelf != to.shelf || response.slot != to.slot || self.failed.is_some() {
             return false;
         }
@@ -342,7 +363,7 @@ impl Transfer {
                 if matches!(self.op, Op::Read | Op::Identify) {
                     if data.len() < bytes {
                         self.failed = Some(Failure::Short);
-                    } else {
+                    } else if let Some(buffer) = buffer {
                         let start = if self.op == Op::Read { (frame * self.per_frame) as usize * SECTOR } else { 0 };
                         buffer[start..start + bytes].copy_from_slice(&data[..bytes]);
                     }

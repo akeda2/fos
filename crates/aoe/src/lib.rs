@@ -1,5 +1,6 @@
 //! ATA over Ethernet, revision 1.0 (ethertype 0x88a2): the frame format, a *target*, the side that serves a disk, and
-//! the *initiator*'s frames and transfer bookkeeping (`initiator`), the side that uses one.
+//! the *initiator*'s frames and transfer bookkeeping (`initiator`), the side that uses one, with its read-ahead
+//! (`readahead`).
 //!
 //! `no_std`, no allocation, no I/O: `Target::handle` takes one received frame, asks a [`Disk`] for sectors and writes
 //! the reply frame into a buffer. The kernel wires `Disk` to its block layer and the frame hook to the NIC; the tests
@@ -22,6 +23,7 @@
 
 pub mod cache;
 pub mod initiator;
+pub mod readahead;
 
 pub const ETHERTYPE: u16 = 0x88a2;
 pub const SECTOR: usize = 512;
@@ -334,3 +336,5 @@ mod tests;
 mod cache_tests;
 #[cfg(test)]
 mod initiator_tests;
+#[cfg(test)]
+mod readahead_tests;

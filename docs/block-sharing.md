@@ -265,10 +265,10 @@ Not done, in the order I would do it:
 1. **Per-controller locking** in the block layer, if measurements on hardware say serial disk access is the limit.
 2. Jumbo frames on this path: `nicctl` drains into 1600-byte buffers and the target assumes MTU 1500.
 3. `vblade` as a peer, and the Linux test on real hardware (a fos machine exporting to a Linux box over a real switch).
-4. Small requests: raw reads in 128 KiB requests reach 88 MB/s against 113 in 1 MiB ones (window 64, through an I350),
-   and ext4 asks for about 122 KB at a time. Read-ahead in the initiator, or requests overlapped across callers, would
-   keep the window full between them. Interrupts are not the limit (below).
-5. A file as an export (a `Backend` over a contiguous file or ext4 extents): only whole disks are exported now.
+4. A file as an export (a `Backend` over a contiguous file or ext4 extents): only whole disks are exported now.
+
+Small requests (128 KiB reads at 90 MB/s against 113 in 1 MiB ones) are done: read-ahead in the initiator, "Read-ahead"
+below.
 
 ### The initiator (`aoe::initiator`, `kernel-mf/src/aoedisk.rs`)
 
@@ -280,7 +280,8 @@ the tapes' `vfs_*` calls use it unchanged. Standard AoE only, so it works agains
 aoe discover                  Query Config on every NIC with a link; lists SHELF.SLOT, MAC, NIC, sectors/frame, bufcount
 aoe attach SHELF.SLOT [rw] [MAC]  IDENTIFY, then a disk number; read-only unless rw; MAC picks the target's NIC
 aoe detach SHELF.SLOT         requests fail from now on; attaching the same target again gives the same disk number
-aoe                           also lists the attached disks: NIC, sectors a frame, window, requests, frames, resends
+aoe                           also lists the attached disks: NIC, sectors a frame, window, requests, frames, resends,
+                              read-ahead fetched and used, what the aoe-ahead thread did
 ```
 
 - **The protocol half** is `crates/aoe/src/initiator.rs`, `no_std` and host-tested against the crate's own `Target` over
@@ -365,7 +366,50 @@ it arrived. What mattered:
   the ring full 493,366 times in 1.3 million frames and spun for the card with the NIC lock held; with 256, never
   (`nic` shows the count).
 - `sha256` of the 694 MB file at window 64: 15.7 s through the I350, 14.6 s through the 8168H after the fixes (16.9
-  before), about half of it reading and half hashing.
+  before). `sha256` reads the whole file into memory and then hashes it, and aneby hashes at about 74 MB/s (a 338 MB
+  local file in 5.3 s, 0.75 s of it reading), so about 9 s of it is hashing whatever the network does.
+
+**Read-ahead** (`crates/aoe/src/readahead.rs`, host-tested, and an `aoe-ahead` thread per attached disk). A lone
+transfer starts with an empty window (a round trip before the first reply) and ends by draining it, and nothing is on
+the wire between two requests: 128 KiB reads made 90 MB/s through the 8168H against 113 in 1 MiB ones.
+
+- A read that continues the previous one, or starts in what was read ahead, also asks for chunks past its end (one
+  window, 64 KiB, each; at most 4, 256 KiB). The read's own frames go first and read-ahead takes the room left in the
+  one shared window. The amount starts at twice the read and doubles with each read of the stream, as Linux's does, so
+  the short sequential runs of `format` and FOSFS metadata fetch a few sectors, not 256 KiB.
+- A read elsewhere (an inode, an extent block) is a plain transfer and leaves the stream alone. Our own writes and
+  flushes drop it, and so does an idle stream after 2 ticks (20-30 ms; the target's cache has the same bound for another
+  host's writes). Read-ahead that failed between reads is dropped and asked for again, not reported as the read's error.
+- **Dropped read-ahead still occupies the target's queue.** Its frames wait in the 64-frame queue the target advertises
+  as its window. A write burst sent straight after them overflowed that queue: under QEMU, 16 resends in
+  `test-mf-aoe-initiator` where there had been none. Dropped transfers with frames in flight are now kept as orphans
+  and still count against the window until their frames are answered or overdue, and a write waits for them first.
+  The test is back to 0 resends, and 5,250 frames against 4,977 without read-ahead.
+- **The `aoe-ahead` thread** drives the read-ahead while no request holds the disk, so a reader that works on each block
+  (decoding, hashing) finds the next one already there. Two bugs found on aneby by counting what the thread did:
+  - It was woken at the end of a request while the caller still held the disk's lock. It found the lock taken, slept to
+    the next tick and missed the reader's pause, and sent a quarter of the read-ahead. It is now woken after the lock is
+    let go.
+  - When it found the lock taken it tried again at once, and took a CPU from the request it waited for (under QEMU,
+    114 resends). It now sleeps until woken.
+
+On hardware (aneby reading rack's `kvart` through the 8168H, `readspeed disk3 256 KIB [US]`, US = microseconds of
+busy work after each request, new):
+
+| Requests | Work after each | Without overlap | Before | With read-ahead |
+| --- | --- | --- | --- | --- |
+| 128 KiB | none | | 90 MB/s | 118 MB/s (2.28 s) |
+| 1 MiB | none | | 113 MB/s | 115 MB/s |
+| 128 KiB | 1 ms | 4.33 s | | 2.58 s |
+| 128 KiB | 2 ms | 6.38 s | | 4.12 s (the work alone is 4.10) |
+| 64 KiB | 1 ms | 6.38 s (2.28 reading) | | 4.14 s (the work alone is 4.10) |
+| 1 MiB | 8 ms | 4.37 s | | 4.14 s |
+
+Gigabit carries about 118 MB/s of 1 KiB payload, so 128 KiB reads now fill the link, and up to 256 KiB a request the
+reading hides behind the reader's work. Larger requests see little gain: read-ahead covers only 256 KiB of each.
+`sha256` is unchanged (14.4 s): it reads the whole file before hashing it, so nothing can overlap (above). `aoe` shows
+how much was read ahead and used, and what the thread did. Not measured: a real tape reading in blocks (`play`, `smbd`
+serving a file).
 
 `aoe attach SHELF.SLOT [rw] MAC` picks which of a target's NICs to use; without it the first answer wins. Attach
 matches a target by shelf.slot, so the same disk cannot be attached twice through two NICs, and it keeps its disk

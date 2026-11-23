@@ -3,11 +3,12 @@
 //! calls use it unchanged. The protocol and the bookkeeping of a transfer are `aoe::initiator`; this is the glue
 //! (docs/block-sharing.md, "The initiator").
 //!
-//! **Threads.** There is none of its own. A block request runs in the caller's thread: it builds the frames, sends them
+//! **Threads.** A block request runs in the caller's thread: it builds the frames, sends them
 //! under the NIC lock (released at once), and sleeps on its remote's key until replies arrive or the next resend is due
 //! (`sched::wait_while_for`). `frame_hook` only copies a reply into the queue of the remote it is from and wakes it, as it
 //! does for the target: no protocol work runs with the NIC lock held. On a machine with a polled NIC (no interrupt, so
-//! `net-rx` never wakes for it) the waiter drains the NICs itself every tick.
+//! `net-rx` never wakes for it) the waiter drains the NICs itself every tick. Between requests an `aoe-ahead` thread per
+//! remote carries on with the read-ahead (below); replies wake it instead of a caller while no request runs.
 //!
 //! **Time** is counted in timer ticks (10 ms): the first resend after `TIMEOUT_TICKS`, doubling, `MAX_TRIES` sends in all
 //! (about 5 s) before the request fails as a device error. A LAN round trip is far below a tick, so this only decides how
@@ -19,14 +20,18 @@
 //! that needs the disk lock the waiting caller may hold.
 //!
 //! Requests to one remote are serial (its `SleepMutex`); each keeps up to `window` frames in flight, which is where the
-//! speed comes from. Running requests side by side would gain little: `cp` and `sha256` ask for 1 MiB at a time, about
-//! 1000 frames, so a request's empty start and draining end are a few percent of it. What counts is that the window is
-//! larger than what the target's worker serves in one wake-up (measured: docs/block-sharing.md, "Speed").
+//! speed comes from, and that the window is larger than what the target's worker serves in one wake-up (measured:
+//! docs/block-sharing.md, "Speed"). Smaller reads (ext4 asks for about 122 KB at a time) would each start with an empty
+//! window and end draining it, and leave the wire idle between them, so a read that continues the previous one also asks
+//! for up to four window-sized chunks past its end (`aoe::readahead`). The `aoe-ahead` thread takes their replies and
+//! sends the rest while the caller works on what it got, and the next read finds them there. Reads elsewhere and every
+//! write or flush leave or drop them as that module explains.
 
 use crate::sched::{self, SleepMutex};
 use crate::sync::SpinLock;
 use crate::{block, net};
-use aoe::initiator::{self, Address, Failure, Kind, Op, Transfer};
+use aoe::initiator::{self, Address, Failure, Kind, Op, Response, Transfer};
+use aoe::readahead::ReadAhead;
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use kernel_core::{nic, nicctl};
@@ -39,10 +44,15 @@ const FRAME: usize = 1600;
 const MAX_WINDOW: usize = 64;
 const TIMEOUT_TICKS: u64 = 2;
 const MAX_TRIES: u8 = 8;
+/// Read-ahead not used for longer than this is dropped (between 20 and 30 ms): the bound on serving sectors another host
+/// has changed since, the same as the target's cache.
+const STALE_TICKS: u64 = 2;
 /// How long `aoe discover` listens for Query Config replies.
 const DISCOVER_TICKS: u64 = 50;
 const MAX_FOUND: usize = 16;
 const WAKE_KEY: usize = 0xa0e1_0000;
+/// What the `aoe-ahead` thread of each remote sleeps on.
+const AHEAD_KEY: usize = 0xa0e2_0000;
 
 /// The fixed half of an attached disk, which the hook reads to route replies.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -73,6 +83,9 @@ struct Remote {
     /// Where frames are built and replies copied to before they are read (on the heap: 3 KiB is a lot for a caller's stack).
     out: Box<[u8; FRAME]>,
     rx: Box<[u8; FRAME]>,
+    /// Sequential reads' read-ahead (`aoe::readahead`) and the chunks it fills (256 KiB at 2 sectors a frame, window 64).
+    ahead: Box<ReadAhead>,
+    store: Box<[u8]>,
 }
 
 struct Entry {
@@ -80,6 +93,16 @@ struct Entry {
     /// `None` while the entry is free or detached; held for a whole request.
     /// Boxed so that `None` is a null pointer (an `Option<Remote>` may mark it with a non-zero byte, see `disk`).
     remote: SleepMutex<Option<Box<Remote>>>,
+    /// A request is running (its caller takes the replies); otherwise the `aoe-ahead` thread does. `ahead_started`: that
+    /// thread exists (one per entry, started at the first attach, kept).
+    busy: AtomicBool,
+    ahead_started: AtomicBool,
+    /// A block request holds `remote`: the thread sleeps until it is let go (`with_remote` wakes it), never spins on it.
+    held: AtomicBool,
+    /// The `aoe-ahead` thread: times it ran, found the remote taken, and frames it sent.
+    ahead_runs: AtomicU64,
+    ahead_locked_out: AtomicU64,
+    ahead_frames: AtomicU64,
     /// The block-layer index this entry was registered as, plus one (it keeps it across detach and attach); 0 for none.
     /// Zero rather than `u64::MAX` for "none" keeps `ENTRIES` all zeros, so its 400 KiB of buffers sit in `.bss` and not
     /// in the kernel image.
@@ -108,6 +131,12 @@ impl Entry {
         Entry {
             inbox: SpinLock::new(Queue { route: None, arrived_at: 0, frames: [[0; FRAME]; QUEUE], lengths: [0; QUEUE], head: 0, count: 0, dropped: 0 }),
             remote: SleepMutex::new(None),
+            busy: AtomicBool::new(false),
+            ahead_started: AtomicBool::new(false),
+            held: AtomicBool::new(false),
+            ahead_runs: AtomicU64::new(0),
+            ahead_locked_out: AtomicU64::new(0),
+            ahead_frames: AtomicU64::new(0),
             disk: AtomicU64::new(0),
             requests: AtomicU64::new(0),
             frames: AtomicU64::new(0),
@@ -204,7 +233,8 @@ pub fn reply(nic: usize, frame: &[u8], wake: bool) {
         }
         drop(queue);
         if wake {
-            sched::wake_all(WAKE_KEY + index);
+            let busy = entry.busy.load(Ordering::Acquire);
+            sched::wake_all(if busy { WAKE_KEY } else { AHEAD_KEY } + index);
         }
         return;
     }
@@ -232,54 +262,91 @@ fn is_empty(entry: &Entry) -> bool {
     entry.inbox.lock().count == 0
 }
 
-/// Runs one transfer on remote `index` to its end, in the calling thread. `buffer` takes what a read or IDENTIFY returns,
-/// `data` is what a write sends.
-fn run(index: usize, remote: &mut Remote, op: Op, lba: u64, sectors: u64, buffer: &mut [u8], data: &[u8]) -> Result<(), Failure> {
+/// What `drive` runs to its end: one transfer, or a read with its read-ahead.
+trait Work {
+    fn next(&mut self, now: u64, to: &Address, out: &mut [u8]) -> usize;
+    fn receive(&mut self, to: &Address, response: &Response) -> bool;
+    fn finished(&self) -> Option<Result<(), Failure>>;
+    fn deadline(&self) -> Option<u64>;
+    /// Resends so far, for the counters.
+    fn resent(&self) -> u64;
+}
+
+struct Single<'a> {
+    transfer: Transfer,
+    buffer: &'a mut [u8],
+    data: &'a [u8],
+}
+
+impl Work for Single<'_> {
+    fn next(&mut self, now: u64, to: &Address, out: &mut [u8]) -> usize {
+        self.transfer.next(now, to, self.data, out)
+    }
+    fn receive(&mut self, to: &Address, response: &Response) -> bool {
+        self.transfer.receive(to, response, self.buffer)
+    }
+    fn finished(&self) -> Option<Result<(), Failure>> {
+        self.transfer.finished()
+    }
+    fn deadline(&self) -> Option<u64> {
+        self.transfer.deadline()
+    }
+    fn resent(&self) -> u64 {
+        u64::from(self.transfer.resent)
+    }
+}
+
+struct Streamed<'a> {
+    ahead: &'a mut ReadAhead,
+    buffer: &'a mut [u8],
+    store: &'a mut [u8],
+}
+
+impl Work for Streamed<'_> {
+    fn next(&mut self, now: u64, to: &Address, out: &mut [u8]) -> usize {
+        self.ahead.next(now, to, out)
+    }
+    fn receive(&mut self, to: &Address, response: &Response) -> bool {
+        self.ahead.receive(to, response, self.buffer, self.store)
+    }
+    fn finished(&self) -> Option<Result<(), Failure>> {
+        self.ahead.finished()
+    }
+    fn deadline(&self) -> Option<u64> {
+        self.ahead.deadline()
+    }
+    fn resent(&self) -> u64 {
+        self.ahead.resent()
+    }
+}
+
+/// Tags for a transfer of `frames` frames; one spare, so the next transfer's range never touches this one's.
+fn take_tags(frames: u64) -> u32 {
+    TAGS.fetch_add(frames as u32 + 1, Ordering::Relaxed)
+}
+
+/// Runs `work` on remote `index` to its end, in the calling thread. `fresh` empties the reply queue first (replies to an
+/// earlier request that came after it ended); a read with read-ahead keeps it, since replies to its chunks wait there.
+fn drive(index: usize, nic: usize, address: &Address, out: &mut [u8; FRAME], rx: &mut [u8; FRAME], work: &mut dyn Work, fresh: bool) -> Result<(), Failure> {
     let entry = &ENTRIES[index];
-    let base = TAGS.fetch_add(initiator::frames_for(op, sectors, remote.per_frame) as u32 + 1, Ordering::Relaxed);
-    let mut transfer = Transfer::new(op, lba, sectors, remote.per_frame, remote.window, base, TIMEOUT_TICKS, MAX_TRIES);
-    // Replies to an earlier request that came after it ended: their tags cannot match, but they would sit in the queue.
-    entry.inbox.lock().count = 0;
+    if fresh {
+        entry.inbox.lock().count = 0;
+    }
     entry.requests.fetch_add(1, Ordering::Relaxed);
+    entry.busy.store(true, Ordering::Release);
+    let resent_before = work.resent();
     let polled = !nic::all_interrupt_driven();
     let result = loop {
-        loop {
-            let length = pop(entry, &mut remote.rx);
-            if length == 0 {
-                break;
-            }
-            if let Some(response) = initiator::parse(&remote.rx[..length]) {
-                transfer.receive(&remote.address, &response, buffer);
-            }
-        }
-        if let Some(result) = transfer.finished() {
+        take_replies(entry, address, rx, work);
+        if let Some(result) = work.finished() {
             break result;
         }
         let now = crate::arch::ticks();
-        {
-            let _nics = net::lock_nics();
-            let mut sent = false;
-            loop {
-                let length = transfer.next(now, &remote.address, data, &mut remote.out[..]);
-                if length == 0 {
-                    break;
-                }
-                nicctl::nic_send_deferred(remote.nic, &remote.out[..length]);
-                entry.frames.fetch_add(1, Ordering::Relaxed);
-                sent = true;
-            }
-            if sent {
-                nicctl::nic_kick(remote.nic);
-                entry.sent_at.store(crate::cpu::cycles(), Ordering::Relaxed);
-            }
-            if polled {
-                nicctl::drain_nics_to_fifo();
-            }
-        }
-        if transfer.finished().is_some() {
+        send_frames(entry, nic, address, out, work, now, polled);
+        if work.finished().is_some() {
             continue;
         }
-        let wait = if polled { 1 } else { transfer.deadline().map_or(1, |due| due.saturating_sub(now)) };
+        let wait = if polled { 1 } else { work.deadline().map_or(1, |due| due.saturating_sub(now)) };
         if !is_empty(entry) {
             continue;
         }
@@ -291,24 +358,129 @@ fn run(index: usize, remote: &mut Remote, op: Op, lba: u64, sectors: u64, buffer
             entry.timer_wakes.fetch_add(1, Ordering::Relaxed);
         }
     };
-    entry.resent.fetch_add(u64::from(transfer.resent), Ordering::Relaxed);
+    entry.resent.fetch_add(work.resent().saturating_sub(resent_before), Ordering::Relaxed);
     if result.is_err() {
         entry.failed.fetch_add(1, Ordering::Relaxed);
     }
+    entry.busy.store(false, Ordering::Release);
     result
 }
 
+/// Hands every queued reply to `work`.
+fn take_replies(entry: &Entry, address: &Address, rx: &mut [u8; FRAME], work: &mut dyn Work) {
+    loop {
+        let length = pop(entry, rx);
+        if length == 0 {
+            return;
+        }
+        if let Some(response) = initiator::parse(&rx[..length]) {
+            work.receive(address, &response);
+        }
+    }
+}
+
+/// Sends what `work` has to send at `now` under the NIC lock, with one doorbell for the burst.
+fn send_frames(entry: &Entry, nic: usize, address: &Address, out: &mut [u8; FRAME], work: &mut dyn Work, now: u64, polled: bool) {
+    let _nics = net::lock_nics();
+    let mut sent = false;
+    loop {
+        let length = work.next(now, address, &mut out[..]);
+        if length == 0 {
+            break;
+        }
+        nicctl::nic_send_deferred(nic, &out[..length]);
+        entry.frames.fetch_add(1, Ordering::Relaxed);
+        sent = true;
+    }
+    if sent {
+        nicctl::nic_kick(nic);
+        entry.sent_at.store(crate::cpu::cycles(), Ordering::Relaxed);
+    }
+    if polled {
+        nicctl::drain_nics_to_fifo();
+    }
+}
+
+/// The `aoe-ahead` thread of entry `index`: while no request runs, it takes the replies to read-ahead and sends the
+/// rest of it, so a reader that works on what it got (a tape decoding, a hash over each block) finds the next sectors
+/// already here. It only takes the remote with `try_lock` and sleeps while a request holds it (`with_remote` wakes it
+/// when it lets go): spinning on it took a CPU from the very request it waited for, and under QEMU frames timed out.
+/// Otherwise it sleeps until a reply comes, a tick at most while read-ahead is in flight (for resends).
+extern "C" fn ahead_thread(index: usize) {
+    let entry = &ENTRIES[index];
+    loop {
+        let Some(mut guard) = entry.remote.try_lock() else {
+            entry.ahead_locked_out.fetch_add(1, Ordering::Relaxed);
+            sched::wait_while_for(AHEAD_KEY + index, 1, || entry.held.load(Ordering::Acquire));
+            continue;
+        };
+        entry.ahead_runs.fetch_add(1, Ordering::Relaxed);
+        let active = match guard.as_mut() {
+            None => false,
+            Some(remote) => {
+                let Remote { nic, address, out, rx, ahead, store, .. } = &mut **remote;
+                let mut work = Streamed { ahead, buffer: &mut [], store };
+                take_replies(entry, address, rx, &mut work);
+                if work.ahead.active() {
+                    let polled = !nic::all_interrupt_driven();
+                    let before = entry.frames.load(Ordering::Relaxed);
+                    send_frames(entry, *nic, address, out, &mut work, crate::arch::ticks(), polled);
+                    entry.ahead_frames.fetch_add(entry.frames.load(Ordering::Relaxed) - before, Ordering::Relaxed);
+                }
+                work.ahead.active()
+            }
+        };
+        drop(guard);
+        let ticks = if active { 1 } else { 100 };
+        sched::wait_while_for(AHEAD_KEY + index, ticks, || is_empty(entry) || entry.held.load(Ordering::Acquire));
+    }
+}
+
+/// Runs one transfer (a write, a flush, IDENTIFY) on remote `index`. `buffer` takes what IDENTIFY returns, `data` is
+/// what a write sends. Read-ahead is dropped first, since after our own write it could hold old sectors, and its frames
+/// still in flight are waited for: they sit in the target's queue, and a write burst on top of them would overflow it
+/// (seen under QEMU as resends after every switch from reading to writing).
+fn run(index: usize, remote: &mut Remote, op: Op, lba: u64, sectors: u64, buffer: &mut [u8], data: &[u8]) -> Result<(), Failure> {
+    remote.ahead.drain();
+    if remote.ahead.finished().is_none() {
+        let Remote { nic, address, out, rx, ahead, store, .. } = &mut *remote;
+        // Never fails: an orphan whose reply is lost is let go at its deadline.
+        let _ = drive(index, *nic, address, out, rx, &mut Streamed { ahead, buffer: &mut [], store }, false);
+    }
+    remote.ahead.finish(&mut [], &remote.store);
+    let transfer = Transfer::new(op, lba, sectors, remote.per_frame, remote.window, take_tags(initiator::frames_for(op, sectors, remote.per_frame)), TIMEOUT_TICKS, MAX_TRIES);
+    let mut work = Single { transfer, buffer, data };
+    drive(index, remote.nic, &remote.address, &mut remote.out, &mut remote.rx, &mut work, true)
+}
+
 /// The remote behind `Backend::Aoe(index)`, locked for one request; `Device` when it is detached.
+/// Afterwards the remote is the `aoe-ahead` thread's: it is woken once the lock is free (woken before, it found the remote
+/// taken and slept until the next tick, missing the reader's whole pause: seen on aneby as a quarter of the read-ahead
+/// sent by the thread).
 fn with_remote<T>(index: usize, work: impl FnOnce(&mut Remote) -> Result<T, block::Error>) -> Result<T, block::Error> {
-    let mut guard = ENTRIES.get(index).ok_or(block::Error::NoSuchDisk)?.remote.lock();
-    let remote = guard.as_mut().ok_or(block::Error::Device)?;
-    work(remote)
+    let entry = ENTRIES.get(index).ok_or(block::Error::NoSuchDisk)?;
+    let result = {
+        let mut guard = entry.remote.lock();
+        entry.held.store(true, Ordering::Release);
+        let result = guard.as_deref_mut().ok_or(block::Error::Device).and_then(work);
+        entry.held.store(false, Ordering::Release);
+        result
+    };
+    sched::wake_all(AHEAD_KEY + index);
+    result
 }
 
 pub fn read(index: usize, lba: u64, buffer: &mut [u8]) -> Result<(), block::Error> {
     with_remote(index, |remote| {
         let sectors = (buffer.len() / 512) as u64;
-        run(index, remote, Op::Read, lba, sectors, buffer, &[]).map_err(|_| block::Error::Device)
+        let Remote { nic, address, out, rx, ahead, store, .. } = remote;
+        ahead.begin(lba, sectors, crate::arch::ticks(), &mut take_tags);
+        let result = drive(index, *nic, address, out, rx, &mut Streamed { ahead, buffer: &mut *buffer, store }, false);
+        match result {
+            Ok(()) => ahead.finish(buffer, store),
+            Err(_) => ahead.clear(),
+        }
+        result.map_err(|_| block::Error::Device)
     })
 }
 
@@ -432,6 +604,8 @@ fn attach(shelf: u16, slot: u8, writable: bool, via: Option<[u8; 6]>) -> Result<
         writable,
         out: Box::new([0; FRAME]),
         rx: Box::new([0; FRAME]),
+        ahead: Box::new(ReadAhead::new(per_frame, window, TIMEOUT_TICKS, MAX_TRIES, 0, STALE_TICKS)),
+        store: Box::new([]),
     };
     entry.inbox.lock().route = Some(route);
     update_wanted();
@@ -449,6 +623,8 @@ fn attach(shelf: u16, slot: u8, writable: bool, via: Option<[u8; 6]>) -> Result<
         }
     };
     remote.sectors = geometry.sectors;
+    *remote.ahead = ReadAhead::new(per_frame, window, TIMEOUT_TICKS, MAX_TRIES, geometry.sectors, STALE_TICKS);
+    remote.store = alloc::vec![0u8; remote.ahead.store_bytes()].into_boxed_slice();
     // "e5.2 " and as much of the target's model as fits.
     let mut model = [b' '; 40];
     let name = alloc::format!("e{shelf}.{slot} ");
@@ -467,6 +643,10 @@ fn attach(shelf: u16, slot: u8, writable: bool, via: Option<[u8; 6]>) -> Result<
         Some(disk) => {
             entry.disk.store(disk as u64 + 1, Ordering::Relaxed);
             forget_mount();
+            // Without it read-ahead still works, only while a read runs.
+            if !entry.ahead_started.swap(true, Ordering::AcqRel) && sched::spawn_any("aoe-ahead", ahead_thread, index).is_none() {
+                entry.ahead_started.store(false, Ordering::Release);
+            }
             Ok(disk)
         }
         None => {
@@ -561,6 +741,13 @@ pub fn list(rate: u64) {
             entry.resent.load(Ordering::Relaxed),
             entry.failed.load(Ordering::Relaxed),
             entry.inbox.lock().dropped
+        );
+        crate::println!("    read ahead {} KiB, of it used {} KiB", remote.ahead.fetched / 2, remote.ahead.used / 2);
+        crate::println!(
+            "    aoe-ahead: ran {}, sent {} frames, found it taken {}",
+            entry.ahead_runs.load(Ordering::Relaxed),
+            entry.ahead_frames.load(Ordering::Relaxed),
+            entry.ahead_locked_out.load(Ordering::Relaxed)
         );
         let waits = entry.waits.load(Ordering::Relaxed);
         crate::println!(
