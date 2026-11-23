@@ -19,6 +19,8 @@ pub enum Backend {
     Usb(usize),
     /// The array `mdvol` assembled: the disk is virtual, its sectors come from the members.
     Md,
+    /// A disk another machine exports over ATA over Ethernet (`aoedisk`), by its entry there.
+    Aoe(usize),
 }
 
 #[derive(Clone, Copy)]
@@ -67,11 +69,12 @@ pub fn move_to_front(index: usize) -> usize {
     index
 }
 
-/// Makes the (stopped) array's disk `index` live again with a new size and name. False when `index` is not an md disk.
-pub fn set_md(index: usize, sectors: u64, model: [u8; 40]) -> bool {
+/// Makes the virtual disk `index` (a stopped md array, a detached AoE disk) live again with a new size and name. False when
+/// `index` is not a virtual disk.
+pub fn set_virtual(index: usize, sectors: u64, model: [u8; 40]) -> bool {
     unsafe {
         match (*core::ptr::addr_of_mut!(DISKS)).get_mut(index) {
-            Some(Some(disk)) if matches!(disk.backend, Backend::Md) => {
+            Some(Some(disk)) if matches!(disk.backend, Backend::Md | Backend::Aoe(_)) => {
                 disk.sectors = sectors;
                 disk.model = model;
                 true
@@ -145,6 +148,7 @@ pub fn read(disk: usize, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
         Backend::Sd(drive) => with_direct_read(buffer, |buffer| drive.read(lba, buffer)).map_err(|_| Error::Device)?,
         Backend::Usb(device) => crate::usb::storage_read(device, lba, buffer).map_err(|_| Error::Device)?,
         Backend::Md => crate::mdvol::read(lba, buffer)?,
+        Backend::Aoe(remote) => crate::aoedisk::read(remote, lba, buffer)?,
     }
     Ok(())
 }
@@ -164,6 +168,7 @@ pub fn flush(disk: usize) -> Result<(), Error> {
     match checked(disk, 0, 0)?.backend {
         Backend::Ahci(drive) => drive.flush().map_err(|_| Error::Device),
         Backend::Md => crate::mdvol::flush(),
+        Backend::Aoe(remote) => crate::aoedisk::flush(remote),
         _ => Ok(()),
     }
 }
@@ -187,6 +192,7 @@ fn write_with(disk: usize, lba: u64, buffer: &[u8], flush: bool) -> Result<(), E
         Backend::Sd(drive) => with_direct_write(buffer, |buffer| drive.write(lba, buffer)).map_err(|_| Error::Device)?,
         Backend::Usb(device) => crate::usb::storage_write(device, lba, buffer).map_err(|_| Error::Device)?,
         Backend::Md => crate::mdvol::write(lba, buffer)?,
+        Backend::Aoe(remote) => crate::aoedisk::write(remote, lba, buffer, flush)?,
     }
     Ok(())
 }
@@ -201,7 +207,7 @@ pub fn discard(disk: usize, ranges: &[(u64, u64)]) -> Result<(), Error> {
     match info.backend {
         Backend::Ahci(drive) => drive.discard(ranges).map_err(|error| if error == ahci::Error::Unsupported { Error::Unsupported } else { Error::Device }),
         Backend::Nvme(drive) => drive.discard(ranges).map_err(|error| if error == nvme::Error::Unsupported { Error::Unsupported } else { Error::Device }),
-        Backend::Usb(_) | Backend::Md => Err(Error::Unsupported),
+        Backend::Usb(_) | Backend::Md | Backend::Aoe(_) => Err(Error::Unsupported),
         #[cfg(target_arch = "aarch64")]
         Backend::Virtio(_) => Err(Error::Unsupported),
         #[cfg(target_arch = "aarch64")]

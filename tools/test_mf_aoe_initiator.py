@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""The server kernel's AoE initiator (`aoe discover`, `aoe attach`, `block::Backend::Aoe`) against its own target, two guests
+on one QEMU multicast segment (docs/block-sharing.md, "The initiator").
+
+- t (the target, 52:54:00:12:34:e1): boots with `aoe-shelf 5` / `aoe-export 2` and a scratch data disk of random bytes.
+- i (the initiator, 52:54:00:12:34:e2): only its boot disk, which carries `big.bin` (192 KiB of random bytes).
+
+Checks: discovery lists e5.2 with its limits; attach makes it disk 2 with the right size; raw sectors read through AoE
+match the data image; a write to the read-only attach fails without touching the wire; then, with the export rw and the
+attach rw: a FOSFS v4 volume made over the network, a file copied onto it with the host's SHA-256, read back after a
+detach and attach (same disk number); the target sees the same file on its own disk after unexporting; and a request to a
+target that has gone fails after the resends instead of hanging.
+"""
+
+import hashlib
+import os
+import select
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_audio_net import GROUP, PORT  # noqa: E402
+
+ROOT = Path(__file__).resolve().parent.parent
+CODE = next(p for p in ["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_CODE.fd",
+                        "/usr/share/edk2/ovmf/OVMF_CODE.fd"] if Path(p).exists())
+SECTORS = 16384
+failures = []
+
+
+def check(ok, text, detail=""):
+    print(("PASS: " if ok else "FAIL: ") + text)
+    if not ok:
+        failures.append(f"{text}: {detail}")
+
+
+class Guest:
+    def __init__(self, name, boot_image, data_images, mac):
+        self.name = name
+        args = ["qemu-system-x86_64", "-cpu", "max", "-machine", "q35", "-m", "1024", "-smp", "2", "-display", "none",
+                "-serial", "stdio", "-monitor", "none", "-no-reboot",
+                "-drive", f"if=pflash,format=raw,readonly=on,file={CODE}", "-drive", f"format=raw,file={boot_image},snapshot=on",
+                *[arg for image in data_images for arg in ("-drive", f"format=raw,file={image}")],
+                "-netdev", f"socket,id=net0,mcast={GROUP}:{PORT}", "-device", f"e1000,netdev=net0,mac={mac}"]
+        if os.environ.get("FOS_KVM"):
+            args.insert(1, "-enable-kvm")
+        self.qemu = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.log = b""
+
+    def wait_for(self, text, timeout):
+        end = time.time() + timeout
+        while time.time() < end and text.encode() not in self.log:
+            if select.select([self.qemu.stdout], [], [], 0.2)[0]:
+                data = os.read(self.qemu.stdout.fileno(), 4096)
+                if not data:
+                    break
+                self.log += data
+        return text.encode() in self.log
+
+    def command(self, line, expect, timeout=30):
+        self.log = b""
+        self.qemu.stdin.write(line.encode() + b"\n")
+        self.qemu.stdin.flush()
+        ok = self.wait_for(expect, timeout)
+        time.sleep(0.3)
+        self.wait_for("fos> ", 10)
+        return ok, self.log.decode("utf8", "replace")
+
+    def kill(self):
+        self.qemu.kill()
+        self.qemu.wait()
+
+
+def build_image(directory, settings_text, files=()):
+    directory.mkdir()
+    settings = directory / "settings"
+    settings.write_text(settings_text)
+    out = directory / "boot.img"
+    command = [sys.executable, str(ROOT / "tools/build_image.py"), "--loader", os.environ["LOADER_EFI"], "--kernel",
+               os.environ["KERNEL_MF_ELF"], "--output", str(out), "--bios-stage1", os.environ["BIOS_STAGE1"],
+               "--bios-stage2", os.environ["BIOS_STAGE2"], "--file", f"settings={settings}"]
+    for name, path in files:
+        command += ["--file", f"{name}={path}"]
+    subprocess.run(command, check=True, capture_output=True)
+    return out
+
+
+def hex_row(data, lba, row):
+    """The first row of `sector`'s dump of sector `lba`: offset, 16 bytes in hex."""
+    chunk = data[lba * 512 + row * 16:lba * 512 + row * 16 + 16]
+    return f"{row * 16:03x}  " + "".join(f"{byte:02x} " for byte in chunk)
+
+
+def main():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        data = os.urandom(SECTORS * 512)
+        disk = tmp / "data.img"
+        disk.write_bytes(data)
+        big = os.urandom(192 * 1024)
+        (tmp / "big.bin").write_bytes(big)
+        digest = hashlib.sha256(big).hexdigest()
+        t = Guest("t", build_image(tmp / "t", "aoe-shelf 5\naoe-export 2\n"), [disk], "52:54:00:12:34:e1")
+        i = Guest("i", build_image(tmp / "i", "", [("big.bin", tmp / "big.bin")]), [], "52:54:00:12:34:e2")
+        try:
+            for guest in (t, i):
+                if not guest.wait_for("fos> ", 150):
+                    raise SystemExit(f"{guest.name} never reached the prompt: {guest.log[-2000:]!r}")
+
+            ok, text = i.command("aoe discover", "e5.2", 20)
+            check(ok and "52:54:00:12:34:e1" in text and "2 sector(s) a frame, bufcount 16" in text,
+                  "discover lists e5.2 with the target's MAC and limits", text[-600:])
+            ok, text = i.command("aoe attach 5.2", "is disk 2", 30)
+            check(ok and "8 MiB, read-only" in text, "attach makes it disk 2, 8 MiB, read-only", text[-600:])
+            ok, text = i.command("disks", "disk2: 8 MiB", 20)
+            check(ok, "disks lists it", text[-800:])
+
+            lbas = (0, 1, 777, SECTORS - 1)
+            for lba in lbas:
+                ok, text = i.command(f"sector disk2 {lba}", f"disk2 sector {lba}:", 30)
+                check(ok and hex_row(data, lba, 0) in text and hex_row(data, lba, 31) in text,
+                      f"sector {lba} read through AoE matches the data image", text[-600:])
+            ok, text = i.command(f"sector disk2 {SECTORS}", "fos", 30)
+            check("Usage" in text or "read failed" in text, "a sector past the end is refused", text[-300:])
+            # Random bytes are not a GPT, hence `force`.
+            ok, text = i.command("format disk2 remote force", "confirm", 20)
+            ok, text = i.command("format disk2 confirm", "fos", 60)
+            check("rror" in text or "fail" in text or "could not" in text.lower(),
+                  "format on a read-only attach fails", text[-400:])
+            ok, text = i.command("sector disk2 0", "disk2 sector 0:", 30)
+            check(ok and hex_row(data, 0, 0) in text, "and sector 0 is unchanged", text[-400:])
+            ok, text = i.command("aoe", "attached e5.2", 20)
+            check(ok and " 0 resent, 0 failed" in text, "the counters show no resends on a clean link", text[-600:])
+
+            # Writable on both ends.
+            ok, text = t.command("aoe unexport 2", "no longer exported", 20)
+            ok, text = t.command("aoe export 2 rw confirm", "READ-WRITE", 20)
+            ok, text = i.command("aoe detach 5.2", "detached", 20)
+            check(ok, "detach", text[-300:])
+            ok, text = i.command("sector disk2 0", "fos", 20)
+            check("read failed" in text, "a detached disk fails at once", text[-300:])
+            ok, text = i.command("aoe attach 5.2 rw", "is disk 2", 30)
+            check(ok and "READ-WRITE" in text, "attach rw gives it the same disk number", text[-600:])
+            ok, text = i.command("format disk2 remote force", "confirm", 20)
+            ok, text = i.command("format disk2 confirm", "fos", 120)
+            check("rror" not in text and "fail" not in text, "format makes a FOSFS volume over AoE", text[-400:])
+            ok, text = i.command("cp big.bin @remote/big.bin", "fos", 120)
+            ok, text = i.command("sha256 @remote/big.bin", digest, 120)
+            check(ok, "a 192 KiB file copied onto a FOSFS volume made over AoE has the host's SHA-256", text[-600:])
+            ok, text = i.command("aoe detach 5.2", "detached", 20)
+            ok, text = i.command("aoe attach 5.2 rw", "is disk 2", 30)
+            ok, text = i.command("sha256 @remote/big.bin", digest, 120)
+            check(ok, "and again after detach and attach", text[-600:])
+            ok, text = i.command("aoe", "attached e5.2", 20)
+            print("        " + "\n        ".join(line.strip() for line in text.splitlines() if "requests" in line or "window" in line))
+
+            # The target's own view of its disk, once nobody else writes it.
+            ok, text = i.command("aoe detach 5.2", "detached", 20)
+            ok, text = t.command("aoe unexport 2", "no longer exported", 30)
+            ok, text = t.command("sha256 @remote/big.bin", digest, 120)
+            check(ok, "the target finds the same file on its own disk", text[-600:])
+
+            # The target is gone: the request fails after the resends (about 5 s), and the shell answers again.
+            ok, text = t.command("aoe export 2", "read-only", 20)
+            ok, text = i.command("aoe attach 5.2", "is disk 2", 30)
+            ok, text = t.command("aoe unexport 2", "no longer exported", 20)
+            start = time.time()
+            ok, text = i.command("sector disk2 5", "read failed", 30)
+            elapsed = time.time() - start
+            check(ok and 2 < elapsed < 20, f"a target that stops answering fails the read after the resends ({elapsed:.1f} s)",
+                  text[-400:])
+            ok, text = i.command("aoe", "attached e5.2", 20)
+            check(ok and "1 failed" in text, "and counts it as failed", text[-600:])
+        finally:
+            for guest in (t, i):
+                guest.kill()
+    for failure in failures:
+        print("FAIL:", failure)
+    if failures:
+        return 1
+    print("PASS: mf-aoe-initiator")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

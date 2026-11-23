@@ -202,7 +202,7 @@ fn try_assemble(wait_over: bool) -> Outcome {
     let take = text.length.min(40);
     model[..take].copy_from_slice(&text.bytes[..take]);
     let disk = match state.disk {
-        Some(disk) => block::set_md(disk, sectors, model).then_some(disk),
+        Some(disk) => block::set_virtual(disk, sectors, model).then_some(disk),
         None => block::register(block::Backend::Md, sectors, model, "md"),
     };
     let Some(disk) = disk else {

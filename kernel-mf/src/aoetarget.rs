@@ -469,9 +469,12 @@ pub fn init() {
 }
 
 pub fn command(mut words: core::str::SplitWhitespace) {
-    let usage = "aoe [export N [rw confirm] | unexport N | shelf N | reset]: serve disks over ATA over Ethernet.";
+    let usage = "ATA over Ethernet: serve this machine's disks, or use another's.\n\
+                 aoe [export N [rw confirm] | unexport N | shelf N | reset]\n\
+                 aoe [discover | attach SHELF.SLOT [rw] | detach SHELF.SLOT]";
     match words.next() {
         None => list(),
+        Some(word) if crate::aoedisk::command(word, &mut words) => {}
         Some("reset") => {
             for slot in SLOTS.iter() {
                 slot.stats.reset();
@@ -583,6 +586,7 @@ fn list() {
             crate::println!("    {} gathered write run(s) FAILED after they were acknowledged", load(&stats.write_errors));
         }
     }
+    crate::aoedisk::list(rate);
     let rx = &net::RX_STATS;
     let wakes = rx.wakes.load(Ordering::Relaxed);
     crate::println!("  frames drained by net-rx {}, by the service thread {}", FROM_RX.load(Ordering::Relaxed), FROM_SERVICE.load(Ordering::Relaxed));

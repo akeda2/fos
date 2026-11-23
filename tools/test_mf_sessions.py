@@ -169,14 +169,16 @@ def main():
                 out = b.run("ps") or ""
                 return out.count(" ed ")
 
-            a.send(TAG_DATA, b"ed\n")
+            # `ed` needs a file name to wait for keys: without one it prints its usage and ends. (It used to look alive
+            # here only because that usage line sat unsent while the service thread, pinned to CPU 0, missed its wake-ups.)
+            a.send(TAG_DATA, b"ed idle.txt\n")
             time.sleep(2)
             check(editing() == 1, "ed started in A's session is running", b.seen.decode(errors="replace"))
             a.send(TAG_BYE)
             time.sleep(1)
             check(editing() == 0, "A's BYE stops the ed it left waiting for keys", b.seen.decode(errors="replace"))
 
-            c.send(TAG_DATA, b"ed\n")
+            c.send(TAG_DATA, b"ed idle.txt\n")
             time.sleep(2)
             for _ in range(4):
                 c.send(TAG_PING)
@@ -187,7 +189,7 @@ def main():
             machine.pump(1)
             check("Remote terminal 3 timed out." in machine.text(), "and the console says so", machine.text()[-800:])
 
-            d.send(TAG_DATA, b"ed\n")
+            d.send(TAG_DATA, b"ed idle.txt\n")
             time.sleep(40)
             check(editing() == 1, "a client that never pinged is not expired", b.seen.decode(errors="replace"))
         finally:

@@ -76,6 +76,7 @@ mod shell;
 mod shellhost;
 mod script;
 mod sysshell;
+mod aoedisk;
 mod aoetarget;
 mod mdvol;
 mod top;
@@ -225,6 +226,7 @@ fn boot_services(info: &BootInfo, century: u8) -> ! {
     sched::spawn("service", service_thread, 0).expect("the service thread");
     println!("kernel-mf: slice 8 reached the end of boot; entering the service loop.");
     // The boot context is the idle thread: it runs when nothing else is ready and sleeps until the next interrupt.
+    sched::become_idle();
     loop {
         sched::yield_now();
         // Interrupts are on: the next tick (or NIC interrupt) wakes the CPU.
@@ -278,6 +280,7 @@ fn boot_services(info: &BootInfo, _century: u8) -> ! {
     private::init();
     sched::spawn("service", service_thread, 0).expect("the service thread");
     println!("kernel-mf: slice 8 reached the end of boot; entering the service loop.");
+    sched::become_idle();
     loop {
         sched::yield_now();
         arch::wait_for_interrupt();

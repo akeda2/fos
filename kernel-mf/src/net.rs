@@ -797,10 +797,20 @@ fn kup_finish(kup: &Kup, staging: &mut [u8]) -> Result<u8, u8> {
 /// Handles one received frame if it is the terminal's, a discovery probe's or KUP's business.
 /// The frame handler `nicctl` calls for every received frame: true for the kernel's own (ethertype 0x88b6), which never reach a tape.
 fn frame_hook(index: usize, frame: &[u8]) -> bool {
-    // ATA over Ethernet, while a disk is exported: queued for the `aoe` thread (never a disk read here, the NIC lock is held).
-    if frame.len() >= 24 && frame[12..14] == aoe::ETHERTYPE.to_be_bytes() && crate::aoetarget::wanted() {
-        crate::aoetarget::enqueue(index, frame, RESCUER.load(Ordering::Acquire) == 0);
-        return true;
+    // ATA over Ethernet: replies (the R flag) for the initiator while a disk is attached or a discovery listens, requests for
+    // the target while a disk is exported. Both only queue the frame and wake a thread: never a disk read here, the NIC lock
+    // is held.
+    if frame.len() >= 24 && frame[12..14] == aoe::ETHERTYPE.to_be_bytes() {
+        let wake = RESCUER.load(Ordering::Acquire) == 0;
+        if frame[14] & 0x08 != 0 {
+            if crate::aoedisk::wanted() {
+                crate::aoedisk::reply(index, frame, wake);
+                return true;
+            }
+        } else if crate::aoetarget::wanted() {
+            crate::aoetarget::enqueue(index, frame, wake);
+            return true;
+        }
     }
     if frame.len() < 15 || frame[12..14] != ETHERTYPE {
         return false;

@@ -37,7 +37,7 @@ const NO_THREAD: usize = usize::MAX;
 pub enum State {
     Running,
     Ready,
-    /// Waiting for `wake_all(key)`.
+    /// Waiting for `wake_all(key)`, and for the tick count to reach `wake_at` too when that is not 0 (`wait_while_for`).
     Blocked,
     /// Waiting for the tick count to reach `wake_at`.
     Sleeping,
@@ -150,6 +150,28 @@ pub fn attach_cpu() {
     sched.current[cpu_index] = id;
     crate::debugcpu::thread_started(id, &name);
     crate::percpu::get(cpu_index).thread.store(id, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Makes the calling context its CPU's idle thread, as `attach_cpu` does for an application processor: the boot context
+/// calls it when boot is done and it enters its idle loop. Until then CPU 0 had no idle thread as far as the scheduler knew,
+/// so `idle_cpu_for` never chose it and a thread pinned to CPU 0 (the service thread, the shell) that another CPU woke ran
+/// only when an interrupt happened to land on CPU 0: a tick, up to 10 ms later. The AoE initiator, waiting in the shell
+/// for replies that `net-rx` queues on the other CPU, took 1.4 ms on average to see each.
+pub fn become_idle() {
+    let flags = cpu::interrupts_save_and_disable();
+    {
+        let cpu_index = this_cpu();
+        let mut guard = SCHED.lock();
+        if let Some(sched) = guard.as_mut() {
+            if sched.idle[cpu_index] == NO_THREAD {
+                let current = sched.current[cpu_index];
+                // Never queued again from here on: it runs when nothing else may (`switch_away`).
+                sched.queue.retain(|&id| id != current);
+                sched.idle[cpu_index] = current;
+            }
+        }
+    }
+    cpu::interrupts_restore(flags);
 }
 
 /// Starts a thread on CPU 0 running `entry(argument)`; it is queued, not run yet. Returns its id.
@@ -484,6 +506,7 @@ pub fn join(tid: u64) {
             let thread = sched.threads[current].as_mut().unwrap();
             thread.state = State::Blocked;
             thread.key = JOIN_KEY | tid as usize;
+            thread.wake_at = 0;
             true
         } else {
             false
@@ -605,7 +628,8 @@ pub fn tick() {
         }
         for id in 0..sched.threads.len() {
             if let Some(thread) = sched.threads[id].as_mut() {
-                if thread.state == State::Sleeping && thread.wake_at <= now {
+                let due = thread.wake_at <= now;
+                if (thread.state == State::Sleeping && due) || (thread.state == State::Blocked && thread.wake_at != 0 && due) {
                     thread.state = State::Ready;
                     let pinned = thread.pinned;
                     sched.queue.push_back(id);
@@ -677,6 +701,16 @@ pub fn sleep_ticks(ticks: u64) {
 /// Blocks the calling thread on `key` if `condition()` is true, checked with the scheduler locked so a `wake_all` cannot slip
 /// in between the check and the block. Returns when woken (the caller re-checks its condition). Not for the idle thread.
 pub fn wait_while(key: usize, condition: impl FnOnce() -> bool) {
+    wait_while_until(key, 0, condition);
+}
+
+/// `wait_while`, and woken by the timer as well once `ticks` ticks (10 ms each, at least 1) have passed: for a waiter that
+/// must act on a timeout (the AoE initiator resending a frame). The caller re-checks both its condition and the time.
+pub fn wait_while_for(key: usize, ticks: u64, condition: impl FnOnce() -> bool) {
+    wait_while_until(key, crate::arch::ticks() + ticks.max(1), condition);
+}
+
+fn wait_while_until(key: usize, wake_at: u64, condition: impl FnOnce() -> bool) {
     let flags = cpu::interrupts_save_and_disable();
     let blocked = {
         let mut guard = SCHED.lock();
@@ -686,6 +720,7 @@ pub fn wait_while(key: usize, condition: impl FnOnce() -> bool) {
             let thread = sched.threads[current].as_mut().unwrap();
             thread.state = State::Blocked;
             thread.key = key;
+            thread.wake_at = wake_at;
             true
         } else {
             false

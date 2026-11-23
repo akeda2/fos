@@ -252,8 +252,6 @@ they are bound by the round trip, not the send. Checked: `test-nic`, `test-jumbo
 `-smbd`, `-httpd`. Only real hardware can say what a TDT write costs on silicon (a posted PCIe write, far less than a
 VM exit), so the gain there will be smaller.
 
-Not done, in the order I would do it:
-
 **The Linux `aoe` module as initiator** (section 9, 2026-11-22, host kernel 7.3, AoE v85, KVM, 2 guest CPUs, MTU 1500):
 discovery, content, the read-only refusal, raw writes, ext4 and `e2fsck` all pass (details in section 9). The module
 picks 1024-byte data frames (2 sectors, as advertised) and keeps 16 frames in flight (`bufcount`): **reads 58 MB/s
@@ -267,7 +265,63 @@ Not done, in the order I would do it:
 1. **Per-controller locking** in the block layer, if measurements on hardware say serial disk access is the limit.
 2. Jumbo frames on this path: `nicctl` drains into 1600-byte buffers and the target assumes MTU 1500.
 3. `vblade` as a peer, and the Linux test on real hardware (a fos machine exporting to a Linux box over a real switch).
-4. The initiator: `block::Backend::Aoe`, a virtual disk like `Md`, with retransmit and a window.
+4. The initiator's speed: about half of what the Python benchmark gets from the same target (below). Requests are serial
+   per remote disk, so each request starts with an empty window and ends draining it; several requests in flight, or
+   read-ahead in the initiator, would keep the target fed.
+
+### The initiator (`aoe::initiator`, `kernel-mf/src/aoedisk.rs`)
+
+A disk another machine exports becomes one more `diskN` (`block::Backend::Aoe`), so `sector`, `format`, FOSFS, ext4 and
+the tapes' `vfs_*` calls use it unchanged. Standard AoE only, so it works against this kernel's target and should against
+`vblade`; the FOS dialect (section 3) is for later.
+
+```
+aoe discover                  Query Config on every NIC with a link; lists SHELF.SLOT, MAC, NIC, sectors/frame, bufcount
+aoe attach SHELF.SLOT [rw]    IDENTIFY for the size, then a disk number; read-only unless rw
+aoe detach SHELF.SLOT         requests fail from now on; attaching the same target again gives the same disk number
+aoe                           also lists the attached disks: NIC, sectors a frame, window, requests, frames, resends
+```
+
+- **The protocol half** is `crates/aoe/src/initiator.rs`, `no_std` and host-tested against the crate's own `Target` over
+  a simulated link that loses requests and replies and reorders them (`initiator_tests.rs`). `Transfer` is one block
+  request: it splits it into frames of `per_frame` sectors, keeps up to `window` in flight, matches replies by tag
+  (`tag_base + frame index`, a fresh range per request so a late reply to an earlier one never matches), resends a
+  frame with the same tag when it times out (doubling the wait) and fails the request after `MAX_TRIES` sends, on an
+  ATA error status or on an AoE error. Its clock is the caller's.
+- **No thread of its own.** A request runs in the caller's thread: it sends under the NIC lock (released at once) and
+  sleeps until a reply or the next resend is due (`sched::wait_while_for`, new: a `Blocked` thread the timer tick also
+  wakes at its `wake_at`). `frame_hook` hands frames with the R flag to the initiator and requests to the target; the
+  initiator's part only copies the reply into the queue of the remote it is from and wakes it. With a polled NIC (no
+  interrupt, so `net-rx` never runs for it) the waiter drains the NICs itself every tick.
+- **Time** is in ticks (10 ms): first resend after 2 ticks, 8 sends in all, so a target that has gone fails a request
+  after about 5 s (5.6 s measured) instead of hanging the caller. The window is the target's `bufcount`, at most 16;
+  sectors per frame the least of what the target advertises, what our MTU carries and the 1600-byte reply buffer.
+- **Safety.** Read-only unless `rw` (a write then fails here, before the wire). A target with one of this machine's own
+  MACs is refused: that is our own export, whose worker needs the disk lock the waiting caller may hold. Nothing stops two
+  hosts writing one disk; the target's `rw confirm` and the initiator's `rw` are where a person decides it. While a
+  request waits on the network, its caller still holds `tapefs::lock()` if it took it, so local disk users wait too; two
+  hosts that each read the other's disk while holding their own lock would wait on each other until the resends fail.
+
+**Speed** (KVM, two guests on one QEMU multicast segment, 2 vCPUs each, on a 4-CPU host, 2026-11-22): `cp` of a 4 MiB
+file onto a FOSFS volume on the attached disk **15.5 MiB/s**, `sha256` of it read back **14.4 MiB/s**; the Python
+initiator against the same target in the same setup reaches 29,700 frames/s (30 MB/s) at window 16. The initiator's
+counters (`aoe`): about 380 us from a burst sent to its first reply, about 55 us from a reply's arrival to the request
+taking it.
+
+Measuring it found a **scheduler bug that cost every mf machine**: CPU 0 had no registered idle thread (its boot context
+idled by convention only), so the wake IPI never went to CPU 0 and a thread pinned there that another CPU woke waited for
+the next interrupt on CPU 0, often the 10 ms tick. The service thread, and so every shell command, is pinned to CPU 0:
+the initiator waiting in `cp` saw each reply 1.4 ms after it arrived. `sched::become_idle` registers the boot context when
+boot ends. Before and after on the same host: the initiator 3.9 -> 15.5 MiB/s writing, 3.6 -> 14.4 reading; the target
+under the Python benchmark at window 16 14,700 -> 29,700 frames/s (the target's own `net-rx` ran 293 us after its
+interrupt before, 34 us after). A brief spin before sleeping (300 us) was tried first and gained nothing once wake-ups
+worked, so it is not in.
+
+`make test-mf-aoe-initiator` (two guests on one QEMU segment): discovery and its limits, attach and the size, raw sectors
+read through AoE against the data image (first, last and two others), a refused write on a read-only attach, detach and
+the same disk number on re-attach, `format` of a FOSFS v4 volume over AoE, a 192 KiB file copied on with the host's
+SHA-256, read back after detach and attach, the same file found by the target on its own disk, and a target that stops
+answering failing the read in 5.6 s. Only real hardware can say what the resend timing does on a busy switch.
 
 ## 9. Testing against Linux
 
