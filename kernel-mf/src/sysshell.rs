@@ -55,6 +55,45 @@ pub fn sector(rest: &str) {
     }
 }
 
+/// `readspeed diskN [MIB] [KIB]`: reads MIB MiB (default 64) from the start of the disk in requests of KIB KiB (default
+/// 1024) through the block layer, and prints the rate. No file system and no hashing, so it measures the disk (or the
+/// network, for an AoE disk) alone; the request size shows what each request's start and end cost. Read-only. The disk
+/// lock is taken per request, so tapes and the target's workers get in between.
+pub fn readspeed(rest: &str) {
+    const USAGE: &str = "Usage: readspeed diskN [MIB 1-4096] [KIB 4-4096]   (read-only)";
+    let mut words = rest.split_whitespace();
+    let disk = words.next().and_then(|word| word.strip_prefix("disk")).and_then(|digits| digits.parse::<usize>().ok());
+    let mib = words.next().map_or(Some(64), |word| word.parse::<u64>().ok());
+    let kib = words.next().map_or(Some(1024), |word| word.parse::<usize>().ok());
+    let (Some(disk), Some(mib), Some(kib)) = (disk, mib, kib) else { return println!("{USAGE}") };
+    if disk == 0 || !(1..=4096).contains(&mib) || !(4..=4096).contains(&kib) || kib % 4 != 0 {
+        return println!("{USAGE}");
+    }
+    let Some(sectors) = crate::block::get(disk - 1).map(|info| info.sectors) else {
+        return println!("readspeed: no disk{disk}.");
+    };
+    let total = (mib << 11).min(sectors);
+    let per = (kib * 2) as u64;
+    let mut buffer = alloc::vec![0u8; kib * 1024];
+    let begin = crate::arch::micros();
+    let mut lba = 0;
+    while lba < total {
+        let count = per.min(total - lba) as usize;
+        let result = {
+            let _disk = crate::tapefs::lock();
+            crate::block::read(disk - 1, lba, &mut buffer[..count * 512])
+        };
+        if let Err(error) = result {
+            return println!("readspeed: disk{disk} sector {lba}: read failed ({error:?}).");
+        }
+        lba += count as u64;
+    }
+    let micros = (crate::arch::micros() - begin).max(1);
+    let bytes = total * 512;
+    println!("disk{disk}: {} MiB in {kib} KiB requests, {}.{:03} s, {} MB/s ({} KB/s)",
+        bytes >> 20, micros / 1_000_000, micros / 1000 % 1000, bytes / micros, bytes * 1000 / micros);
+}
+
 pub fn mount(rest: &str) {
     let mut words = rest.split_whitespace();
     match (words.next(), words.next(), words.next()) {

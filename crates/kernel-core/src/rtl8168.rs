@@ -142,6 +142,9 @@ const DESCRIPTOR_BYTES: usize = 16;
 /// (a 64-entry ring, 0.8 ms at 1 Gb/s, overflowed under an SFTP upload and wedged the receiver).
 const RX_COUNT: usize = 256;
 const TX_COUNT: usize = 32;
+/// The most frames `send_deferred` queues before it rings the doorbell itself: a quarter of the ring, so the ring never
+/// fills with frames the card was not told about (the AoE target kicks every 8 anyway).
+const DEFER_LIMIT: usize = 8;
 const BUFFER_BYTES: usize = 2048;
 const TX_RING_OFFSET: u64 = (RX_COUNT * DESCRIPTOR_BYTES) as u64;
 const RING_FRAMES: u64 = ((RX_COUNT + TX_COUNT) * DESCRIPTOR_BYTES).div_ceil(4096) as u64;
@@ -208,6 +211,10 @@ pub struct Rtl8168 {
     tx_buffers: u64,
     rx_next: usize,
     tx_next: usize,
+    /// Set by `send_deferred` around `send`: queue the frame, leave the doorbell (`TPPOLL`) to `kick`.
+    defer_doorbell: bool,
+    /// Frames queued since the last doorbell.
+    deferred: usize,
     enable_after_config: bool,
     /// Transmit checksum offload (`set_tx_offload`): `send` lets the chip sum IPv4 UDP/TCP frames.
     tx_offload: bool,
@@ -285,6 +292,8 @@ impl Rtl8168 {
             tx_buffers,
             rx_next: 0,
             tx_next: 0,
+            defer_doorbell: false,
+            deferred: 0,
             enable_after_config,
             tx_offload: false,
             promiscuous: false,
@@ -515,6 +524,7 @@ impl Rtl8168 {
         init_rings(self.rings, self.rx_buffers, self.tx_buffers);
         self.rx_next = 0;
         self.tx_next = 0;
+        self.deferred = 0;
         program(self.io_base, self.rings, self.enable_after_config, self.promiscuous);
         FATAL[self.index].store(false, Ordering::Relaxed);
         SOFT_MASKED[self.index].store(false, Ordering::Relaxed);
@@ -588,6 +598,10 @@ impl Rtl8168 {
         }
         let ring = self.rings + TX_RING_OFFSET;
         let index = self.tx_next;
+        if self.deferred != 0 && read_opts1(ring, index) & DESC_OWN != 0 {
+            // The slot is still the card's: it may be waiting for frames it was never told about, so tell it first.
+            self.kick();
+        }
         for _ in 0..1_000_000u32 {
             if read_opts1(ring, index) & DESC_OWN == 0 {
                 break;
@@ -607,9 +621,38 @@ impl Rtl8168 {
         let flags = if self.tx_offload { Self::offload_flags(frame, memory::phys_to_virt(buffer) as *mut u8) } else { None };
         let eor = if index == TX_COUNT - 1 { DESC_EOR } else { 0 };
         write_descriptor(ring, index, DESC_OWN | eor | DESC_FS | DESC_LS | length as u32, buffer, flags.unwrap_or(0));
-        write8(self.io_base, REG_TPPOLL, TPPOLL_NPQ); // doorbell: look at the normal-priority queue
+        if self.defer_doorbell {
+            self.deferred += 1;
+        } else {
+            write8(self.io_base, REG_TPPOLL, TPPOLL_NPQ); // doorbell: look at the normal-priority queue
+            self.deferred = 0;
+        }
         self.frames_sent += 1;
         true
+    }
+
+    /// `send` without the doorbell: the frame is on the ring, owned by the card, but the card is not told to look until
+    /// `kick` (or the `DEFER_LIMIT`th frame). `TPPOLL` is an I/O-port write here, and a port write on PCIe is non-posted:
+    /// the CPU waits for the card to complete it, measured at about 4 us a frame on rack's 8168H serving AoE, against
+    /// 0 us on its I350 that defers already (`E1000::send_deferred`). One write then covers a burst, as Linux's r8169 does
+    /// when the stack says more frames follow (`xmit_more`). The card reads every descriptor it owns from where it
+    /// stopped, so frames queued this way go out in order with the kick.
+    pub fn send_deferred(&mut self, frame: &[u8]) -> bool {
+        if self.deferred >= DEFER_LIMIT {
+            self.kick();
+        }
+        self.defer_doorbell = true;
+        let sent = self.send(frame);
+        self.defer_doorbell = false;
+        sent
+    }
+
+    /// Rings the doorbell for the frames `send_deferred` queued.
+    pub fn kick(&mut self) {
+        if self.deferred != 0 {
+            write8(self.io_base, REG_TPPOLL, TPPOLL_NPQ);
+            self.deferred = 0;
+        }
     }
 
     /// The 8168H can stop receiving after an overflow burst: every descriptor is back in the card's hands, yet

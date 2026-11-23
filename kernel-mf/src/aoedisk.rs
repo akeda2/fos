@@ -33,10 +33,10 @@ use kernel_core::{nic, nicctl};
 
 const MAX_REMOTES: usize = 4;
 /// Replies a remote's queue holds: above the largest window, so a full window of replies is never dropped here.
-const QUEUE: usize = 64;
+const QUEUE: usize = 128;
 const FRAME: usize = 1600;
 /// The most frames in flight per request, whatever the target's `bufcount` says (and never more than the queue holds).
-const MAX_WINDOW: usize = 32;
+const MAX_WINDOW: usize = 64;
 const TIMEOUT_TICKS: u64 = 2;
 const MAX_TRIES: u8 = 8;
 /// How long `aoe discover` listens for Query Config replies.
@@ -385,20 +385,28 @@ pub enum AttachError {
 }
 
 /// Attaches `shelf.slot` (found by a discovery run here): IDENTIFY for its size, then a disk number. Returns the 0-based
-/// block index.
-fn attach(shelf: u16, slot: u8, writable: bool) -> Result<usize, AttachError> {
+/// block index. A target with several NICs answers on each; `via` picks the one to use by its MAC, else the first answer is.
+fn attach(shelf: u16, slot: u8, writable: bool, via: Option<[u8; 6]>) -> Result<usize, AttachError> {
     let (found, _) = discover();
-    let target = found.iter().flatten().find(|f| f.shelf == shelf && f.slot == slot).copied().ok_or(AttachError::NotFound)?;
+    let target = found
+        .iter()
+        .flatten()
+        .find(|f| f.shelf == shelf && f.slot == slot && via.is_none_or(|mac| mac == f.mac))
+        .copied()
+        .ok_or(AttachError::NotFound)?;
     if our_mac(target.mac) {
         return Err(AttachError::Ours);
     }
     let route = Route { mac: target.mac, shelf, slot };
-    if ENTRIES.iter().any(|entry| entry.inbox.lock().route == Some(route)) {
+    // By shelf.slot, not MAC: a target with several NICs answers on each, and the same disk attached twice through two of
+    // them would be two disks here (two writers, with `rw`). Through another NIC it is still the same disk number.
+    let same = |other: Option<Route>| other.is_some_and(|other| (other.shelf, other.slot) == (shelf, slot));
+    if ENTRIES.iter().any(|entry| same(entry.inbox.lock().route)) {
         return Err(AttachError::Attached);
     }
     // The entry this target had before (it keeps its disk number), else one never used.
     let index = (0..MAX_REMOTES)
-        .find(|&index| LAST_ROUTE.lock()[index] == Some(route))
+        .find(|&index| same(LAST_ROUTE.lock()[index]))
         .or_else(|| (0..MAX_REMOTES).find(|&index| ENTRIES[index].disk.load(Ordering::Relaxed) == 0 && LAST_ROUTE.lock()[index].is_none()))
         .ok_or(AttachError::TableFull)?;
     let mut ours = [0u8; 6];
@@ -517,6 +525,15 @@ fn parse_address(word: Option<&str>) -> Option<(u16, u8)> {
     Some((shelf, slot))
 }
 
+fn parse_mac(word: &str) -> Option<[u8; 6]> {
+    let mut mac = [0u8; 6];
+    let mut parts = word.split(':');
+    for byte in mac.iter_mut() {
+        *byte = u8::from_str_radix(parts.next()?, 16).ok()?;
+    }
+    parts.next().is_none().then_some(mac)
+}
+
 fn mac_text(mac: [u8; 6]) -> alloc::string::String {
     alloc::format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5])
 }
@@ -590,18 +607,24 @@ pub fn command(word: &str, words: &mut core::str::SplitWhitespace) -> bool {
         }
         "attach" => {
             let Some((shelf, slot)) = parse_address(words.next()) else {
-                crate::println!("aoe attach SHELF.SLOT [rw]   (`aoe discover` lists them)");
+                crate::println!("aoe attach SHELF.SLOT [rw] [MAC]   (`aoe discover` lists them)");
                 return true;
             };
-            let writable = match words.next() {
-                None => false,
-                Some("rw") => true,
-                Some(_) => {
-                    crate::println!("aoe attach SHELF.SLOT [rw]");
-                    return true;
+            let (mut writable, mut via, mut bad) = (false, None, false);
+            for word in words.by_ref() {
+                match word {
+                    "rw" => writable = true,
+                    _ => match parse_mac(word) {
+                        Some(mac) => via = Some(mac),
+                        None => bad = true,
+                    },
                 }
-            };
-            match attach(shelf, slot, writable) {
+            }
+            if bad {
+                crate::println!("aoe attach SHELF.SLOT [rw] [MAC]   (MAC: which of the target's NICs)");
+                return true;
+            }
+            match attach(shelf, slot, writable, via) {
                 Ok(disk) => {
                     let sectors = block::get(disk).map_or(0, |info| info.sectors);
                     crate::println!("aoe: e{shelf}.{slot} is disk {}, {} MiB, {}.", disk + 1, sectors >> 11, if writable { "READ-WRITE" } else { "read-only" });
@@ -609,7 +632,7 @@ pub fn command(word: &str, words: &mut core::str::SplitWhitespace) -> bool {
                         crate::println!("     No other machine may write it while it is attached here.");
                     }
                 }
-                Err(AttachError::NotFound) => crate::println!("aoe: no target e{shelf}.{slot} answered (see `aoe discover`)."),
+                Err(AttachError::NotFound) => crate::println!("aoe: no target e{shelf}.{slot} answered{} (see `aoe discover`).", if via.is_some() { " from that MAC" } else { "" }),
                 Err(AttachError::Ours) => crate::println!("aoe: e{shelf}.{slot} is this machine's own export."),
                 Err(AttachError::Attached) => crate::println!("aoe: e{shelf}.{slot} is already attached."),
                 Err(AttachError::TableFull) => crate::println!("aoe: {MAX_REMOTES} disks are attached already."),

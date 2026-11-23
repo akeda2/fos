@@ -265,9 +265,9 @@ Not done, in the order I would do it:
 1. **Per-controller locking** in the block layer, if measurements on hardware say serial disk access is the limit.
 2. Jumbo frames on this path: `nicctl` drains into 1600-byte buffers and the target assumes MTU 1500.
 3. `vblade` as a peer, and the Linux test on real hardware (a fos machine exporting to a Linux box over a real switch).
-4. The initiator's speed: about 41 MB/s between two real machines (below), against 90 MB/s from the disk locally. The
-   target serves 17 frames a wake-up and the initiator takes an interrupt per 2.5 frames: interrupt moderation or
-   polling while a request is in flight would be the next step. Jumbo frames (item 2) would quarter the frame count.
+4. Small requests: raw reads in 128 KiB requests reach 88 MB/s against 113 in 1 MiB ones (window 64, through an I350),
+   and ext4 asks for about 122 KB at a time. Read-ahead in the initiator, or requests overlapped across callers, would
+   keep the window full between them. Interrupts are not the limit (below).
 5. A file as an export (a `Backend` over a contiguous file or ext4 extents): only whole disks are exported now.
 
 ### The initiator (`aoe::initiator`, `kernel-mf/src/aoedisk.rs`)
@@ -278,7 +278,7 @@ the tapes' `vfs_*` calls use it unchanged. Standard AoE only, so it works agains
 
 ```
 aoe discover                  Query Config on every NIC with a link; lists SHELF.SLOT, MAC, NIC, sectors/frame, bufcount
-aoe attach SHELF.SLOT [rw]    IDENTIFY for the size, then a disk number; read-only unless rw
+aoe attach SHELF.SLOT [rw] [MAC]  IDENTIFY, then a disk number; read-only unless rw; MAC picks the target's NIC
 aoe detach SHELF.SLOT         requests fail from now on; attaching the same target again gives the same disk number
 aoe                           also lists the attached disks: NIC, sectors a frame, window, requests, frames, resends
 ```
@@ -295,7 +295,7 @@ aoe                           also lists the attached disks: NIC, sectors a fram
   initiator's part only copies the reply into the queue of the remote it is from and wakes it. With a polled NIC (no
   interrupt, so `net-rx` never runs for it) the waiter drains the NICs itself every tick.
 - **Time** is in ticks (10 ms): first resend after 2 ticks, 8 sends in all, so a target that has gone fails a request
-  after about 5 s (5.6 s measured) instead of hanging the caller. The window is the target's `bufcount`, at most 32;
+  after about 5 s (5.6 s measured) instead of hanging the caller. The window is the target's `bufcount`, at most 64;
   sectors per frame the least of what the target advertises, what our MTU carries and the 1600-byte reply buffer.
 - **Safety.** Read-only unless `rw` (a write then fails here, before the wire). A target with one of this machine's own
   MACs is refused: that is our own export, whose worker needs the disk lock the waiting caller may hold. Nothing stops two
@@ -334,6 +334,35 @@ dropped. Wake-ups cost little on real CPUs: the initiator took a reply 1 us afte
 target's worker ran 57 us after its frames were queued (about 400 us under KVM), 66 us from a burst sent to its first
 reply. The worker still served only 17 frames a wake-up, and aneby took one interrupt per 2.5 frames, so per-frame
 interrupt and wake-up work is the next limit, not the window.
+
+**Raw reads and the NICs** (`readspeed diskN [MIB] [KIB]`, new: the block layer only, no file system, no hashing).
+Most of the 16.9 s above was not the network: rack's `kvart` reads 456 MB/s locally, so its 90 MB/s `sha256` was the
+hash, and `sha256` reads and hashes in turn. Raw over AoE, 1 MiB requests:
+
+| rack's NIC | window 32 | window 64 | per frame on rack (serve, of it send) |
+| --- | --- | --- | --- |
+| RTL8168H, doorbell per frame | 91 MB/s | | 8 us, 4 us |
+| RTL8168H, deferred doorbell | 91 MB/s | 90 MB/s | 5 us, 1 us |
+| I350 | 106 MB/s | 113 MB/s | 4 us, 0 us |
+
+Gigabit carries at most about 118 MB/s of 1 KiB AoE payload, so through the I350 at window 64 the link is about 96% used,
+with no resends. Interrupts and wake-ups cost little: aneby's `net-rx` ran in under 1 us and took a reply 1-2 us after
+it arrived. What mattered:
+
+- **The window.** 32 replies of 1 KiB are about 280 us of wire time, so every microsecond of round trip beyond that left
+  the wire idle; 64 hides it. The target now advertises a 64-frame queue (it shares it between initiators).
+- **The RTL8168's doorbell.** Its `TPPOLL` is an I/O-port write, non-posted on PCIe, about 4 us a frame. It now has
+  `send_deferred` and `kick` like the e1000 family (one doorbell per burst, at most 8 frames held back; a frame that
+  finds its slot still owned rings first). That freed rack's CPU but not the link: this 8168H path stays at 90 MB/s at
+  either window, with no drops or errors counted. All of rack's NICs are on the same switch as aneby, so the limit is
+  the 8168H or its driver (its transmit ring is 32 descriptors; it also carries the `web`, `smb` and `ssh` virtual
+  NICs, which put it in promiscuous mode).
+- `sha256` of the 694 MB file through the I350 at window 64: 15.7 s (16.9 before), about half of it reading and half
+  hashing.
+
+`aoe attach SHELF.SLOT [rw] MAC` picks which of a target's NICs to use; without it the first answer wins. Attach
+matches a target by shelf.slot, so the same disk cannot be attached twice through two NICs, and it keeps its disk
+number through another one.
 
 The same run found a **stale ext4 mount**: the shell keeps one ext volume mounted between commands
 (`ext4vol::shared`) and only re-reads it when the disk number changes. Re-attaching a target gives it its old number

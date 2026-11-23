@@ -30,7 +30,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize
 use kernel_core::nicctl;
 
 const MAX_EXPORTS: usize = 8;
-const QUEUE: usize = 32;
+const QUEUE: usize = 64;
 const FRAME: usize = 1600;
 /// Frames a worker handles per hold of the disk lock: fewer lock round trips under load, and still short enough that the
 /// shell or a tape waiting for the disk is not kept out for long (with the cache most frames of a batch are memory copies).
@@ -421,10 +421,11 @@ pub fn export(number: usize, writable: bool) -> Result<(), ExportError> {
     let slot = &SLOTS[index];
     let mut target = Target::new(shelf(), number as u8, [0; 6], MTU);
     target.read_only = !writable;
-    // What the queue holds (the crate's default says 16). An initiator that keeps 32 in flight leaves the worker the next
-    // frames queued when it ends a batch, instead of the two sides taking turns: our initiator under KVM wrote 17.0 ->
-    // 20.9 MiB/s and read 15.5 -> 19.5. More initiators than one share the queue; a frame it has no room for is dropped
-    // and resent, as before.
+    // What the queue holds (the crate's default says 16). An initiator that keeps that many in flight leaves the worker the
+    // next frames queued when it ends a batch, instead of the two sides taking turns (KVM, window 16 -> 32: 15.5 -> 19.5
+    // MiB/s read), and on a real gigabit link 32 replies of 1 KiB are only about 280 us of wire time, so any latency
+    // beyond that is idle wire (rack to aneby through an I350, raw reads: 106 MB/s at 32, 113 at 64, no resends). More
+    // initiators than one share the queue; a frame it has no room for is dropped and resent, as before.
     target.bufcount = QUEUE as u16;
     if let Some(info) = block::get(disk) {
         let model = core::str::from_utf8(&info.model).unwrap_or("").trim();
@@ -478,7 +479,7 @@ pub fn init() {
 pub fn command(mut words: core::str::SplitWhitespace) {
     let usage = "ATA over Ethernet: serve this machine's disks, or use another's.\n\
                  aoe [export N [rw confirm] | unexport N | shelf N | reset]\n\
-                 aoe [discover | attach SHELF.SLOT [rw] | detach SHELF.SLOT]";
+                 aoe [discover | attach SHELF.SLOT [rw] [MAC] | detach SHELF.SLOT]";
     match words.next() {
         None => list(),
         Some(word) if crate::aoedisk::command(word, &mut words) => {}

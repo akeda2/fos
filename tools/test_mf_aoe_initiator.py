@@ -126,7 +126,7 @@ def main():
                     raise SystemExit(f"{guest.name} never reached the prompt: {guest.log[-2000:]!r}")
 
             ok, text = i.command("aoe discover", "e5.2", 20)
-            check(ok and "52:54:00:12:34:e1" in text and "2 sector(s) a frame, bufcount 32" in text,
+            check(ok and "52:54:00:12:34:e1" in text and "2 sector(s) a frame, bufcount 64" in text,
                   "discover lists e5.2 with the target's MAC and limits", text[-600:])
             ok, text = i.command("aoe attach 5.2", "is disk 2", 30)
             check(ok and "8 MiB, read-only" in text, "attach makes it disk 2, 8 MiB, read-only", text[-600:])
@@ -138,6 +138,8 @@ def main():
                 ok, text = i.command(f"sector disk2 {lba}", f"disk2 sector {lba}:", 30)
                 check(ok and hex_row(data, lba, 0) in text and hex_row(data, lba, 31) in text,
                       f"sector {lba} read through AoE matches the data image", text[-600:])
+            ok, text = i.command("readspeed disk2 4 128", "MB/s", 60)
+            check(ok and "disk2: 4 MiB in 128 KiB requests" in text, "readspeed reads 4 MiB of it raw", text[-400:])
             ok, text = i.command(f"sector disk2 {SECTORS}", "fos", 30)
             check("Usage" in text or "read failed" in text, "a sector past the end is refused", text[-300:])
             # Random bytes are not a GPT, hence `force`.
