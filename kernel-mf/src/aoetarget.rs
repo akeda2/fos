@@ -543,6 +543,8 @@ fn install(export: Export, guard: Option<Box<Guard>>) -> Result<usize, ExportErr
         queue.dropped = 0;
     }
     slot.dirty.store(false, Ordering::Release);
+    // The counters belong to the export, not to the table entry: a slot freed by `unexport` and taken again starts at 0.
+    slot.stats.reset();
     slot.refused.store(0, Ordering::Relaxed);
     if guard.is_some() {
         *slot.guard.lock() = guard;

@@ -137,6 +137,14 @@ def main():
                 check(ok and f"read 40 bytes [{FRESH[:40].decode()}]" in text, "the tape then reads the new data (no stale kept mount)", text)
                 ok, text = guest.command("sha256 @fileexp/disk.img", "  @fileexp/disk.img", 60)
                 check(ok and hashlib.sha256(changed).hexdigest() in text, "and the file holds the write (sha256)", text)
+                # A new export in the table entry the rw export used starts with its own counters (they once carried over).
+                ok, text = guest.command("aoe unexport 7", "no longer exported")
+                ok, text = guest.command("aoe export disk2/disk.img slot 7", "aoe:")
+                check(ok and "read-only as shelf 5 slot 7" in text, "re-exported read-only as slot 7", text)
+                ok, text = guest.command("aoe", "file disk2/disk.img")
+                section = text.split("file disk2/disk.img", 1)[-1].split("  file ", 1)[0]
+                check(ok and "0 writes, 0 errors" in section and "disk commands: 0 writes, 0 frames gathered" in section,
+                      "and its counters start at 0, not at the rw export's", section)
                 ok, text = guest.command("aoe export 2 rw confirm", "aoe:")
                 check(ok and "cannot be written as well" in text, "disk 2 cannot also be exported rw whole", text)
 
