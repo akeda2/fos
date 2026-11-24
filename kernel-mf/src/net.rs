@@ -17,6 +17,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use kernel_core::nic::{self, Nic};
 use kernel_core::nicctl;
+use kernel_core::nicorder::{self, Kind};
 use kernel_core::{e1000, netdump::Mac, pci, rtl8125, rtl8139, rtl8168, threecom, virtio_net};
 
 use crate::time::{self, TICK_HZ};
@@ -102,6 +103,12 @@ pub fn print_list() {
     }
 }
 
+/// `nic pin`: the `settings` lines that keep today's numbers (`kernel_core::nicorder`).
+pub fn print_pins() {
+    let _nics = lock_nics();
+    nicorder::print_pin_lines();
+}
+
 /// `nic regs N`: the chip's registers and ring state, for a link or interrupt that misbehaves.
 pub fn print_registers(number: usize) {
     let _nics = lock_nics();
@@ -124,82 +131,96 @@ pub fn init() {
         Some(address) => vm::direct(address) as *mut u8,
         None => core::ptr::null_mut(),
     });
+    // PCI order whatever the driver, with `nic N MAC` pins from settings applied (`kernel_core::nicorder`): the card's
+    // number is its place here, and each driver's `init` takes that number as its index.
+    let kinds = [Kind::E1000, Kind::Rtl8168, Kind::Rtl8125, Kind::Rtl8139, Kind::ThreeCom, Kind::Virtio];
     let mut interfaces = 0;
-    for device in pci::devices().filter(|d| d.vendor == e1000::VENDOR_INTEL && e1000::DEVICE_IDS.contains(&d.id)) {
-        match e1000::E1000::init(&device, interfaces) {
-            Ok(mut nic) => {
-                println!("e1000 ({:?}) at {:02x}:{:02x}.{}: MAC {}, link {}.", nic.variant, device.bus, device.device, device.function, Mac(&nic.mac), if nic.link_up() { "up" } else { "down" });
-                report(nic.enable_interrupts(&device, false));
-                if nic::install(Nic::E1000(nic)).is_some() {
-                    locate(interfaces, &device);
-                    interfaces += 1;
+    for card in nicorder::arrange(&kinds).into_iter().flatten() {
+        let device = card.device;
+        match card.kind {
+            Kind::E1000 => {
+                match e1000::E1000::init(&device, interfaces) {
+                    Ok(mut nic) => {
+                        println!("e1000 ({:?}) at {:02x}:{:02x}.{}: MAC {}, link {}.", nic.variant, device.bus, device.device, device.function, Mac(&nic.mac), if nic.link_up() { "up" } else { "down" });
+                        report(nic.enable_interrupts(&device, false));
+                        if nic::install(Nic::E1000(nic)).is_some() {
+                            locate(interfaces, &device);
+                            interfaces += 1;
+                        }
+                    }
+                    Err(error) => println!("e1000 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
                 }
+    
             }
-            Err(error) => println!("e1000 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
-        }
-    }
-    for device in pci::devices().filter(|d| d.vendor == rtl8168::VENDOR_REALTEK && rtl8168::DEVICE_IDS.contains(&d.id)) {
-        match rtl8168::Rtl8168::init(&device, interfaces) {
-            Ok(mut nic) => {
-                println!("rtl8168 at {:02x}:{:02x}.{} (chip version {:#05x}): MAC {}.", device.bus, device.device, device.function, nic.version, Mac(&nic.mac));
-                report(nic.enable_interrupts(&device));
-                if nic::install(Nic::Rtl8168(nic)).is_some() {
-                    locate(interfaces, &device);
-                    interfaces += 1;
+            Kind::Rtl8168 => {
+                match rtl8168::Rtl8168::init(&device, interfaces) {
+                    Ok(mut nic) => {
+                        println!("rtl8168 at {:02x}:{:02x}.{} (chip version {:#05x}): MAC {}.", device.bus, device.device, device.function, nic.version, Mac(&nic.mac));
+                        report(nic.enable_interrupts(&device));
+                        if nic::install(Nic::Rtl8168(nic)).is_some() {
+                            locate(interfaces, &device);
+                            interfaces += 1;
+                        }
+                    }
+                    Err(error) => println!("rtl8168 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
                 }
+    
             }
-            Err(error) => println!("rtl8168 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
-        }
-    }
-    for device in pci::devices().filter(|d| d.vendor == rtl8125::VENDOR_REALTEK && rtl8125::DEVICE_IDS.contains(&d.id)) {
-        match rtl8125::Rtl8125::init(&device, interfaces) {
-            Ok(mut nic) => {
-                println!("rtl8125 at {:02x}:{:02x}.{} ({}, XID {:#05x}): MAC {}.", device.bus, device.device, device.function, nic.chip.name(), nic.xid, Mac(&nic.mac));
-                report(nic.enable_interrupts(&device));
-                if nic::install(Nic::Rtl8125(nic)).is_some() {
-                    locate(interfaces, &device);
-                    interfaces += 1;
+            Kind::Rtl8125 => {
+                match rtl8125::Rtl8125::init(&device, interfaces) {
+                    Ok(mut nic) => {
+                        println!("rtl8125 at {:02x}:{:02x}.{} ({}, XID {:#05x}): MAC {}.", device.bus, device.device, device.function, nic.chip.name(), nic.xid, Mac(&nic.mac));
+                        report(nic.enable_interrupts(&device));
+                        if nic::install(Nic::Rtl8125(nic)).is_some() {
+                            locate(interfaces, &device);
+                            interfaces += 1;
+                        }
+                    }
+                    Err(error) => println!("rtl8125 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
                 }
+    
             }
-            Err(error) => println!("rtl8125 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
-        }
-    }
-    for device in pci::devices().filter(|d| d.vendor == rtl8139::VENDOR_REALTEK && rtl8139::DEVICE_IDS.contains(&d.id)) {
-        match rtl8139::Rtl8139::init(&device, interfaces) {
-            Ok(mut nic) => {
-                println!("rtl8139 at {:02x}:{:02x}.{}: MAC {}, link {}.", device.bus, device.device, device.function, Mac(&nic.mac), if nic.link_up() { "up" } else { "down" });
-                report(nic.enable_interrupts(&device));
-                if nic::install(Nic::Rtl8139(nic)).is_some() {
-                    locate(interfaces, &device);
-                    interfaces += 1;
+            Kind::Rtl8139 => {
+                match rtl8139::Rtl8139::init(&device, interfaces) {
+                    Ok(mut nic) => {
+                        println!("rtl8139 at {:02x}:{:02x}.{}: MAC {}, link {}.", device.bus, device.device, device.function, Mac(&nic.mac), if nic.link_up() { "up" } else { "down" });
+                        report(nic.enable_interrupts(&device));
+                        if nic::install(Nic::Rtl8139(nic)).is_some() {
+                            locate(interfaces, &device);
+                            interfaces += 1;
+                        }
+                    }
+                    Err(error) => println!("rtl8139 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
                 }
+    
             }
-            Err(error) => println!("rtl8139 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
-        }
-    }
-    for device in pci::devices().filter(|d| d.vendor == threecom::VENDOR_3COM && threecom::DEVICE_IDS.contains(&d.id)) {
-        match threecom::ThreeCom::init(&device, interfaces) {
-            Ok(mut nic) => {
-                println!("3c905 at {:02x}:{:02x}.{}: MAC {}, link {}.", device.bus, device.device, device.function, Mac(&nic.mac), if nic.link_up() { "up" } else { "down" });
-                report(nic.enable_interrupts(&device));
-                if nic::install(Nic::ThreeCom(nic)).is_some() {
-                    locate(interfaces, &device);
-                    interfaces += 1;
+            Kind::ThreeCom => {
+                match threecom::ThreeCom::init(&device, interfaces) {
+                    Ok(mut nic) => {
+                        println!("3c905 at {:02x}:{:02x}.{}: MAC {}, link {}.", device.bus, device.device, device.function, Mac(&nic.mac), if nic.link_up() { "up" } else { "down" });
+                        report(nic.enable_interrupts(&device));
+                        if nic::install(Nic::ThreeCom(nic)).is_some() {
+                            locate(interfaces, &device);
+                            interfaces += 1;
+                        }
+                    }
+                    Err(error) => println!("3c905 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
                 }
+    
             }
-            Err(error) => println!("3c905 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
-        }
-    }
-    for device in pci::devices().filter(|d| d.vendor == virtio_net::VENDOR_VIRTIO && virtio_net::DEVICE_IDS.contains(&d.id)) {
-        match virtio_net::VirtioNet::init(&device, interfaces) {
-            Ok(nic) => {
-                println!("virtio-net at {:02x}:{:02x}.{}: MAC {}, link {}.", device.bus, device.device, device.function, Mac(&nic.mac), if nic.link_up() { "up" } else { "down" });
-                if nic::install(Nic::Virtio(nic)).is_some() {
-                    locate(interfaces, &device);
-                    interfaces += 1;
+            Kind::Virtio => {
+                match virtio_net::VirtioNet::init(&device, interfaces) {
+                    Ok(nic) => {
+                        println!("virtio-net at {:02x}:{:02x}.{}: MAC {}, link {}.", device.bus, device.device, device.function, Mac(&nic.mac), if nic.link_up() { "up" } else { "down" });
+                        if nic::install(Nic::Virtio(nic)).is_some() {
+                            locate(interfaces, &device);
+                            interfaces += 1;
+                        }
+                    }
+                    Err(error) => println!("virtio-net at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
                 }
+    
             }
-            Err(error) => println!("virtio-net at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
         }
     }
     #[cfg(target_arch = "aarch64")]

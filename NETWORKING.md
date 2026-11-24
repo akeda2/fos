@@ -427,6 +427,26 @@ changing existing tape behavior. The appended per-interface callbacks are
 covered by the same network-tape ABI boundary and do not change the first
 interface selected by older tapes.
 
+## Interface numbers
+
+A physical NIC's number is its place in the interface table, and that number is in `settings` (`nic-mtu N`, `vnic NAME
+on N`), `run ... &N`, `nic use N`, tape arguments and the name a machine announces (`hostname` + the number).
+`kernel_core::nicorder` decides it, in both kernels:
+
+- **PCI order.** Cards come up in PCI address order, whatever their driver. Until 2026-11-24 it was driver by driver
+  (every e1000-family card first, then RTL8168, RTL8125, RTL8139, 3C905, virtio-net), so a card of one make added
+  anywhere moved every card of a later make.
+- **Pins.** `nic N MAC` in `settings` gives the card with that MAC number N; the rest fill the free numbers in PCI
+  order. `nic pin` prints the lines that keep the present numbers: run it before adding or moving a card. To place
+  the pins before any driver runs, the kernel reads each card's MAC from its address registers (e1000 RAL0/RAH0,
+  Realtek IDR0-5 or the RTL8125's MAC0_BKP), which the hardware loads from its EEPROM or NVM at power-on; it only
+  reads, and only when `settings` has pins. Each driver's `init` then gets the final number as its index, which
+  also keeps `nic-mtu N` on an 82579/I219 (chosen before the reset) on the right card.
+- Virtual NICs are numbered after the physical ones and are best named (`run ... &web`); their numbers move when a
+  physical card is added.
+
+`make test-nic-order` boots both kernels with an RTL8139 at 00:03.0 and an e1000 at 00:04.0, with and without a pin.
+
 ## RTL8125: first run on hardware
 
 `crates/kernel-core/src/rtl8125.rs` was written from Linux's r8169 before any card was at hand; QEMU has no

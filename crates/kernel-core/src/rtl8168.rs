@@ -300,6 +300,20 @@ fn wait_reset(base: u16) -> bool {
     false
 }
 
+/// The address in IDR0-5 before `init` resets the chip (`nicorder`: placing `nic N MAC` pins). The chip loads it from its
+/// EEPROM at power-on; this only reads, after turning on I/O decoding as `init` does.
+pub fn peek_mac(device: &pci::Device) -> Option<[u8; 6]> {
+    device.force_power_state_d0();
+    let command = device.read32(4);
+    device.write32(4, (command & 0xffff) | 0x1); // I/O decoding (`init` adds bus mastering)
+    let io_base = device.io_bar(0)?;
+    let mut mac = [0u8; 6];
+    for (index, byte) in mac.iter_mut().enumerate() {
+        *byte = read8(io_base, REG_IDR0 + index as u16);
+    }
+    Some(mac)
+}
+
 impl Rtl8168 {
     pub fn init(device: &pci::Device, index: usize) -> Result<Rtl8168, Error> {
         device.force_power_state_d0();

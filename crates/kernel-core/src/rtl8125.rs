@@ -313,6 +313,22 @@ pub struct Rtl8125 {
     pub phy_errors: u32,
 }
 
+/// The factory address before `init` (`nicorder`: placing `nic N MAC` pins): `MAC0_BKP`, else MAC0, as `read_mac` reads them
+/// after `hw_init`. Both hold the EEPROM's address from power-on; this only reads, after the decoding set-up `init` does first.
+pub fn peek_mac(device: &pci::Device) -> Option<[u8; 6]> {
+    device.force_power_state_d0();
+    device.enable_memory_and_bus_master();
+    let (base, size) = (0..6).find_map(|bar| device.memory_bar(bar))?;
+    paging::map_device(base, size.max(WINDOW_BYTES));
+    let registers = base as usize;
+    if read32(registers, REG_TXCONFIG) == 0xffff_ffff {
+        return None; // not responding: `init` will say so
+    }
+    let read = |at: usize| core::array::from_fn::<u8, 6, _>(|offset| read8(registers, at + offset));
+    let mac = read(REG_MAC0_BKP);
+    Some(if mac == [0; 6] || mac[0] & 1 != 0 || mac == [0xff; 6] { read(REG_MAC0) } else { mac })
+}
+
 impl Rtl8125 {
     pub fn init(device: &pci::Device, index: usize) -> Result<Rtl8125, Error> {
         if index >= MAX_INTERFACES {

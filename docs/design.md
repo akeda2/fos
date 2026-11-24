@@ -276,6 +276,10 @@ firmware, so a pending slot is tried on the next boot.
   PHY windows (the file's header lists it). Not carried over: the PHY firmware patch, ASPM, EEE changes, RSS.
   Written before the cards were at hand and only built, never run: QEMU has no RTL8125. The plan for the first
   hardware session is in NETWORKING.md, "RTL8125: first run on hardware".
+* **Interface numbers** (`kernel_core::nicorder`, 2026-11-24): NICs come up in PCI order, not driver by driver, and
+  `nic N MAC` lines in `settings` pin a card to a number (`nic pin` prints them). The MACs are read before the
+  drivers start, so each driver's `init` gets its final number. NETWORKING.md "Interface numbers",
+  `make test-nic-order`.
 * **USB audio (xHCI isochronous, Audio Class 1.0 and 2.0).** `usb_audio.rs` recognises Audio Class devices,
   prints their streaming alternate settings (channels, bit depth, endpoint, sync type, rates, feedback
   endpoint), keeps the device, and streams: it selects the sample rate (class 1.0: SET_CUR on the endpoint;

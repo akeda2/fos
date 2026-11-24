@@ -39,7 +39,7 @@ pub const TOPICS: &[Topic] = &[
     t("top", "System", "top [SECONDS (1-60)] [once]", "Per-CPU and per-process load; q or Escape ends it."),
     t("threads", "System", "threads", "List the kernel threads and the context-switch count."),
     t("ps", "System", "ps", "List the processes (tapes)."),
-    t("nic", "Network", "nic [regs N | mtu [N [SIZE]]]", "List the network interfaces; `regs N` dumps the chip registers and ring state of NIC N; `mtu` shows or sets an MTU (jumbo up to 9000: e1000 family, RTL8168G and later; 82579/I219 only through `nic-mtu` in settings; the peer and switch must carry it); `mtu N send LEN [COUNT]` broadcasts test frames of that size."),
+    t("nic", "Network", "nic [pin | regs N | mtu [N [SIZE]]]", "List the network interfaces; `pin` prints `nic N MAC` lines for settings that keep every card on its number; `regs N` dumps the chip registers and ring state of NIC N; `mtu` shows or sets an MTU (jumbo up to 9000: e1000 family, RTL8168G and later; 82579/I219 only through `nic-mtu` in settings; the peer and switch must carry it); `mtu N send LEN [COUNT]` broadcasts test frames of that size."),
     t("vnic", "Network", "vnic | vnic add NAME on N [mac=...] | vnic del NAME", "Virtual NICs on physical NIC N, each with its own MAC and IP. Use with `run TAPE &NAME`, or `&+N` for one that lasts as long as the tape."),
     t("tapesync", "Network", "tapesync [HOST] [apply]", "Pull newer tapes from HOST (or every peer) between machines that share a `synckey`; without `apply` only lists."),
     t("gpio", "Network", "gpio @HOST ...", "Drive the GPIO pins of this machine (Raspberry Pi 4) or, with @HOST, another's."),

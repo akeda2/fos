@@ -307,128 +307,143 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     hda::init_all(config::no_msi());
 
     // ---- network interfaces (after the settings file: `no-msi` decides how they take interrupts) ----
+    // PCI order whatever the driver, with `nic N MAC` pins from settings applied (`kernel_core::nicorder`): the card's
+    // number is its place here, and each driver's `init` takes that number as its index.
+    use kernel_core::nicorder::{self, Kind};
+    let kinds = [Kind::E1000, Kind::Rtl8168, Kind::Rtl8125, Kind::Rtl8139, Kind::ThreeCom];
     let mut interfaces = 0;
-    for device in pci::devices().filter(|d| d.vendor == e1000::VENDOR_INTEL && e1000::DEVICE_IDS.contains(&d.id)) {
-        match e1000::E1000::init(&device, interfaces) {
-            Ok(mut nic) => {
-                println!("e1000 ({:?}) at {:02x}:{:02x}.{}: MAC {}, link {}.", nic.variant, device.bus, device.device, device.function, term::Mac(&nic.mac), if nic.link_up() { "up" } else { "down" });
-                if config::no_msi() {
-                    println!("  interrupts: polled (settings: no-msi).");
-                } else {
-                    match nic.enable_interrupts(&device, config::prefer_msix()) {
-                        Ok(e1000::Delivery::Msix(vector)) => println!("  interrupts: MSI-X on vector {vector:#x} (the self-test message arrived)."),
-                        Ok(e1000::Delivery::Msi(vector)) => println!("  interrupts: MSI on vector {vector:#x} (the self-test message arrived); frames wake the CPU instead of being polled for."),
-                        Ok(e1000::Delivery::Intx { gsi, vector }) => println!("  interrupts: legacy INTx, I/O APIC pin {gsi} on vector {vector:#x} (found by probing; the self-test interrupt arrived)."),
-                        Ok(e1000::Delivery::Polled) => {}
-                        Err(reason) => println!("  interrupts: polled ({reason})."),
+    for card in nicorder::arrange(&kinds).into_iter().flatten() {
+        let device = card.device;
+        match card.kind {
+            Kind::E1000 => {
+                match e1000::E1000::init(&device, interfaces) {
+                    Ok(mut nic) => {
+                        println!("e1000 ({:?}) at {:02x}:{:02x}.{}: MAC {}, link {}.", nic.variant, device.bus, device.device, device.function, term::Mac(&nic.mac), if nic.link_up() { "up" } else { "down" });
+                        if config::no_msi() {
+                            println!("  interrupts: polled (settings: no-msi).");
+                        } else {
+                            match nic.enable_interrupts(&device, config::prefer_msix()) {
+                                Ok(e1000::Delivery::Msix(vector)) => println!("  interrupts: MSI-X on vector {vector:#x} (the self-test message arrived)."),
+                                Ok(e1000::Delivery::Msi(vector)) => println!("  interrupts: MSI on vector {vector:#x} (the self-test message arrived); frames wake the CPU instead of being polled for."),
+                                Ok(e1000::Delivery::Intx { gsi, vector }) => println!("  interrupts: legacy INTx, I/O APIC pin {gsi} on vector {vector:#x} (found by probing; the self-test interrupt arrived)."),
+                                Ok(e1000::Delivery::Polled) => {}
+                                Err(reason) => println!("  interrupts: polled ({reason})."),
+                            }
+                        }
+                        if term::install(nic::Nic::E1000(nic), info.runtime_services).is_some() {
+                            interfaces += 1;
+                        }
                     }
+                    Err(error) => println!("e1000 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
                 }
-                if term::install(nic::Nic::E1000(nic), info.runtime_services).is_some() {
-                    interfaces += 1;
-                }
+    
             }
-            Err(error) => println!("e1000 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
-        }
-    }
-    for device in pci::devices().filter(|d| d.vendor == rtl8168::VENDOR_REALTEK && rtl8168::DEVICE_IDS.contains(&d.id)) {
-        match rtl8168::Rtl8168::init(&device, interfaces) {
-            Ok(nic) => {
-                match nic.link_speed() {
-                    Some((speed, full)) => println!("rtl8168 at {:02x}:{:02x}.{} (chip version {:#05x}, I/O {:#06x}): MAC {}, link up at {speed} Mb/s {}.", device.bus, device.device, device.function, nic.version, nic.io_base(), term::Mac(&nic.mac), if full { "full duplex" } else { "half duplex" }),
-                    None => println!("rtl8168 at {:02x}:{:02x}.{} (chip version {:#05x}, I/O {:#06x}): MAC {}, link down.", device.bus, device.device, device.function, nic.version, nic.io_base(), term::Mac(&nic.mac)),
-                }
-                let mut nic = nic;
-                if config::no_msi() {
-                    println!("  interrupts: polled (settings: no-msi).");
-                } else {
-                    match nic.enable_interrupts(&device) {
-                        Ok(delivery) => println!("  interrupts: {delivery:?} (the self-test interrupt arrived); frames wake the CPU instead of being polled for."),
-                        Err(reason) => println!("  interrupts: polled ({reason})."),
+            Kind::Rtl8168 => {
+                match rtl8168::Rtl8168::init(&device, interfaces) {
+                    Ok(nic) => {
+                        match nic.link_speed() {
+                            Some((speed, full)) => println!("rtl8168 at {:02x}:{:02x}.{} (chip version {:#05x}, I/O {:#06x}): MAC {}, link up at {speed} Mb/s {}.", device.bus, device.device, device.function, nic.version, nic.io_base(), term::Mac(&nic.mac), if full { "full duplex" } else { "half duplex" }),
+                            None => println!("rtl8168 at {:02x}:{:02x}.{} (chip version {:#05x}, I/O {:#06x}): MAC {}, link down.", device.bus, device.device, device.function, nic.version, nic.io_base(), term::Mac(&nic.mac)),
+                        }
+                        let mut nic = nic;
+                        if config::no_msi() {
+                            println!("  interrupts: polled (settings: no-msi).");
+                        } else {
+                            match nic.enable_interrupts(&device) {
+                                Ok(delivery) => println!("  interrupts: {delivery:?} (the self-test interrupt arrived); frames wake the CPU instead of being polled for."),
+                                Err(reason) => println!("  interrupts: polled ({reason})."),
+                            }
+                        }
+                        if term::install(nic::Nic::Rtl8168(nic), info.runtime_services).is_some() {
+                            interfaces += 1;
+                        }
                     }
+                    Err(error) => println!("rtl8168 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
                 }
-                if term::install(nic::Nic::Rtl8168(nic), info.runtime_services).is_some() {
-                    interfaces += 1;
-                }
+    
             }
-            Err(error) => println!("rtl8168 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
-        }
-    }
-    for device in pci::devices().filter(|d| d.vendor == rtl8125::VENDOR_REALTEK && rtl8125::DEVICE_IDS.contains(&d.id)) {
-        match rtl8125::Rtl8125::init(&device, interfaces) {
-            Ok(mut nic) => {
-                let (bus, slot, function, name) = (device.bus, device.device, device.function, nic.chip.name());
-                println!("rtl8125 at {bus:02x}:{slot:02x}.{function} ({name}, XID {:#05x}): MAC {}.", nic.xid, term::Mac(&nic.mac));
-                match nic.link_speed() {
-                    Some((speed, _)) => println!("  link up at {speed} Mb/s."),
-                    None => println!("  link down."),
-                }
-                if config::no_msi() {
-                    println!("  interrupts: polled (settings: no-msi).");
-                } else {
-                    match nic.enable_interrupts(&device) {
-                        Ok(delivery) => println!("  interrupts: {delivery:?} (the self-test interrupt arrived)."),
-                        Err(reason) => println!("  interrupts: polled ({reason})."),
+            Kind::Rtl8125 => {
+                match rtl8125::Rtl8125::init(&device, interfaces) {
+                    Ok(mut nic) => {
+                        let (bus, slot, function, name) = (device.bus, device.device, device.function, nic.chip.name());
+                        println!("rtl8125 at {bus:02x}:{slot:02x}.{function} ({name}, XID {:#05x}): MAC {}.", nic.xid, term::Mac(&nic.mac));
+                        match nic.link_speed() {
+                            Some((speed, _)) => println!("  link up at {speed} Mb/s."),
+                            None => println!("  link down."),
+                        }
+                        if config::no_msi() {
+                            println!("  interrupts: polled (settings: no-msi).");
+                        } else {
+                            match nic.enable_interrupts(&device) {
+                                Ok(delivery) => println!("  interrupts: {delivery:?} (the self-test interrupt arrived)."),
+                                Err(reason) => println!("  interrupts: polled ({reason})."),
+                            }
+                        }
+                        if term::install(nic::Nic::Rtl8125(nic), info.runtime_services).is_some() {
+                            interfaces += 1;
+                        }
                     }
+                    Err(error) => println!("rtl8125 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
                 }
-                if term::install(nic::Nic::Rtl8125(nic), info.runtime_services).is_some() {
-                    interfaces += 1;
-                }
+    
             }
-            Err(error) => println!("rtl8125 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
-        }
-    }
-    for device in pci::devices().filter(|d| d.vendor == rtl8139::VENDOR_REALTEK && rtl8139::DEVICE_IDS.contains(&d.id)) {
-        match rtl8139::Rtl8139::init(&device, interfaces) {
-            Ok(mut nic) => {
-                println!(
-                    "rtl8139 at {:02x}:{:02x}.{} (I/O {:#06x}): MAC {}, link {}.",
-                    device.bus,
-                    device.device,
-                    device.function,
-                    nic.io_base(),
-                    term::Mac(&nic.mac),
-                    if nic.link_up() { "up" } else { "down" }
-                );
-                if config::no_msi() {
-                    println!("  interrupts: polled (settings: no-msi).");
-                } else {
-                    match nic.enable_interrupts(&device) {
-                        Ok(delivery) => println!("  interrupts: {delivery:?} (the self-test interrupt arrived); frames wake the CPU instead of being polled for."),
-                        Err(reason) => println!("  interrupts: polled ({reason})."),
+            Kind::Rtl8139 => {
+                match rtl8139::Rtl8139::init(&device, interfaces) {
+                    Ok(mut nic) => {
+                        println!(
+                            "rtl8139 at {:02x}:{:02x}.{} (I/O {:#06x}): MAC {}, link {}.",
+                            device.bus,
+                            device.device,
+                            device.function,
+                            nic.io_base(),
+                            term::Mac(&nic.mac),
+                            if nic.link_up() { "up" } else { "down" }
+                        );
+                        if config::no_msi() {
+                            println!("  interrupts: polled (settings: no-msi).");
+                        } else {
+                            match nic.enable_interrupts(&device) {
+                                Ok(delivery) => println!("  interrupts: {delivery:?} (the self-test interrupt arrived); frames wake the CPU instead of being polled for."),
+                                Err(reason) => println!("  interrupts: polled ({reason})."),
+                            }
+                        }
+                        if term::install(nic::Nic::Rtl8139(nic), info.runtime_services).is_some() {
+                            interfaces += 1;
+                        }
                     }
+                    Err(error) => println!("rtl8139 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
                 }
-                if term::install(nic::Nic::Rtl8139(nic), info.runtime_services).is_some() {
-                    interfaces += 1;
-                }
+    
             }
-            Err(error) => println!("rtl8139 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
-        }
-    }
-    for device in pci::devices().filter(|d| d.vendor == threecom::VENDOR_3COM && threecom::DEVICE_IDS.contains(&d.id)) {
-        match threecom::ThreeCom::init(&device, interfaces) {
-            Ok(mut nic) => {
-                println!(
-                    "3c905 at {:02x}:{:02x}.{} (I/O {:#06x}): MAC {}, link {}.",
-                    device.bus,
-                    device.device,
-                    device.function,
-                    nic.io_base(),
-                    term::Mac(&nic.mac),
-                    if nic.link_up() { "up" } else { "down" }
-                );
-                if config::no_msi() {
-                    println!("  interrupts: polled (settings: no-msi).");
-                } else {
-                    match nic.enable_interrupts(&device) {
-                        Ok(delivery) => println!("  interrupts: {delivery:?} (the self-test interrupt arrived); frames wake the CPU instead of being polled for."),
-                        Err(reason) => println!("  interrupts: polled ({reason})."),
+            Kind::ThreeCom => {
+                match threecom::ThreeCom::init(&device, interfaces) {
+                    Ok(mut nic) => {
+                        println!(
+                            "3c905 at {:02x}:{:02x}.{} (I/O {:#06x}): MAC {}, link {}.",
+                            device.bus,
+                            device.device,
+                            device.function,
+                            nic.io_base(),
+                            term::Mac(&nic.mac),
+                            if nic.link_up() { "up" } else { "down" }
+                        );
+                        if config::no_msi() {
+                            println!("  interrupts: polled (settings: no-msi).");
+                        } else {
+                            match nic.enable_interrupts(&device) {
+                                Ok(delivery) => println!("  interrupts: {delivery:?} (the self-test interrupt arrived); frames wake the CPU instead of being polled for."),
+                                Err(reason) => println!("  interrupts: polled ({reason})."),
+                            }
+                        }
+                        if term::install(nic::Nic::ThreeCom(nic), info.runtime_services).is_some() {
+                            interfaces += 1;
+                        }
                     }
+                    Err(error) => println!("3c905 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
                 }
-                if term::install(nic::Nic::ThreeCom(nic), info.runtime_services).is_some() {
-                    interfaces += 1;
-                }
+    
             }
-            Err(error) => println!("3c905 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
+            Kind::Virtio => {} // not driven by this kernel
         }
     }
     if interfaces == 0 {

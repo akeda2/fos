@@ -346,6 +346,21 @@ const REG_FFLT_DBG: usize = 0x5f04;
 const REG_PCH_RAICC: usize = 0x5f50;
 const RAH_AV: u32 = 1 << 31;
 const PCH_TX_PTR_GAP: u16 = 0x1f;
+/// The address in RAL0/RAH0 before `init` resets the part (`nicorder`: placing `nic N MAC` pins). The hardware loads it from
+/// NVM at power-on, so it is there untouched; only reads, after the same power-state and decoding set-up `init` does first.
+/// Checked by the caller (`nicorder::peek_mac`): an I350 still loading reads as zero and is simply not pinned.
+pub fn peek_mac(device: &pci::Device) -> Option<[u8; 6]> {
+    device.force_power_state_d0();
+    device.enable_memory_and_bus_master();
+    let (base, size) = device.memory_bar(0)?;
+    paging::map_device(base, size.max(0x20000));
+    let (ral, rah) = (read(base as usize, REG_RAL0), read(base as usize, REG_RAH0));
+    let mut mac = [0u8; 6];
+    mac[..4].copy_from_slice(&ral.to_le_bytes());
+    mac[4..].copy_from_slice(&(rah as u16).to_le_bytes());
+    Some(mac)
+}
+
 /// Interfaces whose PCH part should be set up for jumbo frames at `init` (`prepare_jumbo`).
 static JUMBO_AT_INIT: [core::sync::atomic::AtomicBool; MAX_INTERFACES] = [const { core::sync::atomic::AtomicBool::new(false) }; MAX_INTERFACES];
 

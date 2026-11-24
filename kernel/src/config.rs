@@ -242,6 +242,13 @@ pub fn load() {
                     crate::fosfs::allow_replace_in_place();
                     crate::println!("settings: replace-in-place -- a rewrite with no room beside the old copy reuses it (not crash-safe).");
                 }
+                Some("nic") => {
+                    use kernel_core::nicorder::{Mac, add_pin, parse_pin};
+                    match parse_pin(line.split_whitespace().skip(1)).ok_or("nic N MAC").and_then(|pin| add_pin(pin).map(|_| pin)) {
+                        Ok(pin) => crate::println!("settings: nic {} {} -- that card is nic{}.", pin.number, Mac(pin.mac), pin.number),
+                        Err(why) => crate::println!("settings: `{line}` ignored ({why})."),
+                    }
+                }
                 Some("no-msi") => {
                     unsafe { NO_MSI = true };
                     crate::println!("settings: no-msi -- NICs stay on polling.");

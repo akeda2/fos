@@ -36,6 +36,14 @@ pub fn nic_mtus() -> alloc::vec::Vec<(usize, usize)> {
     unsafe { (*core::ptr::addr_of!(NIC_MTUS)).clone() }
 }
 
+/// A `nic N MAC` line of `settings`: card MAC gets interface number N (`kernel_core::nicorder`, applied as the NICs come up).
+fn pin_line(line: &str) {
+    match kernel_core::nicorder::parse_pin(line.split_whitespace().skip(1)).ok_or("nic N MAC").and_then(|pin| kernel_core::nicorder::add_pin(pin).map(|_| pin)) {
+        Ok(pin) => println!("settings: nic {} {} -- that card is nic{}.", pin.number, kernel_core::nicorder::Mac(pin.mac), pin.number),
+        Err(why) => println!("settings: `{line}` ignored ({why})."),
+    }
+}
+
 /// The `aoe-attach` targets, in order.
 pub fn aoe_attach() -> alloc::vec::Vec<crate::aoedisk::Wanted> {
     unsafe { (*core::ptr::addr_of!(AOE_ATTACH)).clone() }
@@ -228,6 +236,9 @@ pub fn load() {
             if line.split_whitespace().next() == Some("no-msi") {
                 unsafe { NO_MSI = true };
                 println!("settings: no-msi -- devices are polled.");
+            }
+            if line.split_whitespace().next() == Some("nic") {
+                pin_line(line);
             }
             if line.split_whitespace().next() == Some("nic-mtu") {
                 let mut words = line.split_whitespace().skip(1);

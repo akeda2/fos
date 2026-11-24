@@ -190,6 +190,20 @@ fn soft_reset(base: u16) -> bool {
     false
 }
 
+/// The address in IDR0-5 before `init` resets the chip (`nicorder`: placing `nic N MAC` pins); only reads, after turning on
+/// I/O decoding as `init` does.
+pub fn peek_mac(device: &pci::Device) -> Option<[u8; 6]> {
+    device.force_power_state_d0();
+    let command = device.read32(4);
+    device.write32(4, (command & 0xffff) | 0x1);
+    let io_base = device.io_bar(0)?;
+    let mut mac = [0u8; 6];
+    for (offset, byte) in mac.iter_mut().enumerate() {
+        *byte = read8(io_base, REG_IDR0 + offset as u16);
+    }
+    Some(mac)
+}
+
 impl Rtl8139 {
     pub fn init(device: &pci::Device, index: usize) -> Result<Rtl8139, Error> {
         device.force_power_state_d0();

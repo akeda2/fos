@@ -43,6 +43,7 @@ pub mod loopback;
 pub mod mounts;
 pub mod nic;
 pub mod nicctl;
+pub mod nicorder;
 #[cfg(target_arch = "x86_64")]
 pub mod nicpark;
 pub mod nvme;

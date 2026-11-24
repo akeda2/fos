@@ -24,6 +24,7 @@ unknown line is reported on the console ("unknown line ... ignored") and skipped
 | `term-net NIC[,NIC...]` | Server kernel: `term net` is open on these interfaces only (numbered from 1, as in `nic list`). Without it every NIC accepts it. Up to four clients use the server at once, each with its own history, working folder, foreground tape and `top`. |
 | `replace-in-place` | A rewrite of a FOSFS file with no room beside the old copy reuses the old copy's space (a power cut then loses the file). Without it the write fails and the old file stays. |
 | `no-msi` | NICs stay on polling instead of MSI interrupts. |
+| `nic N MAC` | The card with that MAC is interface N, wherever it sits (both kernels). The other cards take the free numbers in PCI order (bus, device, function), whatever their driver. `nic pin` prints these lines for the numbers a machine has now. A pin for a card that is absent, or for a number above the cards present, is reported at boot and ignored (numbers have no gaps). A 3C905 or virtio-net card cannot be pinned (its MAC is read only once its driver starts). NETWORKING.md "Interface numbers". |
 | `prefer-msix` | Try MSI-X before MSI on devices that offer both (a test aid; `docs/design.md`, interrupt delivery). |
 | `park-idle` | Park every NIC whose link has been down for a minute. |
 | `hwp performance\|balanced\|power` | Let an Intel CPU with hardware P-states pick its own speed, with that preference. Use `performance` on machines doing line-rate network or audio work; `balanced` has cost an i350 receive overruns. |
