@@ -328,6 +328,35 @@ pub struct IsrState {
 }
 
 pub const MAX_INTERFACES: usize = 8;
+
+/// The PCH parts (82579LM/V, I219-LM): Linux's pch2lan and later, the ones its jumbo workaround is for.
+const PCH_IDS: &[u16] = &[0x1502, 0x1503, 0x15b7, 0x156f];
+const REG_CTRL_EXT: usize = 0x0018;
+/// Clear on PCH parts whose NVM gives the MAC no jumbo frames (Linux's `e1000_get_variants_ich8lan`).
+const CTRL_EXT_LSECCK: u32 = 1 << 12;
+/// The packet buffer allocation: the low half is the receive share in KB (26 by default on these parts, 14 for jumbo,
+/// leaving transmit room for two whole frames; Linux's `e1000e_reset`).
+const REG_PBA: usize = 0x1000;
+const PBA_JUMBO_KB: u32 = 14;
+const REG_KMRNCTRLSTA: usize = 0x0034;
+const KMRN_REN: u32 = 1 << 21;
+const KMRN_CTRL_OFFSET: u32 = 0x1;
+const KMRN_HD_CTRL: u32 = 0x10;
+const REG_FFLT_DBG: usize = 0x5f04;
+const REG_PCH_RAICC: usize = 0x5f50;
+const RAH_AV: u32 = 1 << 31;
+const PCH_TX_PTR_GAP: u16 = 0x1f;
+/// Interfaces whose PCH part should be set up for jumbo frames at `init` (`prepare_jumbo`).
+static JUMBO_AT_INIT: [core::sync::atomic::AtomicBool; MAX_INTERFACES] = [const { core::sync::atomic::AtomicBool::new(false) }; MAX_INTERFACES];
+
+/// Asks `init` of interface `index` (0-based) to prepare a PCH part (82579, I219) for jumbo frames: its packet buffer is
+/// split at reset, so this must come before `init`; the server kernel calls it for `nic-mtu N SIZE` lines in `settings`.
+/// Without it `set_mtu` takes only 1500 on those parts. Other parts need nothing.
+pub fn prepare_jumbo(index: usize) {
+    if let Some(wanted) = JUMBO_AT_INIT.get(index) {
+        wanted.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+}
 pub static ISR: [IsrState; MAX_INTERFACES] = [const {
     IsrState {
         registers: core::sync::atomic::AtomicUsize::new(0),
@@ -407,6 +436,14 @@ pub struct E1000 {
     rx_stamp: u64,
     /// Largest frame (header and VLAN tag included) `send` accepts and the join buffer holds: `MAX_FRAME` until `set_mtu`.
     max_frame: usize,
+    /// A PCH part (82579, I217-I219): jumbo frames need its packet buffer split at reset and Linux's PHY workaround.
+    pch: bool,
+    /// PCH: `prepare_jumbo` asked for it, the part allows it (`CTRL_EXT.LSECCK`) and `PBA` was set before the reset.
+    pch_jumbo_ready: bool,
+    /// PCH: the PHY workaround for jumbo frames is in force.
+    pch_jumbo_on: bool,
+    /// An 82579 (Linux's pch2lan): 5 receive addresses, 100 us after each PHY access.
+    pch_82579: bool,
     /// Frames dropped whole because they did not fit the caller's buffer or the MTU. Never delivered truncated.
     pub jumbo_dropped: u64,
     /// `send_deferred` is queueing: `send` leaves the tail register (the doorbell) alone and counts the frame in `deferred`.
@@ -462,6 +499,17 @@ fn write(registers: usize, offset: usize, value: u32) {
 
 fn short_wait(ticks: u64) {
     crate::timer::wait_ticks(ticks);
+}
+
+/// Busy-waits about `micros` microseconds (bounded even if the clock does not move).
+fn wait_us(micros: u64) {
+    let start = crate::timer::micros();
+    for _ in 0..10_000_000u32 {
+        if crate::timer::micros().wrapping_sub(start) >= micros {
+            return;
+        }
+        core::hint::spin_loop();
+    }
 }
 
 /// The classic reset: set CTRL.RST and wait for it to clear.
@@ -575,6 +623,18 @@ impl E1000 {
         let variant = variant_of(device.id);
         let r = regs_of(variant);
         write(registers, r.imc, u32::MAX); // quiet until `enable_interrupts`
+        // PCH jumbo frames (see `pch_jumbo`): the receive share of the packet buffer is set before the reset, as Linux's
+        // `e1000e_reset` does (PBA, then `reset_hw`); the split is taken up by the reset that follows.
+        let pch = PCH_IDS.contains(&device.id);
+        let mut pch_jumbo_ready = false;
+        if pch && JUMBO_AT_INIT.get(index).is_some_and(|wanted| wanted.load(core::sync::atomic::Ordering::Relaxed)) {
+            if read(registers, REG_CTRL_EXT) & CTRL_EXT_LSECCK == 0 {
+                crate::println!("e1000 {}: this part has no jumbo frames (CTRL_EXT.LSECCK clear, as Linux checks).", index + 1);
+            } else {
+                write(registers, REG_PBA, PBA_JUMBO_KB);
+                pch_jumbo_ready = true;
+            }
+        }
         match variant {
             Variant::Classic => reset_classic(registers)?,
             Variant::E1000e => reset_e1000e(registers)?,
@@ -670,7 +730,7 @@ impl E1000 {
             write(registers, r.rdt, (RX_COUNT - 1) as u32);
         }
 
-        Ok(E1000 { registers, variant, r, index, delivery: Delivery::Polled, mac, rx_ring, tx_ring, rx_buffers, tx_buffers, rx_next: 0, rx_in_frame: false, rx_bad: false, assembly_len: 0, assembly: 0, rx_stamp: 0, max_frame: MAX_FRAME, jumbo_dropped: 0, jumbo_joined: 0, defer_doorbell: false, deferred: 0, tx_next: 0, frames_received: 0, frames_sent: 0, frames_dropped_no_link: 0, link_checks: 0, link_ok: true, ts_on: false, ts_all: false, last_stamp: 0, ts_clock: pch_clock(device.id), ts_offset: 0, mc_users: [0; 4096], vlan_ids: [0; 128], promiscuous: false, tx_offload: false, tx_ctx: [false; TX_COUNT] })
+        Ok(E1000 { registers, variant, r, index, delivery: Delivery::Polled, mac, rx_ring, tx_ring, rx_buffers, tx_buffers, rx_next: 0, rx_in_frame: false, rx_bad: false, assembly_len: 0, assembly: 0, rx_stamp: 0, max_frame: MAX_FRAME, pch, pch_jumbo_ready, pch_jumbo_on: false, pch_82579: matches!(device.id, 0x1502 | 0x1503), jumbo_dropped: 0, jumbo_joined: 0, defer_doorbell: false, deferred: 0, tx_next: 0, frames_received: 0, frames_sent: 0, frames_dropped_no_link: 0, link_checks: 0, link_ok: true, ts_on: false, ts_all: false, last_stamp: 0, ts_clock: pch_clock(device.id), ts_offset: 0, mc_users: [0; 4096], vlan_ids: [0; 128], promiscuous: false, tx_offload: false, tx_ctx: [false; TX_COUNT] })
     }
 
     /// Sets the MTU (the payload size: 1500 is standard, up to `JUMBO_MAX_MTU`); false when `mtu` is out of range or the
@@ -680,8 +740,21 @@ impl E1000 {
     /// QEMU's e1000 takes jumbo frames; what only real silicon can show (the 82574L and I219 split their packet buffer
     /// between receive and transmit, and Linux changes `PBA` for jumbo; the I350's `RLPML`) is in docs/block-sharing.md.
     pub fn set_mtu(&mut self, mtu: usize) -> bool {
-        if !(1500..=JUMBO_MAX_MTU).contains(&mtu) {
+        if !(1500..=self.largest_mtu()).contains(&mtu) {
             return false;
+        }
+        // A PCH part switches its PHY workaround with receive paused, as Linux does it before enabling receive.
+        if self.pch && (mtu > 1500) != self.pch_jumbo_on {
+            let rctl = read(self.registers, REG_RCTL);
+            write(self.registers, REG_RCTL, rctl & !RCTL_EN);
+            let done = self.pch_jumbo(mtu > 1500);
+            // The workaround's "off" half clears CRC stripping; this driver always strips (and set it on), so put it back.
+            write(self.registers, REG_RCTL, read(self.registers, REG_RCTL) | RCTL_SECRC | (rctl & RCTL_EN));
+            if !done {
+                crate::println!("e1000 {}: the PHY did not take the jumbo-frame settings.", self.index + 1);
+                return false;
+            }
+            self.pch_jumbo_on = mtu > 1500;
         }
         let max_frame = mtu + FRAME_OVERHEAD;
         if self.assembly == 0 && max_frame > MAX_FRAME {
@@ -694,6 +767,187 @@ impl E1000 {
         self.rx_bad = self.rx_in_frame;
         self.assembly_len = 0;
         true
+    }
+
+    /// The largest MTU `set_mtu` takes: `JUMBO_MAX_MTU`, except on a PCH part not prepared at init (`prepare_jumbo`).
+    pub fn largest_mtu(&self) -> usize {
+        if self.pch && !self.pch_jumbo_ready { 1500 } else { JUMBO_MAX_MTU }
+    }
+
+    /// Linux's `e1000_lv_jumbo_workaround_ich8lan` for the 82579 and I217-I219 (e1000e `ich8lan.c`; the access paths are
+    /// its `phy.c`): the PHY and the Kumeran interface between MAC and PHY are set up for frames over 1500 (`enable`) or
+    /// back. In order: hold the PHY's receive (769/20 bit 14); with `enable`, write the receive-address CRC table
+    /// (`PCH_RAICC`: the CRC-32 of each valid address), copy the addresses into the PHY's wakeup page, set `FFLT_DBG`
+    /// bits 17:15 to 7 and clear 14, CRC stripping on, Kumeran CTRL bit 0 set and HD_CTRL bits 11:8 = 0xb, then PHY
+    /// 769/23 bits 11:5 = 0x37, 769/16 bit 13 clear, 776/20 bits 11:2 = 0x1f, 776/23 = 0xf100, 770/17 bit 10 set; the "off"
+    /// half undoes each (769/23 field 0, 769/16 bit 13 set, 776/20 field 0x8, 776/23 = 0x7e00, 770/17 bit 10 clear,
+    /// `FFLT_DBG` bits 17:14 clear, CRC stripping off: the caller turns it back on); release the hold. False when the PHY
+    /// or its semaphore did not answer: the hold may then still be set, as in Linux.
+    fn pch_jumbo(&mut self, enable: bool) -> bool {
+        let Some(hold) = self.pch_phy_read(769, 20) else { return false };
+        if !self.pch_phy_write(769, 20, hold | 1 << 14) {
+            return false;
+        }
+        let modify = |this: &Self, page: u16, register: u16, change: &dyn Fn(u16) -> u16| -> bool {
+            this.pch_phy_read(page, register).is_some_and(|value| this.pch_phy_write(page, register, change(value)))
+        };
+        let registers = self.registers;
+        let ok = if enable {
+            let entries = self.pch_rar_entries();
+            for entry in 0..entries {
+                let high = read(registers, REG_RAH0 + entry * 8);
+                if high & RAH_AV == 0 {
+                    continue;
+                }
+                let low = read(registers, REG_RAL0 + entry * 8);
+                let mut address = [0u8; 6];
+                address[..4].copy_from_slice(&low.to_le_bytes());
+                address[4..].copy_from_slice(&(high as u16).to_le_bytes());
+                // Linux writes the inverse of `ether_crc_le`, which is the ordinary CRC-32.
+                write(registers, REG_PCH_RAICC + entry * 4, crate::gpt::crc32(&address));
+            }
+            self.pch_copy_addresses_to_phy()
+                && {
+                    write(registers, REG_FFLT_DBG, (read(registers, REG_FFLT_DBG) & !(1 << 14)) | 7 << 15);
+                    write(registers, REG_RCTL, read(registers, REG_RCTL) | RCTL_SECRC);
+                    true
+                }
+                && self.kumeran_modify(KMRN_CTRL_OFFSET, |value| value | 1)
+                && self.kumeran_modify(KMRN_HD_CTRL, |value| (value & !(0xf << 8)) | 0xb << 8)
+                && modify(self, 769, 23, &|value| (value & !(0x7f << 5)) | 0x37 << 5)
+                && modify(self, 769, 16, &|value| value & !(1 << 13))
+                && modify(self, 776, 20, &|value| (value & !(0x3ff << 2)) | PCH_TX_PTR_GAP << 2)
+                && self.pch_phy_write(776, 23, 0xf100)
+                && modify(self, 770, 17, &|value| value | 1 << 10)
+        } else {
+            write(registers, REG_FFLT_DBG, read(registers, REG_FFLT_DBG) & !(0xf << 14));
+            write(registers, REG_RCTL, read(registers, REG_RCTL) & !RCTL_SECRC);
+            self.kumeran_modify(KMRN_CTRL_OFFSET, |value| value & !1)
+                && self.kumeran_modify(KMRN_HD_CTRL, |value| (value & !(0xf << 8)) | 0xb << 8)
+                && modify(self, 769, 23, &|value| value & !(0x7f << 5))
+                && modify(self, 769, 16, &|value| value | 1 << 13)
+                && modify(self, 776, 20, &|value| (value & !(0x3ff << 2)) | 0x8 << 2)
+                && self.pch_phy_write(776, 23, 0x7e00)
+                && modify(self, 770, 17, &|value| value & !(1 << 10))
+        };
+        ok && self.pch_phy_write(769, 20, hold & !(1 << 14))
+    }
+
+    /// Receive-address entries the PCH has (Linux's `rar_entry_count`): 5 on the 82579, 12 from the I217 on.
+    fn pch_rar_entries(&self) -> usize {
+        if self.pch_82579() { 5 } else { 12 }
+    }
+
+    fn pch_82579(&self) -> bool {
+        self.pch_82579
+    }
+
+    /// Takes the PHY semaphore of the PCH (`EXTCNF_CTRL.SWFLAG`, Linux's `e1000_acquire_swflag_ich8lan`): wait up to 100 ms
+    /// for the management firmware to let go, set the flag, and wait up to 1 s for it to read back set.
+    fn pch_acquire(&self) -> bool {
+        let registers = self.registers;
+        let mut free = false;
+        for _ in 0..100 {
+            if read(registers, REG_EXTCNF_CTRL) & EXTCNF_MDIO_SW_OWNERSHIP == 0 {
+                free = true;
+                break;
+            }
+            crate::timer::busy_wait_ms(1);
+        }
+        if !free {
+            return false;
+        }
+        write(registers, REG_EXTCNF_CTRL, read(registers, REG_EXTCNF_CTRL) | EXTCNF_MDIO_SW_OWNERSHIP);
+        for _ in 0..1000 {
+            if read(registers, REG_EXTCNF_CTRL) & EXTCNF_MDIO_SW_OWNERSHIP != 0 {
+                return true;
+            }
+            crate::timer::busy_wait_ms(1);
+        }
+        write(registers, REG_EXTCNF_CTRL, read(registers, REG_EXTCNF_CTRL) & !EXTCNF_MDIO_SW_OWNERSHIP);
+        false
+    }
+
+    fn pch_release(&self) {
+        write(self.registers, REG_EXTCNF_CTRL, read(self.registers, REG_EXTCNF_CTRL) & !EXTCNF_MDIO_SW_OWNERSHIP);
+    }
+
+    /// One MDIC cycle to MDIO address 1 (where these pages live: Linux's `e1000_get_phy_addr_for_hv_page`), with the
+    /// 100 us the 82579 needs after each (`e1000e_*_phy_reg_mdic`).
+    fn pch_mdic(&self, register: u16, write_value: Option<u16>) -> Option<u16> {
+        let opcode = match write_value {
+            Some(_) => 1 << 26,
+            None => 2 << 26,
+        };
+        let value = self.mdic(opcode | u32::from(register & 0x1f) << 16, write_value.unwrap_or(0));
+        if self.pch_82579() {
+            wait_us(100);
+        }
+        value
+    }
+
+    /// A PHY register on page 768 or above (the "HV" PHY of these parts), with the semaphore held: the page select
+    /// (register 31) gets `page << 5`, then the register (all of the workaround's are above 15, so they need the page).
+    fn pch_phy_access(&self, page: u16, register: u16, write_value: Option<u16>) -> Option<u16> {
+        if !self.pch_acquire() {
+            return None;
+        }
+        let value = self.pch_mdic(31, Some(page << 5)).and_then(|_| self.pch_mdic(register, write_value));
+        self.pch_release();
+        value
+    }
+
+    fn pch_phy_read(&self, page: u16, register: u16) -> Option<u16> {
+        self.pch_phy_access(page, register, None)
+    }
+
+    fn pch_phy_write(&self, page: u16, register: u16, value: u16) -> bool {
+        self.pch_phy_access(page, register, Some(value)).is_some()
+    }
+
+    /// A Kumeran register (the MAC-PHY interface) through `KMRNCTRLSTA`, read, changed, written, with the semaphore held
+    /// (Linux's `e1000e_read_kmrn_reg`/`_write_`: offset in bits 20:16, REN for a read, 2 us after each).
+    fn kumeran_modify(&self, offset: u32, change: impl Fn(u16) -> u16) -> bool {
+        if !self.pch_acquire() {
+            return false;
+        }
+        let registers = self.registers;
+        write(registers, REG_KMRNCTRLSTA, offset << 16 | KMRN_REN);
+        let _ = read(registers, REG_STATUS); // flush the posted write
+        wait_us(2);
+        let value = read(registers, REG_KMRNCTRLSTA) as u16;
+        write(registers, REG_KMRNCTRLSTA, offset << 16 | u32::from(change(value)));
+        let _ = read(registers, REG_STATUS);
+        wait_us(2);
+        self.pch_release();
+        true
+    }
+
+    /// Linux's `e1000_copy_rx_addrs_to_phy_ich8lan`: the receive addresses into the PHY's wakeup page (800), which is
+    /// reached through 769/17 (`BM_WUC_ENABLE_REG`: bit 2 on, host and ME wake-up bits 4 and 5 off, restored after), then
+    /// per register its number to 800's address opcode (17) and the value to its data opcode (18). Per entry i: 16 + 4i
+    /// the low half of RAL, 17 + 4i the high half, 18 + 4i the low half of RAH, 19 + 4i its address-valid bit.
+    fn pch_copy_addresses_to_phy(&self) -> bool {
+        if !self.pch_acquire() {
+            return false;
+        }
+        let registers = self.registers;
+        let mut ok = false;
+        if let Some(saved) = self.pch_mdic(31, Some(769 << 5)).and_then(|_| self.pch_mdic(17, None)) {
+            ok = self.pch_mdic(17, Some((saved | 1 << 2) & !(1 << 4 | 1 << 5))).is_some() && self.pch_mdic(31, Some(800 << 5)).is_some();
+            for entry in 0..self.pch_rar_entries() {
+                let (low, high) = (read(registers, REG_RAL0 + entry * 8), read(registers, REG_RAH0 + entry * 8));
+                let values = [low as u16, (low >> 16) as u16, high as u16, ((high & RAH_AV) >> 16) as u16];
+                for (offset, value) in values.into_iter().enumerate() {
+                    let number = (16 + 4 * entry + offset) as u16;
+                    ok = ok && self.pch_mdic(0x11, Some(number)).is_some() && self.pch_mdic(0x12, Some(value)).is_some();
+                }
+            }
+            // Restore the wake-up register whatever happened.
+            ok = self.pch_mdic(31, Some(769 << 5)).is_some() && self.pch_mdic(17, Some(saved)).is_some() && ok;
+        }
+        self.pch_release();
+        ok
     }
 
     /// The MTU in force (1500 until `set_mtu`).

@@ -218,7 +218,7 @@ impl Nic {
     /// The MTU in force, and the largest `set_mtu` accepts for this card (1500, 1500 where jumbo is not supported).
     pub fn mtu(&self) -> (usize, usize) {
         match self {
-            Nic::E1000(nic) => (nic.mtu(), crate::e1000::JUMBO_MAX_MTU),
+            Nic::E1000(nic) => (nic.mtu(), nic.largest_mtu()),
             Nic::Rtl8168(nic) => (nic.mtu(), nic.largest_mtu()),
             _ => (1500, 1500),
         }

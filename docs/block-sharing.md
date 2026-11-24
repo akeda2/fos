@@ -156,12 +156,33 @@ Do not enable it on a machine until a `nic mtu` test frame has crossed that mach
   never disk 1 or a disk with an AoE export.
 - **RTL8168G/H.** `Rtl8168::set_mtu` (up to 9000; older chips stay at 1500): the first MTU above 1500 moves both rings
   to 9 KiB buffers (4.5 MiB) and resets the chip onto them, RMS follows the buffer, `MaxTxPacketSize` becomes 0x27 (Linux's
-  `EarlySize` on these chips); Linux sets no jumbo enable bits for them (`rtl_jumbo_config`). A frame over the MTU or the
-  caller's buffer is dropped whole (`jumbo_dropped`). Not run on hardware yet (QEMU has no RTL8168).
+  `EarlySize` on these chips), and `RxConfig` gets `RX_EARLY_OFF` (bit 11, Linux's `rtl_init_rxcfg` for the G to H).
+  Linux sets no jumbo enable bits for them (`rtl_jumbo_config`). A frame over the MTU or the caller's buffer is dropped
+  whole (`jumbo_dropped`). Found on rack's 8168H: without `RX_EARLY_OFF` it sent jumbo frames but received none over
+  about 2 KiB, with RMS and the descriptors at 9 KiB.
+- **82579 and I219 (PCH).** Linux enables jumbo there only with its `e1000_lv_jumbo_workaround_ich8lan`, and only on a
+  part whose NVM allows it (`CTRL_EXT.LSECCK`). `E1000::pch_jumbo` does the same: the receive-address CRC table
+  (`PCH_RAICC`), the addresses copied into the PHY's wakeup page, `FFLT_DBG`, two Kumeran registers and six PHY registers
+  on pages 769, 770 and 776, each access under the PCH's software flag (`EXTCNF_CTRL`), receive paused meanwhile. The
+  packet buffer's receive share drops to 14 KB, which takes a reset: `E1000::prepare_jumbo` asks `init` for it, and the
+  server kernel calls it for `nic-mtu N SIZE` lines in `settings`. So on these parts jumbo needs that line and a reboot;
+  `nic mtu N SIZE` alone is refused there and says so. Flow-control watermarks are not changed (this driver does not
+  send PAUSE frames).
+- **Test frames.** `nic mtu N send LEN [COUNT]` broadcasts frames of LEN bytes (ethertype 0x88b5); the receiver's `nic`
+  frame counters and `nic mtu` drop counters show whether that size crossed. That is how the 8168H's limit was found.
 - **Checked** in QEMU (`make test-mf-aoe-initiator`): both guests at MTU 9000, 17 sectors a frame, a FOSFS file read back
   with its SHA-256, `writespeed` 8 MiB over AoE and its pattern read on both ends.
-- **Not yet:** the I219's jumbo setup (Linux's `e1000_lv_jumbo_workaround_ich8lan`, PBA and watermarks; needed on aneby),
-  the I350 path, and a real link at 9000.
+- **On hardware (2026-11-24),** aneby (I219-LM 0x156f, `nic-mtu 1 9000`) and rack (RTL8168H at 9000) through the lab
+  switch, 1 GiB raw over AoE: 1500 gives `readspeed` 116 MB/s and `writespeed` 113 MB/s; 9000 (17 sectors a frame)
+  gives 115 and 117 MB/s, with 8.3 times fewer frames (376,000 for 3 GiB), 14 resent, none failed, and the target's
+  worker at 22 us per 8.5 KiB frame against 5 us per 1 KiB (about half the CPU per byte). At 1 Gb/s both sizes are at
+  the wire's limit; the gain is the CPU, which is what 2.5 Gb/s will need. Test frames up to 9018 bytes crossed both
+  ways. rack's I350 sent jumbo frames that aneby received whole.
+- **Set the MTU on both ends in `settings`.** An initiator fixes its frame size at attach. If the target comes back from a
+  reboot at 1500 while the initiator still sends 17-sector writes, those frames vanish and the disk fails until it is
+  attached again. A target-side MTU set only from the shell is not enough for a lasting attach.
+- **Not yet:** the I350's receive path at 9000 (it sent fine), and a read-ahead that does not wait for the disk inside
+  the worker (at 9000 the worker's 22 us a frame is mostly its 64 KiB disk reads, which 2.5 Gb/s will feel).
 
 ## 8. The target (`crates/aoe`, done) and what is next
 

@@ -346,7 +346,7 @@ pub fn run_command(line: &str) {
                 Some(number) => net::print_registers(number),
                 None => println!("usage: nic regs N"),
             },
-            Some("mtu") => net::nic_mtu(words.next(), words.next()),
+            Some("mtu") => net::nic_mtu(words.next(), words.next(), words.next(), words.next()),
             Some(_) => println!("usage: nic [regs N | mtu [N [SIZE]]]"),
         },
         "vnic" => crate::vnic::command(words),

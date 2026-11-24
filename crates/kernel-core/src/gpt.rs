@@ -92,7 +92,7 @@ pub fn inspect(disk: usize) -> Option<Summary> {
     Some(Summary::Gpt { fosfs, other })
 }
 
-fn crc32(data: &[u8]) -> u32 {
+pub(crate) fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xffff_ffffu32;
     for &byte in data {
         crc ^= u32::from(byte);

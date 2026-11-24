@@ -113,6 +113,12 @@ pub fn print_registers(number: usize) {
 
 /// Starts every NIC the drivers know and puts it in the table. Needs interrupts on (the drivers prove their interrupt path).
 pub fn init() {
+    // `nic-mtu N SIZE` above 1500: an 82579/I219 splits its packet buffer at reset, so it must know before `E1000::init`.
+    for (number, mtu) in config::nic_mtus() {
+        if mtu > 1500 {
+            e1000::prepare_jumbo(number - 1);
+        }
+    }
     nicctl::set_frame_handler(frame_hook);
     nicctl::set_frame_allocator(|bytes| match pmm::allocate((bytes as u64).div_ceil(pmm::FRAME), None) {
         Some(address) => vm::direct(address) as *mut u8,
@@ -945,7 +951,7 @@ pub fn mtus() -> [usize; nic::MAX_NICS] {
 /// `nic mtu [N [SIZE]]`: the MTU of every NIC, or of NIC N, or sets it. Above 1500 (jumbo frames; e1000 family and RTL8168
 /// where the chip has them) every switch port and the peer must carry the size too, or frames vanish (docs/block-sharing.md).
 /// Only the AoE target and initiator use frames above 1518; tapes still see at most that.
-pub fn nic_mtu(number: Option<&str>, size: Option<&str>) {
+pub fn nic_mtu(number: Option<&str>, size: Option<&str>, length: Option<&str>, repeat: Option<&str>) {
     let count = { let _nics = lock_nics(); nic::count() };
     let Some(index) = number.map(|word| word.parse::<usize>().ok().filter(|n| (1..=count).contains(n))) else {
         for index in 0..count {
@@ -954,7 +960,10 @@ pub fn nic_mtu(number: Option<&str>, size: Option<&str>) {
         }
         return;
     };
-    let Some(index) = index else { return crate::println!("usage: nic mtu [N [SIZE]]   (N: 1..{count})") };
+    let Some(index) = index else { return crate::println!("usage: nic mtu [N [SIZE | send LEN [COUNT]]]   (N: 1..{count})") };
+    if size == Some("send") {
+        return send_test_frames(index, length, repeat);
+    }
     if let Some(word) = size {
         let Ok(mtu) = word.parse::<usize>() else { return crate::println!("nic mtu: '{word}' is not a number.") };
         let (done, largest) = {
@@ -962,7 +971,11 @@ pub fn nic_mtu(number: Option<&str>, size: Option<&str>) {
             nic::at(index - 1).map_or((false, 1500), |card| (card.set_mtu(mtu), card.mtu().1))
         };
         if !done {
-            return crate::println!("nic {index}: MTU {mtu} refused (1500..{largest} on this interface).");
+            crate::println!("nic {index}: MTU {mtu} refused (1500..{largest} on this interface).");
+            if largest == 1500 && mtu > 1500 {
+                crate::println!("     An 82579/I219 needs `nic-mtu {index} {mtu}` in settings and a reboot.");
+            }
+            return;
         }
     }
     let _nics = lock_nics();
@@ -972,6 +985,32 @@ pub fn nic_mtu(number: Option<&str>, size: Option<&str>) {
     if let Some((joined, dropped)) = card.jumbo_counters() {
         crate::println!("nic {index}: {joined} jumbo frame(s) joined, {dropped} dropped for size.");
     }
+}
+
+/// `nic mtu N send LEN [COUNT]`: broadcasts COUNT (1) frames of LEN bytes, header included (ethertype 0x88b5, payload byte
+/// i is i mod 251, as the embedded kernel's test frame), to see whether frames of that size leave this NIC and reach
+/// another: the receiver's per-NIC frame counters (`nic`) and `nic mtu` drop counters tell.
+fn send_test_frames(index: usize, length: Option<&str>, repeat: Option<&str>) {
+    let Some(size) = length.and_then(|word| word.parse::<usize>().ok()).filter(|n| (60..=9100).contains(n)) else {
+        return crate::println!("nic mtu N send LEN [COUNT]: LEN is 60..9100 bytes, header included.");
+    };
+    let count = repeat.and_then(|word| word.parse::<usize>().ok()).unwrap_or(1).clamp(1, 100_000);
+    let mut frame = alloc::vec![0u8; size];
+    frame[0..6].copy_from_slice(&[0xff; 6]);
+    let Some(mac) = mac(index - 1) else { return };
+    frame[6..12].copy_from_slice(&mac);
+    frame[12..14].copy_from_slice(&[0x88, 0xb5]);
+    for (at, byte) in frame[14..].iter_mut().enumerate() {
+        *byte = (at % 251) as u8;
+    }
+    let mut sent = 0;
+    for _ in 0..count {
+        let _nics = lock_nics();
+        if nic::at(index - 1).is_some_and(|card| card.send(&frame)) {
+            sent += 1;
+        }
+    }
+    crate::println!("nic {index}: {sent} of {count} frame(s) of {size} bytes sent.");
 }
 
 /// Handles whatever the NICs have received, announces the name and sends queued console output. Call from the service loop.

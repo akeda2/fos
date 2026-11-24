@@ -125,6 +125,7 @@ const RX_ACCEPT_ALL_PHYS: u32 = 0x01;
 const RX_ACCEPT_MY_PHYS: u32 = 0x02;
 const RX_ACCEPT_MULTICAST: u32 = 0x04;
 const RX_ACCEPT_BROADCAST: u32 = 0x08;
+const RX_EARLY_OFF: u32 = 1 << 11;
 const RXCONFIG_VALUE: u32 = (7 << 13) | (7 << 8) | RX_ACCEPT_MY_PHYS | RX_ACCEPT_MULTICAST | RX_ACCEPT_BROADCAST;
 const CPLUS_RX_CHECKSUM: u16 = 1 << 5;
 const CPLUS_RX_VLAN: u16 = 1 << 6;
@@ -837,6 +838,13 @@ fn init_rings(rings: u64, rx_buffers: u64, tx_buffers: u64, buffer_bytes: usize)
     }
 }
 
+/// `RxConfig`: as before, plus `RX_EARLY_OFF` (bit 11) with jumbo buffers. Linux sets that bit on the 8168G through H
+/// (`rtl_init_rxcfg`); without it rack's 8168H received no frame above about 2 KiB with 9 KiB buffers and RMS (frames
+/// from 2048 bytes up never showed as received, while the same machine's I350 sent them to aneby whole).
+fn rx_config(buffer_bytes: usize) -> u32 {
+    RXCONFIG_VALUE | if buffer_bytes == JUMBO_BUFFER_BYTES { RX_EARLY_OFF } else { 0 }
+}
+
 /// `MaxTxPacketSize` (128-byte units): 0x3f as before, 0x27 with jumbo buffers (Linux's `EarlySize` on the 8168E-VL
 /// through H, written there at every MTU; here only once jumbo is on, so a 1500 setup stays as verified).
 fn max_tx_packet(buffer_bytes: usize) -> u8 {
@@ -860,7 +868,7 @@ fn program(base: u16, rings: u64, enable_after_config: bool, promiscuous: bool, 
         write8(base, REG_CR, CR_TE | CR_RE);
     }
     write32(base, REG_TXCONFIG, TXCONFIG_VALUE);
-    write32(base, REG_RXCONFIG, RXCONFIG_VALUE | if promiscuous { RX_ACCEPT_ALL_PHYS } else { 0 });
+    write32(base, REG_RXCONFIG, rx_config(buffer_bytes) | if promiscuous { RX_ACCEPT_ALL_PHYS } else { 0 });
     write32(base, REG_MAR0, 0xffff_ffff);
     write32(base, REG_MAR0 + 4, 0xffff_ffff);
     if enable_after_config {
