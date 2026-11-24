@@ -14,6 +14,14 @@
 //! `TxConfig`/`RxConfig`, older ones before. Linux's PHY, ERI, OCP and ASPM tuning is left out,
 //! as in v1; the v1 notes record that this was enough for real gigabit links.
 //!
+//! Jumbo frames (`set_mtu`, RTL8168G and later only): Linux's r8169 gives these chips a 9 KiB limit and sets no jumbo
+//! enable bits for them (`rtl_jumbo_max`, `rtl_jumbo_config`'s default case); it sizes every receive buffer, and RMS, for
+//! a whole frame rather than splitting one over descriptors. So does this driver: the first MTU above 1500 allocates 9 KiB
+//! buffers for both rings (4.5 MiB) and resets the chip onto them (`recover`), and `MaxTxPacketSize` becomes 0x27, the
+//! value Linux writes on these chips (`EarlySize`, `rtl_hw_start_8168`). A frame over the MTU in force, or larger than the
+//! caller's buffer, is dropped and counted (`jumbo_dropped`), never delivered cut short. Older chips need Config3/Config4
+//! bits per generation and smaller limits; they stay at 1500.
+//!
 //! Interrupts: the foreground always polls the rings; MSI (when the chip and chipset pass a
 //! self-test, `enable_interrupts`) only wakes the CPU from `hlt` when a frame arrives, as on the
 //! e1000 family. v1's notes record that the receive-descriptor-unavailable and FIFO-overflow
@@ -150,6 +158,12 @@ const TX_COUNT: usize = 256;
 /// fills with frames the card was not told about (the AoE target kicks every 8 anyway).
 const DEFER_LIMIT: usize = 8;
 const BUFFER_BYTES: usize = 2048;
+/// The buffers once jumbo frames are on: a 9000-byte MTU, its Ethernet header, a VLAN tag and the FCS, rounded up.
+const JUMBO_BUFFER_BYTES: usize = 9216;
+/// The largest MTU `set_mtu` accepts (the e1000 family's figure; Linux allows these chips 9194).
+pub const JUMBO_MAX_MTU: usize = 9000;
+/// Header, VLAN tag: what a frame adds to the MTU (the FCS is not counted, the card strips and appends it).
+const FRAME_OVERHEAD: usize = 18;
 const TX_RING_OFFSET: u64 = (RX_COUNT * DESCRIPTOR_BYTES) as u64;
 const RING_FRAMES: u64 = ((RX_COUNT + TX_COUNT) * DESCRIPTOR_BYTES).div_ceil(4096) as u64;
 const RX_BUFFER_FRAMES: u64 = (RX_COUNT * BUFFER_BYTES / 4096) as u64;
@@ -217,8 +231,8 @@ fn write_descriptor(ring: u64, index: usize, opts1: u32, address: u64, opts2: u3
     unsafe { write_volatile(field(ring, index, 0), opts1) };
 }
 
-fn rx_opts1(index: usize) -> u32 {
-    DESC_OWN | if index == RX_COUNT - 1 { DESC_EOR } else { 0 } | BUFFER_BYTES as u32
+fn rx_opts1(index: usize, buffer_bytes: usize) -> u32 {
+    DESC_OWN | if index == RX_COUNT - 1 { DESC_EOR } else { 0 } | buffer_bytes as u32
 }
 
 pub struct Rtl8168 {
@@ -229,6 +243,12 @@ pub struct Rtl8168 {
     rings: u64,
     rx_buffers: u64,
     tx_buffers: u64,
+    /// The size of every receive and transmit buffer: `BUFFER_BYTES`, or `JUMBO_BUFFER_BYTES` once jumbo frames were on.
+    buffer_bytes: usize,
+    /// The MTU in force (`set_mtu`), 1500 by default.
+    mtu: usize,
+    /// Frames over the MTU, or over the caller's buffer, dropped whole.
+    pub jumbo_dropped: u64,
     rx_next: usize,
     tx_next: usize,
     /// Set by `send_deferred` around `send`: queue the frame, leave the doorbell (`TPPOLL`) to `kick`.
@@ -300,8 +320,8 @@ impl Rtl8168 {
         let rings = memory::allocate_contiguous(RING_FRAMES, below).ok_or(Error::OutOfMemory)?;
         let rx_buffers = memory::allocate_contiguous(RX_BUFFER_FRAMES, below).ok_or(Error::OutOfMemory)?;
         let tx_buffers = memory::allocate_contiguous(TX_BUFFER_FRAMES, below).ok_or(Error::OutOfMemory)?;
-        init_rings(rings, rx_buffers, tx_buffers);
-        program(io_base, rings, enable_after_config, false);
+        init_rings(rings, rx_buffers, tx_buffers, BUFFER_BYTES);
+        program(io_base, rings, enable_after_config, false, BUFFER_BYTES);
         let mut mac = [0u8; 6];
         for (index, byte) in mac.iter_mut().enumerate() {
             *byte = read8(io_base, REG_IDR0 + index as u16);
@@ -315,6 +335,9 @@ impl Rtl8168 {
             rings,
             rx_buffers,
             tx_buffers,
+            buffer_bytes: BUFFER_BYTES,
+            mtu: 1500,
+            jumbo_dropped: 0,
             rx_next: 0,
             tx_next: 0,
             defer_doorbell: false,
@@ -550,11 +573,11 @@ impl Rtl8168 {
         if !wait_reset(self.io_base) {
             return false;
         }
-        init_rings(self.rings, self.rx_buffers, self.tx_buffers);
+        init_rings(self.rings, self.rx_buffers, self.tx_buffers, self.buffer_bytes);
         self.rx_next = 0;
         self.tx_next = 0;
         self.deferred = 0;
-        program(self.io_base, self.rings, self.enable_after_config, self.promiscuous);
+        program(self.io_base, self.rings, self.enable_after_config, self.promiscuous, self.buffer_bytes);
         FATAL[self.index].store(false, Ordering::Relaxed);
         SOFT_MASKED[self.index].store(false, Ordering::Relaxed);
         if self.interrupts_enabled {
@@ -564,6 +587,40 @@ impl Rtl8168 {
         self.recoveries += 1;
         self.recovery_pending = false;
         true
+    }
+
+    /// Sets the MTU, 1500..`JUMBO_MAX_MTU` (RTL8168G and later; older chips take 1500 only). The first value above 1500
+    /// moves both rings to 9 KiB buffers and resets the chip onto them; frames in flight are lost, as in any recovery.
+    /// Back at 1500 the large buffers stay and `receive` drops what is over the MTU, as the old RMS did.
+    pub fn set_mtu(&mut self, mtu: usize) -> bool {
+        if !(1500..=self.largest_mtu()).contains(&mtu) {
+            return false;
+        }
+        if mtu > 1500 && self.buffer_bytes != JUMBO_BUFFER_BYTES {
+            let frames = (RX_COUNT * JUMBO_BUFFER_BYTES).div_ceil(4096) as u64;
+            let below = Some(1u64 << 32);
+            let Some(rx_buffers) = memory::allocate_contiguous(frames, below) else { return false };
+            let Some(tx_buffers) = memory::allocate_contiguous(frames, below) else { return false };
+            // The 2 KiB buffers are not given back: the allocator here keeps what a driver took.
+            (self.rx_buffers, self.tx_buffers, self.buffer_bytes) = (rx_buffers, tx_buffers, JUMBO_BUFFER_BYTES);
+            self.mtu = mtu;
+            return self.recover();
+        }
+        self.mtu = mtu;
+        write8(self.io_base, REG_9346CR, CFG9346_UNLOCK);
+        write8(self.io_base, REG_MAXTXPKT, max_tx_packet(self.buffer_bytes));
+        write8(self.io_base, REG_9346CR, CFG9346_LOCK);
+        true
+    }
+
+    /// The MTU in force.
+    pub fn mtu(&self) -> usize {
+        self.mtu
+    }
+
+    /// The largest MTU this chip takes here: 9000 from the RTL8168G on, 1500 before.
+    pub fn largest_mtu(&self) -> usize {
+        if self.enable_after_config { JUMBO_MAX_MTU } else { 1500 }
     }
 
     /// Turns transmit checksum offload on or off. Only the 8168G/H generation, whose descriptor layout is the one used
@@ -614,7 +671,9 @@ impl Rtl8168 {
     /// Queues one frame (padded to the 60-byte minimum). A frame sent with no link is dropped, as
     /// on the e1000 driver, instead of waiting for a descriptor that would never complete.
     pub fn send(&mut self, frame: &[u8]) -> bool {
-        if frame.len() > MAX_FRAME {
+        // At 1500 the old limit (no VLAN tag); above it the MTU plus header and tag, which the jumbo buffers hold.
+        let limit = if self.mtu > 1500 { self.mtu + FRAME_OVERHEAD } else { MAX_FRAME };
+        if frame.len() > limit {
             return false;
         }
         self.link_checks = self.link_checks.wrapping_add(1);
@@ -645,8 +704,8 @@ impl Rtl8168 {
             return false;
         }
         self.tx_next = (index + 1) % TX_COUNT;
-        let buffer = self.tx_buffers + (index * BUFFER_BYTES) as u64;
-        let destination = unsafe { core::slice::from_raw_parts_mut(memory::phys_to_virt(buffer) as *mut u8, BUFFER_BYTES) };
+        let buffer = self.tx_buffers + (index * self.buffer_bytes) as u64;
+        let destination = unsafe { core::slice::from_raw_parts_mut(memory::phys_to_virt(buffer) as *mut u8, self.buffer_bytes) };
         destination[..frame.len()].copy_from_slice(frame);
         let length = frame.len().max(MIN_FRAME);
         destination[frame.len()..length].fill(0);
@@ -742,15 +801,23 @@ impl Rtl8168 {
         fence(Ordering::SeqCst);
         let length = (opts1 & DESC_LENGTH_MASK) as usize; // includes the 4-byte FCS
         let whole = opts1 & (DESC_FS | DESC_LS) == (DESC_FS | DESC_LS);
-        let good = whole && opts1 & DESC_RX_RES == 0 && (14 + 4..=BUFFER_BYTES).contains(&length);
-        let buffer = self.rx_buffers + (index * BUFFER_BYTES) as u64;
+        let good = whole && opts1 & DESC_RX_RES == 0 && (14 + 4..=self.buffer_bytes).contains(&length);
+        // With the 2 KiB buffers nothing changes (RMS is the limit, a frame is cut to a small caller's buffer, as before).
+        // With jumbo buffers a frame over the MTU in force (header and VLAN tag allowed) or over the caller's buffer is
+        // dropped whole and counted, never cut: the large RMS no longer stops it in hardware.
+        let oversize = self.buffer_bytes == JUMBO_BUFFER_BYTES && good && (length - 4 > self.mtu + FRAME_OVERHEAD || length - 4 > out.len());
+        if oversize {
+            self.jumbo_dropped += 1;
+        }
+        let good = good && !oversize;
+        let buffer = self.rx_buffers + (index * self.buffer_bytes) as u64;
         let copied = good.then(|| {
             let count = (length - 4).min(out.len());
             unsafe { core::ptr::copy_nonoverlapping(memory::phys_to_virt(buffer) as *const u8, out.as_mut_ptr(), count) };
             count
         });
         // Hand the descriptor back whether or not the frame was good.
-        write_descriptor(self.rings, index, rx_opts1(index), buffer, 0);
+        write_descriptor(self.rings, index, rx_opts1(index, self.buffer_bytes), buffer, 0);
         self.rx_next = (index + 1) % RX_COUNT;
         if copied.is_some() {
             self.frames_received += 1;
@@ -760,25 +827,31 @@ impl Rtl8168 {
     }
 }
 
-fn init_rings(rings: u64, rx_buffers: u64, tx_buffers: u64) {
+fn init_rings(rings: u64, rx_buffers: u64, tx_buffers: u64, buffer_bytes: usize) {
     for index in 0..RX_COUNT {
-        write_descriptor(rings, index, rx_opts1(index), rx_buffers + (index * BUFFER_BYTES) as u64, 0);
+        write_descriptor(rings, index, rx_opts1(index, buffer_bytes), rx_buffers + (index * buffer_bytes) as u64, 0);
     }
     for index in 0..TX_COUNT {
         let eor = if index == TX_COUNT - 1 { DESC_EOR } else { 0 };
-        write_descriptor(rings + TX_RING_OFFSET, index, eor, tx_buffers + (index * BUFFER_BYTES) as u64, 0);
+        write_descriptor(rings + TX_RING_OFFSET, index, eor, tx_buffers + (index * buffer_bytes) as u64, 0);
     }
+}
+
+/// `MaxTxPacketSize` (128-byte units): 0x3f as before, 0x27 with jumbo buffers (Linux's `EarlySize` on the 8168E-VL
+/// through H, written there at every MTU; here only once jumbo is on, so a 1500 setup stays as verified).
+fn max_tx_packet(buffer_bytes: usize) -> u8 {
+    if buffer_bytes == JUMBO_BUFFER_BYTES { 0x27 } else { 0x3f }
 }
 
 /// Programs the registers after a reset. Config registers are write-protected unless `9346CR`
 /// says otherwise; the ring base addresses and the receiver/transmitter enables follow the
 /// chip-generation order described at the top of the file.
-fn program(base: u16, rings: u64, enable_after_config: bool, promiscuous: bool) {
+fn program(base: u16, rings: u64, enable_after_config: bool, promiscuous: bool, buffer_bytes: usize) {
     write8(base, REG_9346CR, CFG9346_UNLOCK);
     let cplus = read16(base, REG_CPLUSCMD);
     write16(base, REG_CPLUSCMD, cplus & !(CPLUS_RX_CHECKSUM | CPLUS_RX_VLAN)); // no offloads, no VLAN stripping
-    write16(base, REG_RMS, (BUFFER_BYTES - 1) as u16);
-    write8(base, REG_MAXTXPKT, 0x3f);
+    write16(base, REG_RMS, (buffer_bytes - 1) as u16);
+    write8(base, REG_MAXTXPKT, max_tx_packet(buffer_bytes));
     write32(base, REG_TNPDS + 4, ((rings + TX_RING_OFFSET) >> 32) as u32);
     write32(base, REG_TNPDS, (rings + TX_RING_OFFSET) as u32);
     write32(base, REG_RDSAR + 4, (rings >> 32) as u32);

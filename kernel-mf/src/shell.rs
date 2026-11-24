@@ -191,7 +191,7 @@ pub fn prompt() {
 /// Commands `run` handles itself, outside the shared tables, for Tab completion.
 const BUILTINS: &[&str] = &[
     "version", "cpus", "mem", "pci", "disks", "nic", "vnic", "service", "settings", "tapesync", "gpio", "top", "threads", "ps", "date", "uptime", "slots", "audio", "i2s", "i2c", "touch", "midi", #[cfg(target_arch = "aarch64")] "cpufreq", #[cfg(target_arch = "aarch64")] "temp", "usb", "tape", "run", "kill",
-    "echo", "debug", "sysrq", "trace", "start", "keymap", "kup", "recv", "dmesg", "clear", "sleep", "io", "memmap", "bootinfo", "cpuinfo", "shrink", "sector", "readspeed", "mkimage", "mount", "umount",
+    "echo", "debug", "sysrq", "trace", "start", "keymap", "kup", "recv", "dmesg", "clear", "sleep", "io", "memmap", "bootinfo", "cpuinfo", "shrink", "sector", "readspeed", "writespeed", "mkimage", "mount", "umount",
     "format", "label", "fsck", "grow", "install", "bootcode", "reboot", "reset", "shutdown", "halt", "ext4", "md", "sha256", "cd", "pwd", "exit",
 ];
 
@@ -346,7 +346,8 @@ pub fn run_command(line: &str) {
                 Some(number) => net::print_registers(number),
                 None => println!("usage: nic regs N"),
             },
-            Some(_) => println!("usage: nic [regs N]"),
+            Some("mtu") => net::nic_mtu(words.next(), words.next()),
+            Some(_) => println!("usage: nic [regs N | mtu [N [SIZE]]]"),
         },
         "vnic" => crate::vnic::command(words),
         "service" => crate::service::command(words),
@@ -495,6 +496,7 @@ pub fn run_command(line: &str) {
         "ext4" => crate::sysshell::ext4(&line.trim_start()[command.len()..]),
         "sector" => crate::sysshell::sector(&line.trim_start()[command.len()..]),
         "readspeed" => crate::sysshell::readspeed(&line.trim_start()[command.len()..]),
+        "writespeed" => crate::sysshell::writespeed(&line.trim_start()[command.len()..]),
         "mkimage" => crate::mkimage::command(&line.trim_start()[command.len()..]),
         "mount" => crate::sysshell::mount(&line.trim_start()[command.len()..]),
         "umount" => crate::sysshell::umount(&line.trim_start()[command.len()..]),

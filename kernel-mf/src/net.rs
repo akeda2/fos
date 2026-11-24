@@ -192,6 +192,15 @@ pub fn init() {
     if interfaces == 0 {
         println!("No supported network interface found (e1000, e1000e, I350, RTL8139, RTL8168, 3c905 and virtio-net are driven).");
     }
+    // `nic-mtu N SIZE` in settings: before anything attaches over AoE, whose frame size is fixed at attach.
+    for (number, mtu) in config::nic_mtus() {
+        let done = nic::at(number - 1).map(|card| (card.set_mtu(mtu), card.mtu().1));
+        match done {
+            Some((true, _)) => println!("nic {number}: MTU {mtu} (settings)."),
+            Some((false, largest)) => println!("nic {number}: MTU {mtu} refused (1500..{largest} on this interface)."),
+            None => println!("nic {number}: no such interface; `nic-mtu {number} {mtu}` ignored."),
+        }
+    }
 }
 
 // ---- the NIC lock ----
@@ -924,6 +933,44 @@ fn handle_frame(index: usize, frame: &[u8]) {
         _ => {
             handle_terminal(index, source, tag, payload);
         }
+    }
+}
+
+/// The MTU in force on every NIC (1500 for the ones that do not exist), for the AoE target's replies.
+pub fn mtus() -> [usize; nic::MAX_NICS] {
+    let _nics = lock_nics();
+    core::array::from_fn(|index| nic::at(index).map_or(1500, |card| card.mtu().0))
+}
+
+/// `nic mtu [N [SIZE]]`: the MTU of every NIC, or of NIC N, or sets it. Above 1500 (jumbo frames; e1000 family and RTL8168
+/// where the chip has them) every switch port and the peer must carry the size too, or frames vanish (docs/block-sharing.md).
+/// Only the AoE target and initiator use frames above 1518; tapes still see at most that.
+pub fn nic_mtu(number: Option<&str>, size: Option<&str>) {
+    let count = { let _nics = lock_nics(); nic::count() };
+    let Some(index) = number.map(|word| word.parse::<usize>().ok().filter(|n| (1..=count).contains(n))) else {
+        for index in 0..count {
+            let (mtu, largest) = { let _nics = lock_nics(); nic::at(index).map_or((1500, 1500), |card| card.mtu()) };
+            crate::println!("nic {}: MTU {mtu} (largest {largest})", index + 1);
+        }
+        return;
+    };
+    let Some(index) = index else { return crate::println!("usage: nic mtu [N [SIZE]]   (N: 1..{count})") };
+    if let Some(word) = size {
+        let Ok(mtu) = word.parse::<usize>() else { return crate::println!("nic mtu: '{word}' is not a number.") };
+        let (done, largest) = {
+            let _nics = lock_nics();
+            nic::at(index - 1).map_or((false, 1500), |card| (card.set_mtu(mtu), card.mtu().1))
+        };
+        if !done {
+            return crate::println!("nic {index}: MTU {mtu} refused (1500..{largest} on this interface).");
+        }
+    }
+    let _nics = lock_nics();
+    let Some(card) = nic::at(index - 1) else { return };
+    let (mtu, largest) = card.mtu();
+    crate::println!("nic {index}: MTU {mtu} (largest {largest}).");
+    if let Some((joined, dropped)) = card.jumbo_counters() {
+        crate::println!("nic {index}: {joined} jumbo frame(s) joined, {dropped} dropped for size.");
     }
 }
 

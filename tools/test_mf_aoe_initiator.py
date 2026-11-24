@@ -17,6 +17,10 @@ detach and attach (same disk number); the target sees the same file on its own d
 target that has gone fails after the resends instead of hanging; and an ext4 disk (the target's disk 3, when the host has
 mkfs.ext4) attached, changed on the target, detached and attached again lists the new file (the kept ext4 mount is
 dropped on attach; it once kept listing the old folder because the disk number stays the same).
+
+Jumbo frames at the end: both guests at `nic mtu 1 9000`; discovery then advertises 17 sectors a frame, the attach uses
+them, the FOSFS file written earlier reads back with the host's SHA-256, `writespeed` writes 8 MiB over AoE (refused on
+disk 1 and without `confirm`), and its pattern reads back on the initiator and on the target's own disk.
 """
 
 import hashlib
@@ -260,6 +264,43 @@ def main():
             check(ok, "the initiator attaches e5.9 by itself once it answers", i.log[-600:].decode("utf8", "replace"))
             ok, text = i.command("aoe", "attached e5.9", 20)
             check(ok and "waiting for" not in text, "and no longer waits for it", text[-600:])
+
+            # Jumbo frames: 17 sectors a frame (QEMU's e1000 takes 9000-byte frames).
+            ok, text = i.command("aoe detach 5.9", "detached", 20)
+            ok, text = t.command("aoe unexport 9", "no longer exported", 20)
+            for guest in (t, i):
+                ok, text = guest.command("nic mtu 1 9000", "MTU", 20)
+                check(ok and "nic 1: MTU 9000" in text, f"{guest.name}: nic mtu 1 9000", text[-300:])
+            ok, text = t.command("aoe export 2 slot 9 rw for 52:54:00:12:34:e2", "READ-WRITE", 20)
+            ok, text = i.command("aoe discover", "e5.9", 20)
+            check(ok and "17 sector(s) a frame" in text, "discovery advertises 17 sectors a frame at MTU 9000", text[-600:])
+            ok, text = i.command("aoe attach 5.9 rw", "is disk", 30)
+            number = re.search(r"e5\.9 is disk (\d+)", text)
+            check(ok and number is not None, "attach rw at MTU 9000", text[-400:])
+            jumbo = int(number.group(1)) if number else 4
+            ok, text = i.command("aoe", "attached e5.9", 20)
+            check(ok and "17 sector(s) a frame" in text, "the attach uses 17 sectors a frame", text[-600:])
+            ok, text = i.command("sha256 @remote/big.bin", digest, 120)
+            check(ok, "the FOSFS file reads back in jumbo frames with the host's SHA-256", text[-600:])
+            ok, text = i.command(f"readspeed disk{jumbo} 8", "MB/s", 60)
+            check(ok, "readspeed in jumbo frames", text[-300:])
+            ok, text = i.command("writespeed disk1 8 confirm", "writespeed", 20)
+            check(ok and "boot disk" in text, "writespeed refuses disk 1", text[-300:])
+            ok, text = i.command(f"writespeed disk{jumbo} 8", "writespeed", 20)
+            check(ok and "OVERWRITE" in text and "MB/s" not in text, "writespeed without confirm only says what it would do", text[-300:])
+            ok, text = i.command(f"writespeed disk{jumbo} 8 1024 confirm", "MB/s", 120)
+            check(ok and "8 MiB written" in text, "writespeed writes 8 MiB over AoE in jumbo frames", text[-300:])
+            print("        " + "\n        ".join(line.strip() for line in text.splitlines() if "MB/s" in line or "flush" in line))
+            # The pattern: each 8 bytes hold (lba * 64 + index); sector 3's first 16 bytes are 192 and 193.
+            row = "000  c0 00 00 00 00 00 00 00 c1 00 00 00 00 00 00 00"
+            ok, text = i.command(f"sector disk{jumbo} 3", f"disk{jumbo} sector 3:", 30)
+            check(ok and row in text, "the pattern reads back through AoE", text[-400:])
+            ok, text = i.command("aoe", "attached e5.9", 20)
+            check(ok and " 0 failed" in text, "no failed requests in jumbo frames", text[-600:])
+            ok, text = i.command("aoe detach 5.9", "detached", 20)
+            ok, text = t.command("aoe unexport 9", "no longer exported", 30)
+            ok, text = t.command("sector disk2 3", "disk2 sector 3:", 30)
+            check(ok and row in text, "and on the target's own disk", text[-400:])
         finally:
             for guest in (t, i):
                 if guest is not None:

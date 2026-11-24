@@ -196,10 +196,12 @@ impl Nic {
         }
     }
 
-    /// Sets the MTU (jumbo frames above 1500). Only the e1000 family so far; false elsewhere, or when the size is refused.
+    /// Sets the MTU (jumbo frames above 1500): the e1000 family and the RTL8168G and later; false elsewhere, or when the size
+    /// is refused.
     pub fn set_mtu(&mut self, mtu: usize) -> bool {
         match self {
             Nic::E1000(nic) => nic.set_mtu(mtu),
+            Nic::Rtl8168(nic) => nic.set_mtu(mtu),
             _ => false,
         }
     }
@@ -208,6 +210,7 @@ impl Nic {
     pub fn jumbo_counters(&self) -> Option<(u64, u64)> {
         match self {
             Nic::E1000(nic) => Some((nic.jumbo_joined, nic.jumbo_dropped)),
+            Nic::Rtl8168(nic) => Some((0, nic.jumbo_dropped)),
             _ => None,
         }
     }
@@ -216,6 +219,7 @@ impl Nic {
     pub fn mtu(&self) -> (usize, usize) {
         match self {
             Nic::E1000(nic) => (nic.mtu(), crate::e1000::JUMBO_MAX_MTU),
+            Nic::Rtl8168(nic) => (nic.mtu(), nic.largest_mtu()),
             _ => (1500, 1500),
         }
     }

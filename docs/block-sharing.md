@@ -1,7 +1,8 @@
 # Sharing block devices over Ethernet
 
-Status: design note (2026-11-22). Only the jumbo-frame groundwork in the e1000 driver exists (section 7, `make
-test-jumbo`); no target or initiator yet.
+Status (2026-11-24): the AoE target and initiator run on the server kernel (sections 8 on), with files as exports,
+`mkimage`, one writer per export, and jumbo frames end to end in QEMU ("Jumbo frames on the AoE path"). This began as a
+design note; the early sections keep that form.
 
 The goal is to hand a disk from one machine to another over the lab's Ethernet: between fos hosts, and between fos and
 Linux. File-level sharing already exists (`smbd`, NETFS, `//NAME/path` remote volumes, ABI 35). This note is about the
@@ -138,6 +139,29 @@ Checked in QEMU only (its e1000 takes jumbo frames). What only real hardware can
 - Whether the lab's switch ports pass 9000.
 
 Do not enable it on a machine until a `nic mtu` test frame has crossed that machine's real link.
+
+### Jumbo frames on the AoE path (2026-11-24)
+
+- **Receive.** `nicctl::drain_nic_to_fifo` receives into one `RX_FRAME_MAX` (9216-byte) buffer shared by all NICs
+  (drains are serialised under the NIC lock), so a joined jumbo frame reaches the kernel's handlers. The tape FIFOs keep
+  1600-byte slots: a larger frame no handler took is dropped and counted (tapes see at most 1518, `nic_max_frame_len`).
+- **Target.** Each export's queue holds 64 frames of 9216 bytes (576 KiB), allocated with its first export; in .bss they
+  would not fit the BIOS loader's kernel span. A request is answered with the MTU of the NIC it came in on (read once a
+  batch), so Query Config advertises 17 sectors a frame on a 9000-byte NIC and 2 on a 1500 one.
+- **Initiator.** Its reply queues (128 x 9216 bytes, 1.1 MiB) are allocated at an entry's first attach. The sectors per
+  frame are fixed at attach from the target's figure and our NIC's MTU, so set the MTU first: `nic-mtu N SIZE` in
+  `settings` is applied when the NICs come up, before `aoe-attach`; after `nic mtu` in the shell, detach and attach.
+- **Shell.** `nic mtu [N [SIZE]]` on the server kernel (show, set). `writespeed diskN [MIB] [KIB] confirm` is the write
+  twin of `readspeed`: raw writes from sector 0 (a pattern per request), then a flush, the rate with the flush included;
+  never disk 1 or a disk with an AoE export.
+- **RTL8168G/H.** `Rtl8168::set_mtu` (up to 9000; older chips stay at 1500): the first MTU above 1500 moves both rings
+  to 9 KiB buffers (4.5 MiB) and resets the chip onto them, RMS follows the buffer, `MaxTxPacketSize` becomes 0x27 (Linux's
+  `EarlySize` on these chips); Linux sets no jumbo enable bits for them (`rtl_jumbo_config`). A frame over the MTU or the
+  caller's buffer is dropped whole (`jumbo_dropped`). Not run on hardware yet (QEMU has no RTL8168).
+- **Checked** in QEMU (`make test-mf-aoe-initiator`): both guests at MTU 9000, 17 sectors a frame, a FOSFS file read back
+  with its SHA-256, `writespeed` 8 MiB over AoE and its pattern read on both ends.
+- **Not yet:** the I219's jumbo setup (Linux's `e1000_lv_jumbo_workaround_ich8lan`, PBA and watermarks; needed on aneby),
+  the I350 path, and a real link at 9000.
 
 ## 8. The target (`crates/aoe`, done) and what is next
 
@@ -279,7 +303,7 @@ frames per disk write; the service thread still drained a third of the frames (`
 Not done, in the order I would do it:
 
 1. **Per-controller locking** in the block layer, if measurements on hardware say serial disk access is the limit.
-2. Jumbo frames on this path: `nicctl` drains into 1600-byte buffers and the target assumes MTU 1500.
+2. Jumbo frames on this path: done in QEMU ("Jumbo frames on the AoE path"); hardware needs the I219 setup.
 3. `vblade` as a peer, and the Linux test on real hardware (a fos machine exporting to a Linux box over a real switch).
 4. FAT and exFAT files as exports (FOSFS and ext files are done), and file exports in `settings`.
 
@@ -612,6 +636,6 @@ After quitting QEMU, `e2fsck -fn build/aoe-linux/data.img` (no root needed) chec
 
 ## 10. Open questions
 
-- RTL8168 jumbo (per-chip limits table, `RMS`, buffer size) is not done.
+- RTL8168 jumbo: done for the 8168G and later (section 7); older generations stay at 1500.
 - Does the recorder want the initiator on the embedded kernel too, or mf only? (Leaning mf only.)
 - Claim timeout and what a crashed owner leaves behind (FOSFS journal-less; ext4 replays).

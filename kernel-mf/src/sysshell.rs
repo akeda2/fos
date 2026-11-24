@@ -107,6 +107,74 @@ pub fn readspeed(rest: &str) {
     }
 }
 
+/// `writespeed diskN [MIB] [KIB] confirm`: writes MIB MiB (64) from the disk's start in KIB KiB requests (1024), then
+/// flushes, and prints the rate with the flush included (data the drive only holds in its cache is not written yet). It
+/// overwrites those sectors, partition table included, hence `confirm`; never disk 1, nor a disk with an AoE export (the
+/// export's readers would see it change under them, and an exported file's sectors refuse it anyway). Each request
+/// carries a different pattern, so a drive that compresses or deduplicates zeros cannot shortcut it.
+pub fn writespeed(rest: &str) {
+    const USAGE: &str = "Usage: writespeed diskN [MIB 1-4096] [KIB 4-4096] confirm\n\
+                         \x20      OVERWRITES the first MIB MiB of the disk (its partition table too).";
+    let words: alloc::vec::Vec<&str> = rest.split_whitespace().collect();
+    let confirmed = words.last() == Some(&"confirm");
+    let words = if confirmed { &words[..words.len() - 1] } else { &words[..] };
+    let disk = words.first().and_then(|word| word.strip_prefix("disk")).and_then(|digits| digits.parse::<usize>().ok());
+    let mib = words.get(1).map_or(Some(64), |word| word.parse::<u64>().ok());
+    let kib = words.get(2).map_or(Some(1024), |word| word.parse::<usize>().ok());
+    let (Some(disk), Some(mib), Some(kib)) = (disk, mib, kib) else { return println!("{USAGE}") };
+    if disk == 0 || words.len() > 3 || !(1..=4096).contains(&mib) || !(4..=4096).contains(&kib) || kib % 4 != 0 {
+        return println!("{USAGE}");
+    }
+    if disk == 1 {
+        return println!("writespeed: disk1 is the boot disk and is never written raw.");
+    }
+    let Some(sectors) = crate::block::get(disk - 1).map(|info| info.sectors) else {
+        return println!("writespeed: no disk{disk}.");
+    };
+    if crate::aoetarget::exported(disk - 1) {
+        return println!("writespeed: disk{disk} (or a file on it) is exported over AoE (see `aoe`).");
+    }
+    let total = (mib << 11).min(sectors);
+    if !confirmed {
+        println!("writespeed would OVERWRITE the first {} MiB of disk{disk}, partition", total >> 11);
+        return println!("table included. To go ahead: writespeed disk{disk} {mib} {kib} confirm");
+    }
+    let per = (kib * 2) as u64;
+    let mut buffer = alloc::vec![0u8; kib * 1024];
+    let begin = crate::arch::micros();
+    let mut lba = 0;
+    while lba < total {
+        let count = per.min(total - lba) as usize;
+        // A pattern of its own per request: the LBA in every 8 bytes.
+        for (index, word) in buffer[..count * 512].chunks_exact_mut(8).enumerate() {
+            word.copy_from_slice(&(lba * 64 + index as u64).to_le_bytes());
+        }
+        let result = {
+            let _disk = crate::tapefs::lock();
+            crate::block::write_deferred(disk - 1, lba, &buffer[..count * 512])
+        };
+        if let Err(error) = result {
+            return println!("writespeed: disk{disk} sector {lba}: write failed ({error:?}).");
+        }
+        lba += count as u64;
+    }
+    let written = crate::arch::micros() - begin;
+    let flushed = {
+        let _disk = crate::tapefs::lock();
+        // What was on the disk is gone: a kept ext mount of it must not be trusted.
+        kernel_core::ext4vol::wrote_behind(disk - 1);
+        crate::block::flush(disk - 1)
+    };
+    if flushed.is_err() {
+        return println!("writespeed: disk{disk}: the flush at the end failed.");
+    }
+    let micros = (crate::arch::micros() - begin).max(1);
+    let bytes = total * 512;
+    println!("disk{disk}: {} MiB written in {kib} KiB requests, {}.{:03} s, {} MB/s ({} KB/s)",
+        bytes >> 20, micros / 1_000_000, micros / 1000 % 1000, bytes / micros, bytes * 1000 / micros);
+    println!("  of it {} ms for the flush at the end", (micros - written) / 1000);
+}
+
 pub fn mount(rest: &str) {
     let mut words = rest.split_whitespace();
     match (words.next(), words.next(), words.next()) {

@@ -29,6 +29,13 @@ static mut AOE_EXPORTS: alloc::vec::Vec<crate::aoetarget::Wanted> = alloc::vec::
 /// `aoe-attach SHELF.SLOT [rw] [MAC]` lines in `settings`: targets this machine attaches at the end of boot.
 static mut AOE_ATTACH: alloc::vec::Vec<crate::aoedisk::Wanted> = alloc::vec::Vec::new();
 
+/// `nic-mtu N SIZE` lines in `settings`: (interface number, MTU), applied when the NICs come up.
+static mut NIC_MTUS: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
+
+pub fn nic_mtus() -> alloc::vec::Vec<(usize, usize)> {
+    unsafe { (*core::ptr::addr_of!(NIC_MTUS)).clone() }
+}
+
 /// The `aoe-attach` targets, in order.
 pub fn aoe_attach() -> alloc::vec::Vec<crate::aoedisk::Wanted> {
     unsafe { (*core::ptr::addr_of!(AOE_ATTACH)).clone() }
@@ -221,6 +228,16 @@ pub fn load() {
             if line.split_whitespace().next() == Some("no-msi") {
                 unsafe { NO_MSI = true };
                 println!("settings: no-msi -- devices are polled.");
+            }
+            if line.split_whitespace().next() == Some("nic-mtu") {
+                let mut words = line.split_whitespace().skip(1);
+                match (words.next().and_then(|w| w.parse::<usize>().ok()), words.next().and_then(|w| w.parse::<usize>().ok()), words.next()) {
+                    (Some(number @ 1..), Some(mtu @ 576..=16384), None) => {
+                        println!("settings: nic-mtu {number} {mtu} -- set when the NICs come up.");
+                        unsafe { (*core::ptr::addr_of_mut!(NIC_MTUS)).push((number, mtu)) };
+                    }
+                    _ => println!("settings: `{line}` ignored (nic-mtu N SIZE)."),
+                }
             }
             if line.split_whitespace().next() == Some("aoe-attach") {
                 match crate::aoedisk::parse_wanted(line.split_whitespace().skip(1)) {

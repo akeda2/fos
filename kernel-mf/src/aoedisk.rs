@@ -40,7 +40,8 @@ use kernel_core::{nic, nicctl};
 const MAX_REMOTES: usize = 4;
 /// Replies a remote's queue holds: above the largest window, so a full window of replies is never dropped here.
 const QUEUE: usize = 128;
-const FRAME: usize = 1600;
+/// The largest reply a queue slot holds: a jumbo frame (`nicctl::RX_FRAME_MAX`).
+const FRAME: usize = kernel_core::nicctl::RX_FRAME_MAX;
 /// The most frames in flight per request, whatever the target's `bufcount` says (and never more than the queue holds).
 const MAX_WINDOW: usize = 64;
 const TIMEOUT_TICKS: u64 = 2;
@@ -71,7 +72,9 @@ struct Queue {
     route: Option<Route>,
     /// When the oldest reply in the queue arrived (TSC cycles), 0 while it is empty.
     arrived_at: u64,
-    frames: [[u8; FRAME]; QUEUE],
+    /// `QUEUE` slots of `FRAME` bytes (1.1 MiB), allocated at the entry's first attach and kept: jumbo-sized slots in
+    /// .bss would not fit the BIOS loader's kernel span. Empty until then; a reply finds no room and is dropped.
+    frames: Vec<u8>,
     lengths: [u16; QUEUE],
     head: usize,
     count: usize,
@@ -134,7 +137,7 @@ struct Entry {
 impl Entry {
     const fn new() -> Entry {
         Entry {
-            inbox: SpinLock::new(Queue { route: None, arrived_at: 0, frames: [[0; FRAME]; QUEUE], lengths: [0; QUEUE], head: 0, count: 0, dropped: 0 }),
+            inbox: SpinLock::new(Queue { route: None, arrived_at: 0, frames: Vec::new(), lengths: [0; QUEUE], head: 0, count: 0, dropped: 0 }),
             remote: SleepMutex::new(None),
             busy: AtomicBool::new(false),
             ahead_started: AtomicBool::new(false),
@@ -187,6 +190,11 @@ static ENTRIES: [Entry; MAX_REMOTES] = [const { Entry::new() }; MAX_REMOTES];
 static TAGS: AtomicU32 = AtomicU32::new(0x1000);
 /// Whether the hook should take 0x88a2 replies at all: something is attached or a discovery listens.
 static WANTED: AtomicBool = AtomicBool::new(false);
+
+/// A frame buffer on the heap: `Box::new([0; FRAME])` would build the 9 KiB array on the stack first.
+fn frame_box() -> Box<[u8; FRAME]> {
+    alloc::vec![0u8; FRAME].into_boxed_slice().try_into().unwrap_or_else(|_| unreachable!())
+}
 
 /// A target that answered `aoe discover`.
 #[derive(Clone, Copy)]
@@ -242,7 +250,7 @@ pub fn reply(nic: usize, frame: &[u8], wake: bool) {
         if queue.route != Some(route) {
             continue;
         }
-        if queue.count == QUEUE {
+        if queue.count == QUEUE || queue.frames.is_empty() {
             queue.dropped += 1;
         } else {
             if queue.count == 0 {
@@ -255,7 +263,7 @@ pub fn reply(nic: usize, frame: &[u8], wake: bool) {
                 }
             }
             let at = (queue.head + queue.count) % QUEUE;
-            queue.frames[at][..frame.len()].copy_from_slice(frame);
+            queue.frames[at * FRAME..at * FRAME + frame.len()].copy_from_slice(frame);
             queue.lengths[at] = frame.len() as u16;
             queue.count += 1;
         }
@@ -280,7 +288,7 @@ fn pop(entry: &Entry, out: &mut [u8; FRAME]) -> usize {
     }
     let at = queue.head;
     let length = usize::from(queue.lengths[at]);
-    out[..length].copy_from_slice(&queue.frames[at][..length]);
+    out[..length].copy_from_slice(&queue.frames[at * FRAME..at * FRAME + length]);
     queue.head = (at + 1) % QUEUE;
     queue.count -= 1;
     length
@@ -632,6 +640,10 @@ fn attach(shelf: u16, slot: u8, writable: bool, via: Option<[u8; 6]>) -> Result<
     let window = usize::from(target.bufcount).clamp(1, MAX_WINDOW);
     let entry = &ENTRIES[index];
     entry.reset_counters();
+    if entry.inbox.lock().frames.is_empty() {
+        let storage = alloc::vec![0u8; QUEUE * FRAME];
+        entry.inbox.lock().frames = storage;
+    }
     let mut remote = Remote {
         nic: target.nic,
         address: Address { ours, target: target.mac, shelf, slot },
@@ -639,8 +651,8 @@ fn attach(shelf: u16, slot: u8, writable: bool, via: Option<[u8; 6]>) -> Result<
         window,
         sectors: 0,
         writable,
-        out: Box::new([0; FRAME]),
-        rx: Box::new([0; FRAME]),
+        out: frame_box(),
+        rx: frame_box(),
         ahead: Box::new(ReadAhead::new(per_frame, window, TIMEOUT_TICKS, MAX_TRIES, 0, STALE_TICKS)),
         store: Box::new([]),
     };

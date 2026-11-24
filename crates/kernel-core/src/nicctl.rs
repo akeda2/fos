@@ -58,11 +58,24 @@ pub fn frame_pending(index: usize) -> bool {
     index < MAX_NICS && unsafe { FRAME_TAIL[index] != FRAME_HEAD[index] }
 }
 
+/// The largest frame the receive path takes off a NIC: a 9000-byte MTU (`nic mtu`, the largest any driver here accepts)
+/// plus the Ethernet header, a VLAN tag and slack. Only the kernel's own handlers (the AoE target and initiator) see frames
+/// this big; the tape FIFOs keep 1600-byte slots and drop a larger frame (tapes take at most 1518, `nic_max_frame_len`).
+pub const RX_FRAME_MAX: usize = 9216;
+/// The buffer `drain_nic_to_fifo` receives into. One for all NICs: every drain runs with the NIC lock held (the server
+/// kernel) or on the one thread that polls (the embedded kernels), and 9 KiB is too much for a kernel thread's stack.
+static mut RX_BUFFER: [u8; RX_FRAME_MAX] = [0; RX_FRAME_MAX];
+
 /// Keeps a frame that is not the terminal's for a tape (`tape load net` listens for its own
 /// protocol, `nic_receive` for everything else). Frames that arrive before a tape is
 /// listening wait here instead of being lost.
 pub fn queue_frame(index: usize, frame: &[u8], stamp: u64) {
     unsafe {
+        // A jumbo frame nobody in the kernel took: a tape's slot holds 1600 bytes.
+        if frame.len() > 1600 {
+            FRAMES_DROPPED[index] += 1;
+            return;
+        }
         let head = FRAME_HEAD[index];
         let next = (head + 1) % FRAME_FIFO;
         if next == FRAME_TAIL[index] {
@@ -180,11 +193,12 @@ pub fn drain_nic_to_fifo(index: usize) {
     let mut found = [(0usize, [0u8; 6]); MAX_NICS];
     let count = nic::virtual_children(index, &mut found);
     let children = &found[..count];
-    let mut buffer = [0u8; 1600];
+    // SAFETY: drains are serialised (see `RX_BUFFER`).
+    let buffer = unsafe { &mut *core::ptr::addr_of_mut!(RX_BUFFER) };
     // At most one ring's worth per call: under a line-rate flood the ring never stays empty, and an
     // unbounded loop here would starve the tape that is supposed to consume (and send) the traffic.
     for _ in 0..256 {
-        let Some(length) = nic::at(index).and_then(|nic| nic.receive(&mut buffer)) else { break };
+        let Some(length) = nic::at(index).and_then(|nic| nic.receive(buffer)) else { break };
         let stamp = nic::at(index).map_or(0, |nic| nic.take_stamp());
         let frame = &buffer[..length];
         let target = classify(frame, children);

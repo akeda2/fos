@@ -44,7 +44,8 @@ use kernel_core::nicctl;
 
 const MAX_EXPORTS: usize = 8;
 const QUEUE: usize = 64;
-const FRAME: usize = 1600;
+/// The largest frame a queue slot holds: a jumbo frame (`nicctl::RX_FRAME_MAX`).
+const FRAME: usize = nicctl::RX_FRAME_MAX;
 /// Frames a worker handles per hold of the disk lock: fewer lock round trips under load, and still short enough that the
 /// shell or a tape waiting for the disk is not kept out for long (with the cache most frames of a batch are memory copies).
 const BATCH: usize = 32;
@@ -60,8 +61,9 @@ const KICK_EVERY: usize = 8;
 /// The flusher looks every `FLUSH_TICK` ticks (10 ms each) and flushes a disk that has not been written for `FLUSH_AFTER`.
 const FLUSH_TICK: u64 = 2;
 const FLUSH_AFTER: u64 = 5;
-/// The Ethernet payload size the target assumes: jumbo frames do not reach the receive path yet (`nicctl` drains into
-/// 1600-byte buffers), so it advertises 2 sectors per frame.
+/// The Ethernet payload size a new target starts with. Each request is then answered with the MTU of the NIC it came in on
+/// (`nic mtu`, `nic-mtu` in settings): 2 sectors per frame at 1500, 17 at 9000 (`aoe::max_sectors`), which is also what
+/// Query Config advertises to that initiator.
 const MTU: usize = 1500;
 /// What `aoe-shelf` and the shell leave to the machine: derived from NIC 1's MAC.
 const AUTO_SHELF: u32 = u32::MAX;
@@ -94,7 +96,9 @@ struct Guard {
 }
 
 struct Queue {
-    frames: [[u8; FRAME]; QUEUE],
+    /// `QUEUE` slots of `FRAME` bytes, allocated with the slot's first export (576 KiB: jumbo-sized slots would put 4.5 MiB
+    /// into .bss, which the BIOS loader's kernel span cannot hold). Empty until then.
+    frames: Vec<u8>,
     lengths: [u16; QUEUE],
     nics: [u8; QUEUE],
     head: usize,
@@ -197,7 +201,7 @@ static FROM_SERVICE: AtomicU64 = AtomicU64::new(0);
 impl Slot {
     const fn new() -> Slot {
         Slot {
-            inbox: SpinLock::new(Queue { frames: [[0; FRAME]; QUEUE], lengths: [0; QUEUE], nics: [0; QUEUE], head: 0, count: 0, dropped: 0 }),
+            inbox: SpinLock::new(Queue { frames: Vec::new(), lengths: [0; QUEUE], nics: [0; QUEUE], head: 0, count: 0, dropped: 0 }),
             number: AtomicU8::new(0),
             started: AtomicBool::new(false),
             dirty: AtomicBool::new(false),
@@ -269,12 +273,12 @@ pub fn enqueue(nic: usize, frame: &[u8], wake: bool) {
         }
         let pushed = {
             let mut queue = entry.inbox.lock();
-            if queue.count == QUEUE {
+            if queue.count == QUEUE || queue.frames.is_empty() {
                 queue.dropped += 1;
                 false
             } else {
                 let at = (queue.head + queue.count) % QUEUE;
-                queue.frames[at][..frame.len()].copy_from_slice(frame);
+                queue.frames[at * FRAME..at * FRAME + frame.len()].copy_from_slice(frame);
                 queue.lengths[at] = frame.len() as u16;
                 queue.nics[at] = nic as u8;
                 queue.count += 1;
@@ -298,7 +302,7 @@ fn pop(slot: &Slot, buffer: &mut [u8]) -> Option<(usize, usize)> {
     }
     let head = queue.head;
     let length = usize::from(queue.lengths[head]);
-    buffer[..length].copy_from_slice(&queue.frames[head][..length]);
+    buffer[..length].copy_from_slice(&queue.frames[head * FRAME..head * FRAME + length]);
     let nic = usize::from(queue.nics[head]);
     queue.head = (head + 1) % QUEUE;
     queue.count -= 1;
@@ -395,6 +399,8 @@ extern "C" fn worker(index: usize) {
         };
         let mut cached = cache.on(disk);
         let writes_before = target.writes;
+        // Each NIC's MTU, read once a batch (a `nic mtu` change takes effect at the next batch).
+        let mtus = net::mtus();
         // NICs with replies queued but not yet kicked (bit per NIC), and how many replies.
         let (mut unkicked, mut queued_replies) = (0u32, 0usize);
         for _ in 0..BATCH {
@@ -402,6 +408,7 @@ extern "C" fn worker(index: usize) {
             let Some((nic, length)) = pop(slot, &mut request) else { break };
             let Some(mac) = net::mac(nic) else { continue };
             target.mac = mac;
+            target.mtu = mtus.get(nic).copied().unwrap_or(MTU);
             let (writes, foreign) = (target.writes, target.foreign_writes);
             let handle_start = crate::cpu::cycles();
             let reply_length = target.handle(&request[..length], &mut cached, &mut reply);
@@ -584,6 +591,11 @@ fn install(export: Export, guard: Option<Box<Guard>>) -> Result<usize, ExportErr
         return Err(ExportError::NoThread);
     }
     let slot = &SLOTS[index];
+    // The queue's storage, once per slot (kept after `unexport`, like the worker thread).
+    if slot.inbox.lock().frames.is_empty() {
+        let storage = vec![0u8; QUEUE * FRAME];
+        slot.inbox.lock().frames = storage;
+    }
     // Frames queued for an earlier export of this slot are stale.
     {
         let mut queue = slot.inbox.lock();
@@ -609,6 +621,11 @@ fn install(export: Export, guard: Option<Box<Guard>>) -> Result<usize, ExportErr
 /// Whether a file on disk index `disk` is exported.
 fn files_on(disk: usize) -> bool {
     SLOTS.iter().any(|slot| slot.guard.lock().as_ref().is_some_and(|guard| guard.disk == disk))
+}
+
+/// Whether anything on disk index `disk` is exported: the whole disk or a file on it (`writespeed` refuses such a disk).
+pub fn exported(disk: usize) -> bool {
+    SLOTS.iter().any(|slot| slot.export.lock().as_ref().is_some_and(|export| export.disk == disk))
 }
 
 /// Whether disk index `disk` is exported whole and writable (another machine may be writing it: `mkimage` refuses it).
