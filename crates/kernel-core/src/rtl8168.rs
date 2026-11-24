@@ -132,12 +132,12 @@ const CPLUS_RX_VLAN: u16 = 1 << 6;
 const XID_G_AND_LATER: u16 = 0x4c0;
 const PHYSTATUS_LINK: u8 = 0x02;
 
-const DESC_OWN: u32 = 1 << 31;
-const DESC_EOR: u32 = 1 << 30;
-const DESC_FS: u32 = 1 << 29;
-const DESC_LS: u32 = 1 << 28;
-const DESC_RX_RES: u32 = 1 << 21; // receive error summary
-const DESC_LENGTH_MASK: u32 = 0x3fff;
+pub(crate) const DESC_OWN: u32 = 1 << 31;
+pub(crate) const DESC_EOR: u32 = 1 << 30;
+pub(crate) const DESC_FS: u32 = 1 << 29;
+pub(crate) const DESC_LS: u32 = 1 << 28;
+pub(crate) const DESC_RX_RES: u32 = 1 << 21; // receive error summary
+pub(crate) const DESC_LENGTH_MASK: u32 = 0x3fff;
 // Transmit `opts2` of the 8168C and later (Linux r8169 `TD1_*`; no datasheet lists them): which checksum to compute and,
 // from bit 18, the offset of the TCP/UDP header from the start of the frame.
 const TD1_IPV4_CS: u32 = 1 << 29;
@@ -186,7 +186,7 @@ pub enum Error {
 /// r8169 raised the same field to 4096 on these chips (`rtl_tx_performance_tweak`). A read request may be
 /// larger than Max_Payload_Size; completions are split by the root port as the spec allows, so this is safe on any port.
 /// Device Status shares the dword and its bits clear when written as 1, so its half is written as zeros.
-fn raise_read_request(device: &pci::Device) -> u32 {
+pub(crate) fn raise_read_request(device: &pci::Device) -> u32 {
     let Some(capability) = device.find_capability(0x10) else { return 0 };
     let control = device.read32(capability + 8) & 0xffff;
     let control = (control & !(0x7 << 12)) | (5 << 12);
@@ -217,12 +217,12 @@ fn field(ring: u64, index: usize, dword: usize) -> *mut u32 {
     memory::phys_to_virt(ring + (index * DESCRIPTOR_BYTES + dword * 4) as u64) as *mut u32
 }
 
-fn read_opts1(ring: u64, index: usize) -> u32 {
+pub(crate) fn read_opts1(ring: u64, index: usize) -> u32 {
     unsafe { read_volatile(field(ring, index, 0)) }
 }
 
 /// Fills a descriptor and hands it over: address first, OWN (in `opts1`) last behind a fence.
-fn write_descriptor(ring: u64, index: usize, opts1: u32, address: u64, opts2: u32) {
+pub(crate) fn write_descriptor(ring: u64, index: usize, opts1: u32, address: u64, opts2: u32) {
     unsafe {
         write_volatile(field(ring, index, 1), opts2); // VLAN, transmit checksum flags
         write_volatile(field(ring, index, 2), address as u32);
@@ -638,7 +638,7 @@ impl Rtl8168 {
     /// checksum field of the descriptor's buffer copy (not complemented, as the chip wants it) and returns the `opts2`
     /// flags that make the chip sum the TCP/UDP header and payload and complement. None for anything else (a fragment,
     /// another protocol, a UDP frame that already has its checksum), which goes the ordinary way.
-    fn offload_flags(frame: &[u8], buffer: *mut u8) -> Option<u32> {
+    pub(crate) fn offload_flags(frame: &[u8], buffer: *mut u8) -> Option<u32> {
         if frame.len() < 42 || frame[12..14] != [0x08, 0x00] || frame[14] >> 4 != 4 {
             return None;
         }

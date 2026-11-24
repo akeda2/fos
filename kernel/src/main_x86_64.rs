@@ -353,6 +353,30 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
             Err(error) => println!("rtl8168 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
         }
     }
+    for device in pci::devices().filter(|d| d.vendor == rtl8125::VENDOR_REALTEK && rtl8125::DEVICE_IDS.contains(&d.id)) {
+        match rtl8125::Rtl8125::init(&device, interfaces) {
+            Ok(mut nic) => {
+                let (bus, slot, function, name) = (device.bus, device.device, device.function, nic.chip.name());
+                println!("rtl8125 at {bus:02x}:{slot:02x}.{function} ({name}, XID {:#05x}): MAC {}.", nic.xid, term::Mac(&nic.mac));
+                match nic.link_speed() {
+                    Some((speed, _)) => println!("  link up at {speed} Mb/s."),
+                    None => println!("  link down."),
+                }
+                if config::no_msi() {
+                    println!("  interrupts: polled (settings: no-msi).");
+                } else {
+                    match nic.enable_interrupts(&device) {
+                        Ok(delivery) => println!("  interrupts: {delivery:?} (the self-test interrupt arrived)."),
+                        Err(reason) => println!("  interrupts: polled ({reason})."),
+                    }
+                }
+                if term::install(nic::Nic::Rtl8125(nic), info.runtime_services).is_some() {
+                    interfaces += 1;
+                }
+            }
+            Err(error) => println!("rtl8125 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
+        }
+    }
     for device in pci::devices().filter(|d| d.vendor == rtl8139::VENDOR_REALTEK && rtl8139::DEVICE_IDS.contains(&d.id)) {
         match rtl8139::Rtl8139::init(&device, interfaces) {
             Ok(mut nic) => {

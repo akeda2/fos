@@ -268,6 +268,14 @@ firmware, so a pending slot is tried on the next boot.
   847,604 interrupts, no storms). `nic` shows the chip version, link speed/duplex and recoveries; `nic regs [N]`
   dumps the chip's registers and which descriptors the card owns. Not done: a periodic watchdog (a stuck
   transmit descriptor or a PCI system error resets the chip inline, counted as a recovery).
+* **RTL8125 2.5 Gb/s NICs** (`rtl8125.rs`, PCI 10ec:8125 and 10ec:3000; the 8125A, B and D) are a driver of
+  their own beside `rtl8168.rs`: the rings, the checksum flags, interrupts, recovery and jumbo frames work the same
+  and reuse its helpers, but the control registers moved (32-bit interrupt mask and status at 0x38/0x3c, where
+  the 8168 has its doorbell; the doorbell at 0x90; a 16-bit `PHYstatus` with a 2500 bit), the chip is reached
+  through memory-mapped registers, and its start is Linux's long sequence through the MAC-OCP, PHY-OCP and PCIe
+  PHY windows (the file's header lists it). Not carried over: the PHY firmware patch, ASPM, EEE changes, RSS.
+  Written before the cards were at hand and only built, never run: QEMU has no RTL8125. The plan for the first
+  hardware session is in NETWORKING.md, "RTL8125: first run on hardware".
 * **USB audio (xHCI isochronous, Audio Class 1.0 and 2.0).** `usb_audio.rs` recognises Audio Class devices,
   prints their streaming alternate settings (channels, bit depth, endpoint, sync type, rates, feedback
   endpoint), keeps the device, and streams: it selects the sample rate (class 1.0: SET_CUR on the endpoint;

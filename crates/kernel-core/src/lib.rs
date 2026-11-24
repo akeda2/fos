@@ -52,6 +52,7 @@ pub mod remote;
 pub mod tape_threads;
 pub mod trace;
 pub mod rtl8139;
+pub mod rtl8125;
 pub mod rtl8168;
 pub mod screen;
 pub mod tape_fs;

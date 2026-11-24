@@ -17,7 +17,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use kernel_core::nic::{self, Nic};
 use kernel_core::nicctl;
-use kernel_core::{e1000, netdump::Mac, pci, rtl8139, rtl8168, threecom, virtio_net};
+use kernel_core::{e1000, netdump::Mac, pci, rtl8125, rtl8139, rtl8168, threecom, virtio_net};
 
 use crate::time::{self, TICK_HZ};
 use crate::sync::SpinLock;
@@ -149,6 +149,19 @@ pub fn init() {
                 }
             }
             Err(error) => println!("rtl8168 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
+        }
+    }
+    for device in pci::devices().filter(|d| d.vendor == rtl8125::VENDOR_REALTEK && rtl8125::DEVICE_IDS.contains(&d.id)) {
+        match rtl8125::Rtl8125::init(&device, interfaces) {
+            Ok(mut nic) => {
+                println!("rtl8125 at {:02x}:{:02x}.{} ({}, XID {:#05x}): MAC {}.", device.bus, device.device, device.function, nic.chip.name(), nic.xid, Mac(&nic.mac));
+                report(nic.enable_interrupts(&device));
+                if nic::install(Nic::Rtl8125(nic)).is_some() {
+                    locate(interfaces, &device);
+                    interfaces += 1;
+                }
+            }
+            Err(error) => println!("rtl8125 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
         }
     }
     for device in pci::devices().filter(|d| d.vendor == rtl8139::VENDOR_REALTEK && rtl8139::DEVICE_IDS.contains(&d.id)) {

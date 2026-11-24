@@ -38,7 +38,7 @@ their own.
 | Boot | A UEFI loader (`boot/uefi/`) or BIOS boot code (`boot/bios/`: an MBR, then a stage two in the gap before the first partition that reaches long mode, reads the kernel, chooses a VBE video mode from the monitor's EDID and builds the same `BootInfo`). Both run an A/B kernel-slot state machine: a pushed kernel gets one try and falls back to the previous one. |
 | Kernel | 64-bit, identity-mapped, local APIC and I/O APIC from the ACPI tables, MSI preferred. Framebuffer text console, PS/2 and USB keyboards, a PS/2 or USB mouse or laptop touchpad for tapes (`touch`), a shell, a crash recorder, an optional watchdog. |
 | Disks | AHCI, NVMe, USB mass storage over xHCI and EHCI (including through hubs, with replug recovery). **FOSFS** (flat, 64 files, byte-compatible with the legacy edition) plus FAT32 and exFAT for exchanging files with PCs. |
-| Network | e1000, e1000e, I350, RTL8168, RTL8139 and 3C905 NICs. A raw-Ethernet protocol set (chat, discovery, a network file system, a remote terminal, kernel update); IPv4 and above live in the tapes. |
+| Network | e1000, e1000e, I350, RTL8168, RTL8125 (not yet run on hardware), RTL8139 and 3C905 NICs. A raw-Ethernet protocol set (chat, discovery, a network file system, a remote terminal, kernel update); IPv4 and above live in the tapes. |
 | Audio | USB audio (xHCI) and Intel HD Audio behind one interface. |
 | Tapes | Programs loaded from disk or over the network into one 4 MiB region and run through a versioned, append-only table of kernel calls (`abi/src/tape.rs`). |
 

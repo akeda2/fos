@@ -427,6 +427,26 @@ changing existing tape behavior. The appended per-interface callbacks are
 covered by the same network-tape ABI boundary and do not change the first
 interface selected by older tapes.
 
+## RTL8125: first run on hardware
+
+`crates/kernel-core/src/rtl8125.rs` was written from Linux's r8169 before any card was at hand; QEMU has no
+model, so only the build is checked. The first session, two cards cabled to each other in two mf machines:
+
+1. **Boot.** The probe line names the variant and its XID: `rtl8125 at BB:DD.F (RTL8125B, XID 0x641): MAC ...`.
+   `initialisation failed (UnknownChip(0x...))` is a variant not handled yet (8125BP 0x681, CP 0x708); Linux's
+   table in `rtl_chip_infos` says which start function it needs. A line "N start-up step(s) timed out" names the
+   last wait that ran out; the start goes on regardless, as in Linux.
+2. **Link.** `nic` shows the speed and a line "2.5G advertised yes, offered by the partner yes". At 1000 with
+   the partner offering 2.5G, the PHY firmware patch Linux loads (left out here) is the first suspect; `nic regs N`
+   shows `PHYstatus` (0x0400 is 2500 Mb/s).
+3. **Frames.** `nic mtu N send 1514 1000` one way, then the other, watching `nic` counters on the receiver; the
+   interrupt line at boot should say MSI (the self-test is one transmitted frame, as on the 8168G/H).
+4. **Jumbo.** `nic mtu N 9000` on both ends (the 8125 takes it at run time), then `nic mtu N send 9018 1000`.
+5. **Throughput.** An AoE export over the 8125 pair, `readspeed` and `writespeed` (docs/block-sharing.md), at
+   1500 and at 9000 (`nic-mtu` in `settings` on both ends before attaching). At 2.5 Gb/s the wire carries about
+   290 MB/s; what the target worker and the disk give is the open question.
+6. **Recovery.** Pull and replug the cable during a transfer; `nic` shows the recoveries and the link coming back.
+
 ## Receive ownership with `term net`
 
 The kernel is single-threaded. While a tape is running inside a `term net`

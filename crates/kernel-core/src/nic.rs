@@ -4,6 +4,7 @@
 
 use crate::e1000::{Delivery, E1000};
 use crate::rtl8139::Rtl8139;
+use crate::rtl8125::Rtl8125;
 use crate::rtl8168::Rtl8168;
 use crate::threecom::ThreeCom;
 use crate::virtio_net::VirtioNet;
@@ -27,6 +28,7 @@ pub enum Nic {
     E1000(E1000),
     Rtl8139(Rtl8139),
     Rtl8168(Rtl8168),
+    Rtl8125(Rtl8125),
     ThreeCom(ThreeCom),
     Virtio(VirtioNet),
     Virtual(Virtual),
@@ -49,6 +51,7 @@ impl Nic {
             Nic::E1000(nic) => nic.mac,
             Nic::Rtl8139(nic) => nic.mac,
             Nic::Rtl8168(nic) => nic.mac,
+            Nic::Rtl8125(nic) => nic.mac,
             Nic::ThreeCom(nic) => nic.mac,
             Nic::Virtio(nic) => nic.mac,
             Nic::Platform(nic) => nic.mac(),
@@ -66,6 +69,7 @@ impl Nic {
             },
             Nic::Rtl8139(_) => "rtl8139",
             Nic::Rtl8168(_) => "rtl8168",
+            Nic::Rtl8125(_) => "rtl8125",
             Nic::ThreeCom(_) => "3c905",
             Nic::Virtio(_) => "virtio-net",
             Nic::Platform(nic) => nic.family(),
@@ -78,6 +82,7 @@ impl Nic {
             Nic::E1000(nic) => nic.link_up(),
             Nic::Rtl8139(nic) => nic.link_up(),
             Nic::Rtl8168(nic) => nic.link_up(),
+            Nic::Rtl8125(nic) => nic.link_up(),
             Nic::ThreeCom(nic) => nic.link_up(),
             Nic::Virtio(nic) => nic.link_up(),
             Nic::Platform(nic) => nic.link_up(),
@@ -90,6 +95,7 @@ impl Nic {
         match self {
             Nic::E1000(nic) => nic.link_speed(),
             Nic::Rtl8168(nic) => nic.link_speed(),
+            Nic::Rtl8125(nic) => nic.link_speed(),
             Nic::Platform(nic) => nic.link_speed(),
             Nic::Virtual(nic) => parent_of(nic).and_then(|parent| parent.link_speed()),
             _ => None,
@@ -105,10 +111,11 @@ impl Nic {
         }
     }
 
-    /// An MII register of the copper PHY, for `nic phy` (e1000 classic and I350 only).
+    /// An MII register of the copper PHY, for `nic phy` (e1000 classic, I350 and RTL8125).
     pub fn phy_read(&self, register: u32) -> Option<u16> {
         match self {
             Nic::E1000(nic) => nic.phy_read(register),
+            Nic::Rtl8125(nic) => nic.phy_read(register),
             _ => None,
         }
     }
@@ -119,6 +126,7 @@ impl Nic {
             Nic::E1000(nic) => nic.phy_control(),
             Nic::Rtl8139(nic) => nic.phy_control(),
             Nic::Rtl8168(nic) => nic.phy_control(),
+            Nic::Rtl8125(nic) => nic.phy_control(),
             Nic::ThreeCom(_) | Nic::Virtio(_) | Nic::Platform(_) | Nic::Virtual(_) => None,
         }
     }
@@ -128,6 +136,7 @@ impl Nic {
             Nic::E1000(nic) => nic.set_phy_control(value),
             Nic::Rtl8139(nic) => nic.set_phy_control(value),
             Nic::Rtl8168(nic) => nic.set_phy_control(value),
+            Nic::Rtl8125(nic) => nic.set_phy_control(value),
             Nic::ThreeCom(_) | Nic::Virtio(_) | Nic::Platform(_) | Nic::Virtual(_) => false,
         }
     }
@@ -138,6 +147,7 @@ impl Nic {
             Nic::E1000(nic) => nic.receive(out),
             Nic::Rtl8139(nic) => nic.receive(out),
             Nic::Rtl8168(nic) => nic.receive(out),
+            Nic::Rtl8125(nic) => nic.receive(out),
             Nic::ThreeCom(nic) => nic.receive(out),
             Nic::Virtio(nic) => nic.receive(out),
             Nic::Platform(nic) => nic.receive(out),
@@ -159,6 +169,7 @@ impl Nic {
         match self {
             Nic::E1000(nic) => nic.send_deferred(frame),
             Nic::Rtl8168(nic) => nic.send_deferred(frame),
+            Nic::Rtl8125(nic) => nic.send_deferred(frame),
             _ => self.send(frame),
         }
     }
@@ -168,6 +179,7 @@ impl Nic {
         match self {
             Nic::E1000(nic) => nic.kick(),
             Nic::Rtl8168(nic) => nic.kick(),
+            Nic::Rtl8125(nic) => nic.kick(),
             _ => {}
         }
     }
@@ -177,6 +189,7 @@ impl Nic {
             Nic::E1000(nic) => nic.send(frame),
             Nic::Rtl8139(nic) => nic.send(frame),
             Nic::Rtl8168(nic) => nic.send(frame),
+            Nic::Rtl8125(nic) => nic.send(frame),
             Nic::ThreeCom(nic) => nic.send(frame),
             Nic::Virtio(nic) => nic.send(frame),
             Nic::Platform(nic) => nic.send(frame),
@@ -196,12 +209,13 @@ impl Nic {
         }
     }
 
-    /// Sets the MTU (jumbo frames above 1500): the e1000 family and the RTL8168G and later; false elsewhere, or when the size
+    /// Sets the MTU (jumbo frames above 1500): the e1000 family and the RTL8168G and later, the RTL8125; false elsewhere, or when the size
     /// is refused.
     pub fn set_mtu(&mut self, mtu: usize) -> bool {
         match self {
             Nic::E1000(nic) => nic.set_mtu(mtu),
             Nic::Rtl8168(nic) => nic.set_mtu(mtu),
+            Nic::Rtl8125(nic) => nic.set_mtu(mtu),
             _ => false,
         }
     }
@@ -211,6 +225,7 @@ impl Nic {
         match self {
             Nic::E1000(nic) => Some((nic.jumbo_joined, nic.jumbo_dropped)),
             Nic::Rtl8168(nic) => Some((0, nic.jumbo_dropped)),
+            Nic::Rtl8125(nic) => Some((0, nic.jumbo_dropped)),
             _ => None,
         }
     }
@@ -220,6 +235,7 @@ impl Nic {
         match self {
             Nic::E1000(nic) => (nic.mtu(), nic.largest_mtu()),
             Nic::Rtl8168(nic) => (nic.mtu(), nic.largest_mtu()),
+            Nic::Rtl8125(nic) => (nic.mtu(), nic.largest_mtu()),
             _ => (1500, 1500),
         }
     }
@@ -229,6 +245,7 @@ impl Nic {
             Nic::E1000(nic) => nic.set_promiscuous(on),
             Nic::Rtl8139(nic) => nic.set_promiscuous(on),
             Nic::Rtl8168(nic) => nic.set_promiscuous(on),
+            Nic::Rtl8125(nic) => nic.set_promiscuous(on),
             Nic::ThreeCom(nic) => nic.set_promiscuous(on),
             Nic::Virtio(nic) => nic.set_promiscuous(on),
             Nic::Platform(nic) => nic.set_promiscuous(on),
@@ -256,6 +273,7 @@ impl Nic {
         match self {
             Nic::E1000(nic) => nic.set_tx_offload(on),
             Nic::Rtl8168(nic) => nic.set_tx_offload(on),
+            Nic::Rtl8125(nic) => nic.set_tx_offload(on),
             _ => false,
         }
     }
@@ -280,6 +298,7 @@ impl Nic {
             Nic::E1000(nic) => nic.set_multicast(on),
             Nic::Rtl8139(nic) => nic.set_multicast(on),
             Nic::Rtl8168(_) => {} // already accepts every multicast frame (its hash filter is all ones)
+            Nic::Rtl8125(_) => {} // its hash filter is all ones too
             Nic::ThreeCom(nic) => nic.set_multicast(on),
             Nic::Virtio(_) => {} // the device's default filter stays
             Nic::Platform(_) => {}
@@ -292,6 +311,7 @@ impl Nic {
             Nic::E1000(nic) => nic.delivery,
             Nic::Rtl8139(nic) => nic.delivery,
             Nic::Rtl8168(nic) => nic.delivery,
+            Nic::Rtl8125(nic) => nic.delivery,
             Nic::ThreeCom(nic) => nic.delivery,
             Nic::Virtio(nic) => nic.delivery,
             Nic::Platform(_) => Delivery::Polled,
@@ -305,6 +325,7 @@ impl Nic {
             Nic::E1000(nic) => (nic.frames_received, nic.frames_sent, nic.frames_dropped_no_link),
             Nic::Rtl8139(nic) => (nic.frames_received, nic.frames_sent, nic.frames_dropped_no_link),
             Nic::Rtl8168(nic) => (nic.frames_received, nic.frames_sent, nic.frames_dropped_no_link),
+            Nic::Rtl8125(nic) => (nic.frames_received, nic.frames_sent, nic.frames_dropped_no_link),
             Nic::ThreeCom(nic) => (nic.frames_received, nic.frames_sent, nic.frames_dropped_no_link),
             Nic::Virtio(nic) => (nic.frames_received, nic.frames_sent, nic.frames_dropped_no_link),
             Nic::Platform(nic) => nic.counters(),
@@ -317,6 +338,7 @@ impl Nic {
         match self {
             Nic::Rtl8139(nic) => nic.describe(),
             Nic::Rtl8168(nic) => nic.describe(),
+            Nic::Rtl8125(nic) => nic.describe(),
             Nic::ThreeCom(nic) => nic.describe(),
             Nic::Virtio(nic) => nic.describe(),
             Nic::Platform(nic) => nic.describe(),
@@ -331,6 +353,7 @@ impl Nic {
         match self {
             Nic::Rtl8139(nic) => nic.dump_registers(),
             Nic::Rtl8168(nic) => nic.dump_registers(),
+            Nic::Rtl8125(nic) => nic.dump_registers(),
             Nic::ThreeCom(nic) => nic.dump_registers(),
             Nic::Virtio(_) | Nic::Platform(_) => {}
             Nic::E1000(nic) => nic.dump_registers(),
