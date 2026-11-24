@@ -312,6 +312,13 @@ fn ext_target(reference: &[u8]) -> Option<(usize, Partition, &[u8])> {
     Some((disk, ext4vol::partition_of(disk).ok()?, path))
 }
 
+/// The disk index (0-based) of the ext volume `reference` is on and its free bytes; None when it is not an ext reference
+/// or the volume cannot be read.
+pub fn ext_space(reference: &[u8]) -> Option<(usize, u64)> {
+    let (disk, _) = ext_ref(reference)?;
+    Some((disk, ext4vol::shared(disk).ok()?.fs.space().1))
+}
+
 /// "a/b/c" -> ("a/b", "c"); trailing slashes do not count.
 fn split_leaf(path: &[u8]) -> (&[u8], &[u8]) {
     let mut end = path.len();

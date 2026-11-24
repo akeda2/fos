@@ -13,6 +13,10 @@ The host is the initiator over the QEMU multicast-socket network, as in test_mf_
   (`fscheck vfs`) read the start before the write, so the kept mount had it cached; it reads the new data after, and the
   guest's `sha256` equals the host's digest of the changed contents.
 - A sparse ext4 file: `rw` is refused because of its holes; read-only, the holes read as zeros.
+- `mkimage`: an 8 MiB image on the ext volume and a 4 MiB one on the boot volume (FOSFS), written in the background;
+  each exported `rw for` the host without holes (IDENTIFY gives its size, it reads as zeros, a write lands), the FOSFS
+  one in one run; an existing name, a size that is not whole MiB, one above the free space and a volume whose disk is
+  exported rw whole are refused.
 - The guard: a FOSFS file on a fresh volume is exported, removed here, and a new file written; first fit puts it on the
   exported file's sectors, so the write is refused, the export still serves the old data and `aoe` counts the refusal.
 QEMU only (AHCI, e1000)."""
@@ -206,6 +210,41 @@ def main():
                 head, middle, tail = read(host, 101, 0, 8), read(host, 101, 1000), read(host, 101, 2048, 8)
                 check(head == sparse_head and middle == bytes(1024) and tail == sparse_tail, "the hole reads as zeros between the data",
                       (head == sparse_head, middle == bytes(1024), tail == sparse_tail))
+
+            # --- mkimage: zero-filled images, exportable rw ---
+            images = [("zero.img", 4, 13)] + ([("@fileexp/new.img", 8, 12)] if have_ext else [])
+            for reference, mib, slot in images:
+                ok, text = guest.command(f"mkimage {reference} {mib}M", "mkimage:")
+                check(ok and "in the background" in text, f"`mkimage {reference} {mib}M` starts", text)
+                ok = guest.wait_for(f"mkimage: {reference} done: {mib} MiB", 60)
+                check(ok, "and finishes", guest.log[-600:].decode("utf8", "replace"))
+                ok, text = guest.command(f"aoe export {reference} slot {slot} rw for {host_mac}", "aoe:")
+                check(ok and f"READ-WRITE as shelf 5 slot {slot}" in text and "holes" not in text, "it is exported rw (no holes)", text)
+                if not reference.startswith("@"):
+                    check("in 1 run(s)" in text, "a FOSFS image is one run", text)
+                else:
+                    print("        ext image: " + next((line.strip() for line in text.splitlines() if "run(s)" in line), "?"))
+                check(sectors_of(host, slot) == mib * 2048, f"IDENTIFY gives {mib * 2048} sectors", sectors_of(host, slot))
+                check(read(host, slot, 0) == bytes(1024) and read(host, slot, mib * 2048 - 2) == bytes(1024), "it reads as zeros")
+                reply = host.ata(slot, 0x34, 50, 2, FRESH + bytes(1024 - len(FRESH)), write=True)
+                check(reply is not None and ata_status(reply) == (0x50, 0) and read(host, slot, 50)[:len(FRESH)] == FRESH,
+                      "a write lands and reads back", reply)
+                guest.command(f"aoe unexport {slot}", "no longer exported")
+            ok, text = guest.command("mkimage zero.img 4M", "mkimage:")
+            check(ok and "exists already" in text, "mkimage refuses an existing name", text)
+            ok, text = guest.command("mkimage other.img 1500K", "mkimage:")
+            check(ok and "whole MiB" in text, "and a size that is not whole MiB", text)
+            if have_ext:
+                ok, text = guest.command("mkimage @fileexp/huge.img 1G", "mkimage:")
+                check(ok and "less free space" in text, "and one above the free space", text)
+                # The file exports on disk 2 (slots 7 and 101) would keep it from being exported rw whole.
+                guest.command("aoe unexport 7", "no longer exported")
+                guest.command("aoe unexport 101", "no longer exported")
+                ok, text = guest.command(f"aoe export @fileexp slot 30 rw for {host_mac}", "aoe:")
+                check(ok and "READ-WRITE as shelf 5 slot 30" in text, "disk 2 exported rw whole", text)
+                ok, text = guest.command("mkimage @fileexp/other.img 1M", "mkimage:")
+                check(ok and "exported rw as a whole" in text, "and a volume whose disk is exported rw whole (two writers)", text)
+                guest.command("aoe unexport 30", "no longer exported")
 
             # --- the guard: removing an exported file and writing over its sectors ---
             guest.command("format disk3 guard v4", "confirm")

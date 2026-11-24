@@ -78,6 +78,7 @@ mod script;
 mod sysshell;
 mod aoedisk;
 mod aoetarget;
+mod mkimage;
 mod mdvol;
 mod top;
 #[path = "../../kernel/src/formatshell.rs"]

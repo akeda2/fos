@@ -611,8 +611,8 @@ fn files_on(disk: usize) -> bool {
     SLOTS.iter().any(|slot| slot.guard.lock().as_ref().is_some_and(|guard| guard.disk == disk))
 }
 
-/// Whether disk index `disk` is exported whole and writable.
-fn exported_writable(disk: usize) -> bool {
+/// Whether disk index `disk` is exported whole and writable (another machine may be writing it: `mkimage` refuses it).
+pub fn exported_writable(disk: usize) -> bool {
     SLOTS.iter().any(|slot| slot.export.lock().as_ref().is_some_and(|export| export.file.is_none() && export.disk == disk && !export.target.read_only))
 }
 

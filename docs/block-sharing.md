@@ -322,6 +322,31 @@ away. FOSFS and ext2/3/4 files work; FAT, exFAT and remote (`//NAME/...`) files 
 - A file export and a writable whole-disk export of the same disk refuse each other (two writers). A file on the boot
   disk may be exported `rw`: only its own sectors become writable.
 
+### mkimage
+
+```
+mkimage FILE SIZE     a zero-filled image (SIZE: 64M, 20G, 1T, whole MiB) on a FOSFS or ext volume
+mkimage               how far it is (MiB, %, MiB/s)
+mkimage stop          stop it; the half-made file is removed
+```
+
+An image to export `rw` must have no holes (above), so `mkimage` writes every sector instead of making a sparse file:
+the export's map then never changes, and the space is taken up front, so an initiator never meets a full volume in the
+middle of its work. The cost is writing it once. It runs in a thread (an mf shell command cannot read the keyboard or the
+network terminal while it runs), 1 MiB per hold of the disk lock, so AoE exports and other disk users go on meanwhile.
+
+- FOSFS: one reserved extent of the whole size (`Volume::reserve`), so the image is one run. ext: the volume is asked for
+  a region with room for the file (`Writer::place`, as the recorder does) before the first write; later blocks follow the
+  file's last extent, so it is a few long runs (`aoe export` says how many). ext changes are committed every 256 MiB.
+- Refused: an existing name, a size above the free space (ext) or the largest free run (FOSFS), FAT/exFAT and remote
+  files (they cannot be exported), and a volume whose disk is exported whole and writable (another machine may be
+  changing that file system; the fill also stops if such an export starts while it runs).
+- While it is being made the file must not be removed or exported. The fill looks the FOSFS entry up before every chunk
+  and stops if it moved; ext resolves the path on every write; and an export of the half-made file is guarded like any
+  other, so the fill's next write is refused. A stopped or failed fill removes the file.
+- An image made on Linux for this needs `dd if=/dev/zero`, not `fallocate` (whose extents are unwritten, which `rw`
+  refuses as holes) or `truncate` (holes).
+
 `make test-mf-aoe-file` (`tools/test_mf_aoe_file.py`): a FOSFS file on the boot volume read-only (size, reads, a refused
 write, the partial last sector); an ext4 file `rw` (reads, a write that a tape then reads through the kept mount, and
 the guest's `sha256` of the changed file; without `wrote_behind` the tape read the old data); a sparse ext4 file
