@@ -83,10 +83,10 @@ class Initiator:
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
         self.tag = random.randrange(1, 1 << 31)
 
-    def exchange(self, shelf, slot, command, body, destination=GUEST_MAC, timeout=3.0, attempts=3):
+    def exchange(self, shelf, slot, command, body, destination=GUEST_MAC, timeout=3.0, attempts=3, source=HOST_MAC):
         self.tag += 1
         header = struct.pack(">BBHBBI", 0x10, 0, shelf, slot, command, self.tag)
-        frame = destination + HOST_MAC + b"\x88\xa2" + header + body
+        frame = destination + source + b"\x88\xa2" + header + body
         for _ in range(attempts):
             self.sock.sendto(frame, (GROUP, PORT))
             end = time.time() + timeout
@@ -98,10 +98,11 @@ class Initiator:
                     return reply
         return None
 
-    def ata(self, slot, command, lba=0, count=0, data=b"", write=False, shelf=5):
+    def ata(self, slot, command, lba=0, count=0, data=b"", write=False, shelf=5, source=HOST_MAC):
+        """`source`: the MAC the frame claims to come from (an export `rw for MAC` takes writes from that one only)."""
         aflags = 0x40 | (1 if write else 0)
         body = struct.pack("<BBBB", aflags, 0, count, command) + lba.to_bytes(6, "little") + b"\0\0" + data
-        return self.exchange(shelf, slot, 0, body)
+        return self.exchange(shelf, slot, 0, body, source=source)
 
 
 def ata_status(reply):

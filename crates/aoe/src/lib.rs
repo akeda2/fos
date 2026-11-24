@@ -93,6 +93,11 @@ pub struct Target {
     pub mtu: usize,
     /// Writes are refused (ATA abort) while this is set. The kernel's export command defaults to it.
     pub read_only: bool,
+    /// The one machine that may write, by the source MAC of its frames; `None`: any. Writes from another MAC are
+    /// aborted and counted in `foreign_writes`, and a FLUSH from one is answered without flushing, as when read-only.
+    /// AoE has no notion of who owns a device (the spec's Reserve/Release is a list of MACs the initiator must set,
+    /// which Linux's `aoe` never does), so the target decides: one writer, named where the export is made.
+    pub writer: Option<[u8; 6]>,
     /// Commands the initiator may have outstanding (its window), as advertised in Query Config.
     pub bufcount: u16,
     pub firmware: u16,
@@ -105,6 +110,8 @@ pub struct Target {
     pub reads: u64,
     pub writes: u64,
     pub errors: u64,
+    /// Writes refused because they came from a MAC other than `writer`.
+    pub foreign_writes: u64,
 }
 
 impl Target {
@@ -115,6 +122,7 @@ impl Target {
             mac,
             mtu,
             read_only: true,
+            writer: None,
             bufcount: 16,
             firmware: 1,
             model: [b' '; 40],
@@ -125,6 +133,7 @@ impl Target {
             reads: 0,
             writes: 0,
             errors: 0,
+            foreign_writes: 0,
         };
         set_text(&mut target.model, b"fosfor-os aoe");
         set_text(&mut target.revision, b"1");
@@ -233,6 +242,8 @@ impl Target {
             u64::from(lba_bytes[0]) | u64::from(lba_bytes[1]) << 8 | u64::from(lba_bytes[2]) << 16 | u64::from(lba_bytes[3] & 0x0f) << 24
         };
         let data = &frame[DATA_AT..];
+        // Read-only for every machine but the writer, when one is named.
+        let read_only = self.read_only || self.writer.is_some_and(|writer| frame[6..12] != writer);
         // The reply starts as the request's ATA header with a status; a command fills `status`, `error`, the data.
         let mut status = STATUS_OK;
         let mut error = 0;
@@ -260,14 +271,17 @@ impl Target {
                 }
             }
             ATA_WRITE | ATA_WRITE_EXT => {
-                if self.read_only || !in_range(count) || data.len() < count * SECTOR || !disk.write(lba, &data[..count * SECTOR]) {
+                if read_only && !self.read_only {
+                    self.foreign_writes += 1;
+                }
+                if read_only || !in_range(count) || data.len() < count * SECTOR || !disk.write(lba, &data[..count * SECTOR]) {
                     abort(&mut status, &mut error);
                 } else {
                     self.writes += 1;
                 }
             }
             ATA_FLUSH | ATA_FLUSH_EXT => {
-                if !self.read_only && !disk.flush() {
+                if !read_only && !disk.flush() {
                     abort(&mut status, &mut error);
                 }
             }

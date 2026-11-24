@@ -17,8 +17,10 @@
 //! **Writes** go to the drive with `block::write_deferred`. The IDENTIFY data says there is a write cache, so the initiator
 //! may rely on FLUSH CACHE; the flusher also flushes a disk `FLUSH_AFTER` ticks after its last write, and `unexport` does.
 //!
-//! Exports are read-only unless `rw confirm` is given, and disk 1 (the boot disk) is never writable. Nothing stops a second
-//! writer: do not mount an exported disk here or on another host while it is exported `rw`.
+//! Exports are read-only unless `rw` is given, and disk 1 (the boot disk) is never writable. `rw for MAC` names the one
+//! machine that may write (`aoe::Target::writer`: every other machine's writes are aborted, its reads still served);
+//! `rw confirm` lets any machine write, and nothing then stops a second writer. Either way, do not mount the disk here
+//! while it is exported writable. `settings` only takes `rw for MAC`: a line there has nobody to confirm it.
 //!
 //! **A file as an export** (`aoe export diskN/path`, FOSFS and ext files): the file system is asked once where the file
 //! lies (`tape_vfs::file_map`), and the worker serves that map through `aoe::filedisk::FileDisk`, so a frame costs what it
@@ -400,11 +402,16 @@ extern "C" fn worker(index: usize) {
             let Some((nic, length)) = pop(slot, &mut request) else { break };
             let Some(mac) = net::mac(nic) else { continue };
             target.mac = mac;
-            let writes = target.writes;
+            let (writes, foreign) = (target.writes, target.foreign_writes);
             let handle_start = crate::cpu::cycles();
             let reply_length = target.handle(&request[..length], &mut cached, &mut reply);
             let handled = crate::cpu::cycles();
             slot.stats.handle_us.fetch_add(handled.saturating_sub(handle_start), Ordering::Relaxed);
+            if foreign == 0 && target.foreign_writes != 0 {
+                let from: [u8; 6] = request[6..12].try_into().unwrap_or([0; 6]);
+                crate::println!("aoe: slot {} refused a write from {}:", target.slot, kernel_core::netdump::Mac(&from));
+                crate::println!("     another machine is its writer (said once per export).");
+            }
             if target.writes != writes {
                 slot.last_write.store(crate::arch::ticks(), Ordering::Relaxed);
                 slot.dirty.store(true, Ordering::Release);
@@ -483,6 +490,22 @@ fn start_threads(index: usize) -> bool {
     true
 }
 
+/// Who may write an export.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Access {
+    ReadOnly,
+    /// `rw confirm`: any machine.
+    Anyone,
+    /// `rw for MAC`: that machine only.
+    Only([u8; 6]),
+}
+
+impl Access {
+    fn writable(self) -> bool {
+        self != Access::ReadOnly
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum ExportError {
     NoSuchDisk,
@@ -499,7 +522,8 @@ pub enum ExportError {
 }
 
 /// Exports disk `number` (as `disks` shows it) whole, as slot `slot`, or as slot `number` when none is given; the slot.
-pub fn export(number: usize, slot: Option<u8>, writable: bool) -> Result<u8, ExportError> {
+pub fn export(number: usize, slot: Option<u8>, access: Access) -> Result<u8, ExportError> {
+    let writable = access.writable();
     let Some(disk) = number.checked_sub(1).filter(|&index| block::get(index).is_some() && number < 255) else { return Err(ExportError::NoSuchDisk) };
     if writable && number == 1 {
         return Err(ExportError::BootDiskWritable);
@@ -515,7 +539,7 @@ pub fn export(number: usize, slot: Option<u8>, writable: bool) -> Result<u8, Exp
     if writable && files_on(disk) {
         return Err(ExportError::DiskShared);
     }
-    let mut target = new_target(slot, writable);
+    let mut target = new_target(slot, access);
     if let Some(info) = block::get(disk) {
         let model = core::str::from_utf8(&info.model).unwrap_or("").trim();
         aoe::set_text(&mut target.model, model.as_bytes());
@@ -525,19 +549,23 @@ pub fn export(number: usize, slot: Option<u8>, writable: bool) -> Result<u8, Exp
 
 /// Exports the disk that holds the volume labelled `label` (FOSFS, FAT or ext), whole: a label stays put when disk numbers
 /// change from one boot to the next. The disk's number (1-based) and the slot.
-pub fn export_labelled(label: &str, slot: Option<u8>, writable: bool) -> Result<(usize, u8), ExportError> {
+pub fn export_labelled(label: &str, slot: Option<u8>, access: Access) -> Result<(usize, u8), ExportError> {
     let disk = {
         let _disks = tapefs::lock();
         kernel_core::tape_vfs::disk_labelled(label.as_bytes())
     };
     let number = disk.ok_or(ExportError::NoSuchLabel)? + 1;
-    export(number, slot, writable).map(|slot| (number, slot))
+    export(number, slot, access).map(|slot| (number, slot))
 }
 
 /// A target for slot `number` of this shelf, with the queue size advertised, before its model text is set.
-fn new_target(number: u8, writable: bool) -> Target {
+fn new_target(number: u8, access: Access) -> Target {
     let mut target = Target::new(shelf(), number, [0; 6], MTU);
-    target.read_only = !writable;
+    target.read_only = !access.writable();
+    target.writer = match access {
+        Access::Only(mac) => Some(mac),
+        _ => None,
+    };
     // What the queue holds (the crate's default says 16). An initiator that keeps that many in flight leaves the worker the
     // next frames queued when it ends a batch, instead of the two sides taking turns (KVM, window 16 -> 32: 15.5 -> 19.5
     // MiB/s read), and on a real gigabit link 32 replies of 1 KiB are only about 280 us of wire time, so any latency
@@ -615,9 +643,10 @@ pub struct FileExported {
 }
 
 /// Exports the file `reference` (a FOSFS or ext file: `diskN/path`, `@LABEL/path`, `extN/path`, a bare name) as slot `slot`
-/// (or the first free one from 100), read-only unless `writable`. Looking the file up, checking it and guarding its sectors
+/// (or the first free one from 100), read-only unless `access` says otherwise. Looking the file up, checking it and guarding its sectors
 /// happen under the disk lock, so no write lands between the map and the guard.
-pub fn export_file(reference: &str, slot: Option<u8>, writable: bool) -> Result<FileExported, FileError> {
+pub fn export_file(reference: &str, slot: Option<u8>, access: Access) -> Result<FileExported, FileError> {
+    let writable = access.writable();
     let _disks = tapefs::lock();
     let mut runs: Vec<Run> = Vec::new();
     let found = kernel_core::tape_vfs::file_map(reference.as_bytes(), &mut |sectors, at| {
@@ -652,7 +681,7 @@ pub fn export_file(reference: &str, slot: Option<u8>, writable: bool) -> Result<
     if exported_writable(found.disk) {
         return Err(FileError::Export(ExportError::DiskShared));
     }
-    let mut target = new_target(number, writable);
+    let mut target = new_target(number, access);
     // The model text: the file's own name, as much as fits.
     let leaf = reference.rsplit('/').next().unwrap_or(reference);
     aoe::set_text(&mut target.model, leaf.as_bytes());
@@ -687,32 +716,41 @@ pub fn remove(number: usize) -> bool {
     true
 }
 
-/// After boot: exports the disks `aoe-export N` lines in `settings` named (read-only; writable only by the shell).
+/// An `aoe-export` line of `settings`: what to export (a disk number, `@LABEL` or a file), the slot and who may write.
+#[derive(Clone)]
+pub struct Wanted {
+    pub what: String,
+    pub slot: Option<u8>,
+    pub access: Access,
+}
+
+/// What `settings` takes after `aoe-export`.
+pub const SETTINGS_USAGE: &str = "aoe-export N|@LABEL|FILE [slot N] [rw for MAC]";
+
+/// `WHAT [slot N] [rw for MAC]` after `aoe-export` in `settings`. `rw` needs `for MAC` there: nobody is at a settings
+/// line to confirm that any machine may write. `Err` says why the line is ignored.
+pub fn parse_settings_export<'a>(mut words: impl Iterator<Item = &'a str>) -> Result<Wanted, String> {
+    let what = words.next().filter(|what| *what != "@").ok_or_else(|| String::from(SETTINGS_USAGE))?;
+    let (slot, access) = parse_options(words, what, false)?;
+    Ok(Wanted { what: String::from(what), slot, access })
+}
+
+/// After boot: makes the exports `aoe-export` lines in `settings` asked for, in order, with the shell's messages.
 pub fn init() {
     if let Some(shelf) = crate::config::aoe_shelf() {
         SHELF.store(u32::from(shelf), Ordering::Relaxed);
     }
-    let wanted = crate::config::aoe_exports();
-    for number in 1..32 {
-        if wanted >> number & 1 != 0 {
-            match export(number, None, false) {
-                Ok(slot) => crate::println!("aoe: disk {number} exported read-only as shelf {} slot {slot}.", shelf()),
-                Err(error) => crate::println!("aoe: cannot export disk {number}: {error:?}."),
-            }
-        }
-    }
-    for (label, slot) in crate::config::aoe_export_labels() {
-        match export_labelled(&label, slot, false) {
-            Ok((number, slot)) => crate::println!("aoe: @{label} (disk {number}) exported read-only as shelf {} slot {slot}.", shelf()),
-            Err(error) => crate::println!("aoe: cannot export @{label}: {error:?}."),
-        }
+    for wanted in crate::config::aoe_exports() {
+        export_and_say(&wanted.what, wanted.slot, wanted.access);
     }
 }
 
-/// `[slot N] [rw confirm]` after `aoe export WHAT`: the slot, and whether `rw` came with `confirm`. `Err` holds what to print.
-fn export_options(what: &str, words: core::str::SplitWhitespace, usage: &str) -> Result<(Option<u8>, bool), String> {
-    let (mut slot, mut writable, mut confirmed) = (None, false, false);
-    let mut words = words;
+/// `[slot N] [rw [for MAC] [confirm]]` after `aoe export WHAT` (`shell`) or `aoe-export WHAT` (`settings`): the slot and
+/// who may write. `rw for MAC` is one writer and needs no `confirm`; plain `rw` (any machine) needs `confirm` in the
+/// shell and is refused in `settings`. `Err` holds what to print.
+fn parse_options<'a>(mut words: impl Iterator<Item = &'a str>, what: &str, shell: bool) -> Result<(Option<u8>, Access), String> {
+    let usage = || String::from(if shell { USAGE } else { SETTINGS_USAGE });
+    let (mut slot, mut writable, mut writer, mut confirmed) = (None, false, None, false);
     while let Some(word) = words.next() {
         match word {
             "slot" => match words.next().and_then(|word| word.parse::<u8>().ok()).filter(|&number| (1..255).contains(&number)) {
@@ -720,36 +758,66 @@ fn export_options(what: &str, words: core::str::SplitWhitespace, usage: &str) ->
                 None => return Err(String::from("aoe: slot N: N is 1..254.")),
             },
             "rw" => writable = true,
-            "confirm" if writable => confirmed = true,
-            _ => return Err(String::from(usage)),
+            "for" if writable => match words.next().and_then(crate::netclient::parse_mac) {
+                Some(mac) => writer = Some(mac),
+                None => return Err(String::from("aoe: rw for MAC: MAC is six hex bytes, 52:54:00:12:34:56.")),
+            },
+            "confirm" if writable && shell => confirmed = true,
+            _ => return Err(usage()),
         }
     }
-    if writable && !confirmed {
-        return Err(alloc::format!("aoe: `rw` lets every machine on this network write {what}.\n     Add `confirm` after `rw` to do it."));
+    match (writable, writer) {
+        (false, _) => Ok((slot, Access::ReadOnly)),
+        (true, Some(mac)) => Ok((slot, Access::Only(mac))),
+        (true, None) if confirmed => Ok((slot, Access::Anyone)),
+        (true, None) if shell => Err(alloc::format!(
+            "aoe: `rw` lets every machine on this network write {what}.\n     \
+             Add `for MAC` (that machine only) or `confirm` (any)."
+        )),
+        (true, None) => Err(String::from("aoe-export: `rw` needs `for MAC`, the one machine that writes.")),
     }
-    Ok((slot, writable))
 }
 
-/// `aoe export N|@LABEL [slot N] [rw confirm]`: a whole disk, by its number or by the label of a volume on it.
-fn command_disk(what: &str, words: core::str::SplitWhitespace, usage: &str) {
-    let (slot, writable) = match export_options(what, words, usage) {
-        Ok(options) => options,
-        Err(text) => return crate::println!("{text}"),
-    };
+/// Whether `aoe export WHAT` means a whole disk: a number or a bare `@LABEL`; anything else (`@LABEL/path`, `diskN/...`,
+/// a bare name) is a file.
+fn whole_disk(what: &str) -> bool {
+    what.parse::<usize>().is_ok() || what.strip_prefix('@').is_some_and(|label| !label.is_empty() && !label.contains('/'))
+}
+
+/// Exports `what` (as `aoe export` takes it) and prints what happened.
+fn export_and_say(what: &str, slot: Option<u8>, access: Access) {
+    if whole_disk(what) { disk_and_say(what, slot, access) } else { file_and_say(what, slot, access) }
+}
+
+/// What to say after a writable export was made.
+fn say_writable(access: Access, slot: u8) {
+    match access {
+        Access::ReadOnly => {}
+        Access::Anyone => crate::println!("     Do not mount it here or anywhere else while it is exported rw."),
+        Access::Only(mac) => {
+            crate::println!("     Only {} may write it; other machines' writes are refused.", kernel_core::netdump::Mac(&mac));
+            crate::println!("     Do not mount it here until `aoe unexport {slot}`.");
+        }
+    }
+}
+
+/// `aoe export N|@LABEL [slot N] [rw ...]`: a whole disk, by its number or by the label of a volume on it.
+fn disk_and_say(what: &str, slot: Option<u8>, access: Access) {
     let done = match what.strip_prefix('@') {
-        Some(label) => export_labelled(label, slot, writable),
+        Some(label) => export_labelled(label, slot, access),
         None => match what.parse::<usize>() {
-            Ok(number) => export(number, slot, writable).map(|slot| (number, slot)),
-            Err(_) => return crate::println!("{usage}"),
+            Ok(number) => export(number, slot, access).map(|slot| (number, slot)),
+            Err(_) => return crate::println!("{USAGE}"),
         },
     };
-    let mode = if writable { "READ-WRITE" } else { "read-only" };
+    let mode = if access.writable() { "READ-WRITE" } else { "read-only" };
     match done {
         Ok((number, slot)) => {
-            crate::println!("aoe: disk {number} exported {mode} as shelf {} slot {slot}.", shelf());
-            if writable {
-                crate::println!("     Do not mount it here or anywhere else while it is exported rw.");
+            match what.strip_prefix('@') {
+                Some(_) => crate::println!("aoe: {what} (disk {number}) exported {mode} as shelf {} slot {slot}.", shelf()),
+                None => crate::println!("aoe: disk {number} exported {mode} as shelf {} slot {slot}.", shelf()),
             }
+            say_writable(access, slot);
         }
         Err(ExportError::NoSuchDisk) => crate::println!("aoe: no disk {what} (see `disks`)."),
         Err(ExportError::NoSuchLabel) => crate::println!("aoe: no volume is labelled {what} (see `disks`)."),
@@ -765,12 +833,15 @@ fn command_disk(what: &str, words: core::str::SplitWhitespace, usage: &str) {
     }
 }
 
+const USAGE: &str = "ATA over Ethernet: serve this machine's disks, or use another's.\n\
+                     aoe [export N|@LABEL [slot N] [rw for MAC|rw confirm] | unexport SLOT]\n\
+                     aoe export FILE [slot N] [rw for MAC|rw confirm]\n\
+                     \x20     (FILE: a FOSFS or ext file; rw for MAC: only that machine writes)\n\
+                     aoe [shelf N | reset]\n\
+                     aoe [discover | attach SHELF.SLOT [rw] [MAC] | detach SHELF.SLOT]";
+
 pub fn command(mut words: core::str::SplitWhitespace) {
-    let usage = "ATA over Ethernet: serve this machine's disks, or use another's.\n\
-                 aoe [export N|@LABEL [slot N] [rw confirm] | unexport SLOT]\n\
-                 aoe export FILE [slot N] [rw confirm]   (a FOSFS or ext file)\n\
-                 aoe [shelf N | reset]\n\
-                 aoe [discover | attach SHELF.SLOT [rw] [MAC] | detach SHELF.SLOT]";
+    let usage = USAGE;
     match words.next() {
         None => list(),
         Some(word) if crate::aoedisk::command(word, &mut words) => {}
@@ -786,9 +857,10 @@ pub fn command(mut words: core::str::SplitWhitespace) {
         }
         Some("export") => {
             let Some(what) = words.next() else { return crate::println!("{usage}") };
-            // A number or a bare `@LABEL` is a whole disk; anything else (`@LABEL/path`, `diskN/...`, a bare name) a file.
-            let whole = what.parse::<usize>().is_ok() || what.strip_prefix('@').is_some_and(|label| !label.is_empty() && !label.contains('/'));
-            if whole { command_disk(what, words, usage) } else { command_file(what, words, usage) }
+            match parse_options(words, what, true) {
+                Ok((slot, access)) => export_and_say(what, slot, access),
+                Err(text) => crate::println!("{text}"),
+            }
         }
         Some("unexport") => match words.next().and_then(|word| word.parse::<usize>().ok()) {
             Some(number) if remove(number) => crate::println!("aoe: slot {number} is no longer exported."),
@@ -811,15 +883,11 @@ pub fn command(mut words: core::str::SplitWhitespace) {
     }
 }
 
-/// `aoe export FILE [slot N] [rw confirm]`.
-fn command_file(reference: &str, words: core::str::SplitWhitespace, usage: &str) {
-    let (slot, writable) = match export_options(reference, words, usage) {
-        Ok(options) => options,
-        Err(text) => return crate::println!("{text}"),
-    };
-    match export_file(reference, slot, writable) {
+/// `aoe export FILE [slot N] [rw ...]`.
+fn file_and_say(reference: &str, slot: Option<u8>, access: Access) {
+    match export_file(reference, slot, access) {
         Ok(done) => {
-            crate::println!("aoe: {reference} exported {} as shelf {} slot {}:", if writable { "READ-WRITE" } else { "read-only" }, shelf(), done.slot);
+            crate::println!("aoe: {reference} exported {} as shelf {} slot {}:", if access.writable() { "READ-WRITE" } else { "read-only" }, shelf(), done.slot);
             crate::println!("     {} sectors ({} MiB) on disk {}, in {} run(s).", done.sectors, done.sectors >> 11, done.disk + 1, done.runs);
             if done.zeros > 0 {
                 crate::println!("     {} sector(s) are holes: they read as zeros.", done.zeros);
@@ -828,6 +896,7 @@ fn command_file(reference: &str, words: core::str::SplitWhitespace, usage: &str)
                 crate::println!("     The last {} byte(s) are not a whole sector and are not served.", done.tail);
             }
             crate::println!("     Its sectors take no other writes here until `aoe unexport {}`.", done.slot);
+            say_writable(access, done.slot);
         }
         Err(FileError::Lookup(why)) => crate::println!("aoe: {reference}: {why}."),
         Err(FileError::TooSmall) => crate::println!("aoe: {reference} is smaller than one sector."),
@@ -898,6 +967,9 @@ fn list() {
             export.target.errors,
             slot.inbox.lock().dropped
         );
+        if let Some(mac) = export.target.writer {
+            crate::println!("    only {} writes; {} write(s) from others refused", kernel_core::netdump::Mac(&mac), export.target.foreign_writes);
+        }
         let stats = &slot.stats;
         let (wakes, frames) = (stats.wakes.load(Ordering::Relaxed), stats.frames.load(Ordering::Relaxed));
         let per = |total: &AtomicU64| total.load(Ordering::Relaxed) / frames.max(1) / rate;

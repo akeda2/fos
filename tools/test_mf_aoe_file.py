@@ -4,6 +4,9 @@ The host is the initiator over the QEMU multicast-socket network, as in test_mf_
 
 - A whole disk by its volume's label: `aoe-export @fileexp slot 30` in settings exports disk 2 at boot; the same disk is
   refused a second slot (by label or number), an unknown label is refused, and `aoe export @fileexp slot 31` works.
+- One writer, from settings: `aoe-export @fileexp/disk.img slot 8 rw for HOST_MAC` exports the ext4 file at boot; a
+  write from the host's MAC lands, one from another MAC is aborted and counted, reads from it are served. A settings
+  `rw` without `for MAC` is ignored (nobody is there to confirm it).
 - A FOSFS file on the boot volume (1 MiB and 300 bytes): exported read-only by its bare name, it takes slot 100; IDENTIFY
   says 2048 sectors (the partial last sector is left out), reads match the host's file, a write is aborted.
 - An ext4 file (mkfs.ext4 -d) exported `rw confirm` as slot 7: reads match, a write lands in the file. A tape
@@ -24,7 +27,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_mf_aoe import ROOT, Guest, Initiator, ata_status  # noqa: E402
+from test_mf_aoe import HOST_MAC, ROOT, Guest, Initiator, ata_status  # noqa: E402
 
 failures = []
 FRESH = b"written by the initiator over the old start of the file. "
@@ -75,7 +78,10 @@ def main():
         (tmp / "img.bin").write_bytes(image_data)
         have_ext = Path(mkfs).exists()
         # A whole disk named by its volume's label, with a slot of its own (disk numbers can change between boots).
-        settings_text = "aoe-shelf 5\n" + ("aoe-export @fileexp slot 30\n" if have_ext else "")
+        host_mac = ":".join(f"{byte:02x}" for byte in HOST_MAC)
+        settings_text = "aoe-shelf 5\naoe-export img.bin slot 40 rw\n"
+        if have_ext:
+            settings_text += f"aoe-export @fileexp slot 30\naoe-export @fileexp/disk.img slot 8 rw for {host_mac}\n"
         boot = build_image(tmp, [("img.bin", tmp / "img.bin"), ("fscheck", ROOT / "build/fosfor/tapes/fscheck")], settings_text)
 
         ext = tmp / "ext.img"
@@ -128,9 +134,32 @@ def main():
                 check(ok and "no volume is labelled @nosuchlabel" in text, "an unknown label is refused", text)
                 guest.command("aoe unexport 30", "no longer exported")
                 ok, text = guest.command("aoe export @fileexp slot 31", "aoe:")
-                check(ok and "disk 2 exported read-only as shelf 5 slot 31" in text, "`aoe export @fileexp slot 31` from the shell", text)
+                check(ok and "@fileexp (disk 2) exported read-only as shelf 5 slot 31" in text, "`aoe export @fileexp slot 31` from the shell", text)
                 check(sectors_of(host, 31) == 65536 and sectors_of(host, 30) is None, "slot 31 answers, slot 30 no longer does")
                 guest.command("aoe unexport 31", "no longer exported")
+
+            check("`aoe-export img.bin slot 40 rw` ignored" in boot_log and "needs `for MAC`" in boot_log,
+                  "a settings `rw` without `for MAC` is ignored", boot_log[-1500:])
+            check(sectors_of(host, 40) is None, "and nothing answers as slot 40")
+
+            # --- one writer, from settings ---
+            if have_ext:
+                check("@fileexp/disk.img exported READ-WRITE as shelf 5 slot 8" in boot_log and f"Only {host_mac} may write it" in boot_log,
+                      "`aoe-export @fileexp/disk.img slot 8 rw for MAC` exports the file at boot, one writer", boot_log[-1500:])
+                other = bytes.fromhex("525400aabbcd")
+                original = read(host, 8, 100)
+                reply = host.ata(8, 0x34, 100, 2, bytes(1024), write=True, source=other)
+                check(reply is not None and ata_status(reply) == (0x51, 4), "a write from another MAC is aborted", reply)
+                check(read(host, 8, 100) == original, "and changed nothing")
+                reply = host.ata(8, 0x34, 100, 2, bytes(1024), write=True)
+                check(reply is not None and ata_status(reply) == (0x50, 0), "a write from the writer's MAC is accepted", reply)
+                check(read(host, 8, 100) == bytes(1024), "and reads back")
+                reply = host.ata(8, 0x34, 100, 2, original, write=True)
+                check(reply is not None and ata_status(reply) == (0x50, 0) and read(host, 8, 100) == original,
+                      "the old sectors are written back")
+                ok, text = guest.command("aoe", "file @fileexp/disk.img")
+                check(ok and f"only {host_mac} writes; 1 write(s) from others refused" in text, "`aoe` names the writer and counts the refusal", text)
+                ok, text = guest.command("aoe unexport 8", "no longer exported")
 
             # --- an ext4 file, rw ---
             if have_ext:

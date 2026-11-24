@@ -120,6 +120,32 @@ fn write_lands_on_the_disk_and_read_only_refuses_it() {
 }
 
 #[test]
+fn only_the_named_writer_writes() {
+    let (mut target, mut disk) = (target(), Ram::new());
+    let payload = [0x5au8; SECTOR];
+    target.writer = Some([2, 0, 0, 0, 0, 7]);
+    let before = disk.data;
+    let reply = run(&mut target, &mut disk, ata(7, 3, 0x41, 1, ATA_WRITE_EXT, 4, &payload));
+    assert_eq!((status(&reply), reply.0[25]), (STATUS_ERROR, ERR_ABORT), "THEM is not the writer");
+    assert_eq!(before[..], disk.data[..]);
+    assert_eq!(status(&run(&mut target, &mut disk, ata(7, 3, 0x40, 0, ATA_FLUSH_EXT, 0, &[]))), STATUS_OK);
+    assert_eq!(disk.flushes, 0, "a flush from another machine does not reach the disk");
+    let reply = run(&mut target, &mut disk, ata(7, 3, 0x40, 1, ATA_READ_EXT, 4, &[]));
+    assert_eq!(status(&reply), STATUS_OK, "it may still read");
+    assert_eq!((target.foreign_writes, target.writes), (1, 0));
+
+    target.writer = Some(THEM);
+    let reply = run(&mut target, &mut disk, ata(7, 3, 0x41, 1, ATA_WRITE_EXT, 4, &payload));
+    assert_eq!(status(&reply), STATUS_OK, "the writer writes");
+    assert_eq!(&disk.data[4 * SECTOR..5 * SECTOR], &payload);
+    assert_eq!(target.foreign_writes, 1);
+
+    target.read_only = true;
+    run(&mut target, &mut disk, ata(7, 3, 0x41, 1, ATA_WRITE_EXT, 4, &payload));
+    assert_eq!(target.foreign_writes, 1, "read-only refuses everyone, and that is not counted as foreign");
+}
+
+#[test]
 fn a_short_write_and_a_disk_failure_abort() {
     let (mut target, mut disk) = (target(), Ram::new());
     let reply = run(&mut target, &mut disk, ata(7, 3, 0x41, 2, ATA_WRITE_EXT, 0, &[0u8; SECTOR]));

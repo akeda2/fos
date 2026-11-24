@@ -23,11 +23,8 @@ static mut MD_AUTO: bool = false;
 static mut MD_WAIT: u64 = 10;
 /// `aoe-shelf N` in `settings`: the shelf number the AoE target answers as (default from NIC 1's MAC).
 static mut AOE_SHELF: Option<u16> = None;
-/// Bit n set: `aoe-export n` in `settings` (disk n is exported read-only after boot).
-static mut AOE_EXPORTS: u32 = 0;
-
-/// `aoe-export @LABEL [slot N]` lines in `settings`: the label and the slot asked for (else the disk's number at boot).
-static mut AOE_LABELS: alloc::vec::Vec<(alloc::string::String, Option<u8>)> = alloc::vec::Vec::new();
+/// `aoe-export N|@LABEL|FILE [slot N] [rw for MAC]` lines in `settings`: exports made after boot, in order.
+static mut AOE_EXPORTS: alloc::vec::Vec<crate::aoetarget::Wanted> = alloc::vec::Vec::new();
 
 /// `aoe-attach SHELF.SLOT [rw] [MAC]` lines in `settings`: targets this machine attaches at the end of boot.
 static mut AOE_ATTACH: alloc::vec::Vec<crate::aoedisk::Wanted> = alloc::vec::Vec::new();
@@ -42,25 +39,9 @@ pub fn aoe_shelf() -> Option<u16> {
     unsafe { AOE_SHELF }
 }
 
-/// The disks `aoe-export N` lines named, as a bit mask (bit N for disk N).
-pub fn aoe_exports() -> u32 {
-    unsafe { AOE_EXPORTS }
-}
-
-/// The volumes `aoe-export @LABEL [slot N]` lines named, in order.
-pub fn aoe_export_labels() -> alloc::vec::Vec<(alloc::string::String, Option<u8>)> {
-    unsafe { (*core::ptr::addr_of!(AOE_LABELS)).clone() }
-}
-
-/// `@LABEL [slot N]` after `aoe-export`: the label and the slot; None when the words are something else.
-fn parse_label_export<'a>(words: &mut impl Iterator<Item = &'a str>) -> Option<(alloc::string::String, Option<u8>)> {
-    let label = words.next()?.strip_prefix('@').filter(|label| !label.is_empty() && !label.contains('/'))?;
-    let slot = match (words.next(), words.next()) {
-        (None, _) => None,
-        (Some("slot"), Some(number)) => Some(number.parse::<u8>().ok().filter(|number| (1..255).contains(number))?),
-        _ => return None,
-    };
-    words.next().is_none().then(|| (alloc::string::String::from(label), slot))
+/// The `aoe-export` lines, in order.
+pub fn aoe_exports() -> alloc::vec::Vec<crate::aoetarget::Wanted> {
+    unsafe { (*core::ptr::addr_of!(AOE_EXPORTS)).clone() }
 }
 
 /// `md auto` in `settings`: a thread assembles a Linux md array at boot (see `mdvol`).
@@ -251,25 +232,29 @@ pub fn load() {
                     None => println!("settings: `{line}` ignored (aoe-attach SHELF.SLOT [rw] [MAC])."),
                 }
             }
-            if line.split_whitespace().next() == Some("aoe-export") && line.split_whitespace().nth(1).is_some_and(|word| word.starts_with('@')) {
-                match parse_label_export(&mut line.split_whitespace().skip(1)) {
-                    Some((label, slot)) => {
-                        match slot {
-                            Some(number) => println!("settings: aoe-export @{label} slot {number} -- served read-only after boot."),
-                            None => println!("settings: aoe-export @{label} -- its disk is served read-only after boot."),
+            if line.split_whitespace().next() == Some("aoe-export") {
+                match crate::aoetarget::parse_settings_export(line.split_whitespace().skip(1)) {
+                    Ok(wanted) => {
+                        let slot = wanted.slot.map_or(alloc::string::String::new(), |number| alloc::format!(" slot {number}"));
+                        match wanted.access {
+                            crate::aoetarget::Access::Only(mac) => {
+                                println!("settings: aoe-export {}{slot} -- served after boot, written", wanted.what);
+                                println!("          only by {}.", kernel_core::netdump::Mac(&mac));
+                            }
+                            _ => println!("settings: aoe-export {}{slot} -- served read-only after boot.", wanted.what),
                         }
-                        unsafe { (*core::ptr::addr_of_mut!(AOE_LABELS)).push((label, slot)) };
+                        unsafe { (*core::ptr::addr_of_mut!(AOE_EXPORTS)).push(wanted) };
                     }
-                    None => println!("settings: `{line}` ignored (aoe-export @LABEL [slot 1..254])."),
+                    Err(why) => {
+                        println!("settings: `{line}` ignored:");
+                        println!("          {why}");
+                    }
                 }
-            } else if let Some(key @ ("aoe-shelf" | "aoe-export")) = line.split_whitespace().next() {
+            }
+            if line.split_whitespace().next() == Some("aoe-shelf") {
                 match line.split_whitespace().nth(1).and_then(|word| word.parse::<u16>().ok()) {
-                    Some(number) if key == "aoe-shelf" && number != 0xffff => unsafe { AOE_SHELF = Some(number) },
-                    Some(number @ 1..=31) if key == "aoe-export" => {
-                        unsafe { AOE_EXPORTS |= 1 << number };
-                        println!("settings: aoe-export {number} -- disk {number} is served read-only over AoE after boot.");
-                    }
-                    _ => println!("settings: `{line}` ignored (aoe-shelf 0..65534 | aoe-export 1..31)."),
+                    Some(number) if number != 0xffff => unsafe { AOE_SHELF = Some(number) },
+                    _ => println!("settings: `{line}` ignored (aoe-shelf 0..65534)."),
                 }
             }
             if line.split_whitespace().next() == Some("md") {

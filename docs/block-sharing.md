@@ -154,11 +154,20 @@ The kernel side is `kernel-mf/src/aoetarget.rs` (server kernel only, which is al
   disk read there would stall every interface and the audio drivers). The export's worker thread reads or writes the disk
   through `block::` under the disk lock, builds the reply with `crates/aoe` and sends it. A full queue drops the frame.
 - Writes use `block::write_deferred`; the drive is flushed on FLUSH CACHE (EXT) and by a flusher thread after a pause in writing.
-- Shell: `aoe` (list with counters), `aoe export N|@LABEL [slot N] [rw confirm]`, `aoe export FILE [slot N] [rw confirm]`
-  (a FOSFS or ext file, "A file as an export" below), `aoe unexport SLOT`, `aoe shelf N`. A whole disk is slot N of the
-  shelf unless `slot` says otherwise; a file takes the first free slot from 100. `rw` needs `confirm` on the same line,
-  and disk 1 is never writable as a whole. Settings: `aoe-shelf N`, `aoe-export N`, `aoe-export @LABEL [slot N]`
-  (read-only, applied after boot; docs/config.md).
+- Shell: `aoe` (list with counters), `aoe export N|@LABEL [slot N] [rw for MAC|rw confirm]`, `aoe export FILE [slot N]
+  [rw for MAC|rw confirm]` (a FOSFS or ext file, "A file as an export" below), `aoe unexport SLOT`, `aoe shelf N`. A whole
+  disk is slot N of the shelf unless `slot` says otherwise; a file takes the first free slot from 100. Disk 1 is never
+  writable as a whole. Settings: `aoe-shelf N`, `aoe-export N|@LABEL|FILE [slot N] [rw for MAC]` (applied after boot, in
+  order, with the shell's messages; docs/config.md).
+- **One writer.** `rw for MAC` names the one machine that may write: the target compares the source MAC of every write
+  and FLUSH (`aoe::Target::writer`). Another machine's write is aborted (an I/O error there), its FLUSH answered without
+  flushing; its reads are still served. The first refusal is printed once per export ("aoe: slot N refused a write from
+  MAC"), and `aoe` shows the writer and the count. `rw confirm` lets any machine write, as before; `settings` only takes
+  `rw for MAC`, since nobody is at a settings line to confirm the other. The MAC is the initiator's NIC (`nic`, or
+  `aoe discover` on that machine shows the target from it). A MAC, not a host name: names come from announces every 10 s,
+  so right after a boot a named writer would have its writes refused. AoE's own Reserve/Release (a MAC list the
+  initiator sets) is not used: Linux's `aoe` never sends it. The check is against mistakes, not an attacker: anyone on the
+  segment can send a frame with another machine's MAC. It also does not stop this machine from mounting the disk.
 - `@LABEL` names the disk that holds the volume with that label (FOSFS, FAT/exFAT or ext, in that order), and the whole
   disk is exported, partition table included, as with a number. Disk numbers follow discovery order and can change
   when a disk is added, but a label stays with its volume. The slot is the address initiators attach to (`e64598.2`),
@@ -280,8 +289,12 @@ below.
 ### A file as an export
 
 ```
-aoe export FILE [slot N] [rw confirm]    FILE: diskN/path, @LABEL/path, extN/path or a name on the boot volume
+aoe export FILE [slot N] [rw for MAC|rw confirm]    FILE: diskN/path, @LABEL/path, extN/path or a name on the boot volume
 ```
+
+The same in `settings`: `aoe-export @data/vm.img slot 8 rw for 52:54:00:12:34:e2` serves the file from boot on, writable by
+that machine only. An ext file on another disk needs that disk found before `aoe-export` runs (the end of boot, before
+`aoe-attach`, so not a file on an AoE disk).
 
 A disk image kept as a file (a VM's disk, a test volume, an installer image) can be served without giving the whole disk
 away. FOSFS and ext2/3/4 files work; FAT, exFAT and remote (`//NAME/...`) files are refused for now.
@@ -356,8 +369,9 @@ answers (its `start` file's `disks` lists it) and one that does not, which it at
   after about 5 s (5.6 s measured) instead of hanging the caller. The window is the target's `bufcount`, at most 64;
   sectors per frame the least of what the target advertises, what our MTU carries and the 1600-byte reply buffer.
 - **Safety.** Read-only unless `rw` (a write then fails here, before the wire). A target with one of this machine's own
-  MACs is refused: that is our own export, whose worker needs the disk lock the waiting caller may hold. Nothing stops two
-  hosts writing one disk; the target's `rw confirm` and the initiator's `rw` are where a person decides it. While a
+  MACs is refused: that is our own export, whose worker needs the disk lock the waiting caller may hold. The target's
+  `rw for MAC` keeps a second host from writing (its writes fail with an I/O error); with `rw confirm` nothing does, and
+  the initiator's `rw` is where a person decides it. While a
   request waits on the network, its caller still holds `tapefs::lock()` if it took it, so local disk users wait too; two
   hosts that each read the other's disk while holding their own lock would wait on each other until the resends fail.
 

@@ -157,6 +157,29 @@ impl Entry {
             pickups: AtomicU64::new(0),
         }
     }
+
+    /// Clears the counters `aoe` shows: they belong to one attach, not to the table entry, so a target attached again
+    /// (the same entry, the same disk number) starts at 0 instead of showing an earlier attach's failures.
+    fn reset_counters(&self) {
+        for counter in [
+            &self.ahead_runs,
+            &self.ahead_locked_out,
+            &self.ahead_frames,
+            &self.requests,
+            &self.frames,
+            &self.resent,
+            &self.failed,
+            &self.waits,
+            &self.timer_wakes,
+            &self.waited,
+            &self.answer,
+            &self.answers,
+            &self.pickup,
+            &self.pickups,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
 }
 
 static ENTRIES: [Entry; MAX_REMOTES] = [const { Entry::new() }; MAX_REMOTES];
@@ -608,6 +631,7 @@ fn attach(shelf: u16, slot: u8, writable: bool, via: Option<[u8; 6]>) -> Result<
     let per_frame = advertised.min(aoe::max_sectors(mtu)).min((FRAME - aoe::DATA_AT) / 512).max(1);
     let window = usize::from(target.bufcount).clamp(1, MAX_WINDOW);
     let entry = &ENTRIES[index];
+    entry.reset_counters();
     let mut remote = Remote {
         nic: target.nic,
         address: Address { ours, target: target.mac, shelf, slot },

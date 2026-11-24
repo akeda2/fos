@@ -10,8 +10,9 @@ Boot-time attach: e5.2 is disk 2 before `start` runs (its `disks` lists it); e5.
 the wait and `aoe` says it is still looked for; at the end t exports a disk as slot 9 and i attaches it by itself.
 
 Checks: discovery lists e5.2 with its limits; attach makes it disk 2 with the right size; raw sectors read through AoE
-match the data image; a write to the read-only attach fails without touching the wire; then, with the export rw and the
-attach rw: a FOSFS v4 volume made over the network, a file copied onto it with the host's SHA-256, read back after a
+match the data image; a write to the read-only attach fails without touching the wire; an export `rw for` another
+machine's MAC refuses i's writes (format fails, t says so once and counts them); then, with the export `rw for` i's MAC and
+the attach rw: a FOSFS v4 volume made over the network, a file copied onto it with the host's SHA-256, read back after a
 detach and attach (same disk number); the target sees the same file on its own disk after unexporting; a request to a
 target that has gone fails after the resends instead of hanging; and an ext4 disk (the target's disk 3, when the host has
 mkfs.ext4) attached, changed on the target, detached and attached again lists the new file (the kept ext4 mount is
@@ -173,13 +174,33 @@ def main():
             check(ahead is not None and int(ahead.group(2)) >= 3 * 1024,
                   f"read-ahead serves sequential reads ({ahead.group(0) if ahead else 'no line'})", text[-600:])
 
-            # Writable on both ends.
+            # Writable, but for another machine: i's writes are refused by the target.
             ok, text = t.command("aoe unexport 2", "no longer exported", 20)
-            ok, text = t.command("aoe export 2 rw confirm", "READ-WRITE", 20)
+            ok, text = t.command("aoe export 2 rw for 52:54:00:12:34:e9", "aoe:", 20)
+            check(ok and "READ-WRITE" in text and "Only 52:54:00:12:34:e9 may write it" in text,
+                  "`aoe export 2 rw for MAC` names the one writer", text[-400:])
             ok, text = i.command("aoe detach 5.2", "detached", 20)
             check(ok, "detach", text[-300:])
             ok, text = i.command("sector disk2 0", "fos", 20)
             check("read failed" in text, "a detached disk fails at once", text[-300:])
+            ok, text = i.command("aoe attach 5.2 rw", "is disk 2", 30)
+            t.log = b""
+            ok, text = i.command("format disk2 remote force", "confirm", 20)
+            ok, text = i.command("format disk2 confirm", "fos", 60)
+            check("rror" in text or "fail" in text or "could not" in text.lower(), "format fails when another machine is the writer",
+                  text[-400:])
+            ok, text = i.command("sector disk2 0", "disk2 sector 0:", 30)
+            check(ok and hex_row(data, 0, 0) in text, "and sector 0 is unchanged", text[-400:])
+            check(t.wait_for("aoe: slot 2 refused a write from 52:54:00:12:34:e2:", 10), "the target says so",
+                  t.log[-400:].decode("utf8", "replace"))
+            ok, text = t.command("aoe", "only 52:54:00:12:34:e9 writes", 20)
+            refused = re.search(r"writes; (\d+) write\(s\) from others refused", text)
+            check(ok and refused is not None and int(refused.group(1)) >= 1, "`aoe` counts the refused writes", text[-600:])
+
+            # Writable on both ends, i the one writer.
+            ok, text = t.command("aoe unexport 2", "no longer exported", 20)
+            ok, text = t.command("aoe export 2 rw for 52:54:00:12:34:e2", "READ-WRITE", 20)
+            ok, text = i.command("aoe detach 5.2", "detached", 20)
             ok, text = i.command("aoe attach 5.2 rw", "is disk 2", 30)
             check(ok and "READ-WRITE" in text, "attach rw gives it the same disk number", text[-600:])
             ok, text = i.command("format disk2 remote force", "confirm", 20)
