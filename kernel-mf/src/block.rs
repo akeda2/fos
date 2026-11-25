@@ -2,6 +2,7 @@
 //! `block.rs` (SATA, NVMe and USB mass storage). Registration happens on the boot CPU
 //! during start-up; reads and writes go straight to the drivers.
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_core::{ahci, nvme};
 
 pub const MAX_DISKS: usize = 16;
@@ -190,8 +191,13 @@ fn read_group(reads: &mut [Read<'_>]) -> Result<(), (usize, Error)> {
     overlap(
         &drives[..reads.len()],
         &lengths,
-        |index, drive, done, bytes| drive.start_read(lbas[index] + (done / 512) as u64, bytes),
-        |index, drive, done, bytes| drive.finish_read(&mut reads[index].buffer[done..done + bytes]),
+        |index, drive, done, bytes| timed(&MANY_START, || drive.start_read(lbas[index] + (done / 512) as u64, bytes)),
+        |index, drive, done, bytes| {
+            timed(&MANY_WAIT, || drive.wait())?;
+            timed(&MANY_COPY, || drive.copy_out(&mut reads[index].buffer[done..done + bytes]));
+            counted(bytes);
+            Ok(())
+        },
     )
 }
 
@@ -228,9 +234,71 @@ fn write_group(writes: &[Write<'_>]) -> Result<(), (usize, Error)> {
     overlap(
         &drives[..writes.len()],
         &lengths,
-        |index, drive, done, bytes| drive.start_write(writes[index].lba + (done / 512) as u64, &writes[index].buffer[done..done + bytes]),
-        |_, drive, _, _| drive.finish_write(),
+        |index, drive, done, bytes| {
+            timed(&MANY_COPY, || drive.stage(&writes[index].buffer[done..done + bytes]))?;
+            timed(&MANY_START, || drive.start_staged_write(writes[index].lba + (done / 512) as u64, bytes))
+        },
+        |_, drive, _, bytes| {
+            timed(&MANY_WAIT, || drive.wait())?;
+            counted(bytes);
+            Ok(())
+        },
     )
+}
+
+/// Where `read_many` and `write_many` spent their time on SATA drives, in microseconds of the caller's wall clock, since
+/// boot: starting commands (filling in the command table, ringing the port), waiting for them, and copying through the
+/// drives' bounce buffers; with the commands and bytes moved. `md` takes the difference over a resync or rebuild to say
+/// where the job's time goes.
+#[derive(Clone, Copy, Default)]
+pub struct ManyTimes {
+    pub start_us: u64,
+    pub wait_us: u64,
+    pub copy_us: u64,
+    pub commands: u64,
+    pub bytes: u64,
+}
+
+impl ManyTimes {
+    /// What happened between `earlier` and `self`.
+    pub fn since(&self, earlier: &ManyTimes) -> ManyTimes {
+        ManyTimes {
+            start_us: self.start_us - earlier.start_us,
+            wait_us: self.wait_us - earlier.wait_us,
+            copy_us: self.copy_us - earlier.copy_us,
+            commands: self.commands - earlier.commands,
+            bytes: self.bytes - earlier.bytes,
+        }
+    }
+}
+
+static MANY_START: AtomicU64 = AtomicU64::new(0);
+static MANY_WAIT: AtomicU64 = AtomicU64::new(0);
+static MANY_COPY: AtomicU64 = AtomicU64::new(0);
+static MANY_COMMANDS: AtomicU64 = AtomicU64::new(0);
+static MANY_BYTES: AtomicU64 = AtomicU64::new(0);
+
+pub fn many_times() -> ManyTimes {
+    ManyTimes {
+        start_us: MANY_START.load(Ordering::Relaxed),
+        wait_us: MANY_WAIT.load(Ordering::Relaxed),
+        copy_us: MANY_COPY.load(Ordering::Relaxed),
+        commands: MANY_COMMANDS.load(Ordering::Relaxed),
+        bytes: MANY_BYTES.load(Ordering::Relaxed),
+    }
+}
+
+/// Runs `work`, adding its wall time to `counter` (the TSC clock: a few nanoseconds a reading).
+fn timed<R>(counter: &AtomicU64, work: impl FnOnce() -> R) -> R {
+    let begin = crate::arch::micros();
+    let result = work();
+    counter.fetch_add(crate::arch::micros().saturating_sub(begin), Ordering::Relaxed);
+    result
+}
+
+fn counted(bytes: usize) {
+    MANY_COMMANDS.fetch_add(1, Ordering::Relaxed);
+    MANY_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
 }
 
 /// The rounds `read_many` and `write_many` share. Each round starts one command of up to `ahci::MAX_SECTORS` on every

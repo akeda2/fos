@@ -66,6 +66,17 @@ struct Member {
 struct Candidates {
     list: [Member; md::array::MAX_MEMBERS],
     count: usize,
+    /// Microseconds spent in the member calls below, so the job thread can tell disk time from md's own work.
+    spent_us: u64,
+}
+
+impl Candidates {
+    fn timed<R>(&mut self, work: impl FnOnce() -> R) -> R {
+        let begin = crate::arch::micros();
+        let result = work();
+        self.spent_us += crate::arch::micros().saturating_sub(begin);
+        result
+    }
 }
 
 impl Members for Candidates {
@@ -80,7 +91,7 @@ impl Members for Candidates {
         if lba + (buffer.len() / 512) as u64 > m.sectors {
             return Err(Error::Range);
         }
-        block::read(m.disk, m.base + lba, buffer).map_err(|_| Error::Device)
+        self.timed(|| block::read(m.disk, m.base + lba, buffer).map_err(|_| Error::Device))
     }
     /// A row's members at once: `block::read_many` overlaps the SATA ones, so a row costs its slowest member's time.
     fn read_many(&mut self, reads: &mut [md::Read<'_>]) -> Result<(), (usize, Error)> {
@@ -92,14 +103,14 @@ impl Members for Candidates {
             }
             many.push(block::Read { disk: m.disk, lba: m.base + request.lba, buffer: &mut *request.buffer });
         }
-        block::read_many(&mut many).map_err(|(index, _)| (index, Error::Device))
+        self.timed(|| block::read_many(&mut many).map_err(|(index, _)| (index, Error::Device)))
     }
     fn write(&mut self, member: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
         let m = self.list[member];
         if lba + (buffer.len() / 512) as u64 > m.sectors {
             return Err(Error::Range);
         }
-        block::write_deferred(m.disk, m.base + lba, buffer).map_err(|_| Error::Device)
+        self.timed(|| block::write_deferred(m.disk, m.base + lba, buffer).map_err(|_| Error::Device))
     }
     /// A row's data and parity at once: `block::write_many` overlaps the SATA members (no flush, as `write`).
     fn write_many(&mut self, writes: &[md::Write<'_>]) -> Result<(), (usize, Error)> {
@@ -111,10 +122,11 @@ impl Members for Candidates {
             }
             many.push(block::Write { disk: m.disk, lba: m.base + request.lba, buffer: request.buffer });
         }
-        block::write_many(&many).map_err(|(index, _)| (index, Error::Device))
+        self.timed(|| block::write_many(&many).map_err(|(index, _)| (index, Error::Device)))
     }
     fn flush(&mut self, member: usize) -> Result<(), Error> {
-        block::flush(self.list[member].disk).map_err(|_| Error::Device)
+        let disk = self.list[member].disk;
+        self.timed(|| block::flush(disk).map_err(|_| Error::Device))
     }
 }
 
@@ -152,7 +164,7 @@ impl StatusText {
 
 static STATE: sched::SleepMutex<State> = sched::SleepMutex::new(State {
     array: None,
-    members: Candidates { list: [Member { disk: 0, base: 0, sectors: 0 }; md::array::MAX_MEMBERS], count: 0 },
+    members: Candidates { list: [Member { disk: 0, base: 0, sectors: 0 }; md::array::MAX_MEMBERS], count: 0, spent_us: 0 },
     disk: None,
     force_rw: false,
     last_write: 0,
@@ -167,7 +179,7 @@ fn seconds() -> u64 {
     crate::time::ticks() / 100
 }
 
-const NO_MEMBERS: Candidates = Candidates { list: [Member { disk: 0, base: 0, sectors: 0 }; md::array::MAX_MEMBERS], count: 0 };
+const NO_MEMBERS: Candidates = Candidates { list: [Member { disk: 0, base: 0, sectors: 0 }; md::array::MAX_MEMBERS], count: 0, spent_us: 0 };
 
 /// Finds every disk and Linux RAID partition that carries an md superblock. The array's own disk is skipped.
 fn scan(own: Option<usize>) -> Candidates {
@@ -338,9 +350,67 @@ fn start_job_thread() {
     }
 }
 
+/// Where a resync or rebuild spends its wall time, kept by the job thread and shown by `md` (during the job and after
+/// it), so a slow job can be pinned on the disks, the copies, md's own work (parity, bookkeeping) or the pauses between
+/// steps before anything is changed to speed it up. Times are microseconds.
+#[derive(Clone, Copy)]
+struct JobTimes {
+    job: Job,
+    began_us: u64,
+    /// 0 while it runs.
+    ended_us: u64,
+    /// Inside `Array::step`, the array lock held.
+    step_us: u64,
+    /// Of that, in member reads, writes and flushes (`Candidates::spent_us`).
+    member_us: u64,
+    /// Of that, the overlapped SATA commands' share, step by step (`block::many_times`).
+    many: block::ManyTimes,
+    /// Array sectors covered.
+    sectors: u64,
+}
+
+static JOB_TIMES: crate::sync::SpinLock<Option<JobTimes>> = crate::sync::SpinLock::new(None);
+
+/// `md`'s lines about the running or last job's time (each at most 79 columns).
+fn print_job_times() {
+    let Some(times) = *JOB_TIMES.lock() else { return };
+    let end = if times.ended_us == 0 { crate::arch::micros() } else { times.ended_us };
+    let total = end.saturating_sub(times.began_us).max(1);
+    let part = |us: u64| us * 100 / total;
+    let many = times.many;
+    let disks = many.start_us + many.wait_us + many.copy_us;
+    let name = if times.job == Job::Resync { "resync" } else { "rebuild" };
+    let when = if times.ended_us == 0 { "so far" } else { "in all" };
+    let mib_s = |bytes: u64| bytes * 1_000_000 / total >> 20;
+    println!("    {name} {when}: {} s, {} MiB/s of the array; of that time:", total / 1_000_000, mib_s(times.sectors * 512));
+    println!(
+        "      disk commands {}% (waiting {}, copying {}, starting {})",
+        part(disks),
+        part(many.wait_us),
+        part(many.copy_us),
+        part(many.start_us)
+    );
+    println!(
+        "      other member I/O {}%, md's own work {}%, between steps {}%",
+        part(times.member_us.saturating_sub(disks)),
+        part(times.step_us.saturating_sub(times.member_us)),
+        part(total.saturating_sub(times.step_us))
+    );
+    if many.commands > 0 {
+        println!(
+            "      {} commands of {} KiB on average, {} MiB/s moved",
+            many.commands,
+            many.bytes / many.commands >> 10,
+            mib_s(many.bytes)
+        );
+    }
+}
+
 /// Runs a resync or rebuild to its end, a slice at a time, then exits.
 extern "C" fn job_thread(_: usize) {
     let mut report = 0;
+    let began_us = crate::arch::micros();
+    let mut times: Option<JobTimes> = None;
     loop {
         let outcome = {
             let mut state = STATE.lock();
@@ -348,7 +418,33 @@ extern "C" fn job_thread(_: usize) {
             state.last_write = seconds();
             state.array.as_mut().map(|array| {
                 let before = array.job();
-                (before, array.step(&mut state.members, JOB_BUDGET, now()), array.job(), array.sectors())
+                let (step_begin, member_begin, many_begin) = (crate::arch::micros(), state.members.spent_us, block::many_times());
+                let step = array.step(&mut state.members, JOB_BUDGET, now());
+                let after = array.job();
+                let job = after.or(before).map(|(job, _)| job);
+                if let Some(job) = job {
+                    let entry = times.get_or_insert(JobTimes {
+                        job,
+                        began_us,
+                        ended_us: 0,
+                        step_us: 0,
+                        member_us: 0,
+                        many: block::ManyTimes::default(),
+                        sectors: 0,
+                    });
+                    entry.step_us += crate::arch::micros().saturating_sub(step_begin);
+                    entry.member_us += state.members.spent_us.saturating_sub(member_begin);
+                    let many = block::many_times().since(&many_begin);
+                    entry.many.start_us += many.start_us;
+                    entry.many.wait_us += many.wait_us;
+                    entry.many.copy_us += many.copy_us;
+                    entry.many.commands += many.commands;
+                    entry.many.bytes += many.bytes;
+                    let (from, to) = (before.map_or(0, |(_, done)| done), after.map_or(array.sectors(), |(_, done)| done));
+                    entry.sectors += to.saturating_sub(from);
+                    *JOB_TIMES.lock() = Some(*entry);
+                }
+                (before, step, after, array.sectors())
             })
         };
         match outcome {
@@ -376,6 +472,9 @@ extern "C" fn job_thread(_: usize) {
         } else {
             sched::yield_now();
         }
+    }
+    if let Some(times) = JOB_TIMES.lock().as_mut().filter(|times| times.began_us == began_us) {
+        times.ended_us = crate::arch::micros();
     }
     JOB_THREAD.store(false, Ordering::Release);
     sched::exit()
@@ -672,6 +771,7 @@ pub fn command(mut words: core::str::SplitWhitespace) {
                     if let Some((job, done)) = array.job() {
                         println!("    {}: {}% of {} MiB", if job == Job::Resync { "resync" } else { "rebuild" }, done * 100 / array.sectors().max(1), array.sectors() >> 11);
                     }
+                    print_job_times();
                 }
                 None => println!("md: no array{}{}", if text.is_empty() { "" } else { ": " }, text),
             }

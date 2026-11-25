@@ -130,7 +130,7 @@ through the `Members` trait. Stages:
    that failed. The `md-job` thread yields between steps instead of sleeping 10 ms and steps aside for a tick only while
    block-layer I/O waits for the array lock (`IO_WAITING`). Before this, a 3-SSD RAID 5 on rack resynced at 14 MiB/s per
    member (8 KiB pieces, members one after another, the sleep). Writes go the same way (`Members::write_many`,
-   `block::write_many`, `ahci::Drive::start_write`): a RAID 5 write that covers whole stripe rows (from a row's start,
+   `block::write_many`, `ahci::Drive::start_staged_write`): a RAID 5 write that covers whole stripe rows (from a row's start,
    every member in use, no PPL, no rebuild) reads nothing, since the parity is the XOR of the new data, and writes each
    256 KiB piece of a row to every member at once; a part row is read-modify-write in pieces of up to 256 KiB (32 KiB with
    a PPL, one log entry each) with old data and parity read at once and new data and parity written at once; a RAID 1

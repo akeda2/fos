@@ -16,6 +16,7 @@ file back. At the end the host checks the member images itself, with code indepe
 
 import hashlib
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -115,6 +116,9 @@ def main():
             check(t.wait_for("md: resync finished.", 180), "the resync finishes", t.log[-800:].decode("utf8", "replace"))
             ok, text = t.command("md", "md:", 10)
             check("fos:tank" in text and "3 of 3" in text and "dirty" not in text, "`md` shows it clean, 3 of 3", text[-500:])
+            check("resync in all:" in text and "disk commands" in text and "md's own work" in text
+                  and re.search(r"\n\s+[1-9]\d* commands of \d+ KiB on average", text) is not None,
+                  "`md` says where the resync's time went, overlapped SATA commands counted", text[-700:])
             ok, text = t.command("aoe export 3 slot 7", "aoe:", 20)
             check("member of an md array" in text, "a member disk is not exported on its own", text[-400:])
             ok, text = t.command("md stop", "md:", 20)
@@ -165,7 +169,17 @@ def main():
         check(parity_ok, "every stripe row's parity is right")
         check(big in image, "big.bin is in the array's contents")
         degraded, _ = array_image(disks, absent=1)
-        check(big in degraded and degraded == image, "and the same with member 2 rebuilt from parity")
+        why = ""
+        if degraded != image:
+            # With every row's parity right this cannot differ unless the members changed between the two reads (seen
+            # once, 2026-11-25, not reproduced): say whether a third read differs too, and where.
+            again, again_ok = array_image(disks)
+            first = next((n for n in range(min(len(image), len(degraded))) if image[n] != degraded[n]), None)
+            row = None if first is None else first // ((len(disks) - 1) * CHUNK * 512)
+            why = (f"lengths {len(image)}/{len(degraded)}, first difference at byte {first} (row {row}); a third read "
+                   f"{'equals the first' if again == image else 'differs from the first'}, its parity "
+                   f"{'right' if again_ok else 'wrong'}")
+        check(big in degraded and degraded == image, "and the same with member 2 rebuilt from parity", why)
     if failures:
         print("\n\n".join(failures))
         sys.exit(1)

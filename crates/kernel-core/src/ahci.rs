@@ -1,6 +1,7 @@
 //! A minimal AHCI (SATA) host bus adapter driver: find SATA disks, read their identity
 //! and move sectors with DMA. Polling only, one command at a time per drive (commands on
-//! different drives may overlap: `start_read`/`finish_read`, `start_write`/`finish_write`),
+//! different drives may overlap: `start_read`, `wait`, `copy_out`; `stage`, `start_staged_write`,
+//! `wait`),
 //! 512-byte sectors.
 //!
 //! AHCI in one paragraph. The HBA exposes up to 32 *ports*, each with a register block;
@@ -229,32 +230,41 @@ impl Drive {
         Ok(())
     }
 
-    /// `read` in two halves, so reads on several drives overlap (`block::read_many` on the server kernel): this one starts
-    /// a read of `bytes` (at most `MAX_SECTORS` sectors) at `lba` and returns while the drive works; `finish_read` waits for
-    /// it and copies it out. Nothing else may use this drive in between (its one command slot and bounce buffer are busy).
+    /// `read` in steps, so reads on several drives overlap (`block::read_many` on the server kernel): this one starts a
+    /// read of `bytes` (at most `MAX_SECTORS` sectors) at `lba` and returns while the drive works; `wait` waits for it and
+    /// `copy_out` takes it from the bounce buffer. Nothing else may use this drive in between (its one command slot and
+    /// bounce buffer are busy). The steps are separate calls so the caller can time each (`md`'s job report).
     pub fn start_read(&self, lba: u64, bytes: usize) -> Result<(), Error> {
         let sectors = self.check(lba, bytes)?;
         self.issue(if self.lba48 { ATA_READ_DMA_EXT } else { ATA_READ_DMA }, 0, lba, sectors, false, bytes as u32)
     }
 
-    /// Waits for the read `start_read` began and copies its `buffer.len()` bytes (the same count) out of the bounce buffer.
-    pub fn finish_read(&self, buffer: &mut [u8]) -> Result<(), Error> {
-        self.complete()?;
-        unsafe { core::ptr::copy_nonoverlapping(memory::phys_to_virt((self.frame + OFFSET_BOUNCE) as u64) as *const u8, buffer.as_mut_ptr(), buffer.len()) };
+    /// Waits for the command `start_read` or `start_staged_write` began.
+    pub fn wait(&self) -> Result<(), Error> {
+        self.complete()
+    }
+
+    /// After `wait` for a read: its first `buffer.len()` bytes (the count `start_read` was given) from the bounce buffer.
+    pub fn copy_out(&self, buffer: &mut [u8]) {
+        let length = buffer.len().min(MAX_SECTORS * 512);
+        unsafe { core::ptr::copy_nonoverlapping(memory::phys_to_virt((self.frame + OFFSET_BOUNCE) as u64) as *const u8, buffer.as_mut_ptr(), length) };
+    }
+
+    /// `write_deferred` in steps, like `start_read`: `stage` copies the data into this drive's bounce buffer (at most
+    /// `MAX_SECTORS` sectors), `start_staged_write` starts the command on the same byte count, `wait` waits for it. No cache
+    /// flush (`flush` makes it durable).
+    pub fn stage(&self, buffer: &[u8]) -> Result<(), Error> {
+        if buffer.len() > MAX_SECTORS * 512 {
+            return Err(Error::Unsupported);
+        }
+        unsafe { core::ptr::copy_nonoverlapping(buffer.as_ptr(), memory::phys_to_virt((self.frame + OFFSET_BOUNCE) as u64) as *mut u8, buffer.len()) };
         Ok(())
     }
 
-    /// `write_deferred` in two halves, like `start_read`: the data is copied into this drive's bounce buffer and the
-    /// command started; `finish_write` waits for it. No cache flush (`flush` makes it durable).
-    pub fn start_write(&self, lba: u64, buffer: &[u8]) -> Result<(), Error> {
-        let sectors = self.check(lba, buffer.len())?;
-        unsafe { core::ptr::copy_nonoverlapping(buffer.as_ptr(), memory::phys_to_virt((self.frame + OFFSET_BOUNCE) as u64) as *mut u8, buffer.len()) };
-        self.issue(if self.lba48 { ATA_WRITE_DMA_EXT } else { ATA_WRITE_DMA }, 0, lba, sectors, true, buffer.len() as u32)
-    }
-
-    /// Waits for the write `start_write` began.
-    pub fn finish_write(&self) -> Result<(), Error> {
-        self.complete()
+    /// Starts writing the `bytes` that `stage` put in the bounce buffer to `lba`.
+    pub fn start_staged_write(&self, lba: u64, bytes: usize) -> Result<(), Error> {
+        let sectors = self.check(lba, bytes)?;
+        self.issue(if self.lba48 { ATA_WRITE_DMA_EXT } else { ATA_WRITE_DMA }, 0, lba, sectors, true, bytes as u32)
     }
 
     /// Whether `other` is this same drive (port): two commands on one port cannot overlap.
