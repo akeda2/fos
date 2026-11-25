@@ -737,7 +737,8 @@ Tapes see just another NIC, so `tape-ip`, DHCP, `smbd`, `httpd` and `router` nee
   the same split of `nvme::Drive` into submit and complete, USB and AoE members stay one at a time.
 - **NCQ and pipelining** (done 2026-11-25 for RAID 5 resync and rebuild, `docs/md.md` item 10). Still open: the same
   read-ahead for RAID 6 (its pieces are small stack buffers) and RAID 1/10 resync; queuing several commands per drive in
-  `block::read_many` for one long range; an NCQ error has not been seen on hardware (the READ LOG EXT page 10h path).
+  `block::read_many` for one long range, or reading two pieces ahead (rack: 684 s, 713 MiB/s, each member at
+  ~356 of ~400 MiB/s raw); an NCQ error has not been seen on hardware (the READ LOG EXT page 10h path).
 
 ## USB hotplug from port-change events (planned 2026-11-17)
 

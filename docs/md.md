@@ -162,7 +162,11 @@ through the `Members` trait. Stages:
    is taken out of its error state by reading its NCQ error log. `ahci no-ncq` in `settings` turns queuing off. RAID 6
    and RAID 1/10 jobs still read one piece at a time. A host test lands each read-ahead late, from what the disks held
    when it started, and checks that writes between steps never see stale data; `make test-mf-md-aoe` checks that QEMU's
-   AHCI took the resync's reads queued.
+   AHCI took the resync's reads queued. Each SATA command sequence holds its disk's port lock (`block::PORTS`), so two
+   threads never share tag 0 (md's boot scan and the `settings` read once did). On rack (3 SATA SSDs, Intel 8086:a102):
+   the 488392 MiB resync took 684 s, 713 MiB/s (was 845 s, 577 MiB/s), 1465173 of 1465179 commands read ahead; each
+   member moves about 356 MiB/s against about 400 MiB/s raw with 512 KiB reads. md still waits 85% of the time, so the
+   drives are now nearly the limit; deeper queues per member (several pieces ahead) are what is left (`DEFERRED.md`).
 
 `tools/check_md_mdadm.sh` (run as root, loop devices only) is the cross-check against the real driver: mdadm creates RAID 1, 0, 10, 5 and
 6 (every layout), `probe` dumps, writes and rebuilds them, and mdadm must assemble, `check` (0 mismatches) and fsck the results.
