@@ -202,8 +202,9 @@ The kernel side is `kernel-mf/src/aoetarget.rs` (server kernel only, which is al
 - Shell: `aoe` (list with counters), `aoe export N|@LABEL [slot N] [rw for MAC|rw confirm]`, `aoe export FILE [slot N]
   [rw for MAC|rw confirm]` (a FOSFS or ext file, "A file as an export" below), `aoe unexport SLOT`, `aoe shelf N`. A whole
   disk is slot N of the shelf unless `slot` says otherwise; a file takes the first free slot from 100. Disk 1 is never
-  writable as a whole. Settings: `aoe-shelf N`, `aoe-export N|@LABEL|FILE [slot N] [rw for MAC]` (applied after boot, in
-  order, with the shell's messages; docs/config.md).
+  writable as a whole. Settings: `aoe-shelf N`, `aoe-export N|@LABEL|md|FILE [slot N] [rw for MAC]` (applied after boot, in
+  order, with the shell's messages; docs/config.md). `md` is the md array, made once it is up (docs/md.md, item 8); a
+  member disk of an array is refused (`make test-mf-md-aoe`).
 - **One writer.** `rw for MAC` names the one machine that may write: the target compares the source MAC of every write
   and FLUSH (`aoe::Target::writer`). Another machine's write is aborted (an I/O error there), its FLUSH answered without
   flushing; its reads are still served. The first refusal is printed once per export ("aoe: slot N refused a write from

@@ -37,7 +37,11 @@ static PENDING_ADD: AtomicUsize = AtomicUsize::new(usize::MAX);
 /// Forgets an unconfirmed `md add`: a confirmation must be the very next command.
 pub fn cancel() {
     PENDING_ADD.store(usize::MAX, Ordering::Relaxed);
+    *PENDING_CREATE.lock() = None;
 }
+
+/// The `md create` arguments announced and waiting for `confirm` as the very next command.
+static PENDING_CREATE: crate::sync::SpinLock<Option<alloc::string::String>> = crate::sync::SpinLock::new(None);
 
 #[derive(Clone, Copy)]
 struct Member {
@@ -126,35 +130,59 @@ fn seconds() -> u64 {
     crate::time::ticks() / 100
 }
 
+const NO_MEMBERS: Candidates = Candidates { list: [Member { disk: 0, base: 0, sectors: 0 }; md::array::MAX_MEMBERS], count: 0 };
+
 /// Finds every disk and Linux RAID partition that carries an md superblock. The array's own disk is skipped.
 fn scan(own: Option<usize>) -> Candidates {
-    let mut found = Candidates { list: [Member { disk: 0, base: 0, sectors: 0 }; md::array::MAX_MEMBERS], count: 0 };
+    let mut found = NO_MEMBERS;
     for disk in 0..block::count() {
-        if Some(disk) == own || matches!(block::get(disk), Some(block::Disk { backend: block::Backend::Md, .. }) | None) {
-            continue;
-        }
-        let total = block::get(disk).map_or(0, |info| info.sectors);
-        let mut tries = [Member { disk, base: 0, sectors: total }; 5];
-        let mut count = 1;
-        kernel_core::gpt::find(disk, &RAID_GUID, |partition| {
-            if count < tries.len() {
-                tries[count] = Member { disk, base: partition.start, sectors: partition.sectors };
-                count += 1;
-            }
-            false
-        });
-        for member in &tries[..count] {
-            if found.count == found.list.len() {
-                return found;
-            }
-            let index = found.count;
-            found.list[index] = *member;
-            if md::array::find_superblock(&mut found, index).is_some() {
-                found.count += 1;
-            }
+        if Some(disk) != own {
+            members_on(disk, &mut found);
         }
     }
     found
+}
+
+/// Adds the whole disk `disk` and its Linux RAID partitions to `found` where they carry an md superblock. An array's
+/// own disk (and a missing one) has none.
+fn members_on(disk: usize, found: &mut Candidates) {
+    if matches!(block::get(disk), Some(block::Disk { backend: block::Backend::Md, .. }) | None) {
+        return;
+    }
+    let total = block::get(disk).map_or(0, |info| info.sectors);
+    let mut tries = [Member { disk, base: 0, sectors: total }; 5];
+    let mut count = 1;
+    kernel_core::gpt::find(disk, &RAID_GUID, |partition| {
+        if count < tries.len() {
+            tries[count] = Member { disk, base: partition.start, sectors: partition.sectors };
+            count += 1;
+        }
+        false
+    });
+    for member in &tries[..count] {
+        if found.count == found.list.len() {
+            return;
+        }
+        let index = found.count;
+        found.list[index] = *member;
+        if md::array::find_superblock(found, index).is_some() {
+            found.count += 1;
+        }
+    }
+}
+
+/// Whether disk index `disk` (or a RAID partition on it) carries an md superblock: a member of an array, assembled or
+/// not. Exporting or writing it on its own would go behind the array's back (`aoetarget::export` refuses it).
+pub fn holds_member(disk: usize) -> bool {
+    let mut found = NO_MEMBERS;
+    members_on(disk, &mut found);
+    found.count > 0
+}
+
+/// The array's disk number (1-based) while one is up.
+pub fn disk_number() -> Option<usize> {
+    let state = STATE.lock();
+    state.array.as_ref().and(state.disk).map(|disk| disk + 1)
 }
 
 /// Why a try failed or what it found, for `md`.
@@ -168,6 +196,11 @@ pub enum Outcome {
 
 /// One assembly try. `wait_over`: assemble with what is there even if members are missing.
 fn try_assemble(wait_over: bool) -> Outcome {
+    try_assemble_uuid(wait_over, None)
+}
+
+/// One assembly try, of the array `uuid` only when given (`md create` names the array it just wrote).
+fn try_assemble_uuid(wait_over: bool, uuid: Option<[u8; 16]>) -> Outcome {
     let mut state = STATE.lock();
     if state.array.is_some() {
         return Outcome::Assembled;
@@ -177,7 +210,7 @@ fn try_assemble(wait_over: bool) -> Outcome {
         state.status.set(format_args!("no member found yet"));
         return Outcome::NoMembers;
     }
-    let mut array = match Array::assemble(&mut members, None) {
+    let mut array = match Array::assemble(&mut members, uuid) {
         Ok(array) => array,
         Err(error) => {
             state.status.set(format_args!("members found, cannot assemble: {error:?}"));
@@ -221,6 +254,9 @@ fn try_assemble(wait_over: bool) -> Outcome {
     if pending {
         crate::println!("md: a rebuild was interrupted; `md resume` goes on from where it stopped.");
     }
+    drop(state);
+    // `aoe-export md` lines in settings wait for this
+    crate::aoetarget::md_assembled();
     Outcome::Assembled
 }
 
@@ -363,6 +399,9 @@ fn add_command(mut words: core::str::SplitWhitespace) {
         if array.rebuild_pending() {
             return crate::println!("md: an interrupted rebuild is waiting; `md resume` goes on with it.");
         }
+        if crate::aoetarget::exported(index) {
+            return crate::println!("md: disk{disk} is exported over AoE; `aoe unexport` it first.");
+        }
         if array.present() >= array.expected() {
             return crate::println!("md: no member is missing.");
         }
@@ -410,6 +449,120 @@ fn add_command(mut words: core::str::SplitWhitespace) {
         state.last_write = seconds();
     }
     start_job_thread();
+}
+
+/// `md create LEVEL diskN diskN... [name NAME] [chunk KIB]`, then the same line with `confirm` as the very next
+/// command: writes a new array over whole disks (`md::create`: v1.2 superblocks, an internal bitmap, the layout mdadm
+/// uses, so Linux assembles it), assembles it and starts the resync that computes its parity or second copy. The
+/// array is usable at once (reads and writes go on during the resync, as in Linux).
+fn create_command(words: core::str::SplitWhitespace) {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    const USAGE: &str = "usage: md create raid1|raid5|raid6 diskN diskN... [name NAME] [chunk KIB]";
+    let mut words: Vec<&str> = words.collect();
+    let confirm = words.last() == Some(&"confirm");
+    if confirm {
+        words.pop();
+    }
+    let key: String = words.join(" ");
+    let level = match words.first().copied() {
+        Some("raid1" | "1") => md::superblock::LEVEL_RAID1,
+        Some("raid5" | "5") => md::superblock::LEVEL_RAID5,
+        Some("raid6" | "6") => md::superblock::LEVEL_RAID6,
+        _ => return crate::println!("{USAGE}"),
+    };
+    let (mut disks, mut name, mut chunk_kib): (Vec<usize>, &str, u32) = (Vec::new(), "md0", 512);
+    let mut rest = words[1..].iter();
+    while let Some(&word) = rest.next() {
+        match word {
+            "name" => match rest.next() {
+                Some(&n) if !n.is_empty() && n.len() <= 16 && !n.contains(':') => name = n,
+                _ => return crate::println!("md: name NAME: up to 16 characters, no `:`."),
+            },
+            "chunk" => match rest.next().and_then(|n| n.parse::<u32>().ok()).filter(|&k| (4..=65536).contains(&k) && k.is_power_of_two()) {
+                Some(kib) => chunk_kib = kib,
+                None => return crate::println!("md: chunk KIB: a power of two, 4 to 65536 (default 512)."),
+            },
+            _ => match word.strip_prefix("disk").and_then(|n| n.parse::<usize>().ok()).filter(|&n| n >= 1) {
+                Some(number) if !disks.contains(&(number - 1)) => disks.push(number - 1),
+                Some(_) => return crate::println!("md: {word} is named twice."),
+                None => return crate::println!("{USAGE}"),
+            },
+        }
+    }
+    // Every disk must be a plain local disk nothing else is using.
+    for &index in &disks {
+        let disk = index + 1;
+        let Some(info) = block::get(index) else { return crate::println!("md: disk{disk} does not exist (see `disks`).") };
+        if index == 0 {
+            return crate::println!("md: disk1 is the boot disk and is never part of an array.");
+        }
+        if matches!(info.backend, block::Backend::Md | block::Backend::Aoe(_)) {
+            return crate::println!("md: disk{disk} is an array or another machine's disk, not a local one.");
+        }
+        if crate::aoetarget::exported(index) {
+            return crate::println!("md: disk{disk} is exported over AoE; `aoe unexport` it first.");
+        }
+    }
+    if STATE.lock().array.is_some() {
+        return crate::println!("md: an array is up; this kernel runs one at a time (`md stop` first).");
+    }
+    let sizes: Vec<u64> = disks.iter().map(|&index| block::get(index).map_or(0, |info| info.sectors)).collect();
+    let mut set_name = [0u8; 32];
+    let host = crate::config::hostname().unwrap_or("fos");
+    let full = alloc::format!("{host}:{name}");
+    let take = full.len().min(32);
+    set_name[..take].copy_from_slice(&full.as_bytes()[..take]);
+    let mut spec = md::create::Spec { level, chunk_sectors: chunk_kib * 2, name: set_name, uuid: [0; 16], now: now() };
+    let plan = match md::create::plan(&spec, &sizes) {
+        Ok(plan) => plan,
+        Err(Error::TooSmall) => return crate::println!("md: a disk is too small for an array."),
+        Err(_) => return crate::println!("md: RAID 1 takes 2-8 disks, RAID 5 3-8, RAID 6 4-8."),
+    };
+    if !confirm {
+        crate::println!("md: RAID {level} \"{full}\" of {} disks, {} MiB, would be made on:", disks.len(), plan.sectors >> 11);
+        for &index in &disks {
+            crate::println!("  disk{}: {} MiB", index + 1, sizes[disks.iter().position(|&d| d == index).unwrap_or(0)] >> 11);
+            if holds_member(index) {
+                crate::println!("    an md array member (that array is destroyed)");
+            }
+            let _files = crate::tapefs::lock();
+            kernel_core::ext4vol::describe(index, &mut crate::sysshell::Console);
+        }
+        crate::println!("md: EVERYTHING on these disks is erased. To go on, type as the very next");
+        crate::println!("    command: md create {key} confirm");
+        *PENDING_CREATE.lock() = Some(key);
+        return;
+    }
+    if PENDING_CREATE.lock().take().as_deref() != Some(key.as_str()) {
+        return crate::println!("md: nothing announced for that; run it without `confirm` first.");
+    }
+    kernel_core::random::fill(&mut spec.uuid);
+    let mut device_uuids = [[0u8; 16]; md::array::MAX_MEMBERS];
+    for uuid in device_uuids[..disks.len()].iter_mut() {
+        kernel_core::random::fill(uuid);
+    }
+    {
+        // Keep tape file calls off the disks, and drop the ext volume this kernel may keep open on one of them.
+        let _files = crate::tapefs::lock();
+        let _ = kernel_core::ext4vol::commit_pending();
+        kernel_core::ext4vol::forget_shared();
+        let mut members = NO_MEMBERS;
+        for (slot, &index) in disks.iter().enumerate() {
+            members.list[slot] = Member { disk: index, base: 0, sectors: sizes[slot] };
+        }
+        members.count = disks.len();
+        let _state = STATE.lock();
+        if let Err(error) = md::create::create(&mut members, &spec, &device_uuids[..disks.len()]) {
+            return crate::println!("md: create failed ({error:?}); the disks may be half written: run it again.");
+        }
+    }
+    crate::println!("md: written ({} MiB per disk, bitmap chunk {} MiB); assembling.", plan.member_size >> 11, plan.bitmap_chunk >> 11);
+    match try_assemble_uuid(true, Some(spec.uuid)) {
+        Outcome::Assembled => resync_command(),
+        Outcome::Failed(error) => crate::println!("md: the new array does not assemble: {error:?}"),
+        _ => crate::println!("md: the new array was not found again."),
+    }
 }
 
 /// A read of the array as disk sectors, for the block layer.
@@ -462,7 +615,16 @@ pub fn command(mut words: core::str::SplitWhitespace) {
             let text = core::str::from_utf8(&state.status.bytes[..state.status.length]).unwrap_or("");
             match state.array.as_ref() {
                 Some(array) => {
-                    println!("md: {} ({} MiB, events {}): {}", array.name(), array.sectors() >> 11, array.events(), text);
+                    // the state now, not the line kept from assembly: a resync or `force-rw` changes it
+                    let health = if array.job().is_some_and(|(job, _)| job == Job::Resync) {
+                        ", resyncing (usable)"
+                    } else if array.dirty() && !array.is_writing() && !state.force_rw {
+                        ", dirty: read-only"
+                    } else {
+                        ""
+                    };
+                    let disk = state.disk.map_or(0, |disk| disk + 1);
+                    println!("md: {} ({} MiB, events {}): disk{disk} up{health}", array.name(), array.sectors() >> 11, array.events());
                     println!("    members in use: {} of {}{}", array.present(), array.expected(), if state.force_rw { ", force-rw" } else { "" });
                     if let Some((job, done)) = array.job() {
                         println!("    {}: {}% of {} MiB", if job == Job::Resync { "resync" } else { "rebuild" }, done * 100 / array.sectors().max(1), array.sectors() >> 11);
@@ -482,6 +644,9 @@ pub fn command(mut words: core::str::SplitWhitespace) {
             kernel_core::ext4vol::forget_shared();
             let mut state = STATE.lock();
             let state = &mut *state;
+            if state.array.is_some() && state.disk.is_some_and(crate::aoetarget::exported) {
+                return println!("md: the array is exported over AoE; `aoe unexport SLOT` first (see `aoe`).");
+            }
             match state.array.as_mut() {
                 None => println!("md: no array is up."),
                 Some(array) => {
@@ -496,12 +661,13 @@ pub fn command(mut words: core::str::SplitWhitespace) {
         }
         Some("resync") => resync_command(),
         Some("add") => add_command(words),
+        Some("create") => create_command(words),
         Some("resume") => resume_command(),
         Some("force-rw") => {
             let mut state = STATE.lock();
             state.force_rw = true;
             println!("md: writes allowed even though the array was not clean (nothing resyncs it here; run a check on Linux).");
         }
-        Some(_) => println!("usage: md [assemble | stop | resync | resume | add diskN | force-rw]"),
+        Some(_) => println!("usage: md [assemble | stop | resync | resume | add diskN | force-rw]\n       md create raid1|raid5|raid6 diskN diskN... [name NAME] [chunk KIB]"),
     }
 }

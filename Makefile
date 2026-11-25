@@ -192,7 +192,7 @@ kernel:
 
 # The server kernel (kernel-mf/, docs/big-kernel.md): same loaders, same image layout, its own crate.
 KERNEL_MF_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel-mf
-.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-sessions test-mf-tape test-mf-usb test-mf-debug test-mf-audio test-mf-netfs test-mf-tapesync test-mf-gpio test-mf-bios-video test-mf-shell test-mf-kup-serial test-mf-smbmount test-mf-smbd test-mf-sshd test-mf-sshmount test-mf-ssh test-mf-httpd test-mf-vnic test-mf-service test-mf-cp test-mf-kernel-switch test-mf-abibad test-mf-threads test-mf-md test-mf-aoe test-mf-aoe-initiator test-mf-aoe-file run-mf-aoe-tap test-mf-sysrq
+.PHONY: kernel-mf image-mf test-mf-boot test-mf-net test-mf-sessions test-mf-tape test-mf-usb test-mf-debug test-mf-audio test-mf-netfs test-mf-tapesync test-mf-gpio test-mf-bios-video test-mf-shell test-mf-kup-serial test-mf-smbmount test-mf-smbd test-mf-sshd test-mf-sshmount test-mf-ssh test-mf-httpd test-mf-vnic test-mf-service test-mf-cp test-mf-kernel-switch test-mf-abibad test-mf-threads test-mf-md test-mf-md-aoe test-mf-aoe test-mf-aoe-initiator test-mf-aoe-file run-mf-aoe-tap test-mf-sysrq
 kernel-mf:
 	cd kernel-mf && cargo +nightly-2026-09-13 build --release $(MF_FEATURES)
 
@@ -267,6 +267,10 @@ test-mf-md: image-mf image
 # in docs/block-sharing.md, "Testing against Linux").
 run-mf-aoe-tap: image-mf
 	LOADER_EFI=$(LOADER_EFI) KERNEL_MF_ELF=$(KERNEL_MF_ELF) BIOS_STAGE1=$(BIOS_OUT)/stage1.bin BIOS_STAGE2=$(BIOS_OUT)/stage2.bin python3 tools/aoe_linux.py
+
+# `md create` (RAID 5 over three disks) served over AoE: `aoe-export md` waits for the array, members refused.
+test-mf-md-aoe: image-mf image
+	LOADER_EFI=$(LOADER_EFI) KERNEL_MF_ELF=$(KERNEL_MF_ELF) BIOS_STAGE1=$(BIOS_OUT)/stage1.bin BIOS_STAGE2=$(BIOS_OUT)/stage2.bin python3 tools/test_mf_md_aoe.py
 
 test-mf-aoe: image-mf image
 	LOADER_EFI=$(LOADER_EFI) KERNEL_MF_ELF=$(KERNEL_MF_ELF) BIOS_STAGE1=$(BIOS_OUT)/stage1.bin BIOS_STAGE2=$(BIOS_OUT)/stage2.bin python3 tools/test_mf_aoe.py

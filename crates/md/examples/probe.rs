@@ -25,6 +25,11 @@
 //! `--rebuild N` (members read-write) fills member number N (0-based, as listed; it may be blank) in as the array's
 //! missing member, from the others, and stops the array clean. Mirrors (RAID 1) are compared; striped levels are not.
 //!
+//!     cargo run --example probe -- --create 1|5|6 DISK1 DISK2 ...
+//!
+//! `--create LEVEL` makes a new array over the disks with `md::create` (what fos's `md create` writes: v1.2, an
+//! internal bitmap, 512 KiB chunks), erasing their head and tail; it is dirty until `--resync` or Linux resyncs it.
+//!
 //! `--rebuild-part N` starts that rebuild, stops it after a few steps and closes the array (progress is recorded in the
 //! member); `--rebuild-resume` assembles the array again, goes on from the recorded offset and stops it clean.
 
@@ -67,6 +72,7 @@ fn main() {
     let mut rebuild: Option<usize> = None;
     let (mut part, mut resume) = (false, false);
     let (mut crash, mut resync, mut tear, mut recover) = (false, false, false, false);
+    let mut create: Option<i32> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--write-test" {
@@ -86,6 +92,8 @@ fn main() {
             part = true;
         } else if arg == "--rebuild-resume" {
             resume = true;
+        } else if arg == "--create" {
+            create = args.next().and_then(|n| n.parse().ok());
         } else if arg == "--dump" {
             dump = args.next();
         } else {
@@ -94,9 +102,27 @@ fn main() {
     }
     let mut disks = Disks(Vec::new(), None);
     for path in &paths {
-        let mut file = OpenOptions::new().read(true).write(write_test || crash || tear || recover || resync || rebuild.is_some() || resume).open(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let mut file = OpenOptions::new().read(true).write(create.is_some() || write_test || crash || tear || recover || resync || rebuild.is_some() || resume).open(path).unwrap_or_else(|e| panic!("{path}: {e}"));
         let bytes = file.seek(SeekFrom::End(0)).unwrap();
         disks.0.push((file, bytes / SECTOR as u64));
+    }
+    if let Some(level) = create {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+        let seed = now.as_nanos() as u64;
+        let uuid = |salt: u64| -> [u8; 16] {
+            let a = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(salt.wrapping_mul(0xbf58_476d_1ce4_e5b9));
+            let b = a.rotate_left(29) ^ 0x94d0_49bb_1331_11eb;
+            let mut out = [0u8; 16];
+            out[..8].copy_from_slice(&a.to_le_bytes());
+            out[8..].copy_from_slice(&b.to_le_bytes());
+            out
+        };
+        let mut name = [0u8; 32];
+        name[..10].copy_from_slice(b"probe:test");
+        let spec = md::create::Spec { level, chunk_sectors: md::create::DEFAULT_CHUNK, name, uuid: uuid(0), now: now.as_secs() };
+        let devices: Vec<[u8; 16]> = (1..=disks.0.len() as u64).map(uuid).collect();
+        let plan = md::create::create(&mut disks, &spec, &devices).expect("create");
+        return println!("created RAID {level}: {} sectors, {} per member, bitmap chunk {} sectors", plan.sectors, plan.member_size, plan.bitmap_chunk);
     }
     let mut array = match Array::assemble(&mut disks, None) {
         Ok(array) => array,

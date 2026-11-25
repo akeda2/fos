@@ -526,6 +526,10 @@ pub enum ExportError {
     DiskExported,
     /// No volume carries the label (`aoe export @LABEL`).
     NoSuchLabel,
+    /// The disk carries an md superblock: a member of an array, which only the array may write.
+    MdMember,
+    /// `aoe export md` with no array up.
+    NoArray,
 }
 
 /// Exports disk `number` (as `disks` shows it) whole, as slot `slot`, or as slot `number` when none is given; the slot.
@@ -545,6 +549,10 @@ pub fn export(number: usize, slot: Option<u8>, access: Access) -> Result<u8, Exp
     }
     if writable && files_on(disk) {
         return Err(ExportError::DiskShared);
+    }
+    // A member written (or even read, mid-write) beside the array: the initiator's view and the parity would part.
+    if crate::mdvol::holds_member(disk) {
+        return Err(ExportError::MdMember);
     }
     let mut target = new_target(slot, access);
     if let Some(info) = block::get(disk) {
@@ -742,7 +750,7 @@ pub struct Wanted {
 }
 
 /// What `settings` takes after `aoe-export`.
-pub const SETTINGS_USAGE: &str = "aoe-export N|@LABEL|FILE [slot N] [rw for MAC]";
+pub const SETTINGS_USAGE: &str = "aoe-export N|@LABEL|md|FILE [slot N] [rw for MAC]";
 
 /// `WHAT [slot N] [rw for MAC]` after `aoe-export` in `settings`. `rw` needs `for MAC` there: nobody is at a settings
 /// line to confirm that any machine may write. `Err` says why the line is ignored.
@@ -758,6 +766,23 @@ pub fn init() {
         SHELF.store(u32::from(shelf), Ordering::Relaxed);
     }
     for wanted in crate::config::aoe_exports() {
+        // the md array comes up in the background (`md auto`), after this: its export waits for it
+        if wanted.what == "md" && crate::mdvol::disk_number().is_none() {
+            crate::println!("aoe-export md: waits for the md array to come up.");
+            WAITING_FOR_MD.lock().push(wanted);
+            continue;
+        }
+        export_and_say(&wanted.what, wanted.slot, wanted.access);
+    }
+}
+
+/// `aoe-export md` lines of settings made before the array was up.
+static WAITING_FOR_MD: SpinLock<Vec<Wanted>> = SpinLock::new(Vec::new());
+
+/// The md array is up (`mdvol` calls this after every assembly): makes the exports that waited for it.
+pub fn md_assembled() {
+    let waiting = core::mem::take(&mut *WAITING_FOR_MD.lock());
+    for wanted in waiting {
         export_and_say(&wanted.what, wanted.slot, wanted.access);
     }
 }
@@ -798,7 +823,7 @@ fn parse_options<'a>(mut words: impl Iterator<Item = &'a str>, what: &str, shell
 /// Whether `aoe export WHAT` means a whole disk: a number or a bare `@LABEL`; anything else (`@LABEL/path`, `diskN/...`,
 /// a bare name) is a file.
 fn whole_disk(what: &str) -> bool {
-    what.parse::<usize>().is_ok() || what.strip_prefix('@').is_some_and(|label| !label.is_empty() && !label.contains('/'))
+    what == "md" || what.parse::<usize>().is_ok() || what.strip_prefix('@').is_some_and(|label| !label.is_empty() && !label.contains('/'))
 }
 
 /// Exports `what` (as `aoe export` takes it) and prints what happened.
@@ -822,6 +847,10 @@ fn say_writable(access: Access, slot: u8) {
 fn disk_and_say(what: &str, slot: Option<u8>, access: Access) {
     let done = match what.strip_prefix('@') {
         Some(label) => export_labelled(label, slot, access),
+        None if what == "md" => match crate::mdvol::disk_number() {
+            Some(number) => export(number, slot, access).map(|slot| (number, slot)),
+            None => Err(ExportError::NoArray),
+        },
         None => match what.parse::<usize>() {
             Ok(number) => export(number, slot, access).map(|slot| (number, slot)),
             Err(_) => return crate::println!("{USAGE}"),
@@ -832,6 +861,7 @@ fn disk_and_say(what: &str, slot: Option<u8>, access: Access) {
         Ok((number, slot)) => {
             match what.strip_prefix('@') {
                 Some(_) => crate::println!("aoe: {what} (disk {number}) exported {mode} as shelf {} slot {slot}.", shelf()),
+                None if what == "md" => crate::println!("aoe: the md array (disk {number}) exported {mode} as shelf {} slot {slot}.", shelf()),
                 None => crate::println!("aoe: disk {number} exported {mode} as shelf {} slot {slot}.", shelf()),
             }
             say_writable(access, slot);
@@ -843,6 +873,11 @@ fn disk_and_say(what: &str, slot: Option<u8>, access: Access) {
         Err(ExportError::TableFull) => crate::println!("aoe: {MAX_EXPORTS} disks are exported already."),
         Err(ExportError::BootDiskWritable) => crate::println!("aoe: disk 1 is the boot disk and is never exported writable."),
         Err(ExportError::NoThread) => crate::println!("aoe: could not start the target thread."),
+        Err(ExportError::NoArray) => crate::println!("aoe: no md array is up (see `md`)."),
+        Err(ExportError::MdMember) => {
+            crate::println!("aoe: the disk of {what} is a member of an md array; export the");
+            crate::println!("     array instead (`aoe export md`).");
+        }
         Err(ExportError::DiskShared) => {
             crate::println!("aoe: a file on the disk of {what} is exported, so the disk");
             crate::println!("     cannot be written as well.");
@@ -851,7 +886,7 @@ fn disk_and_say(what: &str, slot: Option<u8>, access: Access) {
 }
 
 const USAGE: &str = "ATA over Ethernet: serve this machine's disks, or use another's.\n\
-                     aoe [export N|@LABEL [slot N] [rw for MAC|rw confirm] | unexport SLOT]\n\
+                     aoe [export N|@LABEL|md [slot N] [rw for MAC|rw confirm] | unexport SLOT]\n\
                      aoe export FILE [slot N] [rw for MAC|rw confirm]\n\
                      \x20     (FILE: a FOSFS or ext file; rw for MAC: only that machine writes)\n\
                      aoe [shelf N | reset]\n\

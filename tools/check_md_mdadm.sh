@@ -4,6 +4,9 @@
 #
 #     (cd crates/md && cargo build --example probe) && sudo tools/check_md_mdadm.sh [CONFIG...]
 #
+# fos-create1 fos-create5 fos-create6: the array is made by probe --create (fos's `md create`) instead of mdadm: mdadm
+# must examine and assemble it, resync it itself with 0 mismatches after, and take an ext4; a second fresh one is
+# resynced by probe --resync, and mdadm's "check" must find 0 mismatches and its bitmap 0 dirty bits.
 # CONFIG is one of: raid1 raid0 raid10 raid5-ls raid5-la raid5-rs raid5-ra raid5-3 raid6-ls raid6-la raid6-rs raid6-ra raid6-5 raid1-bm raid5-bm raid6-bm (an internal
 # write-intent bitmap, 1 MiB chunks) raid5-ppl (a partial parity log). Default: all of them.
 # For each, mdadm creates the array and an ext4 with a known file; then
@@ -127,8 +130,49 @@ resume_steps() {
     done
 }
 
+# An array made by fos (`md::create`), checked by the real driver.
+fos_create() {
+    level=$1; n=$2
+    echo "== fos-create$level"
+    files=()
+    for i in $(seq 0 $((n - 1))); do
+        f="$work/m$i.img"; rm -f "$f"; head -c $SIZE /dev/urandom >"$f"; files+=("$f")
+    done
+    "$PROBE" --create "$level" "${files[@]}" | sed 's/^/    /'
+    attach "${files[@]}"
+    mdadm --examine "${loops[0]}" | grep -E "Version|Raid Level|Chunk Size|Layout|Data Offset|Internal Bitmap|State :" | sed 's/^/    /'
+    mdadm --assemble $MD "${loops[@]}" >/dev/null 2>"$work/asm.err" && ok "mdadm assembles fos's new array" || { bad "mdadm --assemble"; sed "s/^/      /" "$work/asm.err"; detach; return; }
+    mdadm --wait $MD >/dev/null 2>&1
+    echo check >/sys/block/md199/md/sync_action
+    mdadm --wait $MD >/dev/null 2>&1
+    mm=$(cat /sys/block/md199/md/mismatch_cnt)
+    [ "$mm" = 0 ] && ok "after mdadm's own resync: 0 mismatches" || bad "after mdadm's resync: $mm mismatches"
+    mkfs.ext4 -q -F $MD && mount $MD "$work/mnt" && head -c 6M /dev/urandom >"$work/mnt/data" && umount "$work/mnt" && ok "ext4 on it" || bad "ext4"
+    mdadm --stop $MD >/dev/null
+    detach
+    out=$("$PROBE" --dump "$work/dump.img" "${files[@]}")
+    echo "$out" | grep -q "dirty\|DEGRADED\|not assembled" && bad "probe after mdadm: $out"
+    fsck_ok "$work/dump.img" "probe's dump of it"
+
+    for f in "${files[@]}"; do head -c $SIZE /dev/urandom >"$f"; done
+    "$PROBE" --create "$level" "${files[@]}" >/dev/null
+    "$PROBE" --resync "${files[@]}" | tail -1 | sed 's/^/    /'
+    attach "${files[@]}"
+    mdadm --assemble $MD "${loops[@]}" >/dev/null 2>&1 && ok "mdadm assembles it after probe's resync" || { bad "mdadm --assemble after resync"; detach; return; }
+    mdadm --detail $MD | grep -E "State :" | sed 's/^/    /'
+    echo check >/sys/block/md199/md/sync_action
+    mdadm --wait $MD >/dev/null 2>&1
+    mm=$(cat /sys/block/md199/md/mismatch_cnt)
+    [ "$mm" = 0 ] && ok "after probe's resync: mdadm check finds 0 mismatches" || bad "after probe's resync: $mm mismatches"
+    mdadm --stop $MD >/dev/null
+    d=$(dirty_bits)
+    [ "$d" = 0 ] && ok "bitmap: 0 dirty bits" || bad "bitmap: $d dirty bits"
+    detach
+}
+
 run() {
     name=$1
+    case $name in fos-create1) fos_create 1 2; return ;; fos-create5) fos_create 5 3; return ;; fos-create6) fos_create 6 4; return ;; esac
     case $name in
         raid1|raid1-bm) level=1; n=2; extra="" ;;
         raid0) level=0; n=2; extra="--chunk=64" ;;
@@ -207,7 +251,7 @@ run() {
 }
 
 configs=("$@")
-[ ${#configs[@]} -gt 0 ] || configs=(raid1 raid0 raid10 raid5-ls raid5-la raid5-rs raid5-ra raid5-3 raid6-ls raid6-la raid6-rs raid6-ra raid6-5 raid1-bm raid5-bm raid6-bm)
+[ ${#configs[@]} -gt 0 ] || configs=(raid1 raid0 raid10 raid5-ls raid5-la raid5-rs raid5-ra raid5-3 raid6-ls raid6-la raid6-rs raid6-ra raid6-5 raid1-bm raid5-bm raid6-bm fos-create1 fos-create5 fos-create6)
 for c in "${configs[@]}"; do run "$c"; done
 [ $fail = 0 ] && echo "ALL OK" || echo "FAILURES"
 exit $fail

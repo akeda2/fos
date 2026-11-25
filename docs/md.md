@@ -102,6 +102,26 @@ through the `Members` trait. Stages:
    four-member RAID 10 (striped by an independent routine in the test; booted again with one member of each pair) and a
    two-member RAID 0 (which must not assemble with a member missing).
 
+7. **Making an array** (`crates/md/src/create.rs`, `md create` in kernel-mf): `md create raid1|raid5|raid6 diskN diskN...
+   [name NAME] [chunk KIB]` announces the disks and what is on them, and the same line with `confirm` as the very next
+   command writes the array. Whole disks only; refused: the boot disk, an array or AoE disk, a disk exported over AoE, and
+   any create while an array is up (one per machine). The layout is mdadm's for a whole-disk 1.2 member: superblock at
+   sector 8 (384 role slots), an internal bitmap at sector 16 with every bit set (chunk 64 MiB, doubled until the bits fit
+   `bitmap::CAP`), data from sector 2048, chunk 512 KiB, left-symmetric; the name is `hostname:NAME` (default `md0`). The
+   head (old partition table and superblocks) and the first MiB of data are zeroed, so the array's start reads as zeros and
+   not as an old file system; the last MiB is left out of the data and zeroed, because Linux falls back to a backup GPT
+   there when the primary is gone. Superblocks are written last after a flush. They say `resync_offset` 0: the kernel
+   assembles the array at once and starts the resync (parity or the second copy computed from the data); the array reads
+   and writes meanwhile. Not done: RAID 0 and 10, a partial parity log instead of the bitmap, partitions as members.
+   `make test-mf-md-aoe` creates a three-disk RAID 5 in QEMU, serves it over AoE and checks the members on the host with
+   independent code; `tools/check_md_mdadm.sh fos-create1 fos-create5 fos-create6` (root) has the real driver assemble,
+   resync, check and fsck what `probe --create` makes.
+8. **Serving it over AoE**: an array is a disk, so `aoe export md` (the array, whatever its disk number) serves it;
+   `aoe-export md [slot N] [rw for MAC]` in `settings` waits for `md auto` to bring the array up and is made right after
+   each assembly. A disk that carries an md superblock (a member) is never exported on its own, and `md stop` is refused
+   while the array is exported. Each write is a read-modify-write of data and parity under the one array lock, so writes
+   are slower than one disk's, and reads are not spread over the members in parallel.
+
 `tools/check_md_mdadm.sh` (run as root, loop devices only) is the cross-check against the real driver: mdadm creates RAID 1, 0, 10, 5 and
 6 (every layout), `probe` dumps, writes and rebuilds them, and mdadm must assemble, `check` (0 mismatches) and fsck the results.
 
