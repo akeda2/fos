@@ -60,9 +60,20 @@ pub fn sector(rest: &str) {
 /// network, for an AoE disk) alone; the request size shows what each request's start and end cost. Read-only. The disk
 /// lock is taken per request, so tapes and the target's workers get in between.
 pub fn readspeed(rest: &str) {
-    const USAGE: &str = "Usage: readspeed diskN [MIB 1-4096] [KIB 4-4096] [US 0-100000]   (read-only)";
-    let mut words = rest.split_whitespace();
-    let disk = words.next().and_then(|word| word.strip_prefix("disk")).and_then(|digits| digits.parse::<usize>().ok());
+    const USAGE: &str = "Usage: readspeed diskN[,diskM...] [MIB 1-4096] [KIB 4-4096] [US 0-100000]\n\
+                         \x20      [q=1-7]   (read-only; q: commands queued on each drive, SATA NCQ)";
+    let depth = rest.split_whitespace().find_map(|word| word.strip_prefix("q=")).map_or(Some(1), |n| n.parse::<usize>().ok());
+    let Some(depth) = depth.filter(|depth| (1..=7).contains(depth)) else { return println!("{USAGE}") };
+    let mut words = rest.split_whitespace().filter(|word| !word.starts_with("q="));
+    // `disk2,disk3,disk4`: several drives at once, as an md job reads its members
+    let mut disks: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+    for name in words.next().unwrap_or("").split(',') {
+        match name.strip_prefix("disk").and_then(|digits| digits.parse::<usize>().ok()) {
+            Some(disk) if disk > 0 && !disks.contains(&disk) && disks.len() < 8 => disks.push(disk),
+            _ => return println!("{USAGE}"),
+        }
+    }
+    let disk = disks.first().copied();
     let mib = words.next().map_or(Some(64), |word| word.parse::<u64>().ok());
     let kib = words.next().map_or(Some(1024), |word| word.parse::<usize>().ok());
     // Busy work after each request, as a reader that decodes or hashes each block does: shows whether reading goes on
@@ -72,11 +83,16 @@ pub fn readspeed(rest: &str) {
     if disk == 0 || !(1..=4096).contains(&mib) || !(4..=4096).contains(&kib) || kib % 4 != 0 || work > 100_000 {
         return println!("{USAGE}");
     }
-    let Some(sectors) = crate::block::get(disk - 1).map(|info| info.sectors) else {
-        return println!("readspeed: no disk{disk}.");
-    };
+    let mut sectors = u64::MAX;
+    for &disk in &disks {
+        let Some(info) = crate::block::get(disk - 1) else { return println!("readspeed: no disk{disk}.") };
+        sectors = sectors.min(info.sectors);
+    }
     let total = (mib << 11).min(sectors);
     let per = (kib * 2) as u64;
+    if depth > 1 || disks.len() > 1 {
+        return readspeed_queued(&disks, total, kib, work, depth);
+    }
     let mut buffer = alloc::vec![0u8; kib * 1024];
     let begin = crate::arch::micros();
     let mut lba = 0;
@@ -104,6 +120,69 @@ pub fn readspeed(rest: &str) {
     if work > 0 {
         let requests = total.div_ceil(per);
         println!("  of it {} ms of work ({work} us after each of {requests} requests)", requests * work / 1000);
+    }
+}
+
+/// `readspeed ... q=N`, and several disks at once: the same sequential read with up to N requests on each drive at once
+/// (`block::start_ahead`, NCQ tags 1..). Requests are collected in order, every drive's in turn as an md job collects a
+/// piece of its members, and each is replaced at once by the drive's next. Shows what a drive (or several on one HBA)
+/// gives at a queue depth, apart from whatever md does between its requests: with q=2 the drives move in step as md's
+/// one-piece read-ahead makes them, with a deeper queue a drive that is ahead keeps going. The disk lock is not taken:
+/// the queued reads go to their own tags, which nothing else uses but md's read-ahead (the port locks keep the commands
+/// apart).
+fn readspeed_queued(disks: &[usize], total: u64, kib: usize, work: u64, depth: usize) {
+    type Flight = alloc::collections::VecDeque<(crate::block::Ahead, usize, u64, usize)>;
+    let per = (kib * 2) as u64;
+    let slots = depth * disks.len();
+    let mut buffers: alloc::vec::Vec<alloc::vec::Vec<u8>> = (0..slots).map(|_| alloc::vec![0u8; kib * 1024]).collect();
+    let mut flights: alloc::vec::Vec<Flight> = disks.iter().map(|_| Flight::new()).collect();
+    let mut next_lba = alloc::vec![0u64; disks.len()];
+    let queued_before = crate::block::many_times().ahead;
+    let begin = crate::arch::micros();
+    let mut busy = true;
+    while busy {
+        busy = false;
+        for (slot, &disk) in disks.iter().enumerate() {
+            let (flight, lba) = (&mut flights[slot], &mut next_lba[slot]);
+            while flight.len() < depth && *lba < total {
+                let count = per.min(total - *lba) as usize;
+                // each disk has buffers slot*depth.. of its own, used in turn
+                let index = slot * depth + (*lba / per) as usize % depth;
+                let buffer = &mut buffers[index][..count * 512];
+                // The buffer is only touched again by the `finish` below, which waits for the drive first.
+                let ahead = unsafe { crate::block::start_ahead(&mut [crate::block::Read { disk: disk - 1, lba: *lba, buffer }]) };
+                flight.push_back((ahead, index, *lba, count));
+                *lba += count as u64;
+            }
+        }
+        for (slot, &disk) in disks.iter().enumerate() {
+            let Some((ahead, index, at, count)) = flights[slot].pop_front() else { continue };
+            busy = true;
+            let buffer = &mut buffers[index][..count * 512];
+            if let Err((_, error)) = ahead.finish(&mut [crate::block::Read { disk: disk - 1, lba: at, buffer }]) {
+                return println!("readspeed: disk{disk} sector {at}: read failed ({error:?}).");
+            }
+        }
+        if work > 0 && busy {
+            let until = crate::arch::micros() + work;
+            while crate::arch::micros() < until {
+                core::hint::spin_loop();
+            }
+        }
+    }
+    let micros = (crate::arch::micros() - begin).max(1);
+    let bytes = total * 512 * disks.len() as u64;
+    let requests = total.div_ceil(per) * disks.len() as u64;
+    let queued = crate::block::many_times().ahead - queued_before;
+    let names: alloc::vec::Vec<alloc::string::String> = disks.iter().map(|disk| alloc::format!("disk{disk}")).collect();
+    println!("{}: {} MiB in {kib} KiB requests, {depth} at once each, {}.{:03} s,",
+        names.join(","), bytes >> 20, micros / 1_000_000, micros / 1000 % 1000);
+    println!("  {} MB/s in all, {} MB/s a disk", bytes / micros, bytes / micros / disks.len() as u64);
+    println!("  {queued} of {requests} requests queued (NCQ); the rest read one at a time");
+    if work > 0 {
+        // once per round: after one request of every disk, as md works once per piece of all its members
+        let rounds = total.div_ceil(per);
+        println!("  of it {} ms of work ({work} us after each of {rounds} rounds)", rounds * work / 1000);
     }
 }
 
