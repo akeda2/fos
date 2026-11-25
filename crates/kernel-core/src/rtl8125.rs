@@ -32,14 +32,17 @@
 //! which here too comes from a transmitted frame; soft handling of RDU/FOVW; 9 KiB buffers above an MTU of 1500). The chip
 //! takes 16 KiB frames; 9000 is kept as the limit, as on every other card here.
 //!
-//! Only real hardware can check any of this: QEMU has no RTL8125.
+//! Only real hardware can check any of this: QEMU has no RTL8125. Seen working (2026-11-25): an RTL8125B (XID 0x641)
+//! linked at 2.5 Gb/s to another RTL8125, frames both ways, MSI after the deferred self-test (`irqprobe`). Not yet
+//! measured: throughput, jumbo frames, recovery.
 
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
 
 use crate::e1000::{Delivery, ISR, MAX_INTERFACES};
+use crate::irqprobe::{Probe, SelfTest, Step};
 use crate::rtl8168::{DESC_EOR, DESC_FS, DESC_LENGTH_MASK, DESC_LS, DESC_OWN, DESC_RX_RES, Rtl8168, read_opts1, write_descriptor};
-use crate::{cpu, memory, paging, pci, timer};
+use crate::{memory, paging, pci, timer};
 
 pub const VENDOR_REALTEK: u16 = 0x10ec;
 pub const DEVICE_IDS: &[u16] = &[0x8125, 0x3000];
@@ -306,6 +309,8 @@ pub struct Rtl8125 {
     retry: Option<pci::Device>,
     retry_after: u64,
     retry_attempts: u8,
+    /// The self-test `retry_interrupts` is part-way through.
+    probe: Option<Probe>,
     /// Bounded waits that ran out (each is a step Linux would log), and the last one's name.
     pub timeouts: u32,
     pub last_timeout: &'static str,
@@ -382,6 +387,7 @@ impl Rtl8125 {
             retry: None,
             retry_after: 0,
             retry_attempts: 0,
+            probe: None,
             timeouts: 0,
             last_timeout: "",
             phy_errors: 0,
@@ -870,22 +876,6 @@ impl Rtl8125 {
 
     // ---- interrupts ----
 
-    fn self_test(&mut self, arrived: impl Fn() -> u64) -> bool {
-        write32(self.registers, REG_ISR, 0xffff_ffff);
-        write32(self.registers, REG_IMR, INTERRUPT_MASK | ISR_TOK);
-        let before = arrived();
-        let mut frame = [0u8; 14];
-        frame[..6].fill(0xff);
-        frame[6..12].copy_from_slice(&self.mac);
-        frame[12..14].copy_from_slice(&[0x88, 0xb5]);
-        self.send(&frame);
-        let start = timer::ticks();
-        while arrived() == before && timer::ticks().wrapping_sub(start) < 3 {
-            core::hint::spin_loop();
-        }
-        arrived() != before
-    }
-
     fn finish_interrupts(&mut self, delivery: Delivery) -> Delivery {
         self.interrupts_enabled = true;
         self.delivery = delivery;
@@ -894,69 +884,48 @@ impl Rtl8125 {
     }
 
     /// As `Rtl8168::enable_interrupts`: MSI, then INTx pins, each kept only if its self-test interrupt (the completion of
-    /// one broadcast frame; the 8125 has no forced software interrupt) arrives. With no link it is retried from `receive`.
+    /// one broadcast frame; the 8125 has no forced software interrupt) arrives (`irqprobe`). Needs interrupts on. With no
+    /// link it is retried from `receive`, one step at a time.
     pub fn enable_interrupts(&mut self, device: &pci::Device) -> Result<Delivery, &'static str> {
         if !self.link_up() {
             self.retry = Some(*device);
             self.retry_after = timer::ticks() + RETRY_TICKS;
             return Err("no link yet, so the self-test cannot send a frame; it is retried when the link comes up");
         }
-        let mut reason = "no interrupt path passed its self-test";
-        if device.find_capability(0x05).is_some() {
-            match crate::msi::allocate(isr, self.index) {
-                Some(vector) if device.enable_msi(vector, crate::hal::interrupt_target()) => {
-                    if self.self_test(|| crate::msi::count(vector)) {
-                        return Ok(self.finish_interrupts(Delivery::Msi(vector)));
-                    }
-                    write32(self.registers, REG_IMR, 0);
-                    device.disable_msi();
-                    crate::msi::release(vector);
-                    reason = "the MSI self-test message never arrived";
-                }
-                Some(vector) => crate::msi::release(vector),
-                None => reason = "no free MSI vector",
-            }
-        } else {
-            reason = "no MSI capability";
-        }
-        let (first, end) = crate::hal::gsi_range();
-        let candidates = crate::msi::intx_candidates(device.interrupt_line());
-        for (position, &gsi) in candidates.iter().enumerate() {
-            if gsi == u32::MAX || gsi == 0 || gsi < first || gsi >= end || candidates[..position].contains(&gsi) {
-                continue;
-            }
-            let Some(vector) = crate::msi::attach_intx(gsi, isr, self.index) else { continue };
-            let index = self.index;
-            if self.self_test(|| ISR[index].interrupts.load(Ordering::Relaxed)) {
-                return Ok(self.finish_interrupts(Delivery::Intx { gsi, vector }));
-            }
-            write32(self.registers, REG_IMR, 0);
-            crate::msi::detach_intx(vector, self.index);
-            reason = "no I/O APIC pin delivered the self-test interrupt";
-        }
-        Err(reason)
+        let delivery = Probe::new(*device).run(self)?;
+        Ok(self.finish_interrupts(delivery))
     }
 
+    /// The deferred half of `enable_interrupts`, called from `receive`: once the link is up it runs the self-test one
+    /// `Probe::step` per call, since `receive` may hold a lock with interrupts off (the server kernel's NIC lock) and the
+    /// test interrupt only arrives once that is let go. At most `RETRY_LIMIT` searches, `RETRY_TICKS` apart.
     fn retry_interrupts(&mut self) {
         let Some(device) = self.retry else { return };
-        if self.interrupts_enabled || timer::ticks() < self.retry_after || !self.link_up() {
+        if self.interrupts_enabled {
+            self.retry = None;
             return;
         }
-        let was_enabled = cpu::interrupts_save_and_disable();
-        cpu::interrupts_restore(was_enabled);
-        if !was_enabled {
-            return;
-        }
-        self.retry = None;
-        self.retry_attempts += 1;
-        match self.enable_interrupts(&device) {
-            Ok(delivery) => crate::println!("rtl8125 {}: link is up; interrupts: {delivery:?}.", self.index + 1),
-            Err(reason) => {
-                crate::println!("rtl8125 {}: link is up, interrupts stay polled:", self.index + 1);
-                crate::println!("     {reason}.");
-                if self.retry_attempts < RETRY_LIMIT && !self.interrupts_enabled {
-                    self.retry = Some(device);
+        let mut probe = match self.probe.take() {
+            Some(probe) => probe,
+            None if timer::ticks() < self.retry_after || !self.link_up() => return,
+            None => {
+                self.retry_attempts += 1;
+                Probe::new(device)
+            }
+        };
+        match probe.step(self) {
+            Step::Pending => self.probe = Some(probe),
+            Step::Passed(delivery) => {
+                self.retry = None;
+                self.finish_interrupts(delivery);
+                crate::println!("rtl8125 {}: link is up; interrupts: {delivery:?} (the self-test interrupt arrived).", self.index + 1);
+            }
+            Step::Failed(reason) => {
+                crate::println!("rtl8125 {}: link is up, interrupts stay polled ({reason}).", self.index + 1);
+                if self.retry_attempts < RETRY_LIMIT {
                     self.retry_after = timer::ticks() + RETRY_TICKS;
+                } else {
+                    self.retry = None;
                 }
             }
         }
@@ -1261,5 +1230,33 @@ fn init_rings(rings: u64, rx_buffers: u64, tx_buffers: u64, buffer_bytes: usize)
     for index in 0..TX_COUNT {
         let eor = if index == TX_COUNT - 1 { DESC_EOR } else { 0 };
         write_descriptor(rings + TX_RING_OFFSET, index, eor, tx_buffers + (index * buffer_bytes) as u64, 0);
+    }
+}
+
+impl SelfTest for Rtl8125 {
+    fn probe_index(&self) -> usize {
+        self.index
+    }
+
+    fn probe_handler(&self) -> fn(usize) {
+        isr
+    }
+
+    fn probe_link_up(&self) -> bool {
+        self.link_up()
+    }
+
+    fn probe_arm(&mut self) {
+        write32(self.registers, REG_ISR, 0xffff_ffff);
+        write32(self.registers, REG_IMR, INTERRUPT_MASK | ISR_TOK);
+        let mut frame = [0u8; 14];
+        frame[..6].fill(0xff);
+        frame[6..12].copy_from_slice(&self.mac);
+        frame[12..14].copy_from_slice(&[0x88, 0xb5]);
+        self.send(&frame);
+    }
+
+    fn probe_disarm(&mut self) {
+        write32(self.registers, REG_IMR, 0);
     }
 }

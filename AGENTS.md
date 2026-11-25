@@ -99,8 +99,8 @@ when present (`docs/private.md`). Never copy private code, names or docs into pu
 
 ## Drivers
 
-NICs: e1000 family (82540/82574L/82579/I219/I350), RTL8168, RTL8125 (`rtl8125.rs`, 2.5 Gb/s; not yet run on
-hardware), RTL8139, 3C905. NIC numbers: PCI order across drivers, `nic N MAC` pins in `settings` (`nicorder.rs`, `nic pin`). Storage:
+NICs: e1000 family (82540/82574L/82579/I219/I350), RTL8168, RTL8125 (`rtl8125.rs`, 2.5 Gb/s; an RTL8125B
+runs at 2.5G with MSI), RTL8139, 3C905. NIC numbers: PCI order across drivers, `nic N MAC` pins in `settings` (`nicorder.rs`, `nic pin`). Storage:
 AHCI, NVMe, xHCI/EHCI + mass storage and hub. Input: PS/2, USB HID (keyboards on xHCI, EHCI and, for the low/full-speed companion ports of AMD/NVIDIA-era boards, OHCI: `kernel/src/ohci.rs`, root ports only, no hubs or disks). Audio: USB audio
 (xHCI) and Intel HD Audio, behind `kernel/src/audio.rs`. Not carried over from the
 legacy edition (still at `legacy-v1`): UHCI, OHCI disks and hubs, NE2000, AC'97, ES1370, the

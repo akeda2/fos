@@ -35,6 +35,7 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering, fence};
 
 use crate::e1000::{Delivery, ISR, MAX_INTERFACES};
+use crate::irqprobe::{Probe, SelfTest, Step};
 use crate::{cpu, memory, pci, timer};
 
 pub const VENDOR_REALTEK: u16 = 0x10ec;
@@ -283,6 +284,8 @@ pub struct Rtl8168 {
     retry: Option<pci::Device>,
     retry_after: u64,
     retry_attempts: u8,
+    /// The self-test `retry_interrupts` is part-way through.
+    probe: Option<Probe>,
     /// The chip version bits of `TxConfig` (0x4c0 and up: RTL8168G or later).
     pub version: u16,
 }
@@ -375,29 +378,9 @@ impl Rtl8168 {
             retry: None,
             retry_after: 0,
             retry_attempts: 0,
+            probe: None,
             version,
         })
-    }
-
-    /// Raises one interrupt by hand and reports whether `arrived` saw it within three ticks: the
-    /// proof that the chosen delivery path really works. Older chips raise a software interrupt
-    /// when `TPPOLL.FSWINT` is written; the RTL8168G/H ignore that bit, so one broadcast frame is
-    /// sent too, whose completion (transmit OK, enabled just for this test) interrupts instead.
-    fn self_test(&mut self, arrived: impl Fn() -> u64) -> bool {
-        write16(self.io_base, REG_ISR, 0xffff);
-        write16(self.io_base, REG_IMR, INTERRUPT_MASK | ISR_TOK);
-        let before = arrived();
-        write8(self.io_base, REG_TPPOLL, TPPOLL_FSWINT);
-        let mut frame = [0u8; 14];
-        frame[..6].fill(0xff);
-        frame[6..12].copy_from_slice(&self.mac);
-        frame[12..14].copy_from_slice(&[0x88, 0xb5]);
-        self.send(&frame);
-        let start = timer::ticks();
-        while arrived() == before && timer::ticks().wrapping_sub(start) < 3 {
-            core::hint::spin_loop();
-        }
-        arrived() != before
     }
 
     fn finish_interrupts(&mut self, delivery: Delivery) -> Delivery {
@@ -409,8 +392,8 @@ impl Rtl8168 {
 
     /// Switches this NIC from polling to interrupts, trying MSI and then legacy INTx through the
     /// I/O APIC (probing candidate pins, as the e1000 driver does, since the ACPI routing table
-    /// is not read). A path is kept only if its self-test interrupt arrives; otherwise the NIC
-    /// stays polled and says why. Needs interrupts enabled and the local APIC running.
+    /// is not read). A path is kept only if its self-test interrupt arrives (`irqprobe`);
+    /// otherwise the NIC stays polled and says why. Needs interrupts enabled and the local APIC running.
     pub fn enable_interrupts(&mut self, device: &pci::Device) -> Result<Delivery, &'static str> {
         // The RTL8168G/H ignore the forced software interrupt, so the self-test needs a frame to go out, and `send` drops
         // frames while there is no link: with no cable at boot the test could only fail. Stay polled and try again from
@@ -420,66 +403,40 @@ impl Rtl8168 {
             self.retry_after = timer::ticks() + RETRY_TICKS;
             return Err("no link yet, so the self-test cannot send a frame; it is retried when the link comes up");
         }
-        let mut reason = "no interrupt path passed its self-test";
-        if device.find_capability(0x05).is_some() {
-            match crate::msi::allocate(isr, self.index) {
-                Some(vector) if device.enable_msi(vector, crate::hal::interrupt_target()) => {
-                    if self.self_test(|| crate::msi::count(vector)) {
-                        return Ok(self.finish_interrupts(Delivery::Msi(vector)));
-                    }
-                    write16(self.io_base, REG_IMR, 0);
-                    device.disable_msi();
-                    crate::msi::release(vector);
-                    reason = "the MSI self-test message never arrived";
-                }
-                Some(vector) => crate::msi::release(vector),
-                None => reason = "no free MSI vector",
-            }
-        } else {
-            reason = "no MSI capability";
-        }
-        // Legacy INTx: the firmware's interrupt line (a hint) and the PCI pins an Intel/QEMU
-        // chipset routes to the I/O APIC (GSI 16-23).
-        let (first, end) = crate::hal::gsi_range();
-        let candidates = crate::msi::intx_candidates(device.interrupt_line());
-        for (position, &gsi) in candidates.iter().enumerate() {
-            if gsi == u32::MAX || gsi == 0 || gsi < first || gsi >= end || candidates[..position].contains(&gsi) {
-                continue;
-            }
-            let Some(vector) = crate::msi::attach_intx(gsi, isr, self.index) else { continue };
-            let index = self.index;
-            if self.self_test(|| ISR[index].interrupts.load(Ordering::Relaxed)) {
-                return Ok(self.finish_interrupts(Delivery::Intx { gsi, vector }));
-            }
-            write16(self.io_base, REG_IMR, 0);
-            crate::msi::detach_intx(vector, self.index);
-            reason = "no I/O APIC pin delivered the self-test interrupt";
-        }
-        Err(reason)
+        let delivery = Probe::new(*device).run(self)?;
+        Ok(self.finish_interrupts(delivery))
     }
 
-    /// The deferred half of `enable_interrupts`: called from `receive`, it waits for the link, then runs the self-test once
-    /// (at most `RETRY_LIMIT` times, `RETRY_TICKS` apart, so a path that really does not work costs three short stalls).
+    /// The deferred half of `enable_interrupts`, called from `receive`: once the link is up it runs the self-test one
+    /// `Probe::step` per call, since `receive` may hold a lock with interrupts off (the server kernel's NIC lock) and the
+    /// test interrupt only arrives once that is let go. At most `RETRY_LIMIT` searches, `RETRY_TICKS` apart.
     fn retry_interrupts(&mut self) {
         let Some(device) = self.retry else { return };
-        if self.interrupts_enabled || timer::ticks() < self.retry_after || !self.link_up() {
+        if self.interrupts_enabled {
+            self.retry = None;
             return;
         }
-        // The self-test waits for timer ticks: never run it with interrupts off.
-        let was_enabled = cpu::interrupts_save_and_disable();
-        cpu::interrupts_restore(was_enabled);
-        if !was_enabled {
-            return;
-        }
-        self.retry = None;
-        self.retry_attempts += 1;
-        match self.enable_interrupts(&device) {
-            Ok(delivery) => crate::println!("rtl8168 {}: link is up; interrupts: {delivery:?} (the self-test interrupt arrived).", self.index + 1),
-            Err(reason) => {
+        let mut probe = match self.probe.take() {
+            Some(probe) => probe,
+            None if timer::ticks() < self.retry_after || !self.link_up() => return,
+            None => {
+                self.retry_attempts += 1;
+                Probe::new(device)
+            }
+        };
+        match probe.step(self) {
+            Step::Pending => self.probe = Some(probe),
+            Step::Passed(delivery) => {
+                self.retry = None;
+                self.finish_interrupts(delivery);
+                crate::println!("rtl8168 {}: link is up; interrupts: {delivery:?} (the self-test interrupt arrived).", self.index + 1);
+            }
+            Step::Failed(reason) => {
                 crate::println!("rtl8168 {}: link is up, interrupts stay polled ({reason}).", self.index + 1);
-                if self.retry_attempts < RETRY_LIMIT && !self.interrupts_enabled {
-                    self.retry = Some(device);
+                if self.retry_attempts < RETRY_LIMIT {
                     self.retry_after = timer::ticks() + RETRY_TICKS;
+                } else {
+                    self.retry = None;
                 }
             }
         }
@@ -891,4 +848,35 @@ fn program(base: u16, rings: u64, enable_after_config: bool, promiscuous: bool, 
     write8(base, REG_9346CR, CFG9346_LOCK);
     write16(base, REG_ISR, 0xffff); // clear anything latched before the reset
     write16(base, REG_IMR, 0); // polling: no interrupt causes enabled
+}
+
+impl SelfTest for Rtl8168 {
+    fn probe_index(&self) -> usize {
+        self.index
+    }
+
+    fn probe_handler(&self) -> fn(usize) {
+        isr
+    }
+
+    fn probe_link_up(&self) -> bool {
+        self.link_up()
+    }
+
+    /// Older chips raise a software interrupt when `TPPOLL.FSWINT` is written; the RTL8168G/H ignore that bit, so one
+    /// broadcast frame is sent too, whose completion (transmit OK, enabled just for this test) interrupts instead.
+    fn probe_arm(&mut self) {
+        write16(self.io_base, REG_ISR, 0xffff);
+        write16(self.io_base, REG_IMR, INTERRUPT_MASK | ISR_TOK);
+        write8(self.io_base, REG_TPPOLL, TPPOLL_FSWINT);
+        let mut frame = [0u8; 14];
+        frame[..6].fill(0xff);
+        frame[6..12].copy_from_slice(&self.mac);
+        frame[12..14].copy_from_slice(&[0x88, 0xb5]);
+        self.send(&frame);
+    }
+
+    fn probe_disarm(&mut self) {
+        write16(self.io_base, REG_IMR, 0);
+    }
 }
