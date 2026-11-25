@@ -312,6 +312,8 @@ pub struct Rtl8125 {
     /// The self-test `retry_interrupts` is part-way through.
     probe: Option<Probe>,
     /// Bounded waits that ran out (each is a step Linux would log), and the last one's name.
+    /// Why the last `recover` ran (`nic` shows it).
+    last_recovery: &'static str,
     pub timeouts: u32,
     pub last_timeout: &'static str,
     /// The PHY indirect access (`PHY_OCP`) failed to complete at least once.
@@ -388,6 +390,7 @@ impl Rtl8125 {
             retry_after: 0,
             retry_attempts: 0,
             probe: None,
+            last_recovery: "",
             timeouts: 0,
             last_timeout: "",
             phy_errors: 0,
@@ -944,6 +947,10 @@ impl Rtl8125 {
             ),
             None => crate::println!("   rtl8125: {} (XID {:#05x}), no link, {} recoveries", self.chip.name(), self.xid, self.recoveries),
         }
+        if self.recoveries > 0 {
+            crate::println!("   rtl8125: the last recovery was for {}", self.last_recovery);
+        }
+        crate::println!("   rtl8125: receive ring ({RX_COUNT}) overflowed {} time(s) (RDU/FOVW)", ISR[self.index].overruns.load(Ordering::Relaxed));
         crate::println!("   rtl8125: transmit ring ({TX_COUNT}) found full {} time(s)", self.tx_ring_full);
         crate::println!("   rtl8125: PCIe max read request {} bytes", self.read_request);
         let yes = |value: Option<u16>, bit: u16| match value {
@@ -1030,7 +1037,8 @@ impl Rtl8125 {
         self.promiscuous = on;
     }
 
-    fn recover(&mut self) -> bool {
+    fn recover(&mut self, reason: &'static str) -> bool {
+        self.last_recovery = reason;
         if !self.restart() {
             return false;
         }
@@ -1053,7 +1061,7 @@ impl Rtl8125 {
             let Some(tx_buffers) = memory::allocate_contiguous(frames, below) else { return false };
             // Only now: `send` takes frames up to the MTU, which the 2 KiB buffers could not hold.
             (self.rx_buffers, self.tx_buffers, self.buffer_bytes, self.mtu) = (rx_buffers, tx_buffers, JUMBO_BUFFER_BYTES, mtu);
-            return self.recover();
+            return self.recover("the MTU change");
         }
         self.mtu = mtu;
         // The EEE transmit idle timer follows the MTU (Linux `rtl_set_eee_txidle_timer`).
@@ -1184,8 +1192,10 @@ impl Rtl8125 {
         }
         let fatal = FATAL[self.index].swap(false, Ordering::AcqRel)
             || (!self.interrupts_enabled && read32(self.registers, REG_ISR) & ISR_SYSERR != 0);
-        if self.recovery_pending || fatal {
-            self.recover();
+        if fatal {
+            self.recover("a system error (SYSERR)");
+        } else if self.recovery_pending {
+            self.recover("a transmit descriptor the card never gave back");
         }
         let index = self.rx_next;
         let opts1 = read_opts1(self.rings, index);
@@ -1195,7 +1205,7 @@ impl Rtl8125 {
                 write32(self.registers, REG_IMR, INTERRUPT_MASK);
             }
             if self.interrupts_enabled && self.receiver_stalled() {
-                self.recover();
+                self.recover("receive overflow latched with the ring empty");
             }
             return None;
         }
