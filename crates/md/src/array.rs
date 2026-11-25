@@ -120,10 +120,11 @@ pub enum Step {
 
 /// Sectors compared or copied per piece on the paths that use stack buffers (writes, and reads that must reconstruct).
 const PIECE: u64 = 16;
-/// Sectors per piece of a resync or rebuild (256 KiB, two 128 KiB SATA commands per member), read from every member at
-/// once (`Members::read_many`) into `Array::work`. With 8 KiB pieces read one member after another, a 3-disk RAID 5 of
-/// SATA SSDs resynced at 14 MiB/s per member: the time went to per-command latency, not to moving data.
-const JOB_PIECE: u64 = 512;
+/// Sectors per piece of a resync or rebuild (512 KiB, a whole chunk at mdadm's default, so one SATA command per member
+/// where the server kernel can DMA straight into `Array::work`), read from every member at once (`Members::read_many`).
+/// With 8 KiB pieces read one member after another, a 3-disk RAID 5 of SATA SSDs resynced at 14 MiB/s per member; with
+/// 256 KiB pieces in 128 KiB commands at once, at 230 MiB/s per member, 86% of the time waiting for the drives.
+const JOB_PIECE: u64 = 1024;
 /// The longest stretch one partial parity log entry covers when the log area has room (32 KiB): fewer flushed log
 /// writes for a sequential write. Parity ranges of pieces in one stripe overlap, so pieces cannot share a flush.
 const PPL_RUN: u64 = 64;

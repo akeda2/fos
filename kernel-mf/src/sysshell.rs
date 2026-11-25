@@ -462,6 +462,7 @@ pub fn kup(rest: &str) {
         Ok(slot) => {
             println!("KUP serial: image verified and written to slot {slot} (pending); restarting to try it.");
             crate::time::busy_wait_ms(200);
+            crate::mdvol::stop_all();
             crate::slots::mark_clean_stop();
             crate::power::reset();
         }

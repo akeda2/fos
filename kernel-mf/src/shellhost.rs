@@ -402,6 +402,7 @@ impl Host for MfHost {
     }
 
     fn restart(&mut self) {
+        crate::mdvol::stop_all();
         crate::slots::mark_clean_stop();
         crate::power::reset();
     }

@@ -6,8 +6,10 @@
 //! Boot never waits for it. With `md auto` in `settings` one thread (`md-assemble`) looks for members, waits up to
 //! `md wait` seconds (default 10) for all of them, then assembles what it has (degraded if it must) and keeps retrying with
 //! a growing pause (1, 2, 4 ... 30 s), and at once when a disk appears, until an array is up. The same thread closes the
-//! array ("in step" in its superblocks) after a few idle seconds, so only a crash while writing leaves it dirty. A dirty
-//! array is only read, never written, until `md force-rw`.
+//! array ("in step" in its superblocks) after a few idle seconds, so only a crash while writing leaves it dirty; it also
+//! starts, without the assembling, when an array comes up by `md create` or `md assemble` and there is no `md auto`.
+//! `md stop` holds it back from assembling again until `md assemble` or `md create`. Every restart (`reboot`, `shutdown`,
+//! a kernel update) closes the array first (`stop_all`). A dirty array is only read, never written, until `md force-rw`.
 //!
 //! One lock covers the array; the member reads and writes under it are the drivers' bounded ones, and a member that
 //! fails is dropped by `md` (a read falls back to the other member), so a dead disk costs a failed transfer, not a stall.
@@ -44,6 +46,10 @@ fn io_lock() -> sched::SleepGuard<'static, State> {
 }
 
 static JOB_THREAD: AtomicBool = AtomicBool::new(false);
+/// The `md-assemble` thread is running (it never ends).
+static KEEPER: AtomicBool = AtomicBool::new(false);
+/// Set by `md stop`: the thread does not assemble again (`md auto`, a disk appearing) until `md assemble` or `md create`.
+static HELD: AtomicBool = AtomicBool::new(false);
 /// The disk index `md add` announced and waits to have confirmed (usize::MAX: none).
 static PENDING_ADD: AtomicUsize = AtomicUsize::new(usize::MAX);
 
@@ -304,19 +310,32 @@ fn try_assemble_uuid(wait_over: bool, uuid: Option<[u8; 16]>) -> Outcome {
         crate::println!("md: a rebuild was interrupted; `md resume` goes on from where it stopped.");
     }
     drop(state);
+    // the thread that closes the array when idle, also without `md auto`
+    start_keeper();
     // `aoe-export md` lines in settings wait for this
     crate::aoetarget::md_assembled();
     Outcome::Assembled
 }
 
-/// The boot thread: tries until an array is up, never blocks the boot, then closes the array after idle seconds.
-pub extern "C" fn assemble_thread(_: usize) {
+/// Starts `md-assemble` once: at boot with `md auto` (main.rs), and whenever an array comes up, so an array made by
+/// `md create` or assembled by hand is closed clean when idle too.
+pub fn start_keeper() {
+    if !KEEPER.swap(true, Ordering::AcqRel) && sched::spawn("md-assemble", assemble_thread, 0).is_none() {
+        KEEPER.store(false, Ordering::Release);
+        crate::println!("md: could not start the md-assemble thread; the array is closed only by `md stop`.");
+    }
+}
+
+/// The md thread: with `md auto`, tries until an array is up (never blocking the boot) unless `md stop` holds it back;
+/// always closes the array after idle seconds.
+extern "C" fn assemble_thread(_: usize) {
     let started = seconds();
     let (mut pause, mut next, mut seen) = (1u64, 0u64, 0usize);
     loop {
         let t = seconds();
         let up = STATE.lock().array.is_some();
-        if !up && (t >= next || block::count() != seen) {
+        let wanted = crate::config::md_auto() && !HELD.load(Ordering::Acquire);
+        if !up && wanted && (t >= next || block::count() != seen) {
             seen = block::count();
             let over = t.saturating_sub(started) >= crate::config::md_wait();
             match try_assemble(over) {
@@ -398,8 +417,9 @@ fn print_job_times() {
     );
     if many.commands > 0 {
         println!(
-            "      {} commands of {} KiB on average, {} MiB/s moved",
+            "      {} commands, {} direct, {} KiB each on average; {} MiB/s moved",
             many.commands,
+            many.direct,
             many.bytes / many.commands >> 10,
             mib_s(many.bytes)
         );
@@ -439,6 +459,7 @@ extern "C" fn job_thread(_: usize) {
                     entry.many.wait_us += many.wait_us;
                     entry.many.copy_us += many.copy_us;
                     entry.many.commands += many.commands;
+                    entry.many.direct += many.direct;
                     entry.many.bytes += many.bytes;
                     let (from, to) = (before.map_or(0, |(_, done)| done), after.map_or(array.sectors(), |(_, done)| done));
                     entry.sectors += to.saturating_sub(from);
@@ -700,6 +721,7 @@ fn create_command(words: core::str::SplitWhitespace) {
         }
     }
     crate::println!("md: written ({} MiB per disk, bitmap chunk {} MiB); assembling.", plan.member_size >> 11, plan.bitmap_chunk >> 11);
+    HELD.store(false, Ordering::Release);
     match try_assemble_uuid(true, Some(spec.uuid)) {
         Outcome::Assembled => resync_command(),
         Outcome::Failed(error) => crate::println!("md: the new array does not assemble: {error:?}"),
@@ -741,7 +763,18 @@ pub fn flush() -> Result<(), block::Error> {
 
 /// Closes the array clean (shutdown, reboot, `md stop`). Does not wait for a lock that someone holds across a hang.
 pub fn stop_all() {
-    let Some(mut state) = STATE.try_lock() else { return };
+    // The job thread holds the lock for one step (a few ms); wait out that much, but never hang a restart on it.
+    let mut tries = 0;
+    let mut state = loop {
+        match STATE.try_lock() {
+            Some(state) => break state,
+            None if tries < 500 => {
+                tries += 1;
+                crate::time::busy_wait_ms(1);
+            }
+            None => return crate::println!("md: the array is busy; restarting without closing it."),
+        }
+    };
     let state = &mut *state;
     if let Some(array) = state.array.as_mut() {
         if array.is_writing() {
@@ -751,6 +784,11 @@ pub fn stop_all() {
 }
 
 pub fn command(mut words: core::str::SplitWhitespace) {
+    let sub = words.clone().next();
+    if sub == Some("assemble") {
+        // asked for by hand: `md auto` may assemble again after a later disk change too
+        HELD.store(false, Ordering::Release);
+    }
     match words.next() {
         None => {
             let state = STATE.lock();
@@ -799,12 +837,19 @@ pub fn command(mut words: core::str::SplitWhitespace) {
                     }
                     let dirty = array.dirty();
                     state.array = None;
-                    state.status.set(format_args!("stopped"));
-                    if dirty {
-                        println!("md: stopped; the members are NOT in step (its {} did not finish).", if running.is_some_and(|(job, _)| job == Job::Rebuild) { "rebuild" } else { "resync" });
-                        println!("    `md assemble` brings it back; `md resync` starts over.");
-                    } else {
-                        println!("md: stopped; members are clean. `md assemble` brings it back.");
+                    HELD.store(true, Ordering::Release);
+                    state.status.set(format_args!("stopped (`md assemble` brings it back)"));
+                    match running {
+                        Some((job, _)) if dirty => {
+                            let name = if job == Job::Rebuild { "rebuild" } else { "resync" };
+                            println!("md: stopped; the members are NOT in step (its {name} did not finish).");
+                            println!("    `md assemble` brings it back; {}.", if job == Job::Rebuild { "`md resume` goes on" } else { "`md resync` starts over" });
+                        }
+                        _ if dirty => {
+                            println!("md: stopped; the members are still marked not clean, as when assembled.");
+                            println!("    `md assemble` brings it back; `md resync` there makes it clean.");
+                        }
+                        _ => println!("md: stopped; members are clean. `md assemble` brings it back."),
                     }
                 }
             }

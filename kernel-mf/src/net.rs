@@ -1133,6 +1133,7 @@ pub fn housekeeping() {
     unsafe {
         if RESET_AT != 0 && time::ticks() >= RESET_AT {
             RESET_AT = 0;
+            crate::mdvol::stop_all();
             slots::mark_clean_stop();
             power::reset();
         }

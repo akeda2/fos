@@ -1,8 +1,9 @@
 //! A minimal AHCI (SATA) host bus adapter driver: find SATA disks, read their identity
 //! and move sectors with DMA. Polling only, one command at a time per drive (commands on
 //! different drives may overlap: `start_read`, `wait`, `copy_out`; `stage`, `start_staged_write`,
-//! `wait`),
-//! 512-byte sectors.
+//! `wait`; `start_direct`), 512-byte sectors. Data goes through a per-drive bounce buffer,
+//! or with `start_direct` straight to and from the caller's memory, described by physical
+//! segments (the server kernel looks them up in its page tables).
 //!
 //! AHCI in one paragraph. The HBA exposes up to 32 *ports*, each with a register block;
 //! a SATA drive on a port is talked to through structures in RAM the port is pointed at:
@@ -25,8 +26,19 @@ pub const MAX_DRIVES: usize = 8;
 /// Sectors per command: 128 KiB. Each command costs a fixed latency (about 0.7 ms measured on a SATA SSD with polling), so 8 KiB
 /// commands capped a read at ~11 MB/s; 28-bit READ DMA takes at most 256 (count 0 means 256).
 pub const MAX_SECTORS: usize = 256;
+/// Most sectors one `start_direct` command moves on an LBA48 drive (4 MiB; the 16-bit count allows 32 MiB, but a bigger
+/// command only lengthens the wait before a failure is seen). A drive without LBA48 takes `MAX_SECTORS`.
+pub const MAX_DIRECT_SECTORS: usize = 8192;
+/// Most physical segments one `start_direct` command takes: the PRDT entries that fit after the command FIS in the
+/// command table's half of the structures frame.
+pub const MAX_SEGMENTS: usize = (0x1000 - OFFSET_COMMAND_TABLE - 0x80) / 16;
+/// The largest byte count of one PRDT entry (its 22-bit DBC field is the count minus one).
+const PRD_MAX: u64 = 4 << 20;
 const TIMEOUT_TICKS: u64 = 500;
 
+const HBA_CAP: usize = 0x00;
+/// CAP.S64A: the HBA takes 64-bit addresses in PRDT entries and command headers.
+const CAP_S64A: u32 = 1 << 31;
 const HBA_GHC: usize = 0x04;
 const HBA_IS: usize = 0x08;
 const HBA_PI: usize = 0x0c;
@@ -74,6 +86,14 @@ const OFFSET_COMMAND_TABLE: usize = 0x800; // 128-byte aligned: CFIS, then the P
 const OFFSET_BOUNCE: usize = 0x1000; // MAX_SECTORS * 512 = 128 KiB
 const FRAMES: usize = 1 + MAX_SECTORS * 512 / 4096;
 
+/// A physically contiguous piece of the caller's memory for `start_direct`: an even address and an even byte count (AHCI
+/// 1.3.1, 4.2.3.3: DBA bit 0 is reserved, DBC must say an even count).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Segment {
+    pub physical: u64,
+    pub bytes: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Timeout,
@@ -109,6 +129,8 @@ pub struct Drive {
     frame: usize,
     pub sectors: u64,
     lba48: bool,
+    /// CAP.S64A of its HBA: PRDT entries may point above 4 GiB.
+    dma64: bool,
     /// IDENTIFY word 169 bit 0: DATA SET MANAGEMENT with the TRIM feature.
     can_trim: bool,
     pub model: [u8; 40],
@@ -122,18 +144,24 @@ impl Drive {
 
     /// `command` with a feature byte (DATA SET MANAGEMENT's TRIM is feature 1).
     fn command_with(&self, command: u8, feature: u8, lba: u64, count: u32, write: bool, bytes: u32) -> Result<(), Error> {
-        self.issue(command, feature, lba, count, write, bytes)?;
+        self.issue_bounce(command, feature, lba, count, write, bytes)?;
         self.complete()
+    }
+
+    /// `issue` with the bounce buffer as the one data segment (none when `bytes` is 0).
+    fn issue_bounce(&self, command: u8, feature: u8, lba: u64, count: u32, write: bool, bytes: u32) -> Result<(), Error> {
+        let bounce = [Segment { physical: (self.frame + OFFSET_BOUNCE) as u64, bytes: u64::from(bytes) }];
+        self.issue(command, feature, lba, count, write, if bytes == 0 { &[] } else { &bounce })
     }
 
     /// Fills slot 0's header and table and sets its bit in `CI`: the HBA runs the command from here on, and `complete`
     /// waits for it. Every port has its own command list, table and bounce buffer, so commands on different drives may be
     /// in flight at once (`start_read`); one drive takes one command at a time.
-    fn issue(&self, command: u8, feature: u8, lba: u64, count: u32, write: bool, bytes: u32) -> Result<(), Error> {
+    fn issue(&self, command: u8, feature: u8, lba: u64, count: u32, write: bool, segments: &[Segment]) -> Result<(), Error> {
         let list = self.frame + OFFSET_COMMAND_LIST;
         let table = self.frame + OFFSET_COMMAND_TABLE;
         unsafe {
-            core::ptr::write_bytes(memory::phys_to_virt(table as u64) as *mut u8, 0, 0x90);
+            core::ptr::write_bytes(memory::phys_to_virt(table as u64) as *mut u8, 0, 0x80 + 16 * segments.len());
             // 28-bit commands carry LBA bits 27:24 in the device register; 48-bit ones
             // carry bits 47:24 in the second LBA byte group.
             let ext = matches!(command, ATA_READ_DMA_EXT | ATA_WRITE_DMA_EXT | ATA_FLUSH_CACHE_EXT | ATA_DATA_SET_MANAGEMENT);
@@ -154,16 +182,16 @@ impl Drive {
                 (count >> 8) as u8,
             ];
             core::ptr::copy_nonoverlapping(fis.as_ptr(), memory::phys_to_virt(table as u64) as *mut u8, fis.len());
-            if bytes != 0 {
-                // One PRDT entry: the bounce buffer; DBC is the byte count minus one.
-                let entry = memory::phys_to_virt((table + 0x80) as u64) as *mut u32;
-                entry.write_volatile((self.frame + OFFSET_BOUNCE) as u32);
-                entry.add(1).write_volatile(0);
+            // One PRDT entry per segment: base address (low, high), reserved, DBC = byte count minus one.
+            for (index, segment) in segments.iter().enumerate() {
+                let entry = memory::phys_to_virt((table + 0x80 + 16 * index) as u64) as *mut u32;
+                entry.write_volatile(segment.physical as u32);
+                entry.add(1).write_volatile((segment.physical >> 32) as u32);
                 entry.add(2).write_volatile(0);
-                entry.add(3).write_volatile(bytes - 1);
+                entry.add(3).write_volatile(segment.bytes as u32 - 1);
             }
             let header = memory::phys_to_virt(list as u64) as *mut u32;
-            header.write_volatile(5 | (u32::from(write) << 6) | (u32::from(bytes != 0) << 16)); // 5 FIS dwords, direction, PRDT length
+            header.write_volatile(5 | (u32::from(write) << 6) | ((segments.len() as u32) << 16)); // 5 FIS dwords, direction, PRDT length
             header.add(1).write_volatile(0);
             header.add(2).write_volatile(table as u32);
             header.add(3).write_volatile(0);
@@ -172,6 +200,9 @@ impl Drive {
             return self.recover(Error::Timeout);
         }
         write32(self.registers + P_IS, 0xffff_ffff);
+        // The data a write sends (bounce buffer or the caller's memory) is written with ordinary stores: they must all be
+        // done before the doorbell, and the compiler may not move them past it.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         write32(self.registers + P_CI, 1);
         Ok(())
     }
@@ -196,6 +227,8 @@ impl Drive {
         if failed || task_file & TFD_ERROR != 0 {
             return self.recover(Error::Device { status: task_file as u8, error: (task_file >> 8) as u8 });
         }
+        // What the device wrote by DMA is read with ordinary loads after this: none may be done before the command was.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -236,10 +269,46 @@ impl Drive {
     /// bounce buffer are busy). The steps are separate calls so the caller can time each (`md`'s job report).
     pub fn start_read(&self, lba: u64, bytes: usize) -> Result<(), Error> {
         let sectors = self.check(lba, bytes)?;
-        self.issue(if self.lba48 { ATA_READ_DMA_EXT } else { ATA_READ_DMA }, 0, lba, sectors, false, bytes as u32)
+        self.issue_bounce(if self.lba48 { ATA_READ_DMA_EXT } else { ATA_READ_DMA }, 0, lba, sectors, false, bytes as u32)
     }
 
-    /// Waits for the command `start_read` or `start_staged_write` began.
+    /// Starts a read (`write` false) or write of the sectors at `lba` straight from or into the memory `segments` describe,
+    /// in order, without the bounce buffer; `wait` finishes it. Their bytes add up to whole sectors, at most
+    /// `max_direct_sectors`, in at most `MAX_SEGMENTS` pieces of up to 4 MiB each, every address and count even, all
+    /// below 4 GiB unless the HBA takes 64-bit addresses. Anything else is `Unsupported` and nothing is started: the caller
+    /// goes through the bounce buffer instead. The memory must stay put until `wait` returns.
+    pub fn start_direct(&self, lba: u64, segments: &[Segment], write: bool) -> Result<(), Error> {
+        let bytes: u64 = segments.iter().map(|segment| segment.bytes).sum();
+        let fits = |segment: &Segment| {
+            segment.bytes != 0
+                && segment.bytes <= PRD_MAX
+                && segment.physical % 2 == 0
+                && segment.bytes % 2 == 0
+                && (self.dma64 || segment.physical + segment.bytes <= 1 << 32)
+        };
+        if segments.is_empty() || segments.len() > MAX_SEGMENTS || !segments.iter().all(fits) || bytes % 512 != 0 {
+            return Err(Error::Unsupported);
+        }
+        let sectors = bytes / 512;
+        if sectors > self.max_direct_sectors() as u64 || lba + sectors > self.sectors || (!self.lba48 && lba + sectors > 1 << 28) {
+            return Err(Error::Unsupported);
+        }
+        let command = match (write, self.lba48) {
+            (false, true) => ATA_READ_DMA_EXT,
+            (false, false) => ATA_READ_DMA,
+            (true, true) => ATA_WRITE_DMA_EXT,
+            (true, false) => ATA_WRITE_DMA,
+        };
+        // A count of 0 in the FIS means 256 sectors (28-bit) or 65536 (48-bit); `max_direct_sectors` stays below both.
+        self.issue(command, 0, lba, sectors as u32, write, segments)
+    }
+
+    /// Most sectors `start_direct` takes in one command.
+    pub fn max_direct_sectors(&self) -> usize {
+        if self.lba48 { MAX_DIRECT_SECTORS } else { MAX_SECTORS }
+    }
+
+    /// Waits for the command `start_read`, `start_staged_write` or `start_direct` began.
     pub fn wait(&self) -> Result<(), Error> {
         self.complete()
     }
@@ -264,7 +333,7 @@ impl Drive {
     /// Starts writing the `bytes` that `stage` put in the bounce buffer to `lba`.
     pub fn start_staged_write(&self, lba: u64, bytes: usize) -> Result<(), Error> {
         let sectors = self.check(lba, bytes)?;
-        self.issue(if self.lba48 { ATA_WRITE_DMA_EXT } else { ATA_WRITE_DMA }, 0, lba, sectors, true, bytes as u32)
+        self.issue_bounce(if self.lba48 { ATA_WRITE_DMA_EXT } else { ATA_WRITE_DMA }, 0, lba, sectors, true, bytes as u32)
     }
 
     /// Whether `other` is this same drive (port): two commands on one port cannot overlap.
@@ -379,7 +448,7 @@ fn init_controller(device: &pci::Device, controller: usize, found: &mut impl FnM
         if status & 0xf != 3 || (status >> 8) & 0xf != 1 || read32(registers + P_SIG) != SIGNATURE_ATA {
             continue;
         }
-        if let Some(drive) = init_port(registers) {
+        if let Some(drive) = init_port(registers, read32(abar + HBA_CAP) & CAP_S64A != 0) {
             found(drive, controller, port);
             count += 1;
         }
@@ -389,7 +458,7 @@ fn init_controller(device: &pci::Device, controller: usize, found: &mut impl FnM
 
 /// Stops a port's engines, points it at fresh structures, restarts it, identifies the
 /// drive. `None` if anything fails (the port is just skipped).
-fn init_port(registers: usize) -> Option<Drive> {
+fn init_port(registers: usize, dma64: bool) -> Option<Drive> {
     // Both engines (ST, FRE) must be off before their base addresses may change.
     write32(registers + P_CMD, read32(registers + P_CMD) & !(CMD_START | CMD_FIS_RECEIVE));
     if !wait_until(100, || read32(registers + P_CMD) & (CMD_LIST_RUNNING | CMD_FIS_RUNNING) == 0) {
@@ -409,7 +478,7 @@ fn init_port(registers: usize) -> Option<Drive> {
     }
     write32(registers + P_CMD, read32(registers + P_CMD) | CMD_START);
 
-    let mut drive = Drive { registers, frame, sectors: 0, lba48: false, can_trim: false, model: [b' '; 40] };
+    let mut drive = Drive { registers, frame, sectors: 0, lba48: false, dma64, can_trim: false, model: [b' '; 40] };
     drive.command(ATA_IDENTIFY, 0, 0, false, 512).ok()?;
     // IDENTIFY DEVICE data: 256 little-endian words in the bounce buffer.
     let words = memory::phys_to_virt((frame + OFFSET_BOUNCE) as u64) as *const u16;

@@ -91,8 +91,11 @@ through the `Members` trait. Stages:
    disks or GPT "Linux RAID" partitions. `md auto` in `settings` starts the `md-assemble` thread at boot; boot never waits
    for it. It waits up to `md wait N` seconds (default 10) for every member, then assembles with what it has (degraded:
    loud warning), retrying with a 1, 2, 4 ... 30 s pause (and at once when a disk appears) until it succeeds. The array is
-   opened for writing on the first write and closed clean after 3 idle seconds, on `md stop`, `shutdown` and `reboot`;
-   only a crash during a write leaves it dirty. A dirty array is read-only until `md force-rw`. A failing member costs a
+   opened for writing on the first write and closed clean after 3 idle seconds, on `md stop`, `shutdown`, `reboot` and the
+   restart after a kernel update (KUP); only a crash during a write leaves it dirty. The idle close runs in the same
+   thread, which also starts when an array comes up by `md create` or `md assemble` without `md auto` (it then only
+   closes, never assembles). `md stop` holds `md auto` back until `md assemble` or `md create`, so a stopped array stays
+   stopped (to make a new one over it, say). A dirty array is read-only until `md force-rw`. A failing member costs a
    failed transfer, never a stall (reads fall back, writes drop the member). Commands: `md`, `md assemble`, `md stop`,
    `md force-rw`, `md resume` (goes on with a rebuild an earlier stop or crash interrupted; `md assemble` says when one waits), `md resync` (opens a dirty array and resyncs it in the background thread `md-job`; progress in `md`, which
    also reports a rebuild) and `md add diskN` then `md add diskN confirm` (erases that whole disk and rebuilds onto it; refuses
@@ -121,11 +124,14 @@ through the `Members` trait. Stages:
    each assembly. A disk that carries an md superblock (a member) is never exported on its own, and `md stop` is refused
    while the array is exported. Each write is a read-modify-write of data and parity under the one array lock, so writes
    are slower than one disk's.
-9. **Using the members at once** (2026-11-25): a resync or rebuild piece is 256 KiB (`JOB_PIECE`) of every member, read
+9. **Using the members at once** (2026-11-25): a resync or rebuild piece is 512 KiB (`JOB_PIECE`, a whole default chunk) of every member, read
    with one `Members::read_many` into a heap buffer (`Array::work`); a RAID 5 or RAID 0/10 read takes every chunk straight
    from its member with one `read_many` into the caller's buffer; RAID 1/10 resync and RAID 6 rows do the same. The
-   kernel's `block::read_many` overlaps SATA drives: each round starts one 128 KiB command on every AHCI port involved
-   (`ahci::Drive::start_read`), then collects them, so a row costs its slowest member, not the sum. Other disks (NVMe,
+   kernel's `block::read_many` overlaps SATA drives: each round starts one command on every AHCI port involved, then
+   collects them, so a row costs its slowest member, not the sum. A command moves the caller's memory itself, up to 4 MiB
+   (`ahci::Drive::start_direct`, a PRDT built from the kernel's page tables by `block::segments`; a heap buffer is one
+   physical piece), or 128 KiB through the port's bounce buffer when the memory is not the kernel's (a tape's) or needs
+   too many pieces; every SATA `read` and `write` takes the same path. Other disks (NVMe,
    USB, AoE) are read one after another. Any failure falls back to the old piece-by-piece path, which finds the member
    that failed. The `md-job` thread yields between steps instead of sleeping 10 ms and steps aside for a tick only while
    block-layer I/O waits for the array lock (`IO_WAITING`). Before this, a 3-SSD RAID 5 on rack resynced at 14 MiB/s per
@@ -138,6 +144,11 @@ through the `Members` trait. Stages:
    overlapping data and parity does not open a new window. A failed batch is redone one write at a time to find the member.
    Still one at a time: RAID 6 and RAID 0/10 writes. `make test-mf-md test-mf-md-aoe` (AHCI under QEMU q35); host tests
    count the batches and check that whole rows read nothing.
+   `md` shows where a running or finished job's time went (the overlapped commands' waiting, copying and starting, other
+   member I/O, md's own work, the time between steps; the commands, how many went direct, their size). On rack, a RAID 5
+   resync of three SATA SSDs with 128 KiB bounce commands: 460 MiB/s of the array, 86% of the time waiting for the drives,
+   4% copying, 7% md's own work; so overlapping md's work with the next piece (pipelining) could win at most about a
+   tenth, while bigger commands and a queue per drive (NCQ) go after the waiting.
 
 `tools/check_md_mdadm.sh` (run as root, loop devices only) is the cross-check against the real driver: mdadm creates RAID 1, 0, 10, 5 and
 6 (every layout), `probe` dumps, writes and rebuilds them, and mdadm must assemble, `check` (0 mismatches) and fsck the results.

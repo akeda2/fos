@@ -735,6 +735,14 @@ Tapes see just another NIC, so `tape-ip`, DHCP, `smbd`, `httpd` and `router` nee
 - **Writes not yet overlapped**: RAID 6 (`write_raid6`, 4 KiB pieces, members in turn) and RAID 0/10 (`write_striped`).
   RAID 5 and RAID 1 use `write_many` since 2026-11-25 (`docs/md.md` item 9). Only SATA members overlap; NVMe would need
   the same split of `nvme::Drive` into submit and complete, USB and AoE members stay one at a time.
+- **NCQ and pipelining** (next, 2026-11-25): one command per SATA drive at a time, and each resync round waits for its
+  slowest member before the next starts. READ/WRITE FPDMA QUEUED (IDENTIFY word 76 bit 8, depth word 75; HBA CAP.SNCQ,
+  CAP.NCS) would let a drive hold the next piece while the current one runs: a command table per tag, `PxSACT` set
+  before `PxCI`, completion when the tag's `PxSACT` bit clears; on an error every queued command fails, and the drive
+  stays in error until READ LOG EXT page 10h is read. For a resync this only pays together with pipelining (md
+  starting piece N+1 before it is done with piece N, `Members` split into start and finish), which also hides md's own
+  work (7% on rack). Measure with `md`'s job report first: the direct 512 KiB commands may already move the drives
+  close to their sequential speed.
 
 ## USB hotplug from port-change events (planned 2026-11-17)
 

@@ -133,11 +133,8 @@ fn with_direct_write<T>(buffer: &[u8], transfer: impl FnOnce(&[u8]) -> T) -> T {
 /// Reads whole sectors (`buffer.len()` a multiple of 512) from `lba`.
 pub fn read(disk: usize, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
     match checked(disk, lba, buffer.len())?.backend {
-        Backend::Ahci(drive) => {
-            for (index, chunk) in buffer.chunks_mut(ahci::MAX_SECTORS * 512).enumerate() {
-                drive.read(lba + (index * ahci::MAX_SECTORS) as u64, chunk).map_err(|_| Error::Device)?;
-            }
-        }
+        // the same commands `read_many` gives a range: straight into `buffer` where its pages allow it
+        Backend::Ahci(_) => return read_group(&mut [Read { disk, lba, buffer }]).map_err(|(_, error)| error),
         Backend::Nvme(drive) => {
             for (index, chunk) in buffer.chunks_mut(nvme::MAX_SECTORS * 512).enumerate() {
                 drive.read(lba + (index * nvme::MAX_SECTORS) as u64, chunk).map_err(|_| Error::Device)?;
@@ -164,9 +161,10 @@ pub struct Read<'a> {
 /// Most ranges `read_many` overlaps at once; a longer list goes in groups of this many.
 const MANY: usize = 16;
 
-/// Reads several ranges, overlapping those on different SATA drives (`overlap`): each round starts one command of up to
-/// `ahci::MAX_SECTORS` on every AHCI drive that still has sectors to read, then collects them all. A drive is a port with
-/// one command slot here, so two ranges on one drive take turns. Other disks are read one after another, as `read` does.
+/// Reads several ranges, overlapping those on different SATA drives (`overlap`): each round starts one command on every
+/// AHCI drive that still has sectors to read, then collects them all. A command reads straight into the range's buffer
+/// (up to 4 MiB) when its pages allow it (`segments`), else 128 KiB through the drive's bounce buffer. A drive is a port
+/// with one command slot here, so two ranges on one drive take turns. Other disks are read one after another, as `read` does.
 /// An md array's members read this way move at the speed of the slowest drive, not the sum of them all (`mdvol`).
 /// On failure: the index of a range that failed. Every command started is collected first, so no drive is left busy.
 pub fn read_many(reads: &mut [Read<'_>]) -> Result<(), (usize, Error)> {
@@ -188,17 +186,94 @@ fn read_group(reads: &mut [Read<'_>]) -> Result<(), (usize, Error)> {
         }
         (lbas[index], lengths[index]) = (request.lba, request.buffer.len());
     }
+    // The buffers' addresses, taken once: `finish` borrows the buffers mutably to copy out of the bounce buffer.
+    let mut addresses = [0u64; MANY];
+    for (index, request) in reads.iter().enumerate() {
+        addresses[index] = request.buffer.as_ptr() as u64;
+    }
     overlap(
         &drives[..reads.len()],
         &lengths,
-        |index, drive, done, bytes| timed(&MANY_START, || drive.start_read(lbas[index] + (done / 512) as u64, bytes)),
-        |index, drive, done, bytes| {
+        |index, drive, done, left| {
+            let at = lbas[index] + (done / 512) as u64;
+            timed(&MANY_START, || start_command(drive, at, addresses[index] + done as u64, left, false))
+        },
+        |index, drive, done, command| {
             timed(&MANY_WAIT, || drive.wait())?;
-            timed(&MANY_COPY, || drive.copy_out(&mut reads[index].buffer[done..done + bytes]));
-            counted(bytes);
+            if !command.direct {
+                timed(&MANY_COPY, || drive.copy_out(&mut reads[index].buffer[done..done + command.bytes]));
+            }
+            counted(command);
             Ok(())
         },
     )
+}
+
+/// One command `overlap` started: its byte count, and whether it moves the caller's memory itself (no bounce copy).
+#[derive(Clone, Copy)]
+struct Command {
+    bytes: usize,
+    direct: bool,
+}
+
+/// Starts the next command of a range: straight from or into the memory at `address` (up to the drive's direct limit) when
+/// `segments` can describe it, else through the bounce buffer (a write is staged there first). `left` bytes remain.
+fn start_command(drive: ahci::Drive, lba: u64, address: u64, left: usize, write: bool) -> Result<Command, ahci::Error> {
+    let bytes = left.min(drive.max_direct_sectors() * 512);
+    let mut list = [ahci::Segment { physical: 0, bytes: 0 }; ahci::MAX_SEGMENTS];
+    if let Some(count) = segments(address, bytes, !write, &mut list) {
+        match drive.start_direct(lba, &list[..count], write) {
+            Ok(()) => return Ok(Command { bytes, direct: true }),
+            Err(ahci::Error::Unsupported) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let bytes = left.min(ahci::MAX_SECTORS * 512);
+    if write {
+        let data = unsafe { core::slice::from_raw_parts(address as *const u8, bytes) };
+        timed(&MANY_COPY, || drive.stage(data))?;
+        drive.start_staged_write(lba, bytes)?;
+    } else {
+        drive.start_read(lba, bytes)?;
+    }
+    Ok(Command { bytes, direct: false })
+}
+
+/// The physical pieces of the `bytes` at kernel address `address`, found page by page in the kernel's own tables and
+/// merged where they run on (a heap or `allocate_contiguous` buffer is one piece). None when a page is not mapped there
+/// (a tape's memory: it is only in the tape's own tables), not writable for a read into it (`writable`), the address is
+/// odd, or it takes more than `ahci::MAX_SEGMENTS` pieces: the caller then goes through the bounce buffer.
+#[cfg(target_arch = "x86_64")]
+fn segments(address: u64, bytes: usize, writable: bool, list: &mut [ahci::Segment; ahci::MAX_SEGMENTS]) -> Option<usize> {
+    const PAGE: u64 = 4096;
+    const MAX_PIECE: u64 = 4 << 20;
+    if address % 2 != 0 || bytes == 0 {
+        return None;
+    }
+    let (mut at, end, mut count) = (address, address.checked_add(bytes as u64)?, 0usize);
+    while at < end {
+        let take = ((at / PAGE + 1) * PAGE).min(end) - at;
+        let mapping = crate::arch::mmu::translate(at)?;
+        if writable && !mapping.writable {
+            return None;
+        }
+        match count.checked_sub(1).map(|last| &mut list[last]) {
+            Some(last) if last.physical + last.bytes == mapping.physical && last.bytes + take <= MAX_PIECE => last.bytes += take,
+            _ if count == ahci::MAX_SEGMENTS => return None,
+            _ => {
+                list[count] = ahci::Segment { physical: mapping.physical, bytes: take };
+                count += 1;
+            }
+        }
+        at += take;
+    }
+    Some(count)
+}
+
+/// Only the x86 server kernel has SATA (and the page walk); elsewhere everything goes through the bounce buffer.
+#[cfg(not(target_arch = "x86_64"))]
+fn segments(_: u64, _: usize, _: bool, _: &mut [ahci::Segment; ahci::MAX_SEGMENTS]) -> Option<usize> {
+    None
 }
 
 /// One range for `write_many`.
@@ -214,17 +289,20 @@ pub struct Write<'a> {
 pub fn write_many(writes: &[Write<'_>]) -> Result<(), (usize, Error)> {
     let mut first = 0;
     for group in writes.chunks(MANY) {
-        write_group(group).map_err(|(index, error)| (first + index, error))?;
+        write_group(group, true).map_err(|(index, error)| (first + index, error))?;
         first += MANY;
     }
     Ok(())
 }
 
-fn write_group(writes: &[Write<'_>]) -> Result<(), (usize, Error)> {
+/// `guard`: refuse sectors an AoE export of a file owns (false only for `write_with`, whose callers checked or are the export).
+fn write_group(writes: &[Write<'_>], guard: bool) -> Result<(), (usize, Error)> {
     let mut drives: [Option<ahci::Drive>; MANY] = [None; MANY];
     let mut lengths = [0usize; MANY];
     for (index, request) in writes.iter().enumerate() {
-        unguarded(request.disk, request.lba, request.buffer).map_err(|error| (index, error))?;
+        if guard {
+            unguarded(request.disk, request.lba, request.buffer).map_err(|error| (index, error))?;
+        }
         match checked(request.disk, request.lba, request.buffer.len()).map_err(|error| (index, error))?.backend {
             Backend::Ahci(drive) => drives[index] = Some(drive),
             _ => write_with(request.disk, request.lba, request.buffer, false).map_err(|error| (index, error))?,
@@ -234,13 +312,19 @@ fn write_group(writes: &[Write<'_>]) -> Result<(), (usize, Error)> {
     overlap(
         &drives[..writes.len()],
         &lengths,
-        |index, drive, done, bytes| {
-            timed(&MANY_COPY, || drive.stage(&writes[index].buffer[done..done + bytes]))?;
-            timed(&MANY_START, || drive.start_staged_write(writes[index].lba + (done / 512) as u64, bytes))
+        |index, drive, done, left| {
+            let (at, address) = (writes[index].lba + (done / 512) as u64, writes[index].buffer.as_ptr() as u64 + done as u64);
+            // `start_command` times a bounce copy as copying itself; the rest is starting
+            let begin = crate::arch::micros();
+            let copied = MANY_COPY.load(Ordering::Relaxed);
+            let command = start_command(drive, at, address, left, true);
+            let spent = crate::arch::micros().saturating_sub(begin);
+            MANY_START.fetch_add(spent.saturating_sub(MANY_COPY.load(Ordering::Relaxed) - copied), Ordering::Relaxed);
+            command
         },
-        |_, drive, _, bytes| {
+        |_, drive, _, command| {
             timed(&MANY_WAIT, || drive.wait())?;
-            counted(bytes);
+            counted(command);
             Ok(())
         },
     )
@@ -256,6 +340,8 @@ pub struct ManyTimes {
     pub wait_us: u64,
     pub copy_us: u64,
     pub commands: u64,
+    /// Of those, the ones that moved the caller's memory itself (no bounce copy).
+    pub direct: u64,
     pub bytes: u64,
 }
 
@@ -267,6 +353,7 @@ impl ManyTimes {
             wait_us: self.wait_us - earlier.wait_us,
             copy_us: self.copy_us - earlier.copy_us,
             commands: self.commands - earlier.commands,
+            direct: self.direct - earlier.direct,
             bytes: self.bytes - earlier.bytes,
         }
     }
@@ -276,6 +363,7 @@ static MANY_START: AtomicU64 = AtomicU64::new(0);
 static MANY_WAIT: AtomicU64 = AtomicU64::new(0);
 static MANY_COPY: AtomicU64 = AtomicU64::new(0);
 static MANY_COMMANDS: AtomicU64 = AtomicU64::new(0);
+static MANY_DIRECT: AtomicU64 = AtomicU64::new(0);
 static MANY_BYTES: AtomicU64 = AtomicU64::new(0);
 
 pub fn many_times() -> ManyTimes {
@@ -284,6 +372,7 @@ pub fn many_times() -> ManyTimes {
         wait_us: MANY_WAIT.load(Ordering::Relaxed),
         copy_us: MANY_COPY.load(Ordering::Relaxed),
         commands: MANY_COMMANDS.load(Ordering::Relaxed),
+        direct: MANY_DIRECT.load(Ordering::Relaxed),
         bytes: MANY_BYTES.load(Ordering::Relaxed),
     }
 }
@@ -296,48 +385,49 @@ fn timed<R>(counter: &AtomicU64, work: impl FnOnce() -> R) -> R {
     result
 }
 
-fn counted(bytes: usize) {
+fn counted(command: Command) {
     MANY_COMMANDS.fetch_add(1, Ordering::Relaxed);
-    MANY_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    MANY_DIRECT.fetch_add(u64::from(command.direct), Ordering::Relaxed);
+    MANY_BYTES.fetch_add(command.bytes as u64, Ordering::Relaxed);
 }
 
-/// The rounds `read_many` and `write_many` share. Each round starts one command of up to `ahci::MAX_SECTORS` on every
-/// AHCI drive (`drives[i]`, None for a range already done another way) that still has bytes of its `lengths[i]` to move,
-/// skipping a drive that already has one this round, then finishes them all in order. `start(i, drive, done, bytes)`
-/// issues bytes `done..done + bytes` of range `i`, `finish` with the same arguments waits for it. Every started command
-/// is finished before an error is returned, so no drive is left busy.
+/// The rounds `read_many` and `write_many` share. Each round starts one command on every AHCI drive (`drives[i]`, None
+/// for a range already done another way) that still has bytes of its `lengths[i]` to move, skipping a drive that already
+/// has one this round, then finishes them all in order. `start(i, drive, done, left)` issues the next command of range
+/// `i` (from byte `done`, `left` bytes to go) and says how much it covers; `finish(i, drive, done, command)` waits for it.
+/// Every started command is finished before an error is returned, so no drive is left busy.
 fn overlap(
     drives: &[Option<ahci::Drive>],
     lengths: &[usize],
-    mut start: impl FnMut(usize, ahci::Drive, usize, usize) -> Result<(), ahci::Error>,
-    mut finish: impl FnMut(usize, ahci::Drive, usize, usize) -> Result<(), ahci::Error>,
+    mut start: impl FnMut(usize, ahci::Drive, usize, usize) -> Result<Command, ahci::Error>,
+    mut finish: impl FnMut(usize, ahci::Drive, usize, Command) -> Result<(), ahci::Error>,
 ) -> Result<(), (usize, Error)> {
     let mut done = [0usize; MANY];
     loop {
-        let mut started = [false; MANY];
+        let mut started: [Option<Command>; MANY] = [None; MANY];
         let mut failed = None;
         for (index, drive) in drives.iter().enumerate() {
             let Some(drive) = *drive else { continue };
             let left = lengths[index] - done[index];
-            let busy = (0..index).any(|other| started[other] && drives[other].is_some_and(|d| d.same_port(&drive)));
+            let busy = (0..index).any(|other| started[other].is_some() && drives[other].is_some_and(|d| d.same_port(&drive)));
             if left == 0 || busy {
                 continue;
             }
-            match start(index, drive, done[index], left.min(ahci::MAX_SECTORS * 512)) {
-                Ok(()) => started[index] = true,
+            match start(index, drive, done[index], left) {
+                Ok(command) => started[index] = Some(command),
                 Err(_) => {
                     failed = Some(index);
                     break;
                 }
             }
         }
-        if !started.contains(&true) {
+        if started.iter().all(Option::is_none) {
             return failed.map_or(Ok(()), |index| Err((index, Error::Device)));
         }
-        for index in (0..drives.len()).filter(|&index| started[index]) {
-            let bytes = (lengths[index] - done[index]).min(ahci::MAX_SECTORS * 512);
-            match finish(index, drives[index].unwrap(), done[index], bytes) {
-                Ok(()) => done[index] += bytes,
+        for index in 0..drives.len() {
+            let Some(command) = started[index] else { continue };
+            match finish(index, drives[index].unwrap(), done[index], command) {
+                Ok(()) => done[index] += command.bytes,
                 Err(_) => failed = failed.or(Some(index)),
             }
         }
@@ -381,10 +471,11 @@ pub fn flush(disk: usize) -> Result<(), Error> {
 
 fn write_with(disk: usize, lba: u64, buffer: &[u8], flush: bool) -> Result<(), Error> {
     match checked(disk, lba, buffer.len())?.backend {
+        // the same commands `write_many` gives a range (straight from `buffer` where its pages allow it), then the flush
         Backend::Ahci(drive) => {
-            for (index, chunk) in buffer.chunks(ahci::MAX_SECTORS * 512).enumerate() {
-                let at = lba + (index * ahci::MAX_SECTORS) as u64;
-                if flush { drive.write(at, chunk) } else { drive.write_deferred(at, chunk) }.map_err(|_| Error::Device)?;
+            write_group(&[Write { disk, lba, buffer }], false).map_err(|(_, error)| error)?;
+            if flush {
+                drive.flush().map_err(|_| Error::Device)?;
             }
         }
         Backend::Nvme(drive) => {

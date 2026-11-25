@@ -219,7 +219,7 @@ fn boot_services(info: &BootInfo, century: u8) -> ! {
     // After the self-test: that is where the scheduler starts, and private drivers may start threads.
     private::init();
     if config::md_auto() {
-        sched::spawn("md-assemble", mdvol::assemble_thread, 0);
+        mdvol::start_keeper();
     }
     aoetarget::init();
     // Drains the NICs on their interrupts, so a long shell command on the service thread does not stop the network.

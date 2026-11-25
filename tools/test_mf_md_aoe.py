@@ -20,6 +20,7 @@ import re
 import struct
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -116,9 +117,11 @@ def main():
             check(t.wait_for("md: resync finished.", 180), "the resync finishes", t.log[-800:].decode("utf8", "replace"))
             ok, text = t.command("md", "md:", 10)
             check("fos:tank" in text and "3 of 3" in text and "dirty" not in text, "`md` shows it clean, 3 of 3", text[-500:])
-            check("resync in all:" in text and "disk commands" in text and "md's own work" in text
-                  and re.search(r"\n\s+[1-9]\d* commands of \d+ KiB on average", text) is not None,
-                  "`md` says where the resync's time went, overlapped SATA commands counted", text[-700:])
+            counts = re.search(r"\n\s+([1-9]\d*) commands, (\d+) direct, (\d+) KiB each on average", text)
+            check("resync in all:" in text and "disk commands" in text and "md's own work" in text and counts is not None
+                  and counts.group(1) == counts.group(2) and int(counts.group(3)) >= 256,
+                  "`md` says where the resync's time went; every command went straight to md's memory, 256+ KiB each",
+                  text[-700:])
             ok, text = t.command("aoe export 3 slot 7", "aoe:", 20)
             check("member of an md array" in text, "a member disk is not exported on its own", text[-400:])
             ok, text = t.command("md stop", "md:", 20)
@@ -152,6 +155,15 @@ def main():
             t.command("aoe unexport 1", "aoe:", 20)
             ok, text = t.command("md stop", "stopped", 30)
             check(ok, "unexported, the array stops clean", text[-400:])
+            # `md auto`'s thread looks every second: a stop must hold until asked otherwise
+            time.sleep(4)
+            ok, text = t.command("md", "md:", 10)
+            check("no array" in text and "stopped" in text, "with `md auto`, a stopped array stays stopped", text[-400:])
+            ok, text = t.command("md assemble", "assembled", 30)
+            check(ok, "`md assemble` brings it back", text[-400:])
+            t.command("aoe unexport 1", "aoe:", 20)
+            ok, text = t.command("md stop", "stopped", 30)
+            check(ok and "members are clean" in text, "and it stops clean again", text[-400:])
         finally:
             t.kill()
             if i:
@@ -180,6 +192,29 @@ def main():
                    f"{'equals the first' if again == image else 'differs from the first'}, its parity "
                    f"{'right' if again_ok else 'wrong'}")
         check(big in degraded and degraded == image, "and the same with member 2 rebuilt from parity", why)
+        # Without `md auto`: an array made by `md create` is still closed clean once idle (the thread that does it used to
+        # start only with `md auto`, so the end of the resync never reached the superblocks). The guest is killed, not
+        # stopped: only the idle close can have written "clean".
+        fresh = []
+        for n in range(3):
+            disk = tmp / f"n{n}.img"
+            disk.write_bytes(os.urandom(MEMBER))
+            fresh.append(disk)
+        c = Guest("c", build_image(tmp / "c", ""), fresh, "52:54:00:12:34:f3")
+        try:
+            check(c.wait_for("fos> ", 150), "c (no `md auto`) reaches the prompt", c.log[-1500:].decode("utf8", "replace"))
+            create = "md create raid5 disk2 disk3 disk4"
+            c.command(create, "confirm", 30)
+            ok, text = c.command(create + " confirm", "resync started", 60)
+            check(ok, "c: `md create` without `md auto` starts the resync", text[-800:])
+            check(c.wait_for("md: resync finished.", 180), "c: the resync finishes", c.log[-800:].decode("utf8", "replace"))
+            time.sleep(6)
+        finally:
+            c.kill()
+        supers = [read_super(path) for path in fresh]
+        check(all(s["csum_ok"] and s["resync"] == 0xFFFFFFFFFFFFFFFF for s in supers),
+              "c: the idle close marks the new array clean, with no `md auto` and no `md stop`", str(supers))
+        check(array_image(fresh)[1], "c: every stripe row's parity is right")
     if failures:
         print("\n\n".join(failures))
         sys.exit(1)
