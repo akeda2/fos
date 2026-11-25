@@ -10,6 +10,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use fosfor_abi::tape::{AudioBuffer, AudioDevice, AudioInfo, AudioStats, AUDIO_BUSY};
 use kernel_core::{audio, usb_audio};
 
+use crate::sync::SpinLock;
 use crate::{process, sched, usb};
 
 const CHUNK: usize = 64 * 1024;
@@ -18,6 +19,45 @@ static OWNER: AtomicU64 = AtomicU64::new(0);
 fn pin() -> usb::UsbGuard {
     sched::pin_current(0);
     usb::lock()
+}
+
+/// What a tape's audio calls can do while the USB lock is busy (a stick stalled in a write holds it for seconds): the
+/// active device's lock-free `read`/`write` and its mixer, as last seen with the lock held by the process `pid`. Device
+/// selection itself needs the lock, so it is not looked up again without it.
+struct Unlocked {
+    pid: u64,
+    read: Option<fn(&mut [u8]) -> usize>,
+    write: Option<fn(&[u8]) -> usize>,
+    mixer: Option<&'static dyn kernel_core::ext_audio::Mixer>,
+}
+
+static UNLOCKED: SpinLock<Unlocked> = SpinLock::new(Unlocked { pid: 0, read: None, write: None, mixer: None });
+
+/// With the USB lock held: notes the devices' lock-free entries for the calling process.
+fn remember_io() {
+    let (read, write) = audio::unlocked_io();
+    let pid = sched::current_pid();
+    let mut unlocked = UNLOCKED.lock();
+    if unlocked.pid != pid {
+        unlocked.mixer = None;
+    }
+    *unlocked = Unlocked { pid, read, write, mixer: unlocked.mixer };
+}
+
+fn remember_mixer(mixer: Option<&'static dyn kernel_core::ext_audio::Mixer>) {
+    let pid = sched::current_pid();
+    let mut unlocked = UNLOCKED.lock();
+    if unlocked.pid != pid {
+        *unlocked = Unlocked { pid, read: None, write: None, mixer };
+    } else {
+        unlocked.mixer = mixer;
+    }
+}
+
+/// The calling process's lock-free entry `pick`, if it has one.
+fn unlocked<T>(pick: impl FnOnce(&Unlocked) -> Option<T>) -> Option<T> {
+    let unlocked = UNLOCKED.lock();
+    if unlocked.pid == sched::current_pid() { pick(&unlocked) } else { None }
 }
 
 fn put<T: Copy>(address: u64, value: &T) -> bool {
@@ -71,22 +111,47 @@ pub fn process_ended(pid: u64) {
     }
 }
 
-pub fn read(out: u64, length: u64) -> u64 {
-    let _usb = pin();
+/// A read or write with the USB lock: the controller polled (no MSI), the lock-free entries noted for later.
+fn locked<R>(io: impl FnOnce() -> R) -> R {
     kernel_core::usb_class::poll();
+    remember_io();
+    io()
+}
+
+/// `audio_read`. While something else holds the USB lock, a device with a lock-free FIFO is read without it: a tape that
+/// records to a USB stick goes on reading (and drawing) while the stick stalls in a write.
+pub fn read(out: u64, length: u64) -> u64 {
     let mut buffer = alloc::vec![0u8; (length as usize).min(CHUNK)];
-    let got = audio::read(&mut buffer);
+    let got = match usb::try_tape_lock() {
+        Some(_usb) => locked(|| audio::read(&mut buffer)),
+        None => match unlocked(|u| u.read) {
+            Some(read) => read(&mut buffer),
+            None => {
+                let _usb = pin();
+                locked(|| audio::read(&mut buffer))
+            }
+        },
+    };
     if got > 0 && !process::copy_to_user(out, &buffer[..got]) {
         return 0;
     }
     got as u64
 }
 
+/// `audio_write`, likewise.
 pub fn write(data: u64, length: u64) -> u64 {
-    let _usb = pin();
-    kernel_core::usb_class::poll();
     let Some(bytes) = process::user_bytes_up_to(data, length.min(CHUNK as u64), CHUNK as u64) else { return 0 };
-    audio::write(&bytes) as u64
+    let written = match usb::try_tape_lock() {
+        Some(_usb) => locked(|| audio::write(&bytes)),
+        None => match unlocked(|u| u.write) {
+            Some(write) => write(&bytes),
+            None => {
+                let _usb = pin();
+                locked(|| audio::write(&bytes))
+            }
+        },
+    };
+    written as u64
 }
 
 pub fn stats(out: u64) {
@@ -200,21 +265,41 @@ pub fn mixer_set(output: u64, source: u64, gain: u64) -> i32 {
     with_interrupts(|| audio::mixer().map_or(fosfor_abi::tape::MIXER_NONE, |mixer| mixer.set(output as u32, source as u32, gain)))
 }
 
+/// `mixer_serial`: a tape asks it every frame or so; while the USB lock is busy the driver's atomic copy answers.
 pub fn mixer_serial() -> u64 {
+    if let Some(_usb) = usb::try_tape_lock() {
+        let mixer = audio::mixer();
+        remember_mixer(mixer);
+        return mixer.map_or(0, |mixer| mixer.serial());
+    }
+    if let Some(serial) = unlocked(|u| u.mixer).and_then(|mixer| mixer.serial_unlocked()) {
+        return serial;
+    }
     let _usb = pin();
     audio::mixer().map_or(0, |mixer| mixer.serial())
 }
 
+/// `mixer_meters`: while the USB lock is busy, the set the driver read last (it reads them over USB).
 pub fn mixer_meters(out: u64, count: u64) -> u64 {
-    let _usb = pin();
-    let Some(mixer) = audio::mixer() else { return 0 };
     let mut meters = alloc::vec![fosfor_abi::tape::MixerMeter::default(); (count as usize).min(METERS_MAX)];
-    // Meters may be bulk reads, which wait on the device like a change does.
-    let mut got = 0;
-    with_interrupts(|| {
-        got = mixer.meters(&mut meters);
-        0
-    });
+    let cached = match usb::try_tape_lock() {
+        Some(usb) => Err(usb),
+        None => unlocked(|u| u.mixer).and_then(|mixer| mixer.meters_cached(&mut meters)).ok_or_else(pin),
+    };
+    let got = match cached {
+        Ok(got) => got,
+        Err(_usb) => {
+            let Some(mixer) = audio::mixer() else { return 0 };
+            remember_mixer(Some(mixer));
+            // Meters may be bulk reads, which wait on the device like a change does.
+            let mut got = 0;
+            with_interrupts(|| {
+                got = mixer.meters(&mut meters);
+                0
+            });
+            got
+        }
+    };
     let bytes = unsafe { core::slice::from_raw_parts(meters.as_ptr().cast::<u8>(), got * core::mem::size_of::<fosfor_abi::tape::MixerMeter>()) }; // kernel-memory
     if process::copy_to_user(out, bytes) { got as u64 } else { 0 }
 }

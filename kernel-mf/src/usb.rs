@@ -4,7 +4,7 @@
 //! `lock` drains the rings), and every entry point here holds that lock. It is re-entrant per thread because a transfer waits
 //! by polling, which comes back through `poll`. The service thread polls on CPU 0 and drains typed bytes to the shell.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use fosfor_abi::keymap::Layout;
 use kernel_core::usb_class::{self, Class, Host, NONE};
 #[cfg(target_arch = "x86_64")]
@@ -72,6 +72,13 @@ pub fn lock() -> UsbGuard {
     }
     OWNER.store(me, Ordering::Release);
     UsbGuard { taken: true }
+}
+
+/// The lock for a tape call that has an answer without it (`tapeaudio`, `touch_read`): pinned to CPU 0 like `tape_lock`,
+/// but none when the lock is held or waited for.
+pub fn try_tape_lock() -> Option<UsbGuard> {
+    crate::sched::pin_current(0);
+    try_lock()
 }
 
 /// The lock if nobody holds it or waits for it, without waiting (an interrupt handler's poll, the PS/2 mouse).
@@ -209,11 +216,64 @@ pub fn storage_write(device: usize, lba: u64, buffer: &[u8]) -> Result<(), usb_s
     usb_storage::write(device, lba, buffer)
 }
 
-fn storage_lock() -> UsbGuard {
+/// When the disk transfer that holds the USB lock took it (`time::micros`, at least 1), 0 when no disk transfer holds it.
+/// A USB stick can stall inside one write for a second or more while it erases flash, holding the lock all along: a tape
+/// call that only reads what arrives over USB (`touch_read`) then answers "nothing" instead of waiting it out
+/// (`disk_stalled`), as nothing can arrive while the lock is held.
+static DISK_SINCE: AtomicU64 = AtomicU64::new(0);
+
+/// The USB lock held for a disk transfer.
+struct StorageGuard {
+    _usb: UsbGuard,
+}
+
+impl Drop for StorageGuard {
+    fn drop(&mut self) {
+        // Before the lock goes (the field drops after this).
+        DISK_SINCE.store(0, Ordering::Release);
+    }
+}
+
+fn storage_lock() -> StorageGuard {
     if crate::sched::ready() {
         crate::sched::pin_current(0);
     }
-    lock()
+    let usb = lock();
+    DISK_SINCE.store(crate::time::micros().max(1), Ordering::Release);
+    StorageGuard { _usb: usb }
+}
+
+/// Whether a disk transfer has held the USB lock for `us` microseconds or more.
+pub fn disk_stalled(us: u64) -> bool {
+    let since = DISK_SINCE.load(Ordering::Acquire);
+    since != 0 && crate::time::micros().wrapping_sub(since) >= us
+}
+
+/// How long a disk transfer holds the USB lock before `touch_read` stops waiting for it: longer than a normal transfer
+/// (256 KiB to a stick at 10 MB/s is 26 ms), so a tape only skips its input while a stick stalls.
+const TOUCH_WAIT_US: u64 = 50_000;
+
+/// The lock for a tape's input call, or none when a disk transfer holds it and has for `TOUCH_WAIT_US`. Waits as
+/// `tape_lock` does for any other holder (and for a disk transfer that ends in time).
+fn input_lock() -> Option<UsbGuard> {
+    loop {
+        if let Some(usb) = try_tape_lock() {
+            return Some(usb);
+        }
+        if DISK_SINCE.load(Ordering::Acquire) == 0 {
+            return Some(tape_lock());
+        }
+        if disk_stalled(TOUCH_WAIT_US) {
+            return None;
+        }
+        // The CPU goes to the holder meanwhile (both are often on CPU 0); a system call arrives with interrupts off.
+        let was_on = crate::cpu::interrupts_save_and_disable();
+        crate::cpu::interrupts_enable();
+        crate::sched::yield_now();
+        if !was_on {
+            crate::cpu::interrupts_disable();
+        }
+    }
 }
 
 /// `midi_read`: six bytes (device, cable, count, three data bytes) to `out`.
@@ -247,7 +307,8 @@ pub fn touch_info(panel: u64) -> u64 {
 pub fn touch_read(out: u64) -> i64 {
     let mut event = [0i32; 6];
     let got = {
-        let _usb = tape_lock();
+        // A stick stalled in a write: no touch can arrive meanwhile, and the tape keeps drawing.
+        let Some(_usb) = input_lock() else { return 0 };
         crate::ps2::deliver_mouse();
         usb_pointer::api_touch_read(event.as_mut_ptr())
     };

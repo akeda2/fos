@@ -756,9 +756,10 @@ at the left and a scroll bar for the rest. Still open:
   `mt-loop=IN:OUT` for a cable); the input is then named "Loop N" and a "Loop" preset appears. Not yet measured on hardware:
   LUFS through a real loopback, and whether the second USB model's loopback is post-mixer and bit-exact (its spec lists the
   open experiments).
-- Meters are read by the drawing thread; a device whose meter read is slow (bulk reads under the USB lock) would want them on
-  a thread too. The driver caches a set for 50 ms. The USB lock is fair since 2026-11-21, so a disk writer no longer starves
-  them.
+- Meters are read by the drawing thread. The driver caches a set for 50 ms, and while a disk transfer holds the USB lock
+  the kernel answers from that set instead of waiting (2026-11-24, `docs/big-kernel.md` "Audio"); a meter read that is slow
+  in itself (the UFX's bulk reads) still costs the drawing thread its duration. Not yet seen on hardware: a stick stall with
+  KakelFix drawing and taking touch throughout.
 - Hardware not yet tried: the PCI card on any page (its driver has no `Mixer` yet); the second USB model on the Mixer and
   Analyzer pages. Done on the USB interfaces (server kernel): Mixer, Meters (touch included), Analyzer, Recorder (takes to
   ext4 and to an exFAT stick).

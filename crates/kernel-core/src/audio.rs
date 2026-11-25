@@ -340,6 +340,20 @@ pub fn write(data: &[u8]) -> usize {
     }
 }
 
+/// The active device's `read` and the output device's `write` without the drivers' lock, where the driver has them
+/// (`ext_audio::Ops::read_unlocked`). Asked with the lock held; the caller keeps the answer for when the lock is busy.
+pub fn unlocked_io() -> (Option<fn(&mut [u8]) -> usize>, Option<fn(&[u8]) -> usize>) {
+    let read = match active() {
+        Some(Backend::Ext(slot)) => ext::slot(slot).read_unlocked(),
+        _ => None,
+    };
+    let write = match output() {
+        Some(Backend::Ext(slot)) => ext::slot(slot).write_unlocked(),
+        _ => None,
+    };
+    (read, write)
+}
+
 pub fn playback_space() -> usize {
     match output() {
         Some(Backend::Usb(unit)) => usb::playback_space(unit),

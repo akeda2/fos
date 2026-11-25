@@ -35,6 +35,12 @@ pub struct Ops {
     pub state: fn() -> i32,
     /// The device's hardware mixer, for the tape ABI `mixer_*` calls (version 41), if the driver offers one.
     pub mixer: Option<&'static dyn Mixer>,
+    /// `read` without the audio drivers' lock, for a driver whose capture FIFO is lock-free (its interrupt handler on one
+    /// side, the tape on the other): on mf a tape's `audio_read` uses it while a disk transfer holds the USB lock, so a
+    /// USB stick that stalls in a write does not stall the tape too (`kernel-mf/src/tapeaudio.rs`). No controller poll.
+    pub read_unlocked: Option<fn(&mut [u8]) -> usize>,
+    /// The same for `write`.
+    pub write_unlocked: Option<fn(&[u8]) -> usize>,
 }
 
 /// A device's mixer as the tape ABI `mixer_*` calls (version 41, `abi/src/tape.rs`) see it: a matrix of linear crosspoint
@@ -52,6 +58,14 @@ pub trait Mixer: Sync {
     fn control(&self, index: u32, out: &mut MixerControl) -> bool;
     fn control_item(&self, index: u32, item: u32, out: &mut [u8]) -> Option<usize>;
     fn control_set(&self, index: u32, value: i64) -> i32;
+    /// `serial` without the audio drivers' lock, where the driver keeps it in an atomic: `None` when it needs the lock.
+    fn serial_unlocked(&self) -> Option<u64> {
+        None
+    }
+    /// The meters last read, without the lock and without asking the device: `None` when there are none to give.
+    fn meters_cached(&self, _out: &mut [MixerMeter]) -> Option<usize> {
+        None
+    }
 }
 
 /// Copies `text` into a zero-padded fixed field (truncated at a character boundary), for `MixerInfo::name` and friends.
@@ -173,6 +187,12 @@ impl Slot {
     }
     pub fn mixer(&self) -> Option<&'static dyn Mixer> {
         self.ops()?.mixer
+    }
+    pub fn read_unlocked(&self) -> Option<fn(&mut [u8]) -> usize> {
+        self.ops()?.read_unlocked
+    }
+    pub fn write_unlocked(&self) -> Option<fn(&[u8]) -> usize> {
+        self.ops()?.write_unlocked
     }
     pub fn float(&self, capture: bool) -> bool {
         self.ops().is_some_and(|ops| (ops.float)(capture))

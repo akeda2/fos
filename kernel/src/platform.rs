@@ -303,4 +303,6 @@ static I2S: kernel_core::i2s::Ops = kernel_core::i2s::Ops {
     float: |_| false,
     state: || fosfor_abi::tape::AUDIO_STATE_RUNNING,
     mixer: None,
+    read_unlocked: None,
+    write_unlocked: None,
 };

@@ -265,6 +265,11 @@ pub fn set_capture_ring(bytes: u64) {
     WANTED_CAPTURE_RING.store(bytes as usize, Ordering::Relaxed);
 }
 
+/// The capture ring size a tape asked for, 0 for none: for drivers outside this module that size their own capture FIFO.
+pub fn wanted_capture_ring() -> usize {
+    WANTED_CAPTURE_RING.load(Ordering::Relaxed)
+}
+
 /// Exercises a ring made of three separate blocks of different sizes (so frames and chunks straddle block boundaries and
 /// the wrap-around): pushes and pops odd-sized pieces of a counting pattern for many laps and checks every byte. Run at boot,
 /// since the recorder's multi-gigabyte capture ring is built the same way and a mistake here would silently scramble audio.
