@@ -27,8 +27,21 @@ const RAID_GUID: [u8; 16] = [0x0f, 0x88, 0x9d, 0xa1, 0xfc, 0x05, 0x3b, 0x4d, 0xa
 /// Seconds without a write after which the array is closed clean.
 const IDLE_SECONDS: u64 = 3;
 
-/// Array sectors a resync or rebuild covers per hold of the lock; reads and writes get in between.
-const JOB_BUDGET: u64 = 2048;
+/// Array sectors a resync or rebuild covers per hold of the lock (2 MiB; a few milliseconds on SATA SSDs, whose members
+/// are read at once); reads and writes get in between.
+const JOB_BUDGET: u64 = 4096;
+
+/// Block-layer reads, writes and flushes waiting for `STATE`. The job thread takes the lock again right after it lets
+/// go, before a waiter woken on another CPU has run, so while this is non-zero it sleeps a tick instead.
+static IO_WAITING: AtomicUsize = AtomicUsize::new(0);
+
+/// `STATE` for a block-layer read, write or flush: counted in `IO_WAITING` while it waits, so a resync steps aside.
+fn io_lock() -> sched::SleepGuard<'static, State> {
+    IO_WAITING.fetch_add(1, Ordering::AcqRel);
+    let guard = STATE.lock();
+    IO_WAITING.fetch_sub(1, Ordering::AcqRel);
+    guard
+}
 
 static JOB_THREAD: AtomicBool = AtomicBool::new(false);
 /// The disk index `md add` announced and waits to have confirmed (usize::MAX: none).
@@ -69,12 +82,36 @@ impl Members for Candidates {
         }
         block::read(m.disk, m.base + lba, buffer).map_err(|_| Error::Device)
     }
+    /// A row's members at once: `block::read_many` overlaps the SATA ones, so a row costs its slowest member's time.
+    fn read_many(&mut self, reads: &mut [md::Read<'_>]) -> Result<(), (usize, Error)> {
+        let mut many = alloc::vec::Vec::with_capacity(reads.len());
+        for (index, request) in reads.iter_mut().enumerate() {
+            let m = self.list[request.member];
+            if request.lba + (request.buffer.len() / 512) as u64 > m.sectors {
+                return Err((index, Error::Range));
+            }
+            many.push(block::Read { disk: m.disk, lba: m.base + request.lba, buffer: &mut *request.buffer });
+        }
+        block::read_many(&mut many).map_err(|(index, _)| (index, Error::Device))
+    }
     fn write(&mut self, member: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
         let m = self.list[member];
         if lba + (buffer.len() / 512) as u64 > m.sectors {
             return Err(Error::Range);
         }
         block::write_deferred(m.disk, m.base + lba, buffer).map_err(|_| Error::Device)
+    }
+    /// A row's data and parity at once: `block::write_many` overlaps the SATA members (no flush, as `write`).
+    fn write_many(&mut self, writes: &[md::Write<'_>]) -> Result<(), (usize, Error)> {
+        let mut many = alloc::vec::Vec::with_capacity(writes.len());
+        for (index, request) in writes.iter().enumerate() {
+            let m = self.list[request.member];
+            if request.lba + (request.buffer.len() / 512) as u64 > m.sectors {
+                return Err((index, Error::Range));
+            }
+            many.push(block::Write { disk: m.disk, lba: m.base + request.lba, buffer: request.buffer });
+        }
+        block::write_many(&many).map_err(|(index, _)| (index, Error::Device))
     }
     fn flush(&mut self, member: usize) -> Result<(), Error> {
         block::flush(self.list[member].disk).map_err(|_| Error::Device)
@@ -332,7 +369,13 @@ extern "C" fn job_thread(_: usize) {
                 break;
             }
         }
-        sched::sleep_ticks(1);
+        // Full speed while nobody waits (a fixed 10 ms sleep per step held the resync to a third of the disks' time);
+        // a tick's pause when reads or writes queue for the lock, so they get it.
+        if IO_WAITING.load(Ordering::Acquire) > 0 {
+            sched::sleep_ticks(1);
+        } else {
+            sched::yield_now();
+        }
     }
     JOB_THREAD.store(false, Ordering::Release);
     sched::exit()
@@ -567,14 +610,14 @@ fn create_command(words: core::str::SplitWhitespace) {
 
 /// A read of the array as disk sectors, for the block layer.
 pub fn read(lba: u64, buffer: &mut [u8]) -> Result<(), block::Error> {
-    let mut state = STATE.lock();
+    let mut state = io_lock();
     let state = &mut *state;
     let array = state.array.as_ref().ok_or(block::Error::Device)?;
     array.read(&mut state.members, lba, buffer).map_err(|error| if error == Error::Range { block::Error::OutOfRange } else { block::Error::Device })
 }
 
 pub fn write(lba: u64, buffer: &[u8]) -> Result<(), block::Error> {
-    let mut state = STATE.lock();
+    let mut state = io_lock();
     let state = &mut *state;
     let force = state.force_rw;
     let array = state.array.as_mut().ok_or(block::Error::Device)?;
@@ -589,7 +632,7 @@ pub fn write(lba: u64, buffer: &[u8]) -> Result<(), block::Error> {
 }
 
 pub fn flush() -> Result<(), block::Error> {
-    let mut state = STATE.lock();
+    let mut state = io_lock();
     let state = &mut *state;
     match state.array.as_mut() {
         Some(array) if array.is_writing() => array.flush(&mut state.members, now()).map_err(|_| block::Error::Device),
@@ -650,12 +693,19 @@ pub fn command(mut words: core::str::SplitWhitespace) {
             match state.array.as_mut() {
                 None => println!("md: no array is up."),
                 Some(array) => {
+                    let running = array.job();
                     if array.is_writing() {
                         let _ = array.stop(&mut state.members, now());
                     }
+                    let dirty = array.dirty();
                     state.array = None;
                     state.status.set(format_args!("stopped"));
-                    println!("md: stopped; members are clean. `md assemble` brings it back.");
+                    if dirty {
+                        println!("md: stopped; the members are NOT in step (its {} did not finish).", if running.is_some_and(|(job, _)| job == Job::Rebuild) { "rebuild" } else { "resync" });
+                        println!("    `md assemble` brings it back; `md resync` starts over.");
+                    } else {
+                        println!("md: stopped; members are clean. `md assemble` brings it back.");
+                    }
                 }
             }
         }

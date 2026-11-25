@@ -13,7 +13,8 @@
 //! needs one copy of every chunk: a member that fails is dropped as long as that holds.
 
 use crate::superblock::{self, Superblock, FEATURE_BAD_BLOCKS, FEATURE_BITMAP, FEATURE_MULTIPLE_PPLS, FEATURE_PPL, FEATURE_RAID0_LAYOUT, FEATURE_RECOVERY_OFFSET, LEVEL_RAID0, LEVEL_RAID1, LEVEL_RAID10, LEVEL_RAID5, LEVEL_RAID6, READ_BYTES, ROLE_FAULTY, SYNCED};
-use crate::{Error, Members, SECTOR};
+use crate::{Error, Members, Read, SECTOR, Write};
+use alloc::vec::Vec;
 
 mod ppl;
 mod raid6;
@@ -24,9 +25,16 @@ use crate::bitmap::Bitmap;
 
 pub const MAX_MEMBERS: usize = 8;
 
+/// `into ^= from` over the shorter of the two, eight bytes at a time (the kernel has no SIMD; a byte loop is 8x the work).
 fn xor(into: &mut [u8], from: &[u8]) {
-    for (a, b) in into.iter_mut().zip(from) {
-        *a ^= b;
+    let length = into.len().min(from.len());
+    let (mut a, mut b) = (into[..length].chunks_exact_mut(8), from[..length].chunks_exact(8));
+    for (x, y) in (&mut a).zip(&mut b) {
+        let word = u64::from_ne_bytes((&*x).try_into().unwrap()) ^ u64::from_ne_bytes(y.try_into().unwrap());
+        x.copy_from_slice(&word.to_ne_bytes());
+    }
+    for (x, y) in a.into_remainder().iter_mut().zip(b.remainder()) {
+        *x ^= y;
     }
 }
 
@@ -81,6 +89,8 @@ pub struct Array {
     /// The RAID 5 partial parity log (`ppl.rs`); `ppl_bad` is a log this code cannot vouch for or place.
     ppl: Option<ppl::Ppl>,
     ppl_bad: bool,
+    /// The resync's and rebuild's buffer (`JOB_PIECE` of every member and one more), allocated on first use.
+    work: Vec<u8>,
 }
 
 struct Rebuild {
@@ -108,8 +118,12 @@ pub enum Step {
     Done(Job),
 }
 
-/// Sectors compared or copied per piece (the stack buffers are this big).
+/// Sectors compared or copied per piece on the paths that use stack buffers (writes, and reads that must reconstruct).
 const PIECE: u64 = 16;
+/// Sectors per piece of a resync or rebuild (256 KiB, two 128 KiB SATA commands per member), read from every member at
+/// once (`Members::read_many`) into `Array::work`. With 8 KiB pieces read one member after another, a 3-disk RAID 5 of
+/// SATA SSDs resynced at 14 MiB/s per member: the time went to per-command latency, not to moving data.
+const JOB_PIECE: u64 = 512;
 /// The longest stretch one partial parity log entry covers when the log area has room (32 KiB): fewer flushed log
 /// writes for a sequential write. Parity ranges of pieces in one stripe overlap, so pieces cannot share a flush.
 const PPL_RUN: u64 = 64;
@@ -230,6 +244,7 @@ impl Array {
             partial: false,
             ppl: None,
             ppl_bad: false,
+            work: Vec::new(),
         };
         for (member, entry) in found.iter().enumerate() {
             let Some((sb, block)) = entry else { continue };
@@ -546,7 +561,77 @@ impl Array {
         Ok(())
     }
 
+    /// The job buffer, at least `bytes` long, taken out of the array while a piece uses it (`self.work = ...` returns it).
+    fn take_work(&mut self, bytes: usize) -> Vec<u8> {
+        let mut work = core::mem::take(&mut self.work);
+        if work.len() < bytes {
+            work.resize(bytes, 0);
+        }
+        work
+    }
+
+    /// Reads the piece at member sector `at` of every role in the mask `roles` into its part of `work` (role `r` at
+    /// `r * bytes`), all at once (`Members::read_many`). A role that is gone, or fails, is an error (and goes into
+    /// `failed`).
+    fn read_roles<M: Members>(&self, members: &mut M, roles: u32, at: u64, bytes: usize, work: &mut [u8], failed: &mut u32) -> Result<(), Error> {
+        let mut reads = Vec::with_capacity(MAX_MEMBERS);
+        let mut which = [0u16; MAX_MEMBERS];
+        for (role, piece) in work.chunks_mut(bytes).take(self.raid_disks as usize).enumerate() {
+            if roles & (1 << role) == 0 {
+                continue;
+            }
+            let (member, base) = self.usable(role as u16, *failed).ok_or(Error::Device)?;
+            which[reads.len()] = role as u16;
+            reads.push(Read { member, lba: base + at, buffer: piece });
+        }
+        members.read_many(&mut reads).map_err(|(index, error)| {
+            *failed |= 1 << which[index];
+            error
+        })
+    }
+
+    /// Splits `work` (as `read_roles` filled it) into the members' pieces and the spare slot after them, which gets the
+    /// XOR of the roles in the mask `roles`.
+    fn xor_roles<'w>(&self, work: &'w mut [u8], roles: u32, bytes: usize) -> (&'w [u8], &'w mut [u8]) {
+        let (rows, spare) = work.split_at_mut(self.raid_disks as usize * bytes);
+        let sum = &mut spare[..bytes];
+        sum.fill(0);
+        for (role, piece) in rows.chunks(bytes).enumerate() {
+            if roles & (1 << role) != 0 {
+                xor(sum, piece);
+            }
+        }
+        (rows, sum)
+    }
+
+    /// The fast path of a read: every chunk's piece of `buffer` straight from the member holding it (RAID 5's data
+    /// member, RAID 0/10's first copy), all at once. False when one of those members is gone or a read fails: the
+    /// caller then goes piece by piece, reconstructing or trying other copies as before.
+    fn read_direct<M: Members>(&self, members: &mut M, lba: u64, buffer: &mut [u8]) -> bool {
+        let mut reads = Vec::new();
+        let (mut rest, mut v) = (buffer, lba);
+        while !rest.is_empty() {
+            let (run, role, at) = if self.level == LEVEL_RAID5 {
+                let (run, data, _, at) = self.locate5(v);
+                (run, data, at)
+            } else {
+                let (run, copies, _) = self.locate(v);
+                (run, copies[0].0, copies[0].1)
+            };
+            let Some((member, base)) = self.usable(role, 0) else { return false };
+            let take = (run.min((rest.len() / SECTOR) as u64)) as usize * SECTOR;
+            let (piece, tail) = core::mem::take(&mut rest).split_at_mut(take);
+            rest = tail;
+            reads.push(Read { member, lba: base + at, buffer: piece });
+            v += (take / SECTOR) as u64;
+        }
+        members.read_many(&mut reads).is_ok()
+    }
+
     fn read_parity<M: Members>(&self, members: &mut M, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
+        if self.read_direct(members, lba, buffer) {
+            return Ok(());
+        }
         let count = (buffer.len() / SECTOR) as u64;
         let mut done = 0;
         while done < count {
@@ -570,16 +655,17 @@ impl Array {
         let count = (buffer.len() / SECTOR) as u64;
         let (mut done, mut failed, mut lost) = (0, 0u32, false);
         while done < count {
+            let rows = self.write_rows5(members, lba + done, &buffer[done as usize * SECTOR..], &mut failed);
+            if rows > 0 {
+                done += rows;
+                continue;
+            }
             let (run, data, parity, at) = self.locate5(lba + done);
-            let big = self.ppl_run() > PIECE;
-            let run = run.min(count - done).min(if big { PPL_RUN } else { PIECE });
+            // a partial parity log entry covers one piece, so with a log the piece is what one entry holds
+            let limit = if self.ppl.is_some() { self.ppl_run() } else { JOB_PIECE };
+            let run = run.min(count - done).min(limit);
             let new = &buffer[done as usize * SECTOR..(done + run) as usize * SECTOR];
-            let result = if big {
-                self.write_piece5::<M, { PPL_RUN as usize * SECTOR }>(members, data, parity, at, lba + done, new, &mut failed)
-            } else {
-                self.write_piece5::<M, { PIECE as usize * SECTOR }>(members, data, parity, at, lba + done, new, &mut failed)
-            };
-            if result.is_err() {
+            if self.write_piece5(members, data, parity, at, lba + done, new, &mut failed).is_err() {
                 lost = true;
                 break;
             }
@@ -591,19 +677,109 @@ impl Array {
         if lost { Err(Error::Device) } else { Ok(()) }
     }
 
-    fn write_piece5<M: Members, const BYTES: usize>(&mut self, members: &mut M, data: u16, parity: u16, at: u64, v: u64, new: &[u8], failed: &mut u32) -> Result<(), Error> {
+    /// Writes `plan` (role, member, member sector, bytes, whether that member is the rebuild target) with one
+    /// `write_many`, so data and parity go to their drives at once. If that fails, again one at a time, which finds the
+    /// member that failed (into `failed`; a failing rebuild target ends the rebuild): rewriting what may already have
+    /// landed is harmless, the bytes are the same. Returns how many writes to members in use succeeded.
+    fn write_plan<M: Members>(&mut self, members: &mut M, plan: &[(u16, usize, u64, &[u8], bool)], failed: &mut u32) -> usize {
+        let writes: Vec<Write> = plan.iter().map(|&(_, member, lba, buffer, _)| Write { member, lba, buffer }).collect();
+        if members.write_many(&writes).is_ok() {
+            return plan.iter().filter(|entry| !entry.4).count();
+        }
+        let mut wrote = 0;
+        for &(role, member, lba, buffer, target) in plan {
+            match (members.write(member, lba, buffer), target) {
+                (Ok(()), false) => wrote += 1,
+                (Ok(()), true) => {}
+                (Err(_), false) => *failed |= 1 << role,
+                (Err(_), true) => self.rebuild = None,
+            }
+        }
+        wrote
+    }
+
+    /// Whole stripe rows from array sector `v`, which must start a row, when every member is in use and neither a partial
+    /// parity log nor a rebuild is involved: the parity is the XOR of the new data alone, so nothing is read, and each
+    /// piece of the row (data on every data member, parity) goes out in one `write_many`. Returns the array sectors
+    /// written this way, 0 when the write does not qualify (the caller then goes piece by piece, read-modify-write).
+    fn write_rows5<M: Members>(&mut self, members: &mut M, v: u64, new: &[u8], failed: &mut u32) -> u64 {
+        let d = self.raid_disks as u64 - 1;
+        let row = d * self.chunk;
+        let rows = (new.len() / SECTOR) as u64 / row;
+        let whole = self.role_mask().count_ones() == self.raid_disks;
+        if rows == 0 || v % row != 0 || self.ppl.is_some() || self.rebuild.is_some() || *failed != 0 || !whole {
+            return 0;
+        }
+        let mut work = self.take_work(JOB_PIECE as usize * SECTOR);
+        for r in 0..rows {
+            let row_v = v + r * row;
+            let (_, _, parity, row_at) = self.locate5(row_v);
+            let mut offset = 0;
+            while offset < self.chunk {
+                let length = (self.chunk - offset).min(JOB_PIECE);
+                let bytes = length as usize * SECTOR;
+                // chunk i of the row, at `offset`, is the caller's bytes at array sector row_v + i * chunk + offset
+                let piece = |i: u64| {
+                    let start = (row_v + i * self.chunk + offset - v) as usize * SECTOR;
+                    &new[start..start + bytes]
+                };
+                let sum = &mut work[..bytes];
+                sum.fill(0);
+                for i in 0..d {
+                    xor(sum, piece(i));
+                }
+                let mut plan = Vec::with_capacity(MAX_MEMBERS);
+                for i in 0..d {
+                    let (_, role, _, at) = self.locate5(row_v + i * self.chunk + offset);
+                    let (member, base) = self.usable(role, 0).expect("every member is in use");
+                    plan.push((role, member, base + at, piece(i), false));
+                }
+                let (member, base) = self.usable(parity, 0).expect("every member is in use");
+                plan.push((parity, member, base + row_at + offset, &work[..bytes], false));
+                self.write_plan(members, &plan, failed);
+                offset += length;
+            }
+        }
+        self.work = work;
+        rows * row
+    }
+
+    /// One piece of a RAID 5 write (inside one chunk), read-modify-write: the old data and the old parity are read at once,
+    /// the new parity is the old one with the old data taken out and the new data put in, and data and parity are written
+    /// at once. When the data or the parity member is gone the parity is the XOR of all the data.
+    fn write_piece5<M: Members>(&mut self, members: &mut M, data: u16, parity: u16, at: u64, v: u64, new: &[u8], failed: &mut u32) -> Result<(), Error> {
         let bytes = new.len();
-        let (mut fresh, mut old) = ([0u8; BYTES], [0u8; BYTES]);
+        let mut work = self.take_work(2 * bytes);
+        let result = self.write_piece5_in(members, data, parity, at, v, new, failed, &mut work[..2 * bytes]);
+        self.work = work;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_piece5_in<M: Members>(&mut self, members: &mut M, data: u16, parity: u16, at: u64, v: u64, new: &[u8], failed: &mut u32, work: &mut [u8]) -> Result<(), Error> {
+        let bytes = new.len();
+        let (fresh, old) = work.split_at_mut(bytes);
         let mut have_parity = false;
         if let (Some((dm, db)), Some((pm, pb))) = (self.usable(data, *failed), self.usable(parity, *failed)) {
-            if members.read(dm, db + at, &mut old[..bytes]).is_err() {
-                *failed |= 1 << data;
-            } else if members.read(pm, pb + at, &mut fresh[..bytes]).is_err() {
-                *failed |= 1 << parity;
-            } else {
-                xor(&mut fresh[..bytes], &old[..bytes]);
-                if self.ppl_logged(members, parity, v, &fresh[..bytes]) {
-                    xor(&mut fresh[..bytes], new);
+            let together = {
+                let mut reads = [Read { member: dm, lba: db + at, buffer: &mut *old }, Read { member: pm, lba: pb + at, buffer: &mut *fresh }];
+                members.read_many(&mut reads).is_ok()
+            };
+            // one at a time when that failed, to learn which member it was
+            let read = together
+                || if members.read(dm, db + at, old).is_err() {
+                    *failed |= 1 << data;
+                    false
+                } else if members.read(pm, pb + at, fresh).is_err() {
+                    *failed |= 1 << parity;
+                    false
+                } else {
+                    true
+                };
+            if read {
+                xor(fresh, old);
+                if self.ppl_logged(members, parity, v, fresh) {
+                    xor(fresh, new);
                     have_parity = true;
                 } else {
                     *failed |= 1 << parity;
@@ -612,54 +788,61 @@ impl Array {
         }
         let wanted = self.usable(parity, *failed).is_some() || self.target(parity).is_some();
         if !have_parity && wanted {
-            fresh[..bytes].fill(0);
-            self.xor_others(members, &[data, parity], at, &mut fresh[..bytes], failed)?;
-            if self.usable(parity, *failed).is_none() || self.ppl_logged(members, parity, v, &fresh[..bytes]) {
-                xor(&mut fresh[..bytes], new);
+            fresh.fill(0);
+            self.xor_others(members, &[data, parity], at, fresh, failed)?;
+            if self.usable(parity, *failed).is_none() || self.ppl_logged(members, parity, v, fresh) {
+                xor(fresh, new);
                 have_parity = true;
             } else {
                 *failed |= 1 << parity;
             }
         }
-        let mut wrote = 0;
-        for (role, buffer) in [(data, Some(new)), (parity, have_parity.then_some(&fresh[..bytes]))] {
+        let mut plan = Vec::with_capacity(2);
+        for (role, buffer) in [(data, Some(new)), (parity, have_parity.then_some(&fresh[..]))] {
             let Some(buffer) = buffer else { continue };
             if let Some((member, base)) = self.usable(role, *failed) {
-                match members.write(member, base + at, buffer) {
-                    Ok(()) => wrote += 1,
-                    Err(_) => *failed |= 1 << role,
-                }
+                plan.push((role, member, base + at, buffer, false));
             } else if let Some((member, base)) = self.target(role) {
-                if members.write(member, base + at, buffer).is_err() {
-                    self.rebuild = None;
-                }
+                plan.push((role, member, base + at, buffer, true));
             }
         }
-        if wrote == 0 { Err(Error::Device) } else { Ok(()) }
+        if self.write_plan(members, &plan, failed) == 0 { Err(Error::Device) } else { Ok(()) }
     }
 
-    /// Makes the parity of one piece at member sector `m` agree with the data.
+    /// Makes the parity of one piece at member sector `m` agree with the data: every member's piece is read at once, the
+    /// data XORed and the parity written only where it differs (an SSD is spared the writes of a row already in step).
     fn resync_piece5<M: Members>(&mut self, members: &mut M, m: u64, end: u64) -> Result<u64, Error> {
         let (offset, parity) = (m % self.chunk, self.parity_role(m / self.chunk));
-        let length = (self.chunk - offset).min(end - m).min(PIECE);
+        let length = (self.chunk - offset).min(end - m).min(JOB_PIECE);
         let bytes = length as usize * SECTOR;
-        let (mut sum, mut stored) = ([0u8; PIECE as usize * SECTOR], [0u8; PIECE as usize * SECTOR]);
-        self.xor_others(members, &[parity], m, &mut sum[..bytes], &mut 0)?;
-        let (member, base) = self.usable(parity, 0).ok_or(Error::Device)?;
-        members.read(member, base + m, &mut stored[..bytes])?;
-        if stored[..bytes] != sum[..bytes] {
-            members.write(member, base + m, &sum[..bytes])?;
-        }
-        Ok(m + length)
+        let all = (1u32 << self.raid_disks) - 1;
+        let mut work = self.take_work((self.raid_disks as usize + 1) * bytes);
+        let done = self.read_roles(members, all, m, bytes, &mut work, &mut 0).and_then(|()| {
+            let (rows, sum) = self.xor_roles(&mut work, all & !(1 << parity), bytes);
+            let stored = &rows[parity as usize * bytes..][..bytes];
+            if stored != &sum[..] {
+                let (member, base) = self.usable(parity, 0).ok_or(Error::Device)?;
+                members.write(member, base + m, sum)?;
+            }
+            Ok(())
+        });
+        self.work = work;
+        done.map(|()| m + length)
     }
 
-    /// Fills the rebuild target's piece at member sector `m`: whatever role it has in that row, it is the XOR of the rest.
+    /// Fills the rebuild target's piece at member sector `m`: whatever role it has in that row, it is the XOR of the rest,
+    /// all read at once.
     fn rebuild_piece5<M: Members>(&mut self, members: &mut M, m: u64, end: u64) -> Result<u64, Error> {
-        let length = (self.chunk - m % self.chunk).min(end - m).min(PIECE);
+        let length = (self.chunk - m % self.chunk).min(end - m).min(JOB_PIECE);
         let bytes = length as usize * SECTOR;
         let (role, member, base) = self.rebuild.as_ref().map(|r| (r.slot.role, r.slot.member, r.slot.data_offset)).ok_or(Error::Busy)?;
-        let mut buffer = [0u8; PIECE as usize * SECTOR];
-        let done = self.xor_others(members, &[role], m, &mut buffer[..bytes], &mut 0).and_then(|()| members.write(member, base + m, &buffer[..bytes]));
+        let others = ((1u32 << self.raid_disks) - 1) & !(1 << role);
+        let mut work = self.take_work((self.raid_disks as usize + 1) * bytes);
+        let done = self.read_roles(members, others, m, bytes, &mut work, &mut 0).and_then(|()| {
+            let (_, sum) = self.xor_roles(&mut work, others, bytes);
+            members.write(member, base + m, sum)
+        });
+        self.work = work;
         match done {
             Ok(()) => Ok(m + length),
             Err(error) => {
@@ -674,6 +857,9 @@ impl Array {
     }
 
     fn read_striped<M: Members>(&self, members: &mut M, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
+        if self.read_direct(members, lba, buffer) {
+            return Ok(());
+        }
         let count = (buffer.len() / SECTOR) as u64;
         let mut done = 0;
         while done < count {
@@ -840,6 +1026,14 @@ impl Array {
         }
         if self.level != LEVEL_RAID1 {
             return self.write_striped(members, lba, buffer, now);
+        }
+        // every mirror (and a rebuild target) at once; if that fails, one at a time below to find the member
+        let mut writes: Vec<Write> = self.slots[..self.used].iter().flatten().map(|slot| Write { member: slot.member, lba: slot.data_offset + lba, buffer }).collect();
+        if let Some(r) = self.rebuild.as_ref() {
+            writes.push(Write { member: r.slot.member, lba: r.slot.data_offset + lba, buffer });
+        }
+        if !writes.is_empty() && members.write_many(&writes).is_ok() {
+            return Ok(());
         }
         let mut failed = [false; MAX_MEMBERS];
         let mut done = 0;
@@ -1125,6 +1319,9 @@ impl Array {
         if self.level == LEVEL_RAID6 {
             return self.resync_piece6(members, cursor, end);
         }
+        if let Some(next) = self.resync_copies(members, cursor, end, now)? {
+            return Ok(next);
+        }
         let (run, copies, n) = self.locate(cursor);
         let length = run.min(end - cursor).min(PIECE);
         let bytes = length as usize * SECTOR;
@@ -1153,6 +1350,48 @@ impl Array {
         Ok(cursor + length)
     }
 
+    /// RAID 1 and 10: every copy of one piece read at once, the first one the reference, the others rewritten where they
+    /// differ. `None` when a read failed: the caller then does the piece the slow way, which finds out which copy failed.
+    fn resync_copies<M: Members>(&mut self, members: &mut M, cursor: u64, end: u64, now: u64) -> Result<Option<u64>, Error> {
+        let (run, copies, n) = self.locate(cursor);
+        let length = run.min(end - cursor).min(JOB_PIECE);
+        let bytes = length as usize * SECTOR;
+        let mut work = self.take_work(n * bytes);
+        // (member, member sector, role) of each copy in use, in the order of their pieces in `work`
+        let mut places = [(0usize, 0u64, 0u16); MAX_MEMBERS];
+        let mut count = 0;
+        for &(role, at) in &copies[..n] {
+            if let Some(slot) = self.slot_of_role(role) {
+                places[count] = (slot.member, slot.data_offset + at, role);
+                count += 1;
+            }
+        }
+        let read = count > 0 && {
+            let mut reads: Vec<Read> = places[..count]
+                .iter()
+                .zip(work.chunks_mut(bytes))
+                .map(|(&(member, lba, _), buffer)| Read { member, lba, buffer })
+                .collect();
+            members.read_many(&mut reads).is_ok()
+        };
+        if !read {
+            self.work = work;
+            return Ok(None);
+        }
+        let mut failed_roles = 0u32;
+        let (reference, others) = work[..count * bytes].split_at(bytes);
+        for (other, &(member, at, role)) in others.chunks(bytes).zip(&places[1..count]) {
+            if other != reference && members.write(member, at, reference).is_err() {
+                failed_roles |= 1 << role;
+            }
+        }
+        self.work = work;
+        if failed_roles != 0 {
+            self.drop_roles(members, failed_roles, now)?;
+        }
+        Ok(Some(cursor + length))
+    }
+
     fn rebuild_piece<M: Members>(&mut self, members: &mut M, cursor: u64, end: u64, now: u64) -> Result<u64, Error> {
         if self.level == LEVEL_RAID5 {
             return self.rebuild_piece5(members, cursor, end);
@@ -1161,11 +1400,11 @@ impl Array {
             return self.rebuild_piece6(members, cursor, end);
         }
         let (run, copies, n) = self.locate(cursor);
-        let length = run.min(end - cursor).min(PIECE);
+        let length = run.min(end - cursor).min(JOB_PIECE);
         let bytes = length as usize * SECTOR;
         let target_role = self.rebuild.as_ref().map(|r| r.slot.role).ok_or(Error::Busy)?;
         let Some(&(_, target_at)) = copies[..n].iter().find(|c| c.0 == target_role) else { return Ok(cursor + length) };
-        let mut buffer = [0u8; PIECE as usize * SECTOR];
+        let mut buffer = self.take_work(bytes);
         let (mut got, mut failed_roles) = (false, 0u32);
         for &(role, at) in copies[..n].iter().filter(|c| c.0 != target_role) {
             let Some(slot) = self.slot_of_role(role) else { continue };
@@ -1179,12 +1418,13 @@ impl Array {
             self.drop_roles(members, failed_roles, now)?;
         }
         let target = self.rebuild.as_ref().map(|r| (r.slot.member, r.slot.data_offset + target_at));
-        match target {
-            Some((member, at)) if got && members.write(member, at, &buffer[..bytes]).is_ok() => Ok(cursor + length),
-            _ => {
-                self.rebuild = None;
-                Err(Error::Device)
-            }
+        let wrote = matches!(target, Some((member, at)) if got && members.write(member, at, &buffer[..bytes]).is_ok());
+        self.work = buffer;
+        if wrote {
+            Ok(cursor + length)
+        } else {
+            self.rebuild = None;
+            Err(Error::Device)
         }
     }
 
@@ -1422,16 +1662,23 @@ mod tests {
     }
 
     /// Disks that take writes, can be told to fail them, and log every operation in order.
+    /// Writable members. `read_many` is its own (not the trait's default), so the tests run the code that reads a row at
+    /// once: `batches` records how many ranges each call had, and `many_fail` makes every such call fail, which sends
+    /// the array down its one-read-at-a-time fallbacks.
     struct Rw {
         disks: Disks,
         write_fail: Vec<bool>,
         log: Vec<String>,
+        batches: Vec<usize>,
+        write_batches: Vec<usize>,
+        reads: usize,
+        many_fail: bool,
     }
 
     impl Rw {
         fn new(disks: Vec<Vec<u8>>) -> Rw {
             let n = disks.len();
-            Rw { disks: Disks(disks, vec![false; n]), write_fail: vec![false; n], log: Vec::new() }
+            Rw { disks: Disks(disks, vec![false; n]), write_fail: vec![false; n], log: Vec::new(), batches: Vec::new(), write_batches: Vec::new(), reads: 0, many_fail: false }
         }
     }
 
@@ -1443,7 +1690,29 @@ mod tests {
             self.disks.sectors(member)
         }
         fn read(&mut self, member: usize, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
+            self.reads += 1;
             self.disks.read(member, lba, buffer)
+        }
+        fn read_many(&mut self, reads: &mut [Read<'_>]) -> Result<(), (usize, Error)> {
+            if self.many_fail {
+                return Err((0, Error::Device));
+            }
+            self.reads += reads.len();
+            self.batches.push(reads.len());
+            for (index, request) in reads.iter_mut().enumerate() {
+                self.disks.read(request.member, request.lba, request.buffer).map_err(|error| (index, error))?;
+            }
+            Ok(())
+        }
+        fn write_many(&mut self, writes: &[Write<'_>]) -> Result<(), (usize, Error)> {
+            if self.many_fail {
+                return Err((0, Error::Device));
+            }
+            self.write_batches.push(writes.len());
+            for (index, request) in writes.iter().enumerate() {
+                self.write(request.member, request.lba, request.buffer).map_err(|error| (index, error))?;
+            }
+            Ok(())
         }
         fn write(&mut self, member: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
             if self.write_fail[member] {
@@ -1728,6 +1997,13 @@ mod tests {
 
     #[test]
     fn resync_copies_the_first_member_over_a_differing_one() {
+        // both copies of a piece in one `read_many`, and the one-at-a-time fallback when that fails
+        for many_fail in [false, true] {
+            resync_copies_once(many_fail);
+        }
+    }
+
+    fn resync_copies_once(many_fail: bool) {
         let mut dirty = member(2, 1, 10, &[0, 1], 9);
         let at = superblock::super_sector(2, DISK_SECTORS as u64).unwrap() as usize * SECTOR;
         superblock::set_resync(&mut dirty[at..], 0);
@@ -1736,13 +2012,19 @@ mod tests {
         superblock::set_resync(&mut first[at..], 0);
         superblock::reseal(&mut first[at..]);
         let mut rw = Rw::new(vec![first, dirty]);
+        rw.many_fail = many_fail;
         let mut array = Array::assemble(&mut rw, None).unwrap();
         assert!(array.dirty());
         assert_eq!(array.begin_resync(), Err(Error::NotWritable));
         array.start(&mut rw, 1).unwrap();
         array.begin_resync().unwrap();
         assert_eq!(array.begin_resync(), Err(Error::Busy));
+        rw.batches.clear();
         assert_eq!(run_job(&mut array, &mut rw), Job::Resync);
+        if !many_fail {
+            // each piece (cut by `run_job`'s budget) reads both copies in one call
+            assert!(!rw.batches.is_empty() && rw.batches.iter().all(|&n| n == 2), "{:?}", rw.batches);
+        }
         assert!(!array.dirty());
         assert_eq!(data_of(&rw, 0, ARRAY_SECTORS), data_of(&rw, 1, ARRAY_SECTORS));
         assert_eq!(data_of(&rw, 0, 1)[0], 1);
@@ -1929,6 +2211,82 @@ mod tests {
             let other = (lost + 1) % 4;
             rw.write_fail[other] = true;
             assert_eq!(again.write(&mut rw, 0, &[1; SECTOR * 40], 7), Err(Error::Device));
+        }
+    }
+
+    #[test]
+    fn raid5_reads_and_resyncs_a_row_from_every_member_at_once() {
+        let mut rw = striped(LEVEL_RAID5, 2, 4);
+        let mut array = Array::assemble(&mut rw, None).unwrap();
+        array.start(&mut rw, 1).unwrap();
+        let data = pattern(array.sectors());
+        array.write(&mut rw, 0, &data, 2).unwrap();
+
+        // a read over the whole array: one `read_many`, one range per chunk, straight into the caller's buffer
+        rw.batches.clear();
+        let mut back = vec![0u8; data.len()];
+        array.read(&mut rw, 0, &mut back).unwrap();
+        assert_eq!(back, data);
+        assert_eq!(rw.batches, vec![(array.sectors() / array.chunk) as usize]);
+        // the same when that fails: piece by piece, as before
+        rw.many_fail = true;
+        back.fill(0);
+        array.read(&mut rw, 0, &mut back).unwrap();
+        assert_eq!(back, data);
+        rw.many_fail = false;
+
+        // a stale parity byte after a crash: every piece of the resync reads all four members in one call
+        let (_, parity) = model5(2, 4, 3, 0);
+        let at = (DATA_OFFSET + 3 * array.chunk + 1) as usize * SECTOR;
+        rw.disks.0[parity][at] ^= 0x5a;
+        let mut crashed = Array::assemble(&mut rw, None).unwrap();
+        assert!(crashed.dirty());
+        crashed.start(&mut rw, 3).unwrap();
+        crashed.begin_resync().unwrap();
+        rw.batches.clear();
+        assert_eq!(run_job(&mut crashed, &mut rw), Job::Resync);
+        assert!(!rw.batches.is_empty() && rw.batches.iter().all(|&n| n == 4), "{:?}", rw.batches);
+        crashed.stop(&mut rw, 4).unwrap();
+        check_raid5(&rw, 2, 4, crashed.sectors(), &data);
+    }
+
+    #[test]
+    fn raid5_whole_rows_are_written_without_reads_and_a_part_row_reads_data_and_parity_together() {
+        for many_fail in [false, true] {
+            let mut rw = striped(LEVEL_RAID5, 2, 4);
+            rw.many_fail = many_fail;
+            let mut array = Array::assemble(&mut rw, None).unwrap();
+            array.start(&mut rw, 1).unwrap();
+            let row = 3 * array.chunk;
+            let mut data = pattern(array.sectors());
+            // the whole array: whole rows only, so the parity comes from the new data and nothing is read
+            rw.batches.clear();
+            rw.write_batches.clear();
+            rw.reads = 0;
+            array.write(&mut rw, 0, &data, 2).unwrap();
+            assert_eq!(rw.reads, 0, "a whole-row write reads nothing");
+            if !many_fail {
+                assert!(rw.write_batches.iter().all(|&n| n == 4), "data on three members and parity together: {:?}", rw.write_batches);
+            }
+            check_raid5(&rw, 2, 4, array.sectors(), &data);
+
+            // a write from the middle of one row past the end of the next: part row, whole row, part row
+            let (at, length) = (row + 5, row + 7);
+            let fresh: Vec<u8> = (0..length as usize * SECTOR).map(|i| (i * 7 + 3) as u8).collect();
+            rw.batches.clear();
+            rw.write_batches.clear();
+            array.write(&mut rw, at, &fresh, 3).unwrap();
+            data[at as usize * SECTOR..(at + length) as usize * SECTOR].copy_from_slice(&fresh);
+            if !many_fail {
+                // read-modify-write pieces read old data and parity in one call and write both in one call
+                assert!(rw.batches.iter().all(|&n| n == 2), "{:?}", rw.batches);
+                assert!(rw.write_batches.iter().all(|&n| n == 2 || n == 4), "{:?}", rw.write_batches);
+            }
+            array.stop(&mut rw, 4).unwrap();
+            check_raid5(&rw, 2, 4, array.sectors(), &data);
+            let mut back = vec![0u8; data.len()];
+            Array::assemble(&mut rw, None).unwrap().read(&mut rw, 0, &mut back).unwrap();
+            assert_eq!(back, data);
         }
     }
 

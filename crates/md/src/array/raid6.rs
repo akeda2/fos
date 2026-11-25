@@ -50,6 +50,21 @@ impl Array {
     /// Reads every member's piece at member sector `at`. Returns the roles that are missing (absent, or failed now:
     /// those are added to `failed`); more than two is an error.
     fn load6<M: Members>(&self, members: &mut M, at: u64, bytes: usize, bufs: &mut Bufs, failed: &mut u32) -> Result<u32, Error> {
+        // Every member in use at once (`Members::read_many`); a failure sends it the slow way below, which finds which one.
+        let mut gone = 0u32;
+        let all = {
+            let mut reads = alloc::vec::Vec::with_capacity(MAX_MEMBERS);
+            for (role, buf) in bufs.iter_mut().enumerate().take(self.raid_disks as usize) {
+                match self.usable(role as u16, *failed) {
+                    Some((member, base)) => reads.push(crate::Read { member, lba: base + at, buffer: &mut buf[..bytes] }),
+                    None => gone |= 1 << role,
+                }
+            }
+            members.read_many(&mut reads).is_ok()
+        };
+        if all {
+            return if gone.count_ones() > 2 { Err(Error::Device) } else { Ok(gone) };
+        }
         let mut missing = 0u32;
         for role in 0..self.raid_disks as u16 {
             match self.usable(role, *failed) {

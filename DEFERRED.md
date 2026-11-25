@@ -723,6 +723,18 @@ Tapes see just another NIC, so `tape-ip`, DHCP, `smbd`, `httpd` and `router` nee
   (`tools/check_md_mdadm.sh`) and the QEMU test (`make test-mf-md`) are the evidence so far; the resume-a-half-rebuild
   steps of the cross-check were added after its last run.
 - **PPL** logs one piece (up to 32 KiB) per flushed write; entries cannot share a flush (see `docs/md.md` 5d).
+- **RAID 6 Q syndrome without SIMD** (decided 2026-11-25: not now). `gf::mul_add` multiplies byte by byte through
+  log/exp tables, about 100x slower than Linux's PSHUFB method (`lib/raid6/`: split each byte into nibbles, two 16-entry
+  table lookups per 16 bytes). RAID 5 parity is a plain XOR, done 8 bytes at a time in integer registers, which keeps up with
+  SATA SSDs; RAID 6 writes, resync and rebuild will be CPU-bound first. The kernel is built without SSE (`x86_64-fos-kernel`,
+  soft-float), and turning it on everywhere would mean saving vector state on every interrupt and switch, a separate
+  aarch64 path anyway, and care with tapes' FPU state (`fp_level`). The narrow way, if RAID 6 speed ever matters: a
+  `simd_begin()`/`simd_end()` pair (Linux's `kernel_fpu_begin/end`): CR0.TS/CR4.OSFXSR on, XSAVE the current state, run
+  the one loop (`#[target_feature(enable = "ssse3")]`, CPUID-checked, table fallback), XRSTOR, preemption off between.
+  aarch64 would get NEON's TBL the same way. Measure first: `raid6` resync throughput on rack against RAID 5's.
+- **Writes not yet overlapped**: RAID 6 (`write_raid6`, 4 KiB pieces, members in turn) and RAID 0/10 (`write_striped`).
+  RAID 5 and RAID 1 use `write_many` since 2026-11-25 (`docs/md.md` item 9). Only SATA members overlap; NVMe would need
+  the same split of `nvme::Drive` into submit and complete, USB and AoE members stay one at a time.
 
 ## USB hotplug from port-change events (planned 2026-11-17)
 

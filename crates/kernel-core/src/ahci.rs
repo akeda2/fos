@@ -1,5 +1,7 @@
 //! A minimal AHCI (SATA) host bus adapter driver: find SATA disks, read their identity
-//! and move sectors with DMA. Polling only, one command at a time, 512-byte sectors.
+//! and move sectors with DMA. Polling only, one command at a time per drive (commands on
+//! different drives may overlap: `start_read`/`finish_read`, `start_write`/`finish_write`),
+//! 512-byte sectors.
 //!
 //! AHCI in one paragraph. The HBA exposes up to 32 *ports*, each with a register block;
 //! a SATA drive on a port is talked to through structures in RAM the port is pointed at:
@@ -119,6 +121,14 @@ impl Drive {
 
     /// `command` with a feature byte (DATA SET MANAGEMENT's TRIM is feature 1).
     fn command_with(&self, command: u8, feature: u8, lba: u64, count: u32, write: bool, bytes: u32) -> Result<(), Error> {
+        self.issue(command, feature, lba, count, write, bytes)?;
+        self.complete()
+    }
+
+    /// Fills slot 0's header and table and sets its bit in `CI`: the HBA runs the command from here on, and `complete`
+    /// waits for it. Every port has its own command list, table and bounce buffer, so commands on different drives may be
+    /// in flight at once (`start_read`); one drive takes one command at a time.
+    fn issue(&self, command: u8, feature: u8, lba: u64, count: u32, write: bool, bytes: u32) -> Result<(), Error> {
         let list = self.frame + OFFSET_COMMAND_LIST;
         let table = self.frame + OFFSET_COMMAND_TABLE;
         unsafe {
@@ -162,6 +172,11 @@ impl Drive {
         }
         write32(self.registers + P_IS, 0xffff_ffff);
         write32(self.registers + P_CI, 1);
+        Ok(())
+    }
+
+    /// Waits for the command `issue` started: `CI` bit 0 clears when it is done, a task-file error ends it early.
+    fn complete(&self) -> Result<(), Error> {
         let mut failed = false;
         let finished = wait_until(TIMEOUT_TICKS, || {
             if read32(self.registers + P_CI) & 1 == 0 {
@@ -212,6 +227,39 @@ impl Drive {
         self.command(if self.lba48 { ATA_READ_DMA_EXT } else { ATA_READ_DMA }, lba, sectors, false, buffer.len() as u32)?;
         unsafe { core::ptr::copy_nonoverlapping(memory::phys_to_virt((self.frame + OFFSET_BOUNCE) as u64) as *const u8, buffer.as_mut_ptr(), buffer.len()) };
         Ok(())
+    }
+
+    /// `read` in two halves, so reads on several drives overlap (`block::read_many` on the server kernel): this one starts
+    /// a read of `bytes` (at most `MAX_SECTORS` sectors) at `lba` and returns while the drive works; `finish_read` waits for
+    /// it and copies it out. Nothing else may use this drive in between (its one command slot and bounce buffer are busy).
+    pub fn start_read(&self, lba: u64, bytes: usize) -> Result<(), Error> {
+        let sectors = self.check(lba, bytes)?;
+        self.issue(if self.lba48 { ATA_READ_DMA_EXT } else { ATA_READ_DMA }, 0, lba, sectors, false, bytes as u32)
+    }
+
+    /// Waits for the read `start_read` began and copies its `buffer.len()` bytes (the same count) out of the bounce buffer.
+    pub fn finish_read(&self, buffer: &mut [u8]) -> Result<(), Error> {
+        self.complete()?;
+        unsafe { core::ptr::copy_nonoverlapping(memory::phys_to_virt((self.frame + OFFSET_BOUNCE) as u64) as *const u8, buffer.as_mut_ptr(), buffer.len()) };
+        Ok(())
+    }
+
+    /// `write_deferred` in two halves, like `start_read`: the data is copied into this drive's bounce buffer and the
+    /// command started; `finish_write` waits for it. No cache flush (`flush` makes it durable).
+    pub fn start_write(&self, lba: u64, buffer: &[u8]) -> Result<(), Error> {
+        let sectors = self.check(lba, buffer.len())?;
+        unsafe { core::ptr::copy_nonoverlapping(buffer.as_ptr(), memory::phys_to_virt((self.frame + OFFSET_BOUNCE) as u64) as *mut u8, buffer.len()) };
+        self.issue(if self.lba48 { ATA_WRITE_DMA_EXT } else { ATA_WRITE_DMA }, 0, lba, sectors, true, buffer.len() as u32)
+    }
+
+    /// Waits for the write `start_write` began.
+    pub fn finish_write(&self) -> Result<(), Error> {
+        self.complete()
+    }
+
+    /// Whether `other` is this same drive (port): two commands on one port cannot overlap.
+    pub fn same_port(&self, other: &Drive) -> bool {
+        self.registers == other.registers
     }
 
     /// TRIM: DATA SET MANAGEMENT (feature 1) over `ranges` (start, sectors). The payload is 8-byte entries, a 48-bit LBA

@@ -120,7 +120,24 @@ through the `Members` trait. Stages:
    `aoe-export md [slot N] [rw for MAC]` in `settings` waits for `md auto` to bring the array up and is made right after
    each assembly. A disk that carries an md superblock (a member) is never exported on its own, and `md stop` is refused
    while the array is exported. Each write is a read-modify-write of data and parity under the one array lock, so writes
-   are slower than one disk's, and reads are not spread over the members in parallel.
+   are slower than one disk's.
+9. **Using the members at once** (2026-11-25): a resync or rebuild piece is 256 KiB (`JOB_PIECE`) of every member, read
+   with one `Members::read_many` into a heap buffer (`Array::work`); a RAID 5 or RAID 0/10 read takes every chunk straight
+   from its member with one `read_many` into the caller's buffer; RAID 1/10 resync and RAID 6 rows do the same. The
+   kernel's `block::read_many` overlaps SATA drives: each round starts one 128 KiB command on every AHCI port involved
+   (`ahci::Drive::start_read`), then collects them, so a row costs its slowest member, not the sum. Other disks (NVMe,
+   USB, AoE) are read one after another. Any failure falls back to the old piece-by-piece path, which finds the member
+   that failed. The `md-job` thread yields between steps instead of sleeping 10 ms and steps aside for a tick only while
+   block-layer I/O waits for the array lock (`IO_WAITING`). Before this, a 3-SSD RAID 5 on rack resynced at 14 MiB/s per
+   member (8 KiB pieces, members one after another, the sleep). Writes go the same way (`Members::write_many`,
+   `block::write_many`, `ahci::Drive::start_write`): a RAID 5 write that covers whole stripe rows (from a row's start,
+   every member in use, no PPL, no rebuild) reads nothing, since the parity is the XOR of the new data, and writes each
+   256 KiB piece of a row to every member at once; a part row is read-modify-write in pieces of up to 256 KiB (32 KiB with
+   a PPL, one log entry each) with old data and parity read at once and new data and parity written at once; a RAID 1
+   write goes to every mirror at once. The bitmap (or PPL entry) is written and flushed before any of them, as before, so
+   overlapping data and parity does not open a new window. A failed batch is redone one write at a time to find the member.
+   Still one at a time: RAID 6 and RAID 0/10 writes. `make test-mf-md test-mf-md-aoe` (AHCI under QEMU q35); host tests
+   count the batches and check that whole rows read nothing.
 
 `tools/check_md_mdadm.sh` (run as root, loop devices only) is the cross-check against the real driver: mdadm creates RAID 1, 0, 10, 5 and
 6 (every layout), `probe` dumps, writes and rebuilds them, and mdadm must assemble, `check` (0 mismatches) and fsck the results.
