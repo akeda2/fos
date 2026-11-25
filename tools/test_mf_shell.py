@@ -127,7 +127,7 @@ def ext4_trim_nvme_scenario():
 
 
 def ext4_write_scenario():
-    """`ext4 diskN mkfs|mkdir|write|mv|rm`: a partition is added after a shrunk FOSFS one, formatted, written; e2fsck agrees."""
+    """`ext4 diskN mkfs|mkdir|write|mv|rm|chmod`: a partition is added after a shrunk FOSFS one, formatted, written; e2fsck agrees."""
     import subprocess
     import uuid
     e2fsck = "/usr/sbin/e2fsck"
@@ -181,6 +181,11 @@ def ext4_write_scenario():
             check(second.stat().st_blocks < before, "the host image shrank: QEMU saw the discard", f"{before} -> {second.stat().st_blocks}")
             out = machine.run("ext4 disk2 cat /moved.txt")
             check("hej på dig" in out, "files survive a trim", out[-300:])
+            machine.run("ext4 disk2 mkdir /drop")
+            out = machine.run("ext4 disk2 chmod 1777 /drop")
+            check("ext4:" not in out, "chmod sets a folder's bits", out[-300:])
+            out = machine.run("ext4 disk2 chmod 9 /drop")
+            check("ext4:" in out, "chmod refuses a mode that is not octal", out[-300:])
         finally:
             machine.stop()
         if Path(e2fsck).exists():
@@ -201,6 +206,8 @@ def ext4_write_scenario():
                 check("has_journal" in header and "needs_recovery" not in header, "the volume has a journal and is clean", header[-500:])
                 cat = subprocess.run(["/usr/sbin/debugfs", "-R", "cat /moved.txt", str(part)], capture_output=True)
                 check(cat.stdout == "hej på dig".encode(), "debugfs reads what the kernel wrote", repr(cat.stdout))
+                stat = subprocess.run(["/usr/sbin/debugfs", "-R", "stat /drop", str(part)], capture_output=True, text=True).stdout
+                check("Mode:  01777" in stat and "Type: directory" in stat, "debugfs sees chmod's bits on the folder", stat[:300])
 
 
 def shrink_scenario():

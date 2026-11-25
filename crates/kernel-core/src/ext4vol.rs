@@ -402,7 +402,7 @@ fn text_out(out: &mut dyn Write, text: &str) {
     }
 }
 
-const USAGE: &str = "usage: ext4 diskN [ls|cat|info|recover|trim|mkfs|remkfs|mkdir|rm|mv|write] [PATH ...]";
+const USAGE: &str = "usage: ext4 diskN [ls|cat|info|recover|trim|mkfs|remkfs] [PATH ...]\n       ext4 diskN mkdir|rm|mv|write|chmod ... (chmod MODE PATH: octal bits)";
 
 /// Splits "a/b/c" into the folder "a/b" (an inode) and the name "c".
 fn parent_of(writer: &mut Writer<Journaled<Partition>>, path: &str) -> Result<(u32, usize), Error> {
@@ -531,7 +531,7 @@ fn trim(disk: usize, out: &mut dyn Write) {
     }
 }
 
-/// `ext4 diskN mkdir|rm|mv|write ...`
+/// `ext4 diskN mkdir|rm|mv|write|chmod ...`
 fn change(disk: usize, action: &str, rest: &str, out: &mut dyn Write) {
     let fs = match locate(disk - 1).and_then(|partition| ext4::open(partition, stage())) {
         Ok(fs) => fs,
@@ -561,6 +561,15 @@ fn change(disk: usize, action: &str, rest: &str, out: &mut dyn Write) {
         "rm" => {
             let (parent, cut) = parent_of(writer, first)?;
             writer.remove(parent, leaf(first, cut))
+        }
+        // chmod MODE PATH: new permission bits (octal, as chmod(1) takes them); the owner and the file type stay
+        "chmod" => {
+            let mode = u16::from_str_radix(first, 8).ok().filter(|mode| *mode <= 0o7777).ok_or(Error::Invalid)?;
+            let path = second.ok_or(Error::Invalid)?;
+            let (parent, cut) = parent_of(writer, path)?;
+            let folder = writer.inode(parent)?;
+            let inode = writer.lookup(&folder, leaf(path, cut))?.ok_or(Error::NotFound)?;
+            writer.set_owner(inode.number, inode.uid, inode.gid, Some(mode))
         }
         "mv" => {
             let to = second.ok_or(Error::Invalid)?;
@@ -596,7 +605,7 @@ fn change(disk: usize, action: &str, rest: &str, out: &mut dyn Write) {
     }
 }
 
-/// `ext4 diskN [ls|cat|info|recover|mkfs|remkfs|mkdir|rm|mv|write] [ARGS]`; `rest` is what follows the word `ext4`.
+/// `ext4 diskN [ls|cat|info|recover|mkfs|remkfs|mkdir|rm|mv|write|chmod] [ARGS]`; `rest` is what follows the word `ext4`.
 pub fn command(rest: &str, out: &mut dyn Write) {
     let confirmed = rest.split_whitespace().nth(2) == Some("confirm") && matches!(rest.split_whitespace().nth(1), Some("mkfs" | "remkfs"));
     if !confirmed {
@@ -628,7 +637,7 @@ pub fn command(rest: &str, out: &mut dyn Write) {
     if action == "trim" {
         return trim(disk, out);
     }
-    if matches!(action, "mkdir" | "rm" | "mv" | "write") {
+    if matches!(action, "mkdir" | "rm" | "mv" | "write" | "chmod") {
         let mut after = rest.trim_start();
         for _ in 0..2 {
             after = after[after.find(char::is_whitespace).unwrap_or(after.len())..].trim_start();
