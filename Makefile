@@ -199,6 +199,7 @@ kernel-mf:
 # A bootable image with the server kernel in slot 0 (no tapes yet: the server kernel has no tape loader).
 image-mf: loader kernel-mf $(BIOS_STAGES)
 	mkdir -p $(BUILD)/fosfor-mf
+	python3 tools/check_kernel_span.py $(KERNEL_MF_ELF)
 	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_MF_ELF) --output $(BUILD)/fosfor-mf/fosfor.img \
 		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin
 
@@ -389,6 +390,7 @@ stamp-tapes: tapes
 # standard library only).
 image: loader kernel kernel-mf tapes stamp-tapes $(BIOS_STAGES)
 	mkdir -p $(OUT)
+	python3 tools/check_kernel_span.py $(KERNEL_ELF) $(KERNEL_MF_ELF)
 	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_ELF) --output $(IMAGE) \
 		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin $(TAPE_FILES) \
 		--file kernel.embedded=$(KERNEL_ELF) --file kernel.mf=$(KERNEL_MF_ELF)
@@ -474,6 +476,7 @@ run: image
 # Loader + kernel under QEMU + OVMF, including a framebuffer screendump check.
 test: image
 	python3 tools/check_hal.py
+	python3 tools/check_kernel_span.py $(KERNEL_ELF) $(KERNEL_MF_ELF)
 	python3 tools/check_user_pointers.py
 	python3 tools/check_abi_support.py
 	python3 tools/check_public.py

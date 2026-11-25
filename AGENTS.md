@@ -59,7 +59,9 @@ when present (`docs/private.md`). Never copy private code, names or docs into pu
   page at `0x5000` must stay untouched). Either way the kernel ELF64 is read by LBA from an A/B
   slot and entered in long mode, identity-mapped, interrupts off; it is a position-independent
   image placed wherever the loader chooses (BIOS: chosen from the E820 map, the lowest 2 MiB-aligned
-  usable region with about 10 MiB free above 1 MiB). `BootInfo` (`abi/src/lib.rs`, version 5) is the loader/kernel ABI, passed by
+  usable region with about 10 MiB free above 1 MiB). Stage two reserves 8 MiB (`KERNEL_SPAN`) for the kernel's
+  in-memory image, zero-filled `.bss` included: `tools/check_kernel_span.py` (run by `make image`, `image-mf`, `test`) fails a
+  kernel over it, so big buffers come from the page allocator (`nicctl::reserve_frames`, `ext4vol::cache`), not statics. `BootInfo` (`abi/src/lib.rs`, version 5) is the loader/kernel ABI, passed by
   pointer; validate magic, version and size. Stage two writes it by hand, so a unit test in
   `abi` pins its layout: change both together. On BIOS `runtime_services` is 0 and the memory
   map is E820 converted to UEFI descriptor types (usable RAM below 1 MiB is "loader data").

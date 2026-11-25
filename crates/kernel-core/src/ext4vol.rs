@@ -23,16 +23,36 @@ pub struct Partition {
 /// Read cache for the volume in use (docs/ext4.md "Performance"): 512 slots of 4 KiB. A folder of thousands of names or the
 /// allocation bitmaps are read from the disk once, not on every use. It is emptied whenever a volume is located or made, so
 /// nothing written behind its back (`sector`, `foscopy`, another tool) can be served stale.
+///
+/// The 2 MiB of data come from the page allocator on first use, not .bss: the BIOS loader reserves only 8 MiB for the whole
+/// kernel image (`KERNEL_SPAN`, stage2.S; `tools/check_kernel_span.py`). If that much is not to be had, the cache halves
+/// until it fits, down to the one static slot.
 const CACHE_SLOTS: usize = 512;
 static mut CACHE_TAGS: [u64; CACHE_SLOTS] = [0; CACHE_SLOTS];
-static mut CACHE_DATA: [u8; CACHE_SLOTS * 4096] = [0; CACHE_SLOTS * 4096];
+static mut CACHE_FALLBACK: [u8; 4096] = [0; 4096];
 static mut CACHE: Option<Cache> = None;
 
 fn cache() -> &'static mut Cache {
-    // SAFETY: one shell command at a time uses the volume code; the statics are only reached from here.
+    // SAFETY: one shell command at a time uses the volume code; the statics are only reached from here, and the allocated
+    // block is never freed, so it is 'static.
     unsafe {
         let slot = &mut *core::ptr::addr_of_mut!(CACHE);
-        slot.get_or_insert_with(|| Cache::new(&mut *core::ptr::addr_of_mut!(CACHE_TAGS), &mut *core::ptr::addr_of_mut!(CACHE_DATA)))
+        slot.get_or_insert_with(|| {
+            let tags = &mut *core::ptr::addr_of_mut!(CACHE_TAGS);
+            let mut slots = CACHE_SLOTS;
+            let mut data: &'static mut [u8] = &mut *core::ptr::addr_of_mut!(CACHE_FALLBACK);
+            while slots > 1 {
+                // Uncleared data: the `clear` below marks every slot empty, and a slot is read only after it was filled.
+                if let Some(physical) = crate::memory::allocate_contiguous_uncleared(slots as u64, None) {
+                    data = core::slice::from_raw_parts_mut(crate::memory::phys_to_virt(physical) as *mut u8, slots * 4096);
+                    break;
+                }
+                slots /= 2;
+            }
+            let mut cache = Cache::new(&mut tags[..slots], data);
+            cache.clear(); // the tags start at 0, which would name block 0
+            cache
+        })
     }
 }
 

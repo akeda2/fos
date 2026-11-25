@@ -380,6 +380,8 @@ pub fn install(nic: Nic) -> Option<usize> {
         }
         (*core::ptr::addr_of_mut!(NICS))[NIC_COUNT] = Some(nic);
         NIC_COUNT += 1;
+        // Its receive FIFO for tapes, now rather than in the receive path (`nicctl::reserve_frames`).
+        crate::nicctl::reserve_frames(NIC_COUNT - 1);
         Some(NIC_COUNT - 1)
     }
 }

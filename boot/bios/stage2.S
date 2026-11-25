@@ -438,7 +438,8 @@ rh_error:
     ret
 
 /* ---- where the kernel goes: from the E820 map, not a fixed address ----
- * The kernel image needs KERNEL_SPAN bytes (8 MiB; the real image is about 2 MiB, its .bss included) and the ELF as read
+ * The kernel image needs KERNEL_SPAN bytes (8 MiB; the real images are about 3 MiB, .bss included, and
+ * tools/check_kernel_span.py fails a build that would not fit, since KUP cannot update this code) and the ELF as read
  * from disk needs the slot's size again (up to 8 MiB) as a staging area, both below 4 GiB (the copy and the page tables
  * here reach that far). Take the lowest usable E820 region above 1 MiB that can hold both back to back, starting on a
  * 2 MiB boundary: kernel_base = that start, staging_base = kernel_base + KERNEL_SPAN. Fails with a message if there is none

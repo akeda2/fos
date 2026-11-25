@@ -127,10 +127,6 @@ pub fn init() {
         }
     }
     nicctl::set_frame_handler(frame_hook);
-    nicctl::set_frame_allocator(|bytes| match pmm::allocate((bytes as u64).div_ceil(pmm::FRAME), None) {
-        Some(address) => vm::direct(address) as *mut u8,
-        None => core::ptr::null_mut(),
-    });
     // PCI order whatever the driver, with `nic N MAC` pins from settings applied (`kernel_core::nicorder`): the card's
     // number is its place here, and each driver's `init` takes that number as its index.
     let kinds = [Kind::E1000, Kind::Rtl8168, Kind::Rtl8125, Kind::Rtl8139, Kind::ThreeCom, Kind::Virtio];
