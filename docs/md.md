@@ -145,10 +145,24 @@ through the `Members` trait. Stages:
    Still one at a time: RAID 6 and RAID 0/10 writes. `make test-mf-md test-mf-md-aoe` (AHCI under QEMU q35); host tests
    count the batches and check that whole rows read nothing.
    `md` shows where a running or finished job's time went (the overlapped commands' waiting, copying and starting, other
-   member I/O, md's own work, the time between steps; the commands, how many went direct, their size). On rack, a RAID 5
-   resync of three SATA SSDs with 128 KiB bounce commands: 460 MiB/s of the array, 86% of the time waiting for the drives,
-   4% copying, 7% md's own work; so overlapping md's work with the next piece (pipelining) could win at most about a
-   tenth, while bigger commands and a queue per drive (NCQ) go after the waiting.
+   member I/O, md's own work, the time between steps; the commands, their size, how many went direct and how many were
+   read ahead). On rack, a RAID 5 resync of three SATA SSDs with 128 KiB bounce commands: 469 MiB/s of the array, 86% of
+   the time waiting for the drives, 4% copying, 7% md's own work; with direct 512 KiB commands 577 MiB/s (88% waiting,
+   10% md's work), each member at about 70% of what it reads alone (409-441 MB/s).
+10. **Queued and read ahead** (2026-11-25): a RAID 5 resync or rebuild starts the next piece's reads before it waits for
+   the current one (`Array::read_job`, `Members::read_ahead`), into a second buffer (`Array::ahead`), so each member
+   always has the next command while md XORs and writes the current piece. On the kernel side `block::start_ahead` puts
+   each read on the drive as a queued command (NCQ: READ FPDMA QUEUED on a tag of its own, `ahci::Drive::start_queued`)
+   and `Ahead::finish` only waits for it; a drive that cannot queue reads it when it is collected. A read-ahead may run
+   into the next `step` (the job thread lets go of the array lock between steps), so every array write first collects
+   it (`Array::settle`): it could hold the old contents of the sectors being written. A job that ends or fails collects it
+   too, and an array dropped with one in flight leaks the buffer rather than free memory a drive still writes. NCQ is on
+   on the server kernel for every SATA read and write where drive (IDENTIFY word 76) and HBA (CAP.SNCQ) have it, up to 8
+   tags; a plain command (flush, TRIM) waits until the queue is empty; an error fails every queued command, and the drive
+   is taken out of its error state by reading its NCQ error log. `ahci no-ncq` in `settings` turns queuing off. RAID 6
+   and RAID 1/10 jobs still read one piece at a time. A host test lands each read-ahead late, from what the disks held
+   when it started, and checks that writes between steps never see stale data; `make test-mf-md-aoe` checks that QEMU's
+   AHCI took the resync's reads queued.
 
 `tools/check_md_mdadm.sh` (run as root, loop devices only) is the cross-check against the real driver: mdadm creates RAID 1, 0, 10, 5 and
 6 (every layout), `probe` dumps, writes and rebuilds them, and mdadm must assemble, `check` (0 mismatches) and fsck the results.

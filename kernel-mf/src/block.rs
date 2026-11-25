@@ -2,7 +2,7 @@
 //! `block.rs` (SATA, NVMe and USB mass storage). Registration happens on the boot CPU
 //! during start-up; reads and writes go straight to the drivers.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use kernel_core::{ahci, nvme};
 
 pub const MAX_DISKS: usize = 16;
@@ -43,6 +43,20 @@ pub enum Error {
 }
 
 static mut DISKS: [Option<Disk>; MAX_DISKS] = [None; MAX_DISKS];
+
+/// One lock per disk for its SATA commands. A port's tag 0 (its table, the bounce buffer) and the driver's bookkeeping of
+/// queued tags take one caller at a time: md's boot scan reads every disk while the service thread reads `settings` from
+/// the boot disk, with no file lock between them. Taken innermost (after `tapefs::lock` and md's lock), several in
+/// ascending disk order, and never across a call back into the block layer.
+static PORTS: [crate::sched::SleepMutex<()>; MAX_DISKS] = [const { crate::sched::SleepMutex::new(()) }; MAX_DISKS];
+
+/// The port locks of `disks` (indices into `DISKS`), taken in ascending order.
+fn lock_ports(disks: impl Iterator<Item = usize>) -> alloc::vec::Vec<crate::sched::SleepGuard<'static, ()>> {
+    let mut list: alloc::vec::Vec<usize> = disks.collect();
+    list.sort_unstable();
+    list.dedup();
+    list.into_iter().map(|disk| PORTS[disk].lock()).collect()
+}
 static mut COUNT: usize = 0;
 
 pub fn register(backend: Backend, sectors: u64, model: [u8; 40], origin: &str) -> Option<usize> {
@@ -191,6 +205,7 @@ fn read_group(reads: &mut [Read<'_>]) -> Result<(), (usize, Error)> {
     for (index, request) in reads.iter().enumerate() {
         addresses[index] = request.buffer.as_ptr() as u64;
     }
+    let _ports = lock_ports(reads.iter().zip(&drives).filter(|(_, drive)| drive.is_some()).map(|(request, _)| request.disk));
     overlap(
         &drives[..reads.len()],
         &lengths,
@@ -276,6 +291,137 @@ fn segments(_: u64, _: usize, _: bool, _: &mut [ahci::Segment; ahci::MAX_SEGMENT
     None
 }
 
+/// The tags after 0 of each disk that a read-ahead holds (bit n: tag n). Tag 0 is the one the plain calls use.
+static AHEAD_TAGS: [AtomicU32; MAX_DISKS] = [const { AtomicU32::new(0) }; MAX_DISKS];
+
+fn claim_tag(disk: usize, depth: usize) -> Option<usize> {
+    (1..depth.min(32)).find(|&tag| AHEAD_TAGS[disk].fetch_or(1 << tag, Ordering::AcqRel) & (1 << tag) == 0)
+}
+
+fn release_tag(disk: usize, tag: usize) {
+    AHEAD_TAGS[disk].fetch_and(!(1 << tag), Ordering::Release);
+}
+
+/// Reads `start_ahead` began, and how far each got.
+pub struct Ahead {
+    ranges: [Option<AheadRange>; MANY],
+    count: usize,
+}
+
+#[derive(Clone, Copy)]
+struct AheadRange {
+    disk: usize,
+    lba: u64,
+    address: u64,
+    bytes: usize,
+    /// The drive, tag and command while the read is queued there; None once collected, or when it was not queued.
+    queued: Option<(ahci::Drive, usize, Command)>,
+}
+
+/// Starts reading `reads` ahead of time, for `Ahead::finish` to collect later: each range that a SATA drive can take as
+/// one queued command (NCQ, a free tag, its pages in the kernel's tables, at most the drive's direct limit) goes on the
+/// drive now, beside whatever else it has queued; the rest are read when `finish` is called. An md resync starts the
+/// next piece this way before it waits for the current one, so every member always has a command to work on.
+///
+/// # Safety
+/// The buffers must stay allocated and untouched until `finish` returns or the `Ahead` is dropped (dropping it waits for
+/// the queued reads): the drives write into them until then.
+pub unsafe fn start_ahead(reads: &mut [Read<'_>]) -> Ahead {
+    let mut ahead = Ahead { ranges: [None; MANY], count: reads.len().min(MANY) };
+    for (index, request) in reads.iter_mut().take(MANY).enumerate() {
+        let (address, bytes) = (request.buffer.as_mut_ptr() as u64, request.buffer.len());
+        let mut range = AheadRange { disk: request.disk, lba: request.lba, address, bytes, queued: None };
+        if let Ok(Disk { backend: Backend::Ahci(drive), .. }) = checked(request.disk, request.lba, bytes) {
+            range.queued = queue_read(request.disk, drive, request.lba, address, bytes);
+        }
+        ahead.ranges[index] = Some(range);
+    }
+    ahead
+}
+
+/// One queued read straight into the memory at `address`, on a tag of its own; None when the drive cannot take it so.
+fn queue_read(disk: usize, drive: ahci::Drive, lba: u64, address: u64, bytes: usize) -> Option<(ahci::Drive, usize, Command)> {
+    if drive.queue_depth() < 2 || bytes == 0 || bytes > drive.max_direct_sectors() * 512 {
+        return None;
+    }
+    let mut list = [ahci::Segment { physical: 0, bytes: 0 }; ahci::MAX_SEGMENTS];
+    let count = segments(address, bytes, true, &mut list)?;
+    let tag = claim_tag(disk, drive.queue_depth())?;
+    let _port = PORTS[disk].lock();
+    match timed(&MANY_START, || drive.start_queued(tag, lba, &list[..count], false)) {
+        Ok(()) => Some((drive, tag, Command { bytes, direct: true })),
+        Err(_) => {
+            release_tag(disk, tag);
+            None
+        }
+    }
+}
+
+impl Ahead {
+    /// Whether `reads` are the very ranges and buffers this was started on.
+    pub fn matches(&self, reads: &[Read<'_>]) -> bool {
+        reads.len() == self.count
+            && reads.iter().zip(&self.ranges).all(|(request, range)| {
+                range.is_some_and(|range| {
+                    (range.disk, range.lba, range.address, range.bytes)
+                        == (request.disk, request.lba, request.buffer.as_ptr() as u64, request.buffer.len())
+                })
+            })
+    }
+
+    /// Collects the reads into `reads` (the ranges `start_ahead` was given, `matches`): waits for the queued ones and
+    /// reads the rest now, as `read_many` would. On failure: the index of a range that failed, once every queued read
+    /// has been waited for.
+    pub fn finish(mut self, reads: &mut [Read<'_>]) -> Result<(), (usize, Error)> {
+        if !self.matches(reads) {
+            drop(self);
+            return read_many(reads);
+        }
+        let mut failed = None;
+        let mut queued = [false; MANY];
+        for index in 0..self.count {
+            let Some(range) = self.ranges[index].as_mut() else { continue };
+            let Some((drive, tag, command)) = range.queued.take() else { continue };
+            queued[index] = true;
+            let result = timed(&MANY_WAIT, || {
+                let _port = PORTS[range.disk].lock();
+                drive.wait_queued(tag)
+            });
+            release_tag(range.disk, tag);
+            match result {
+                Ok(()) => {
+                    counted(command);
+                    MANY_AHEAD.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => failed = failed.or(Some(index)),
+            }
+        }
+        if let Some(index) = failed {
+            return Err((index, Error::Device));
+        }
+        let mut which = [0usize; MANY];
+        let mut rest = alloc::vec::Vec::new();
+        for (index, request) in reads.iter_mut().enumerate().filter(|(index, _)| !queued[*index]) {
+            which[rest.len()] = index;
+            rest.push(Read { disk: request.disk, lba: request.lba, buffer: &mut *request.buffer });
+        }
+        read_many(&mut rest).map_err(|(index, error)| (which[index], error))
+    }
+}
+
+impl Drop for Ahead {
+    /// Waits for what is still queued (the buffers must not be given back while a drive writes into them).
+    fn drop(&mut self) {
+        for range in self.ranges.iter_mut().flatten() {
+            if let Some((drive, tag, _)) = range.queued.take() {
+                let _port = PORTS[range.disk].lock();
+                let _ = drive.wait_queued(tag);
+                release_tag(range.disk, tag);
+            }
+        }
+    }
+}
+
 /// One range for `write_many`.
 pub struct Write<'a> {
     pub disk: usize,
@@ -309,6 +455,7 @@ fn write_group(writes: &[Write<'_>], guard: bool) -> Result<(), (usize, Error)> 
         }
         lengths[index] = request.buffer.len();
     }
+    let _ports = lock_ports(writes.iter().zip(&drives).filter(|(_, drive)| drive.is_some()).map(|(request, _)| request.disk));
     overlap(
         &drives[..writes.len()],
         &lengths,
@@ -343,6 +490,8 @@ pub struct ManyTimes {
     /// Of those, the ones that moved the caller's memory itself (no bounce copy).
     pub direct: u64,
     pub bytes: u64,
+    /// Of those, reads `start_ahead` queued before they were waited for.
+    pub ahead: u64,
 }
 
 impl ManyTimes {
@@ -355,6 +504,7 @@ impl ManyTimes {
             commands: self.commands - earlier.commands,
             direct: self.direct - earlier.direct,
             bytes: self.bytes - earlier.bytes,
+            ahead: self.ahead - earlier.ahead,
         }
     }
 }
@@ -365,6 +515,7 @@ static MANY_COPY: AtomicU64 = AtomicU64::new(0);
 static MANY_COMMANDS: AtomicU64 = AtomicU64::new(0);
 static MANY_DIRECT: AtomicU64 = AtomicU64::new(0);
 static MANY_BYTES: AtomicU64 = AtomicU64::new(0);
+static MANY_AHEAD: AtomicU64 = AtomicU64::new(0);
 
 pub fn many_times() -> ManyTimes {
     ManyTimes {
@@ -374,6 +525,7 @@ pub fn many_times() -> ManyTimes {
         commands: MANY_COMMANDS.load(Ordering::Relaxed),
         direct: MANY_DIRECT.load(Ordering::Relaxed),
         bytes: MANY_BYTES.load(Ordering::Relaxed),
+        ahead: MANY_AHEAD.load(Ordering::Relaxed),
     }
 }
 
@@ -462,7 +614,10 @@ fn unguarded(disk: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
 /// Makes the writes so far durable (SATA: FLUSH CACHE).
 pub fn flush(disk: usize) -> Result<(), Error> {
     match checked(disk, 0, 0)?.backend {
-        Backend::Ahci(drive) => drive.flush().map_err(|_| Error::Device),
+        Backend::Ahci(drive) => {
+            let _port = PORTS[disk].lock();
+            drive.flush().map_err(|_| Error::Device)
+        }
         Backend::Md => crate::mdvol::flush(),
         Backend::Aoe(remote) => crate::aoedisk::flush(remote),
         _ => Ok(()),
@@ -475,6 +630,7 @@ fn write_with(disk: usize, lba: u64, buffer: &[u8], flush: bool) -> Result<(), E
         Backend::Ahci(drive) => {
             write_group(&[Write { disk, lba, buffer }], false).map_err(|(_, error)| error)?;
             if flush {
+                let _port = PORTS[disk].lock();
                 drive.flush().map_err(|_| Error::Device)?;
             }
         }
@@ -506,7 +662,10 @@ pub fn discard(disk: usize, ranges: &[(u64, u64)]) -> Result<(), Error> {
         return Err(Error::Unsupported);
     }
     match info.backend {
-        Backend::Ahci(drive) => drive.discard(ranges).map_err(|error| if error == ahci::Error::Unsupported { Error::Unsupported } else { Error::Device }),
+        Backend::Ahci(drive) => {
+            let _port = PORTS[disk].lock();
+            drive.discard(ranges).map_err(|error| if error == ahci::Error::Unsupported { Error::Unsupported } else { Error::Device })
+        }
         Backend::Nvme(drive) => drive.discard(ranges).map_err(|error| if error == nvme::Error::Unsupported { Error::Unsupported } else { Error::Device }),
         Backend::Usb(_) | Backend::Md | Backend::Aoe(_) => Err(Error::Unsupported),
         #[cfg(target_arch = "aarch64")]

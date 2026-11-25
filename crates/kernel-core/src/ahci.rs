@@ -1,9 +1,15 @@
 //! A minimal AHCI (SATA) host bus adapter driver: find SATA disks, read their identity
-//! and move sectors with DMA. Polling only, one command at a time per drive (commands on
-//! different drives may overlap: `start_read`, `wait`, `copy_out`; `stage`, `start_staged_write`,
-//! `wait`; `start_direct`), 512-byte sectors. Data goes through a per-drive bounce buffer,
-//! or with `start_direct` straight to and from the caller's memory, described by physical
-//! segments (the server kernel looks them up in its page tables).
+//! and move sectors with DMA. Polling only, 512-byte sectors. Commands on different drives
+//! may overlap (`start_read`, `wait`, `copy_out`; `stage`, `start_staged_write`, `wait`;
+//! `start_direct`). Data goes through a per-drive bounce buffer, or with `start_direct`
+//! straight to and from the caller's memory, described by physical segments (the server
+//! kernel looks them up in its page tables).
+//!
+//! Native Command Queuing (NCQ), when the drive, the HBA and `set_ncq` allow it: reads and
+//! writes become READ/WRITE FPDMA QUEUED, and `start_queued` puts up to `queue_depth` of them
+//! on one drive at once, each in its own command slot (the *tag*). The drive then works on
+//! the next while the host is still busy with the last, and may reorder them. Tag 0 is the
+//! one every plain call (`read`, `write`, `start_direct`...) uses.
 //!
 //! AHCI in one paragraph. The HBA exposes up to 32 *ports*, each with a register block;
 //! a SATA drive on a port is talked to through structures in RAM the port is pointed at:
@@ -12,7 +18,9 @@
 //! Register H2D FIS (the ATA command and its LBA/count) and a *PRDT*, the scatter/gather
 //! list of the data buffers. Software fills slot 0's header and table, sets bit 0 of the
 //! port's `CI` register, and the HBA runs the command; the bit clears when it is done
-//! and the task-file register says whether it worked.
+//! and the task-file register says whether it worked. A queued command also sets its bit
+//! in `SACT` first; `CI` clears once the drive has taken it, `SACT` when it is done
+//! (the drive's Set Device Bits FIS).
 //!
 //! The firmware's own AHCI driver may have left ports running when it handed over, so
 //! each port is stopped before it is pointed at fresh structures. The HBA is not reset:
@@ -35,10 +43,29 @@ pub const MAX_SEGMENTS: usize = (0x1000 - OFFSET_COMMAND_TABLE - 0x80) / 16;
 /// The largest byte count of one PRDT entry (its 22-bit DBC field is the count minus one).
 const PRD_MAX: u64 = 4 << 20;
 const TIMEOUT_TICKS: u64 = 500;
+/// Most commands queued on one drive (tags 0..TAGS). Two or three already keep a drive streaming; each tag costs a
+/// command table frame.
+pub const TAGS: usize = 8;
+
+/// Whether drives that can queue do (`set_ncq`). Off until a kernel turns it on: the embedded kernel keeps one plain
+/// command at a time.
+static NCQ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Lets drives that support NCQ queue their reads and writes (the server kernel at boot; `settings` `ahci no-ncq` turns
+/// it off again). Commands already queued finish as they are; the next plain command waits for them.
+pub fn set_ncq(on: bool) {
+    NCQ.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn ncq() -> bool {
+    NCQ.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 const HBA_CAP: usize = 0x00;
 /// CAP.S64A: the HBA takes 64-bit addresses in PRDT entries and command headers.
 const CAP_S64A: u32 = 1 << 31;
+/// CAP.SNCQ: the HBA handles queued commands (Set Device Bits FIS, `SACT`).
+const CAP_SNCQ: u32 = 1 << 30;
 const HBA_GHC: usize = 0x04;
 const HBA_IS: usize = 0x08;
 const HBA_PI: usize = 0x0c;
@@ -58,6 +85,7 @@ const P_TFD: usize = 0x20;
 const P_SIG: usize = 0x24;
 const P_SSTS: usize = 0x28;
 const P_SERR: usize = 0x30;
+const P_SACT: usize = 0x34;
 const P_CI: usize = 0x38;
 
 const CMD_START: u32 = 1 << 0;
@@ -78,13 +106,26 @@ const ATA_WRITE_DMA_EXT: u8 = 0x35;
 const ATA_DATA_SET_MANAGEMENT: u8 = 0x06;
 const ATA_FLUSH_CACHE: u8 = 0xe7;
 const ATA_FLUSH_CACHE_EXT: u8 = 0xea;
+const ATA_READ_FPDMA_QUEUED: u8 = 0x60;
+const ATA_WRITE_FPDMA_QUEUED: u8 = 0x61;
+/// READ LOG EXT (PIO in): page 10h, the NCQ error log, is what takes a drive out of the error state a failed queued
+/// command leaves it in (until then it refuses queued commands).
+const ATA_READ_LOG_EXT: u8 = 0x2f;
+const LOG_NCQ_ERROR: u64 = 0x10;
 
-// Layout of what each drive gets: one frame of structures, then the bounce buffer (`FRAMES` contiguous frames in all).
+// Layout of what each drive gets: one frame of structures, then the bounce buffer, then a command table frame for each
+// tag after 0 (`FRAMES` contiguous frames in all).
 const OFFSET_COMMAND_LIST: usize = 0x000; // 1 KiB aligned: 32 headers of 32 bytes
 const OFFSET_RECEIVED_FIS: usize = 0x400; // 256-byte aligned
-const OFFSET_COMMAND_TABLE: usize = 0x800; // 128-byte aligned: CFIS, then the PRDT at +0x80
+/// The driver's own word: the tags an error recovery aborted whose `wait` has not yet reported it (the HBA never looks
+/// at 0x500-0x7ff).
+const OFFSET_ABORTED: usize = 0x600;
+/// And the tags whose command in flight is a queued one (its error shows only as a task-file error interrupt status).
+const OFFSET_QUEUED: usize = 0x604;
+const OFFSET_COMMAND_TABLE: usize = 0x800; // 128-byte aligned: CFIS, then the PRDT at +0x80 (tag 0)
 const OFFSET_BOUNCE: usize = 0x1000; // MAX_SECTORS * 512 = 128 KiB
-const FRAMES: usize = 1 + MAX_SECTORS * 512 / 4096;
+const OFFSET_TABLES: usize = OFFSET_BOUNCE + MAX_SECTORS * 512; // tags 1.., one frame each
+const FRAMES: usize = OFFSET_TABLES / 4096 + TAGS - 1;
 
 /// A physically contiguous piece of the caller's memory for `start_direct`: an even address and an even byte count (AHCI
 /// 1.3.1, 4.2.3.3: DBA bit 0 is reserved, DBC must say an even count).
@@ -131,6 +172,9 @@ pub struct Drive {
     lba48: bool,
     /// CAP.S64A of its HBA: PRDT entries may point above 4 GiB.
     dma64: bool,
+    /// Commands it can queue: the least of IDENTIFY word 75 (depth), the HBA's command slots and `TAGS`; 1 when the
+    /// drive (word 76 bit 8) or the HBA (CAP.SNCQ) cannot queue.
+    depth: u8,
     /// IDENTIFY word 169 bit 0: DATA SET MANAGEMENT with the TRIM feature.
     can_trim: bool,
     pub model: [u8; 40],
@@ -145,31 +189,90 @@ impl Drive {
     /// `command` with a feature byte (DATA SET MANAGEMENT's TRIM is feature 1).
     fn command_with(&self, command: u8, feature: u8, lba: u64, count: u32, write: bool, bytes: u32) -> Result<(), Error> {
         self.issue_bounce(command, feature, lba, count, write, bytes)?;
-        self.complete()
+        self.complete(0)
     }
 
-    /// `issue` with the bounce buffer as the one data segment (none when `bytes` is 0).
+    /// `issue` on tag 0 with the bounce buffer as the one data segment (none when `bytes` is 0).
     fn issue_bounce(&self, command: u8, feature: u8, lba: u64, count: u32, write: bool, bytes: u32) -> Result<(), Error> {
         let bounce = [Segment { physical: (self.frame + OFFSET_BOUNCE) as u64, bytes: u64::from(bytes) }];
-        self.issue(command, feature, lba, count, write, if bytes == 0 { &[] } else { &bounce })
+        self.issue(0, command, feature, lba, count, write, if bytes == 0 { &[] } else { &bounce })
     }
 
-    /// Fills slot 0's header and table and sets its bit in `CI`: the HBA runs the command from here on, and `complete`
-    /// waits for it. Every port has its own command list, table and bounce buffer, so commands on different drives may be
-    /// in flight at once (`start_read`); one drive takes one command at a time.
-    fn issue(&self, command: u8, feature: u8, lba: u64, count: u32, write: bool, segments: &[Segment]) -> Result<(), Error> {
-        let list = self.frame + OFFSET_COMMAND_LIST;
-        let table = self.frame + OFFSET_COMMAND_TABLE;
+    /// Whether reads and writes go out queued (READ/WRITE FPDMA QUEUED) now.
+    fn queued(&self) -> bool {
+        self.depth > 1 && ncq()
+    }
+
+    /// Commands `start_queued` may have on this drive at once (tags 0..depth); 1 when it does not queue.
+    pub fn queue_depth(&self) -> usize {
+        if self.queued() { usize::from(self.depth) } else { 1 }
+    }
+
+    /// The queue depth found at boot (1: the drive or its HBA does not queue), whatever `set_ncq` says now.
+    pub fn can_queue(&self) -> usize {
+        usize::from(self.depth)
+    }
+
+    fn header(&self, tag: usize) -> usize {
+        self.frame + OFFSET_COMMAND_LIST + 32 * tag
+    }
+
+    fn table(&self, tag: usize) -> usize {
+        if tag == 0 { self.frame + OFFSET_COMMAND_TABLE } else { self.frame + OFFSET_TABLES + (tag - 1) * 0x1000 }
+    }
+
+    fn aborted(&self) -> *mut u32 {
+        memory::phys_to_virt((self.frame + OFFSET_ABORTED) as u64) as *mut u32
+    }
+
+    fn queued_tags(&self) -> *mut u32 {
+        memory::phys_to_virt((self.frame + OFFSET_QUEUED) as u64) as *mut u32
+    }
+
+    /// Fills tag `tag`'s header and table and rings the port: the HBA runs the command from here on, and `complete` waits
+    /// for it. Every port has its own command list, tables and bounce buffer, so commands on different drives may be in
+    /// flight at once (`start_read`). On a drive that queues, a read or write goes out as its FPDMA QUEUED form beside
+    /// the others in flight; any other command first waits until the drive has finished them all (ATA forbids a
+    /// non-queued command while queued ones are outstanding), so it never needs more than tag 0.
+    #[allow(clippy::too_many_arguments)]
+    fn issue(&self, tag: usize, command: u8, feature: u8, lba: u64, count: u32, write: bool, segments: &[Segment]) -> Result<(), Error> {
+        let queued = self.queued() && matches!(command, ATA_READ_DMA_EXT | ATA_WRITE_DMA_EXT);
+        if tag >= TAGS || (tag > 0 && !queued) {
+            return Err(Error::Unsupported);
+        }
+        if !queued {
+            // A plain command: whatever is queued finishes first (its owner's `wait` still finds it done).
+            let quiet = wait_until(TIMEOUT_TICKS, || read32(self.registers + P_SACT) == 0 && read32(self.registers + P_CI) == 0);
+            if !quiet || !wait_until(TIMEOUT_TICKS, || read32(self.registers + P_TFD) & (TFD_BUSY | TFD_DRQ) == 0) {
+                return self.recover(0, Error::Timeout);
+            }
+        }
+        self.fill(tag, queued, command, feature, lba, count, write, segments);
+        self.ring(tag, queued);
+        Ok(())
+    }
+
+    /// Writes tag `tag`'s command header and table: the command FIS (its queued form when `queued`) and one PRDT entry
+    /// per segment.
+    #[allow(clippy::too_many_arguments)]
+    fn fill(&self, tag: usize, queued: bool, command: u8, feature: u8, lba: u64, count: u32, write: bool, segments: &[Segment]) {
+        let (list, table) = (self.header(tag), self.table(tag));
         unsafe {
             core::ptr::write_bytes(memory::phys_to_virt(table as u64) as *mut u8, 0, 0x80 + 16 * segments.len());
             // 28-bit commands carry LBA bits 27:24 in the device register; 48-bit ones
-            // carry bits 47:24 in the second LBA byte group.
-            let ext = matches!(command, ATA_READ_DMA_EXT | ATA_WRITE_DMA_EXT | ATA_FLUSH_CACHE_EXT | ATA_DATA_SET_MANAGEMENT);
+            // carry bits 47:24 in the second LBA byte group. A queued command moves the sector count to the features
+            // field and carries its tag in count bits 7:3 (ATA8-ACS 7.23, 7.62).
+            let ext = matches!(command, ATA_READ_DMA_EXT | ATA_WRITE_DMA_EXT | ATA_FLUSH_CACHE_EXT | ATA_DATA_SET_MANAGEMENT | ATA_READ_LOG_EXT);
+            let (command, feature, count) = match (queued, write) {
+                (true, false) => (ATA_READ_FPDMA_QUEUED, count, (tag as u32) << 3),
+                (true, true) => (ATA_WRITE_FPDMA_QUEUED, count, (tag as u32) << 3),
+                (false, _) => (command, u32::from(feature), count),
+            };
             let fis = [
                 0x27u8, // FIS type: Register Host-to-Device
                 0x80,   // bit 7: this FIS carries a command
                 command,
-                feature,
+                feature as u8,
                 lba as u8,
                 (lba >> 8) as u8,
                 (lba >> 16) as u8,
@@ -177,7 +280,7 @@ impl Drive {
                 if ext { (lba >> 24) as u8 } else { 0 },
                 if ext { (lba >> 32) as u8 } else { 0 },
                 if ext { (lba >> 40) as u8 } else { 0 },
-                0,
+                (feature >> 8) as u8,
                 count as u8,
                 (count >> 8) as u8,
             ];
@@ -195,23 +298,38 @@ impl Drive {
             header.add(1).write_volatile(0);
             header.add(2).write_volatile(table as u32);
             header.add(3).write_volatile(0);
+            let bit = 1u32 << tag;
+            self.aborted().write_volatile(self.aborted().read_volatile() & !bit);
+            let others = self.queued_tags().read_volatile() & !bit;
+            self.queued_tags().write_volatile(if queued { others | bit } else { others });
         }
-        if !wait_until(TIMEOUT_TICKS, || read32(self.registers + P_TFD) & (TFD_BUSY | TFD_DRQ) == 0) {
-            return self.recover(Error::Timeout);
-        }
-        write32(self.registers + P_IS, 0xffff_ffff);
-        // The data a write sends (bounce buffer or the caller's memory) is written with ordinary stores: they must all be
-        // done before the doorbell, and the compiler may not move them past it.
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        write32(self.registers + P_CI, 1);
-        Ok(())
     }
 
-    /// Waits for the command `issue` started: `CI` bit 0 clears when it is done, a task-file error ends it early.
-    fn complete(&self) -> Result<(), Error> {
+    /// Hands the filled tag to the HBA. The data a write sends (bounce buffer or the caller's memory) is written with
+    /// ordinary stores: they must all be done before the doorbell, and the compiler may not move them past it.
+    fn ring(&self, tag: usize, queued: bool) {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        if queued {
+            // The HBA sends a queued command when the link is free; `SACT` before `CI` (AHCI 1.3.1, 5.3.2.2). `IS` is
+            // left alone: a task-file error it holds belongs to a command already in flight.
+            write32(self.registers + P_SACT, 1 << tag);
+        } else {
+            write32(self.registers + P_IS, 0xffff_ffff);
+        }
+        write32(self.registers + P_CI, 1 << tag);
+    }
+
+    /// Waits for the command `issue` started on `tag`: its `CI` bit clears when a plain command is done, its `SACT` bit
+    /// (and `CI`) when a queued one is. A task-file error ends it early; with commands queued it ends them all, and each
+    /// of the others reports it at its own `wait`.
+    fn complete(&self, tag: usize) -> Result<(), Error> {
+        let bit = 1u32 << tag;
         let mut failed = false;
         let finished = wait_until(TIMEOUT_TICKS, || {
-            if read32(self.registers + P_CI) & 1 == 0 {
+            if unsafe { self.aborted().read_volatile() } & bit != 0 {
+                return true;
+            }
+            if (read32(self.registers + P_CI) | read32(self.registers + P_SACT)) & bit == 0 {
                 return true;
             }
             if read32(self.registers + P_IS) & IS_TASK_FILE_ERROR != 0 {
@@ -221,27 +339,58 @@ impl Drive {
             false
         });
         let task_file = read32(self.registers + P_TFD);
-        if !finished {
-            return self.recover(Error::Timeout);
+        unsafe {
+            let aborted = self.aborted().read_volatile();
+            if aborted & bit != 0 {
+                self.aborted().write_volatile(aborted & !bit);
+                return Err(Error::Device { status: task_file as u8, error: (task_file >> 8) as u8 });
+            }
         }
-        if failed || task_file & TFD_ERROR != 0 {
-            return self.recover(Error::Device { status: task_file as u8, error: (task_file >> 8) as u8 });
+        if !finished {
+            return self.recover(tag, Error::Timeout);
+        }
+        // A queued command that finished before another one's error was a success; a plain one is checked here.
+        let plain = unsafe { self.queued_tags().read_volatile() } & bit == 0;
+        if failed || (plain && task_file & TFD_ERROR != 0) {
+            return self.recover(tag, Error::Device { status: task_file as u8, error: (task_file >> 8) as u8 });
         }
         // What the device wrote by DMA is read with ordinary loads after this: none may be done before the command was.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
-    /// After a failed command: stop the command engine, clear the error state, start it
-    /// again so the next command begins clean.
-    fn recover(&self, error: Error) -> Result<(), Error> {
+    /// After a failed or stuck command on `tag`: every other command still in flight is aborted too (marked, so its
+    /// `wait` fails), the command engine stopped (which clears `CI` and `SACT`), the error state cleared and the engine
+    /// started again. A drive that queues stays in its error state until its NCQ error log is read, so that is read.
+    fn recover(&self, tag: usize, error: Error) -> Result<(), Error> {
+        let outstanding = read32(self.registers + P_CI) | read32(self.registers + P_SACT);
+        unsafe { self.aborted().write_volatile((self.aborted().read_volatile() | outstanding) & !(1 << tag)) };
+        self.restart();
+        if outstanding & unsafe { self.queued_tags().read_volatile() } != 0 || self.queued() {
+            // A non-queued PIO read of one sector into the bounce buffer (whatever a bounce command had there is lost
+            // with it), filled and rung here rather than through `issue`, so its own failure is not recovered from
+            // again: the next command finds out.
+            if wait_until(TIMEOUT_TICKS, || read32(self.registers + P_TFD) & (TFD_BUSY | TFD_DRQ) == 0) {
+                let log = [Segment { physical: (self.frame + OFFSET_BOUNCE) as u64, bytes: 512 }];
+                self.fill(0, false, ATA_READ_LOG_EXT, 0, LOG_NCQ_ERROR, 1, false, &log);
+                self.ring(0, false);
+                let done = wait_until(TIMEOUT_TICKS, || read32(self.registers + P_CI) & 1 == 0 || read32(self.registers + P_IS) & IS_TASK_FILE_ERROR != 0);
+                if !done || read32(self.registers + P_IS) & IS_TASK_FILE_ERROR != 0 {
+                    self.restart();
+                }
+            }
+        }
+        Err(error)
+    }
+
+    /// Stops the command engine, clears the error state, starts it again.
+    fn restart(&self) {
         write32(self.registers + P_CMD, read32(self.registers + P_CMD) & !CMD_START);
         wait_until(100, || read32(self.registers + P_CMD) & CMD_LIST_RUNNING == 0);
         write32(self.registers + P_SERR, 0xffff_ffff);
         write32(self.registers + P_IS, 0xffff_ffff);
         wait_until(100, || read32(self.registers + P_TFD) & (TFD_BUSY | TFD_DRQ) == 0);
         write32(self.registers + P_CMD, read32(self.registers + P_CMD) | CMD_START);
-        Err(error)
     }
 
     fn check(&self, lba: u64, bytes: usize) -> Result<u32, Error> {
@@ -278,6 +427,13 @@ impl Drive {
     /// below 4 GiB unless the HBA takes 64-bit addresses. Anything else is `Unsupported` and nothing is started: the caller
     /// goes through the bounce buffer instead. The memory must stay put until `wait` returns.
     pub fn start_direct(&self, lba: u64, segments: &[Segment], write: bool) -> Result<(), Error> {
+        self.start_queued(0, lba, segments, write)
+    }
+
+    /// `start_direct` on tag `tag` (below `queue_depth`): the command is queued beside those on the drive's other tags,
+    /// and `wait_queued(tag)` finishes it. The caller keeps track of which tags it has in flight; tag 0 is the one the
+    /// plain calls use.
+    pub fn start_queued(&self, tag: usize, lba: u64, segments: &[Segment], write: bool) -> Result<(), Error> {
         let bytes: u64 = segments.iter().map(|segment| segment.bytes).sum();
         let fits = |segment: &Segment| {
             segment.bytes != 0
@@ -286,7 +442,7 @@ impl Drive {
                 && segment.bytes % 2 == 0
                 && (self.dma64 || segment.physical + segment.bytes <= 1 << 32)
         };
-        if segments.is_empty() || segments.len() > MAX_SEGMENTS || !segments.iter().all(fits) || bytes % 512 != 0 {
+        if segments.is_empty() || segments.len() > MAX_SEGMENTS || !segments.iter().all(fits) || bytes % 512 != 0 || tag >= self.queue_depth() {
             return Err(Error::Unsupported);
         }
         let sectors = bytes / 512;
@@ -300,7 +456,12 @@ impl Drive {
             (true, false) => ATA_WRITE_DMA,
         };
         // A count of 0 in the FIS means 256 sectors (28-bit) or 65536 (48-bit); `max_direct_sectors` stays below both.
-        self.issue(command, 0, lba, sectors as u32, write, segments)
+        self.issue(tag, command, 0, lba, sectors as u32, write, segments)
+    }
+
+    /// Waits for the command `start_queued` began on `tag`.
+    pub fn wait_queued(&self, tag: usize) -> Result<(), Error> {
+        self.complete(tag)
     }
 
     /// Most sectors `start_direct` takes in one command.
@@ -310,7 +471,7 @@ impl Drive {
 
     /// Waits for the command `start_read`, `start_staged_write` or `start_direct` began.
     pub fn wait(&self) -> Result<(), Error> {
-        self.complete()
+        self.complete(0)
     }
 
     /// After `wait` for a read: its first `buffer.len()` bytes (the count `start_read` was given) from the bounce buffer.
@@ -448,7 +609,7 @@ fn init_controller(device: &pci::Device, controller: usize, found: &mut impl FnM
         if status & 0xf != 3 || (status >> 8) & 0xf != 1 || read32(registers + P_SIG) != SIGNATURE_ATA {
             continue;
         }
-        if let Some(drive) = init_port(registers, read32(abar + HBA_CAP) & CAP_S64A != 0) {
+        if let Some(drive) = init_port(registers, read32(abar + HBA_CAP)) {
             found(drive, controller, port);
             count += 1;
         }
@@ -457,8 +618,9 @@ fn init_controller(device: &pci::Device, controller: usize, found: &mut impl FnM
 }
 
 /// Stops a port's engines, points it at fresh structures, restarts it, identifies the
-/// drive. `None` if anything fails (the port is just skipped).
-fn init_port(registers: usize, dma64: bool) -> Option<Drive> {
+/// drive. `None` if anything fails (the port is just skipped). `cap` is the HBA's CAP register.
+fn init_port(registers: usize, cap: u32) -> Option<Drive> {
+    let dma64 = cap & CAP_S64A != 0;
     // Both engines (ST, FRE) must be off before their base addresses may change.
     write32(registers + P_CMD, read32(registers + P_CMD) & !(CMD_START | CMD_FIS_RECEIVE));
     if !wait_until(100, || read32(registers + P_CMD) & (CMD_LIST_RUNNING | CMD_FIS_RUNNING) == 0) {
@@ -478,7 +640,7 @@ fn init_port(registers: usize, dma64: bool) -> Option<Drive> {
     }
     write32(registers + P_CMD, read32(registers + P_CMD) | CMD_START);
 
-    let mut drive = Drive { registers, frame, sectors: 0, lba48: false, dma64, can_trim: false, model: [b' '; 40] };
+    let mut drive = Drive { registers, frame, sectors: 0, lba48: false, dma64, depth: 1, can_trim: false, model: [b' '; 40] };
     drive.command(ATA_IDENTIFY, 0, 0, false, 512).ok()?;
     // IDENTIFY DEVICE data: 256 little-endian words in the bounce buffer.
     let words = memory::phys_to_virt((frame + OFFSET_BOUNCE) as u64) as *const u16;
@@ -490,6 +652,13 @@ fn init_port(registers: usize, dma64: bool) -> Option<Drive> {
     }
     drive.lba48 = word(83) & (1 << 10) != 0;
     drive.can_trim = word(169) & 1 != 0;
+    // NCQ: IDENTIFY word 76 bit 8 (a word of 0 or ffff is not filled in) and 48-bit addressing, which every queued
+    // command uses; word 75 bits 4:0 are the depth less one. The HBA: CAP.SNCQ and CAP.NCS (bits 12:8, its command
+    // slots less one).
+    if !matches!(word(76), 0 | 0xffff) && word(76) & (1 << 8) != 0 && drive.lba48 && cap & CAP_SNCQ != 0 {
+        let slots = ((cap >> 8) & 0x1f) as usize + 1;
+        drive.depth = (usize::from(word(75) & 0x1f) + 1).min(slots).min(TAGS) as u8;
+    }
     drive.sectors = if drive.lba48 {
         u64::from(word(100)) | u64::from(word(101)) << 16 | u64::from(word(102)) << 32 | u64::from(word(103)) << 48
     } else {

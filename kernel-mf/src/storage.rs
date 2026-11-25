@@ -57,10 +57,21 @@ impl Write for Origin {
 }
 
 pub fn init(info: &BootInfo) {
+    // SATA drives that can queue commands (NCQ) do here: an md resync keeps the next piece queued on every member while
+    // the drive reads the current one (`block::start_ahead`). `ahci no-ncq` in `settings` turns it off.
+    ahci::set_ncq(true);
+    let (mut queuing, mut depth) = (0, 0);
     let sata = ahci::init_all(|drive, controller, port| {
         let origin = Origin::new("SATA", controller, Some(port));
         block::register(Backend::Ahci(drive), drive.sectors, drive.model, origin.as_str());
+        if drive.can_queue() > 1 {
+            queuing += 1;
+            depth = depth.max(drive.can_queue());
+        }
     });
+    if queuing > 0 {
+        println!("SATA: {queuing} drive(s) queue commands (NCQ), up to {depth} at once.");
+    }
     let nvme = nvme::init_all(|drive, controller| {
         let origin = Origin::new("NVMe", controller, None);
         block::register(Backend::Nvme(drive), drive.sectors, drive.model, origin.as_str());

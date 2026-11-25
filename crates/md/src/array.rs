@@ -91,6 +91,23 @@ pub struct Array {
     ppl_bad: bool,
     /// The resync's and rebuild's buffer (`JOB_PIECE` of every member and one more), allocated on first use.
     work: Vec<u8>,
+    /// Its twin: the next piece of a RAID 5 resync or rebuild is read into it (`Members::read_ahead`) while the current
+    /// one is waited for and worked on, then the two swap.
+    ahead: Vec<u8>,
+    /// What is being read into `ahead` (roles, member sector, bytes per role), until `read_job` or `settle` collects it.
+    ahead_at: Option<(u32, u64, usize)>,
+    /// The array sectors per role the last `step` was given, to foresee where the next one ends.
+    job_units: u64,
+}
+
+impl Drop for Array {
+    /// A read-ahead still in flight may land in `ahead` after this (a caller that drops the array without `stop`): the
+    /// buffer is leaked rather than given back to the allocator under the drive's feet.
+    fn drop(&mut self) {
+        if self.ahead_at.is_some() {
+            core::mem::forget(core::mem::take(&mut self.ahead));
+        }
+    }
 }
 
 struct Rebuild {
@@ -246,6 +263,9 @@ impl Array {
             ppl: None,
             ppl_bad: false,
             work: Vec::new(),
+            ahead: Vec::new(),
+            ahead_at: None,
+            job_units: 0,
         };
         for (member, entry) in found.iter().enumerate() {
             let Some((sb, block)) = entry else { continue };
@@ -575,20 +595,79 @@ impl Array {
     /// `r * bytes`), all at once (`Members::read_many`). A role that is gone, or fails, is an error (and goes into
     /// `failed`).
     fn read_roles<M: Members>(&self, members: &mut M, roles: u32, at: u64, bytes: usize, work: &mut [u8], failed: &mut u32) -> Result<(), Error> {
-        let mut reads = Vec::with_capacity(MAX_MEMBERS);
         let mut which = [0u16; MAX_MEMBERS];
-        for (role, piece) in work.chunks_mut(bytes).take(self.raid_disks as usize).enumerate() {
-            if roles & (1 << role) == 0 {
-                continue;
-            }
-            let (member, base) = self.usable(role as u16, *failed).ok_or(Error::Device)?;
-            which[reads.len()] = role as u16;
-            reads.push(Read { member, lba: base + at, buffer: piece });
-        }
+        let mut reads = self.role_reads(roles, at, bytes, work, *failed, &mut which).map_err(|role| {
+            *failed |= 1 << role;
+            Error::Device
+        })?;
         members.read_many(&mut reads).map_err(|(index, error)| {
             *failed |= 1 << which[index];
             error
         })
+    }
+
+    /// The reads `read_roles` makes, the role of each in `which`; Err(role) for a role that is gone.
+    fn role_reads<'w>(&self, roles: u32, at: u64, bytes: usize, work: &'w mut [u8], failed: u32, which: &mut [u16; MAX_MEMBERS]) -> Result<Vec<Read<'w>>, u16> {
+        let mut reads = Vec::with_capacity(MAX_MEMBERS);
+        for (role, piece) in work.chunks_mut(bytes).take(self.raid_disks as usize).enumerate() {
+            if roles & (1 << role) == 0 {
+                continue;
+            }
+            let (member, base) = self.usable(role as u16, failed).ok_or(role as u16)?;
+            which[reads.len()] = role as u16;
+            reads.push(Read { member, lba: base + at, buffer: piece });
+        }
+        Ok(reads)
+    }
+
+    /// `read_roles` for a job piece, pipelined: the reads of `next` (roles, member sector, bytes per role: the piece after
+    /// this one) are started first (`Members::read_ahead`), so each member has them queued while this piece is waited
+    /// for and worked on; this piece's own reads were usually started the same way one piece earlier. Returns the buffer
+    /// the piece is in (room for every role and a spare piece after them, as `xor_roles` wants); the caller gives it
+    /// back with `self.work = ...`. Whatever the caller does to the members meanwhile must not touch `next`'s sectors.
+    fn read_job<M: Members>(&mut self, members: &mut M, roles: u32, at: u64, bytes: usize, next: Option<(u32, u64, usize)>) -> (Vec<u8>, Result<(), Error>) {
+        let slots = self.raid_disks as usize + 1;
+        let mut current = core::mem::take(&mut self.ahead);
+        if self.ahead_at.take().is_some_and(|pending| pending != (roles, at, bytes)) {
+            members.settle();
+        }
+        // in flight, it was sized for exactly this piece and is not resized
+        if current.len() < slots * bytes {
+            current.resize(slots * bytes, 0);
+        }
+        if let Some((next_roles, next_at, next_bytes)) = next {
+            let mut spare = self.take_work(slots * next_bytes);
+            let mut which = [0u16; MAX_MEMBERS];
+            if let Ok(mut reads) = self.role_reads(next_roles, next_at, next_bytes, &mut spare, 0, &mut which) {
+                // `spare` becomes `self.ahead` below and is only touched again by the `read_job` that collects it or
+                // after `settle`
+                unsafe { members.read_ahead(&mut reads) };
+                self.ahead_at = Some((next_roles, next_at, next_bytes));
+            }
+            self.ahead = spare;
+        }
+        let result = self.read_roles(members, roles, at, bytes, &mut current, &mut 0);
+        (current, result)
+    }
+
+    /// Collects a read-ahead still in flight: `ahead` is free again.
+    fn settle<M: Members>(&mut self, members: &mut M) {
+        if self.ahead_at.take().is_some() {
+            members.settle();
+        }
+    }
+
+    /// The piece after the one at member sector `m` of `length` sectors that a job's next `step` (or this one, before
+    /// `end`) takes: its member sector and bytes. None at the end of the array, and for a resync that only visits the
+    /// chunks a bitmap marks.
+    fn next_piece(&self, m: u64, length: u64, end: u64) -> Option<(u64, usize)> {
+        let (next, total) = (m + length, self.span());
+        if next >= total || self.partial {
+            return None;
+        }
+        let end = if next < end { end } else { (next + self.job_units).min(total) };
+        let length = (self.chunk - next % self.chunk).min(end - next).min(JOB_PIECE);
+        Some((next, length as usize * SECTOR))
     }
 
     /// Splits `work` (as `read_roles` filled it) into the members' pieces and the spare slot after them, which gets the
@@ -817,8 +896,9 @@ impl Array {
         let length = (self.chunk - offset).min(end - m).min(JOB_PIECE);
         let bytes = length as usize * SECTOR;
         let all = (1u32 << self.raid_disks) - 1;
-        let mut work = self.take_work((self.raid_disks as usize + 1) * bytes);
-        let done = self.read_roles(members, all, m, bytes, &mut work, &mut 0).and_then(|()| {
+        let next = self.next_piece(m, length, end).map(|(at, bytes)| (all, at, bytes));
+        let (mut work, read) = self.read_job(members, all, m, bytes, next);
+        let done = read.and_then(|()| {
             let (rows, sum) = self.xor_roles(&mut work, all & !(1 << parity), bytes);
             let stored = &rows[parity as usize * bytes..][..bytes];
             if stored != &sum[..] {
@@ -838,8 +918,9 @@ impl Array {
         let bytes = length as usize * SECTOR;
         let (role, member, base) = self.rebuild.as_ref().map(|r| (r.slot.role, r.slot.member, r.slot.data_offset)).ok_or(Error::Busy)?;
         let others = ((1u32 << self.raid_disks) - 1) & !(1 << role);
-        let mut work = self.take_work((self.raid_disks as usize + 1) * bytes);
-        let done = self.read_roles(members, others, m, bytes, &mut work, &mut 0).and_then(|()| {
+        let next = self.next_piece(m, length, end).map(|(at, bytes)| (others, at, bytes));
+        let (mut work, read) = self.read_job(members, others, m, bytes, next);
+        let done = read.and_then(|()| {
             let (_, sum) = self.xor_roles(&mut work, others, bytes);
             members.write(member, base + m, sum)
         });
@@ -1008,6 +1089,8 @@ impl Array {
     /// are rewritten (flushed) saying so, with a higher event count, before this returns, so the dropped member can
     /// never be mistaken for current again. It fails only when no member took the data.
     pub fn write<M: Members>(&mut self, members: &mut M, lba: u64, buffer: &[u8], now: u64) -> Result<(), Error> {
+        // a job's read-ahead could hold the old contents of these sectors
+        self.settle(members);
         if !self.writing {
             return Err(Error::NotWritable);
         }
@@ -1150,6 +1233,7 @@ impl Array {
     /// Closes the array: flushes the data, then records "in step" (`resync_offset` back to `SYNCED`, one more event)
     /// in every superblock. An array that was already dirty when assembled stays dirty: nothing here resyncs it.
     pub fn stop<M: Members>(&mut self, members: &mut M, now: u64) -> Result<(), Error> {
+        self.settle(members);
         if !self.writing {
             return Err(Error::NotWritable);
         }
@@ -1257,6 +1341,16 @@ impl Array {
     /// serialises it with reads and writes; a job that fails is abandoned (a rebuild target stays flagged as
     /// recovering and is left out at the next assembly).
     pub fn step<M: Members>(&mut self, members: &mut M, budget: u64, now: u64) -> Result<Step, Error> {
+        self.job_units = self.unit_budget(budget);
+        let step = self.step_job(members, budget, now);
+        // a read-ahead stays in flight only into the next step of a job that goes on
+        if !matches!(step, Ok(Step::Running(_))) {
+            self.settle(members);
+        }
+        step
+    }
+
+    fn step_job<M: Members>(&mut self, members: &mut M, budget: u64, now: u64) -> Result<Step, Error> {
         if !self.writing {
             self.sync_cursor = None;
             return Ok(Step::Idle);
@@ -1674,12 +1768,25 @@ mod tests {
         write_batches: Vec<usize>,
         reads: usize,
         many_fail: bool,
+        /// `read_ahead` behaves like a drive: the data is what the disks held when it was started, and it lands in the
+        /// buffers only when a matching `read_many` or `settle` collects it (they hold 0xee until then).
+        late: bool,
+        /// Each read-ahead batch: (member, lba, buffer address, bytes, the data it will land).
+        in_flight: Vec<Vec<(usize, u64, usize, usize, Vec<u8>)>>,
+        /// `read_many` calls a read-ahead answered.
+        collected: usize,
     }
 
     impl Rw {
         fn new(disks: Vec<Vec<u8>>) -> Rw {
             let n = disks.len();
-            Rw { disks: Disks(disks, vec![false; n]), write_fail: vec![false; n], log: Vec::new(), batches: Vec::new(), write_batches: Vec::new(), reads: 0, many_fail: false }
+            Rw { disks: Disks(disks, vec![false; n]), write_fail: vec![false; n], log: Vec::new(), batches: Vec::new(), write_batches: Vec::new(), reads: 0, many_fail: false, late: false, in_flight: Vec::new(), collected: 0 }
+        }
+
+        fn land(batch: Vec<(usize, u64, usize, usize, Vec<u8>)>) {
+            for (_, _, address, bytes, data) in batch {
+                unsafe { core::slice::from_raw_parts_mut(address as *mut u8, bytes) }.copy_from_slice(&data);
+            }
         }
     }
 
@@ -1700,10 +1807,39 @@ mod tests {
             }
             self.reads += reads.len();
             self.batches.push(reads.len());
+            let key = |r: &Read<'_>| (r.member, r.lba, r.buffer.as_ptr() as usize, r.buffer.len());
+            let started = self.in_flight.iter().position(|batch| {
+                batch.len() == reads.len() && batch.iter().zip(reads.iter()).all(|(b, r)| (b.0, b.1, b.2, b.3) == key(r))
+            });
+            if let Some(index) = started {
+                Rw::land(self.in_flight.remove(index));
+                self.collected += 1;
+                return Ok(());
+            }
             for (index, request) in reads.iter_mut().enumerate() {
                 self.disks.read(request.member, request.lba, request.buffer).map_err(|error| (index, error))?;
             }
             Ok(())
+        }
+        unsafe fn read_ahead(&mut self, reads: &mut [Read<'_>]) {
+            if !self.late {
+                return;
+            }
+            let mut batch = Vec::new();
+            for request in reads.iter_mut() {
+                let mut data = vec![0u8; request.buffer.len()];
+                if self.disks.read(request.member, request.lba, &mut data).is_err() {
+                    return;
+                }
+                request.buffer.fill(0xee);
+                batch.push((request.member, request.lba, request.buffer.as_ptr() as usize, request.buffer.len(), data));
+            }
+            self.in_flight.push(batch);
+        }
+        fn settle(&mut self) {
+            for batch in core::mem::take(&mut self.in_flight) {
+                Rw::land(batch);
+            }
         }
         fn write_many(&mut self, writes: &[Write<'_>]) -> Result<(), (usize, Error)> {
             if self.many_fail {
@@ -2332,6 +2468,63 @@ mod tests {
             crashed.begin_resync().unwrap();
             assert_eq!(run_job(&mut crashed, &mut rw), Job::Resync);
             crashed.stop(&mut rw, 10).unwrap();
+            check_raid5(&rw, layout, 4, crashed.sectors(), &data);
+        }
+    }
+
+    #[test]
+    fn raid5_jobs_read_the_next_piece_ahead_and_writes_never_see_it_stale() {
+        for layout in [0, 2] {
+            let mut rw = striped(LEVEL_RAID5, layout, 4);
+            rw.late = true;
+            let mut array = Array::assemble(&mut rw, None).unwrap();
+            array.start(&mut rw, 1).unwrap();
+            let mut data = pattern(array.sectors());
+            array.write(&mut rw, 0, &data, 2).unwrap();
+            array.stop(&mut rw, 3).unwrap();
+            rw.disks.0[1] = vec![0; DISK_SECTORS * SECTOR];
+            let mut array = Array::assemble(&mut rw, None).unwrap();
+            array.start(&mut rw, 4).unwrap();
+            array.begin_rebuild(&mut rw, 1, [9; 16]).unwrap();
+            // steps of a few pieces with writes between them, just ahead of the cursor: the read-ahead of the next
+            // piece is then of sectors a write changes, so the write must collect it first
+            let mut at = 0u64;
+            while array.step(&mut rw, 40, 5).unwrap() == Step::Running(Job::Rebuild) {
+                at += 37;
+                let length = 9.min(array.sectors() - at.min(array.sectors()));
+                if length == 0 {
+                    continue;
+                }
+                let fresh: Vec<u8> = (0..length as usize * SECTOR).map(|i| (i as u64 * 11 + at) as u8).collect();
+                array.write(&mut rw, at, &fresh, 6).unwrap();
+                data[at as usize * SECTOR..(at + length) as usize * SECTOR].copy_from_slice(&fresh);
+            }
+            assert!(rw.collected > 0, "the rebuild read ahead");
+            assert!(rw.in_flight.is_empty(), "nothing is left in flight when the job ends");
+            array.stop(&mut rw, 7).unwrap();
+            check_raid5(&rw, layout, 4, array.sectors(), &data);
+
+            // a resync over stale parity in every row, with writes between its steps
+            let mut array = Array::assemble(&mut rw, None).unwrap();
+            array.start(&mut rw, 8).unwrap();
+            for row in 0..(array.sectors() / (3 * array.chunk)) {
+                let (_, parity) = model5(layout, 4, row as usize, 0);
+                rw.disks.0[parity][(DATA_OFFSET + row * array.chunk) as usize * SECTOR] ^= 0x33;
+            }
+            let mut crashed = Array::assemble(&mut rw, None).unwrap();
+            crashed.start(&mut rw, 9).unwrap();
+            crashed.begin_resync().unwrap();
+            rw.collected = 0;
+            let mut at = 0u64;
+            while crashed.step(&mut rw, 40, 10).unwrap() == Step::Running(Job::Resync) {
+                at = (at + 53) % crashed.sectors();
+                let length = 5.min(crashed.sectors() - at);
+                let fresh: Vec<u8> = (0..length as usize * SECTOR).map(|i| (i as u64 * 5 + at) as u8).collect();
+                crashed.write(&mut rw, at, &fresh, 11).unwrap();
+                data[at as usize * SECTOR..(at + length) as usize * SECTOR].copy_from_slice(&fresh);
+            }
+            assert!(rw.collected > 0, "the resync read ahead");
+            crashed.stop(&mut rw, 12).unwrap();
             check_raid5(&rw, layout, 4, crashed.sectors(), &data);
         }
     }

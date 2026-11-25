@@ -94,6 +94,16 @@ pub trait Members {
         }
         Ok(())
     }
+    /// Starts reading `reads` ahead of time, a hint: a later `read_many` over exactly these ranges and buffers then only
+    /// has to wait for them, and meanwhile the caller works on something else (a resync XORs one piece while the next
+    /// is read). This default does nothing, and `read_many` reads them then.
+    ///
+    /// # Safety
+    /// The buffers must stay allocated and untouched until a `read_many` over the same ranges, or `settle`, returns:
+    /// the disks may write into them until then.
+    unsafe fn read_ahead(&mut self, _reads: &mut [Read<'_>]) {}
+    /// Waits for every read `read_ahead` started that no `read_many` has collected; their buffers are free again.
+    fn settle(&mut self) {}
     /// Returns once everything written to `member` is on the medium (a cache flush).
     fn flush(&mut self, _member: usize) -> Result<(), Error> {
         Err(Error::Unsupported)

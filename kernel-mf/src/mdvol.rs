@@ -74,6 +74,8 @@ struct Candidates {
     count: usize,
     /// Microseconds spent in the member calls below, so the job thread can tell disk time from md's own work.
     spent_us: u64,
+    /// Reads `read_ahead` started, oldest first: a resync keeps the next piece in flight while it waits for this one.
+    ahead: [Option<block::Ahead>; 2],
 }
 
 impl Candidates {
@@ -100,6 +102,7 @@ impl Members for Candidates {
         self.timed(|| block::read(m.disk, m.base + lba, buffer).map_err(|_| Error::Device))
     }
     /// A row's members at once: `block::read_many` overlaps the SATA ones, so a row costs its slowest member's time.
+    /// Ranges `read_ahead` started are only waited for.
     fn read_many(&mut self, reads: &mut [md::Read<'_>]) -> Result<(), (usize, Error)> {
         let mut many = alloc::vec::Vec::with_capacity(reads.len());
         for (index, request) in reads.iter_mut().enumerate() {
@@ -109,7 +112,36 @@ impl Members for Candidates {
             }
             many.push(block::Read { disk: m.disk, lba: m.base + request.lba, buffer: &mut *request.buffer });
         }
-        self.timed(|| block::read_many(&mut many).map_err(|(index, _)| (index, Error::Device)))
+        let started = self.ahead.iter().position(|ahead| ahead.as_ref().is_some_and(|ahead| ahead.matches(&many)));
+        let ahead = started.and_then(|index| self.ahead[index].take());
+        self.timed(|| match ahead {
+            Some(ahead) => ahead.finish(&mut many),
+            None => block::read_many(&mut many),
+        })
+        .map_err(|(index, _)| (index, Error::Device))
+    }
+    /// Queues the ranges on the SATA members (`block::start_ahead`); a third read-ahead first waits for the oldest.
+    unsafe fn read_ahead(&mut self, reads: &mut [md::Read<'_>]) {
+        let mut many = alloc::vec::Vec::with_capacity(reads.len());
+        for request in reads.iter_mut() {
+            let m = self.list[request.member];
+            if request.lba + (request.buffer.len() / 512) as u64 > m.sectors {
+                return;
+            }
+            many.push(block::Read { disk: m.disk, lba: m.base + request.lba, buffer: &mut *request.buffer });
+        }
+        if self.ahead.iter().all(Option::is_some) {
+            let oldest = self.ahead[0].take();
+            self.timed(|| drop(oldest));
+            self.ahead.rotate_left(1);
+        }
+        let slot = self.ahead.iter().position(Option::is_none).unwrap_or(0);
+        // the caller keeps the buffers as `start_ahead` needs (this method's own contract)
+        self.ahead[slot] = Some(self.timed(|| unsafe { block::start_ahead(&mut many) }));
+    }
+    fn settle(&mut self) {
+        let ahead = [self.ahead[0].take(), self.ahead[1].take()];
+        self.timed(|| drop(ahead));
     }
     fn write(&mut self, member: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
         let m = self.list[member];
@@ -170,7 +202,7 @@ impl StatusText {
 
 static STATE: sched::SleepMutex<State> = sched::SleepMutex::new(State {
     array: None,
-    members: Candidates { list: [Member { disk: 0, base: 0, sectors: 0 }; md::array::MAX_MEMBERS], count: 0, spent_us: 0 },
+    members: Candidates { list: [Member { disk: 0, base: 0, sectors: 0 }; md::array::MAX_MEMBERS], count: 0, spent_us: 0, ahead: [None, None] },
     disk: None,
     force_rw: false,
     last_write: 0,
@@ -185,7 +217,7 @@ fn seconds() -> u64 {
     crate::time::ticks() / 100
 }
 
-const NO_MEMBERS: Candidates = Candidates { list: [Member { disk: 0, base: 0, sectors: 0 }; md::array::MAX_MEMBERS], count: 0, spent_us: 0 };
+const NO_MEMBERS: Candidates = Candidates { list: [Member { disk: 0, base: 0, sectors: 0 }; md::array::MAX_MEMBERS], count: 0, spent_us: 0, ahead: [None, None] };
 
 /// Finds every disk and Linux RAID partition that carries an md superblock. The array's own disk is skipped.
 fn scan(own: Option<usize>) -> Candidates {
@@ -416,13 +448,8 @@ fn print_job_times() {
         part(total.saturating_sub(times.step_us))
     );
     if many.commands > 0 {
-        println!(
-            "      {} commands, {} direct, {} KiB each on average; {} MiB/s moved",
-            many.commands,
-            many.direct,
-            many.bytes / many.commands >> 10,
-            mib_s(many.bytes)
-        );
+        println!("      {} commands of {} KiB on average, {} MiB/s moved;", many.commands, many.bytes / many.commands >> 10, mib_s(many.bytes));
+        println!("      {} straight to md's memory, {} read ahead (queued)", many.direct, many.ahead);
     }
 }
 
@@ -461,6 +488,7 @@ extern "C" fn job_thread(_: usize) {
                     entry.many.commands += many.commands;
                     entry.many.direct += many.direct;
                     entry.many.bytes += many.bytes;
+                    entry.many.ahead += many.ahead;
                     let (from, to) = (before.map_or(0, |(_, done)| done), after.map_or(array.sectors(), |(_, done)| done));
                     entry.sectors += to.saturating_sub(from);
                     *JOB_TIMES.lock() = Some(*entry);

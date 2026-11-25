@@ -237,6 +237,10 @@ pub fn load() {
                 unsafe { NO_MSI = true };
                 println!("settings: no-msi -- devices are polled.");
             }
+            if line.split_whitespace().eq(["ahci", "no-ncq"]) {
+                kernel_core::ahci::set_ncq(false);
+                println!("settings: ahci no-ncq -- SATA drives get one command at a time.");
+            }
             if line.split_whitespace().next() == Some("nic") {
                 pin_line(line);
             }

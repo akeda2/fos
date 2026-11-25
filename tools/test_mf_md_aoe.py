@@ -101,6 +101,7 @@ def main():
                 raise SystemExit(f"t never reached the prompt: {t.log[-2000:]!r}")
             check(b"aoe-export md: waits for the md array" in t.log, "`aoe-export md` waits while there is no array",
                   t.log[-1500:].decode("utf8", "replace"))
+            boot_log = t.log.decode("utf8", "replace")  # `command` starts each log afresh
 
             create = "md create raid5 disk2 disk3 disk4 name tank"
             ok, text = t.command(create, "confirm", 30)
@@ -117,11 +118,15 @@ def main():
             check(t.wait_for("md: resync finished.", 180), "the resync finishes", t.log[-800:].decode("utf8", "replace"))
             ok, text = t.command("md", "md:", 10)
             check("fos:tank" in text and "3 of 3" in text and "dirty" not in text, "`md` shows it clean, 3 of 3", text[-500:])
-            counts = re.search(r"\n\s+([1-9]\d*) commands, (\d+) direct, (\d+) KiB each on average", text)
+            counts = re.search(r"\n\s+([1-9]\d*) commands of (\d+) KiB on average.*\n\s+(\d+) straight to md's memory, "
+                               r"(\d+) read ahead", text)
             check("resync in all:" in text and "disk commands" in text and "md's own work" in text and counts is not None
-                  and counts.group(1) == counts.group(2) and int(counts.group(3)) >= 256,
+                  and counts.group(1) == counts.group(3) and int(counts.group(2)) >= 256,
                   "`md` says where the resync's time went; every command went straight to md's memory, 256+ KiB each",
                   text[-700:])
+            # QEMU's AHCI queues (NCQ): all but the first piece of each member is read while the one before is worked on
+            check(counts is not None and int(counts.group(4)) * 2 >= int(counts.group(1)) and "queue commands (NCQ)" in boot_log,
+                  "the resync's reads were queued one piece ahead (NCQ)", text[-700:])
             ok, text = t.command("aoe export 3 slot 7", "aoe:", 20)
             check("member of an md array" in text, "a member disk is not exported on its own", text[-400:])
             ok, text = t.command("md stop", "md:", 20)
