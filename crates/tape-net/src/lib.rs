@@ -2161,6 +2161,23 @@ impl<const RX: usize> TcpConnection<RX> {
                     self.receive_len += copied;
                     self.receive_next = self.receive_next.wrapping_add(segment.data.len() as u32);
                     response = true;
+                } else if !segment.data.is_empty() {
+                    // Not the next byte. A retransmission may reach back into what was taken already: its new tail is
+                    // kept, when it fits. Anything else (a gap before it: a segment was lost, or an old duplicate) is
+                    // not kept but answered at once with the ACK of what is wanted (RFC 5681 4.2): the sender counts
+                    // three such duplicates and resends the lost segment within a round trip. Without them it waits
+                    // for its retransmission timeout (200 ms or more, doubling) for every lost frame, which held an
+                    // SMB upload over 2.5 Gb/s to 10 MB/s once a few receive-ring overflows dropped frames.
+                    let behind = self.receive_next.wrapping_sub(segment.sequence) as usize;
+                    if (behind as u32 as i32) > 0 && behind < segment.data.len() {
+                        let fresh = &segment.data[behind..];
+                        if fresh.len() <= RX.saturating_sub(self.receive_len) {
+                            self.receive_buffer[self.receive_len..self.receive_len + fresh.len()].copy_from_slice(fresh);
+                            self.receive_len += fresh.len();
+                            self.receive_next = self.receive_next.wrapping_add(fresh.len() as u32);
+                        }
+                    }
+                    response = true;
                 }
                 if segment.flags & TCP_FIN != 0
                     && segment.sequence.wrapping_add(segment.data.len() as u32) == self.receive_next
@@ -2956,6 +2973,37 @@ mod tests {
         assert_eq!(client.take_received(&mut sink), 1400);
         let update = client.window_update(&mut out).unwrap();
         assert_eq!(TcpSegment::parse(&out[..update], IP_A, IP_B, true).unwrap().window, 2000);
+    }
+
+    #[test]
+    fn tcp_a_gap_is_answered_at_once_and_a_retransmission_keeps_only_its_new_bytes() {
+        let mut client = TcpConnection::<4000>::active(IP_A, 1000, IP_B, 2000, 10, 5);
+        let mut out = [0u8; 2100];
+        client.start_connect(100, &mut out).unwrap();
+        let (bytes, length) = segment(2000, 1000, 50, 11, TCP_SYN | TCP_ACK, &[]);
+        client.on_segment(&TcpSegment::parse(&bytes[..length], IP_B, IP_A, true).unwrap(), 101, &mut out).unwrap();
+        let mut deliver = |client: &mut TcpConnection<4000>, sequence: u32, data: &[u8]| {
+            let mut bytes = [0u8; 1600];
+            let length = TcpSegment { source_port: 2000, destination_port: 1000, sequence, acknowledgment: 11, flags: TCP_ACK, window: 512, checksum: 0, urgent: 0, window_scale: None, data }.encode(&mut bytes, IP_B, IP_A).unwrap();
+            let reply = client.on_segment(&TcpSegment::parse(&bytes[..length], IP_B, IP_A, true).unwrap(), 102, &mut out).unwrap();
+            reply.map(|reply| TcpSegment::parse(&out[..reply], IP_A, IP_B, true).unwrap().acknowledgment)
+        };
+        // 51..151 lost; 151.. arrives: nothing kept, the ACK for 51 goes out at once (a duplicate the sender counts).
+        assert_eq!(deliver(&mut client, 151, &[2; 100]), Some(51));
+        assert_eq!(deliver(&mut client, 251, &[3; 100]), Some(51));
+        assert!(client.received().is_empty());
+        // The lost one comes again.
+        assert_eq!(deliver(&mut client, 51, &[1; 100]), Some(151));
+        // A retransmission of 101..251 overlaps 101..151 taken already: only 151..251 is new.
+        let mut overlap = [2u8; 150];
+        overlap[..50].fill(1);
+        assert_eq!(deliver(&mut client, 101, &overlap), Some(251));
+        let mut expected = [1u8; 200];
+        expected[100..].fill(2);
+        assert_eq!(client.received(), &expected[..]);
+        // An old duplicate (all of it taken) is answered too, with nothing kept.
+        assert_eq!(deliver(&mut client, 51, &[1; 100]), Some(251));
+        assert_eq!(client.received().len(), 200);
     }
 
     #[test]
