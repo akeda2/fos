@@ -236,10 +236,18 @@ fn drain() {
     }
 }
 
-/// For the fault and panic paths: the CPU that was printing (or draining) may be the one that crashed.
+/// For the fault and panic paths: the CPU that was printing (or draining) may be the one that crashed. The screen goes
+/// back to drawing each print at once (`fb::direct`): the console thread may never run again.
 pub fn break_lock() {
     unsafe { LOCK.force_unlock() };
     DRAINING.store(false, core::sync::atomic::Ordering::Release);
+    crate::fb::direct();
+}
+
+/// Runs `f` under the console lock (interrupts off): for `fb`, whose text grid only prints change.
+pub fn with_lock<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = LOCK.lock();
+    f()
 }
 
 macro_rules! println {

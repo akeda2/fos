@@ -71,6 +71,8 @@ fn write_dump(out: &mut dyn Write, rescue: bool) {
         }
     }
     crate::net::write_sessions(out);
+    let (print_us, pass_us) = crate::fb::timings();
+    let _ = writeln!(out, "screen: a print held interrupts off up to {print_us} us, a console pass took up to {pass_us} us");
     let total = kernel_core::trace::total();
     let _ = writeln!(out, "last trace events ({total} recorded; `trace` for more):");
     kernel_core::trace::recent(16, |event| {

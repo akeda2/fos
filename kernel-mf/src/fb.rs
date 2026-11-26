@@ -10,11 +10,18 @@
 //!   reads the screen: it keeps the text grid in `CELLS` (character and colours) and scrolling redraws from that, once per
 //!   `write_str` call however many lines it scrolled. A `sfence` ends each call so the combined writes reach the screen.
 //!   Only real hardware shows the speed-up; QEMU's framebuffer is plain RAM.
+//! - Drawing outside the print lock: `print` holds the console lock with interrupts off, and a scroll used to repaint the
+//!   whole screen under it (up to ~2 ms on rack at 1920x1080), long enough to make an audio card's interrupt a whole DMA
+//!   ring late. Now a print only changes `CELLS` and marks the rows it touched; the `console` thread (`start_painter`)
+//!   draws them with interrupts on, one row per short hold of `PAINT`, and only the cells that differ from `SHOWN`, the
+//!   grid as it is on the screen. A burst of lines becomes one pass. Before the thread runs (boot) and after a crash
+//!   (`direct`), a print draws at once, as before: the crash text must reach the screen with no scheduler to rely on.
 
 use fosfor_abi::{Framebuffer, PIXEL_NONE, PIXEL_RGB};
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::sync::SpinLock;
 use crate::vm;
 
 #[path = "../../kernel/src/font_data.rs"]
@@ -25,8 +32,28 @@ use font_data::{FONT, FONT_HEIGHT, FONT_WIDTH};
 /// The text grid is clamped to this size (4096x2720 pixels); a larger screen leaves its margin black.
 const MAX_COLUMNS: usize = 512;
 const MAX_ROWS: usize = 170;
-/// One cell: the byte in the low half, foreground (0-15) and background (0-15) colour in the high half.
+/// One cell: the byte in the low half, foreground (0-15) and background (0-15) colour in the high half. Changed only under
+/// the console lock (`serial::with_lock`), which `write_str`'s callers hold.
 static mut CELLS: [u16; MAX_COLUMNS * MAX_ROWS] = [0; MAX_COLUMNS * MAX_ROWS];
+/// The cells as drawn on the screen, under `PAINT`; the caret's underline is drawn over its cell and not recorded here.
+static mut SHOWN: [u16; MAX_COLUMNS * MAX_ROWS] = [0; MAX_COLUMNS * MAX_ROWS];
+/// Rows of `CELLS` changed since they were drawn, one bit each: set under the console lock, cleared by a pass as it
+/// copies the row.
+static DIRTY: [AtomicU64; MAX_ROWS.div_ceil(64)] = [const { AtomicU64::new(0) }; MAX_ROWS.div_ceil(64)];
+/// The next pass draws every cell, whatever `SHOWN` says (the palette changed, or the screen's pixels are unknown).
+static FORCE: AtomicBool = AtomicBool::new(false);
+/// Held while pixels are written: by a pass for one row, by the caret, by `gfx_*` and `set_colours`. Taken after the
+/// console lock when both are needed, never before it.
+static PAINT: SpinLock<()> = SpinLock::new(());
+/// The `console` thread draws (set by `start_painter`, cleared for good by `direct`); clear: `write_str` draws itself.
+static PAINTER: AtomicBool = AtomicBool::new(false);
+/// Set for good by a crash (`direct`): prints draw without `PAINT`, which a painter on another CPU may hold for ever.
+static CRASHED: AtomicBool = AtomicBool::new(false);
+/// Something changed since the painter's last pass began; it sleeps on this flag's address.
+static PENDING: AtomicBool = AtomicBool::new(false);
+/// Longest `write_str` while the painter draws (the time a print keeps interrupts off), and longest painter pass, in µs.
+static WRITE_MAX_US: AtomicU64 = AtomicU64::new(0);
+static PASS_MAX_US: AtomicU64 = AtomicU64::new(0);
 
 /// The 16 ANSI colours as 0xRRGGBB: the usual dark 0-7, then the bright 8-15 (light grey is colour 7, the default text).
 const PALETTE: [u32; 16] = [
@@ -58,8 +85,6 @@ struct Console {
     background: u8,
     bold: bool,
     palette: [u32; 16],
-    /// Cells scrolled: the screen is redrawn from `CELLS` at the end of the write.
-    stale: bool,
     escape: Escape,
     parameters: [u16; 4],
     parameter_count: usize,
@@ -107,7 +132,6 @@ pub fn init(framebuffer: &Framebuffer) -> Option<(usize, usize, bool)> {
         background: DEFAULT_BACKGROUND,
         bold: false,
         palette,
-        stale: false,
         escape: Escape::None,
         parameters: [0; 4],
         parameter_count: 0,
@@ -118,6 +142,7 @@ pub fn init(framebuffer: &Framebuffer) -> Option<(usize, usize, bool)> {
         private: false,
     };
     console.clear_all();
+    console.clear_screen();
     flush_writes();
     let size = (console.columns, console.rows, combining);
     unsafe { *core::ptr::addr_of_mut!(CONSOLE) = Some(console) };
@@ -142,7 +167,6 @@ pub fn init_text() -> (usize, usize) {
         background: DEFAULT_BACKGROUND,
         bold: false,
         palette: [0; 16],
-        stale: false,
         escape: Escape::None,
         parameters: [0; 4],
         parameter_count: 0,
@@ -153,6 +177,7 @@ pub fn init_text() -> (usize, usize) {
         private: false,
     };
     console.clear_all();
+    console.clear_screen();
     // CRTC register 0x0A bit 5 turns the cursor off: clear it, and give it scan lines 13-15 (an underline-to-block shape).
     outb(0x3d4, 0x0a);
     outb(0x3d5, 13);
@@ -171,6 +196,31 @@ const ANSI_TO_VGA: [u8; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
 
 fn cells() -> &'static mut [u16; MAX_COLUMNS * MAX_ROWS] {
     unsafe { &mut *core::ptr::addr_of_mut!(CELLS) }
+}
+
+/// Under `PAINT` (or before the console exists).
+fn shown() -> &'static mut [u16; MAX_COLUMNS * MAX_ROWS] {
+    unsafe { &mut *core::ptr::addr_of_mut!(SHOWN) }
+}
+
+fn mark_dirty(row: usize) {
+    DIRTY[row / 64].fetch_or(1 << (row % 64), Ordering::Relaxed);
+}
+
+fn mark_all_dirty() {
+    for word in &DIRTY {
+        word.store(u64::MAX, Ordering::Relaxed);
+    }
+}
+
+/// Clears `row`'s dirty bit; true if it was set.
+fn take_dirty(row: usize) -> bool {
+    let bit = 1 << (row % 64);
+    DIRTY[row / 64].fetch_and(!bit, Ordering::Relaxed) & bit != 0
+}
+
+fn is_dirty(row: usize) -> bool {
+    DIRTY[row / 64].load(Ordering::Relaxed) & 1 << (row % 64) != 0
 }
 
 impl Console {
@@ -195,16 +245,29 @@ impl Console {
         u16::from(b' ') | self.attribute() << 8
     }
 
-    /// Every cell blank in the current background, the whole screen painted with it.
+    /// Every cell blank in the current background; the screen follows with the next pass (`clear_screen`: at once).
     fn clear_all(&mut self) {
         let blank = self.blank();
         cells().fill(blank);
+        mark_all_dirty();
+    }
+
+    /// The screen painted to match a grid `clear_all` just blanked: the pixel screen filled with the background (its margin
+    /// too), the text screen drawn cell by cell. Under `PAINT`, or before the console is installed.
+    fn clear_screen(&mut self) {
         if self.text {
-            return self.redraw();
+            for row in 0..self.rows {
+                for column in 0..self.columns {
+                    self.draw_cell(column, row);
+                }
+            }
+        } else {
+            let background = self.palette[usize::from(self.background)];
+            self.fill(0, self.height, background);
         }
-        let background = self.palette[usize::from(self.background)];
-        self.fill(0, self.height, background);
-        self.stale = false;
+        let blank = self.blank();
+        shown().fill(blank);
+        self.caret_at = usize::MAX;
     }
 
     /// A text cell's VGA attribute from the grid's (foreground 0-15, background 0-7: the top bit would blink).
@@ -227,17 +290,19 @@ impl Console {
 
     /// The pixel console's caret: an underline in the cell the next character goes to. A cell that was redrawn has lost it and
     /// a cell it left must be restored, so the old cell is redrawn and the caret drawn afresh each time.
-    fn draw_caret(&mut self) {
+    /// Under `PAINT`; `row`, `column` and `hidden` are the cursor as the grid had it, `SHOWN` what the cells look like.
+    fn draw_caret(&mut self, row: usize, column: usize, hidden: bool) {
         let old = self.caret_at;
-        let at = self.row.min(self.rows - 1) * self.columns + self.column.min(self.columns - 1);
-        if old < self.rows * self.columns && (old != at || self.caret_hidden) {
-            self.draw_cell(old % self.columns, old / self.columns);
+        let at = row.min(self.rows - 1) * self.columns + column.min(self.columns - 1);
+        if old < self.rows * self.columns && (old != at || hidden) {
+            let cell = shown()[(old / self.columns) * MAX_COLUMNS + old % self.columns];
+            self.draw_value(old % self.columns, old / self.columns, cell);
         }
-        if self.caret_hidden {
+        if hidden {
             self.caret_at = usize::MAX;
             return;
         }
-        let cell = cells()[(at / self.columns) * MAX_COLUMNS + at % self.columns];
+        let cell = shown()[(at / self.columns) * MAX_COLUMNS + at % self.columns];
         let value = self.palette[usize::from((cell >> 8) & 15)];
         let (x, y) = ((at % self.columns) * FONT_WIDTH, (at / self.columns) * FONT_HEIGHT);
         for line in FONT_HEIGHT - 2..FONT_HEIGHT {
@@ -248,8 +313,14 @@ impl Console {
         self.caret_at = at;
     }
 
+    /// Draws the cell as the grid has it and records it in `SHOWN`.
     fn draw_cell(&mut self, column: usize, row: usize) {
         let cell = cells()[row * MAX_COLUMNS + column];
+        shown()[row * MAX_COLUMNS + column] = cell;
+        self.draw_value(column, row, cell);
+    }
+
+    fn draw_value(&mut self, column: usize, row: usize, cell: u16) {
         if self.text {
             let character = if (cell as u8) < 0x80 { cell as u8 } else { b'?' };
             let value = u16::from(character) | Self::vga_attribute(cell >> 8) << 8;
@@ -269,18 +340,7 @@ impl Console {
 
     fn set_cell(&mut self, column: usize, row: usize, cell: u16) {
         cells()[row * MAX_COLUMNS + column] = cell;
-        if !self.stale {
-            self.draw_cell(column, row);
-        }
-    }
-
-    fn redraw(&mut self) {
-        for row in 0..self.rows {
-            for column in 0..self.columns {
-                self.draw_cell(column, row);
-            }
-        }
-        self.stale = false;
+        mark_dirty(row);
     }
 
     fn scroll(&mut self) {
@@ -288,7 +348,7 @@ impl Console {
         cells.copy_within(MAX_COLUMNS..self.rows * MAX_COLUMNS, 0);
         let blank = self.blank();
         cells[(self.rows - 1) * MAX_COLUMNS..self.rows * MAX_COLUMNS].fill(blank);
-        self.stale = true;
+        mark_all_dirty();
     }
 
     fn newline(&mut self) {
@@ -428,25 +488,129 @@ impl Console {
     }
 }
 
-/// Called by the console for every piece of text, with the serial lock held; a no-op until `init` succeeded.
+fn console() -> Option<&'static mut Console> {
+    unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }
+}
+
+/// Called by the console for every piece of text, with the serial lock held; a no-op until `init` succeeded. With the
+/// painter running it only updates the grid and wakes it; otherwise it draws the change itself.
 pub fn write_str(text: &str) {
     if GFX_OPEN.load(Ordering::Relaxed) {
         return;
     }
-    if let Some(console) = unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() } {
+    let Some(console) = console() else { return };
+    if !PAINTER.load(Ordering::Acquire) {
         for byte in text.bytes() {
             console.put(byte);
         }
-        if console.stale {
-            console.redraw();
-        }
-        if console.text {
-            console.place_cursor();
-        } else {
-            console.draw_caret();
-        }
-        flush_writes();
+        paint(true);
+        return;
     }
+    let start = crate::time::micros();
+    for byte in text.bytes() {
+        console.put(byte);
+    }
+    // The painter blocks on PENDING with the scheduler locked, so setting it before the wake cannot be missed.
+    if !PENDING.swap(true, Ordering::AcqRel) {
+        crate::sched::wake_all(PENDING.as_ptr() as usize);
+    }
+    WRITE_MAX_US.fetch_max(crate::time::micros().saturating_sub(start), Ordering::Relaxed);
+}
+
+/// One pass over the grid: each dirty row copied from `CELLS` under the console lock (`locked`: the caller holds it), then
+/// the cells that differ from `SHOWN` drawn under `PAINT`, one row per hold; last the caret. Interrupts are off only for
+/// a row at a time unless the caller holds the console lock.
+/// `PAINT`, except after a crash: then nothing is taken (the holder may be stopped mid-row; a few stray pixels are the cost).
+fn paint_lock() -> Option<crate::sync::Guard<'static, ()>> {
+    (!CRASHED.load(Ordering::Acquire)).then(|| PAINT.lock())
+}
+
+fn paint(locked: bool) {
+    let Some(console) = console() else { return };
+    let grid = |f: &mut dyn FnMut()| if locked { f() } else { crate::serial::with_lock(|| f()) };
+    let force = FORCE.swap(false, Ordering::AcqRel);
+    let mut row_cells = [0u16; MAX_COLUMNS];
+    let columns = console.columns;
+    for row in 0..console.rows {
+        // The painter gives up its pass when a crash made prints draw themselves.
+        if !locked && !PAINTER.load(Ordering::Acquire) {
+            return;
+        }
+        if !is_dirty(row) {
+            continue;
+        }
+        let mut copied = false;
+        grid(&mut || {
+            if take_dirty(row) {
+                row_cells[..columns].copy_from_slice(&cells()[row * MAX_COLUMNS..row * MAX_COLUMNS + columns]);
+                copied = true;
+            }
+        });
+        if !copied {
+            continue;
+        }
+        let _paint = paint_lock();
+        // A tape took the screen since: `gfx_close` repaints it all.
+        if GFX_OPEN.load(Ordering::Relaxed) {
+            return;
+        }
+        let shown = &mut shown()[row * MAX_COLUMNS..row * MAX_COLUMNS + columns];
+        for column in 0..columns {
+            if force || shown[column] != row_cells[column] {
+                console.draw_value(column, row, row_cells[column]);
+                shown[column] = row_cells[column];
+            }
+        }
+    }
+    let mut cursor = (0, 0, false);
+    grid(&mut || cursor = (console.row, console.column, console.caret_hidden));
+    let _paint = paint_lock();
+    if GFX_OPEN.load(Ordering::Relaxed) {
+        return;
+    }
+    if console.text {
+        console.place_cursor();
+    } else {
+        console.draw_caret(cursor.0, cursor.1, cursor.2);
+    }
+    flush_writes();
+}
+
+/// The `console` thread: sleeps until a print changed the grid, then draws it (`paint`).
+extern "C" fn painter(_argument: usize) {
+    loop {
+        crate::sched::wait_while(PENDING.as_ptr() as usize, || !PENDING.load(Ordering::Acquire));
+        if !PAINTER.load(Ordering::Acquire) {
+            crate::sched::exit();
+        }
+        PENDING.store(false, Ordering::Release);
+        let start = crate::time::micros();
+        paint(false);
+        PASS_MAX_US.fetch_max(crate::time::micros().saturating_sub(start), Ordering::Relaxed);
+    }
+}
+
+/// Starts the `console` thread once the scheduler runs; from then on prints leave the drawing to it. Any CPU may run it.
+pub fn start_painter() {
+    if console().is_none() || PAINTER.load(Ordering::Acquire) {
+        return;
+    }
+    PAINTER.store(true, Ordering::Release);
+    if crate::sched::spawn_any("console", painter, 0).is_none() {
+        PAINTER.store(false, Ordering::Release);
+    }
+}
+
+/// For the crash paths (`serial::break_lock`): prints draw at once again, without `PAINT`. Forcing `PAINT` open instead
+/// would let a painter that still holds it bump the ticket lock past its next taker, and the crash report would never draw.
+pub fn direct() {
+    PAINTER.store(false, Ordering::Release);
+    CRASHED.store(true, Ordering::Release);
+}
+
+/// (longest print with the painter running, longest painter pass), in µs, for `sysrq`.
+pub fn timings() -> (u64, u64) {
+    (WRITE_MAX_US.load(Ordering::Relaxed), PASS_MAX_US.load(Ordering::Relaxed))
 }
 
 /// Makes the write-combining buffers drain, so what was just drawn is on the screen.
@@ -580,11 +744,12 @@ pub fn gfx_info() -> Option<(u32, u32)> {
 
 pub fn gfx_open() -> bool {
     let Some(console) = (unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }).filter(|console| !console.text) else { return false };
+    let _paint = PAINT.lock();
+    GFX_OPEN.store(true, Ordering::Relaxed);
     let black = console.palette[usize::from(DEFAULT_BACKGROUND)];
     console.fill(0, console.height, black);
     console.caret_at = usize::MAX;
     flush_writes();
-    GFX_OPEN.store(true, Ordering::Relaxed);
     true
 }
 
@@ -594,17 +759,20 @@ pub fn gfx_close() {
         return;
     }
     let Some(console) = (unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }) else { return };
-    console.foreground = DEFAULT_FOREGROUND;
-    console.background = DEFAULT_BACKGROUND;
-    console.bold = false;
-    console.escape = Escape::None;
-    console.caret_hidden = false;
-    console.caret_at = usize::MAX;
-    console.clear_all();
-    console.column = 0;
-    console.row = 0;
-    console.draw_caret();
-    flush_writes();
+    crate::serial::with_lock(|| {
+        let _paint = PAINT.lock();
+        console.foreground = DEFAULT_FOREGROUND;
+        console.background = DEFAULT_BACKGROUND;
+        console.bold = false;
+        console.escape = Escape::None;
+        console.caret_hidden = false;
+        console.clear_all();
+        console.clear_screen();
+        console.column = 0;
+        console.row = 0;
+        console.draw_caret(0, 0, false);
+        flush_writes();
+    });
 }
 
 pub fn gfx_is_open() -> bool {
@@ -713,18 +881,26 @@ pub fn set_colours(foreground: Option<&str>, background: Option<&str>) -> bool {
     ) else {
         return false;
     };
-    if let Some((red, green, blue)) = foreground {
-        console.palette[usize::from(DEFAULT_FOREGROUND)] = pixel(console.format, red, green, blue);
+    crate::serial::with_lock(|| {
+        let _paint = PAINT.lock();
+        if let Some((red, green, blue)) = foreground {
+            console.palette[usize::from(DEFAULT_FOREGROUND)] = pixel(console.format, red, green, blue);
+        }
+        if let Some((red, green, blue)) = background {
+            console.palette[usize::from(DEFAULT_BACKGROUND)] = pixel(console.format, red, green, blue);
+        }
+        let (height, black) = (console.height, console.palette[usize::from(DEFAULT_BACKGROUND)]);
+        console.fill(0, height, black);
+        console.caret_at = usize::MAX;
+        FORCE.store(true, Ordering::Release);
+        mark_all_dirty();
+    });
+    // Every cell in the new colours: now if prints draw themselves, else by the painter.
+    if !PAINTER.load(Ordering::Acquire) {
+        crate::serial::with_lock(|| paint(true));
+    } else if !PENDING.swap(true, Ordering::AcqRel) {
+        crate::sched::wake_all(PENDING.as_ptr() as usize);
     }
-    if let Some((red, green, blue)) = background {
-        console.palette[usize::from(DEFAULT_BACKGROUND)] = pixel(console.format, red, green, blue);
-    }
-    let (height, black) = (console.height, console.palette[usize::from(DEFAULT_BACKGROUND)]);
-    console.fill(0, height, black);
-    console.caret_at = usize::MAX;
-    console.redraw();
-    console.draw_caret();
-    flush_writes();
     true
 }
 

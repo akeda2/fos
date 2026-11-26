@@ -224,6 +224,8 @@ fn boot_services(info: &BootInfo, century: u8) -> ! {
     aoetarget::init();
     // Drains the NICs on their interrupts, so a long shell command on the service thread does not stop the network.
     sched::spawn_any("net-rx", net::rx_thread, 0);
+    // From here a print leaves the screen to the console thread, so it never repaints with interrupts off (`fb.rs`).
+    fb::start_painter();
     sched::spawn("service", service_thread, 0).expect("the service thread");
     println!("kernel-mf: slice 8 reached the end of boot; entering the service loop.");
     // The boot context is the idle thread: it runs when nothing else is ready and sleeps until the next interrupt.
@@ -279,6 +281,8 @@ fn boot_services(info: &BootInfo, _century: u8) -> ! {
     selftest::run();
     // After the self-test: that is where the scheduler starts, and private drivers may start threads.
     private::init();
+    // From here a print leaves the screen to the console thread, so it never repaints with interrupts off (`fb.rs`).
+    fb::start_painter();
     sched::spawn("service", service_thread, 0).expect("the service thread");
     println!("kernel-mf: slice 8 reached the end of boot; entering the service loop.");
     sched::become_idle();
