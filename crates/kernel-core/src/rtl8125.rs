@@ -152,7 +152,10 @@ const PHY_AN_10GBT_STAT: u32 = 0xa5d6;
 const PARTNER_2500: u16 = 0x0020;
 
 const DESCRIPTOR_BYTES: usize = 16;
-const RX_COUNT: usize = 256;
+/// Receive descriptors. At 2.5 Gb/s 256 buffers of full frames are 1.2 ms of traffic, less than the time the frames
+/// can wait for a drain while a tape works (an SMB upload from Linux overflowed them some 150 times per 700 MB); 1024
+/// are 5 ms (Realtek's own r8125 driver uses 1024 too). 2 MiB of buffers, 9 MiB with jumbo frames.
+const RX_COUNT: usize = 1024;
 const TX_COUNT: usize = 256;
 const DEFER_LIMIT: usize = 8;
 const BUFFER_BYTES: usize = 2048;
@@ -407,9 +410,9 @@ impl Rtl8125 {
         nic.set_mac();
         let below = Some(1u64 << 32); // 64-bit descriptors, but low memory is simplest (as on the 8168)
         nic.rings = memory::allocate_contiguous(RING_FRAMES, below).ok_or(Error::OutOfMemory)?;
-        let frames = (RX_COUNT * BUFFER_BYTES / 4096) as u64;
-        nic.rx_buffers = memory::allocate_contiguous(frames, below).ok_or(Error::OutOfMemory)?;
-        nic.tx_buffers = memory::allocate_contiguous(frames, below).ok_or(Error::OutOfMemory)?;
+        let (rx_frames, tx_frames) = ((RX_COUNT * BUFFER_BYTES / 4096) as u64, (TX_COUNT * BUFFER_BYTES / 4096) as u64);
+        nic.rx_buffers = memory::allocate_contiguous(rx_frames, below).ok_or(Error::OutOfMemory)?;
+        nic.tx_buffers = memory::allocate_contiguous(tx_frames, below).ok_or(Error::OutOfMemory)?;
         // Linux's open: the PHY first, then the reset work (`rtl8169_cleanup`, `rtl_hw_start`).
         nic.phy_init();
         if !nic.restart() {
@@ -1055,10 +1058,9 @@ impl Rtl8125 {
             return false;
         }
         if mtu > 1500 && self.buffer_bytes != JUMBO_BUFFER_BYTES {
-            let frames = (RX_COUNT * JUMBO_BUFFER_BYTES).div_ceil(4096) as u64;
             let below = Some(1u64 << 32);
-            let Some(rx_buffers) = memory::allocate_contiguous(frames, below) else { return false };
-            let Some(tx_buffers) = memory::allocate_contiguous(frames, below) else { return false };
+            let Some(rx_buffers) = memory::allocate_contiguous((RX_COUNT * JUMBO_BUFFER_BYTES).div_ceil(4096) as u64, below) else { return false };
+            let Some(tx_buffers) = memory::allocate_contiguous((TX_COUNT * JUMBO_BUFFER_BYTES).div_ceil(4096) as u64, below) else { return false };
             // Only now: `send` takes frames up to the MTU, which the 2 KiB buffers could not hold.
             (self.rx_buffers, self.tx_buffers, self.buffer_bytes, self.mtu) = (rx_buffers, tx_buffers, JUMBO_BUFFER_BYTES, mtu);
             return self.recover("the MTU change");
