@@ -791,3 +791,7 @@ owners, the rescue from the timer interrupt, `trace` with CPU and thread, crash 
   hardware watchdog helps there.
 - Real hardware: whether a board delivers the NMI to a CPU with interrupts off (QEMU does), and the aarch64 SGI capture
   (not delivered to a CPU with interrupts masked: such a CPU shows "no answer to the capture"; FIQ/pseudo-NMI would fix it).
+
+- **TCP SACK** (`crates/tape-net`): the receiver keeps data after a gap and answers with duplicate ACKs (2026-11-25), but does
+  not tell the sender which stretches it holds (RFC 2018), so a sender that lost several segments in one window resends them one
+  round trip at a time. Not seen to matter since the RTL8125's receive ring grew to 1024 (no losses in 700 MB uploads at 2.5 Gb/s).

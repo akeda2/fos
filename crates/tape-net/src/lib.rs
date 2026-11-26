@@ -11,7 +11,10 @@
 //! state machine for discovery, lease renewal, and rebinding.  The TCP
 //! implementation is not a general-purpose stack: it is a teaching state
 //! machine for one connection, with one fixed receive buffer and one
-//! outstanding segment for retransmission.
+//! outstanding segment for retransmission. Data that arrives after a gap is
+//! kept in place in that buffer (up to 8 stretches) and the gap is answered
+//! at once with a duplicate ACK, so a lost frame costs one resent segment;
+//! no SACK yet (`TcpConnection::take_data`).
 #![no_std]
 
 pub mod dns;
@@ -1861,6 +1864,9 @@ const TCP_RX_CAPACITY: usize = 512;
 /// [`TcpConnection::retransmit`] when appropriate.  At most one segment is
 /// outstanding, and received application data is copied into a 512-byte
 /// fixed buffer.
+/// Separate stretches of data after a gap a connection keeps (`TcpConnection::take_data`).
+const HELD_RANGES: usize = 8;
+
 pub struct TcpConnection<const RX: usize = TCP_RX_CAPACITY> {
     local_ip: Ipv4Address,
     remote_ip: Ipv4Address,
@@ -1894,6 +1900,11 @@ pub struct TcpConnection<const RX: usize = TCP_RX_CAPACITY> {
     /// third sets `fast_retransmit`, which `take_fast_retransmit` hands out once.
     dup_acks: u8,
     fast_retransmit: bool,
+    /// Data that arrived after a gap (a lost segment), kept in place: a byte with sequence number `s` is always at
+    /// `receive_len + (s - receive_next)` of `receive_buffer`, so it needs no copy when the gap is filled. These are the
+    /// filled sequence ranges (start, end) after `receive_next`, sorted, apart from each other; `held` of them are used.
+    held_ranges: [(u32, u32); HELD_RANGES],
+    held: usize,
 }
 
 impl<const RX: usize> TcpConnection<RX> {
@@ -1931,6 +1942,8 @@ impl<const RX: usize> TcpConnection<RX> {
             stream_active: false,
             dup_acks: 0,
             fast_retransmit: false,
+            held_ranges: [(0, 0); HELD_RANGES],
+            held: 0,
         }
     }
 
@@ -1997,6 +2010,7 @@ impl<const RX: usize> TcpConnection<RX> {
         self.stream_active = false;
         self.dup_acks = 0;
         self.fast_retransmit = false;
+        self.held = 0;
     }
 
     /// Makes this a listener again that takes a connection from any peer on `local_port` (see `accept_from`).
@@ -2153,30 +2167,11 @@ impl<const RX: usize> TcpConnection<RX> {
                     }
                 }
                 let mut response = false;
-                if !segment.data.is_empty() && segment.sequence == self.receive_next {
-                    let available = RX.saturating_sub(self.receive_len);
-                    let copied = core::cmp::min(available, segment.data.len());
-                    self.receive_buffer[self.receive_len..self.receive_len + copied]
-                        .copy_from_slice(&segment.data[..copied]);
-                    self.receive_len += copied;
-                    self.receive_next = self.receive_next.wrapping_add(segment.data.len() as u32);
-                    response = true;
-                } else if !segment.data.is_empty() {
-                    // Not the next byte. A retransmission may reach back into what was taken already: its new tail is
-                    // kept, when it fits. Anything else (a gap before it: a segment was lost, or an old duplicate) is
-                    // not kept but answered at once with the ACK of what is wanted (RFC 5681 4.2): the sender counts
-                    // three such duplicates and resends the lost segment within a round trip. Without them it waits
-                    // for its retransmission timeout (200 ms or more, doubling) for every lost frame, which held an
-                    // SMB upload over 2.5 Gb/s to 10 MB/s once a few receive-ring overflows dropped frames.
-                    let behind = self.receive_next.wrapping_sub(segment.sequence) as usize;
-                    if (behind as u32 as i32) > 0 && behind < segment.data.len() {
-                        let fresh = &segment.data[behind..];
-                        if fresh.len() <= RX.saturating_sub(self.receive_len) {
-                            self.receive_buffer[self.receive_len..self.receive_len + fresh.len()].copy_from_slice(fresh);
-                            self.receive_len += fresh.len();
-                            self.receive_next = self.receive_next.wrapping_add(fresh.len() as u32);
-                        }
-                    }
+                if !segment.data.is_empty() {
+                    // Every data segment is answered at once with the ACK of what is wanted next. For a segment after
+                    // a gap that is a duplicate ACK (RFC 5681 4.2): three of them make the sender resend the lost
+                    // segment within a round trip instead of waiting out its retransmission timeout.
+                    self.take_data(segment.sequence, segment.data);
                     response = true;
                 }
                 if segment.flags & TCP_FIN != 0
@@ -2331,6 +2326,86 @@ impl<const RX: usize> TcpConnection<RX> {
         Ok(Some(length))
     }
 
+    /// Takes a data segment's bytes: the part already taken is skipped (a retransmission may reach back), the rest goes
+    /// to its place in the receive buffer (`held_ranges`) as far as the buffer reaches. In order, it moves `receive_next`
+    /// on, and over any held data the gap was hiding. After a gap it is held (up to `HELD_RANGES` separate stretches)
+    /// so that one lost frame costs one resent segment: without that, everything after the gap must come again.
+    fn take_data(&mut self, sequence: u32, data: &[u8]) {
+        let behind = self.receive_next.wrapping_sub(sequence) as i32;
+        let (offset, data) = if behind > 0 {
+            if behind as usize >= data.len() {
+                return; // all of it taken already
+            }
+            (0usize, &data[behind as usize..])
+        } else {
+            (behind.unsigned_abs() as usize, data)
+        };
+        // The room this segment may use: from `receive_len` to the end of the buffer.
+        let room = RX.saturating_sub(self.receive_len);
+        if offset >= room {
+            return;
+        }
+        let data = &data[..data.len().min(room - offset)];
+        let at = self.receive_len + offset;
+        self.receive_buffer[at..at + data.len()].copy_from_slice(data);
+        let start = self.receive_next.wrapping_add(offset as u32);
+        self.hold(start, start.wrapping_add(data.len() as u32));
+        // Whatever now starts at `receive_next` is in order.
+        if self.held > 0 && self.held_ranges[0].0 == self.receive_next {
+            let end = self.held_ranges[0].1;
+            self.receive_len += end.wrapping_sub(self.receive_next) as usize;
+            self.receive_next = end;
+            self.held_ranges.copy_within(1..self.held, 0);
+            self.held -= 1;
+        }
+    }
+
+    /// Adds the filled range `start..end` (sequence numbers at or after `receive_next`) to `held_ranges`, merged with
+    /// any it touches. With all `HELD_RANGES` in use the furthest range is let go (it comes again): never the nearer
+    /// one, since the range at `receive_next` itself must always be taken, or the sender would resend it for ever.
+    fn hold(&mut self, start: u32, end: u32) {
+        let base = self.receive_next;
+        let key = |sequence: u32| sequence.wrapping_sub(base);
+        let (mut start, mut end) = (start, end);
+        let mut kept = [(0u32, 0u32); HELD_RANGES + 1];
+        let mut count = 0;
+        let mut placed = false;
+        for &(range_start, range_end) in &self.held_ranges[..self.held] {
+            if key(range_end) < key(start) {
+                kept[count] = (range_start, range_end);
+                count += 1;
+            } else if key(end) < key(range_start) {
+                if !placed {
+                    kept[count] = (start, end);
+                    count += 1;
+                    placed = true;
+                }
+                kept[count] = (range_start, range_end);
+                count += 1;
+            } else {
+                // touches or overlaps: merge
+                if key(range_start) < key(start) {
+                    start = range_start;
+                }
+                if key(range_end) > key(end) {
+                    end = range_end;
+                }
+            }
+        }
+        if !placed {
+            kept[count] = (start, end);
+            count += 1;
+        }
+        let count = count.min(HELD_RANGES);
+        self.held_ranges.copy_from_slice(&kept[..HELD_RANGES]);
+        self.held = count;
+    }
+
+    /// How far past `receive_len` the buffer holds data (the end of the last held range), 0 with none.
+    fn held_span(&self) -> usize {
+        if self.held == 0 { 0 } else { self.held_ranges[self.held - 1].1.wrapping_sub(self.receive_next) as usize }
+    }
+
     pub fn received(&self) -> &[u8] {
         &self.receive_buffer[..self.receive_len]
     }
@@ -2338,7 +2413,9 @@ impl<const RX: usize> TcpConnection<RX> {
     pub fn take_received(&mut self, output: &mut [u8]) -> usize {
         let count = core::cmp::min(output.len(), self.receive_len);
         output[..count].copy_from_slice(&self.receive_buffer[..count]);
-        self.receive_buffer.copy_within(count..self.receive_len, 0);
+        // held data moves along, so it stays at `receive_len + (s - receive_next)`
+        let end = self.receive_len + self.held_span();
+        self.receive_buffer.copy_within(count..end, 0);
         self.receive_len -= count;
         count
     }
@@ -2975,35 +3052,101 @@ mod tests {
         assert_eq!(TcpSegment::parse(&out[..update], IP_A, IP_B, true).unwrap().window, 2000);
     }
 
-    #[test]
-    fn tcp_a_gap_is_answered_at_once_and_a_retransmission_keeps_only_its_new_bytes() {
-        let mut client = TcpConnection::<4000>::active(IP_A, 1000, IP_B, 2000, 10, 5);
+    /// A connection past its handshake (peer data starts at sequence 51), and a way to hand it a data segment that
+    /// returns the acknowledgement it answers with.
+    fn receiving<const RX: usize>() -> TcpConnection<RX> {
+        let mut client = TcpConnection::<RX>::active(IP_A, 1000, IP_B, 2000, 10, 5);
         let mut out = [0u8; 2100];
         client.start_connect(100, &mut out).unwrap();
         let (bytes, length) = segment(2000, 1000, 50, 11, TCP_SYN | TCP_ACK, &[]);
         client.on_segment(&TcpSegment::parse(&bytes[..length], IP_B, IP_A, true).unwrap(), 101, &mut out).unwrap();
-        let mut deliver = |client: &mut TcpConnection<4000>, sequence: u32, data: &[u8]| {
-            let mut bytes = [0u8; 1600];
-            let length = TcpSegment { source_port: 2000, destination_port: 1000, sequence, acknowledgment: 11, flags: TCP_ACK, window: 512, checksum: 0, urgent: 0, window_scale: None, data }.encode(&mut bytes, IP_B, IP_A).unwrap();
-            let reply = client.on_segment(&TcpSegment::parse(&bytes[..length], IP_B, IP_A, true).unwrap(), 102, &mut out).unwrap();
-            reply.map(|reply| TcpSegment::parse(&out[..reply], IP_A, IP_B, true).unwrap().acknowledgment)
-        };
-        // 51..151 lost; 151.. arrives: nothing kept, the ACK for 51 goes out at once (a duplicate the sender counts).
+        client
+    }
+
+    fn deliver<const RX: usize>(client: &mut TcpConnection<RX>, sequence: u32, data: &[u8]) -> Option<u32> {
+        let (mut bytes, mut out) = ([0u8; 1600], [0u8; 2100]);
+        let length = TcpSegment { source_port: 2000, destination_port: 1000, sequence, acknowledgment: 11, flags: TCP_ACK, window: 512, checksum: 0, urgent: 0, window_scale: None, data }.encode(&mut bytes, IP_B, IP_A).unwrap();
+        let reply = client.on_segment(&TcpSegment::parse(&bytes[..length], IP_B, IP_A, true).unwrap(), 102, &mut out).unwrap();
+        reply.map(|reply| TcpSegment::parse(&out[..reply], IP_A, IP_B, true).unwrap().acknowledgment)
+    }
+
+    #[test]
+    fn tcp_a_gap_is_answered_at_once_and_what_came_after_it_is_kept() {
+        let mut client = receiving::<4000>();
+        // 51..151 lost; 151..351 arrives: answered at once with the ACK for 51 (a duplicate the sender counts), held.
         assert_eq!(deliver(&mut client, 151, &[2; 100]), Some(51));
         assert_eq!(deliver(&mut client, 251, &[3; 100]), Some(51));
         assert!(client.received().is_empty());
-        // The lost one comes again.
-        assert_eq!(deliver(&mut client, 51, &[1; 100]), Some(151));
-        // A retransmission of 101..251 overlaps 101..151 taken already: only 151..251 is new.
-        let mut overlap = [2u8; 150];
-        overlap[..50].fill(1);
-        assert_eq!(deliver(&mut client, 101, &overlap), Some(251));
-        let mut expected = [1u8; 200];
-        expected[100..].fill(2);
+        // The lost one comes again: everything held joins it.
+        assert_eq!(deliver(&mut client, 51, &[1; 100]), Some(351));
+        let mut expected = [1u8; 300];
+        expected[100..200].fill(2);
+        expected[200..].fill(3);
         assert_eq!(client.received(), &expected[..]);
-        // An old duplicate (all of it taken) is answered too, with nothing kept.
-        assert_eq!(deliver(&mut client, 51, &[1; 100]), Some(251));
-        assert_eq!(client.received().len(), 200);
+        // An old duplicate is answered, nothing kept; a retransmission reaching back keeps only its new tail.
+        assert_eq!(deliver(&mut client, 51, &[1; 100]), Some(351));
+        let mut overlap = [4u8; 150];
+        overlap[..50].fill(3);
+        assert_eq!(deliver(&mut client, 301, &overlap), Some(451));
+        assert_eq!(client.received().len(), 400);
+        assert_eq!(&client.received()[300..], &[4u8; 100][..]);
+    }
+
+    #[test]
+    fn tcp_held_data_survives_reading_and_two_gaps_close_in_any_order() {
+        let mut client = receiving::<4000>();
+        assert_eq!(deliver(&mut client, 51, &[1; 100]), Some(151));
+        // Two gaps: 151..251 and 351..451 lost, 251..351 and 451..551 held.
+        assert_eq!(deliver(&mut client, 251, &[3; 100]), Some(151));
+        assert_eq!(deliver(&mut client, 451, &[5; 100]), Some(151));
+        // The reader takes what is in order; the held data must move with the buffer.
+        let mut sink = [0u8; 60];
+        assert_eq!(client.take_received(&mut sink), 60);
+        assert_eq!(client.received(), &[1u8; 40][..]);
+        // The second gap closes first: still waiting for 151.
+        assert_eq!(deliver(&mut client, 351, &[4; 100]), Some(151));
+        // Then the first: all of it in order.
+        assert_eq!(deliver(&mut client, 151, &[2; 100]), Some(551));
+        let mut expected = [1u8; 440];
+        for (index, value) in [2u8, 3, 4, 5].iter().enumerate() {
+            expected[40 + index * 100..140 + index * 100].fill(*value);
+        }
+        assert_eq!(client.received(), &expected[..]);
+        // The window is the free room, held data or not.
+        assert_eq!(client.advertised_window() as usize, 4000 - 440);
+    }
+
+    #[test]
+    fn tcp_holds_at_most_a_few_stretches_and_never_past_the_buffer() {
+        let mut client = receiving::<2000>();
+        // Nine separate stretches after a gap at 51: the ninth is not kept (it is answered, and comes again).
+        for index in 0..9u32 {
+            assert_eq!(deliver(&mut client, 151 + index * 200, &[9; 10]), Some(51));
+        }
+        assert_eq!(client.held, HELD_RANGES);
+        // Past the end of the buffer nothing is kept.
+        assert_eq!(deliver(&mut client, 51 + 2000, &[9; 10]), Some(51));
+        assert_eq!(client.held, HELD_RANGES);
+        // A segment that fills the gap and touches the first stretch takes it in.
+        assert_eq!(deliver(&mut client, 51, &[1; 100]), Some(161));
+    }
+
+    #[test]
+    fn tcp_in_order_data_is_taken_even_with_every_stretch_in_use() {
+        let mut client = receiving::<4000>();
+        // Eight separate stretches after a gap at 51, far enough apart that the next in-order segment touches none.
+        for index in 0..8u32 {
+            assert_eq!(deliver(&mut client, 351 + index * 200, &[9; 10]), Some(51));
+        }
+        assert_eq!(client.held, HELD_RANGES);
+        // The in-order segment must be taken (it once was refused and the connection stalled for good); the furthest
+        // stretch makes room.
+        assert_eq!(deliver(&mut client, 51, &[1; 100]), Some(151));
+        assert_eq!(client.received(), &[1u8; 100][..]);
+        // A nearer stretch also wins over the furthest.
+        assert_eq!(deliver(&mut client, 201, &[2; 10]), Some(151));
+        assert_eq!(client.held, HELD_RANGES);
+        assert_eq!(client.held_ranges[0], (201, 211));
     }
 
     #[test]
