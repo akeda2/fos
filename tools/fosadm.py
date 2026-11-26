@@ -36,6 +36,8 @@ import threading
 from pathlib import Path
 
 TOOLS = Path(__file__).resolve().parent
+# The shell prompt both kernels print after every command (kernel/src/term.rs, kernel-mf/src/shell.rs).
+PROMPT_TEXT = "fos> "
 ROOT = TOOLS.parent
 sys.path.insert(0, str(TOOLS))
 import send_tape  # noqa: E402
@@ -271,12 +273,21 @@ def find_hosts(args, iface: str) -> list[Host]:
     return discover(iface, args.keep, args.timeout)
 
 
-def ask_host(iface: str, host: Host, commands: list[str], timeout: float = 60) -> str:
+def ask_host(iface: str, host: Host, commands: list[str], timeout: float = 60, prompt: bool = True) -> str:
+    """Runs `commands` in one term net session and returns what came back. Each command waits for the shell's prompt
+    after it (up to `timeout`): a shell builtin on the server kernel sends its whole output when it returns, so a test
+    command that runs for a minute is silent all that time and then answers. `prompt=False` (a `reboot`) waits for a
+    quiet wire instead. Output that arrived before `timeout` ran out is returned even then."""
     if host.serial:
         return host.serial.ask(commands, min(timeout, 60))
-    result = subprocess.run(
-        [sys.executable, str(TOOLS / "term_net.py"), "--iface", iface, "--mac", send_tape.format_mac(host.mac),
-         "--command-timeout", "10", *commands], capture_output=True, text=True, timeout=timeout)
+    wait = ["--prompt", PROMPT_TEXT, "--command-timeout", str(timeout)] if prompt else ["--command-timeout", "10"]
+    try:
+        result = subprocess.run(
+            [sys.executable, str(TOOLS / "term_net.py"), "--iface", iface, "--mac", send_tape.format_mac(host.mac),
+             *wait, *commands], capture_output=True, text=True, timeout=timeout * len(commands) + 15)
+    except subprocess.TimeoutExpired as expired:
+        out = expired.stdout or ""
+        return out.decode("utf-8", "replace") if isinstance(out, bytes) else out
     return result.stdout
 
 
@@ -748,7 +759,7 @@ def cmd_revert(args, iface: str) -> int:
     print(next((l for l in out.splitlines() if "revert" in l or "active slot now" in l), "no answer").replace("fos> ", ""))
     if "is the active slot now" not in out:
         return 1
-    ask_host(iface, host, ["reboot"], timeout=20)
+    ask_host(iface, host, ["reboot"], timeout=20, prompt=False)
     after = wait_up(iface, host)
     if after is None:
         print("the host did not come back in time; check it by hand")

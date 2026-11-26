@@ -128,7 +128,7 @@ def recv_data_frame(raw: socket.socket, source: bytes, peer: bytes, timeout: flo
 
 def run_noninteractive(
     raw: socket.socket, source: bytes, peer: bytes, commands: list[str], settle: float, initial_wait: float, command_timeout: float,
-    until: bytes | None = None,
+    until: bytes | None = None, prompt: bytes | None = None,
 ) -> None:
     """Sends each of `commands` as one line, printing whatever text comes
     back before moving to the next: after sending, keeps reading
@@ -154,9 +154,17 @@ def run_noninteractive(
     quiet moment no longer means it finished. For such a command pass `until`:
     the marker text that shows it is done. It applies to the *last* command only,
     which then waits (up to `command_timeout`) for the marker instead of for
-    silence."""
+    silence.
 
-    def drain_output(timeout_first: float, marker: bytes | None = None) -> bool:
+    `prompt` (the shell's prompt, `fos> `) makes *every* command wait for the
+    shell to come back instead: done when the prompt appears after the echo
+    of the typed line, or after `command_timeout`. This is what a shell
+    builtin that runs long needs: on the server kernel it sends its output in
+    one burst when it returns, so neither the first-reply wait nor a quiet
+    period says when it is done. Only a prompt after the echo counts, so a
+    welcome prompt that arrives late cannot end the wait early."""
+
+    def drain_output(timeout_first: float, marker: bytes | None = None, after: bytes | None = None) -> bool:
         """Returns whether any output was actually received."""
         timeout = timeout_first
         received_any = False
@@ -181,14 +189,23 @@ def run_noninteractive(
             timeout = settle
             if marker is not None:
                 seen += payload
-                if marker in seen:
+                start = 0
+                if after is not None:
+                    echo = seen.find(after)
+                    if echo < 0:
+                        continue
+                    start = echo + len(after)
+                if marker in seen[start:]:
                     return received_any
 
     connected = drain_output(initial_wait)
     for index, command in enumerate(commands):
         send_data(raw, peer, source, command.encode() + b"\n")
         marker = until if index == len(commands) - 1 else None
-        if drain_output(command_timeout, marker):
+        after = None
+        if marker is None and prompt is not None:
+            marker, after = prompt, command.encode()
+        if drain_output(command_timeout, marker, after):
             connected = True
 
     # Only say goodbye to a session that was actually established: if
@@ -401,6 +418,12 @@ def main() -> None:
         "and prints as it goes (e.g. 'tape load net', marker 'Tape loaded'). Waits up to --command-timeout.",
     )
     parser.add_argument(
+        "--prompt",
+        help="The shell's prompt (e.g. 'fos> '): every command waits, up to --command-timeout, for the prompt to "
+        "come back after its echo instead of for a quiet period. For shell builtins that run long and print "
+        "only when they return.",
+    )
+    parser.add_argument(
         "--initial-wait", type=float, default=2.0, help="Seconds to wait for the session banner/first prompt (default: 2.0)."
     )
     args = parser.parse_args()
@@ -462,7 +485,7 @@ def main() -> None:
         else:
             run_noninteractive(
                 raw, source, destination, commands, args.settle, args.initial_wait, args.command_timeout,
-                args.until.encode() if args.until else None,
+                args.until.encode() if args.until else None, args.prompt.encode() if args.prompt else None,
             )
 
 
