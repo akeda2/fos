@@ -128,45 +128,21 @@ pub fn idle_poll() -> bool {
     IDLE_POLL.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// The Intel PCH's `SMI_EN` and `SMI_STS` (I/O `PMBASE + 0x30`, `+ 0x34`), read only: which firmware sources may raise an
-/// SMI and which have (status bits are sticky until the firmware clears them). PMBASE is the PM1a event block, 8 below the PM
-/// timer on that chipset. `None` without an Intel CPU or a PM timer.
+/// The Intel chipset's `SMI_EN` and `SMI_STS` (`kernel_core::smi`): which firmware sources may raise an SMI and which
+/// have. `None` without an Intel chipset.
 pub fn smi_sources() -> Option<(u32, u32)> {
-    smi_count()?;
-    let timer = apic::pm_port();
-    if timer < 8 {
-        return None;
-    }
-    let base = timer - 8;
-    Some((cpu::inl(base + 0x30), cpu::inl(base + 0x34)))
+    kernel_core::smi::sources()
 }
 
-/// `SMI_EN` as the firmware left it, saved at the first `debug smi on|off` so `debug smi restore` can put it back.
-static SMI_EN_FIRMWARE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
-
-/// `debug smi on|off BIT`: sets or clears one `SMI_EN` source and returns the register before and after (read back: a
-/// bit the firmware locked stays as it was). An experiment, not a setting: the firmware owns this register, may set the
-/// bit again in its next SMI, and may rely on the source (bit 6, the software SMI timer, re-arms itself every 1.5 to 64 ms
-/// and is often how firmware polls legacy USB). Bit 0 (all SMIs) is refused by the caller. `None` where `smi_sources` is.
+/// `debug smi on|off BIT`: one `SMI_EN` source, read back (`kernel_core::smi::set_bit`). An experiment, not a setting:
+/// the firmware owns this register. `smi-timer off` in `settings` is the setting for bit 6.
 pub fn smi_enable_bit(bit: u32, on: bool) -> Option<(u32, u32)> {
-    let (before, _) = smi_sources()?;
-    let _ = SMI_EN_FIRMWARE.compare_exchange(u64::MAX, before as u64, core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed);
-    let value = if on { before | 1 << bit } else { before & !(1 << bit) };
-    let port = apic::pm_port() - 8 + 0x30;
-    cpu::outl(port, value);
-    Some((before, cpu::inl(port)))
+    kernel_core::smi::set_bit(bit, on)
 }
 
 /// Writes back the `SMI_EN` saved before the first change; `None` if nothing was changed.
 pub fn smi_restore() -> Option<(u32, u32)> {
-    let saved = SMI_EN_FIRMWARE.load(core::sync::atomic::Ordering::Relaxed);
-    if saved == u64::MAX {
-        return None;
-    }
-    let (before, _) = smi_sources()?;
-    let port = apic::pm_port() - 8 + 0x30;
-    cpu::outl(port, saved as u32);
-    Some((before, cpu::inl(port)))
+    kernel_core::smi::restore()
 }
 
 /// System management interrupts since reset (Intel `MSR_SMI_COUNT`, 0x34, family 6 from Nehalem, model 0x1a, on). An SMI
@@ -280,6 +256,8 @@ pub fn init_machine(machine: &boot::Machine) -> u8 {
     println!("ACPI: revision {}, local APIC at {:#x}, {} CPU(s), {} I/O APIC(s), PM timer port {:#x}.", tables.revision, madt.local_apic_address, madt.cpu_count, madt.io_apics, fadt.pm_timer_port);
     power::set_acpi_reset(fadt.reset);
     power::set_acpi_s5(fadt.pm1a_control, fadt.pm1b_control, fadt.s5);
+    // Where the chipset's SMI enables are, for `smi-timer off` and `debug smi` (Intel only).
+    kernel_core::smi::init(fadt.pm1a_event);
     let srat = acpi::srat(&tables);
     match &srat {
         Some(srat) => {

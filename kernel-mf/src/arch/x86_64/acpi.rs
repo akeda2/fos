@@ -58,6 +58,8 @@ pub struct Fadt {
     pub reset: Option<(u16, u8)>,
     /// CMOS register holding the century of the RTC date (0 = none).
     pub century: u8,
+    /// PM1a event block port: on Intel chipsets also PMBASE, the start of the ACPI I/O block (`kernel_core::smi`).
+    pub pm1a_event: u16,
     /// PM1a/PM1b control block ports (0 = none), where SLP_TYP + SLP_EN powers the machine off.
     pub pm1a_control: u16,
     pub pm1b_control: u16,
@@ -106,7 +108,7 @@ pub fn fadt(tables: &Tables) -> Option<Fadt> {
     let flags = read::<u32>(table + 112);
     // RESET_REG is a 12-byte generic address at 116 (space id, width, offset, size, 64-bit address); the value is at 128.
     let reset = (flags & (1 << 10) != 0 && read::<u8>(table + 116) == 1).then(|| (read::<u64>(table + 120) as u16, read::<u8>(table + 128)));
-    Some(Fadt { pm_timer_port: read::<u32>(table + 76) as u16, pm_timer_32_bit: flags & (1 << 8) != 0, reset, century: if read::<u32>(table + 4) >= 109 { read::<u8>(table + 108) } else { 0 }, pm1a_control: read::<u32>(table + 64) as u16, pm1b_control: read::<u32>(table + 68) as u16, s5: s5_sleep_types(table) })
+    Some(Fadt { pm_timer_port: read::<u32>(table + 76) as u16, pm_timer_32_bit: flags & (1 << 8) != 0, reset, century: if read::<u32>(table + 4) >= 109 { read::<u8>(table + 108) } else { 0 }, pm1a_event: read::<u32>(table + 56) as u16, pm1a_control: read::<u32>(table + 64) as u16, pm1b_control: read::<u32>(table + 68) as u16, s5: s5_sleep_types(table) })
 }
 
 pub const MAX_CPUS: usize = 256;

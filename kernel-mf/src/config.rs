@@ -1,5 +1,5 @@
 //! The per-machine text files on the boot volume that the server kernel honours so far: `hostname`, `settings`
-//! (`deny-term-net`, `term-net`, `no-msi`, `keymap`, `irq-cpu N`), `start` (the boot script, rerun by the `start` command) and `debug` (`kernel-update`, `reboot-on-crash`, `reboot-delay`, `watchdog`, `crash-on-boot`). Same files and names as the embedded kernel (docs/config.md); a FOSFS v4
+//! (`deny-term-net`, `term-net`, `no-msi`, `keymap`, `irq-cpu N`, `smi-timer off`), `start` (the boot script, rerun by the `start` command) and `debug` (`kernel-update`, `reboot-on-crash`, `reboot-delay`, `watchdog`, `crash-on-boot`). Same files and names as the embedded kernel (docs/config.md); a FOSFS v4
 //! volume keeps them in `settings/`, the bare name in the root stays valid. Options the server kernel has no use for yet are
 //! ignored silently.
 
@@ -236,6 +236,9 @@ pub fn load() {
             if line.split_whitespace().next() == Some("no-msi") {
                 unsafe { NO_MSI = true };
                 println!("settings: no-msi -- devices are polled.");
+            }
+            if line.split_whitespace().eq(["smi-timer", "off"]) {
+                kernel_core::smi::apply_timer_off();
             }
             if line.split_whitespace().eq(["ahci", "no-ncq"]) {
                 kernel_core::ahci::set_ncq(false);

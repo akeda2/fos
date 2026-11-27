@@ -90,6 +90,8 @@ pub struct Fadt {
     /// I/O port of the 24- or 32-bit power-management timer, 0 if the chipset has none.
     pub pm_timer_port: u16,
     pub pm_timer_32_bit: bool,
+    /// PM1a event block port: on Intel chipsets also PMBASE, the start of the ACPI I/O block (`kernel_core::smi`).
+    pub pm1a_event: u16,
     pub pm1a_control: u16,
     #[allow(dead_code)] // FADT field, parsed for completeness
     pub sci_interrupt: u16,
@@ -110,6 +112,7 @@ pub fn fadt(tables: &Tables) -> Option<Fadt> {
     Some(Fadt {
         pm_timer_port: read_u32(table + 76) as u16,
         pm_timer_32_bit: flags & (1 << 8) != 0,
+        pm1a_event: read_u32(table + 56) as u16,
         pm1a_control: read_u32(table + 64) as u16,
         sci_interrupt: read_u16(table + 46),
         pm1b_control: read_u32(table + 68) as u16,

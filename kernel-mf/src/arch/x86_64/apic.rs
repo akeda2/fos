@@ -58,11 +58,6 @@ pub fn micros() -> u64 {
     clock.1 * 1_000_000 / PM_TIMER_HZ
 }
 
-/// The ACPI PM timer's I/O port (0: none), for `smi_sources`.
-pub fn pm_port() -> u16 {
-    unsafe { PM_PORT }
-}
-
 /// Where the clock comes from, for the boot narration.
 pub fn micros_source() -> &'static str {
     if unsafe { TSC_KHZ } != 0 { "invariant TSC" } else { "ACPI PM timer" }

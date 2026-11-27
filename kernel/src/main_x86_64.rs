@@ -197,6 +197,8 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
                 madt.processors,
                 madt.io_apics
             );
+            // Where the chipset's SMI enables are, for `smi-timer off` in `settings` (Intel only).
+            kernel_core::smi::init(fadt.pm1a_event);
         }
         _ => println!("ACPI: FADT/MADT not found; no timer tick."),
     }

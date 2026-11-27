@@ -26,6 +26,7 @@ unknown line is reported on the console ("unknown line ... ignored") and skipped
 | `no-msi` | NICs stay on polling instead of MSI interrupts. |
 | `ahci no-ncq` | Server kernel: SATA drives get one command at a time, no native command queuing (NCQ is on by default where the drive and HBA have it). |
 | `nic N MAC` | The card with that MAC is interface N, wherever it sits (both kernels). The other cards take the free numbers in PCI order (bus, device, function), whatever their driver. `nic pin` prints these lines for the numbers a machine has now. A pinned card that is absent leaves its number empty (reported at boot), so the cards pinned above it keep theirs; unpinned cards take the lowest numbers no pin claims. A pin above the interface table (8, 16 on the server kernel) is reported and ignored. A 3C905 or virtio-net card cannot be pinned (its MAC is read only once its driver starts). NETWORKING.md "Interface numbers". |
+| `smi-timer off` | Both kernels, x86 with an Intel chipset: stop the firmware's software SMI timer (`SMI_EN` bit 6) when `settings` is read at boot. While it runs, the firmware stops every CPU many times a second (60 on rack), each SMI delaying interrupts by about 170 µs and now and then by 1-2 ms, enough to lose an audio ring. The timer polls USB for legacy keyboard emulation, which fos never uses (it takes the controllers over at boot). For boards whose BIOS has no switch for it. The boot says what changed; `debug smi` (server kernel) shows the rate. `kernel_core::smi`. |
 | `prefer-msix` | Try MSI-X before MSI on devices that offer both (a test aid; `docs/design.md`, interrupt delivery). |
 | `park-idle` | Park every NIC whose link has been down for a minute. |
 | `hwp performance\|balanced\|power` | Let an Intel CPU with hardware P-states pick its own speed, with that preference. Use `performance` on machines doing line-rate network or audio work; `balanced` has cost an i350 receive overruns. |
@@ -64,7 +65,7 @@ Two more on the server kernel (x86), for finding why interrupts arrive late; nei
 - `debug smi [on|off BIT | restore]`: with no words, the system management interrupts (SMIs) of the last second, the
   count since reset and the Intel PCH's `SMI_EN`/`SMI_STS`. An SMI runs firmware with every CPU stopped. `off BIT`
   clears one `SMI_EN` source and `restore` puts back the firmware's value. Bit 0 (every SMI) is refused. The firmware
-  owns this register and may rely on a source, so this is an experiment, not a setting. On rack, `debug smi off 6`
+  owns this register and may rely on a source, so this is an experiment; `smi-timer off` in `settings` is the setting for bit 6. On rack, `debug smi off 6`
   (the software SMI timer) took the rate from 60 a second to none, and 60 s ring checks at 176.4 kHz, period 64, ran
   clean where two of three had lost a ring.
   `sysrq` prints the SMI count and each CPU's worst timer-tick lateness too.

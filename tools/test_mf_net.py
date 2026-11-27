@@ -140,7 +140,7 @@ def main():
 
     # `irq-cpu 1`: the NIC's interrupt (self-test, then every frame) is delivered to CPU 1 and the terminal still works.
     with tempfile.TemporaryDirectory() as tmp:
-        machine = base.Machine(tmp, {"settings": "irq-cpu 1\n"})
+        machine = base.Machine(tmp, {"settings": "irq-cpu 1\nsmi-timer off\n"})
         machine.extra = ["-smp", "4"]
         machine.start()
         try:
@@ -153,6 +153,12 @@ def main():
             check("routed" in out, "the network terminal works with interrupts on CPU 1", out)
             out = machine.run("cpus")
             check("4 CPU(s)" in out, "on a 4 CPU machine", out)
+            # q35's ICH9 bridge at 00:1f.0 is an Intel chipset, so `smi-timer off` reaches SMI_EN and `debug smi` shows it.
+            check("settings: smi-timer off -- the chipset's software SMI timer" in text, "settings: smi-timer off is applied", "\n".join(l for l in text.splitlines() if "smi" in l.lower() or "settings" in l))
+            out = machine.run("debug smi off 6")
+            check("SMI_EN 0x" in out and "bit 6 off" in out, "debug smi reaches the same registers", out)
+            out = machine.run("debug smi restore")
+            check("restored: SMI_EN" in out, "and restore puts back the value from before smi-timer off", out)
         finally:
             machine.stop()
 

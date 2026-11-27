@@ -5,6 +5,7 @@
 //!   number, so `lab` becomes `lab1`);
 //! (Every option is listed in docs/config.md; keep it in step with this parser.)
 //! * `settings`: `deny-term-net` closes the network terminal, `no-msi` keeps NICs polling, `prefer-msix` tries MSI-X first,
+//!   `smi-timer off` stops the firmware's periodic SMI on Intel chipsets (`kernel_core::smi`),
 //!   `park-idle` parks NICs without a link, `hwp performance|balanced|power` lets the CPU pick its speed; `gpio-remote` lets other machines write
 //!   pins, `gpio-deny N..` forbids pins, `gpio-sim` gives a RAM-backed bank (tests);
 //!   `serial-shell [PORT] [BAUD]` puts the shell on a serial port as well (COM2-COM4, numbered as `fterm list` does; off unless asked);
@@ -253,6 +254,7 @@ pub fn load() {
                     unsafe { NO_MSI = true };
                     crate::println!("settings: no-msi -- NICs stay on polling.");
                 }
+                Some("smi-timer") if line.split_whitespace().nth(1) == Some("off") => kernel_core::smi::apply_timer_off(),
                 _ => crate::println!("settings: unknown line `{line}` ignored."),
             }
         }

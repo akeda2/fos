@@ -33,6 +33,7 @@ pub mod ext4vol;
 pub mod fatvol;
 pub mod fosfs;
 pub mod slot_report;
+pub mod smi;
 pub mod tapesync_client;
 pub mod gpio_client;
 pub mod gpt;

@@ -103,8 +103,11 @@ def main():
         seen = [tag for _, tag, _ in [f for _ in range(10) for f in wire.frames(0.2)] if tag == TAG_DATA]
         outcome["data"] = seen
 
-    text = run({"settings": "deny-term-net\n"}, "M3 complete", denied)
+    text = run({"settings": "deny-term-net\nsmi-timer off\n"}, "M3 complete", denied)
     check("deny-term-net" in text and outcome["reply"] == b"fos-123479", "deny-term-net: discovery still answers", text)
+    # q35's ICH9 bridge at 00:1f.0 is an Intel chipset: the line finds SMI_EN and reads the timer bit back off.
+    check("settings: smi-timer off -- the chipset's software SMI timer" in text and "SMI_EN 0x" in text,
+          "smi-timer off finds the chipset's SMI_EN and the timer bit is off", text[-2000:])
     check(not outcome["data"] and "Remote terminal connected" not in text, "deny-term-net: a HELLO gets no session", text)
 
     ptp_tape = ROOT / "build/cargo-target/x86_64-fos-tape/release/ptp"
