@@ -612,6 +612,7 @@ extern "C" fn sched_exit() -> ! {
 
 /// Called from the timer interrupt (after the end-of-interrupt): wakes sleepers that are due and ends the running thread's slice.
 pub fn tick() {
+    crate::time::note_tick(this_cpu());
     let now = crate::arch::ticks();
     let mut mask = 0;
     {

@@ -448,6 +448,16 @@ pub fn run_command(line: &str) {
                 println!("\x1b[41;1m bold on red \x1b[0m");
             }
             Some("slots") | Some("status") => slots::report(),
+            Some("idle") => match words.next() {
+                Some(word @ ("poll" | "halt")) => {
+                    if crate::arch::set_idle_poll(word == "poll") {
+                        println!("debug idle: idle CPUs {} (not kept across a reboot).", if word == "poll" { "spin instead of halting" } else { "halt" });
+                    } else {
+                        println!("debug idle: only on x86.");
+                    }
+                }
+                _ => println!("debug idle: {} (`debug idle poll|halt`).", if crate::arch::idle_poll() { "poll" } else { "halt" }),
+            },
             Some("revert") => {
                 let _disk = crate::tapefs::lock();
                 let mut outcome = Err("the slot metadata cannot be read or written");

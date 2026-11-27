@@ -328,6 +328,24 @@ pub fn wait_for_interrupt() {
     cpu::sleep()
 }
 
+/// `debug idle poll` is an x86 experiment; the Pi keeps `wfi`.
+pub fn set_idle_poll(_on: bool) -> bool {
+    false
+}
+
+pub fn idle_poll() -> bool {
+    false
+}
+
+pub fn smi_sources() -> Option<(u32, u32)> {
+    None
+}
+
+/// No SMIs on the Pi.
+pub fn smi_count() -> Option<u64> {
+    None
+}
+
 pub use timer::TICK_HZ;
 
 pub fn ticks() -> u64 {

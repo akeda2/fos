@@ -115,8 +115,54 @@ pub fn halt() -> ! {
     }
 }
 
-/// Sleeps until the next interrupt (interrupts are enabled for the wait).
+/// `debug idle poll`: idle CPUs spin instead of `hlt`, so none enters a sleep state the firmware may deepen (C1E, package
+/// C-states) and an interrupt is taken at once. An experiment for audio interrupt latency; it costs power and heat.
+static IDLE_POLL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn set_idle_poll(on: bool) -> bool {
+    IDLE_POLL.store(on, core::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+pub fn idle_poll() -> bool {
+    IDLE_POLL.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// The Intel PCH's `SMI_EN` and `SMI_STS` (I/O `PMBASE + 0x30`, `+ 0x34`), read only: which firmware sources may raise an
+/// SMI and which have (status bits are sticky until the firmware clears them). PMBASE is the PM1a event block, 8 below the PM
+/// timer on that chipset. `None` without an Intel CPU or a PM timer.
+pub fn smi_sources() -> Option<(u32, u32)> {
+    smi_count()?;
+    let timer = apic::pm_port();
+    if timer < 8 {
+        return None;
+    }
+    let base = timer - 8;
+    Some((cpu::inl(base + 0x30), cpu::inl(base + 0x34)))
+}
+
+/// System management interrupts since reset (Intel `MSR_SMI_COUNT`, 0x34, family 6 from Nehalem, model 0x1a, on). An SMI
+/// runs firmware with every CPU stopped, invisible to the kernel but not to an audio card's deadline. `None` on other CPUs,
+/// where reading the MSR would fault.
+pub fn smi_count() -> Option<u64> {
+    let (_, ebx, ecx, edx) = cpu::cpuid(0, 0);
+    let intel = (ebx, edx, ecx) == (u32::from_le_bytes(*b"Genu"), u32::from_le_bytes(*b"ineI"), u32::from_le_bytes(*b"ntel"));
+    let signature = cpu::cpuid(1, 0).0;
+    let family = (signature >> 8) & 0xf;
+    let model = ((signature >> 4) & 0xf) | ((signature >> 12) & 0xf0);
+    (intel && family == 6 && model >= 0x1a).then(|| cpu::read_msr(0x34) & 0xffff_ffff)
+}
+
+/// Sleeps until the next interrupt (interrupts are enabled for the wait); with `debug idle poll`, spins about 10 µs with
+/// interrupts on and returns, and the idle loop looks at the run queue again.
 pub fn wait_for_interrupt() {
+    if idle_poll() {
+        unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+        for _ in 0..1000 {
+            core::hint::spin_loop();
+        }
+        return;
+    }
     unsafe { core::arch::asm!("sti", "hlt", options(nomem, nostack)) };
 }
 
