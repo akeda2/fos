@@ -21,6 +21,12 @@ pub const TAG_SYNC_REQUEST: u8 = 0x40;
 pub const KEY_FILE: &str = "synckey";
 pub const KEY_MAX: usize = 128;
 
+/// True for the key file in the root or in any folder (`settings/synckey`): NETFS paths may name folders, and the key
+/// must not leave the machine whichever folder holds it.
+pub fn is_key_file(path: &[u8]) -> bool {
+    path.rsplit(|&byte| byte == b'/').next() == Some(KEY_FILE.as_bytes())
+}
+
 /// What the client needs from its kernel.
 pub trait Env {
     fn print(&self, arguments: core::fmt::Arguments);

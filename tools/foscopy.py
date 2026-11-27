@@ -22,8 +22,11 @@ HOST is a hostname as `nic peers` shows it (fos appends the NIC number:
 (see peers.py). `:diskN` defaults to disk1, the boot disk. A source or
 destination counts as remote when it has the form HOST[:diskN]/NAME and no
 local directory called HOST exists. Exactly one side must be remote. Names are
-FOSFS names: up to 16 of a-z 0-9 . _ - (the file is never renamed for you; a
-trailing slash on a PUT destination reuses the source's file name).
+FOSFS names (v4: up to 48 bytes of UTF-8; v3: 16 of a-z 0-9 . _ -), and on a v4
+volume NAME may be a path into folders that exist: `rack/settings/start` (the
+file is never renamed for you; a trailing slash on a PUT destination,
+`rack/settings/`, reuses the source's file name). The machine never sends or
+takes its `synckey`, in whichever folder.
 
 Sending raw frames needs CAP_NET_RAW (see AGENTS.md: the setcap'd
 `python3-netraw` copy of Python). `--mcast GROUP:PORT` uses a UDP multicast
@@ -88,6 +91,7 @@ ERROR_NAMES = {
 CHUNK_LEN = 1024
 NAME_CAPACITY = 48  # fosfs::MAX_NAME: bytes of UTF-8 (a v3 volume refuses what its 16 lowercase characters cannot hold)
 NAME_RE = re.compile(r"^[A-Za-z0-9._+-]+$")  # the ASCII part of fosfs::valid_name
+PATH_CAPACITY = 192  # fosfs::MAX_PATH
 
 
 def legal_name(name: str) -> bool:
@@ -102,7 +106,12 @@ def legal_name(name: str) -> bool:
         elif code <= 0x9F or code in (0x2028, 0x2029, 0xFEFF) or 0x202A <= code <= 0x202E or 0x2066 <= code <= 0x2069 or 0xFDD0 <= code <= 0xFDEF or code & 0xFFFE == 0xFFFE or 0xD800 <= code <= 0xDFFF:
             return False
     return True
-REMOTE_RE = re.compile(r"^(?P<host>[^/]*?)(?::disk(?P<disk>\d+))?/(?P<name>[^/]*)$")
+
+
+def legal_path(path: str) -> bool:
+    """fosfs::valid_path: legal names separated by single `/`, at most 192 bytes (a v3 volume refuses any folder)."""
+    return len(path.encode()) <= PATH_CAPACITY and all(legal_name(part) for part in path.split("/"))
+REMOTE_RE = re.compile(r"^(?P<host>[^/]*?)(?::disk(?P<disk>\d+))?/(?P<name>.*)$")
 
 
 class Fatal(SystemExit):
@@ -348,7 +357,7 @@ def main() -> None:
         host, disk, name = src_remote
         local = Path(args.destination)
         if local.is_dir():
-            local = local / name
+            local = local / name.rsplit("/", 1)[-1]
         data = b""
     else:
         host, disk, name = dst_remote
@@ -356,12 +365,13 @@ def main() -> None:
         if not local.is_file():
             raise Fatal(f"{local}: no such file")
         data = local.read_bytes()
-        if not name:
-            name = local.name
+        if not name or name.endswith("/"):
+            name += local.name
         if not data:
             raise Fatal("refusing to copy an empty file (fos rejects zero-length files)")
-    if not legal_name(name):
-        raise Fatal(f"'{name}' is not a legal FOSFS name (up to {NAME_CAPACITY} bytes of UTF-8: letters, digits . _ - + and non-ASCII characters)")
+    if not legal_path(name):
+        raise Fatal(f"'{name}' is not a legal FOSFS name or path (names of up to {NAME_CAPACITY} bytes of UTF-8:\n"
+                    f"letters, digits . _ - + and non-ASCII characters; folders joined by /, {PATH_CAPACITY} bytes in all)")
     if disk < 1:
         raise Fatal("disk numbers start at 1")
 

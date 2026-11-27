@@ -6,6 +6,7 @@ reads them back over the multicast seam. Checks, byte for byte:
  2. a read comes from the FOSFS volume, so the PUT reached the disk and not just a buffer;
  3. tape sync: the manifest is signed with `synckey`; another key is refused;
  4. a missing file, a missing disk and the `synckey` secret are refused with the usual messages.
+ 5. a path into a folder (`settings/note.txt`) is stored and read back; `synckey` in a folder is refused too.
 QEMU only: real NIC pacing, and a transfer racing a running tape on silicon, are for hardware."""
 
 import subprocess
@@ -32,6 +33,25 @@ def foscopy(machine, args, cwd):
     return process.returncode, process.stdout.read()
 
 
+def folder_checks(machine, work, copy=None):
+    """A path into a v4 folder (`settings/`, made by the image builder) round-trips; a trailing slash keeps the source's
+    name; a missing folder is "file not found"; the key file is refused in a folder too. Shared with test_netfs.py."""
+    copy = copy or (lambda args: foscopy(machine, args, work))
+    code, out = copy(["note.txt", ":disk1/settings/note.txt"])
+    check(code == 0, "foscopy stores a file in a folder (settings/note.txt)", out[-600:])
+    code, out = copy([":disk1/settings/note.txt", "folder.back"])
+    check(code == 0 and (work / "folder.back").read_bytes() == (work / "note.txt").read_bytes(),
+          "and reads it back from the folder", out[-600:])
+    code, out = copy(["note.txt", ":disk1/settings/"])
+    check(code == 0 and "settings/note.txt" in out, "a trailing slash keeps the source's name", out[-600:])
+    code, out = copy(["note.txt", ":disk1/nosuchfolder/note.txt"])
+    check(code != 0 and "file not found" in out, "a missing folder is reported as not found", out[-400:])
+    code, out = copy(["note.txt", ":disk1/settings/synckey"])
+    check(code != 0, "the synckey secret cannot be written in a folder", out[-400:])
+    code, out = copy([":disk1/settings/synckey", "k2.bin"])
+    check(code != 0 and not (work / "k2.bin").exists(), "or read from one", out[-400:])
+
+
 def main():
     import random
     with tempfile.TemporaryDirectory() as tmp:
@@ -43,7 +63,12 @@ def main():
         (work / "big.bin").write_bytes(big)
         (work / "large.bin").write_bytes(large)
         (work / "key").write_text("mf test key\n")
-        machine = base.Machine(tmp, {"hostname": "mfhost\n", "synckey": "mf test key\n"}, {"hello": ROOT / "build/fosfor/tapes/hello"})
+        # FOSFS v4, as `make image` builds, so a path can reach a folder: tapes in bin/, a settings/ folder. A key in
+        # settings/ too, so refusing `settings/synckey` is the guard at work and not a missing file.
+        (work / "readme").write_text("settings folder\n")
+        machine = base.Machine(tmp, {"hostname": "mfhost\n", "synckey": "mf test key\n"},
+                               {"bin/hello": ROOT / "build/fosfor/tapes/hello", "settings/readme": work / "readme",
+                                "settings/synckey": work / "key"}, fosfs=4)
         machine.start()
         try:
             machine.wait_for(READY)
@@ -65,6 +90,7 @@ def main():
             check(code != 0, "the synckey secret cannot be written", out[-400:])
             code, out = foscopy(machine, [":disk1/synckey", "k.bin"], work)
             check(code != 0 and not (work / "k.bin").exists(), "or read", out[-400:])
+            folder_checks(machine, work)
 
             # Tape sync: the signed manifest of the stamped tapes (tools/tape_manifest.py checks the signature).
             def manifest(key):

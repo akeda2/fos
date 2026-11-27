@@ -67,6 +67,12 @@ def main():
             check(result.returncode != 0 and "file not found" in result.stderr + result.stdout, "a missing file is reported as such", result.stderr[-400:])
             result = foscopy(["--mac", mac_a, "note.txt", ":disk9/note.txt"], work)
             check(result.returncode != 0 and "disk is not available" in result.stderr + result.stdout, "an unavailable disk is refused", result.stderr[-400:])
+            from test_mf_netfs import folder_checks
+
+            def copy(args):
+                result = foscopy(["--mac", mac_a, *args], work)
+                return result.returncode, result.stdout + result.stderr
+            folder_checks(None, work, copy)
 
             # Machine to machine.
             mark = a.send("nic discover")

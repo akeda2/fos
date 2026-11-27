@@ -34,8 +34,6 @@ pub(crate) const NETFS_NO_SYNC: u8 = 10;
 pub(crate) const TAG_SYNC_REQUEST: u8 = 0x40;
 /// GPIO over the network (`gpio_remote.rs`): a signed request and its answer, one frame each.
 pub(crate) use kernel_core::gpio_client::TAG_GPIO_REQUEST;
-/// The shared secret of `tapesync`; NETFS never reads or writes it.
-pub(crate) const KEY_FILE: &str = "synckey";
 pub(crate) const NETFS_CHUNK: usize = 1024;
 
 /// The name announced in discovery replies for interface `index`: `NAME<n>` from the
@@ -81,7 +79,7 @@ struct NetfsPut {
     active: bool,
     source: [u8; 6],
     disk: usize,
-    name: [u8; crate::fosfs::MAX_NAME],
+    name: [u8; crate::fosfs::MAX_PATH],
     name_length: usize,
     expected: usize,
     checksum: u16,
@@ -90,7 +88,7 @@ struct NetfsPut {
     last_activity: u64,
 }
 
-static mut NETFS_PUT: NetfsPut = NetfsPut { active: false, source: [0; 6], disk: 0, name: [0; crate::fosfs::MAX_NAME], name_length: 0, expected: 0, checksum: 0, received: 0, next_sequence: 0, last_activity: 0 };
+static mut NETFS_PUT: NetfsPut = NetfsPut { active: false, source: [0; 6], disk: 0, name: [0; crate::fosfs::MAX_PATH], name_length: 0, expected: 0, checksum: 0, received: 0, next_sequence: 0, last_activity: 0 };
 
 pub(crate) fn netfs_reply(index: usize, destination: &[u8; 6], tag: u8, payload: &[u8]) {
     send(index, destination, tag, payload);
@@ -112,11 +110,12 @@ fn netfs_get_request(index: usize, source: [u8; 6], payload: &[u8]) {
     if netfs_busy(&source) {
         return reply_error(NETFS_BUSY);
     }
-    if !crate::fosfs::valid_name(name) {
+    // A path (`settings/start`) reaches a folder of a v4 volume; a v3 volume has none and refuses it.
+    if !crate::fosfs::valid_path(name) {
         return reply_error(NETFS_BAD_NAME);
     }
-    // The shared secret of `tapesync` never leaves the machine, whoever asks.
-    if name == KEY_FILE.as_bytes() {
+    // The shared secret of `tapesync` never leaves the machine, whoever asks, from whichever folder.
+    if kernel_core::tapesync_client::is_key_file(name) {
         return reply_error(NETFS_NOT_FOUND);
     }
     let Ok(volume) = crate::storage::volume_on(usize::from(payload[0])) else { return reply_error(NETFS_NO_DISK) };
@@ -132,6 +131,8 @@ fn netfs_get_request(index: usize, source: [u8; 6], payload: &[u8]) {
         Ok(Some(length)) => length,
         Ok(None) => return reply_error(NETFS_NOT_FOUND),
         Err(crate::fosfs::Error::TooBig) => return reply_error(NETFS_TOO_LARGE),
+        Err(crate::fosfs::Error::NoDirectory) => return reply_error(NETFS_NOT_FOUND),
+        Err(crate::fosfs::Error::InvalidName) => return reply_error(NETFS_BAD_NAME),
         Err(_) => return reply_error(NETFS_DISK_ERROR),
     };
     netfs_stream(index, &source, &staging[..length], core::str::from_utf8(name).unwrap_or("?"));
@@ -174,7 +175,7 @@ fn netfs_put_request(index: usize, source: [u8; 6], payload: &[u8]) {
     let expected = u32::from_le_bytes(payload[1..5].try_into().unwrap()) as usize;
     let checksum = u16::from_le_bytes(payload[5..7].try_into().unwrap());
     let name = netfs_name(&payload[7..]);
-    if !crate::fosfs::valid_name(name) || name == KEY_FILE.as_bytes() {
+    if !crate::fosfs::valid_path(name) || kernel_core::tapesync_client::is_key_file(name) {
         return reply_error(NETFS_BAD_NAME);
     }
     if crate::storage::volume_on(usize::from(payload[0])).is_err() {
@@ -184,7 +185,7 @@ fn netfs_put_request(index: usize, source: [u8; 6], payload: &[u8]) {
         return reply_error(NETFS_TOO_LARGE);
     }
     let put = unsafe { &mut *core::ptr::addr_of_mut!(NETFS_PUT) };
-    *put = NetfsPut { active: true, source, disk: usize::from(payload[0]), name: [0; crate::fosfs::MAX_NAME], name_length: name.len(), expected, checksum, received: 0, next_sequence: 0, last_activity: timer::ticks() };
+    *put = NetfsPut { active: true, source, disk: usize::from(payload[0]), name: [0; crate::fosfs::MAX_PATH], name_length: name.len(), expected, checksum, received: 0, next_sequence: 0, last_activity: timer::ticks() };
     put.name[..name.len()].copy_from_slice(name);
     crate::println!("NETFS: receiving {} ({expected} bytes) from {}.", core::str::from_utf8(name).unwrap_or("?"), crate::netdump::Mac(&source));
 }
@@ -233,6 +234,7 @@ fn netfs_put_stop(index: usize, source: [u8; 6]) {
         Err(crate::fosfs::Error::DirectoryFull) => reply_error(NETFS_DIRECTORY_FULL),
         Err(crate::fosfs::Error::DataFull | crate::fosfs::Error::NoRoomToReplace) => reply_error(NETFS_DATA_FULL),
         Err(crate::fosfs::Error::InvalidName) => reply_error(NETFS_BAD_NAME),
+        Err(crate::fosfs::Error::NoDirectory) => reply_error(NETFS_NOT_FOUND),
         Err(_) => reply_error(NETFS_DISK_ERROR),
     }
 }

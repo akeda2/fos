@@ -40,8 +40,6 @@ const BUSY: u8 = 9;
 /// The tape-sync request (`tapesync.rs`): a nonce in, a signed manifest out as a GET stream.
 pub const TAG_SYNC_REQUEST: u8 = 0x40;
 pub use kernel_core::gpio_client::{TAG_GPIO_REPLY, TAG_GPIO_REQUEST};
-/// The shared secret of tape sync: NETFS never reads or writes it.
-pub const KEY_FILE: &str = "synckey";
 const CHUNK: usize = 1024;
 /// The largest file a transfer carries (the embedded kernel's staging buffer is 4 MiB; a tape's own write limit is 8 MiB).
 const LIMIT: usize = 8 << 20;
@@ -135,10 +133,11 @@ fn get_request(index: usize, source: [u8; 6], payload: &[u8]) {
         return fail(BUSY);
     }
     let name = name_of(&payload[1..]);
-    if !fosfs::valid_name(name) {
+    // A path (`settings/start`) reaches a folder of a v4 volume; a v3 volume has none and refuses it.
+    if !fosfs::valid_path(name) {
         return fail(BAD_NAME);
     }
-    if name == KEY_FILE.as_bytes() {
+    if kernel_core::tapesync_client::is_key_file(name) {
         return fail(NOT_FOUND);
     }
     let data = {
@@ -150,6 +149,8 @@ fn get_request(index: usize, source: [u8; 6], payload: &[u8]) {
                 Some(path) if matches!(volume.file_length(path), Ok(Some(_))) => path,
                 _ => return fail(NOT_FOUND),
             },
+            Err(fosfs::Error::NoDirectory) => return fail(NOT_FOUND),
+            Err(fosfs::Error::InvalidName) => return fail(BAD_NAME),
             Err(_) => return fail(DISK_ERROR),
         };
         let length = match volume.file_length(path) {
@@ -203,7 +204,7 @@ fn put_request(index: usize, source: [u8; 6], payload: &[u8]) {
     let expected = u32::from_le_bytes(payload[1..5].try_into().unwrap()) as usize;
     let checksum = u16::from_le_bytes(payload[5..7].try_into().unwrap());
     let name = name_of(&payload[7..]);
-    if !fosfs::valid_name(name) || name == KEY_FILE.as_bytes() {
+    if !fosfs::valid_path(name) || kernel_core::tapesync_client::is_key_file(name) {
         return fail(BAD_NAME);
     }
     {
@@ -269,6 +270,7 @@ fn put_stop(index: usize, source: [u8; 6]) {
         Err(fosfs::Error::DirectoryFull) => fail(DIRECTORY_FULL),
         Err(fosfs::Error::DataFull | fosfs::Error::NoRoomToReplace) => fail(DATA_FULL),
         Err(fosfs::Error::InvalidName) => fail(BAD_NAME),
+        Err(fosfs::Error::NoDirectory) => fail(NOT_FOUND),
         Err(_) => fail(DISK_ERROR),
     }
 }

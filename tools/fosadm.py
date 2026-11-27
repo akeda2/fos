@@ -859,7 +859,7 @@ def main() -> int:
             sp.add_argument("words", nargs="+", help="the command")
         if name == "put":
             sp.add_argument("file")
-            sp.add_argument("name", nargs="?", help="name on the host (default: the file's name)")
+            sp.add_argument("name", nargs="?", help="name on the host (default: the file's name); a path such as settings/start reaches a folder, settings/ keeps the name")
             sp.add_argument("--disk", type=int, default=1)
         if name == "bootcode":
             sp.add_argument("--update", action="store_true", help="rewrite it (asks you to type the host name)")
