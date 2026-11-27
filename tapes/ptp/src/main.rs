@@ -448,9 +448,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     }
     let ntp_synced = wants_ntp && adopt_ntp_time(api, &options, &config, dhcp_ntp, dhcp_dns);
     if options.master {
-        master(api, &options, &config, mac, ntp_synced);
+        master(api, &options, &config, mac, ntp_synced, &mut igmp);
     } else {
-        slave(api, &options, &config, mac);
+        slave(api, &options, &config, mac, &mut igmp);
     }
     if options.l2 || options.both {
         l2_multicast(api, options.nic, false);
@@ -460,10 +460,11 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     }
 }
 
-fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]) {
+/// `igmp` is the membership `run` joined: its loop answers queries and, with no querier, repeats the join (a second,
+/// unjoined `Igmp` here once let a snooping switch drop the group after a few minutes).
+fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6], igmp: &mut igmp::Igmp) {
     let identity = port_identity(mac, 1);
     let mut slave = Slave::new(options.domain, identity, i64::from(options.delay_seconds) * 1_000_000_000);
-    let mut igmp = igmp::Igmp::new(GROUP);
     let mut arp = ArpCache::<8>::new();
     let (mut second, mut total) = (Window::default(), Window::default());
     let mut delays = Window::default();
@@ -647,7 +648,8 @@ fn send_all(options: &Options, api: &TapeApi, config: &net::NetConfig, port: u16
     }
 }
 
-fn master(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6], ntp_synced: bool) {
+/// `igmp` as for `slave`: without the repeated join a master stopped hearing its slaves' UDP Delay_Req.
+fn master(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6], ntp_synced: bool, igmp: &mut igmp::Igmp) {
     let identity = port_identity(mac, 1);
     let mut clock = Clock::ordinary(mac);
     clock.priority1 = options.priority1;
@@ -655,7 +657,6 @@ fn master(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6
         clock.time_source = ptp_tape::TIME_SOURCE_NTP;
         clock.utc_offset = Some(tape_net::ntp::TAI_MINUS_UTC as i16);
     }
-    let mut igmp = igmp::Igmp::new(GROUP);
     let mut arp = ArpCache::<8>::new();
     let mut frame = [0u8; net::MAX_FRAME];
     let sync_interval = i64::from(options.sync_ms) * 1_000_000;

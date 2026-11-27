@@ -941,7 +941,13 @@ frames to a joined and an unjoined group. The ICH/PCH parts (82579, I217-I219) h
 hash `(mac[4] >> 6 | mac[5] << 2) & 0x3ff`; the I350/82574 use the 4096-bit formula above. Checked on an 82579V: of 256
 groups swept, only the joined one arrived. Only real hardware can confirm the tables behave like QEMU's. A switch with IGMP snooping on kept an 82579V from
 getting UDP PTP (frames injected from a host arrived, the switch's group table never listed the card); with snooping off,
-82579V and I350 work as slave and master over UDP.
+82579V and I350 work as slave and master over UDP. The test network's switch snoops with no querier (no IGMP query in 280 s,
+2026-11-27): it keeps a membership for about 260 s after a report, then sends the group only to ports that reported since,
+so a `ptp` master (rack, and clock's 82579V) stopped hearing UDP Delay_Req 260 s after it started while unicast and
+Ethernet PTP kept working. `tape-ip`'s `Igmp` now repeats the join every 60 s while no query has been heard for 260 s
+(`poll`); `ptp` also polled a second, never-joined `Igmp` in `master`/`slave`, now the one `run` joined. Verified on rack
+(server kernel, I219): group Delay_Req answered 20/20 at 7 and 16 minutes (0/20 at 5 minutes before), and a UDP slave on
+aneby that steers its card locked with 64 Delay_Resp, offset sd 0.2 us.
 
 **Audio-analysis crates (for the `ltas` tape and later ones).** All `no_std`, no allocation, host-tested (`make test`):
 `crates/gfx` (a RAM `Canvas` of 0x00RRGGBB pixels: rectangles, lines, 8x16 text in the kernel's console font, and a PNG

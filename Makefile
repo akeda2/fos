@@ -486,6 +486,7 @@ test: image
 	cargo +nightly-2026-09-13 test --manifest-path crates/hid/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-rec/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/tape-net/Cargo.toml
+	cargo +nightly-2026-09-13 test --manifest-path crates/tape-ip/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/tape-http/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/tape-sip/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/md/Cargo.toml

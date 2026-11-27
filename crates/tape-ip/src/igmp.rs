@@ -6,6 +6,13 @@
 //! time, so that the hosts on a segment do not all answer at once. The unsolicited join is an IGMPv2 report
 //! (every querier accepts it, a v3 one in compatibility mode); answers to a query use the version of the query.
 //!
+//! **No querier.** IGMP hosts report only when asked, which assumes a querier on the segment. A snooping switch with no
+//! querier still learns members from the unsolicited join, but forgets them when its membership timer runs out
+//! (RFC 2236's Group Membership Interval, 260 s by default; vendors differ) and then stops forwarding the group to
+//! that port. A PTP master on the test network lost its slaves' Delay_Req after a few minutes that way (2026-11-27:
+//! no IGMP query in 280 s of capture). So while no query has been heard for a membership interval, a joined group is
+//! reported again every `REREPORT_US`; once a querier speaks, only its queries are answered, as the RFCs have it.
+//!
 //! An IGMP packet is an IPv4 packet of protocol 2, TTL 1, with the Router Alert option (RFC 2113), sent to the
 //! group itself (v2 report), to 224.0.0.2 (v2 leave) or to 224.0.0.22 (v3 report).
 
@@ -16,11 +23,22 @@ use tape_rt::TapeApi;
 const ALL_HOSTS: [u8; 4] = [224, 0, 0, 1];
 const ALL_ROUTERS: [u8; 4] = [224, 0, 0, 2];
 const IGMPV3_REPORTS: [u8; 4] = [224, 0, 0, 22];
+/// RFC 2236 8.4, Group Membership Interval (2 x 125 s + 10 s): how long a querier or switch keeps a membership
+/// that nobody reports again; also how long a heard querier counts as present.
+const MEMBERSHIP_US: u64 = 260_000_000;
+/// With no querier heard, a joined group is reported again this often: well inside any membership timeout.
+const REREPORT_US: u64 = 60_000_000;
 
 pub struct Igmp {
     group: [u8; 4],
     /// When (micros) a pending answer to a query is due, and whether it is a v3 report.
     due: Option<(u64, bool)>,
+    /// Between `join` and `leave`.
+    joined: bool,
+    /// When the last query for us arrived, and when we last reported, on the caller's clock (`handle`, `poll`).
+    /// `last_report` is `None` right after `join`, until `poll` gives it a time.
+    last_query: Option<u64>,
+    last_report: Option<u64>,
     pub queries: u32,
     pub reports: u32,
 }
@@ -62,7 +80,7 @@ fn build(out: &mut [u8; 80], config: &NetConfig, destination: [u8; 4], igmp: &[u
 
 impl Igmp {
     pub fn new(group: [u8; 4]) -> Igmp {
-        Igmp { group, due: None, queries: 0, reports: 0 }
+        Igmp { group, due: None, joined: false, last_query: None, last_report: None, queries: 0, reports: 0 }
     }
 
     fn send(&mut self, api: &TapeApi, nic: usize, config: &NetConfig, v3: bool, leave: bool) {
@@ -94,6 +112,8 @@ impl Igmp {
         if !self.filter(nic, true) {
             (api.nic_set_multicast)(nic, 1);
         }
+        self.joined = true;
+        self.last_report = None;
         self.send(api, nic, config, false, false);
         let until = tape_rt::micros() + 10_000;
         while tape_rt::micros() < until {
@@ -104,11 +124,13 @@ impl Igmp {
 
     /// A leave that keeps the NIC's multicast filter open: another group is still joined.
     pub fn leave_report(&mut self, api: &TapeApi, nic: usize, config: &NetConfig) {
+        self.joined = false;
         self.send(api, nic, config, false, true);
         self.filter(nic, false);
     }
 
     pub fn leave(&mut self, api: &TapeApi, nic: usize, config: &NetConfig) {
+        self.joined = false;
         self.send(api, nic, config, false, true);
         if !self.filter(nic, false) {
             (api.nic_set_multicast)(nic, 0);
@@ -138,6 +160,7 @@ impl Igmp {
             return true;
         }
         self.queries += 1;
+        self.last_query = Some(now_micros);
         let v3 = message.len() >= 12;
         // Maximum response code: tenths of a second (v2); v3 codes of 128 and over are a floating-point format.
         let code = u64::from(message[1]);
@@ -151,13 +174,90 @@ impl Igmp {
         true
     }
 
-    /// Sends a due answer; call once per loop pass.
+    /// Sends a due answer, or a repeated join when no querier is heard; call once per loop pass, always with the
+    /// same clock as `handle`.
     pub fn poll(&mut self, api: &TapeApi, nic: usize, config: &NetConfig, now_micros: u64) {
         if let Some((at, v3)) = self.due {
             if now_micros >= at {
                 self.due = None;
+                self.last_report = Some(now_micros);
                 self.send(api, nic, config, v3, false);
             }
+        } else if self.rereport_due(now_micros) {
+            self.last_report = Some(now_micros);
+            self.send(api, nic, config, false, false);
         }
+    }
+
+    /// True when a joined group should be reported again unasked: no query for a membership interval and no report
+    /// for `REREPORT_US`. The first call after `join` only starts the count (the join itself was the report).
+    fn rereport_due(&mut self, now_micros: u64) -> bool {
+        if !self.joined {
+            return false;
+        }
+        let Some(last) = self.last_report else {
+            self.last_report = Some(now_micros);
+            return false;
+        };
+        let querier_heard = self.last_query.is_some_and(|at| now_micros.saturating_sub(at) < MEMBERSHIP_US);
+        !querier_heard && now_micros.saturating_sub(last) >= REREPORT_US
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn joined() -> Igmp {
+        let mut igmp = Igmp::new([224, 0, 1, 129]);
+        igmp.joined = true;
+        igmp
+    }
+
+    /// A general IGMPv2 query (maximum response 1 s) as a raw frame.
+    fn query() -> [u8; 46] {
+        let mut frame = [0u8; 46];
+        frame[12..14].copy_from_slice(&[0x08, 0x00]);
+        frame[14] = 0x45;
+        frame[14 + 9] = 2;
+        frame[34] = 0x11;
+        frame[35] = 10;
+        frame
+    }
+
+    #[test]
+    fn without_a_querier_a_joined_group_is_reported_every_minute() {
+        let mut igmp = joined();
+        assert!(!igmp.rereport_due(1_000), "the first poll after the join only starts the count");
+        assert!(!igmp.rereport_due(1_000 + REREPORT_US - 1));
+        assert!(igmp.rereport_due(1_000 + REREPORT_US));
+    }
+
+    #[test]
+    fn a_heard_querier_takes_over_until_it_falls_silent() {
+        let mut igmp = joined();
+        igmp.rereport_due(0);
+        assert!(igmp.handle(&query(), 5_000_000));
+        assert_eq!(igmp.queries, 1);
+        igmp.due = None; // its answer was sent
+        assert!(!igmp.rereport_due(5_000_000 + 2 * REREPORT_US), "the querier asks; no unasked reports");
+        assert!(igmp.rereport_due(5_000_000 + MEMBERSHIP_US), "a querier silent for a membership interval is gone");
+    }
+
+    #[test]
+    fn a_left_or_never_joined_group_is_not_reported() {
+        let mut igmp = Igmp::new([224, 0, 1, 129]);
+        igmp.rereport_due(0);
+        assert!(!igmp.rereport_due(10 * REREPORT_US));
+    }
+
+    #[test]
+    fn a_clock_that_starts_far_from_zero_works_the_same() {
+        // ptp passes TAI microseconds (about 1.8e15): nothing may assume the caller's clock starts near zero.
+        let start = 1_800_000_000_000_000;
+        let mut igmp = joined();
+        igmp.rereport_due(start);
+        assert!(!igmp.rereport_due(start + 1));
+        assert!(igmp.rereport_due(start + REREPORT_US));
     }
 }
