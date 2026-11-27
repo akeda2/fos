@@ -5,6 +5,7 @@
 //! layout of the payload partition (a metadata sector, then two kernel slots).
 #![cfg_attr(not(test), no_std)]
 
+pub mod config;
 pub mod elf;
 pub mod keymap;
 pub mod tape;

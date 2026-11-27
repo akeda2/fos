@@ -30,6 +30,9 @@ dependencies = [
 [[package]]
 name = "tape-http"
 version = "0.1.0"
+dependencies = [
+ "fosfor-abi",
+]
 
 [[package]]
 name = "tape-ip"

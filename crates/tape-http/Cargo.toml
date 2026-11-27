@@ -5,6 +5,9 @@ edition = "2024"
 description = "HTTP/1.0 pieces for the httpd and web tapes: request and response heads, URLs, path safety, MIME types, HTML to text"
 license = "MIT"
 
+[dependencies]
+fosfor-abi = { path = "../../abi" }
+
 [lib]
 name = "tape_http"
 path = "src/lib.rs"

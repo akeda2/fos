@@ -310,11 +310,13 @@ fn hex(byte: u8) -> Option<u8> {
 }
 
 /// Files that are never served: the machine's own configuration, whatever the web root (a root of the whole volume
-/// would otherwise publish `synckey`), and everything under `config/`.
+/// would otherwise publish `synckey`), and every configuration folder (`fosfor_abi::config::FOLDERS`: `etc`, `cfg`,
+/// `settings`, `config`), its listing included. Before 2026-11-27 only `config/` was blocked: with the root at the
+/// whole volume, `settings/smbusers` and the ssh keys in `settings/` could be downloaded.
 pub fn is_blocked(path: &[u8]) -> bool {
     const NAMES: [&[u8]; 7] = [b"synckey", b"settings", b"start", b"hostname", b"debug", b"fstab", b"password"];
     let first = path.split(|&b| b == b'/').next().unwrap_or(b"");
-    if first.eq_ignore_ascii_case(b"config") && path.len() > first.len() {
+    if fosfor_abi::config::is_folder_name(first) {
         return true;
     }
     let last = path.rsplit(|&b| b == b'/').next().unwrap_or(b"");
@@ -1152,7 +1154,12 @@ mod tests {
         assert!(is_blocked(b"SETTINGS"));
         assert!(is_blocked(b"www/start"));
         assert!(is_blocked(b"config/anything"));
-        assert!(!is_blocked(b"config"));
+        assert!(is_blocked(b"config"));
+        // Every configuration folder, in any case, and its listing.
+        for path in [&b"settings/smbusers"[..], b"settings/ssh_host_key", b"etc/smbd.cfg", b"ETC/x", b"cfg/phono.cfg", b"etc", b"cfg"] {
+            assert!(is_blocked(path), "{}", String::from_utf8_lossy(path));
+        }
+        assert!(!is_blocked(b"www/etc.html") && !is_blocked(b"etcetera/x") && !is_blocked(b"docs/settings.txt"));
         assert!(!is_blocked(b"docs/readme.txt"));
     }
 
