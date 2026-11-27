@@ -52,6 +52,35 @@ def folder_checks(machine, work, copy=None):
     check(code != 0 and not (work / "k2.bin").exists(), "or read from one", out[-400:])
 
 
+def mount_checks(machine, work):
+    """A path under a mount point reaches the mounted volume, as the shell's `cp` does, not the boot volume's own folder
+    of that name (which the mount hides). On rack `settings` is an exFAT volume mounted so: a NETFS write into the boot
+    volume's settings/ folder was stored and acknowledged, and the machine never read it."""
+    machine.connect()
+    disks = machine.run("disks")
+    number = next((line.split()[0].rstrip(":") for line in disks.splitlines() if line.startswith("disk") and "64 MiB" in line), None)
+    check(number is not None, "the blank second disk is found", disks)
+    machine.run(f"format {number} exfat CFG")
+    out = machine.run(f"format {number} confirm")
+    listing = machine.run(f"label {number}")
+    check("@CFG (exFAT)" in listing, "and formatted exFAT, labelled CFG", out[-400:] + listing)
+    out = machine.run("mount cfg @cfg")
+    listing = machine.run("mount")
+    check("is now @cfg" in out and "not present" not in listing and "cfg -> @cfg" in listing, "and mounted at cfg/", out + listing)
+    machine.run("mkdir cfg")  # the boot volume's own cfg/ folder, hidden by the mount: NETFS must not write there
+    code, out = foscopy(machine, ["note.txt", ":disk1/cfg/note.txt"], work)
+    check(code == 0, "foscopy stores a file under a mount point", out[-600:])
+    out = machine.run("cat cfg/note.txt")
+    check("hello from the host" in out, "and the shell sees it through the mount", out[-400:])
+    out = machine.run("cat disk1/cfg/note.txt")  # names disk1 itself: the mount table is not consulted
+    check("hello from the host" not in out, "it is on the mounted volume, not in the boot volume's hidden folder", out[-400:])
+    code, out = foscopy(machine, [":disk1/cfg/note.txt", "mounted.back"], work)
+    check(code == 0 and (work / "mounted.back").read_bytes() == (work / "note.txt").read_bytes(),
+          "and reads back through the mount", out[-600:])
+    code, out = foscopy(machine, [":disk1/cfg/nosuchfile", "x.bin"], work)
+    check(code != 0 and "file not found" in out, "a missing file under a mount point is not found", out[-400:])
+
+
 def main():
     import random
     with tempfile.TemporaryDirectory() as tmp:
@@ -69,6 +98,11 @@ def main():
         machine = base.Machine(tmp, {"hostname": "mfhost\n", "synckey": "mf test key\n"},
                                {"bin/hello": ROOT / "build/fosfor/tapes/hello", "settings/readme": work / "readme",
                                 "settings/synckey": work / "key"}, fosfs=4)
+        # A blank second disk, formatted exFAT and mounted at cfg/ by `mount_checks` (rack keeps its settings so).
+        blank = work / "cfg.img"
+        with open(blank, "wb") as image:
+            image.truncate(64 << 20)
+        machine.extra = ["-drive", f"format=raw,file={blank},if=ide,index=2"]
         machine.start()
         try:
             machine.wait_for(READY)
@@ -91,6 +125,7 @@ def main():
             code, out = foscopy(machine, [":disk1/synckey", "k.bin"], work)
             check(code != 0 and not (work / "k.bin").exists(), "or read", out[-400:])
             folder_checks(machine, work)
+            mount_checks(machine, work)
 
             # Tape sync: the signed manifest of the stamped tapes (tools/tape_manifest.py checks the signature).
             def manifest(key):

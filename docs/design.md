@@ -614,6 +614,8 @@ firmware, so a pending slot is tried on the next boot.
   On a FOSFS v4 volume NAME may be a path into folders that exist (`foscopy.py start rack/settings/start`, or
   `rack/settings/` to keep the source's name; since 2026-11-27, both kernels): a missing folder is "not found", a v3
   volume refuses any path as a bad name, and `synckey` is refused in every folder, not only the root.
+  A disk1 path under a mount point (`fstab`) goes to the mounted volume, FAT, ext or FOSFS, as the shell's `cp` does,
+  not to the boot volume's own folder of that name, which the mount hides.
   The shell side is `copy HOST[:diskN]/NAME DST [NEWNAME]` (fetch) and `copy SRC NAME HOST[:diskN] [NEWNAME]` (store), HOST
   being a name from `nic peers` (a host name carries its NIC number: `alpha1`; discovery runs if the name is not known), a
   MAC address or a peer number. Data frames go out one a millisecond, a pace real hardware keeps up with. `send` can now

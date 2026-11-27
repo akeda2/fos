@@ -118,8 +118,16 @@ fn netfs_get_request(index: usize, source: [u8; 6], payload: &[u8]) {
     if kernel_core::tapesync_client::is_key_file(name) {
         return reply_error(NETFS_NOT_FOUND);
     }
-    let Ok(volume) = crate::storage::volume_on(usize::from(payload[0])) else { return reply_error(NETFS_NO_DISK) };
     let Some(staging) = imp::staging() else { return reply_error(NETFS_TOO_LARGE) };
+    // A path under a mount point (`fstab`) is the mounted volume's, as the shell's `cp` sees it.
+    if crate::tape_fs::netfs_mounted(usize::from(payload[0]), name) {
+        return match crate::tape_fs::read(name, staging) {
+            length if length > 0 => netfs_stream(index, &source, &staging[..length as usize], core::str::from_utf8(name).unwrap_or("?")),
+            0 => reply_error(NETFS_TOO_LARGE),
+            code => reply_error(crate::tape_fs::netfs_error(code)),
+        };
+    }
+    let Ok(volume) = crate::storage::volume_on(usize::from(payload[0])) else { return reply_error(NETFS_NO_DISK) };
     let mut result = volume.read(name, staging);
     if matches!(result, Ok(None)) {
         if let Some(path) = crate::tape_fs::bin_path(name) {
@@ -224,6 +232,15 @@ fn netfs_put_stop(index: usize, source: [u8; 6]) {
     if fosfor_abi::internet_checksum(&staging[..put.expected]) != put.checksum {
         crate::println!("NETFS: checksum mismatch; file rejected.");
         return reply_error(NETFS_CHECKSUM);
+    }
+    let name = &put.name[..put.name_length];
+    if crate::tape_fs::netfs_mounted(put.disk, name) {
+        let code = crate::tape_fs::write(name, &staging[..put.expected]);
+        if code < 0 {
+            return reply_error(crate::tape_fs::netfs_error(code));
+        }
+        crate::println!("NETFS: stored {} ({} bytes).", core::str::from_utf8(name).unwrap_or("?"), put.expected);
+        return netfs_reply(index, &source, TAG_PUT_ACK, &[]);
     }
     let Ok(volume) = crate::storage::volume_on(put.disk) else { return reply_error(NETFS_NO_DISK) };
     match volume.write(crate::tape_fs::replace_target(&volume, &put.name[..put.name_length]), &staging[..put.expected]) {

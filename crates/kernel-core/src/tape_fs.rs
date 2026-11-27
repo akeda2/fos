@@ -65,6 +65,26 @@ pub fn resolve_file(reference: &[u8], reading: bool) -> Result<(Volume, &[u8]), 
     Ok((volume, name))
 }
 
+/// True when a NETFS request (`tools/foscopy.py`) for disk `disk` names a path under a mount point (`fstab`): it then
+/// goes through `read`/`write` here, as the shell's `cp` does, and reaches the mounted volume (FAT, ext or FOSFS)
+/// instead of the boot volume's own folder of that name, which the mount hides. disk1 is always the boot disk.
+pub fn netfs_mounted(disk: usize, name: &[u8]) -> bool {
+    disk == 1 && crate::mounts::lookup(name).is_some()
+}
+
+/// A file call's `FS_*` result as a NETFS error code (the numbers `tools/foscopy.py` names): 1 not found, 2 no such
+/// disk, 3 too large, 4 bad name, 6 no room, 7 disk error.
+pub fn netfs_error(code: isize) -> u8 {
+    match code {
+        FS_NOT_FOUND | FS_IS_DIR => 1,
+        FS_NO_VOLUME => 2,
+        FS_TOO_BIG => 3,
+        FS_BAD_NAME => 4,
+        FS_NO_SPACE => 6,
+        _ => 7,
+    }
+}
+
 /// `bin/NAME` for a bare NAME, in a buffer that outlives the call (file calls are synchronous and the caller uses the
 /// name at once). A tape is found in `bin/` when its bare name is not there: `run NAME`, and a tape that loads another
 /// one, need not know whether the volume keeps its tapes in a folder.

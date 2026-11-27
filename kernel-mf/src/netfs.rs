@@ -140,6 +140,25 @@ fn get_request(index: usize, source: [u8; 6], payload: &[u8]) {
     if kernel_core::tapesync_client::is_key_file(name) {
         return fail(NOT_FOUND);
     }
+    if tape_fs::netfs_mounted(usize::from(payload[0]), name) {
+        let data = {
+            let _disk = tapefs::lock();
+            let length = tape_fs::length(name);
+            if length < 0 {
+                return fail(tape_fs::netfs_error(length));
+            }
+            if length == 0 || length as usize > LIMIT {
+                return fail(TOO_LARGE);
+            }
+            let mut data = alloc::vec![0u8; length as usize];
+            match tape_fs::read(name, &mut data) {
+                read if read >= 0 => data.truncate(read as usize),
+                code => return fail(tape_fs::netfs_error(code)),
+            }
+            data
+        };
+        return stream(index, &source, &data, core::str::from_utf8(name).unwrap_or("?"));
+    }
     let data = {
         let _disk = tapefs::lock();
         let Ok(volume) = volumes::volume_on(usize::from(payload[0])) else { return fail(NO_DISK) };
@@ -256,12 +275,23 @@ fn put_stop(index: usize, source: [u8; 6]) {
         println!("NETFS: checksum mismatch; file rejected.");
         return fail(CHECKSUM);
     }
+    let shown = core::str::from_utf8(&state.name).unwrap_or("?");
+    if tape_fs::netfs_mounted(state.disk, &state.name) {
+        let code = {
+            let _disk = tapefs::lock();
+            tape_fs::write(&state.name, &state.data)
+        };
+        if code < 0 {
+            return fail(tape_fs::netfs_error(code));
+        }
+        println!("NETFS: stored {shown} ({} bytes).", state.data.len());
+        return reply(index, &source, TAG_PUT_ACK, &[]);
+    }
     let result = {
         let _disk = tapefs::lock();
         let Ok(volume) = volumes::volume_on(state.disk) else { return fail(NO_DISK) };
         volume.write(tape_fs::replace_target(&volume, &state.name), &state.data)
     };
-    let shown = core::str::from_utf8(&state.name).unwrap_or("?");
     match result {
         Ok(()) => {
             println!("NETFS: stored {shown} ({} bytes).", state.data.len());
