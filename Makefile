@@ -246,7 +246,7 @@ test-mf-sshmount: image-mf image
 
 test-mf-ssh: image-mf image
 	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_MF_ELF) --output $(BUILD)/fosfor-mf/fosfor-ssh.img \
-		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin --file ssh=$(BUILD)/fosfor/tapes/ssh
+		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin --file ssh=$(BUILD)/fosfor/tapes/ssh --fosfs 4
 	python3 tools/test_mf_ssh.py
 
 test-mf-cp: image-mf image

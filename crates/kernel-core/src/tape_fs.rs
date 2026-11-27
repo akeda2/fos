@@ -65,6 +65,25 @@ pub fn resolve_file(reference: &[u8], reading: bool) -> Result<(Volume, &[u8]), 
     Ok((volume, name))
 }
 
+/// The folder new configuration files go to (`fosfor_abi::config::home`): the first of `etc/`, `cfg/`, `settings/`,
+/// `config/` that the boot volume has, a folder mounted there included, else `settings/`. Takes the disk; callers on
+/// the server kernel hold `tapefs::lock`.
+pub fn config_home() -> &'static str {
+    fosfor_abi::config::home(|folder| each_entry(folder.as_bytes(), &mut |_, _, _, _| {}).is_ok())
+}
+
+/// Where configuration file `name` is, as this module sees paths (mounts honoured): the first copy in
+/// `fosfor_abi::config::FOLDERS` order, then the root.
+pub fn config_find(name: &str) -> Option<fosfor_abi::config::Path> {
+    fosfor_abi::config::find(name, |path| length(path.as_bytes()) >= 0)
+}
+
+/// Where to write configuration file `name`: where it is, else in `config_home()`. A volume without folders (v3, FAT)
+/// refuses the folder path; the caller then writes the bare name.
+pub fn config_path(name: &str) -> Option<fosfor_abi::config::Path> {
+    config_find(name).or_else(|| fosfor_abi::config::join(config_home(), name))
+}
+
 /// True when a NETFS request (`tools/foscopy.py`) for disk `disk` names a path under a mount point (`fstab`): it then
 /// goes through `read`/`write` here, as the shell's `cp` does, and reaches the mounted volume (FAT, ext or FOSFS)
 /// instead of the boot volume's own folder of that name, which the mount hides. disk1 is always the boot disk.

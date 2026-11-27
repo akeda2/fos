@@ -354,7 +354,7 @@ pub fn run_command(line: &str) {
         "service" => crate::service::command(words),
         "settings" => match words.next() {
             Some("migrate") => migrate_settings(),
-            _ => println!("usage: settings migrate   (moves the root's *.cfg and smbusers into settings/)"),
+            _ => println!("usage: settings migrate   (moves the root's *.cfg, smbusers and services\n  into the configuration folder: etc/, cfg/ or settings/, whichever exists)"),
         },
         "top" => crate::top::start(&line.trim_start()[command.len()..]),
         "threads" => {
@@ -569,11 +569,14 @@ fn split_background(args: &str) -> (&str, Option<Result<u64, ()>>) {
 
 /// `run NAME ARGS`: the tape becomes the foreground process (Escape stops it). With `&N` it is a background tape (a service):
 /// it owns NIC N, keeps running while the shell takes commands, and ends with `kill PID`.
-/// `settings migrate`: machine-specific files that lie in the root move into `settings/`, where tapes and `service` look first.
+/// `settings migrate`: machine-specific files that lie in the root move into the configuration folder (the first of
+/// `etc/`, `cfg/`, `settings/` the volume has, else `settings/`; `fosfor_abi::config`), where tapes and `service` look first.
 fn migrate_settings() {
     let mut names = alloc::vec::Vec::new();
+    let home;
     {
         let _disk = crate::tapefs::lock();
+        home = kernel_core::tape_fs::config_home();
         let mut info = fosfor_abi::tape::FileInfo { length: 0, flags: 0, name_length: 0, name: [0; 64] };
         let mut index = 0;
         while kernel_core::tape_fs::list(b"", index, &mut info) == 1 {
@@ -588,7 +591,7 @@ fn migrate_settings() {
         }
     }
     for name in &names {
-        run(&alloc::format!("mv {name} settings/"));
+        run(&alloc::format!("mv {name} {home}/"));
     }
     if names.is_empty() {
         println!("settings: nothing to move (the root has no *.cfg, smbusers or services).");

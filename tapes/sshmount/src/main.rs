@@ -26,9 +26,10 @@ host's first name label) until the service is stopped (kill). Then
 and every tape's vfs_* calls work on it, writes too where the server allows
 them. path= is the folder to show (default: the login folder). The service
 owns NIC N and takes its address from DHCP.
-Login is by key only: `sshmount keygen` makes settings/ssh_key (key=NAME: another
-file) and prints its line; put that line in ~/.ssh/authorized_keys on the server.
-The server's key is remembered in settings/known_hosts the first time and
+Login is by key only: `sshmount keygen` makes ssh_key in the configuration
+folder (etc/, cfg/ or settings/; key=NAME: another file) and prints its line;
+put that line in ~/.ssh/authorized_keys on the server.
+The server's key is remembered in known_hosts (same folder) the first time and
 checked afterwards: a changed key is refused (edit the file to accept it).
 Folders list their first 128 entries. OpenSSH, fos's sshd, any SFTP v3 server.
 "#

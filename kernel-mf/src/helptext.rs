@@ -75,7 +75,7 @@ pub const TOPICS: &[Topic] = &[
     t("kill", "Tapes and services", "kill PID", "Stop a process (the number `run` printed, or `ps` shows)."),
     t("service", "Tapes and services", "service | service start|stop|restart NAME|all | service reload", "Named background tapes from `settings/services` (lines `NAME [restart] TAPE ARGS... &NIC`). `restart` ones come back after a crash."),
     t("start", "Tapes and services", "start", "Run the boot script `settings/start` again."),
-    t("settings", "Tapes and services", "settings migrate", "Move machine-specific files (*.cfg, smbusers, services) from the root into settings/."),
+    t("settings", "Tapes and services", "settings migrate", "Move machine-specific files (*.cfg, smbusers, services) from the root into etc/, cfg/ or settings/."),
     t("sysrq", "Debug", "sysrq", "State dump: every CPU's program counter and backtrace (stopped by an NMI), held locks, threads and their tape calls, memory, sessions, recent trace events. `term_net.py --sysrq` asks for it over the wire, even when the service thread is stuck."),
     t("trace", "Debug", "trace [N|all] | trace on|off CATEGORY...|all | trace clear", "The kernel's event ring: context switches, tape spawns and exits, futexes, input, audio and network events, with CPU and thread."),
     t("debug", "Debug", "debug slots|revert|colors|crash now|hang now|deadhang now|deadlock now", "Test hooks: slot report, undo a kernel update, console colours; crash, hang, deadhang and deadlock stop the machine on purpose."),

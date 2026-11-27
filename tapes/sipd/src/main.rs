@@ -17,8 +17,8 @@ A SIP registrar and proxy (UDP). Phones and machines REGISTER under a user name
 (digest authentication), then call each other as sip:USER@THIS-ADDRESS; the
 proxy stays in the signalling path (Record-Route), so NAT bindings stay open.
 Audio is not relayed: media flows between the two ends.
-users=  file of lines user:password (# comments), in settings/ or the root; it
-        is read again every 30 s. A password with a colon is fine.
+users=  file of lines user:password (# comments), in etc/, cfg/, settings/ or
+        the root; it is read again every 30 s. A password with a colon is fine.
 ip=     a fixed address (recommended: clients are told this one); without it
         DHCP. nic= is the NIC number from 1 (default: nic use).
 log     print registrations and refusals.

@@ -3,8 +3,9 @@
 //! `Config::load` builds one string of words, in the order of precedence (`arg_value` returns the first match):
 //! 1. the words on the command line, except `@NAME`;
 //! 2. the file: `@NAME` from the command line (`diskN/NAME` and `@LABEL/NAME` work, a missing file is an error), or, when
-//!    there is no `@NAME`, `TAPE.cfg` (a missing one is fine: first run). A bare name is looked up in `settings/`, then
-//!    `config/`, then the root (`locate`).
+//!    there is no `@NAME`, `TAPE.cfg` (a missing one is fine: first run). A bare name is looked up in the configuration
+//!    folders, `etc/`, `cfg/`, `settings/`, `config/` (`fosfor_abi::config`, shared with the kernels), then the root
+//!    (`locate`).
 //!
 //! A file has `key=value` words separated by spaces or newlines, and `#` starts a comment to the end of the line. `save`
 //! rewrites the file that was loaded (or `TAPE.cfg`) with one `key=value` per line, which is what a tape's save key does.
@@ -22,17 +23,14 @@ pub struct Config {
     file_length: usize,
 }
 
-/// A file name is looked for in these folders, in this order, and then in the root: `settings/` is the home of every
-/// machine-specific file; `config/` is where tape configs used to live.
-const FOLDERS: [&str; 2] = ["settings/", "config/"];
-/// The longest folder prefix plus the longest name.
+/// The longest folder prefix (`settings/`) plus the longest name.
 pub const MAX_PATH: usize = MAX_NAME + 9;
 
 /// Where a bare config file name lives (or would be made).
 pub struct Located {
     path: [u8; MAX_PATH],
     length: usize,
-    /// False when no copy was found: `path` is then the `settings/` name a new file gets.
+    /// False when no copy was found: `path` is then where a new file goes (the machine's configuration folder).
     pub exists: bool,
 }
 
@@ -49,8 +47,9 @@ fn join(folder: &str, name: &str) -> ([u8; MAX_PATH], usize) {
     (path, folder.len() + name.len())
 }
 
-/// Finds `name` in `settings/`, `config/`, then the root (v3 and FAT volumes have no folders: the folder names are refused
-/// there and the root copy stands). A name with a `/` or a volume prefix is taken as it is.
+/// Finds `name` in `etc/`, `cfg/`, `settings/`, `config/`, then the root (v3 and FAT volumes have no folders: the folder
+/// names are refused there and the root copy stands). A name with a `/` or a volume prefix is taken as it is. A name
+/// found nowhere gets the first of those folders the boot volume has (`vfs_stat`, ABI 32; `settings/` before that).
 pub fn locate(api: &TapeApi, name: &str) -> Located {
     let mut probe = [0u8; 1];
     let exists = |path: &str, probe: &mut [u8; 1]| {
@@ -61,17 +60,15 @@ pub fn locate(api: &TapeApi, name: &str) -> Located {
         let (path, length) = join("", &name[..name.len().min(MAX_NAME)]);
         return Located { path, length, exists: name.len() <= MAX_NAME && exists(name, &mut probe) };
     }
-    for folder in FOLDERS {
-        let (path, length) = join(folder, name);
-        if exists(core::str::from_utf8(&path[..length]).unwrap_or(""), &mut probe) {
-            return Located { path, length, exists: true };
-        }
-    }
-    let (path, length) = join("", name);
-    if exists(name, &mut probe) {
+    if let Some(found) = fosfor_abi::config::find(name, |path| exists(path, &mut probe)) {
+        let (path, length) = join("", found.as_str());
         return Located { path, length, exists: true };
     }
-    let (path, length) = join(FOLDERS[0], name);
+    let home = fosfor_abi::config::home(|folder| crate::vfs_stat(folder).is_ok_and(|stat| stat.kind == fosfor_abi::tape::VFS_DIR));
+    let mut folder = [0u8; 16];
+    folder[..home.len()].copy_from_slice(home.as_bytes());
+    folder[home.len()] = b'/';
+    let (path, length) = join(core::str::from_utf8(&folder[..home.len() + 1]).unwrap_or("settings/"), name);
     Located { path, length, exists: false }
 }
 
@@ -85,7 +82,8 @@ pub fn read_named(api: &TapeApi, name: &str, out: &mut [u8]) -> isize {
     (api.fs_read)(path.as_ptr(), path.len(), out.as_mut_ptr(), out.len())
 }
 
-/// Writes a config file where `locate` finds it, a new one into `settings/` (the root where the volume has no folders). 0 or an `FS_*` code.
+/// Writes a config file where `locate` finds it, a new one into the configuration folder (the root where the volume has
+/// no folders). 0 or an `FS_*` code.
 pub fn write_named(api: &TapeApi, name: &str, body: &[u8]) -> isize {
     write_path(api, locate(api, name).path(), body)
 }
@@ -95,9 +93,9 @@ fn write_path(api: &TapeApi, path: &str, body: &[u8]) -> isize {
     if code == 0 {
         return 0;
     }
-    // no `settings` folder (FOSFS v3, FAT): the bare name is what those volumes know
-    match FOLDERS.iter().find_map(|folder| path.strip_prefix(folder)) {
-        Some(bare) => (api.fs_write)(bare.as_ptr(), bare.len(), body.as_ptr(), body.len()),
+    // no configuration folder (FOSFS v3, FAT): the bare name is what those volumes know
+    match path.split_once('/').filter(|(folder, _)| fosfor_abi::config::is_folder_name(folder.as_bytes())) {
+        Some((_, bare)) => (api.fs_write)(bare.as_ptr(), bare.len(), body.as_ptr(), body.len()),
         None => code,
     }
 }

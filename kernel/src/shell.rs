@@ -292,11 +292,11 @@ pub(crate) fn run_tape(rest: &str) {
 pub fn apply_settings() -> bool {
     let Some(volume) = storage::boot_volume() else { return false };
     let mut buffer = [0u8; 1024];
-    // v4 keeps it in settings/ (a root file would clash with the folder); v3 and FAT keep it in the root.
-    let Ok(Some(length)) = volume.read(b"settings/settings", &mut buffer).and_then(|found| match found {
-        Some(length) => Ok(Some(length)),
-        None => volume.read(b"settings", &mut buffer),
-    }) else {
+    // v4 keeps it in a configuration folder (`fosfor_abi::config`: etc/, cfg/, settings/, config/); v3 and FAT in the root.
+    let Some(path) = fosfor_abi::config::find("settings", |path| matches!(volume.file_length(path.as_bytes()), Ok(Some(_)))) else {
+        return false;
+    };
+    let Ok(Some(length)) = volume.read(path.as_bytes(), &mut buffer) else {
         return false;
     };
     let mut no_msi = false;

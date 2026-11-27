@@ -130,11 +130,12 @@ pub fn load_from(boot: Option<fosfs::Volume>) -> (usize, usize) {
     clear();
     let Some(volume) = boot else { return (0, 0) };
     let mut buffer = [0u8; FSTAB_MAX];
-    // `fstab` is boot configuration: settings/fstab on a v4 volume, else the root's.
-    let Ok(Some(length)) = volume.read(b"settings/fstab", &mut buffer).and_then(|found| match found {
-        Some(length) => Ok(Some(length)),
-        None => volume.read(b"fstab", &mut buffer),
-    }) else {
+    // `fstab` is boot configuration: in the first configuration folder that has it (etc/, cfg/, settings/, config/;
+    // `fosfor_abi::config`), else the root. Read from the boot volume itself: nothing is mounted yet.
+    let Some(path) = fosfor_abi::config::find("fstab", |path| matches!(volume.file_length(path.as_bytes()), Ok(Some(_)))) else {
+        return (0, 0);
+    };
+    let Ok(Some(length)) = volume.read(path.as_bytes(), &mut buffer) else {
         return (0, 0);
     };
     let Ok(text) = core::str::from_utf8(&buffer[..length]) else { return (0, 1) };

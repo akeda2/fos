@@ -94,7 +94,7 @@ when present (`docs/private.md`). Never copy private code, names or docs into pu
   `tools/build_image.py`, which must be kept in sync. **FOSFS v4** (`format diskN v4`,
   `build_image.py --fosfs 4`, 48-character case-sensitive names, directory sized from the
   volume, real folders, per-entry CRC32, backup superblock in sector 1, mtime, up to 3 extents per file)
-  is mounted by the same `Volume` and is the default for `make image` and `format` (`FOSFS=3`, `format diskN v3` for v3; tapes in `bin/`, boot config in `settings/`, bare names stay valid fallbacks); `docs/fosfs-v4.md`, `make test-fosfs4 test-v4-boot`. The mount table
+  is mounted by the same `Volume` and is the default for `make image` and `format` (`FOSFS=3`, `format diskN v3` for v3; tapes in `bin/`, boot config in `settings/` or `etc/`/`cfg/` (`fosfor_abi::config`, docs/config.md), bare names stay valid fallbacks); `docs/fosfs-v4.md`, `make test-fosfs4 test-v4-boot`. The mount table
   (`kernel/src/mounts.rs`: `fstab`, `mount`/`umount`, folder paths on other labelled volumes) is `make test-mounts`.
 
 ## Drivers

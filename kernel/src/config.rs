@@ -67,33 +67,31 @@ pub fn hostname() -> Option<&'static str> {
     unsafe { (HOSTNAME_LENGTH != 0).then(|| core::str::from_utf8(core::slice::from_raw_parts(core::ptr::addr_of!(HOSTNAME) as *const u8, HOSTNAME_LENGTH)).unwrap_or("")) }
 }
 
-/// Reads `name` into the shared buffer (from the boot volume, else the first other disk that has it); the text, if present.
+/// Reads `name` into the shared buffer; the text, if present. Looked for in each configuration folder in turn
+/// (`fosfor_abi::config::FOLDERS`: `etc/`, `cfg/`, `settings/`, `config/`), then the root (v3, FAT sticks); in each
+/// folder a volume mounted there (`fstab`) comes first, then the boot volume, then the first other disk that has it.
 fn read(name: &str) -> Option<&'static str> {
-    // A FOSFS v4 volume keeps these files in `settings/`; the bare name in the root stays valid (v3, FAT sticks).
-    let mut path = [0u8; 40];
-    if name.len() + 9 <= path.len() {
-        path[..9].copy_from_slice(b"settings/");
-        path[9..9 + name.len()].copy_from_slice(name.as_bytes());
-        if let Ok(folder) = core::str::from_utf8(&path[..9 + name.len()]) {
-            // `settings` mounted from a config volume (fstab): its copy overrides the root's.
-            if let Some((label, rest)) = crate::mounts::lookup(folder.as_bytes()) {
-                if let Some((_, volume)) = storage::volume_labelled(label.as_bytes()).filter(|(_, volume)| matches!(volume.file_length(rest), Ok(Some(_)))) {
-                    crate::println!("{name}: read from @{} (mounted at settings).", core::str::from_utf8(label.as_bytes()).unwrap_or("?"));
-                    return read_volume(volume, rest, name);
-                }
+    for folder in fosfor_abi::config::FOLDERS {
+        let Some(path) = fosfor_abi::config::join(folder, name) else { continue };
+        let file = path.as_bytes();
+        // The folder mounted from a config volume (fstab): its copy overrides the boot volume's.
+        if let Some((label, rest)) = crate::mounts::lookup(file) {
+            if let Some((_, volume)) = storage::volume_labelled(label.as_bytes()).filter(|(_, volume)| matches!(volume.file_length(rest), Ok(Some(_)))) {
+                crate::println!("{name}: read from @{} (mounted at {folder}).", core::str::from_utf8(label.as_bytes()).unwrap_or("?"));
+                return read_volume(volume, rest, name);
             }
             // The same mount on an exFAT stick.
-            if crate::mounts::lookup(folder.as_bytes()).is_some_and(|(label, _)| storage::volume_labelled(label.as_bytes()).is_none()) {
+            if storage::volume_labelled(label.as_bytes()).is_none() {
                 let buffer = unsafe { &mut *core::ptr::addr_of_mut!(BUFFER) };
-                let length = crate::tape_fs::read(folder.as_bytes(), buffer);
+                let length = crate::tape_fs::read(file, buffer);
                 if length >= 0 {
-                    crate::println!("{name}: read from the exFAT volume mounted at settings.");
+                    crate::println!("{name}: read from the exFAT volume mounted at {folder}.");
                     return core::str::from_utf8(&buffer[..length as usize]).ok();
                 }
             }
-            if storage::volume_with_file(folder.as_bytes()).is_some() {
-                return read_root(folder);
-            }
+        }
+        if let Some(volume) = storage::volume_with_file(file) {
+            return read_volume(volume, file, name);
         }
     }
     read_root(name)

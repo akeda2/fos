@@ -2,7 +2,8 @@
 """A FOSFS v4 boot volume laid out in folders (docs/fosfs-v4.md, step 4): tapes in bin/, configuration in settings/.
 Run through `make test-v4-boot`, which builds the image (FOSFOR_IMAGE). `run NAME` must find bin/NAME, the kernel must
 read settings/debug at boot and a bare name in the root is still read as itself
-(the v3 and FAT habit stays valid). A tape's config/ lookup is only covered by tape-rt's host tests."""
+(the v3 and FAT habit stays valid). The other configuration folders (`fosfor_abi::config`): an `etc/` copy wins over
+`settings/`, and `etc/fstab` can mount a config volume at `etc` (a tape's new file going to `etc/` is test-mf-ssh). A tape's config/ lookup is only covered by tape-rt's host tests."""
 
 import sys
 import tempfile
@@ -52,6 +53,30 @@ def overlay(run):
     check("watchdog: 17 s" in status, "its debug file overrides settings/debug", status)
 
 
+def prepare_etc(run):
+    run("mkdir etc")
+    run("write etc/debug watchdog 23")
+
+
+def etc_wins(run):
+    status = run("debug status")
+    check("watchdog: 23 s" in status, "etc/debug is read before settings/debug", status)
+
+
+def prepare_exfat_etc(run):
+    run("format disk2 exfat cfgvol")
+    run("format disk2 confirm")
+    run("write disk2/debug watchdog 21")
+    run("mkdir etc")
+    run("write etc/fstab etc @cfgvol")
+
+
+def overlay_exfat_etc(run):
+    check("etc -> @cfgvol" in run("mount"), "etc/fstab mounts the config volume at etc", "")
+    status = run("debug status")
+    check("watchdog: 21 s" in status, "and its debug file is read through etc/", status)
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         boot(Path(tmp), [], scenario)
@@ -65,6 +90,14 @@ def main():
         disk.write_bytes(bytes(64 << 20))
         boot(Path(tmp), [disk], prepare_exfat)
         boot(Path(tmp), [disk], overlay_exfat, reuse=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        boot(Path(tmp), [], prepare_etc)
+        boot(Path(tmp), [], etc_wins, reuse=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        disk = Path(tmp) / "cfg.img"
+        disk.write_bytes(bytes(64 << 20))
+        boot(Path(tmp), [disk], prepare_exfat_etc)
+        boot(Path(tmp), [disk], overlay_exfat_etc, reuse=True)
     print("v4-boot: all checks passed")
 
 

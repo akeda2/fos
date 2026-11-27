@@ -17,12 +17,13 @@ tape_rt::tape_help!(
     br#"sshd [@NAME] [root=DIR] [export=NAME[=ROOT][,ro]] [port=22] [nic=N]
       [ip=A.B.C.D/N] [gateway=A.B.C.D] [ro] [log]
 An SSH server for file access over SFTP: sftp, sshfs and scp -s from Linux,
-macOS and Windows. Public-key logins only (ssh-ed25519): settings/authorized_keys
-has one key per line, user=NAME[,uid=N][,gid=N][,ro] ssh-ed25519 KEY comment.
-The host key is made at the first start (settings/ssh_host_key); its fingerprint
-is printed at every start. Runs as a service: run sshd @SSHD.CFG &2.
-root=   the folder served: disk2, disk2/music, @LABEL/site, //NAME. Default: the
-        boot volume. One export shows as /, several as folders under /.
+macOS and Windows. Public-key logins only (ssh-ed25519): authorized_keys, in
+the configuration folder (etc/, cfg/ or settings/), has one key per line,
+user=NAME[,uid=N][,gid=N][,ro] ssh-ed25519 KEY comment. The host key is made
+at the first start (ssh_host_key, same folder); its fingerprint is printed at
+every start. Runs as a service: run sshd @SSHD.CFG &2.
+root=   the folder served: disk2, disk2/music, @LABEL/site, //NAME. Default:
+        the boot volume. One export shows as /, several as folders under /.
 export= one more folder under its own name (up to 8); ,ro refuses changes.
 ro      every export refuses changes.   log  show logins and sessions.
 Without ip= the NIC asks DHCP."#
@@ -128,7 +129,8 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let Some(buffer) = bytes(api, 8192) else { return println!("sshd: out of memory.") };
     let length = read_named(api, "authorized_keys", buffer);
     if length < 0 {
-        return println!("sshd: no authorized_keys file (settings/authorized_keys): nobody could log in.");
+        println!("sshd: no authorized_keys file ({}):", tape_rt::config::locate(api, "authorized_keys").path());
+        return println!("  nobody could log in.");
     }
     if let Err(reason) = node.keys.parse(core::str::from_utf8(&buffer[..length as usize]).unwrap_or("")) {
         return println!("sshd: {reason}.");
@@ -148,7 +150,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             let mut file = [0u8; 65];
             seed_text(&seed, &mut file);
             if write_named(api, "ssh_host_key", &file) != 0 {
-                return println!("sshd: could not write settings/ssh_host_key.");
+                return println!("sshd: could not write {}.", tape_rt::config::locate(api, "ssh_host_key").path());
             }
             println!("sshd: made a new host key.");
             seed

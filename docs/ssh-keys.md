@@ -8,6 +8,9 @@ fos logs in with **ed25519 keys only**, in both directions. This manual covers b
   public line in fos's `settings/authorized_keys`.
 * Part 5: checking that two files really hold the same key, Part 6: when it does not work.
 
+The files are shown in `settings/`, the configuration folder `make image` makes. A machine that keeps its configuration
+in `etc/` or `cfg/` has them there instead; fos prints the real path in its messages (docs/config.md).
+
 Words used here: the **private key** (a secret; whoever has it is you), the **public key** (one line, safe to hand around),
 the **fingerprint** (a short `SHA256:...` summary of a public key, used to compare keys by eye) and the **host key** (the
 server's own key, which proves to the client that it reached the right machine).
@@ -84,7 +87,8 @@ prints nothing about it. Later logins compare against that line:
 
 ```
 ssh: THE KEY OF 192.168.0.10 CHANGED. Refusing to log in.
-ssh: it was meant to be SHA256:...; if that is right, remove its line from settings/known_hosts.
+ssh: it was meant to be SHA256:...;
+  if that is right, remove its line from settings/known_hosts.
 ```
 
 A changed key means either the server was reinstalled (then edit `settings/known_hosts` with `ebb` and delete the

@@ -1,7 +1,7 @@
 //! What the SSH client tapes (`sshmount`, `ssh`) share. Every message is prefixed with the tape's name (`tool`).
 //!
 //! - `load_seed`: the ed25519 login key, `settings/ssh_key` (64 hex digits; `keygen` makes it).
-//! - `Trust`: the server's host key against `settings/known_hosts` (`HOST[:PORT] SHA256:fingerprint`), trust on first use.
+//! - `Trust`: the server's host key against `known_hosts` in the configuration folder (`HOST[:PORT] SHA256:fingerprint`), trust on first use.
 //! - `dial`: DHCP on the active NIC, DNS for the host name, a TCP connection: a `Wire`, the `ssh::client::Link` over it.
 #![no_std]
 
@@ -11,7 +11,7 @@ use tape_ip::net;
 use tape_ip::tcp::Socket;
 use tape_net::{ArpCache, MacAddress};
 use tape_rt::TapeApi;
-use tape_rt::config::{read_named, write_named};
+use tape_rt::config::{locate, read_named, write_named};
 
 /// How long a send may wait for the server's acknowledgement.
 const SEND_MICROS: u64 = 20_000_000;
@@ -58,12 +58,13 @@ pub fn load_seed(tool: &str, api: &TapeApi, file: &str, make: bool) -> Option<[u
     if length > 0 {
         let seed = core::str::from_utf8(&text[..length as usize]).ok().and_then(parse_seed);
         if seed.is_none() {
-            tape_rt::println!("{tool}: settings/{file} is not 64 hex digits.");
+            tape_rt::println!("{tool}: {} is not 64 hex digits.", locate(api, file).path());
         }
         return seed;
     }
     if !make {
-        tape_rt::println!("{tool}: no settings/{file}: run `{tool} keygen` first and put its line on the server.");
+        tape_rt::println!("{tool}: no {}: run `{tool} keygen` first", locate(api, file).path());
+        tape_rt::println!("  and put its line on the server.");
         return None;
     }
     let mut seed = [0u8; 32];
@@ -74,14 +75,14 @@ pub fn load_seed(tool: &str, api: &TapeApi, file: &str, make: bool) -> Option<[u
     let mut body = [0u8; 65];
     seed_text(&seed, &mut body);
     if write_named(api, file, &body) != 0 {
-        tape_rt::println!("{tool}: could not write settings/{file}.");
+        tape_rt::println!("{tool}: could not write {}.", locate(api, file).path());
         return None;
     }
-    tape_rt::println!("{tool}: made settings/{file}.");
+    tape_rt::println!("{tool}: made {}.", locate(api, file).path());
     Some(seed)
 }
 
-/// Checks the server's host key against `settings/known_hosts` for one connection.
+/// Checks the server's host key against `known_hosts` (in the configuration folder) for one connection.
 pub struct Trust<'a> {
     pub tool: &'a str,
     pub api: &'a TapeApi,
@@ -131,7 +132,8 @@ fn check_host(tool: &str, api: &TapeApi, host: &str, port: u16, public: &[u8; 32
                 return true;
             }
             tape_rt::println!("{tool}: THE KEY OF {label} CHANGED. Refusing to log in.");
-            tape_rt::println!("{tool}: it was meant to be {print}; if that is right, remove its line from settings/known_hosts.");
+            tape_rt::println!("{tool}: it was meant to be {print};");
+            tape_rt::println!("  if that is right, remove its line from {}.", locate(api, "known_hosts").path());
             return false;
         }
     }
@@ -145,7 +147,7 @@ fn check_host(tool: &str, api: &TapeApi, host: &str, port: u16, public: &[u8; 32
         at += part.len();
     }
     if write_named(api, "known_hosts", &file[..at]) != 0 {
-        tape_rt::println!("{tool}: could not write settings/known_hosts; not trusting {label}.");
+        tape_rt::println!("{tool}: could not write {}; not trusting {label}.", locate(api, "known_hosts").path());
         return false;
     }
     tape_rt::println!("{tool}: {label} is new: remembered its key {print}.");

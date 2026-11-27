@@ -129,30 +129,28 @@ pub fn watchdog_seconds() -> Option<u32> {
     unsafe { WATCHDOG }
 }
 
-/// Reads `name` into the shared buffer: from the boot volume (`settings/NAME`, then the root), else any other FOSFS volume,
-/// else the root of the first FAT32/exFAT disk that has it (a stick a PC can edit), as the embedded kernel does.
+/// Reads `name` into the shared buffer. Looked for in each configuration folder in turn
+/// (`fosfor_abi::config::FOLDERS`: `etc/`, `cfg/`, `settings/`, `config/`), then the root: a volume mounted at the folder
+/// (`fstab`) first, then the boot volume, then any other FOSFS volume; else the root of the first FAT32/exFAT disk that
+/// has it (a stick a PC can edit), as the embedded kernel does.
 pub(crate) fn read(name: &str) -> Option<&'static str> {
     let buffer = unsafe { &mut *core::ptr::addr_of_mut!(BUFFER) };
-    let mut path = [0u8; 40];
-    let length = name.len().min(31);
-    path[..9].copy_from_slice(b"settings/");
-    path[9..9 + length].copy_from_slice(&name.as_bytes()[..length]);
-    let folder = &path[..9 + length];
-    // `settings` mounted from a config volume (fstab): its copy overrides the root's.
-    if let Some((label, rest)) = kernel_core::mounts::lookup(folder) {
-        let volume = volumes::volume_labelled(label.as_bytes());
-        match volume {
+    for folder in fosfor_abi::config::FOLDERS {
+        let Some(path) = fosfor_abi::config::join(folder, name) else { continue };
+        // The folder mounted from a config volume (fstab): its copy overrides the boot volume's.
+        let Some((label, rest)) = kernel_core::mounts::lookup(path.as_bytes()) else { continue };
+        match volumes::volume_labelled(label.as_bytes()) {
             Some((_, volume)) if matches!(volume.file_length(rest), Ok(Some(_))) => {
-                println!("{name}: read from @{} (mounted at settings).", core::str::from_utf8(label.as_bytes()).unwrap_or("?"));
+                println!("{name}: read from @{} (mounted at {folder}).", core::str::from_utf8(label.as_bytes()).unwrap_or("?"));
                 return match volume.read(rest, buffer) {
                     Ok(Some(length)) => core::str::from_utf8(&buffer[..length]).ok(),
                     _ => None,
                 };
             }
             None => {
-                let length = kernel_core::tape_fs::read(folder, buffer);
+                let length = kernel_core::tape_fs::read(path.as_bytes(), buffer);
                 if length >= 0 {
-                    println!("{name}: read from the FAT volume mounted at settings.");
+                    println!("{name}: read from the FAT volume mounted at {folder}.");
                     return core::str::from_utf8(&buffer[..length as usize]).ok();
                 }
             }
@@ -160,7 +158,7 @@ pub(crate) fn read(name: &str) -> Option<&'static str> {
         }
     }
     let has = |volume: &kernel_core::fosfs::Volume| {
-        [folder, name.as_bytes()].into_iter().find(|file| matches!(volume.file_length(file), Ok(Some(_))))
+        fosfor_abi::config::find(name, |file| matches!(volume.file_length(file.as_bytes()), Ok(Some(_))))
     };
     let found = volumes::boot_volume().and_then(|volume| has(&volume).map(|file| (volume, file))).or_else(|| {
         (1..=crate::block::count()).find_map(|number| {
@@ -169,7 +167,7 @@ pub(crate) fn read(name: &str) -> Option<&'static str> {
         })
     });
     let Some((volume, file)) = found else { return read_fat(name, buffer) };
-    match volume.read(file, buffer) {
+    match volume.read(file.as_bytes(), buffer) {
         Ok(Some(length)) => core::str::from_utf8(&buffer[..length]).ok(),
         _ => None,
     }

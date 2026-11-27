@@ -23,12 +23,13 @@ COMMAND there and prints its output (then the exit status, if it is not 0).
 Esc ends the session. Everything else you type goes to the server, which does
 the echo and the line editing; the console understands ANSI colours and
 cursor movement, so a full-screen program may not look right.
-Login is by key: `ssh keygen` makes settings/ssh_key (key=NAME: another file,
-shared with sshmount) and prints its line; put that line in
+Login is by key: `ssh keygen` makes ssh_key in the configuration folder (etc/,
+cfg/ or settings/; key=NAME: another file, shared with sshmount) and prints its
+line; put that line in
 ~/.ssh/authorized_keys on the server. With `password` (or `pw`) the tape asks
 for the account's password instead (typed blind, Esc cancels): for a first
 login on a machine that does not have the key yet.
-The server's key is remembered in settings/known_hosts the first time and
+The server's key is remembered in known_hosts (same folder) the first time and
 checked afterwards: a changed key is refused (edit the file to accept it).
 The tape takes its address from DHCP on the active NIC (`nic use N`).
 OpenSSH, fos's sshd (with the `shell` option), any SSH-2 server with ed25519.

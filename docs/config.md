@@ -79,7 +79,14 @@ lists its words.
 
 ## Where the files live
 
-Every machine-specific file (start, services, settings, hostname, debug, smbusers, tape configs such as phono.cfg, smbd.cfg, httpd.cfg and @NAME files) belongs in `settings/`. A tape looks for `settings/NAME`, then `config/NAME`, then the bare name in the root (`tape_rt::config::locate`); a save goes where the file was found, a new file goes to `settings/` (the root on a volume without folders). `fstab` stays in the root because it builds the mount table. The mf shell command `settings migrate` moves the root *.cfg files, smbusers and services into `settings/`.
+Every machine-specific file (start, services, settings, hostname, debug, fstab, smbusers, ssh keys, tape configs such as phono.cfg, smbd.cfg, httpd.cfg and @NAME files) belongs in a configuration folder: `etc/`, `cfg/` or `settings/` (`config/` is the old name of tape configs and still read). Pick one per machine; `settings/` is what `make image` makes.
+
+- **Reading**: a file is looked for in `etc/`, `cfg/`, `settings/`, `config/`, in that order, then in the root (v3 and FAT volumes have no folders). The first copy found wins, so a stray old copy in another folder is ignored. Both kernels (boot config, `fstab`), every tape (`tape_rt::config::locate`) and the private drivers use the one list, `fosfor_abi::config` (2026-11-27).
+- **Mounts**: a folder of that list mounted from a config volume (`fstab`: `etc @LABEL`) is read through the mount, as `settings` was. `fstab` itself is read from the boot volume's own folders, before anything is mounted.
+- **New files** (a tape's first save, `ssh keygen`, `settings migrate`): where the file already is, else the first of `etc/`, `cfg/`, `settings/` the boot volume has, else `settings/`.
+- **httpd** never serves any of these folders, whatever its root (`tape_http::is_blocked`).
+
+The mf shell command `settings migrate` moves the root *.cfg files, smbusers and services into that folder.
 
 Step-by-step key handling for both directions: `docs/ssh-keys.md`.
 
