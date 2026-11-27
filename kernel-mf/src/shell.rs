@@ -458,6 +458,7 @@ pub fn run_command(line: &str) {
                 }
                 _ => println!("debug idle: {} (`debug idle poll|halt`).", if crate::arch::idle_poll() { "poll" } else { "halt" }),
             },
+            Some("smi") => debug_smi(words.next(), words.next()),
             Some("revert") => {
                 let _disk = crate::tapefs::lock();
                 let mut outcome = Err("the slot metadata cannot be read or written");
@@ -709,6 +710,41 @@ pub fn run_tape(name: &str, args: &str) {
 /// `pci BB:DD.F [probe|diff]`: the config space and BARs of one device; `probe` also switches on memory decoding and reads
 /// the first 256 bytes of every memory BAR (reads only, nothing is written to the device), for finding out what an
 /// undocumented card is.
+/// `debug smi [on|off BIT | restore]`: the SMI rate over one second and the PCH's SMI sources, or one source switched on
+/// or off as an experiment (`arch::smi_enable_bit`). Not kept across a reboot.
+fn debug_smi(action: Option<&str>, bit: Option<&str>) {
+    let show = |what: &str, (before, after): (u32, u32)| {
+        println!("debug smi: {what}: SMI_EN {before:#010x} -> {after:#010x}.");
+        if before == after {
+            println!("  unchanged: the firmware locked it or it was already so.");
+        }
+    };
+    match (action, bit.and_then(|bit| bit.parse::<u32>().ok())) {
+        (Some(word @ ("on" | "off")), Some(bit @ 1..=31)) => match crate::arch::smi_enable_bit(bit, word == "on") {
+            Some(change) => show(&alloc::format!("bit {bit} {word}"), change),
+            None => println!("debug smi: no Intel PCH SMI registers here."),
+        },
+        (Some("on" | "off"), _) => println!("debug smi: give a bit, 1-31 (0 would turn every SMI off)."),
+        (Some("restore"), _) => match crate::arch::smi_restore() {
+            Some(change) => show("restored", change),
+            None => println!("debug smi: nothing changed since boot."),
+        },
+        _ => {
+            let Some(first) = crate::arch::smi_count() else {
+                println!("debug smi: no SMI counter on this CPU.");
+                return;
+            };
+            crate::sched::sleep_ticks(crate::arch::TICK_HZ);
+            let second = crate::arch::smi_count().unwrap_or(first);
+            println!("debug smi: {} SMIs in the last second, {second} since reset.", second.wrapping_sub(first) & 0xffff_ffff);
+            if let Some((enabled, status)) = crate::arch::smi_sources() {
+                println!("  PCH SMI_EN {enabled:#010x}, SMI_STS {status:#010x}");
+                println!("  `debug smi on|off BIT`, `debug smi restore`");
+            }
+        }
+    }
+}
+
 fn pci_inspect<'a>(mut words: impl Iterator<Item = &'a str>) {
     let address = words.next().unwrap_or("");
     let parse = || -> Option<(u8, u8, u8)> {

@@ -141,6 +141,34 @@ pub fn smi_sources() -> Option<(u32, u32)> {
     Some((cpu::inl(base + 0x30), cpu::inl(base + 0x34)))
 }
 
+/// `SMI_EN` as the firmware left it, saved at the first `debug smi on|off` so `debug smi restore` can put it back.
+static SMI_EN_FIRMWARE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// `debug smi on|off BIT`: sets or clears one `SMI_EN` source and returns the register before and after (read back: a
+/// bit the firmware locked stays as it was). An experiment, not a setting: the firmware owns this register, may set the
+/// bit again in its next SMI, and may rely on the source (bit 6, the software SMI timer, re-arms itself every 1.5 to 64 ms
+/// and is often how firmware polls legacy USB). Bit 0 (all SMIs) is refused by the caller. `None` where `smi_sources` is.
+pub fn smi_enable_bit(bit: u32, on: bool) -> Option<(u32, u32)> {
+    let (before, _) = smi_sources()?;
+    let _ = SMI_EN_FIRMWARE.compare_exchange(u64::MAX, before as u64, core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed);
+    let value = if on { before | 1 << bit } else { before & !(1 << bit) };
+    let port = apic::pm_port() - 8 + 0x30;
+    cpu::outl(port, value);
+    Some((before, cpu::inl(port)))
+}
+
+/// Writes back the `SMI_EN` saved before the first change; `None` if nothing was changed.
+pub fn smi_restore() -> Option<(u32, u32)> {
+    let saved = SMI_EN_FIRMWARE.load(core::sync::atomic::Ordering::Relaxed);
+    if saved == u64::MAX {
+        return None;
+    }
+    let (before, _) = smi_sources()?;
+    let port = apic::pm_port() - 8 + 0x30;
+    cpu::outl(port, saved as u32);
+    Some((before, cpu::inl(port)))
+}
+
 /// System management interrupts since reset (Intel `MSR_SMI_COUNT`, 0x34, family 6 from Nehalem, model 0x1a, on). An SMI
 /// runs firmware with every CPU stopped, invisible to the kernel but not to an audio card's deadline. `None` on other CPUs,
 /// where reading the MSR would fault.

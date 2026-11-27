@@ -57,6 +57,18 @@ The shell command `debug` (not a file option) inspects and changes things at run
 cannot be read), `debug video skip|auto|size WxH` (BIOS boots: skip the video-mode switch, or give a monitor size when the card has
 no EDID).
 
+Two more on the server kernel (x86), for finding why interrupts arrive late; neither is kept across a reboot:
+
+- `debug idle poll|halt`: idle CPUs spin with interrupts on instead of halting, so no CPU waits out a sleep-state exit
+  (about 190 µs on rack). Costs power and heat.
+- `debug smi [on|off BIT | restore]`: with no words, the system management interrupts (SMIs) of the last second, the
+  count since reset and the Intel PCH's `SMI_EN`/`SMI_STS`. An SMI runs firmware with every CPU stopped. `off BIT`
+  clears one `SMI_EN` source and `restore` puts back the firmware's value. Bit 0 (every SMI) is refused. The firmware
+  owns this register and may rely on a source, so this is an experiment, not a setting. On rack, `debug smi off 6`
+  (the software SMI timer) took the rate from 60 a second to none, and 60 s ring checks at 176.4 kHz, period 64, ran
+  clean where two of three had lost a ring.
+  `sysrq` prints the SMI count and each CPU's worst timer-tick lateness too.
+
 ## Tape settings files
 
 A tape that keeps settings reads a text file of the same words it takes on its command line; `run TAPE @NAME` loads another file.

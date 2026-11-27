@@ -346,6 +346,14 @@ pub fn smi_count() -> Option<u64> {
     None
 }
 
+pub fn smi_enable_bit(_bit: u32, _on: bool) -> Option<(u32, u32)> {
+    None
+}
+
+pub fn smi_restore() -> Option<(u32, u32)> {
+    None
+}
+
 pub use timer::TICK_HZ;
 
 pub fn ticks() -> u64 {
