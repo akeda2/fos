@@ -312,11 +312,14 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     use kernel_core::nicorder::{self, Kind};
     let kinds = [Kind::E1000, Kind::Rtl8168, Kind::Rtl8125, Kind::Rtl8139, Kind::ThreeCom];
     let mut interfaces = 0;
-    for card in nicorder::arrange(&kinds).into_iter().flatten() {
+    // Entry k of `arrange` is interface k+1; an empty one (a pinned card that is away) stays a hole in the table.
+    for (number, card) in nicorder::arrange(&kinds).into_iter().enumerate() {
+        let Some(card) = card else { continue };
+        nic::skip_to(number);
         let device = card.device;
         match card.kind {
             Kind::E1000 => {
-                match e1000::E1000::init(&device, interfaces) {
+                match e1000::E1000::init(&device, number) {
                     Ok(mut nic) => {
                         println!("e1000 ({:?}) at {:02x}:{:02x}.{}: MAC {}, link {}.", nic.variant, device.bus, device.device, device.function, term::Mac(&nic.mac), if nic.link_up() { "up" } else { "down" });
                         if config::no_msi() {
@@ -339,7 +342,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     
             }
             Kind::Rtl8168 => {
-                match rtl8168::Rtl8168::init(&device, interfaces) {
+                match rtl8168::Rtl8168::init(&device, number) {
                     Ok(nic) => {
                         match nic.link_speed() {
                             Some((speed, full)) => println!("rtl8168 at {:02x}:{:02x}.{} (chip version {:#05x}, I/O {:#06x}): MAC {}, link up at {speed} Mb/s {}.", device.bus, device.device, device.function, nic.version, nic.io_base(), term::Mac(&nic.mac), if full { "full duplex" } else { "half duplex" }),
@@ -363,7 +366,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     
             }
             Kind::Rtl8125 => {
-                match rtl8125::Rtl8125::init(&device, interfaces) {
+                match rtl8125::Rtl8125::init(&device, number) {
                     Ok(mut nic) => {
                         let (bus, slot, function, name) = (device.bus, device.device, device.function, nic.chip.name());
                         println!("rtl8125 at {bus:02x}:{slot:02x}.{function} ({name}, XID {:#05x}): MAC {}.", nic.xid, term::Mac(&nic.mac));
@@ -388,7 +391,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     
             }
             Kind::Rtl8139 => {
-                match rtl8139::Rtl8139::init(&device, interfaces) {
+                match rtl8139::Rtl8139::init(&device, number) {
                     Ok(mut nic) => {
                         println!(
                             "rtl8139 at {:02x}:{:02x}.{} (I/O {:#06x}): MAC {}, link {}.",
@@ -416,7 +419,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     
             }
             Kind::ThreeCom => {
-                match threecom::ThreeCom::init(&device, interfaces) {
+                match threecom::ThreeCom::init(&device, number) {
                     Ok(mut nic) => {
                         println!(
                             "3c905 at {:02x}:{:02x}.{} (I/O {:#06x}): MAC {}, link {}.",

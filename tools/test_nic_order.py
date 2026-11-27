@@ -2,7 +2,9 @@
 """NIC numbering (`make test-nic-order`, `kernel_core::nicorder`): cards come up in PCI order whatever their driver, and
 `nic N MAC` lines in `settings` pin a card to a number. An RTL8139 at 00:03.0 and an e1000 at 00:04.0 are numbered 1 and 2
 (the old driver-by-driver order made the e1000 nic1); with `nic 1 <e1000 MAC>` they swap. `nic pin` prints the lines that
-keep the current numbers, and a pin for an absent MAC or a bad line is reported, not fatal. Both kernels: the embedded one
+keep the current numbers, and a pin for an absent MAC or a bad line is reported, not fatal. A pinned card that is away
+leaves its number empty: with `nic 3 <RTL MAC>` and `nic 2 <absent>` the RTL8139 is nic3, nic2 stays empty and the
+unpinned e1000 takes nic1, the lowest number no pin claims. Both kernels: the embedded one
 (FOSFOR_IMAGE) and the server kernel (FOSFOR_IMAGE_MF)."""
 
 import os
@@ -95,8 +97,12 @@ def main():
             text = boot(tmp, f"{kernel}-pinned", image, settings)
             check(pinned(text) == {1: INTEL, 2: RTL}, f"{kernel}: `nic 1 <e1000 MAC>` makes the e1000 nic1", text)
             check("settings: nic 1 52:54:00:00:10:0e -- that card is nic1." in text, f"{kernel}: the pin is narrated", text)
-            check("pin 3 ignored: no card with MAC 02:00:00:00:00:01" in text, f"{kernel}: a pin for an absent card is reported", text)
+            check("no card with MAC 02:00:00:00:00:01: nic3 stays empty" in text, f"{kernel}: a pin for an absent card is reported", text)
             check(f"`nic x {RTL}` ignored (nic N MAC)" in text, f"{kernel}: a bad line is reported", text)
+
+            settings = f"nic 3 {RTL}\nnic 2 02:00:00:00:00:02\n"
+            text = boot(tmp, f"{kernel}-hole", image, settings)
+            check(pinned(text) == {1: INTEL, 3: RTL}, f"{kernel}: an absent pinned card leaves a hole; the others keep their pins", text)
     if failures:
         print("\n\n".join(failures))
         sys.exit(1)

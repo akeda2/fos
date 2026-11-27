@@ -390,6 +390,16 @@ pub fn count() -> usize {
     unsafe { NIC_COUNT }
 }
 
+/// Leaves the slots up to `index` empty, so the next `install` gets `index`: the hole of a pinned card that is away, or of
+/// one whose driver failed (`nicorder`). Empty slots read as `None` from `at`, like any number past the end.
+pub fn skip_to(index: usize) {
+    unsafe {
+        if NIC_COUNT < index && index <= MAX_NICS {
+            NIC_COUNT = index;
+        }
+    }
+}
+
 pub fn at(index: usize) -> Option<&'static mut Nic> {
     unsafe { (*core::ptr::addr_of_mut!(NICS)).get_mut(index)?.as_mut() }
 }

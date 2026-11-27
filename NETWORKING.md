@@ -442,6 +442,10 @@ on N`), `run ... &N`, `nic use N`, tape arguments and the name a machine announc
   Realtek IDR0-5 or the RTL8125's MAC0_BKP), which the hardware loads from its EEPROM or NVM at power-on; it only
   reads, and only when `settings` has pins. Each driver's `init` then gets the final number as its index, which
   also keeps `nic-mtu N` on an 82579/I219 (chosen before the reset) on the right card.
+- **Holes.** A pinned card that is away leaves its number empty (`nic` skips it), so the cards pinned above it keep
+  theirs; unpinned cards take the lowest numbers no pin claims, and a returning card finds its number free. A card
+  whose driver fails to start leaves a hole too. Until 2026-11-27 the numbers had no gaps: replacing rack's I350 (pins
+  2 and 3) by an RTL8125 turned the RTL8168 pinned to 4 into nic3, and every service on `&4` failed and retried.
 - Virtual NICs are numbered after the physical ones and are best named (`run ... &web`); their numbers move when a
   physical card is added.
 

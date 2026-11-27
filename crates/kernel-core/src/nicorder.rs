@@ -16,9 +16,15 @@
 //!   peek rather than renumbering afterwards. A 3C905 (EEPROM behind window commands) and virtio-net (MAC in the device's config
 //!   after feature negotiation) have no peek: they cannot be pinned and take free numbers.
 //!
-//! The table stays dense: a pinned card that is absent leaves no hole, so a pin above the number of cards present cannot be
-//! honoured (it is reported, and the card takes a free number). Pins are read only when `settings` has some; without them no
-//! card is touched before its driver's `init`.
+//! * **Holes.** A pinned number belongs to its card even while the card is away: the slot stays empty (`nic::skip_to`), so a
+//!   card pulled from a lower slot does not move the pinned cards above it, and the `run ... &N` and `vnic ... on N` lines
+//!   naming them keep working. Unpinned cards take the lowest numbers no pin claims, so a card that comes back finds its
+//!   number free; only when every free number is claimed does an unpinned card take one of an absent card's. A card whose
+//!   driver fails to start leaves its number empty too. A pin above the interface table (`nic::MAX_NICS`) cannot be
+//!   honoured: it is reported and the card takes a free number. (Until 2026-11-27 the table had no holes: on rack an I350
+//!   with pins 2 and 3 was replaced by an RTL8125, the RTL8168 pinned to 4 became nic3, and every service on `&4` failed.)
+//!
+//! Pins are read only when `settings` has some; without them no card is touched before its driver's `init`.
 //!
 //! `plan` is the pure part (host tests below); `arrange` walks PCI and reads the MACs.
 
@@ -90,34 +96,44 @@ pub fn pins() -> ([Pin; MAX_CARDS], usize) {
 pub enum Unhonoured {
     /// No card present has the MAC (or its MAC could not be read before `init`).
     Absent(Pin),
-    /// Fewer cards than the number: the table has no holes.
-    BeyondCards(Pin, usize),
+    /// The number is above the interface table (`limit` interfaces).
+    BeyondTable(Pin, usize),
 }
 
-/// Numbers the cards. `macs[i]` is the MAC of the i-th card in PCI order (`None`: not read). Writes to `order[k]` the index
-/// into `macs` of the card that becomes interface k+1, for every card; reports each pin not honoured through `skipped`.
-pub fn plan(macs: &[Option<[u8; 6]>], pins: &[Pin], order: &mut [usize], mut skipped: impl FnMut(Unhonoured)) {
-    let count = macs.len().min(order.len()).min(MAX_CARDS);
+/// Numbers the cards. `macs[i]` is the MAC of the i-th card in PCI order (`None`: not read); the table has `limit`
+/// interfaces. Sets `order[k]` to the index into `macs` of the card that becomes interface k+1, `None` for a hole; reports
+/// each pin not honoured through `skipped`. A card left without a number (more cards than `limit`) is not in `order`.
+pub fn plan(macs: &[Option<[u8; 6]>], pins: &[Pin], limit: usize, order: &mut [Option<usize>], mut skipped: impl FnMut(Unhonoured)) {
+    let count = macs.len().min(MAX_CARDS);
+    let limit = limit.min(order.len()).min(MAX_CARDS);
     let mut placed = [false; MAX_CARDS]; // card i has a number
     let mut slot: [Option<usize>; MAX_CARDS] = [None; MAX_CARDS]; // number k+1 -> card
+    let mut claimed = [false; MAX_CARDS]; // number k+1 is pinned, whether its card is here or not
     for pin in pins {
+        if pin.number > limit {
+            skipped(Unhonoured::BeyondTable(*pin, limit));
+            continue;
+        }
+        claimed[pin.number - 1] = true;
         match macs[..count].iter().position(|mac| *mac == Some(pin.mac)) {
-            None => skipped(Unhonoured::Absent(*pin)),
-            Some(_) if pin.number > count => skipped(Unhonoured::BeyondCards(*pin, count)),
             // `add_pin` refuses duplicate numbers and MACs, so neither the slot nor the card is taken here.
             Some(card) if slot[pin.number - 1].is_none() && !placed[card] => {
                 slot[pin.number - 1] = Some(card);
                 placed[card] = true;
             }
-            Some(_) => skipped(Unhonoured::Absent(*pin)),
+            _ => skipped(Unhonoured::Absent(*pin)),
         }
     }
-    let mut unplaced = (0..count).filter(|&card| !placed[card]);
-    for (number, entry) in slot[..count].iter().enumerate() {
-        order[number] = match entry {
-            Some(card) => *card,
-            None => unplaced.next().expect("one free number per unplaced card"),
-        };
+    // Unpinned cards in PCI order: first the numbers no pin claims, then those of absent pinned cards.
+    for card in (0..count).filter(|&card| !placed[card]) {
+        let free = (0..limit).find(|&k| slot[k].is_none() && !claimed[k]).or_else(|| (0..limit).find(|&k| slot[k].is_none()));
+        if let Some(k) = free {
+            slot[k] = Some(card);
+        }
+    }
+    order[..limit].copy_from_slice(&slot[..limit]);
+    for entry in &mut order[limit..] {
+        *entry = None;
     }
 }
 
@@ -174,8 +190,8 @@ fn peek_mac(card: &Card) -> Option<[u8; 6]> {
     (mac != [0; 6] && mac != [0xff; 6] && mac[0] & 1 == 0).then_some(mac)
 }
 
-/// The NIC cards of the families in `kinds`, in the order to bring them up (PCI order, then pins applied), `None` after the
-/// last. Narrates the pins it cannot honour.
+/// The NIC cards of the families in `kinds` at their interface numbers: entry k is interface k+1, `None` a hole (PCI order,
+/// then pins applied). The caller brings each up with index k after `nic::skip_to(k)`. Narrates the pins it cannot honour.
 pub fn arrange(kinds: &[Kind]) -> [Option<Card>; MAX_CARDS] {
     let mut cards: [Option<Card>; MAX_CARDS] = [None; MAX_CARDS];
     let mut count = 0;
@@ -188,10 +204,11 @@ pub fn arrange(kinds: &[Kind]) -> [Option<Card>; MAX_CARDS] {
         count += 1;
     }
     let (pins, pin_count) = pins();
-    let mut order = [0usize; MAX_CARDS];
+    let limit = crate::nic::MAX_NICS.min(MAX_CARDS);
+    let mut order = [None; MAX_CARDS];
     if pin_count == 0 {
-        for (number, entry) in order.iter_mut().enumerate() {
-            *entry = number;
+        for (number, entry) in order[..count.min(limit)].iter_mut().enumerate() {
+            *entry = Some(number);
         }
     } else {
         let mut macs = [None; MAX_CARDS];
@@ -199,17 +216,17 @@ pub fn arrange(kinds: &[Kind]) -> [Option<Card>; MAX_CARDS] {
             *mac = peek_mac(card);
         }
         crate::println!("nic: {pin_count} pinned number(s) in settings; read {} card MAC(s) to place them.", macs.iter().flatten().count());
-        plan(&macs[..count], &pins[..pin_count], &mut order, |why| match why {
-            Unhonoured::Absent(pin) => crate::println!("nic: pin {} ignored: no card with MAC {}.", pin.number, Mac(pin.mac)),
-            Unhonoured::BeyondCards(pin, cards) => {
-                crate::println!("nic: pin {} ({}) ignored: only {cards} card(s),", pin.number, Mac(pin.mac));
-                crate::println!("     and the numbers have no gaps; it takes a free one.");
+        plan(&macs[..count], &pins[..pin_count], limit, &mut order, |why| match why {
+            Unhonoured::Absent(pin) => crate::println!("nic: no card with MAC {}: nic{} stays empty.", Mac(pin.mac), pin.number),
+            Unhonoured::BeyondTable(pin, limit) => {
+                crate::println!("nic: pin {} ({}) ignored: the table has {limit} interfaces;", pin.number, Mac(pin.mac));
+                crate::println!("     the card takes a free number.");
             }
         });
     }
     let mut out = [None; MAX_CARDS];
-    for (slot, &card) in out.iter_mut().zip(&order[..count]) {
-        *slot = cards[card];
+    for (slot, card) in out.iter_mut().zip(order) {
+        *slot = card.and_then(|card| cards[card]);
     }
     out
 }
@@ -253,17 +270,21 @@ mod tests {
     }
 
     /// The planned order of `macs.len()` cards and how many pins were not honoured.
-    fn run(macs: &[Option<[u8; 6]>], pins: &[Pin]) -> ([usize; MAX_CARDS], usize) {
-        let mut order = [usize::MAX; MAX_CARDS];
+    fn run(macs: &[Option<[u8; 6]>], pins: &[Pin]) -> ([Option<usize>; MAX_CARDS], usize) {
+        run_limit(macs, pins, 16)
+    }
+
+    fn run_limit(macs: &[Option<[u8; 6]>], pins: &[Pin], limit: usize) -> ([Option<usize>; MAX_CARDS], usize) {
+        let mut order = [Some(usize::MAX); MAX_CARDS];
         let mut skipped = 0;
-        plan(macs, pins, &mut order, |_| skipped += 1);
+        plan(macs, pins, limit, &mut order, |_| skipped += 1);
         (order, skipped)
     }
 
     #[test]
     fn without_pins_the_pci_order_stands() {
         let (order, skipped) = run(&[mac(1), mac(2), None], &[]);
-        assert_eq!(order[..3], [0, 1, 2]);
+        assert_eq!(order[..4], [Some(0), Some(1), Some(2), None]);
         assert_eq!(skipped, 0);
     }
 
@@ -271,7 +292,7 @@ mod tests {
     fn a_pin_moves_one_card_and_the_rest_fill_in_pci_order() {
         // rack: I219 00:1f.6, RTL8168 04:00.0, I350 05:00.0 and 05:00.1; the RTL8168 is pinned to 4.
         let (order, _) = run(&[mac(1), mac(8), mac(2), mac(3)], &[pin(4, 8)]);
-        assert_eq!(order[..4], [0, 2, 3, 1]);
+        assert_eq!(order[..4], [Some(0), Some(2), Some(3), Some(1)]);
     }
 
     #[test]
@@ -279,20 +300,36 @@ mod tests {
         // A card appears at 03:00.0 (index 1); all four old ones are pinned.
         let macs = [mac(1), mac(9), mac(8), mac(2), mac(3)];
         let (order, _) = run(&macs, &[pin(1, 1), pin(2, 2), pin(3, 3), pin(4, 8)]);
-        assert_eq!(order[..5], [0, 3, 4, 2, 1]);
+        assert_eq!(order[..5], [Some(0), Some(3), Some(4), Some(2), Some(1)]);
     }
 
     #[test]
-    fn an_absent_or_unread_card_leaves_its_pin_unused() {
+    fn an_absent_or_unread_card_keeps_its_number_empty() {
         let (order, skipped) = run(&[None, mac(2)], &[pin(2, 1)]);
-        assert_eq!(order[..2], [0, 1]);
+        assert_eq!(order[..3], [Some(0), None, Some(1)]);
         assert_eq!(skipped, 1);
     }
 
     #[test]
-    fn a_pin_beyond_the_cards_present_is_reported_and_the_card_takes_a_free_number() {
-        let (order, skipped) = run(&[mac(1), mac(2)], &[pin(5, 1)]);
-        assert_eq!(order[..2], [0, 1]);
+    fn a_pulled_card_leaves_holes_and_a_new_one_takes_an_unclaimed_number() {
+        // rack on 2026-11-27: the I350 (pins 2 and 3) replaced by an RTL8125 at 01:00.0; I219 00:1f.6 pinned to 1, the
+        // RTL8168 at 04:00.0 to 4. Before, the RTL8168 became nic3 and the services on &4 failed.
+        let macs = [mac(1), mac(7), mac(8)];
+        let (order, skipped) = run(&macs, &[pin(1, 1), pin(2, 2), pin(3, 3), pin(4, 8)]);
+        assert_eq!(order[..6], [Some(0), None, None, Some(2), Some(1), None]);
+        assert_eq!(skipped, 2);
+    }
+
+    #[test]
+    fn with_every_free_number_claimed_an_unpinned_card_takes_an_absent_ones() {
+        let (order, _) = run_limit(&[mac(1), mac(7)], &[pin(1, 1), pin(2, 2)], 2);
+        assert_eq!(order[..3], [Some(0), Some(1), None]);
+    }
+
+    #[test]
+    fn a_pin_beyond_the_table_is_reported_and_the_card_takes_a_free_number() {
+        let (order, skipped) = run_limit(&[mac(1), mac(2)], &[pin(9, 1)], 8);
+        assert_eq!(order[..3], [Some(0), Some(1), None]);
         assert_eq!(skipped, 1);
     }
 

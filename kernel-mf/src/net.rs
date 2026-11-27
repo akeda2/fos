@@ -131,16 +131,19 @@ pub fn init() {
     // number is its place here, and each driver's `init` takes that number as its index.
     let kinds = [Kind::E1000, Kind::Rtl8168, Kind::Rtl8125, Kind::Rtl8139, Kind::ThreeCom, Kind::Virtio];
     let mut interfaces = 0;
-    for card in nicorder::arrange(&kinds).into_iter().flatten() {
+    // Entry k of `arrange` is interface k+1; an empty one (a pinned card that is away) stays a hole in the table.
+    for (number, card) in nicorder::arrange(&kinds).into_iter().enumerate() {
+        let Some(card) = card else { continue };
+        nic::skip_to(number);
         let device = card.device;
         match card.kind {
             Kind::E1000 => {
-                match e1000::E1000::init(&device, interfaces) {
+                match e1000::E1000::init(&device, number) {
                     Ok(mut nic) => {
                         println!("e1000 ({:?}) at {:02x}:{:02x}.{}: MAC {}, link {}.", nic.variant, device.bus, device.device, device.function, Mac(&nic.mac), if nic.link_up() { "up" } else { "down" });
                         report(nic.enable_interrupts(&device, false));
                         if nic::install(Nic::E1000(nic)).is_some() {
-                            locate(interfaces, &device);
+                            locate(number, &device);
                             interfaces += 1;
                         }
                     }
@@ -149,12 +152,12 @@ pub fn init() {
     
             }
             Kind::Rtl8168 => {
-                match rtl8168::Rtl8168::init(&device, interfaces) {
+                match rtl8168::Rtl8168::init(&device, number) {
                     Ok(mut nic) => {
                         println!("rtl8168 at {:02x}:{:02x}.{} (chip version {:#05x}): MAC {}.", device.bus, device.device, device.function, nic.version, Mac(&nic.mac));
                         report(nic.enable_interrupts(&device));
                         if nic::install(Nic::Rtl8168(nic)).is_some() {
-                            locate(interfaces, &device);
+                            locate(number, &device);
                             interfaces += 1;
                         }
                     }
@@ -163,12 +166,12 @@ pub fn init() {
     
             }
             Kind::Rtl8125 => {
-                match rtl8125::Rtl8125::init(&device, interfaces) {
+                match rtl8125::Rtl8125::init(&device, number) {
                     Ok(mut nic) => {
                         println!("rtl8125 at {:02x}:{:02x}.{} ({}, XID {:#05x}): MAC {}.", device.bus, device.device, device.function, nic.chip.name(), nic.xid, Mac(&nic.mac));
                         report(nic.enable_interrupts(&device));
                         if nic::install(Nic::Rtl8125(nic)).is_some() {
-                            locate(interfaces, &device);
+                            locate(number, &device);
                             interfaces += 1;
                         }
                     }
@@ -177,12 +180,12 @@ pub fn init() {
     
             }
             Kind::Rtl8139 => {
-                match rtl8139::Rtl8139::init(&device, interfaces) {
+                match rtl8139::Rtl8139::init(&device, number) {
                     Ok(mut nic) => {
                         println!("rtl8139 at {:02x}:{:02x}.{}: MAC {}, link {}.", device.bus, device.device, device.function, Mac(&nic.mac), if nic.link_up() { "up" } else { "down" });
                         report(nic.enable_interrupts(&device));
                         if nic::install(Nic::Rtl8139(nic)).is_some() {
-                            locate(interfaces, &device);
+                            locate(number, &device);
                             interfaces += 1;
                         }
                     }
@@ -191,12 +194,12 @@ pub fn init() {
     
             }
             Kind::ThreeCom => {
-                match threecom::ThreeCom::init(&device, interfaces) {
+                match threecom::ThreeCom::init(&device, number) {
                     Ok(mut nic) => {
                         println!("3c905 at {:02x}:{:02x}.{}: MAC {}, link {}.", device.bus, device.device, device.function, Mac(&nic.mac), if nic.link_up() { "up" } else { "down" });
                         report(nic.enable_interrupts(&device));
                         if nic::install(Nic::ThreeCom(nic)).is_some() {
-                            locate(interfaces, &device);
+                            locate(number, &device);
                             interfaces += 1;
                         }
                     }
@@ -205,11 +208,11 @@ pub fn init() {
     
             }
             Kind::Virtio => {
-                match virtio_net::VirtioNet::init(&device, interfaces) {
+                match virtio_net::VirtioNet::init(&device, number) {
                     Ok(nic) => {
                         println!("virtio-net at {:02x}:{:02x}.{}: MAC {}, link {}.", device.bus, device.device, device.function, Mac(&nic.mac), if nic.link_up() { "up" } else { "down" });
                         if nic::install(Nic::Virtio(nic)).is_some() {
-                            locate(interfaces, &device);
+                            locate(number, &device);
                             interfaces += 1;
                         }
                     }
