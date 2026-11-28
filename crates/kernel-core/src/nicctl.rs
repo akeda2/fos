@@ -215,9 +215,10 @@ pub fn drain_nic_to_fifo(index: usize) {
         }
         queue_frame(index, frame, stamp);
         if target == Target::Everyone {
+            // The stamp goes along: multicast PTP (Sync, a slave's Delay_Req) reaches a vnic this way.
             for &(child, _) in children {
                 count_virtual_received(child);
-                queue_frame(child, frame, 0);
+                queue_frame(child, frame, stamp);
             }
         }
     }
@@ -259,24 +260,31 @@ pub fn nic_release(index: usize) {
     }
 }
 
+/// The card whose timestamp unit serves interface `index`: its own, or for a virtual interface (`vnic`) its parent's. A
+/// vnic has no clock of its own, and the parent stamps the vnic's frames as it stamps any other, so a `ptp` service on a
+/// vnic gets hardware stamps and steers the parent's clock. Only one tape should steer a card's clock at a time.
+fn stamping_card(index: usize) -> Option<&'static mut crate::e1000::E1000> {
+    nic::at(nic::virtual_parent(index).unwrap_or(index)).and_then(|nic| nic.as_e1000())
+}
+
 /// Arms hardware timestamps on interface `index` (index 0-based); false if the card has none.
 pub fn nic_ts_enable(index: usize) -> bool {
-    nic::at(index).and_then(|nic| nic.as_e1000()).is_some_and(|card| card.ts_enable())
+    stamping_card(index).is_some_and(|card| card.ts_enable())
 }
 
 /// The card's clock in nanoseconds (0 without timestamps).
 pub fn nic_ts_clock(index: usize) -> u64 {
-    nic::at(index).and_then(|nic| nic.as_e1000()).filter(|card| card.ts_supported()).map_or(0, |card| card.systim())
+    stamping_card(index).filter(|card| card.ts_supported()).map_or(0, |card| card.systim())
 }
 
 /// Frequency-adjusts the card's clock by `ppb` (false without timestamps).
 pub fn nic_ts_adjust(index: usize, ppb: i32) -> bool {
-    nic::at(index).and_then(|nic| nic.as_e1000()).filter(|card| card.ts_supported()).map(|card| card.ts_adjust(ppb)).is_some()
+    stamping_card(index).filter(|card| card.ts_supported()).map(|card| card.ts_adjust(ppb)).is_some()
 }
 
 /// Stamps every received frame (`on`) or only PTP events again; false without timestamps armed.
 pub fn nic_ts_all(index: usize, on: bool) -> bool {
-    nic::at(index).and_then(|nic| nic.as_e1000()).is_some_and(|card| card.ts_stamp_all(on))
+    stamping_card(index).is_some_and(|card| card.ts_stamp_all(on))
 }
 
 /// Back to stamping only PTP events on every interface (after a tape that asked for every frame).
@@ -295,16 +303,20 @@ pub fn nic_ts_all_off() {
 
 /// Steps the card's clock by `delta` nanoseconds (false without timestamps).
 pub fn nic_ts_step(index: usize, delta: i64) -> bool {
-    nic::at(index).and_then(|nic| nic.as_e1000()).filter(|card| card.ts_supported()).map(|card| card.ts_step(delta)).is_some()
+    stamping_card(index).filter(|card| card.ts_supported()).map(|card| card.ts_step(delta)).is_some()
 }
 
 /// Sends `frame` and returns (sent, transmit stamp); the stamp is 0 when the card has none.
 pub fn nic_send_stamped(index: usize, frame: &[u8]) -> (bool, u64) {
-    let Some(nic) = nic::at(index) else { return (false, 0) };
-    match nic.as_e1000().filter(|card| card.ts_supported()) {
-        Some(card) => card.send_stamped(frame),
-        None => (nic.send(frame), 0),
+    if let Some(card) = stamping_card(index).filter(|card| card.ts_supported()) {
+        let sent = card.send_stamped(frame);
+        // Sent through the parent's ring directly: the vnic's own count would miss it.
+        if let (true, Some(nic::Nic::Virtual(nic))) = (sent.0, nic::at(index)) {
+            nic.frames_sent += 1;
+        }
+        return sent;
     }
+    (nic::at(index).is_some_and(|nic| nic.send(frame)), 0)
 }
 
 pub fn nic_mac(index: usize, out: &mut [u8; 6]) -> bool {
