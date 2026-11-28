@@ -961,8 +961,8 @@ while the workstation (Linux) is joined, v2 or v3 alike: the switches, not the r
 
 `ptp` on a vnic (server kernel) stamps in hardware: the timestamp calls on a vnic act on its parent's card
 (`nicctl::stamping_card`), and multicast frames take their stamp along to the vnics. Rack runs a `ptp` service on vnic
-`ptp` over the I350 (`master both steer domain=1`); aneby's slaves get 0.1 us per-second sd over Ethernet and UDP, as
-against the card itself. One tape at a time should steer a card's clock.
+`ptp` over the I350 (`master both steer`, domain 0, the network's PTP master since 2026-11-28, replacing clock's);
+aneby's slaves get 0.1 us per-second sd over Ethernet and UDP, as against the card itself. One tape at a time should steer a card's clock.
 
 **Audio-analysis crates (for the `ltas` tape and later ones).** All `no_std`, no allocation, host-tested (`make test`):
 `crates/gfx` (a RAM `Canvas` of 0x00RRGGBB pixels: rectangles, lines, 8x16 text in the kernel's console font, and a PNG
