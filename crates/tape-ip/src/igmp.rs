@@ -3,8 +3,14 @@
 //!
 //! Without a join, a snooping switch forwards a multicast group only to the ports that asked for it, so a
 //! receiver would hear nothing. A query is answered after a random delay of up to the query's maximum response
-//! time, so that the hosts on a segment do not all answer at once. The unsolicited join is an IGMPv2 report
-//! (every querier accepts it, a v3 one in compatibility mode); answers to a query use the version of the query.
+//! time, so that the hosts on a segment do not all answer at once.
+//!
+//! **Version.** Reports are IGMPv3 (RFC 3376), sent to 224.0.0.22, unless an IGMPv2 querier has been heard within a
+//! membership interval: then v2, as RFC 3376 7.2.1 has it (v2 before 2026-11-28). The version did not change what
+//! reaches whom on the test network: clock's PTP group reaches a fos receiver on rack or aneby only while the
+//! workstation (Linux) is joined, with v2 and v3 fos reports alike, and the reports are byte for byte the ones Linux
+//! sends. That looks like a switch with no querier that never learns of members behind another snooping switch; a
+//! querier on the network (a switch setting) is the usual cure.
 //!
 //! **No querier.** IGMP hosts report only when asked, which assumes a querier on the segment. A snooping switch with no
 //! querier still learns members from the unsolicited join, but forgets them when its membership timer runs out
@@ -14,7 +20,7 @@
 //! reported again every `REREPORT_US`; once a querier speaks, only its queries are answered, as the RFCs have it.
 //!
 //! An IGMP packet is an IPv4 packet of protocol 2, TTL 1, with the Router Alert option (RFC 2113), sent to the
-//! group itself (v2 report), to 224.0.0.2 (v2 leave) or to 224.0.0.22 (v3 report).
+//! group itself (v2 report), to 224.0.0.2 (v2 leave) or to 224.0.0.22 (v3 report and leave).
 
 use crate::net::NetConfig;
 use audio_wire::multicast_mac;
@@ -29,10 +35,23 @@ const MEMBERSHIP_US: u64 = 260_000_000;
 /// With no querier heard, a joined group is reported again this often: well inside any membership timeout.
 const REREPORT_US: u64 = 60_000_000;
 
+/// What a report says.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Report {
+    /// The unsolicited join: v3 record CHANGE_TO_EXCLUDE_MODE with no sources.
+    Join,
+    /// An answer to a query, or a repeated join: v3 MODE_IS_EXCLUDE with no sources ("everything from the group").
+    Current,
+    /// The leave: v3 CHANGE_TO_INCLUDE_MODE with no sources, or a v2 leave to 224.0.0.2.
+    Leave,
+}
+
 pub struct Igmp {
     group: [u8; 4],
-    /// When (micros) a pending answer to a query is due, and whether it is a v3 report.
-    due: Option<(u64, bool)>,
+    /// When (micros) a pending answer to a query is due.
+    due: Option<u64>,
+    /// When an IGMPv2 querier was last heard (a query of 8 bytes): while it counts as present, reports are v2.
+    v2_query: Option<u64>,
     /// Between `join` and `leave`.
     joined: bool,
     /// When the last query for us arrived, and when we last reported, on the caller's clock (`handle`, `poll`).
@@ -80,25 +99,37 @@ fn build(out: &mut [u8; 80], config: &NetConfig, destination: [u8; 4], igmp: &[u
 
 impl Igmp {
     pub fn new(group: [u8; 4]) -> Igmp {
-        Igmp { group, due: None, joined: false, last_query: None, last_report: None, queries: 0, reports: 0 }
+        Igmp { group, due: None, v2_query: None, joined: false, last_query: None, last_report: None, queries: 0, reports: 0 }
     }
 
-    fn send(&mut self, api: &TapeApi, nic: usize, config: &NetConfig, v3: bool, leave: bool) {
-        let mut message = [0u8; 20];
-        let (destination, length) = if v3 {
-            // Report with one record: MODE_IS_EXCLUDE with no sources (= "I want everything from the group").
+    /// The IGMP message for `report` into `message`: (destination, length). v2 while a v2 querier counts as present.
+    fn message(&self, report: Report, message: &mut [u8; 16]) -> ([u8; 4], usize) {
+        *message = [0; 16];
+        let (destination, length) = if self.v2_query.is_none() {
+            // A v3 report with one group record and no sources.
             message[0] = 0x22;
             message[6..8].copy_from_slice(&1u16.to_be_bytes());
-            message[8] = 2;
+            message[8] = match report {
+                Report::Current => 2,
+                Report::Leave => 3,
+                Report::Join => 4,
+            };
             message[12..16].copy_from_slice(&self.group);
             (IGMPV3_REPORTS, 16)
         } else {
+            let leave = report == Report::Leave;
             message[0] = if leave { 0x17 } else { 0x16 };
             message[4..8].copy_from_slice(&self.group);
             (if leave { ALL_ROUTERS } else { self.group }, 8)
         };
         let sum = checksum(&message[..length]);
         message[2..4].copy_from_slice(&sum.to_be_bytes());
+        (destination, length)
+    }
+
+    fn send(&mut self, api: &TapeApi, nic: usize, config: &NetConfig, report: Report) {
+        let mut message = [0u8; 16];
+        let (destination, length) = self.message(report, &mut message);
         let mut frame = [0u8; 80];
         let total = build(&mut frame, config, destination, &message[..length]);
         (api.nic_send)(nic, frame.as_ptr(), total);
@@ -114,24 +145,24 @@ impl Igmp {
         }
         self.joined = true;
         self.last_report = None;
-        self.send(api, nic, config, false, false);
+        self.send(api, nic, config, Report::Join);
         let until = tape_rt::micros() + 10_000;
         while tape_rt::micros() < until {
             core::hint::spin_loop();
         }
-        self.send(api, nic, config, false, false);
+        self.send(api, nic, config, Report::Join);
     }
 
     /// A leave that keeps the NIC's multicast filter open: another group is still joined.
     pub fn leave_report(&mut self, api: &TapeApi, nic: usize, config: &NetConfig) {
         self.joined = false;
-        self.send(api, nic, config, false, true);
+        self.send(api, nic, config, Report::Leave);
         self.filter(nic, false);
     }
 
     pub fn leave(&mut self, api: &TapeApi, nic: usize, config: &NetConfig) {
         self.joined = false;
-        self.send(api, nic, config, false, true);
+        self.send(api, nic, config, Report::Leave);
         if !self.filter(nic, false) {
             (api.nic_set_multicast)(nic, 0);
         }
@@ -161,15 +192,20 @@ impl Igmp {
         }
         self.queries += 1;
         self.last_query = Some(now_micros);
-        let v3 = message.len() >= 12;
+        // A v2 query is 8 bytes, a v3 one at least 12 (RFC 3376 7.1; Ethernet padding can make a v2 one longer, but the
+        // IP total length cannot).
+        let total = usize::from(u16::from_be_bytes([frame[16], frame[17]]));
+        if total.saturating_sub(header) < 12 {
+            self.v2_query = Some(now_micros);
+        }
         // Maximum response code: tenths of a second (v2); v3 codes of 128 and over are a floating-point format.
         let code = u64::from(message[1]);
         let tenths = if code < 128 { code } else { ((code & 0x0f) | 0x10) << (((code >> 4) & 7) + 3) };
         let max = tenths.max(1) * 100_000;
         // Pseudo-random delay in [0, max): the low bits of the clock are good enough to spread hosts apart.
         let delay = now_micros.wrapping_mul(2_654_435_761) % max;
-        if self.due.is_none_or(|(at, _)| now_micros + delay < at) {
-            self.due = Some((now_micros + delay, v3));
+        if self.due.is_none_or(|at| now_micros + delay < at) {
+            self.due = Some(now_micros + delay);
         }
         true
     }
@@ -177,15 +213,24 @@ impl Igmp {
     /// Sends a due answer, or a repeated join when no querier is heard; call once per loop pass, always with the
     /// same clock as `handle`.
     pub fn poll(&mut self, api: &TapeApi, nic: usize, config: &NetConfig, now_micros: u64) {
-        if let Some((at, v3)) = self.due {
+        self.forget_old_querier(now_micros);
+        if let Some(at) = self.due {
             if now_micros >= at {
                 self.due = None;
                 self.last_report = Some(now_micros);
-                self.send(api, nic, config, v3, false);
+                self.send(api, nic, config, Report::Current);
             }
         } else if self.rereport_due(now_micros) {
             self.last_report = Some(now_micros);
-            self.send(api, nic, config, false, false);
+            self.send(api, nic, config, Report::Current);
+        }
+    }
+
+    /// Back to v3 once the v2 querier has been silent for a membership interval (RFC 3376 8.12's Older Version
+    /// Querier Present Timeout is about that long).
+    fn forget_old_querier(&mut self, now_micros: u64) {
+        if self.v2_query.is_some_and(|at| now_micros.saturating_sub(at) >= MEMBERSHIP_US) {
+            self.v2_query = None;
         }
     }
 
@@ -214,15 +259,65 @@ mod tests {
         igmp
     }
 
-    /// A general IGMPv2 query (maximum response 1 s) as a raw frame.
-    fn query() -> [u8; 46] {
-        let mut frame = [0u8; 46];
+    /// A general IGMPv2 query (maximum response 1 s) as a raw frame, padded to Ethernet's minimum like a real one.
+    fn query() -> [u8; 60] {
+        let mut frame = [0u8; 60];
         frame[12..14].copy_from_slice(&[0x08, 0x00]);
         frame[14] = 0x45;
+        frame[16..18].copy_from_slice(&28u16.to_be_bytes());
         frame[14 + 9] = 2;
         frame[34] = 0x11;
         frame[35] = 10;
         frame
+    }
+
+    /// The same as an IGMPv3 query (12 bytes: the v2 fields plus QRV/QQIC and no sources).
+    fn query_v3() -> [u8; 60] {
+        let mut frame = query();
+        frame[16..18].copy_from_slice(&32u16.to_be_bytes());
+        frame
+    }
+
+    /// (destination, the message padded with zeros, its length).
+    fn sent(igmp: &Igmp, report: Report) -> ([u8; 4], [u8; 16], usize) {
+        let mut message = [0u8; 16];
+        let (destination, length) = igmp.message(report, &mut message);
+        assert_eq!(checksum(&message[..length]), 0, "the checksum covers the message");
+        (destination, message, length)
+    }
+
+    #[test]
+    fn with_no_querier_reports_are_v3_to_224_0_0_22() {
+        let igmp = joined();
+        for (report, record) in [(Report::Join, 4), (Report::Current, 2), (Report::Leave, 3)] {
+            let (destination, message, length) = sent(&igmp, report);
+            assert_eq!(destination, IGMPV3_REPORTS);
+            assert_eq!((message[0], length, message[7], message[8]), (0x22, 16, 1, record));
+            assert_eq!(message[12..16], [224, 0, 1, 129]);
+        }
+    }
+
+    #[test]
+    fn a_v2_querier_makes_the_reports_v2_until_it_falls_silent() {
+        let mut igmp = joined();
+        assert!(igmp.handle(&query(), 1_000_000));
+        let (destination, message, length) = sent(&igmp, Report::Join);
+        assert_eq!((destination, &message[..length]), ([224, 0, 1, 129], &[0x16, 0, 0x08, 0x7e, 224, 0, 1, 129][..]));
+        assert_eq!(sent(&igmp, Report::Leave).0, ALL_ROUTERS);
+        assert_eq!(sent(&igmp, Report::Leave).1[0], 0x17);
+        igmp.forget_old_querier(1_000_000 + MEMBERSHIP_US - 1);
+        assert_eq!(sent(&igmp, Report::Current).1[0], 0x16);
+        igmp.forget_old_querier(1_000_000 + MEMBERSHIP_US);
+        assert_eq!(sent(&igmp, Report::Current).1[0], 0x22);
+    }
+
+    #[test]
+    fn a_v3_querier_keeps_v3() {
+        let mut igmp = joined();
+        assert!(igmp.handle(&query_v3(), 1_000_000));
+        assert!(igmp.v2_query.is_none());
+        assert_eq!(sent(&igmp, Report::Current).1[0], 0x22);
+        assert!(igmp.due.is_some(), "the query is answered");
     }
 
     #[test]

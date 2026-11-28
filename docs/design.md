@@ -955,6 +955,10 @@ Ethernet Announce, 12.8 us early on the slave's side (the master's two t1 stayed
 stamp is not known. The master now sends its Announce halfway between two Syncs: an Ethernet slave on aneby then
 settles to 0.1 us per-second sd against either rack card (2026-11-28).
 
+IGMP reports are v3 (to 224.0.0.22) since 2026-11-28, v2 while a v2 querier is heard (`tape-ip` `igmp.rs`); a UDP
+slave on aneby kept getting Delay_Resp for 290 s from a rack master. Clock's UDP group still reaches rack and aneby only
+while the workstation (Linux) is joined, v2 or v3 alike: the switches, not the report, decide that (see `igmp.rs`).
+
 **Audio-analysis crates (for the `ltas` tape and later ones).** All `no_std`, no allocation, host-tested (`make test`):
 `crates/gfx` (a RAM `Canvas` of 0x00RRGGBB pixels: rectangles, lines, 8x16 text in the kernel's console font, and a PNG
 writer: 8-bit RGB, filter "Up" plus fixed-Huffman deflate with distance-1 runs, so a flat chart is tens of KB, streamed through
