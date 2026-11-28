@@ -949,6 +949,12 @@ Ethernet PTP kept working. `tape-ip`'s `Igmp` now repeats the join every 60 s wh
 (server kernel, I219): group Delay_Req answered 20/20 at 7 and 16 minutes (0/20 at 5 minutes before), and a UDP slave on
 aneby that steers its card locked with 64 Delay_Resp, offset sd 0.2 us.
 
+A `both` master on rack (I219 or I350) gave an Ethernet slave on aneby one bad Sync a second: the one right after the
+Ethernet Announce, 12.8 us early on the slave's side (the master's two t1 stayed consistent, and UDP slaves were clean),
+4.5 us per-second sd in all. Clock's 82579V, with the same frame order on the wire, did not; which latch takes the wrong
+stamp is not known. The master now sends its Announce halfway between two Syncs: an Ethernet slave on aneby then
+settles to 0.1 us per-second sd against either rack card (2026-11-28).
+
 **Audio-analysis crates (for the `ltas` tape and later ones).** All `no_std`, no allocation, host-tested (`make test`):
 `crates/gfx` (a RAM `Canvas` of 0x00RRGGBB pixels: rectangles, lines, 8x16 text in the kernel's console font, and a PNG
 writer: 8-bit RGB, filter "Up" plus fixed-Huffman deflate with distance-1 runs, so a flat chart is tens of KB, streamed through

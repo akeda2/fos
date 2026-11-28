@@ -671,9 +671,13 @@ fn master(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6
     };
     start_hardware_stamps(options);
     let start = now_ns();
-    let (mut next_announce, mut next_sync, mut next_report) = (start, start, start + 5_000_000_000);
+    // Announces go out halfway between two Syncs. Sent just before one, as they were, a `both` master on the server
+    // kernel (I219 and I350 alike) gave an Ethernet slave that Sync 12.8 us early once a second (docs/design.md).
+    let (mut next_announce, mut next_sync, mut next_report) = (start + sync_interval / 2, start, start + 5_000_000_000);
     let (mut announce_sequence, mut sync_sequence) = (0u16, 0u16);
-    let (mut syncs, mut answered) = (0u32, 0u32);
+    // `soft`: Delay_Req answered with a software receive time because the card had no stamp for it (only one is latched at a
+    // time, so a request right behind another event frame goes unstamped).
+    let (mut syncs, mut answered, mut soft) = (0u32, 0u32, 0u32);
     loop {
         let now = now_ns();
         if (api.should_abort)() != 0 || (options.seconds != 0 && now - start >= i64::from(options.seconds) * 1_000_000_000) {
@@ -685,7 +689,7 @@ fn master(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6
             if length == 0 {
                 break;
             }
-            let (t4, _) = receive_time(options.nic);
+            let (t4, stamped) = receive_time(options.nic);
             busy = true;
             if !l2() && igmp.handle(&frame[..length], t4 as u64 / 1000) {
                 continue;
@@ -698,6 +702,7 @@ fn master(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6
                     let length = build_delay_resp(&mut message, options.domain, identity, request.source, request.sequence, t4, 0x7f);
                     send(over_l2, api, options.nic, config, GENERAL_PORT, &message[..length]);
                     answered += 1;
+                    soft += u32::from(HW_NIC.load(core::sync::atomic::Ordering::Relaxed) == options.nic && !stamped);
                 }
             }
         }
@@ -734,13 +739,16 @@ fn master(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6
         }
         if now >= next_report {
             next_report += 5_000_000_000;
-            println!("{:>4}s master: {} syncs sent, {} delay requests answered", (now - start) / 1_000_000_000, syncs, answered);
+            println!("{:>4}s master: {} syncs sent, {} delay requests answered ({} unstamped)", (now - start) / 1_000_000_000, syncs, answered, soft);
         }
         if !busy {
             wait(options, next_announce.min(next_sync));
         }
     }
     println!("ptp: {syncs} syncs sent, {answered} delay requests answered.");
+    if soft != 0 {
+        println!("ptp: {soft} of them answered without a hardware stamp.");
+    }
 }
 
 tape_rt::tape_help!(br#"ptp: PTPv2 (IEEE 1588) clock sync, master or slave, UDP or Ethernet.
