@@ -46,6 +46,7 @@ pub fn session_open() -> bool {
 }
 
 /// The interface the remote terminal session runs over, while one is open.
+#[cfg(target_arch = "x86_64")]
 pub fn session_nic() -> Option<usize> {
     session_open().then(|| unsafe { SESSION_NIC })
 }

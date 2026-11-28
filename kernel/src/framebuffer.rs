@@ -530,12 +530,15 @@ pub fn init(framebuffer: &Framebuffer) -> bool {
 }
 
 /// Where VGA text memory is, and the colours of its cells: light grey on black, as the pixel console draws.
+#[cfg(target_arch = "x86_64")]
 pub const VGA_TEXT_BASE: u64 = 0xb8000;
+#[cfg(target_arch = "x86_64")]
 const TEXT_ATTRIBUTE: u8 = 0x07;
 
 /// Starts the console in VGA text mode (80x25 at 0xB8000, which `paging` maps on a BIOS boot without a framebuffer): the
 /// screen is cleared, and the cursor made visible. Only for a BIOS boot, where the BIOS left the screen in text mode; a UEFI
 /// machine without a framebuffer has no text screen.
+#[cfg(target_arch = "x86_64")]
 pub fn init_text() -> bool {
     let console = Console {
         text: true,
@@ -651,6 +654,7 @@ pub fn size() -> Option<(usize, usize)> {
 /// Draws a filled rectangle in an RGB colour given independently of the
 /// framebuffer's byte order: a test that red looks red proves the pixel-format
 /// handling.
+#[cfg(target_arch = "x86_64")]
 pub fn fill_rect(x: usize, y: usize, width: usize, height: usize, red: u8, green: u8, blue: u8) {
     if let Some(console) = unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() } {
         let value = console.pixel(red, green, blue);
@@ -845,6 +849,7 @@ struct Extra {
 static mut EXTRA: Option<Extra> = None;
 
 /// Registers the second screen: `stride` is in pixels, memory already mapped, 32 bits per pixel, blue first in memory.
+#[cfg(target_arch = "aarch64")]
 pub fn add_screen(base: u64, width: u32, height: u32, stride: u32) {
     let extra = Extra { base: base as *mut u32, stride: stride as usize, width: width as usize, height: height as usize, open: false };
     unsafe { *core::ptr::addr_of_mut!(EXTRA) = Some(extra) };
@@ -900,6 +905,7 @@ pub fn split_set(phys: usize, mode: Option<Split>) {
 }
 
 /// `split_set` for tapes started as services: the split goes away when the last service has ended.
+#[cfg(target_arch = "aarch64")]
 pub fn split_set_service(phys: usize, mode: Split) {
     split_set(phys, Some(mode));
     if phys < 2 {

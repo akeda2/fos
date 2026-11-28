@@ -82,7 +82,7 @@ pub fn init_cpu() {
     cpu::write_msr(MSR_EFER, cpu::read_msr(MSR_EFER) | 1); // SCE
     // STAR: bits 47:32 the kernel CS (SS is the next descriptor); 63:48 the base `sysret` derives the user selectors from.
     cpu::write_msr(MSR_STAR, u64::from(0x10u16) << 48 | u64::from(gdt::KERNEL_CODE) << 32);
-    cpu::write_msr(MSR_LSTAR, syscall_entry as usize as u64);
+    cpu::write_msr(MSR_LSTAR, syscall_entry as *const () as u64);
     cpu::write_msr(MSR_SFMASK, 0x200 | 0x100 | 0x400 | 0x4_0000); // IF, TF, DF, AC
     let features = cpu::cpuid(7, 0).1;
     // CR4 bit 20 SMEP (no execution of user pages), bit 21 SMAP (no access to them unless RFLAGS.AC is set: `user_access`).
@@ -120,8 +120,8 @@ pub fn user_access<R>(f: impl FnOnce() -> R) -> R {
 /// Nothing to do: x86 keeps instruction fetch coherent with stores.
 pub fn sync_code(_address: u64, _length: u64) {}
 
-/// The tape shim, mapped into every tape's address space by `tapeapi::map_support` (entry wrapper, thread start, one stub per
-/// table slot). The stub numbering and layout are the contract with `tapeapi`; the instructions are this CPU's.
+// The tape shim, mapped into every tape's address space by `tapeapi::map_support` (entry wrapper, thread start, one stub per
+// table slot). The stub numbering and layout are the contract with `tapeapi`; the instructions are this CPU's.
 core::arch::global_asm!(
     r#"
     .text

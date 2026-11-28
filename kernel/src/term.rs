@@ -24,7 +24,6 @@ const KUP_TOO_LARGE: u8 = 1;
 const KUP_CHECKSUM_MISMATCH: u8 = 2;
 const KUP_DISK_ERROR: u8 = 3;
 const KUP_BUSY: u8 = 4;
-pub use crate::nic::MAX_NICS;
 static mut RUNTIME_SERVICES: u64 = 0;
 
 
@@ -677,46 +676,6 @@ fn execute(command: &str) {
     }
 }
 
-/// Runs `action` on the volume the command names -- an optional leading `diskN` word picks
-/// that disk's FOSFS data partition (mounted on the spot), `@LABEL` the volume carrying that
-/// label (see `label`; unlike a disk number it does not change when the disks are found in
-/// another order) -- or on the boot volume. The action gets the rest of the command's words.
-///
-/// A file may also be written `diskN/NAME` or `@LABEL/NAME` (the form tapes and `copy` use): the action then gets the name
-/// as its first argument, the other words after it.
-fn files<'a>(words: &mut core::str::SplitWhitespace<'a>, action: impl FnOnce(crate::fosfs::Volume, Option<&'a str>, core::str::SplitWhitespace<'a>)) {
-    let mut rest = words.clone();
-    let first = rest.next().unwrap_or("");
-    if let Some((volume_text, name)) = split_volume(first) {
-        match volume_word(volume_text) {
-            Some(Ok((_, volume))) => action(volume, Some(name), rest),
-            Some(Err(String8Error::NoLabel)) => crate::println!("{volume_text}: no volume carries that label (see `label`)."),
-            Some(Err(String8Error::Volume(error))) => crate::println!("{volume_text}: {error}."),
-            None => {}
-        }
-        return;
-    }
-    if let Some(label) = first.strip_prefix('@') {
-        match crate::storage::volume_labelled(label.as_bytes()) {
-            Some((_, volume)) => action(volume, None, rest),
-            None => crate::println!("@{label}: no volume carries that label (see `label`)."),
-        }
-        return;
-    }
-    let disk = first.strip_prefix("disk").and_then(|number| number.parse::<usize>().ok());
-    let Some(number) = disk else {
-        match crate::storage::boot_volume() {
-            Some(volume) => action(volume, None, words.clone()),
-            None => crate::println!("No FOSFS volume is mounted (see `disks`)."),
-        }
-        return;
-    };
-    match crate::storage::volume_on(number) {
-        Ok(volume) => action(volume, None, rest),
-        Err(error) => crate::println!("disk{number}: {error}."),
-    }
-}
-
 /// `diskN/NAME` or `@LABEL/NAME` split into the volume word and the file name. `None` for anything else (a plain name, or
 /// `HOST/NAME`, which names another machine).
 /// `diskN` (or `diskN/NAME`) naming a disk that has a FAT32/exFAT volume and no FOSFS one: the volume and the file
@@ -1073,13 +1032,6 @@ pub(crate) fn help_extra() {
     crate::println!("keymap    [us|sv]  the local keyboard layout (sv: Swedish/Finnish; `keymap sv` in settings keeps it)");
     crate::println!("uptime    time since the timer started; sleep N waits N seconds");
     crate::println!("Remote: term net, and tools/term_net.py, devloop.py, foscopy.py from a PC.");
-}
-
-fn parse_number(word: &str) -> Option<u64> {
-    match word.strip_prefix("0x") {
-        Some(hex) => u64::from_str_radix(hex, 16).ok(),
-        None => word.parse().ok(),
-    }
 }
 
 /// `nic send`: one broadcast test frame (ethertype 0x88b5, v1's TEST_ETHERTYPE) out of interface 1.

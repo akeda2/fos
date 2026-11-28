@@ -28,11 +28,13 @@ const ALL: u64 = (1 << PINS) - 1;
 /// GPIO2..27 without 14 and 15 (the console UART): the pins `gpio` may change unless `gpio-deny` takes more away.
 const USER_PINS: u64 = ((1 << 28) - 1) & !0b11 & !(1 << 14) & !(1 << 15);
 
+#[allow(dead_code)] // part of the value set (FUNC_*, PULL_*) the gpio calls take
 pub const FUNC_IN: u8 = 0;
 pub const FUNC_OUT: u8 = 1;
 const FUNC_TO_CODE: [u8; 8] = [0, 1, 4, 5, 6, 7, 3, 2];
 const CODE_TO_FUNC: [u8; 8] = [0, 1, 7, 6, 2, 3, 4, 5];
 
+#[allow(dead_code)]
 pub const PULL_NONE: u8 = 0;
 pub const PULL_UP: u8 = 1;
 pub const PULL_DOWN: u8 = 2;
@@ -58,6 +60,7 @@ impl Error {
 
 enum Bank {
     None,
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))] // only the Pi finds a GPIO bank; x86 has the simulated one
     Pi,
     Sim,
 }
@@ -280,6 +283,7 @@ pub fn set_function(pin: usize, function: u8, level: bool) -> Result<(), Error> 
 }
 
 /// The kernel's own use of a pin the shell and tapes may not touch (the display connector's I2C on GPIO44/45).
+#[cfg(target_arch = "aarch64")]
 pub fn set_function_kernel(pin: usize, function: u8) -> bool {
     if !available() || pin >= PINS || function > 7 {
         return false;

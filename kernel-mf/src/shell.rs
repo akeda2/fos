@@ -3,9 +3,8 @@
 //! the network). Runs on the boot CPU from the service loop.
 
 use crate::{time, block, clock, net, percpu, pmm, power, sched, slots};
-use kernel_core::netdump::Mac;
 use alloc::vec::Vec;
-use kernel_core::{nic, pci};
+use kernel_core::pci;
 
 const PROMPT: &str = "fos> ";
 const ESCAPE: u8 = 0x1b;

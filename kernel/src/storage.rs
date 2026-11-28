@@ -35,7 +35,9 @@ pub fn boot_slot() -> u32 {
 pub fn payload_start() -> Option<u64> {
     unsafe { *core::ptr::addr_of!(PAYLOAD_START) }
 }
-pub use kernel_core::volumes::{VolumeError, boot_volume, set_boot_volume, volume_labelled, volume_on, volume_with_file};
+pub use kernel_core::volumes::{VolumeError, boot_volume, set_boot_volume, volume_labelled, volume_on};
+#[cfg(target_arch = "x86_64")]
+pub use kernel_core::volumes::volume_with_file;
 
 pub fn boot_disk() -> Option<usize> {
     unsafe { *core::ptr::addr_of!(BOOT_DISK) }

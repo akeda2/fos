@@ -63,6 +63,7 @@ pub fn madt_gic(rsdp: u64) -> Option<(u64, u64)> {
 
 /// The MPIDR affinity values (Aff3..Aff0) of the enabled processors in MADT's GICC entries, in table order; returns how many
 /// went into `out`. GICC (type 0xB): flags at +12 (bit 0 enabled), MPIDR at +68.
+#[allow(dead_code)] // for an ACPI-booted arm64 board (docs/aarch64-plan.md); the Pi boots from a device tree
 pub fn madt_cpus(rsdp: u64, out: &mut [u64]) -> usize {
     let Some(table) = find_table(rsdp, b"APIC") else { return 0 };
     let end = table_length(table);
@@ -83,6 +84,7 @@ pub fn madt_cpus(rsdp: u64, out: &mut [u64]) -> usize {
 
 /// How the firmware wants PSCI called, from the FADT's ARM boot architecture flags: `Some(true)` for HVC, `Some(false)` for
 /// SMC, `None` when the FADT does not claim PSCI.
+#[allow(dead_code)] // for an ACPI-booted arm64 board (docs/aarch64-plan.md); the Pi boots from a device tree
 pub fn psci_uses_hvc(rsdp: u64) -> Option<bool> {
     let table = find_table(rsdp, b"FACP")?;
     if table_length(table) < 131 {
@@ -95,6 +97,7 @@ pub fn psci_uses_hvc(rsdp: u64) -> Option<bool> {
 static mut RSDP: u64 = 0;
 
 /// The RSDP given to `remember` (0 before).
+#[allow(dead_code)] // for an ACPI-booted arm64 board (docs/aarch64-plan.md); the Pi boots from a device tree
 pub fn rsdp() -> u64 {
     unsafe { RSDP }
 }

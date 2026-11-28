@@ -28,7 +28,7 @@ pub use apic::ioapic;
 pub use context::{WAKE_VECTOR, end_wake_interrupt, prepare_stack, send_wake_ipi, switch};
 pub use percpu_arch::{CpuArch, activate, cpu_pointer, interrupt_target, set_kernel_stack};
 
-use crate::{boot, percpu, pmm, process, vm};
+use crate::{boot, percpu, pmm, vm};
 use fosfor_abi::BootInfo;
 
 // The embedded kernel's interrupt-routing file, included as it is so the two kernels cannot drift. It names `crate::apic`,

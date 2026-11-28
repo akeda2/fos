@@ -188,11 +188,6 @@ const GFX_CLOSE_ON: u64 = slot(offset_of!(TapeApi, gfx_close_on));
 const GFX_FILL_ON: u64 = slot(offset_of!(TapeApi, gfx_fill_on));
 const GFX_BLIT_ON: u64 = slot(offset_of!(TapeApi, gfx_blit_on));
 
-/// The table slots that hold data, not a function.
-fn is_data(slot: u64) -> bool {
-    [ARGS, ARGS_LEN, MEMORY_MAP, MEMORY_MAP_COUNT, MEMORY_MAP_DESCRIPTOR_SIZE].contains(&slot)
-}
-
 /// Where a new thread starts: the shim's `tape_thread_start`, mapped at the same place in every process.
 pub fn thread_start() -> u64 {
     SHIM_BASE + unsafe { &tape_thread_start as *const u8 as usize - &tape_shim_start as *const u8 as usize } as u64 // kernel-memory

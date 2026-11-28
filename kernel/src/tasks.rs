@@ -444,6 +444,7 @@ pub fn own_rotation(arguments: &str) -> Option<crate::framebuffer::Rotate> {
 }
 
 /// The `screen=N` of a `run A | B` pair: the physical screen the pair shares (either tape may name it).
+#[cfg(target_arch = "aarch64")]
 pub fn group_screen(first: &str, second: &str) -> Option<usize> {
     first.split_ascii_whitespace().chain(second.split_ascii_whitespace()).find_map(|word| word.strip_prefix("screen=")?.parse().ok())
 }

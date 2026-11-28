@@ -925,17 +925,6 @@ fn help_in_staged(length: usize) -> Option<&'static str> {
     core::str::from_utf8(elf::section(image, ".fos_help")?).ok()
 }
 
-/// `help NAME`: shows the help screen the tape file NAME carries, without running it.
-pub fn show_help(name: &str) {
-    match load_from_file(name) {
-        Ok(length) => match help_in_staged(length) {
-            Some(text) => crate::println!("{text}"),
-            None => crate::println!("help: {name} has no help screen."),
-        },
-        Err(reason) => crate::println!("help: {name}: {reason}."),
-    }
-}
-
 /// `run A | B`: the console is split into two screens, B starts as a service on screen 1 and A runs in front on screen 0.
 /// False (nothing started) when B is not a tape, since `calc 3 | 4` has a `|` too. B ends with A.
 fn run_shared(first: &str, second: &str) -> bool {

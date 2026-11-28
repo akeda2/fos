@@ -99,11 +99,6 @@ impl Panel {
         Some(Geometry { bars, units, history, bars_x, bars_h, numbers_x })
     }
 
-    /// True when the area is big enough for anything.
-    pub fn fits(area: Rect) -> bool {
-        Self::geometry(area).is_some()
-    }
-
     /// The static part: bar scale and titles.
     pub fn draw_grid(&self, canvas: &mut Canvas, area: Rect) {
         let Some(g) = Self::geometry(area) else { return };

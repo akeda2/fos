@@ -146,6 +146,7 @@ pub fn reserve(start: u64, length: u64) {
 static POOL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static POOL_END: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+#[cfg(target_arch = "aarch64")]
 pub fn set_pool(first: u64, end: u64) {
     POOL.store(first, core::sync::atomic::Ordering::Relaxed);
     POOL_END.store(end, core::sync::atomic::Ordering::Relaxed);

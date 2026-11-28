@@ -276,8 +276,8 @@ pub fn disk_number() -> Option<usize> {
 pub enum Outcome {
     Assembled,
     NoMembers,
-    /// Present members, expected members.
-    Waiting(usize, usize),
+    /// Members missing (the status line says how many).
+    Waiting,
     Failed(Error),
 }
 
@@ -306,7 +306,7 @@ fn try_assemble_uuid(wait_over: bool, uuid: Option<[u8; 16]>) -> Outcome {
     };
     if array.degraded() && !wait_over {
         state.status.set(format_args!("waiting for members ({} of {})", array.present(), array.expected()));
-        return Outcome::Waiting(array.present(), array.expected());
+        return Outcome::Waiting;
     }
     // a partial parity log repairs what a crash left half written, before anything reads the array
     if array.has_ppl() && array.dirty() {
@@ -372,7 +372,7 @@ extern "C" fn assemble_thread(_: usize) {
             let over = t.saturating_sub(started) >= crate::config::md_wait();
             match try_assemble(over) {
                 Outcome::Assembled => pause = 1,
-                Outcome::Waiting(..) => next = t + 1,
+                Outcome::Waiting => next = t + 1,
                 _ => {
                     next = t + pause;
                     pause = (pause * 2).min(30);
@@ -845,7 +845,7 @@ pub fn command(mut words: core::str::SplitWhitespace) {
         Some("assemble") => match try_assemble(true) {
             Outcome::Assembled => {}
             Outcome::NoMembers => println!("md: no member with an md superblock found."),
-            Outcome::Waiting(..) => unreachable!(),
+            Outcome::Waiting => unreachable!(),
             Outcome::Failed(error) => println!("md: cannot assemble: {error:?}"),
         },
         Some("stop") => {

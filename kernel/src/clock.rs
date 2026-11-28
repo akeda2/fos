@@ -155,11 +155,6 @@ pub fn unix_seconds() -> u64 {
     now().map_or(0, |time| to_seconds(&time) + UNIX_OFFSET)
 }
 
-/// The inverse of `unix_seconds` for a stored non-zero value (before 2000 shows as 2000-01-01 00:00:00).
-pub fn time_at_unix(seconds: u64) -> Time {
-    from_seconds(seconds.saturating_sub(UNIX_OFFSET))
-}
-
 /// `YYYY-MM-DD HH:MM:SS`.
 pub struct Display(pub Time);
 

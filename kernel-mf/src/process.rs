@@ -84,7 +84,7 @@ pub fn spawn(name: &str, image: &[u8]) -> Option<u64> {
 /// Why `spawn_elf` refused.
 #[derive(Debug)]
 pub enum SpawnError {
-    Elf(fosfor_abi::elf::Error),
+    Elf(#[allow(dead_code)] fosfor_abi::elf::Error), // shown through Debug when `run` fails
     NoMemory,
     /// The image would reach the stack's guard page (`MAX_IMAGE` bytes at most).
     TooLarge,

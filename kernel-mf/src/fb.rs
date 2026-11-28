@@ -775,10 +775,6 @@ pub fn gfx_close() {
     });
 }
 
-pub fn gfx_is_open() -> bool {
-    GFX_OPEN.load(Ordering::Relaxed)
-}
-
 /// 0x00RRGGBB to this framebuffer's pixel format.
 fn from_rgb(console: &Console, rgb: u32) -> u32 {
     pixel(console.format, (rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
@@ -917,6 +913,7 @@ struct Extra {
 static mut EXTRA: Option<Extra> = None;
 
 /// Registers the second screen: `stride` is in pixels.
+#[cfg(target_arch = "aarch64")]
 pub fn add_screen(base: u64, width: u32, height: u32, stride: u32) {
     let extra = Extra { base: base as *mut u32, stride: stride as usize, width: width as usize, height: height as usize, open: false };
     unsafe { *core::ptr::addr_of_mut!(EXTRA) = Some(extra) };

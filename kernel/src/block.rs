@@ -140,6 +140,9 @@ pub fn flush(disk: usize) -> Result<(), Error> {
 fn write_with(disk: usize, lba: u64, buffer: &[u8], flush: bool) -> Result<(), Error> {
     #[cfg(target_arch = "aarch64")]
     let _busy = crate::crash::disk_busy();
+    // Only AHCI can defer a write; the Pi's SD and virtio drivers always write through.
+    #[cfg(target_arch = "aarch64")]
+    let _ = flush;
     let info = get(disk).ok_or(Error::NoSuchDisk)?;
     if buffer.len() % 512 != 0 || lba + (buffer.len() / 512) as u64 > info.sectors {
         return Err(Error::OutOfRange);

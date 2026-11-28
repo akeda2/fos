@@ -49,5 +49,3 @@ mod tape_common;
 pub use hal::{cpu, msi, paging, pci_config, timer};
 #[cfg(target_arch = "aarch64")]
 pub use arch::aarch64::gic;
-#[cfg(target_arch = "aarch64")]
-use usb_kbd as usb_hid;

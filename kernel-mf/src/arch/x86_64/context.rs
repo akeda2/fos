@@ -55,7 +55,7 @@ pub fn prepare_stack(top: u64, entry: extern "C" fn(usize), argument: usize) -> 
     // The first switch pops r15, r14, r13, r12, rbx, rbp and returns into the trampoline, which calls `entry(argument)`.
     // 72 bytes below the (16-aligned) top leaves rsp 16-aligned at the trampoline's `call`.
     let start = top - 72;
-    let words: [u64; 7] = [0, 0, argument as u64, entry as usize as u64, 0, 0, thread_trampoline as usize as u64];
+    let words: [u64; 7] = [0, 0, argument as u64, entry as usize as u64, 0, 0, thread_trampoline as *const () as u64];
     for (index, word) in words.iter().enumerate() {
         unsafe { ((start + index as u64 * 8) as *mut u64).write(*word) };
     }

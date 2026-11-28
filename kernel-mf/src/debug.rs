@@ -19,8 +19,6 @@ pub const DEADLOCK_VECTOR: u64 = 241;
 pub const PANIC_VECTOR: u64 = 242;
 
 static mut BOOT_CRASH_COUNT: u32 = 0;
-/// Where the record page is in the direct map, 0 when it is not mapped (no RAM record).
-static mut RECORD: u64 = 0;
 static LAST_PET: AtomicU64 = AtomicU64::new(0);
 /// Watchdog limit in ticks, 0 while off.
 static LIMIT_TICKS: AtomicU64 = AtomicU64::new(0);
@@ -85,6 +83,7 @@ pub fn watchdog_seconds() -> Option<u64> {
 
 /// True once (and disarms the watchdog) when the service thread has not petted for longer than the limit; for ports whose timer
 /// handler has no `Frame` (aarch64).
+#[cfg(target_arch = "aarch64")]
 pub fn watchdog_expired() -> bool {
     let limit = LIMIT_TICKS.load(Ordering::Relaxed);
     if limit != 0 && crate::time::ticks().saturating_sub(LAST_PET.load(Ordering::Relaxed)) > limit {

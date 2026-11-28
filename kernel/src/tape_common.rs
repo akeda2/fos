@@ -106,12 +106,17 @@ pub mod unsupported {
     }
 
     stubs! {
-        api_nic_max_frame_len() -> usize = 1514;
         api_session_open() -> isize = -1;
         api_session_write(isize, *const u8, usize) -> isize = -1;
         api_session_read(isize, *mut u8, usize) -> isize = -1;
         api_session_close(isize) -> isize = -1;
         api_resolve_path(*const u8, usize, *mut u8, usize) -> isize = -1;
+    }
+
+    // The Pi has no NIC driver; x86 serves these in `tape.rs`.
+    #[cfg(target_arch = "aarch64")]
+    stubs! {
+        api_nic_max_frame_len() -> usize = 1514;
         api_nic_ts_enable(usize) -> u32 = 0;
         api_nic_ts_clock(usize) -> u64 = 0;
         api_nic_ts_rx(usize) -> u64 = 0;

@@ -653,7 +653,7 @@ pub(crate) fn volume_word(word: &str) -> Option<Result<(usize, crate::fosfs::Vol
 
 pub(crate) enum String8Error {
     NoLabel,
-    Volume(crate::storage::VolumeError),
+    Volume(#[cfg_attr(target_arch = "aarch64", allow(dead_code))] crate::storage::VolumeError), // shown by the x86 shell
 }
 
 

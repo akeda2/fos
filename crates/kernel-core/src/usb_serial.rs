@@ -118,6 +118,8 @@ impl Pipe {
                 match controller.bulk_transfer_within(POLL_TICKS, target, self.in_ep & 0x0f, self.in_max, (self.bounce + IN_OFFSET) as u32, length, true, &mut self.in_toggle) {
                     Ok(count) => Ok(count),
                     Err(ehci::Error::Timeout) => Ok(0),
+                    // A kernel without EHCI (`ehci_none`, the Pi) has no error but Timeout.
+                    #[allow(unreachable_patterns)]
                     Err(_) => Err(()),
                 }
             }

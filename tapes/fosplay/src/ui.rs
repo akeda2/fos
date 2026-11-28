@@ -197,8 +197,6 @@ struct Widget {
 }
 
 pub struct Layout {
-    pub width: i32,
-    pub height: i32,
     pub scale: i32,
     margin: i32,
     pub header: Rect,
@@ -219,8 +217,6 @@ impl Layout {
         let text = GLYPH_H * scale;
         let header_h = text * if page == Page::Player { 3 } else { 2 } + margin;
         let mut layout = Layout {
-            width,
-            height,
             scale,
             margin,
             header: Rect { x: margin, y: margin, w: width - 2 * margin, h: header_h },
@@ -472,10 +468,6 @@ impl Ui {
 
     pub fn close(&self) {
         self.screen.close();
-    }
-
-    fn layout(&self) -> &Layout {
-        &self.layouts[slot(self.view.page)]
     }
 
     pub fn set_page(&mut self, page: Page) {
