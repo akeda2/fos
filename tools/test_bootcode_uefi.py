@@ -119,30 +119,31 @@ def main():
             check("Done: the loader reads back identical" in done, "`bootcode update confirm` writes the loader, switches it in and reads it back", done)
             again = machine.run("bootcode")
             check("identical to the installed loader" in again, "afterwards the installed loader is the file's loader", again)
-        finally:
-            pass
-        # Independent verification: the ESP, taken out of the image file (QEMU wrote it through the virtual disk), is a valid FAT32
-        # volume and holds the new loader. The guest is still running, so give its writes a moment to land.
-        time.sleep(1)
-        esp = esp_of(image, tmp / "esp.img")
-        fsck = subprocess.run(["fsck.vfat", "-n", str(esp)], capture_output=True, text=True)
-        check(fsck.returncode == 0, "the ESP passes fsck.vfat after the update", fsck.stdout + fsck.stderr)
-        if shutil.which("7z"):
-            listing = subprocess.run(["7z", "l", str(esp)], capture_output=True, text=True).stdout
-            check("bootx64.new" not in listing.lower(), "no BOOTX64.NEW is left behind", listing)
-            # 7-Zip wants the name as stored (upper case from the image builder): take it from the listing.
-            path = next((line.split()[-1] for line in listing.splitlines() if line.lower().endswith("efi/boot/bootx64.efi")), "EFI/BOOT/BOOTX64.EFI")
-            read = subprocess.run(["7z", "e", "-so", str(esp), path], capture_output=True).stdout
-            check(read == patched, "7-Zip reads the new loader from \\EFI\\BOOT\\BOOTX64.EFI", f"{len(read)} bytes")
+            # Independent verification: the ESP, taken out of the image file (QEMU wrote it through the virtual disk), is a valid FAT32
+            # volume and holds the new loader. The guest is still running, so give its writes a moment to land.
+            time.sleep(1)
+            esp = esp_of(image, tmp / "esp.img")
+            fsck = subprocess.run(["fsck.vfat", "-n", str(esp)], capture_output=True, text=True)
+            check(fsck.returncode == 0, "the ESP passes fsck.vfat after the update", fsck.stdout + fsck.stderr)
+            if shutil.which("7z"):
+                listing = subprocess.run(["7z", "l", str(esp)], capture_output=True, text=True).stdout
+                check("bootx64.new" not in listing.lower(), "no BOOTX64.NEW is left behind", listing)
+                # 7-Zip wants the name as stored (upper case from the image builder): take it from the listing.
+                path = next((line.split()[-1] for line in listing.splitlines() if line.lower().endswith("efi/boot/bootx64.efi")), "EFI/BOOT/BOOTX64.EFI")
+                read = subprocess.run(["7z", "e", "-so", str(esp), path], capture_output=True).stdout
+                check(read == patched, "7-Zip reads the new loader from \\EFI\\BOOT\\BOOTX64.EFI", f"{len(read)} bytes")
 
-        # The new loader runs.
-        mark = len(machine.text())
-        machine.process.stdin.write(b"reset\n")
-        machine.process.stdin.flush()
-        machine.wait_for("Fosfor OS loader (milestone M1): UEFI application RUNNING.", 120, mark)
-        machine.wait_for("fos> ", 120, mark)
-        check(True, "after a reset the second boot prints the changed banner: the new loader runs, and the kernel comes up")
-        machine.close()
+            # The new loader runs.
+            mark = len(machine.text())
+            machine.process.stdin.write(b"reset\n")
+            machine.process.stdin.flush()
+            machine.wait_for("Fosfor OS loader (milestone M1): UEFI application RUNNING.", 120, mark)
+            machine.wait_for("fos> ", 120, mark)
+            check(True, "after a reset the second boot prints the changed banner: the new loader runs, and the kernel comes up")
+        finally:
+            # Also when a check above fails: a guest left running outlives the test (seven were found after buildbot runs
+            # whose fsck.vfat was not on PATH, 2026-11-28).
+            machine.close()
 
         # Bad inputs are refused before anything is written.
         other_machine = bytearray(loader)

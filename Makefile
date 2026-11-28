@@ -8,6 +8,10 @@
 # into each crate before calling cargo.
 BUILD := build
 export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
+# The tests' disk tools (mkfs.vfat, mkfs.exfat, fsck.*, sgdisk, sfdisk, mkfs.ext4, debugfs) live in /usr/sbin and /sbin
+# on Debian and Ubuntu, which a service's PATH can leave out: the buildbot under pueue had only /usr/local/bin:/usr/bin,
+# and 16 targets of a test-all run failed on it (2026-11-28). Appended, so a tool earlier in PATH still wins.
+export PATH := $(PATH):/usr/sbin:/sbin
 
 .DEFAULT_GOAL := image
 
